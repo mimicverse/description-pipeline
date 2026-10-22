@@ -4855,5 +4855,345 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "recovery_dsn_authority_mismatch")
 
 
+class WindowsScpEvidenceTests(unittest.TestCase):
+    def test_failure_cleanup_keeps_referenced_sidecars_and_partial_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for partial in (False, True):
+                out = root / str(partial)
+                claim = recovery.claim_backup_output(out, "fixture")
+                staging = out / "backup"
+                staging.mkdir()
+                piece = write(staging / "partial.zip", "partial")
+                sidecar = write(out / "windows-transfer-evidence" / "upload.stderr", "diagnostic")
+                detail = {"phase": "download" if partial else "upload", "stderr": {"path": str(sidecar)}}
+                if partial:
+                    detail["download"] = {"present": True, "partial": {"path": str(piece)}}
+                recovery.record_backup_failure(
+                    argparse.Namespace(out=out, backup_id="fixture", config=root / "platform.json"),
+                    recovery.RecoveryError("windows_recovery_transport_unknown", "transfer failed", detail),
+                    claim,
+                )
+                receipt = json.loads((out / "receipt.json").read_text())
+                self.assertTrue(Path(receipt["detail"]["stderr"]["path"]).is_file())
+                self.assertEqual(staging.exists(), partial)
+
+    def test_strict_umask_still_creates_private_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = write(root / "input", "payload")
+            previous = os.umask(0o777)
+            try:
+                with (
+                    mock.patch.object(
+                        recovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"error")
+                    ),
+                    self.assertRaises(recovery.RecoveryError),
+                ):
+                    recovery._windows_scp(
+                        ssh_host="windows-fixture",
+                        sources=[source],
+                        remote_dir="C:/private/probe",
+                        upload=True,
+                        timeout=5,
+                        commands=[],
+                        code="windows_recovery_transport_unknown",
+                        evidence_dir=root / "evidence",
+                    )
+                self.assertEqual(stat.S_IMODE((root / "evidence").stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE((root / "evidence/upload.stderr").stat().st_mode), 0o600)
+            finally:
+                os.umask(previous)
+
+    def test_raw_bytes_secret_redaction_and_evidence_write_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = write(root / "input.txt", "payload")
+            secret = b"private-sentinel"
+            raw = b"\xff\xfe error " + secret
+            for blocked in (False, True):
+                evidence = root / str(blocked)
+                evidence.mkdir(mode=0o700)
+                if blocked:
+                    (evidence / "upload.stderr").write_bytes(b"original")
+                commands = []
+                with (
+                    mock.patch.object(
+                        recovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", raw)
+                    ),
+                    self.assertRaises(recovery.RecoveryError) as raised,
+                ):
+                    recovery._windows_scp(
+                        ssh_host="windows-fixture",
+                        sources=[source],
+                        remote_dir="C:/private/probe",
+                        upload=True,
+                        timeout=5,
+                        commands=commands,
+                        code="windows_recovery_transport_unknown",
+                        evidence_dir=evidence,
+                        sensitive_values=(secret,),
+                    )
+                detail = raised.exception.detail
+                self.assertEqual(detail["returncode"], 1)
+                self.assertEqual(detail["stderr"]["sha256"], hashlib.sha256(raw).hexdigest())
+                self.assertTrue(detail["stderr"]["redacted"])
+                self.assertNotIn(secret.decode(), json.dumps(detail))
+                self.assertNotIn(str(source), commands[0]["argv"])
+                if blocked:
+                    self.assertTrue(detail["evidence_write_errors"])
+                    self.assertEqual((evidence / "upload.stderr").read_bytes(), b"original")
+                else:
+                    self.assertEqual((evidence / "upload.stderr").read_bytes(), raw.replace(secret, b"<redacted>"))
+
+    def test_download_partial_records_expected_and_actual_separately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "partial.zip"
+            expected = {
+                "name": "recovery.zip",
+                "path": "C:/private/probe/recovery.zip",
+                "bytes": 100,
+                "sha256": "a" * 64,
+            }
+
+            def fail_transfer(*args, **kwargs):
+                target.write_bytes(b"partial")
+                return subprocess.CompletedProcess([], 1, b"", b"failed")
+
+            with (
+                mock.patch.object(recovery.subprocess, "run", side_effect=fail_transfer),
+                self.assertRaises(recovery.RecoveryError) as raised,
+            ):
+                recovery._windows_scp(
+                    ssh_host="windows-fixture",
+                    sources=[target],
+                    remote_dir="C:/private/probe",
+                    upload=False,
+                    remote_name="recovery.zip",
+                    timeout=5,
+                    commands=[],
+                    code="windows_recovery_transport_unknown",
+                    evidence_dir=root / "evidence",
+                    expected_download=expected,
+                )
+            self.assertEqual(raised.exception.detail["download"]["expected"], expected)
+            self.assertEqual(
+                raised.exception.detail["download"]["observed"]["sha256"], hashlib.sha256(b"partial").hexdigest()
+            )
+
+    def test_tar_reader_drains_after_archive_end_and_rejects_decrypt_failure(self):
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as archive:
+            member = tarfile.TarInfo("member")
+            member.size = 1
+            archive.addfile(member, io.BytesIO(b"x"))
+
+        class TailStream(io.BytesIO):
+            exhausted = False
+
+            def read(self, size=-1):
+                value = super().read(size)
+                if not value:
+                    self.exhausted = True
+                return value
+
+        class Process:
+            def __init__(self, code):
+                self.stdout = TailStream(payload.getvalue() + b"\0" * 65536)
+                self.stderr = io.BytesIO(b"" if code == 0 else b"bad decrypt")
+                self.code = code
+                self.finished = False
+
+            def wait(self):
+                self.finished = True
+                return self.code if self.stdout.exhausted else 1
+
+            def poll(self):
+                return self.code if self.finished else None
+
+            def kill(self):
+                self.finished = True
+
+        for code in (0, 1, 2):
+            if code == 2:
+                payload = io.BytesIO()
+                with tarfile.open(fileobj=payload, mode="w") as archive:
+                    member = tarfile.TarInfo("unsupported-link")
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = "target"
+                    archive.addfile(member)
+            process = Process(0 if code == 2 else code)
+            with self.subTest(code=code), mock.patch.object(recovery.subprocess, "Popen", return_value=process):
+                if code:
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        recovery.read_sealed_tar_member_rows(Path("archive"), Path("key"))
+                    if code == 2:
+                        self.assertIn("archive_stream", raised.exception.detail)
+                else:
+                    rows = recovery.read_sealed_tar_member_rows(Path("archive"), Path("key"))
+                    self.assertEqual(rows[0]["member"], "member")
+                self.assertTrue(process.stdout.exhausted)
+
+    def test_credential_binding_is_rejected_before_any_transfer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            script = write(Path(temporary) / "helper.ps1", "fixture")
+            for binding in ({"token": "secret"}, {"nested": [{"private-key": "secret"}]}):
+                with self.subTest(binding=binding), mock.patch.object(recovery, "_create_remote_dir") as create:
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        recovery._transfer_windows_recovery(
+                            ssh_host="windows-fixture",
+                            remote_dir="C:/private/probe",
+                            script=script,
+                            binding_document=binding,
+                            operation="recovery-snapshot",
+                            commands=[],
+                            timeout=5,
+                        )
+                    self.assertEqual(raised.exception.code, "windows_recovery_binding_invalid")
+                    create.assert_not_called()
+
+    def test_timeout_retains_partial_streams(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = write(root / "input.txt", "payload")
+            evidence = root / "evidence"
+            with (
+                mock.patch.object(
+                    recovery.subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired(["scp"], 5, output=b"partial", stderr=b"timeout"),
+                ),
+                self.assertRaises(recovery.RecoveryError) as raised,
+            ):
+                recovery._windows_scp(
+                    ssh_host="windows-fixture",
+                    sources=[source],
+                    remote_dir="C:/private/probe",
+                    upload=True,
+                    timeout=5,
+                    commands=[],
+                    code="windows_recovery_transport_unknown",
+                    evidence_dir=evidence,
+                )
+            self.assertTrue(raised.exception.detail["interrupted"])
+            self.assertEqual((evidence / "upload.stdout").read_bytes(), b"partial")
+            self.assertEqual((evidence / "upload.stderr").read_bytes(), b"timeout")
+
+    def test_failed_upload_retains_helper_and_binding_outside_temporary_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = write(root / "instance-lifecycle.ps1", "fixture helper")
+            evidence = root / "evidence"
+            with (
+                mock.patch.object(recovery, "_create_remote_dir"),
+                mock.patch.object(recovery, "_remove_remote_dir"),
+                mock.patch.object(
+                    recovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "failed")
+                ),
+                self.assertRaises(recovery.RecoveryError) as raised,
+            ):
+                recovery._transfer_windows_recovery(
+                    ssh_host="windows-fixture",
+                    remote_dir="C:/private/probe",
+                    script=script,
+                    binding_document={"token_sha256": "a" * 64},
+                    operation="recovery-snapshot",
+                    commands=[],
+                    timeout=5,
+                    evidence_dir=evidence,
+                )
+            self.assertEqual(raised.exception.detail["phase"], "upload")
+            self.assertEqual((evidence / script.name).read_bytes(), script.read_bytes())
+            self.assertEqual(json.loads((evidence / "windows-binding.json").read_text())["token_sha256"], "a" * 64)
+            self.assertNotIn('"token"', (evidence / "windows-binding.json").read_text())
+            self.assertFalse((evidence / "recovery.zip").exists())
+
+    def test_sftp_argv_preserves_spaces_without_literal_quotes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = write(Path(temporary) / "input file.txt", "payload")
+            for upload in (True, False):
+                with (
+                    self.subTest(upload=upload),
+                    mock.patch.object(
+                        recovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")
+                    ) as run,
+                ):
+                    recovery._windows_scp(
+                        ssh_host="windows-fixture",
+                        sources=[source],
+                        remote_dir="C:/private space/probe",
+                        upload=upload,
+                        remote_name=None if upload else "output file.txt",
+                        timeout=5,
+                        commands=[],
+                        code="windows_recovery_transport_unknown",
+                    )
+                    argv = run.call_args.args[0]
+                    remote = next(value for value in argv if value.startswith("windows-fixture:"))
+                    self.assertNotIn('"', remote)
+                    self.assertNotIn("-O", argv)
+                    self.assertIn("private space", remote)
+
+    def test_upload_and_download_failures_retain_bounded_private_raw_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = write(root / "input.txt", "payload")
+            for upload in (True, False):
+                phase = "upload" if upload else "download"
+                evidence = root / phase
+                stderr = "failure " + "x" * 70000
+                with (
+                    self.subTest(upload=upload),
+                    mock.patch.object(
+                        recovery.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess([], 1, "raw output", stderr),
+                    ),
+                    self.assertRaises(recovery.RecoveryError) as raised,
+                ):
+                    recovery._windows_scp(
+                        ssh_host="windows-fixture",
+                        sources=[source],
+                        remote_dir="C:/private/probe",
+                        upload=upload,
+                        remote_name=None if upload else "recovery.zip",
+                        timeout=5,
+                        commands=[],
+                        code="windows_recovery_transport_unknown",
+                        evidence_dir=evidence,
+                    )
+                detail = raised.exception.detail
+                self.assertEqual(detail["phase"], phase)
+                self.assertEqual(detail["returncode"], 1)
+                self.assertEqual((evidence / f"{phase}.stderr").read_bytes(), stderr.encode()[:65536])
+                self.assertEqual((evidence / f"{phase}.stdout").read_bytes(), b"raw output")
+                self.assertTrue(detail["stderr"]["truncated"])
+                self.assertEqual(detail["stderr"]["sha256"], hashlib.sha256(stderr.encode()).hexdigest())
+                self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE((evidence / f"{phase}.stderr").stat().st_mode), 0o600)
+                self.assertEqual(
+                    json.loads((evidence / f"{phase}.json").read_text()),
+                    {k: v for k, v in detail.items() if k != "evidence_record"},
+                )
+
+    def test_invalid_remote_paths_are_rejected_before_transport(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = write(Path(temporary) / "input", "payload")
+            for path in ("C:/private/../escape", 'C:/private/"quoted"', "C:/private/\nline"):
+                with self.subTest(path=path), mock.patch.object(recovery.subprocess, "run") as run:
+                    with self.assertRaises(recovery.RecoveryError):
+                        recovery._windows_scp(
+                            ssh_host="windows-fixture",
+                            sources=[source],
+                            remote_dir=path,
+                            upload=True,
+                            timeout=5,
+                            commands=[],
+                            code="windows_recovery_transport_unknown",
+                        )
+                    run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

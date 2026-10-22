@@ -2200,7 +2200,7 @@ function Invoke-RecoverySnapshot($Binding) {
   }
   Emit @{
     passed=$true; verb='recovery-snapshot'; task_state=[string]$current.task_projection.state;
-    endpoint='stopped'; cad_ownership='free'; bundle_sha256=(Sha256 $zip)
+    endpoint='stopped'; cad_ownership='free'; bundle_sha256=(Sha256 $zip); bundle_bytes=(Get-Item -LiteralPath $zip).Length
   }
 }
 function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {

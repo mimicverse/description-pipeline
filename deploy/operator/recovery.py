@@ -3375,6 +3375,9 @@ def read_sealed_tar_member_rows(archive: Path, key: Path) -> list[dict]:
     assert process.stdout is not None and process.stderr is not None
     rows = []
     stream_error = None
+    primary_error = None
+    drain_error = None
+    tail_bytes = 0
     try:
         try:
             with tarfile.open(fileobj=process.stdout, mode="r|") as archive_stream:
@@ -3424,6 +3427,13 @@ def read_sealed_tar_member_rows(archive: Path, key: Path) -> list[dict]:
                         )
         except (OSError, tarfile.TarError) as error:
             stream_error = error
+        except RecoveryError as error:
+            primary_error = error
+        try:
+            while chunk := process.stdout.read(1024 * 1024):
+                tail_bytes += len(chunk)
+        except OSError as error:
+            drain_error = error
         process.stdout.close()
         stderr = process.stderr.read() if process.stderr is not None else b""
         process.stderr.close()
@@ -3434,13 +3444,27 @@ def read_sealed_tar_member_rows(archive: Path, key: Path) -> list[dict]:
             process.wait()
         process.stdout.close()
         process.stderr.close()
+    if primary_error is not None:
+        primary_error.detail = {
+            **(primary_error.detail or {}),
+            "archive_stream": {
+                "openssl": stderr.decode("utf-8", errors="replace").strip(),
+                "returncode": returncode,
+                "drain_error": None if drain_error is None else str(drain_error),
+                "tail_bytes": tail_bytes,
+            },
+        }
+        raise primary_error
     require(
-        returncode == 0 and stream_error is None,
+        returncode == 0 and stream_error is None and drain_error is None,
         "recovery_archive_member_mismatch",
         "cannot read sealed archive tar stream",
         {
             "openssl": stderr.decode("utf-8", errors="replace").strip(),
             "tar_error": None if stream_error is None else str(stream_error),
+            "drain_error": None if drain_error is None else str(drain_error),
+            "returncode": returncode,
+            "tail_bytes": tail_bytes,
         },
     )
     return sorted(rows, key=lambda row: row["member"])
@@ -4684,11 +4708,14 @@ def _command_evidence(
     argv: list[str | Path],
     completed: subprocess.CompletedProcess,
 ) -> dict:
+    def raw(value):
+        return value.encode("utf-8") if isinstance(value, str) else (value or b"")
+
     evidence = {
         "argv": [str(value) for value in argv],
         "returncode": completed.returncode,
-        "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
-        "stderr_sha256": hashlib.sha256(completed.stderr.encode("utf-8")).hexdigest(),
+        "stdout_sha256": hashlib.sha256(raw(completed.stdout)).hexdigest(),
+        "stderr_sha256": hashlib.sha256(raw(completed.stderr)).hexdigest(),
     }
     transport = getattr(completed, "transport", None)
     if isinstance(transport, dict):
@@ -4966,6 +4993,33 @@ def _run_windows_recovery_json(
     )
 
 
+def _private_transfer_directory(path: Path, code: str) -> None:
+    require_no_links(path, "Windows transfer evidence")
+    existed = path.exists()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not existed:
+        os.chmod(path, 0o700, follow_symlinks=False)
+    require(stat.S_IMODE(path.stat().st_mode) == 0o700, code, "transfer evidence must be private")
+
+
+def _write_transfer_evidence(path: Path, payload: bytes) -> dict:
+    _private_transfer_directory(path.parent, "windows_recovery_transport_unknown")
+    descriptor, temporary = tempfile.mkstemp(prefix=".transfer-", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        digest = hashlib.sha256(payload).hexdigest()
+        require(sha256_file(temporary_path) == digest, "windows_recovery_transport_unknown", "evidence bytes differ")
+        os.link(temporary_path, path, follow_symlinks=False)
+        return {"path": str(path), "bytes": len(payload), "sha256": digest}
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def _windows_scp(
     *,
     ssh_host: str,
@@ -4976,8 +5030,23 @@ def _windows_scp(
     timeout: int,
     commands: list[dict],
     code: str,
+    evidence_dir: Path | None = None,
+    sensitive_values: tuple[bytes, ...] = (),
+    preserved_objects: tuple[dict, ...] = (),
+    expected_download: dict | None = None,
 ) -> Path | None:
-    remote = f'{ssh_host}:"{remote_dir.rstrip("/")}/"'
+    require(
+        isinstance(ssh_host, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", ssh_host) is not None
+        and re.match(r"^[A-Za-z]:/", remote_dir) is not None
+        and not any(character in remote_dir for character in ("\x00", "\r", "\n", '"', "\\"))
+        and ":" not in remote_dir[2:]
+        and all(part not in {".", ".."} for part in remote_dir.split("/")),
+        code,
+        "the Windows recovery transfer address is invalid",
+    )
+    phase = "upload" if upload else "download"
+    remote = f"{ssh_host}:{remote_dir.rstrip('/')}/"
     if upload:
         argv = [
             "scp",
@@ -4993,11 +5062,15 @@ def _windows_scp(
         destination = None
     else:
         require(
-            len(sources) == 1 and isinstance(remote_name, str) and bool(remote_name),
+            len(sources) == 1
+            and isinstance(remote_name, str)
+            and bool(remote_name)
+            and remote_name not in {".", ".."}
+            and not any(character in remote_name for character in ("/", "\\", "\x00", "\r", "\n", '"', ":")),
             code,
             "one named Windows recovery artifact must be selected",
         )
-        remote_file = f'{ssh_host}:"{remote_dir.rstrip("/")}/{remote_name}"'
+        remote_file = f"{ssh_host}:{remote_dir.rstrip('/')}/{remote_name}"
         destination = Path(sources[0])
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         argv = [
@@ -5011,26 +5084,131 @@ def _windows_scp(
             remote_file,
             str(destination),
         ]
+    objects = [
+        {"name": path.name, "path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+        for path in sources
+        if upload or path.is_file()
+    ]
+
+    def sanitized(raw):
+        result = raw
+        for secret in sensitive_values:
+            if secret:
+                result = result.replace(secret, b"<redacted>")
+        return result
+
+    normalized_argv = [sanitized(str(value).encode("utf-8")).decode("utf-8", errors="replace") for value in argv]
+    for index, value in enumerate(normalized_argv):
+        if value in {str(path) for path in sources}:
+            normalized_argv[index] = f"<{phase}>/{Path(value).name}"
+
+    def preserve(completed, *, interrupted=False):
+        detail = {
+            "phase": phase,
+            "argv": normalized_argv,
+            "returncode": completed.returncode,
+            "interrupted": interrupted,
+            "objects": objects,
+            "preserved_objects": list(preserved_objects),
+            "remote_dir": remote_dir,
+            "remote_name": remote_name,
+        }
+        if not upload:
+            present = destination.is_file() and not destination.is_symlink()
+            detail["download"] = {
+                "expected": expected_download,
+                "present": present,
+                "observed": None
+                if not present
+                else {
+                    "path": str(destination),
+                    "bytes": destination.stat().st_size,
+                    "sha256": sha256_file(destination),
+                },
+            }
+            observed = detail["download"]["observed"]
+            matches = bool(
+                present
+                and expected_download
+                and observed["bytes"] == expected_download["bytes"]
+                and observed["sha256"] == expected_download["sha256"]
+            )
+            detail["download"].update(
+                {"matches_expected": matches, "complete": matches, "partial": present and not matches}
+            )
+        for stream in ("stdout", "stderr"):
+            raw = getattr(completed, stream) or b""
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8")
+            safe = sanitized(raw)
+            row = {
+                "bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "truncated": len(safe) > 65536,
+                "redacted": safe != raw,
+                "preview": safe[:2048].decode("utf-8", errors="replace"),
+            }
+            if evidence_dir is not None:
+                try:
+                    path = evidence_dir / f"{phase}.{stream}"
+                    retained = _write_transfer_evidence(path, safe[:65536])
+                    row.update(
+                        {
+                            "path": str(path),
+                            "retained_bytes": min(len(safe), 65536),
+                            "retained_sha256": retained["sha256"],
+                        }
+                    )
+                except (OSError, RecoveryError) as error:
+                    detail.setdefault("evidence_write_errors", []).append(
+                        {"stream": stream, "error_type": type(error).__name__}
+                    )
+            detail[stream] = row
+        detail["stderr_sha256"] = detail["stderr"]["sha256"]
+        if evidence_dir is not None:
+            try:
+                record = evidence_dir / f"{phase}.json"
+                detail["evidence_record"] = _write_transfer_evidence(record, canonical_json(detail))
+            except (OSError, RecoveryError) as error:
+                detail.setdefault("evidence_write_errors", []).append(
+                    {"stream": "metadata", "error_type": type(error).__name__}
+                )
+        return detail
+
     try:
         completed = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise RecoveryError(code, "the Windows recovery transfer could not run", {"error": str(error)}) from error
-    commands.append(_command_evidence(argv, completed))
+        interrupted = subprocess.CompletedProcess(
+            argv, None, getattr(error, "stdout", None), getattr(error, "stderr", None)
+        )
+        detail = preserve(interrupted, interrupted=True)
+        detail["error_type"] = type(error).__name__
+        raise RecoveryError(code, "the Windows recovery transfer could not run", detail) from error
+    commands.append(_command_evidence(normalized_argv, completed))
+    detail = preserve(completed)
+    commands[-1]["transfer"] = detail
     require(
         completed.returncode == 0,
         code,
         "the Windows recovery transfer did not prove success",
-        {
-            "returncode": completed.returncode,
-            "stderr_sha256": hashlib.sha256(completed.stderr.encode("utf-8")).hexdigest(),
-        },
+        detail,
     )
+    require(
+        not detail.get("evidence_write_errors"),
+        code,
+        "the Windows recovery transfer evidence could not be preserved",
+        detail,
+    )
+    if not upload:
+        require(detail["download"]["present"], code, "downloaded Windows recovery object is missing", detail)
+        if expected_download is not None:
+            require(detail["download"]["matches_expected"], code, "downloaded Windows recovery object differs", detail)
     return destination
 
 
@@ -6141,7 +6319,24 @@ def _transfer_windows_recovery(
     timeout: int,
     upload_bundle: Path | None = None,
     download_bundle: Path | None = None,
+    evidence_dir: Path | None = None,
 ) -> dict:
+    def reject_credentials(value):
+        if isinstance(value, list):
+            for item in value:
+                reject_credentials(item)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                name = key.lower().replace("-", "_")
+                sensitive = any(term in name for term in ("password", "secret", "token", "private_key", "dsn"))
+                require(
+                    not sensitive or name.endswith(("_path", "_sha256", "_digest")),
+                    "windows_recovery_binding_invalid",
+                    "recovery binding cannot contain credential values",
+                )
+                reject_credentials(item)
+
+    reject_credentials(binding_document)
     binding_document = {
         **binding_document,
         "script_sha256": sha256_file(script),
@@ -6152,6 +6347,44 @@ def _transfer_windows_recovery(
         uploads = [script, binding]
         if upload_bundle is not None:
             uploads.append(upload_bundle)
+
+        def known_secrets(value):
+            if not isinstance(value, dict):
+                return []
+            result = []
+            for key, item in value.items():
+                if key.lower() in {"password", "token", "secret", "private_key", "dsn"} and isinstance(item, str):
+                    result.append(item.encode("utf-8"))
+                elif isinstance(item, dict):
+                    result.extend(known_secrets(item))
+            return result
+
+        sensitive_values = tuple(known_secrets(binding_document))
+        if os.environ.get("SSH_AUTH_SOCK"):
+            sensitive_values += (os.environ["SSH_AUTH_SOCK"].encode("utf-8"),)
+        preserved_objects = []
+        if evidence_dir is not None:
+            _private_transfer_directory(evidence_dir, "windows_recovery_transport_unknown")
+            # The helper and binding contain code, paths and identity hashes, not credential values.
+            # Keep these inputs outside disposable staging; never copy the credential-bearing bundle.
+            for source in (script, binding):
+                target = evidence_dir / source.name
+                raw = source.read_bytes()
+                retained = raw
+                for secret in sensitive_values:
+                    retained = retained.replace(secret, b"<redacted>")
+                _write_transfer_evidence(target, retained)
+                preserved_objects.append(
+                    {
+                        "name": source.name,
+                        "path": str(target),
+                        "bytes": len(retained),
+                        "sha256": sha256_file(target),
+                        "source_bytes": len(raw),
+                        "source_sha256": hashlib.sha256(raw).hexdigest(),
+                        "redacted": retained != raw,
+                    }
+                )
         ownership_token = secrets.token_hex(32)
         remote_dir_owned = False
         document: dict | None = None
@@ -6173,6 +6406,9 @@ def _transfer_windows_recovery(
                 timeout=timeout,
                 commands=commands,
                 code="windows_recovery_transport_unknown",
+                evidence_dir=evidence_dir,
+                sensitive_values=sensitive_values,
+                preserved_objects=tuple(preserved_objects),
             )
             remote_script = f"{remote_dir}/instance-lifecycle.ps1"
             remote_binding = f"{remote_dir}/windows-binding.json"
@@ -6200,6 +6436,14 @@ def _transfer_windows_recovery(
                     "windows_recovery_state_invalid",
                     "only snapshot may download a Windows recovery bundle",
                 )
+                require(
+                    type(document.get("bundle_bytes")) is int
+                    and document["bundle_bytes"] >= 0
+                    and isinstance(document.get("bundle_sha256"), str)
+                    and bool(HEX64.fullmatch(document["bundle_sha256"])),
+                    "windows_recovery_bundle_invalid",
+                    "remote bundle identity is incomplete",
+                )
                 _windows_scp(
                     ssh_host=ssh_host,
                     sources=[download_bundle],
@@ -6209,11 +6453,21 @@ def _transfer_windows_recovery(
                     timeout=timeout,
                     commands=commands,
                     code="windows_recovery_transport_unknown",
+                    evidence_dir=evidence_dir,
+                    sensitive_values=sensitive_values,
+                    preserved_objects=tuple(preserved_objects),
+                    expected_download={
+                        "name": WINDOWS_BUNDLE,
+                        "path": f"{remote_dir}/{WINDOWS_BUNDLE}",
+                        "bytes": document["bundle_bytes"],
+                        "sha256": document["bundle_sha256"],
+                    },
                 )
                 expected = document.get("bundle_sha256")
                 require(
                     isinstance(expected, str)
                     and bool(HEX64.fullmatch(expected))
+                    and download_bundle.stat().st_size == document["bundle_bytes"]
                     and sha256_file(download_bundle) == expected,
                     "windows_recovery_bundle_invalid",
                     "downloaded Windows recovery bundle differs from the remote receipt",
@@ -6274,6 +6528,7 @@ def capture_windows_recovery(
         commands=commands,
         timeout=timeout,
         download_bundle=bundle,
+        evidence_dir=staging.parent / "windows-transfer-evidence",
     )
     state = _read_windows_state(bundle)
     verify_windows_recovery_bundle_members(bundle, state)
@@ -6363,6 +6618,7 @@ def restore_windows_recovery(
         commands=commands,
         timeout=timeout,
         upload_bundle=bundle,
+        evidence_dir=status_dir / "windows-transfer-evidence",
     )
     _validate_remote_cleanup(result.get("remote_cleanup"))
     _validate_windows_inner_cleanup(result.get("cleanup"), required=True)
@@ -11930,8 +12186,13 @@ def record_backup_failure(
         receipt_written = False
     staging_removed = False
     try:
-        if _claim_is_current(claim):
+        partial_download = (
+            isinstance(payload["detail"], dict) and payload["detail"].get("download", {}).get("present") is True
+        )
+        if _claim_is_current(claim) and not partial_download:
             staging_removed = backup.remove_private_staging(out)
+        if partial_download:
+            payload["staging_retained_reason"] = "partial_windows_download"
     except (SystemExit, OSError, RecoveryError):
         staging_removed = False
     if receipt_written:
