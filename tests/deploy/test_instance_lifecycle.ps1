@@ -66,11 +66,22 @@ Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfi
   $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
 Check 'wording.python_module_task_action' ($source.Contains('function Runtime-LauncherArguments') -and
   $source.Contains('function Test-Runtime-Launcher') -and
-  $source.Contains('-I -m description_pipeline serve --config') -and
+  $source.Contains('-I -B -m description_pipeline serve --config') -and
   $source.Contains('function Legacy-Launcher') -and
   $source.Contains('function Legacy-LauncherArguments') -and
   $source.Contains('launch_contract=(Python-Module-LaunchContract)') -and
   $source.Contains('-Argument (Runtime-LauncherArguments $StageDir)'))
+Check 'wording.remote_python_bytecode_disabled' (-not @(($source -split "`r?`n") |
+  Where-Object { $_ -match '\s-I\s' -and $_ -notmatch '\s-I\s+-B' }))
+Check 'wording.bytecode_transition_is_exact' ($source.Contains('Test-Bytecode-TransitionGeneration') -and
+  $source.Contains('140d39e51be5f0c39c32d7cfea9ca25fe642c273') -and
+  $source.Contains('351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec'))
+Check 'wording.archive_is_read_only' ($source.Contains('function Protect-ManagedArchive') -and
+  $source.Contains('function Assert-ManagedArchive') -and
+  $source.Contains('Set-ItemProperty -LiteralPath $Path -Name IsReadOnly -Value $true') -and
+  $source.Contains([System.Security.AccessControl.FileSystemRights]::ReadAndExecute.ToString()))
+Check 'wording.archive_outside_recovery_state' (
+  $source.Contains('canonical release archive is immutable lifecycle input'))
 Check 'wording.path_identity_normalization' ($source.Contains('Normalize-PathIdentity') -and
   $source.Contains("Replace('\', '/')")) 'path identity comparisons must normalize the two Windows separators'
 Check 'wording.user_domain_pins' ($source.Contains("GetEnvironmentVariable(`$Name, 'User')") -and
@@ -122,6 +133,57 @@ if ($StaticOnly) {
 
 # ---- load the script without running its main flow --------------------------
 . $ScriptPath -Verb health -Binding @{ task_name = 'test-endpoint' }
+
+$startupRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+  'il-startup-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $startupRoot
+$startupConfig = Join-Path $startupRoot 'endpoint.json'
+$startupToken = Join-Path $startupRoot 'token'
+[System.IO.File]::WriteAllText(
+  $startupConfig,
+  (@{port=8765; token_file=$startupToken} | ConvertTo-Json -Compress))
+[System.IO.File]::WriteAllText($startupToken, 'token')
+$script:startupStates = @('Ready','Ready','Running')
+$script:startupNow = [datetime]'2026-10-22T00:00:00Z'
+function Get-ScheduledTask {
+  [CmdletBinding()] param([string]$TaskName)
+  $state = $script:startupStates[0]
+  if ($script:startupStates.Count -gt 1) {
+    $script:startupStates = @($script:startupStates | Select-Object -Skip 1)
+  }
+  return [pscustomobject]@{ State=$state }
+}
+function Get-ListenerProcess { param([int]$port) return 4242 }
+function Invoke-RestMethod {
+  param([string]$Uri, [hashtable]$Headers, [int]$TimeoutSec)
+  return [pscustomobject]@{
+    ready=$true; native_platform=$true;
+    schema_version='solidworks-to-urdf.health/v1'}
+}
+function Get-Date { return $script:startupNow }
+function Start-Sleep {
+  param([int]$Milliseconds)
+  $script:startupNow = $script:startupNow.AddMilliseconds($Milliseconds)
+}
+$startupResult = Wait-StartupHealthy $startupConfig @{task_name='test-endpoint'}
+Check 'settle.startup_ready_then_running' ($startupResult.listener_pid -eq 4242)
+function Get-ScheduledTask {
+  [CmdletBinding()] param([string]$TaskName)
+  return [pscustomobject]@{ State='Ready' }
+}
+$script:startupNow = [datetime]'2026-10-22T00:00:00Z'
+try {
+  $null = Wait-StartupHealthy $startupConfig @{task_name='test-endpoint'}
+  $startupTimeout = ''
+} catch {
+  $startupTimeout = $_.Exception.Message
+}
+Check 'settle.startup_ready_timeout_refused' (
+  $startupTimeout -match 'did not answer /health within the startup window')
+Remove-Item Function:\Get-ScheduledTask, Function:\Get-ListenerProcess, Function:\Invoke-RestMethod,
+  Function:\Get-Date, Function:\Start-Sleep -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $startupRoot -Recurse -Force -ErrorAction SilentlyContinue
+
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
   'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
@@ -545,7 +607,7 @@ function Wait-Settled {
   $next = $script:SettleOutcomes[0]
   $script:SettleOutcomes = @($script:SettleOutcomes | Select-Object -Skip 1)
   if ($next -eq 'throw') { throw 'the settle window observed a refusal' }
-  return @{ health = @{ install = @{ config_digest = 'digest' } }; settled_seconds = 180; listener_pid = 4242 }
+  return @{ health = @{ install = @{ config_digest = 'digest' } }; settled_seconds = 184; listener_pid = 4242 }
 }
 function Wait-SettleRetryDelay { param([int]$Seconds = 60) $script:Sleeps.Add($Seconds) }
 function Health-Probe {
@@ -589,9 +651,30 @@ $binding = @{ task_name = 'test-endpoint'; port = 8765; state_root = $root; gene
 Check 'launch.python_entrypoint' ((Normalize-PathIdentity (Runtime-Launcher $generation)) -eq
   (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\python.exe')))
 Check 'launch.module_arguments' ((Runtime-LauncherArguments $generation) -eq
-  ('-I -m description_pipeline serve --config "' + (Config-Path $generation) + '"'))
+  ('-I -B -m description_pipeline serve --config "' + (Config-Path $generation) + '"'))
 Check 'launch.candidate_action_accepted' (Test-Runtime-Launcher (Runtime-Launcher $generation) `
   (Runtime-LauncherArguments $generation) $generation)
+Check 'launch.bytecode_flag_required' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `
+  ((Runtime-LauncherArguments $generation) -replace ' -B', '') $generation))
+$bytecodeTransitionGeneration = Join-Path $root 'bytecode-transition-generation'
+$null = New-Item -ItemType Directory -Path $bytecodeTransitionGeneration
+[System.IO.File]::WriteAllText(
+  (Join-Path $bytecodeTransitionGeneration 'endpoint.json'),
+  ('{{"state_root":"{0}"}}' -f ($root -replace '\\', '/')))
+[System.IO.File]::WriteAllText(
+  (Join-Path $bytecodeTransitionGeneration 'stage-receipt.json'),
+  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $bytecodeTransitionGeneration);
+     launch_contract='python_module_v1'; version='1.5.0';
+     source_commit='140d39e51be5f0c39c32d7cfea9ca25fe642c273';
+     source_sha256='351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec'} |
+    ConvertTo-Json -Compress))
+$bytecodeTransitionArguments = '-I -m description_pipeline serve --config "' +
+  (Config-Path $bytecodeTransitionGeneration) + '"'
+Check 'launch.bytecode_transition_action_accepted' (Test-Runtime-Launcher `
+  (Runtime-Launcher $bytecodeTransitionGeneration) $bytecodeTransitionArguments $bytecodeTransitionGeneration)
+Check 'launch.bytecode_transition_is_not_broad' (-not (Test-Runtime-Launcher `
+  (Runtime-Launcher $generation) ('-I -m description_pipeline serve --config "' +
+    (Config-Path $generation) + '"') $generation))
 Check 'launch.interactive_flag_refused' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `
   ((Runtime-LauncherArguments $generation) -replace '^-I ', '-i ') $generation))
 Check 'launch.module_case_refused' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `

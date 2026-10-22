@@ -62,7 +62,7 @@ class DeployMachineryTests(unittest.TestCase):
             "'status'",
             "Write-Utf8NoBom",
             "python.exe",
-            "-I -m description_pipeline",
+            "-I -B -m description_pipeline",
             "serve --config",
             "launch_contract",
             "stage-receipt.json",

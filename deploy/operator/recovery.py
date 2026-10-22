@@ -61,6 +61,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 sys.dont_write_bytecode = True
 
 try:
@@ -68,6 +69,7 @@ try:
     import install_record
     import platform_config
     import render_operator
+    from windows_transport import TransportDecodeError
     from windows_transport import decode_output as _decode_windows_output
     from windows_transport import run_powershell as _transport_powershell
 except ImportError as error:  # pragma: no cover - exercised by deployment layout
@@ -87,6 +89,9 @@ WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
 WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
 WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256 = (
     "62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200"
+)
+WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256 = (
+    "15d94bef1ad0475bc30ba4b3cc9fd19a707d9893e6318d9529b787cca0dfcf3a"
 )
 WINDOWS_BUNDLE_MEMBER = "windows/recovery.zip"
 WINDOWS_STATE_MEMBER = "windows-state.json"
@@ -4038,12 +4043,20 @@ def _run_windows_powershell(
             "the Windows recovery command could not be executed",
             {"error": str(error)},
         ) from error
-    completed = subprocess.CompletedProcess(
-        process.args,
-        process.returncode,
-        _decode_windows_output(process.stdout),
-        _decode_windows_output(process.stderr),
-    )
+    try:
+        stdout = _decode_windows_output(process.stdout, stream="stdout")
+        stderr = _decode_windows_output(process.stderr, stream="stderr")
+    except TransportDecodeError as error:
+        raise RecoveryError(
+            "windows_transport_decode_failed",
+            "Windows transport output could not be decoded",
+            {
+                "stream": error.stream,
+                "bytes": error.payload_bytes,
+                "sha256": error.payload_sha256,
+            },
+        ) from error
+    completed = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     transport = getattr(process, "transport", None)
     if isinstance(transport, dict):
         completed.transport = dict(transport)
@@ -4834,12 +4847,20 @@ def _validate_windows_recovery_state(document: object) -> dict:
         )
     }
     normalized_action = {key: str(value).replace("\\", "/") for key, value in action.items()}
-    python_module_action = (
-        normalized_action["execute"]
+    transition_python_action = (
+        identity["release_identity_sha256"]
+        == WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
+        and normalized_action["execute"]
         == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
         and normalized_action["arguments"]
         == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
     )
+    python_module_action = (
+        normalized_action["execute"]
+        == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
+        and normalized_action["arguments"]
+        == f'-I -B -m description_pipeline serve --config "{normalized["config_path"]}"'
+    ) or transition_python_action
     legacy_launcher_action = (
         normalized_action["execute"]
         == normalized["endpoint_root"] + "/runtime/Scripts/description.exe"

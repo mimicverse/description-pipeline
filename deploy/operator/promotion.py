@@ -26,6 +26,32 @@ from pathlib import Path
 RECEIPT_SCHEMA = "solidworks-to-urdf.promotion/v1"
 VERBS = ("stage", "reconcile", "promote", "rollback")
 STATUSES = ("completed", "failed", "unknown")
+PROMOTE_STEPS = (
+    "linux-generation",
+    "windows-generation",
+    "close-admission",
+    "drain",
+    "backup",
+    "stop-services",
+    "schema-migration",
+    "windows-switch",
+    "endpoint-identity",
+    "switch-pointer",
+    "config-reference",
+    "start-services",
+    "verify",
+    "open-admission",
+)
+ROLLBACK_STEPS = (
+    "rollback-close",
+    "rollback-drain",
+    "rollback-stop",
+    "rollback-windows",
+    "rollback-linux",
+    "rollback-config-reference",
+    "rollback-verify",
+)
+STAGE_OWNED_STEPS = frozenset({"linux-generation", "windows-generation"})
 
 
 def die(message: str) -> None:
@@ -86,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
     show = subparsers.add_parser("show")
     show.add_argument("--state-root", type=Path, required=True)
     show.add_argument("--install-id", required=True)
+    replay = subparsers.add_parser("replay")
+    replay.add_argument("--state-root", type=Path, required=True)
+    replay.add_argument("--install-id", required=True)
+    replay.add_argument("--verb", choices=("promote", "rollback"), required=True)
+    replay.add_argument("--active-record", type=Path, required=True)
     verify_release = subparsers.add_parser("verify-release")
     verify_release.add_argument("--state-root", type=Path, required=True)
     verify_release.add_argument("--install-id", required=True)
@@ -127,6 +158,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         evidence = [str(item) for item in args.evidence]
         require(all(item for item in evidence), "every journal step needs non-empty evidence")
+        require(
+            not any(
+                row.get("verb") == args.verb and row.get("step") == args.step
+                for row in document["steps"]
+                if isinstance(row, dict)
+            ),
+            f"promotion step is already recorded: {args.verb}/{args.step}",
+        )
         document["steps"].append(
             {
                 "seq": len(document["steps"]) + 1,
@@ -145,6 +184,71 @@ def main(argv: list[str] | None = None) -> int:
         print(f"receipt={path}")
         print(f"steps={len(document['steps'])} plan={','.join(document['plan'])}")
         return 0
+    if args.action == "replay":
+        document = load_receipt(path)
+        if document.get("install_id") != args.install_id:
+            print("replay=drift")
+            return 11
+        required = PROMOTE_STEPS if args.verb == "promote" else ROLLBACK_STEPS
+        verb_rows = [
+            row
+            for row in document["steps"]
+            if isinstance(row, dict) and row.get("verb") == args.verb
+        ]
+        names = [row.get("step") for row in verb_rows]
+        if len(names) != len(set(names)):
+            print("replay=partial")
+            return 11
+        by_name = {row["step"]: row for row in verb_rows}
+        completed = all(
+            by_name.get(name, {}).get("status") == "completed" for name in required
+        )
+        fresh = not verb_rows or (
+            args.verb == "promote"
+            and {row.get("step") for row in verb_rows} == STAGE_OWNED_STEPS
+            and all(row.get("status") == "completed" for row in verb_rows)
+        )
+        if not completed and not fresh:
+            print("replay=partial")
+            return 11
+        if not args.active_record.is_file():
+            print("replay=drift")
+            return 11
+        try:
+            active = json.loads(args.active_record.read_text(encoding="utf-8"))
+            source_path = Path(document["from"])
+            target_path = Path(document["to"])
+            source = json.loads(source_path.read_text(encoding="utf-8"))
+            target = json.loads(target_path.read_text(encoding="utf-8"))
+        except (KeyError, OSError, TypeError, ValueError):
+            print("replay=drift")
+            return 11
+        if (
+            hashlib.sha256(source_path.read_bytes()).hexdigest()
+            != document.get("from_sha256")
+            or hashlib.sha256(target_path.read_bytes()).hexdigest()
+            != document.get("to_sha256")
+            or target.get("install_id") != document["install_id"]
+        ):
+            print("replay=drift")
+            return 11
+        source_id = source.get("install_id")
+        target_id = target.get("install_id")
+        if args.verb == "promote":
+            expected_install_id = target_id if completed else source_id
+        else:
+            expected_install_id = source_id if completed else target_id
+        active_install_id = active.get("install_id")
+        fresh_rollback_pointer = (
+            args.verb == "rollback"
+            and not completed
+            and active_install_id in {source_id, target_id}
+        )
+        if not fresh_rollback_pointer and active_install_id != expected_install_id:
+            print("replay=drift")
+            return 11
+        print("replay=completed" if completed else "replay=fresh")
+        return 0 if completed else 10
     if args.action == "verify-release":
         document = load_receipt(path)
         binding = document.get("release_manifest")

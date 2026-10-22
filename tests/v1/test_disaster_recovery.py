@@ -32,6 +32,7 @@ sys.path.insert(0, str(DEPLOY))
 sys.path.insert(0, str(HERE))
 
 import recovery  # noqa: E402
+import windows_transport  # noqa: E402
 
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
@@ -171,7 +172,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             },
             "action": {
                 "execute": generation + "/runtime/Scripts/python.exe",
-                "arguments": '-I -m description_pipeline serve --config "'
+                "arguments": '-I -B -m description_pipeline serve --config "'
                 + generation
                 + '/endpoint.json"',
                 "working_directory": "C:/description/state",
@@ -2896,6 +2897,34 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         self.assertEqual(recovery._digest_document(validated), before_digest)
 
+    def test_windows_state_accepts_only_the_exact_bytecode_transition_action(self) -> None:
+        _out, manifest = self.backup()
+        state = copy.deepcopy(manifest["windows"]["state"])
+        endpoint_root = state["identity"]["endpoint_root"]
+        state["identity"][
+            "release_identity_sha256"
+        ] = recovery.WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
+        state["identity"][
+            "runtime_launch_contract"
+        ] = recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT
+        state["task"]["action"] = {
+            "execute": endpoint_root + "/runtime/Scripts/python.exe",
+            "arguments": '-I -m description_pipeline serve --config "'
+            + endpoint_root
+            + '/endpoint.json"',
+            "working_directory": state["identity"]["state_root"],
+        }
+        validated = recovery._validate_windows_recovery_state(state)
+        self.assertEqual(
+            validated["identity"]["runtime_launch_contract"],
+            recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT,
+        )
+        foreign = copy.deepcopy(state)
+        foreign["identity"]["release_identity_sha256"] = "e" * 64
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery._validate_windows_recovery_state(foreign)
+        self.assertEqual(raised.exception.code, "windows_recovery_state_invalid")
+
     def test_windows_state_negative_boundary_matrix(self) -> None:
         _out, manifest = self.backup()
 
@@ -3474,6 +3503,37 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("localized PowerShell error", completed.stderr)
         self.assertEqual(commands[-1]["transport"]["encoding"], "base64(gzip(utf-8))")
+
+    def test_windows_truncated_utf16_is_a_classified_transport_error(self) -> None:
+        process = subprocess.CompletedProcess(
+            ["ssh", "windows-fixture"],
+            0,
+            b"\xff\xfeA",
+            b"",
+        )
+        process.transport = windows_transport.request_metadata("fixture")
+        with (
+            mock.patch.object(recovery, "_transport_powershell", return_value=process),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._run_windows_powershell(
+                ssh_host="windows-fixture",
+                script="fixture",
+                timeout=5,
+                commands=[],
+            )
+        self.assertEqual(raised.exception.code, "windows_transport_decode_failed")
+        self.assertEqual(raised.exception.detail["stream"], "stdout")
+        self.assertEqual(
+            raised.exception.detail["sha256"],
+            hashlib.sha256(b"\xff\xfeA").hexdigest(),
+        )
+
+    def test_recovery_propagates_bytecode_suppression_to_children(self) -> None:
+        self.assertEqual(os.environ.get("PYTHONDONTWRITEBYTECODE"), "1")
+        source = (DEPLOY / "recovery.py").read_text(encoding="utf-8")
+        self.assertIn('os.environ["PYTHONDONTWRITEBYTECODE"] = "1"', source)
+        self.assertIn("sys.dont_write_bytecode = True", source)
 
     def test_windows_failure_receipt_with_expected_verb_is_definite(self) -> None:
         cleanup = {

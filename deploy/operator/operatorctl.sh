@@ -27,6 +27,15 @@
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
 # live under the configured state root (outside Git).
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
+CONTROL_PYTHON="${CONTROL_PYTHON:-python3}"
+if ! "$CONTROL_PYTHON" -I -B -c \
+    'import sys; raise SystemExit(0 if sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12) else 1)' \
+    2>/dev/null; then
+  echo "operatorctl: CONTROL_PYTHON must be CPython 3.12" >&2
+  exit 1
+fi
+export CONTROL_PYTHON
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AIRFLOW_HERE="$HERE/../airflow"
 RELEASE_ROOT="$(cd "$HERE/../.." && pwd -P)"
@@ -39,16 +48,21 @@ GENERATION_ENV_REQUIRED=(
   PLATFORM_OPERATOR_DSN PLATFORM_SERVICE_DSN POSTGRES_PORT POSTGRES_ROOT
   SOLIDWORKS_HANDOFF_ROOT SOLIDWORKS_SSH_HOST
 )
+WINDOWS_LIFECYCLE_TIMEOUT=480
 
 die() { echo "operatorctl: $*" >&2; exit 1; }
 windows_transport() {
-  python3 "$HERE/windows_transport.py" --host "$SOLIDWORKS_SSH_HOST" --timeout "${1:-60}"
+  local timeout="${1:-60}" metadata="${2:-}"
+  local -a transport_args=(--host "$SOLIDWORKS_SSH_HOST" --timeout "$timeout")
+  [ -z "$metadata" ] || transport_args+=(--metadata-file "$metadata")
+  "$CONTROL_PYTHON" "$HERE/windows_transport.py" "${transport_args[@]}"
 }
 windows_lifecycle() {
   local output="$1" script_path="$2" binding_path="$3" verb="$4"
   local stage_dir="${5:-}" previous="${6:-}"
-  python3 - "$script_path" "$binding_path" "$verb" "$stage_dir" "$previous" <<'PY' \
-    | windows_transport 60 > "$output"
+  "$CONTROL_PYTHON" - "$script_path" "$binding_path" "$verb" "$stage_dir" "$previous" <<'PY' \
+    | windows_transport "$WINDOWS_LIFECYCLE_TIMEOUT" "$output.transport.json" \
+      > "$output" 2> "$output.stderr"
 import sys
 
 
@@ -156,30 +170,30 @@ install_from_config() {
   # artifact digests, the endpoint generation, their common release triple, and the wheel
   # that will actually be consumed.
   if [ -n "$WHEEL_FILE" ]; then
-    python3 "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
+    "$CONTROL_PYTHON" "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
       --endpoint-identity "$ENDPOINT_IDENTITY" --tree "$HERE/../.." --wheel "$WHEEL_FILE" \
       >/dev/null || exit $?
   else
-    python3 "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
+    "$CONTROL_PYTHON" "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
       --endpoint-identity "$ENDPOINT_IDENTITY" --tree "$HERE/../.." >/dev/null || exit $?
   fi
   if [ -z "$INSTALL_ID" ]; then
-    INSTALL_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    INSTALL_ID="$("$CONTROL_PYTHON" -c 'import uuid; print(uuid.uuid4().hex)')"
   fi
   if [ -n "$WHEEL_FILE" ]; then
-    SNAPSHOT_PATH="$(python3 "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
+    SNAPSHOT_PATH="$("$CONTROL_PYTHON" "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
       --install-id "$INSTALL_ID" --wheel "$WHEEL_FILE" | sed -n 's/^snapshot=//p')" || exit $?
   else
-    SNAPSHOT_PATH="$(python3 "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
+    SNAPSHOT_PATH="$("$CONTROL_PYTHON" "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
       --install-id "$INSTALL_ID" --tree "$HERE/../.." | sed -n 's/^snapshot=//p')" || exit $?
   fi
   [ -f "$SNAPSHOT_PATH" ] || die "config snapshot was not written"
   if [ -n "$WHEEL_FILE" ]; then
-    DERIVED_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
+    DERIVED_ENV="$("$CONTROL_PYTHON" "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
       --install-id "$INSTALL_ID" --tree "$HERE/../.." --release-file "$RELEASE_FILE" \
       --wheel "$WHEEL_FILE" | sed -n 's/^env=//p')" || exit $?
   else
-    DERIVED_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
+    DERIVED_ENV="$("$CONTROL_PYTHON" "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
       --install-id "$INSTALL_ID" --tree "$HERE/../.." --release-file "$RELEASE_FILE" | sed -n 's/^env=//p')" \
       || exit $?
   fi
@@ -202,8 +216,8 @@ load_env_file() {
 }
 
 load_active_env() {
-  STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
+  STATE_ROOT="$("$CONTROL_PYTHON" "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
+    "$CONTROL_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
   [ -f "$STATE_ROOT/resolved.env" ] || die "not installed: $STATE_ROOT/resolved.env is missing (run install first)"
   load_env_file "$STATE_ROOT/resolved.env" || return $?
   # The operational entry verifies the complete install record, the snapshot digest and the
@@ -221,8 +235,8 @@ load_active_env() {
 # snapshot only: the candidate configuration is the subject of the switch, not drift of the
 # running generation.  Current-config binding stays with verify-active on the steady-state verbs.
 load_running_env() {
-  STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
+  STATE_ROOT="$("$CONTROL_PYTHON" "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
+    "$CONTROL_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
   [ -f "$STATE_ROOT/resolved.env" ] || die "not installed: $STATE_ROOT/resolved.env is missing (run install first)"
   load_env_file "$STATE_ROOT/resolved.env" || return $?
   ACTIVE_ID="$(AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
@@ -267,7 +281,7 @@ acquire_maintenance_lock() {
     [ "$inherited_path" = "$lock_path" ] \
       || die "the inherited maintenance lock path does not match the state-root lock"
     [ -f "$lock_path" ] || die "the inherited maintenance lock is missing: $lock_path"
-    python3 - "$inherited_fd" "$lock_path" "$inherited_owner" <<'PY' \
+    "$CONTROL_PYTHON" - "$inherited_fd" "$lock_path" "$inherited_owner" <<'PY' \
       || die "the inherited maintenance lock descriptor is not the held state-root lock"
 import json
 import os
@@ -344,7 +358,7 @@ generation_env_value() {
 # Canonicalize it before any stage/promote/rollback side effect and refuse a cross-tree path.
 resolve_release_file() {
   local candidate="${RELEASE_FILE:-$RELEASE_ROOT/release.json}" resolved
-  resolved="$(python3 - "$RELEASE_ROOT" "$candidate" <<'PY'
+  resolved="$("$CONTROL_PYTHON" - "$RELEASE_ROOT" "$candidate" <<'PY'
 import os
 import sys
 
@@ -371,7 +385,7 @@ PY
 # duplicates decode to the same bytes the canonical readers see and are accepted.
 generation_env_declared_value() {
   local file="$1" key="$2" value
-  value="$(python3 - "$HERE/render_operator.py" "$file" "$key" <<'PY'
+  value="$("$CONTROL_PYTHON" - "$HERE/render_operator.py" "$file" "$key" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
@@ -489,7 +503,7 @@ airflow_require_no_readers() {
 }
 
 airflow_record_dag() {
-  python3 - "$1" <<'PY'
+  "$CONTROL_PYTHON" - "$1" <<'PY'
 import json
 import re
 import sys
@@ -527,7 +541,7 @@ airflow_render_generation_config() {
   runtime_dsn="$(generation_env_value "$env_file" AIRFLOW_RUNTIME_DB_URL)" || return 1
   # Resolve the port through the target controller's own env parser and default, so the
   # generated execution URL cannot fall back to the resident generation's ambient value.
-  api_port="$(python3 - "$renderer" "$env_file" <<'PY'
+  api_port="$("$CONTROL_PYTHON" - "$renderer" "$env_file" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
@@ -658,7 +672,7 @@ PY
 
 airflow_restore_dag_state() {
   local state_file="$1" paused
-  paused="$(python3 - "$state_file" <<'PY'
+  paused="$("$CONTROL_PYTHON" - "$state_file" <<'PY'
 import json
 import sys
 
@@ -770,7 +784,7 @@ instance_lifecycle_health() {
   local dir="$OPERATOR_STATE/promotions/$generation"
   local binding="$dir/windows-health-binding.json" output="$dir/windows-health.out"
   mkdir -p "$dir"
-  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" \
+  "$CONTROL_PYTHON" - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" \
     "$HERE/../windows/instance-lifecycle.ps1" <<'PY' || return 1
 import json
 import sys
@@ -831,11 +845,11 @@ out.write_text(
 )
 PY
   local remote archive_name expected_hash remote_archive_state
-  remote="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dir"])' "$binding")"
-  archive_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
-  expected_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$binding")"
+  remote="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dir"])' "$binding")"
+  archive_name="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
+  expected_hash="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$binding")"
   remote_archive_state="$(
-    python3 - "$remote/$archive_name" <<'PY' | windows_transport 60 \
+    "$CONTROL_PYTHON" - "$remote/$archive_name" <<'PY' | windows_transport 60 \
       2>/dev/null | tr -d '\r' | tail -1
 import sys
 
@@ -875,7 +889,7 @@ PY
     return 2
   fi
   local parse_rc=0
-  python3 - "$output" "$remote_rc" <<'PY' || parse_rc=$?
+  "$CONTROL_PYTHON" - "$output" "$remote_rc" <<'PY' || parse_rc=$?
 import json
 import sys
 
@@ -912,7 +926,7 @@ instance_lifecycle_resume() {
   binding="$dir/windows-resume-binding.json"
   output="$dir/windows-resume.out"
   mkdir -p "$dir"
-  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" \
+  "$CONTROL_PYTHON" - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" \
     "$HERE/../windows/instance-lifecycle.ps1" <<'PY' || return 1
 import hashlib
 import json
@@ -960,11 +974,11 @@ document = {
 }
 out_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
-  remote="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_root"].rstrip("/") + "/instance-promotions/windows-resume-" + sys.argv[2])' \
+  remote="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_root"].rstrip("/") + "/instance-promotions/windows-resume-" + sys.argv[2])' \
     "$binding" "$generation-$stamp")"
   remote_script="$remote/instance-lifecycle.ps1"
   remote_binding="$remote/windows-resume-binding.json"
-  python3 - "$remote" <<'PY' | windows_transport 60 \
+  "$CONTROL_PYTHON" - "$remote" <<'PY' | windows_transport 60 \
     || { echo "instance_lifecycle_resume: could not create $remote" >&2; return 1; }
 import sys
 
@@ -982,7 +996,7 @@ PY
   : > "$output"
   windows_lifecycle "$output" "$remote_script" "$remote_binding" resume || remote_rc=$?
   local parse_rc=0
-  python3 - "$output" "$remote_rc" <<'PY' || parse_rc=$?
+  "$CONTROL_PYTHON" - "$output" "$remote_rc" <<'PY' || parse_rc=$?
 import json
 import sys
 
@@ -1010,6 +1024,76 @@ PY
 # here from platform.json + release.json travels with the single lifecycle script over the
 # authenticated SSH channel; the script's stdout is kept as the step evidence under the
 # promotion receipt directory.
+instance_lifecycle_status() {
+  local generation="$1"
+  local dir="$OPERATOR_STATE/promotions/$generation"
+  local output="$dir/windows-status.out"
+  mkdir -p "$dir"
+  local remote
+  remote="$("$CONTROL_PYTHON" - "$CONFIG_FILE" "$generation" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+instance = document["windows"]["instance"]
+print(instance["state_root"].rstrip("/") + "/lifecycle/" + sys.argv[2])
+PY
+)" || return 1
+  local remote_script="$remote/instance-lifecycle.ps1"
+  local remote_binding="$remote/windows-binding.json"
+  if ! {
+    : > "$output"
+    : > "$output.ssh-rc"
+    : > "$output.stderr"
+    : > "$output.transport.json"
+  }; then
+    echo "instance_lifecycle_status: could not initialise status evidence in $dir" >&2
+    return 2
+  fi
+  local remote_rc=0
+  windows_lifecycle "$output" "$remote_script" "$remote_binding" status || remote_rc=$?
+  if ! printf '%s\n' "$remote_rc" > "$output.ssh-rc"; then
+    echo "instance_lifecycle_status: could not persist the status SSH exit code in $dir" >&2
+    return 2
+  fi
+  local parse_rc=0
+  "$CONTROL_PYTHON" - "$output" "$remote_rc" <<'PY' || parse_rc=$?
+import json
+import sys
+
+remote_rc = int(sys.argv[2])
+try:
+    document = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[-1])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(3)
+if (
+    remote_rc == 0
+    and isinstance(document, dict)
+    and document.get("passed") is True
+    and document.get("verb") == "status"
+):
+    raise SystemExit(0)
+if (
+    remote_rc == 1
+    and isinstance(document, dict)
+    and document.get("passed") is False
+    and isinstance(document.get("code"), str)
+    and document["code"].strip()
+):
+    raise SystemExit(1)
+raise SystemExit(3)
+PY
+  if [ "$parse_rc" = "1" ]; then
+    echo "instance_lifecycle_status: the status result is a definite refusal; see $output" >&2
+    return 1
+  fi
+  if [ "$parse_rc" != "0" ]; then
+    echo "instance_lifecycle_status: the status outcome is unreadable; see $output" >&2
+    return 2
+  fi
+  echo "$output"
+}
+
 instance_lifecycle() {
   local verb="$1" generation="$2" previous="${3:-}"
   case "$verb" in
@@ -1019,7 +1103,7 @@ instance_lifecycle() {
   local dir="$OPERATOR_STATE/promotions/$generation"
   local binding="$dir/windows-binding.json" output="$dir/windows-$verb.out"
   mkdir -p "$dir"
-  python3 - "$CONFIG_FILE" "$RELEASE_FILE" "$binding" "$generation" <<'PY' || return 1
+  "$CONTROL_PYTHON" - "$CONFIG_FILE" "$RELEASE_FILE" "$binding" "$generation" <<'PY' || return 1
 import hashlib, json, os, sys
 from pathlib import Path
 
@@ -1067,15 +1151,15 @@ out.write_text(
 )
 PY
   local remote archive_local archive_name expected_archive_size expected_archive_hash remote_archive_state
-  remote="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dir"])' "$binding")"
-  archive_local="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive_local"])' "$binding")"
-  archive_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
-  expected_archive_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$binding")"
+  remote="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dir"])' "$binding")"
+  archive_local="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive_local"])' "$binding")"
+  archive_name="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
+  expected_archive_hash="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$binding")"
   expected_archive_size="$(stat -c %s "$archive_local")" \
     || { echo "instance_lifecycle: could not size the native archive: $archive_local" >&2; return 1; }
   # The generation directory exists first (private, under the instance state root); the archive
   # travels with the binding and the script, and the script consumes exactly the transferred file.
-  python3 - "$remote" <<'PY' | windows_transport 60 \
+  "$CONTROL_PYTHON" - "$remote" <<'PY' | windows_transport 60 \
     || { echo "instance_lifecycle: could not create $remote on $SOLIDWORKS_SSH_HOST" >&2; return 1; }
 import sys
 
@@ -1086,7 +1170,7 @@ PY
   # immutable staged copy when its remote size and digest still match the
   # binding. A present-but-different archive is a refusal, never an overwrite.
   remote_archive_state="$(
-    python3 - "$remote/$archive_name" <<'PY' | windows_transport 60 \
+    "$CONTROL_PYTHON" - "$remote/$archive_name" <<'PY' | windows_transport 60 \
       2>/dev/null | tr -d '\r' | tail -1
 import sys
 
@@ -1137,7 +1221,7 @@ PY
   # Classify both signals together: parsing after an unconditional exit test would turn every
   # intentional refusal into unknown before its evidence was read.
   local parse_rc=0
-  python3 - "$output" "$verb" "$remote_rc" <<'PY' || parse_rc=$?
+  "$CONTROL_PYTHON" - "$output" "$verb" "$remote_rc" <<'PY' || parse_rc=$?
 import json
 import sys
 
@@ -1170,13 +1254,18 @@ promotion_step() {
   local generation="$1" verb="$2" step="$3" status="$4"
   shift 4
   local arguments=(--state-root "$OPERATOR_STATE" --install-id "$generation" --verb "$verb" --step "$step" --status "$status")
-  local item
-  for item in "$@"; do arguments+=(--evidence "$item"); done
-  python3 "$HERE/promotion.py" step "${arguments[@]}" >/dev/null
+  local item sibling
+  for item in "$@"; do
+    arguments+=(--evidence "$item")
+    for sibling in "$item.transport.json" "$item.stderr" "$item.ssh-rc"; do
+      [ -f "$sibling" ] && arguments+=(--evidence "$sibling")
+    done
+  done
+  "$CONTROL_PYTHON" "$HERE/promotion.py" step "${arguments[@]}" >/dev/null
 }
 
 config_reference_recorded() {
-  python3 - "$1" <<'PY'
+  "$CONTROL_PYTHON" - "$1" <<'PY'
 import json
 import sys
 
@@ -1212,7 +1301,7 @@ PY
 }
 
 promotion_extract_health() {
-  python3 - "$1" "$2" <<'PY'
+  "$CONTROL_PYTHON" - "$1" "$2" <<'PY'
 import json
 import sys
 
@@ -1225,19 +1314,29 @@ PY
 }
 
 windows_status_check() {
-  python3 - "$CONFIG_FILE" "$OPERATOR_STATE_DIR/install-record.json" "$HERE" <<'PY'
+  "$CONTROL_PYTHON" - "$CONFIG_FILE" "${OPERATOR_STATE_DIR:-$OPERATOR_STATE}/install-record.json" "$HERE" <<'PY'
 import base64
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
 WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[3])
-from windows_transport import decode_output, run_powershell
+from windows_transport import (
+    TransportDecodeError,
+    completed_metadata,
+    decode_output,
+    error_streams,
+    raw_stream_metadata,
+    request_metadata,
+    run_powershell,
+    write_metadata,
+)
 
 config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
@@ -1325,17 +1424,51 @@ function Get-LaunchContract([string]$generation) {{
   }}
   return 'legacy_pip_launcher_v0'
 }}
-function Test-LaunchArguments([string]$arguments, [string]$generation, [string]$contract) {{
+function Test-Bytecode-TransitionGeneration([string]$generation) {{
+  $receiptPath = Join-Path $generation 'stage-receipt.json'
+  if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {{ return $false }}
+  try {{ $record = Read-Json $receiptPath }} catch {{ return $false }}
+  return (
+    $record.passed -eq $true -and
+    $record.verb -ceq 'stage' -and
+    $record.PSObject.Properties.Name -contains 'launch_contract' -and
+    $record.launch_contract -ceq 'python_module_v1' -and
+    (Normalize-PathIdentity $record.generation) -eq
+      (Normalize-PathIdentity $generation) -and
+    $record.version -ceq '1.5.0' -and
+    $record.source_commit -ceq '140d39e51be5f0c39c32d7cfea9ca25fe642c273' -and
+    $record.source_sha256 -ceq '351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec'
+  )
+}}
+function Test-Transition-LaunchArguments([string]$arguments, [string]$generation, [object]$release) {{
+  if (-not (Test-Bytecode-TransitionGeneration $generation) -or
+      $release.source_commit -cne '140d39e51be5f0c39c32d7cfea9ca25fe642c273' -or
+      $release.source_sha256 -cne '351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec' -or
+      $release.version -cne '1.5.0' -or $release.role -cne 'native') {{
+    return $false
+  }}
+  $match = [regex]::Match(
+    $arguments,
+    '^(-I -m description_pipeline serve --config )"([^"]+)"$')
+  return (
+    $match.Success -and
+    $match.Groups[1].Value -ceq '-I -m description_pipeline serve --config ' -and
+    (Normalize-PathIdentity $match.Groups[2].Value) -eq
+      (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))
+  )
+}}
+function Test-LaunchArguments([string]$arguments, [string]$generation, [string]$contract, [object]$release) {{
   if ($contract -ceq 'python_module_v1') {{
     $match = [regex]::Match(
       $arguments,
-      '^(-I -m description_pipeline serve --config )"([^"]+)"$')
-    return (
+      '^(-I -B -m description_pipeline serve --config )"([^"]+)"$')
+    if (
       $match.Success -and
-      $match.Groups[1].Value -ceq '-I -m description_pipeline serve --config ' -and
+      $match.Groups[1].Value -ceq '-I -B -m description_pipeline serve --config ' -and
       (Normalize-PathIdentity $match.Groups[2].Value) -eq
       (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))
-    )
+    ) {{ return $true }}
+    return (Test-Transition-LaunchArguments $arguments $generation $release)
   }}
   if ($contract -ceq 'legacy_pip_launcher_v0') {{
     $match = [regex]::Match($arguments, '^(serve --config )"([^"]+)"$')
@@ -1348,19 +1481,19 @@ function Test-LaunchArguments([string]$arguments, [string]$generation, [string]$
   }}
   return $false
 }}
-function Test-LaunchAction([string]$execute, [string]$arguments, [string]$generation, [string]$contract) {{
+function Test-LaunchAction([string]$execute, [string]$arguments, [string]$generation, [string]$contract, [object]$release) {{
   if ($contract -ceq 'python_module_v1') {{
     return (
       (Normalize-PathIdentity $execute) -eq
         (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\python.exe')) -and
-      (Test-LaunchArguments $arguments $generation $contract)
+      (Test-LaunchArguments $arguments $generation $contract $release)
     )
   }}
   return (
     $contract -ceq 'legacy_pip_launcher_v0' -and
     (Normalize-PathIdentity $execute) -eq
       (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\description.exe')) -and
-    (Test-LaunchArguments $arguments $generation $contract)
+      (Test-LaunchArguments $arguments $generation $contract $release)
   )
 }}
 function Get-Sample {{
@@ -1374,7 +1507,7 @@ function Get-Sample {{
   $generation = Split-Path -Parent $configPath
   $launchContract = Get-LaunchContract $generation
   if (-not (Test-LaunchAction ([string]$task.Actions[0].Execute) `
-      ([string]$task.Actions[0].Arguments) $generation $launchContract)) {{
+      ([string]$task.Actions[0].Arguments) $generation $launchContract ([object]$expected.release))) {{
     throw 'task action does not match its generation launch contract'
   }}
   $python = Join-Path $generation 'runtime\Scripts\python.exe'
@@ -1388,7 +1521,7 @@ function Get-Sample {{
     "print(json.dumps({{'config_digest':c['config_digest']," +
     "'state_root':str(c['state_root']),'port':c['port']," +
     "'release':tool_record(role='native')}},sort_keys=True))"
-  $probe = ((& $python -I -c $program $configPath) | Select-Object -Last 1) |
+  $probe = ((& $python -I -B -c $program $configPath) | Select-Object -Last 1) |
     ConvertFrom-Json
   $config = Read-Json $configPath
   if ((Normalize-PathIdentity ([string]$task.Actions[0].WorkingDirectory)) -ne
@@ -1465,6 +1598,39 @@ try {{
 }}
 """
 ssh_bin = os.environ.get("SOLIDWORKS_SSH_BIN", "ssh")
+evidence_root = Path(os.environ["OPERATOR_STATE"]) / "health-gate"
+evidence_root.mkdir(parents=True, exist_ok=True)
+evidence_stem = f"windows-status-{time.time_ns()}-{os.getpid()}"
+stdout_path = evidence_root / (evidence_stem + ".stdout")
+stderr_path = evidence_root / (evidence_stem + ".stderr")
+metadata_path = evidence_root / (evidence_stem + ".transport.json")
+base_metadata = {
+    "schema_version": "solidworks-to-urdf.windows-transport/v1",
+    "host": host,
+    "timeout_seconds": 60,
+    "returncode": None,
+    "stdout": raw_stream_metadata(b""),
+    "stderr": raw_stream_metadata(b""),
+    "transport": request_metadata(script),
+}
+
+
+def persist_status_evidence(raw_stdout, raw_stderr, metadata):
+    stdout_path.write_bytes(raw_stdout)
+    stderr_path.write_bytes(raw_stderr)
+    document = {
+        **base_metadata,
+        **metadata,
+        "stdout": raw_stream_metadata(raw_stdout),
+        "stderr": raw_stream_metadata(raw_stderr),
+        "raw_evidence": {
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+        },
+    }
+    write_metadata(metadata_path, document)
+
+
 try:
     completed = run_powershell(
         ssh_host=host,
@@ -1472,21 +1638,78 @@ try:
         timeout=60,
         ssh_bin=ssh_bin,
     )
-except (OSError, subprocess.TimeoutExpired) as error:
+except (OSError, subprocess.SubprocessError, ValueError) as error:
+    raw_stdout, raw_stderr = error_streams(error)
+    persist_status_evidence(
+        raw_stdout,
+        raw_stderr,
+        {
+            "status": "error",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        },
+    )
     raise SystemExit(f"operatorctl status: Windows probe failed: {error}") from error
+try:
+    stderr_text = decode_output(completed.stderr, stream="stderr")
+    stdout_text = decode_output(completed.stdout, stream="stdout")
+except TransportDecodeError as error:
+    persist_status_evidence(
+        completed.stdout,
+        completed.stderr,
+        {
+            "status": "decode_error",
+            "returncode": completed.returncode,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "decode_error": {
+                "stream": error.stream,
+                "bytes": error.payload_bytes,
+                "sha256": error.payload_sha256,
+            },
+        },
+    )
+    raise SystemExit(
+        f"operatorctl status: Windows {error.stream} decode failed: "
+        f"{error.payload_bytes} bytes sha256={error.payload_sha256}"
+    ) from error
 if completed.returncode != 0:
-    stderr_text = decode_output(completed.stderr).strip()
-    stdout_text = decode_output(completed.stdout).strip()
+    persist_status_evidence(
+        completed.stdout,
+        completed.stderr,
+        {
+            "status": "error",
+            "returncode": completed.returncode,
+            "error_type": "RemoteExit",
+        },
+    )
     raise SystemExit(
         "operatorctl status: Windows probe failed: "
-        + (stderr_text or stdout_text or "unknown failure")[:1000]
+        + (stderr_text.strip() or stdout_text.strip() or "unknown failure")[:1000]
     )
-stdout_text = decode_output(completed.stdout)
 try:
     result = json.loads(stdout_text.strip().splitlines()[-1])
 except (IndexError, ValueError) as error:
+    persist_status_evidence(
+        completed.stdout,
+        completed.stderr,
+        {
+            "status": "error",
+            "returncode": completed.returncode,
+            "error_type": "InvalidJson",
+        },
+    )
     raise SystemExit("operatorctl status: Windows probe returned no JSON") from error
 if not isinstance(result, dict) or result.get("passed") is not True:
+    persist_status_evidence(
+        completed.stdout,
+        completed.stderr,
+        {
+            "status": "error",
+            "returncode": completed.returncode,
+            "error_type": "Refused",
+        },
+    )
     raise SystemExit(
         "operatorctl status: "
         + str(result.get("error") if isinstance(result, dict) else "invalid result")
@@ -1511,7 +1734,23 @@ if (
     or not isinstance(sample.get("process_start_utc"), str)
     or not sample["process_start_utc"]
 ):
+    persist_status_evidence(
+        completed.stdout,
+        completed.stderr,
+        {
+            "status": "error",
+            "returncode": completed.returncode,
+            "error_type": "IdentityMismatch",
+        },
+    )
     raise SystemExit("operatorctl status: Windows process/identity probe differs from the install record")
+status_metadata = {
+    **completed_metadata(completed),
+    "status": "completed",
+    "host": host,
+    "timeout_seconds": 60,
+}
+persist_status_evidence(completed.stdout, completed.stderr, status_metadata)
 print(
     json.dumps(
         {
@@ -1525,6 +1764,11 @@ print(
             "launch_contract": sample["launch_contract"],
             "action_matches_generation": sample["action_matches_generation"],
             "transport": getattr(completed, "transport", {}),
+            "evidence": {
+                "stdout": str(stdout_path),
+                "stderr": str(stderr_path),
+                "metadata": str(metadata_path),
+            },
         },
         sort_keys=True,
     )
@@ -1565,7 +1809,7 @@ drift_check() {
   [ -n "$proxy_bin" ] && extra=(--nginx-bin "$proxy_bin")
   drift_log="$(mktemp)"
   tmp_xdg="$(mktemp -d)"
-  if ! python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --dry-run \
+  if ! "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" --dry-run \
         "${extra[@]}" --units-dir "$tmp_xdg/systemd/user" > "$drift_log"; then rc=1; fi
   grep -v -e '^DRIFT none$' -e '^OPERATOR_UNITS=' "$drift_log" || true
   # The operator units carry the temporary render state; normalize it before comparing.
@@ -1589,9 +1833,28 @@ drift_check() {
       echo "DRIFT unit differs: $unit.service"; rc=1
     fi
   done
-  python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$tmp_xdg"
+  "$CONTROL_PYTHON" -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$tmp_xdg"
   rm -f "$drift_log"
   return "$rc"
+}
+
+promotion_replay_state() {
+  local install_id="$1" verb="$2" output rc=0
+  output="$("$CONTROL_PYTHON" "$HERE/promotion.py" replay --state-root "$OPERATOR_STATE" \
+    --install-id "$install_id" --verb "$verb" \
+    --active-record "$STATE_ROOT/install-record.json" 2>&1)" || rc=$?
+  case "$rc" in
+    0) printf '%s\n' "$output" ;;
+    10) printf '%s\n' "$output"; return 10 ;;
+    11) printf '%s\n' "${output:-replay=partial}"; return 11 ;;
+    *) printf '%s\n' "${output:-promotion replay check failed}" >&2; return 2 ;;
+  esac
+}
+
+verify_completed_replay() {
+  load_installed
+  windows_status_check >/dev/null || return 1
+  OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/health.sh" >/dev/null || return 1
 }
 
 [ -n "$CONFIG_FILE" ] || usage
@@ -1608,7 +1871,7 @@ fi
 [ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
 # Every verb passes the same static config gate first; the install record and its derived
 # per-generation environment stay the single authority for the operational verbs.
-python3 "$HERE/platform_config.py" validate --config "$CONFIG_FILE" >/dev/null || exit $?
+"$CONTROL_PYTHON" "$HERE/platform_config.py" validate --config "$CONFIG_FILE" >/dev/null || exit $?
 case "$ACTION" in
   validate)
     echo "operatorctl: configuration valid: $CONFIG_FILE"
@@ -1621,8 +1884,8 @@ case "$ACTION" in
     # any identity/drift verification, so a failed start attempt cannot leave a leftover open
     # gate), then run the preconditions; the gate reopens only after everything is ready (under
     # --keep-admission-closed it stays closed once everything is ready).
-    START_STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
-      python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
+    START_STATE_ROOT="$("$CONTROL_PYTHON" "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
+      "$CONTROL_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
     [ -f "$START_STATE_ROOT/resolved.env" ] \
       || die "not installed: $START_STATE_ROOT/resolved.env is missing (run install first)"
     load_env_file "$START_STATE_ROOT/resolved.env"
@@ -1648,7 +1911,7 @@ case "$ACTION" in
       [ -f "$RECEIPT_DIR/receipt.json" ] \
         || die "no stage receipt for $CANDIDATE_ID; run stage first"
       resolve_release_file
-      python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+      "$CONTROL_PYTHON" "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
         --install-id "$CANDIDATE_ID" --release-file "$RELEASE_FILE" >/dev/null \
         || die "the staged promotion receipt binds another release manifest"
       CANDIDATE_ENV="$OPERATOR_STATE/derived/$CANDIDATE_ID/operator.env"
@@ -1699,7 +1962,7 @@ GUARD
         -m description_pipeline.orchestration.lifecycle_state report \
         --require-admission-closed >/dev/null \
         || die "the staged-candidate reconcile runs only while the admission is closed"
-      python3 - "$HERE/../../release.json" "$RECEIPT_DIR/receipt.json" "$CANDIDATE_DIGEST" \
+      "$CONTROL_PYTHON" - "$HERE/../../release.json" "$RECEIPT_DIR/receipt.json" "$CANDIDATE_DIGEST" \
         "$CANDIDATE_WHEEL_PATH" "$AIRFLOW_VENV" "$HERE" <<'GUARD' || die "the staged generation identity did not verify; re-run stage"
 # staged-generation identity: the recorded snapshot, the wheel binding and the installed package
 import hashlib
@@ -1799,7 +2062,7 @@ case "$ACTION" in
     # written into resolved.env, the units and health - one path, one source.
     OPERATOR_STATE="$(generation_env_value "$ENV_FILE" OPERATOR_STATE)"
     PROXY_BIN="$(ensure_proxy_binary)" || die "the managed proxy binary is unavailable; nothing was installed"
-    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" > "$RENDER_LOG"
+    "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" > "$RENDER_LOG"
     cat "$RENDER_LOG"
     load_env_file "$(sed -n 's/^OPERATOR_STATE=//p' "$RENDER_LOG" | head -1)/resolved.env"
     load_generation_env
@@ -1807,7 +2070,7 @@ case "$ACTION" in
     bash "$HERE/scripts/install_toolchain.sh" > "$TOOLCHAIN_LOG"
     cat "$TOOLCHAIN_LOG"
     load_env_file "$TOOLCHAIN_LOG"
-    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+    "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
       --units-dir "$TARGET" >/dev/null
     airflow_render
     if [ -n "${POSTGRES_ROOT:-}" ]; then
@@ -1872,18 +2135,18 @@ case "$ACTION" in
     systemctl --user daemon-reload
     # The install record binds this generation to its snapshot, release identity and both ends;
     # it is written only after the installation legs are ready.
-    STATE_ROOT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["resolved"]["storage"]["state_root"])' "$SNAPSHOT_PATH")"
+    STATE_ROOT="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["resolved"]["storage"]["state_root"])' "$SNAPSHOT_PATH")"
     SERVICES_CSV="$(IFS=,; printf '%s' "${UNITS[*]}")"
     # The record's canonical bytes and its digest come from the same contract closure the
     # snapshot legs consumed: the installed wheel or the single wheel in the deployment tree.
     if [ -n "$WHEEL_FILE" ]; then
-      python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
+      "$CONTROL_PYTHON" "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
         --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
         --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
         --deployment-root "$HERE/../.." --wheel "$WHEEL_FILE"
     else
-      python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
+      "$CONTROL_PYTHON" "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
         --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
         --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
@@ -2002,7 +2265,7 @@ case "$ACTION" in
     # The Linux generation is built from the candidate release's own wheel - a cross-release
     # upgrade consumes the release archive, never the running generation's asset - into a new
     # snapshot, derived environment and runtime, with no pointer, unit or admission change.
-    CANDIDATE_WHEEL="$(python3 - "$RELEASE_FILE" <<'PY'
+    CANDIDATE_WHEEL="$("$CONTROL_PYTHON" - "$RELEASE_FILE" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
 
@@ -2021,14 +2284,14 @@ if hashlib.sha256(wheel.read_bytes()).hexdigest() != release["artifacts"][wheels
 print(wheel)
 PY
 )" || die "the candidate release wheel was refused"
-    SNAPSHOT_PATH="$(python3 "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
+    SNAPSHOT_PATH="$("$CONTROL_PYTHON" "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
       --install-id "$CANDIDATE_ID" --wheel "$CANDIDATE_WHEEL" | sed -n 's/^snapshot=//p')" || exit $?
     [ -f "$SNAPSHOT_PATH" ] || die "candidate snapshot was not written"
-    CANDIDATE_ENV="$(python3 "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
+    CANDIDATE_ENV="$("$CONTROL_PYTHON" "$HERE/platform_env.py" emit --snapshot "$SNAPSHOT_PATH" \
       --install-id "$CANDIDATE_ID" --tree "$HERE/../.." --release-file "$RELEASE_FILE" \
       --wheel "$CANDIDATE_WHEEL" | sed -n 's/^env=//p')" || exit $?
     [ -f "$CANDIDATE_ENV" ] || die "candidate derived environment was not written"
-    python3 "$HERE/promotion.py" init --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+    "$CONTROL_PYTHON" "$HERE/promotion.py" init --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --from "$STATE_ROOT/install-records/$ACTIVE_ID.json" --to "$SNAPSHOT_PATH" \
       --release-file "$RELEASE_FILE" \
       --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,config-reference,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-config-reference,rollback-verify" \
@@ -2037,23 +2300,23 @@ PY
     ENV_FILE="$CANDIDATE_ENV"
     load_generation_env
     if bash "$AIRFLOW_HERE/install.sh" --stage > "$RECEIPT_DIR/linux-generation.out" 2>&1; then
-      python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+      "$CONTROL_PYTHON" "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
         --verb promote --step linux-generation --status completed \
         --evidence "$SNAPSHOT_PATH" --evidence "$CANDIDATE_ENV" --evidence "$RECEIPT_DIR/linux-generation.out" \
         >/dev/null
     else
-      python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+      "$CONTROL_PYTHON" "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
         --verb promote --step linux-generation --status failed \
         --evidence "$RECEIPT_DIR/linux-generation.out" >/dev/null
       die "the candidate runtime failed to stage; the active generation is unchanged"
     fi
     if ! WINDOWS_STAGE="$(instance_lifecycle stage "$CANDIDATE_ID")"; then
-      python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+      "$CONTROL_PYTHON" "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
         --verb promote --step windows-generation --status failed \
         --evidence "$RECEIPT_DIR/windows-stage.out" >/dev/null
       die "the Windows candidate stage failed; the active generation is unchanged"
     fi
-    python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
+    "$CONTROL_PYTHON" "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --verb promote --step windows-generation --status completed --evidence "$WINDOWS_STAGE" >/dev/null
     # stage performs no schema DDL: the live database is only written by guarded windows -
     # the closed-admission reconcile route (which applies the staged objects before it
@@ -2067,11 +2330,33 @@ PY
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
     [ -f "$RECEIPT_DIR/receipt.json" ] || die "no stage receipt for $CANDIDATE_ID; run stage first"
     resolve_release_file
-    python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+    "$CONTROL_PYTHON" "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
       --install-id "$CANDIDATE_ID" --release-file "$RELEASE_FILE" >/dev/null \
       || die "the promotion receipt binds another release manifest"
+    REPLAY_STATUS=0
+    REPLAY_STATE="$(promotion_replay_state "$CANDIDATE_ID" promote)" || REPLAY_STATUS=$?
+    case "$REPLAY_STATUS" in
+      0)
+        [ "$REPLAY_STATE" = "replay=completed" ] \
+          || die "promotion replay returned an invalid completed state: $REPLAY_STATE"
+        verify_completed_replay \
+          || die "completed promotion replay verification failed; no side effect was repeated"
+        echo "promote replay complete: $CANDIDATE_ID (existing health verified)"
+        exit 0
+        ;;
+      10)
+        [ "$REPLAY_STATE" = "replay=fresh" ] \
+          || die "promotion replay returned an invalid fresh state: $REPLAY_STATE"
+        ;;
+      11)
+        die "the promotion receipt is partial or inconsistent; use reconcile or rollback instead of replaying promote"
+        ;;
+      *)
+        die "the promotion receipt could not be classified for replay"
+        ;;
+    esac
     EVIDENCE_DIR="$RECEIPT_DIR/evidence"
-    SNAPSHOT_PATH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["to"])' "$RECEIPT_DIR/receipt.json")"
+    SNAPSHOT_PATH="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["to"])' "$RECEIPT_DIR/receipt.json")"
     CANDIDATE_ENV="$OPERATOR_STATE/derived/$CANDIDATE_ID/operator.env"
     if [ ! -f "$SNAPSHOT_PATH" ] || [ ! -f "$CANDIDATE_ENV" ]; then
       die "the staged generation is incomplete; re-run stage"
@@ -2107,7 +2392,7 @@ PY
     #    staging only): a leftover partial staging would otherwise nest under the cp -a
     #    targets or abort the copy, and the copied 0555 directories would abort a plain rm.
     BACKUP_DIR="$RECEIPT_DIR/backup"
-    if ! python3 "$HERE/backup.py" clean-staging --receipt-dir "$RECEIPT_DIR" \
+    if ! "$CONTROL_PYTHON" "$HERE/backup.py" clean-staging --receipt-dir "$RECEIPT_DIR" \
         > "$EVIDENCE_DIR/backup-staging-clean.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-staging-clean.out"
       die "the private backup staging could not be cleaned (the admission stays closed)"
@@ -2133,8 +2418,8 @@ PY
     cp -p "$STATE_ROOT/resolved.env" "$BACKUP_DIR/state/resolved.env"
     # The closure references the RUNNING generation's snapshot (the candidate describes where
     # the system is going, not where it is).
-    RUNNING_SNAPSHOT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshot"]["path"])' "$STATE_ROOT/install-record.json")"
-    python3 - "$RUNNING_SNAPSHOT" "$BACKUP_DIR" <<'PY'
+    RUNNING_SNAPSHOT="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshot"]["path"])' "$STATE_ROOT/install-record.json")"
+    "$CONTROL_PYTHON" - "$RUNNING_SNAPSHOT" "$BACKUP_DIR" <<'PY'
 import json
 import os
 import shutil
@@ -2202,14 +2487,14 @@ PY
     # The archive is sealed with the state-root key: controlled, and the only artifact the
     # manifest binds for restore.
     BACKUP_KEY="$STATE_ROOT/secrets/backup.key"
-    if ! python3 "$HERE/backup.py" key --path "$BACKUP_KEY" > "$EVIDENCE_DIR/backup-key.out" 2>&1 \
-        || ! python3 "$HERE/backup.py" seal --source "$BACKUP_DIR" --key "$BACKUP_KEY" \
+    if ! "$CONTROL_PYTHON" "$HERE/backup.py" key --path "$BACKUP_KEY" > "$EVIDENCE_DIR/backup-key.out" 2>&1 \
+        || ! "$CONTROL_PYTHON" "$HERE/backup.py" seal --source "$BACKUP_DIR" --key "$BACKUP_KEY" \
             --out "$RECEIPT_DIR/backup.tar.enc" > "$EVIDENCE_DIR/backup-seal.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-seal.out"
       die "the backup archive could not be sealed (the admission stays closed)"
     fi
     # The manifest format has one owner: backup.py writes and strictly reads it.
-    if ! python3 "$HERE/backup.py" manifest --source "$BACKUP_DIR" --sealed "$RECEIPT_DIR/backup.tar.enc" \
+    if ! "$CONTROL_PYTHON" "$HERE/backup.py" manifest --source "$BACKUP_DIR" --sealed "$RECEIPT_DIR/backup.tar.enc" \
         --key "$BACKUP_KEY" --out "$EVIDENCE_DIR/backup-manifest.json" > "$EVIDENCE_DIR/backup-manifest.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-manifest.out"
       die "the backup manifest could not be written (the admission stays closed)"
@@ -2218,7 +2503,7 @@ PY
     # manifest are the only restore inputs that remain.  The same single owner removes the
     # staging, so a cleanup failure is recorded under this step - before any service stop or
     # pointer switch - and the step completes only after the removal succeeded.
-    if ! python3 "$HERE/backup.py" clean-staging --receipt-dir "$RECEIPT_DIR" \
+    if ! "$CONTROL_PYTHON" "$HERE/backup.py" clean-staging --receipt-dir "$RECEIPT_DIR" \
         > "$EVIDENCE_DIR/backup-staging-removed.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-staging-removed.out"
       die "the sealed backup staging could not be removed (the admission stays closed)"
@@ -2315,7 +2600,7 @@ PY
     #    carries one reference to this receipt, the single step authority.
     PREVIOUS_RECORD="$STATE_ROOT/install-records/$ACTIVE_ID.json"
     [ -f "$PREVIOUS_RECORD" ] || die "the active generation file is missing: $PREVIOUS_RECORD"
-    python3 - "$EVIDENCE_DIR/journal.json" "$RECEIPT_DIR/receipt.json" "$EVIDENCE_DIR/health.json" \
+    "$CONTROL_PYTHON" - "$EVIDENCE_DIR/journal.json" "$RECEIPT_DIR/receipt.json" "$EVIDENCE_DIR/health.json" \
       "$EVIDENCE_DIR/endpoint-identity.json" <<'PY'
 import json
 import sys
@@ -2364,7 +2649,7 @@ PY
     PROXY_BIN="$(ensure_proxy_binary)" \
       || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
-      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+      "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
         --units-dir "$TARGET" \
       && load_env_file "$STATE_ROOT/resolved.env" \
       && load_generation_env \
@@ -2410,9 +2695,31 @@ PY
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$ROLLBACK_ID"
     [ -f "$RECEIPT_DIR/receipt.json" ] || die "no promotion receipt for maintenance $ROLLBACK_ID; nothing is guessed"
     resolve_release_file
-    python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+    "$CONTROL_PYTHON" "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
       --install-id "$ROLLBACK_ID" --release-file "$RELEASE_FILE" >/dev/null \
       || die "the rollback receipt binds another release manifest"
+    REPLAY_STATUS=0
+    REPLAY_STATE="$(promotion_replay_state "$ROLLBACK_ID" rollback)" || REPLAY_STATUS=$?
+    case "$REPLAY_STATUS" in
+      0)
+        [ "$REPLAY_STATE" = "replay=completed" ] \
+          || die "rollback replay returned an invalid completed state: $REPLAY_STATE"
+        verify_completed_replay \
+          || die "completed rollback replay verification failed; no side effect was repeated"
+        echo "rollback replay complete: $ROLLBACK_ID (existing health verified)"
+        exit 0
+        ;;
+      10)
+        [ "$REPLAY_STATE" = "replay=fresh" ] \
+          || die "rollback replay returned an invalid fresh state: $REPLAY_STATE"
+        ;;
+      11)
+        die "the rollback receipt is partial or inconsistent; do not repeat rollback"
+        ;;
+      *)
+        die "the rollback receipt could not be classified for replay"
+        ;;
+    esac
     EVIDENCE_DIR="$RECEIPT_DIR/evidence"
     mkdir -p "$EVIDENCE_DIR"
     DAG_STATE_FILE="$EVIDENCE_DIR/dag-before-promotion.json"
@@ -2422,21 +2729,21 @@ PY
     CANDIDATE_VENV="$(generation_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
     LINUX_SWITCHED=1
     if [ "$ROLLBACK_ID" = "$ACTIVE_ID" ]; then
-      PREVIOUS_RECORD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["previous"]["record"])' "$STATE_ROOT/install-record.json")" \
+      PREVIOUS_RECORD="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["previous"]["record"])' "$STATE_ROOT/install-record.json")" \
         || die "the active record carries no rollback binding"
     else
       # The Linux pointer never moved for this maintenance attempt; its source generation comes
       # from the receipt's bound immutable generation, never from the mutable active pointer.
       LINUX_SWITCHED=0
-      PREVIOUS_RECORD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["from"])' "$RECEIPT_DIR/receipt.json")" \
+      PREVIOUS_RECORD="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["from"])' "$RECEIPT_DIR/receipt.json")" \
         || die "the receipt carries no source generation"
     fi
     [ -f "$PREVIOUS_RECORD" ] || die "the recorded source generation is missing: $PREVIOUS_RECORD"
-    PREVIOUS_RELEASE_TRIPLE="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["release"]; print(r["version"], r["source_commit"], r["source_sha256"])' "$PREVIOUS_RECORD")" \
+    PREVIOUS_RELEASE_TRIPLE="$("$CONTROL_PYTHON" -c 'import json,sys; r=json.load(open(sys.argv[1]))["release"]; print(r["version"], r["source_commit"], r["source_sha256"])' "$PREVIOUS_RECORD")" \
       || die "the rollback binding carries no release identity"
     PREVIOUS_GENERATION_DIR=""
     if [ -f "$RECEIPT_DIR/windows-promote.out" ]; then
-      PREVIOUS_GENERATION_DIR="$(python3 -c '
+      PREVIOUS_GENERATION_DIR="$("$CONTROL_PYTHON" -c '
 import json, sys
 try:
     print(json.load(open(sys.argv[1]))["previous"])
@@ -2450,13 +2757,13 @@ except Exception:
       # An unacknowledged switch is reconciled from the endpoint's own recorded status; the
       # unknown switch itself is never resent.
       WINDOWS_STATUS_STATUS=0
-      WINDOWS_STATUS="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" instance_lifecycle status "$ROLLBACK_ID")" \
+      WINDOWS_STATUS="$(instance_lifecycle_status "$ROLLBACK_ID")" \
         || WINDOWS_STATUS_STATUS=$?
       if [ "$WINDOWS_STATUS_STATUS" != "0" ]; then
         promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown "$RECEIPT_DIR/windows-status.out"
         die "the endpoint status is unreadable; the Windows end cannot be reconciled (the admission stays closed)"
       fi
-      RECONCILIATION="$(python3 - "$RECEIPT_DIR/windows-binding.json" "$WINDOWS_STATUS" <<'PY'
+      RECONCILIATION="$("$CONTROL_PYTHON" - "$RECEIPT_DIR/windows-binding.json" "$WINDOWS_STATUS" <<'PY'
 import json
 import re
 import sys
@@ -2469,6 +2776,7 @@ def normalize(value):
 def parse_arguments(value):
     text = str(value or "").strip()
     for pattern in (
+        r'^(-I -B -m description_pipeline serve --config )"([^"]+)"$',
         r'^(-I -m description_pipeline serve --config )"([^"]+)"$',
         r'^(serve --config )"([^"]+)"$',
     ):
@@ -2528,7 +2836,7 @@ def runs(generation):
         and config == (generation + "/endpoint.json").lower()
         and arguments
         == (
-            '-I -m description_pipeline serve --config ',
+            '-I -B -m description_pipeline serve --config ',
             normalize(generation + "/endpoint.json").lower(),
         )
         and working_directory == normalize(binding.get("state_root")).lower()
@@ -2714,7 +3022,7 @@ PY
     PROXY_BIN="$(ensure_proxy_binary)" \
       || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
-      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+      "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
         --units-dir "$TARGET" \
       && load_env_file "$STATE_ROOT/resolved.env" \
       && load_generation_env \
@@ -2791,7 +3099,7 @@ PY
     PIPELINE_STORE_ROOT="$(generation_env_value "$ENV_FILE" PIPELINE_STORE_ROOT)"
     export PLATFORM_SERVICE_DSN PLATFORM_OPERATOR_DSN PIPELINE_STORE_ROOT
     RECONCILE_RUN_ID="$RUN_ID" RECONCILE_STAGE="$STAGE" RECONCILE_OUTCOME="$OUTCOME" \
-    RECONCILE_EVIDENCE="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
+    RECONCILE_EVIDENCE="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
     RECONCILE_NATIVE_RECEIPT="$NATIVE_RECEIPT" RECONCILE_NATIVE_RUN_ID="$NATIVE_RUN_ID" \
     RECONCILE_ORPHAN_OPERATION_ID="$ORPHAN_OPERATION_ID" RECONCILE_ORPHAN_TASK_ID="$ORPHAN_TASK_ID" \
     RECONCILE_ORPHAN_MAP_INDEX="$ORPHAN_MAP_INDEX" RECONCILE_REPORTED_STAGE="$REPORTED_STAGE" \
