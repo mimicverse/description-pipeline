@@ -300,9 +300,13 @@ class ReportViewTests(unittest.TestCase):
         job["status"] = "failed"
         job["events"] = protocol_events(subject=SHA, failed_stage="discover")
         job["error"] = "PipelineError: Required check failed: discovery.definition"
+        job["detail"] = {"path": "C:\\private\\unclassified.SLDASM"}
+        job["activity_final"] = {"action": "unclassified", "current_object": "unclassified.SLDASM"}
         failure = build_report(job)["failure"]
         self.assertEqual(failure["title"], "Stage failed (cause undetermined)")
         self.assertEqual(failure["kind"], "unknown")
+        for key in ("object", "phase", "cause", "values", "evidence_path"):
+            self.assertNotIn(key, failure)
 
     def test_link_group_payload_failure_has_a_specific_native_explanation(self) -> None:
         job = passed_job()
@@ -317,6 +321,52 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(failure["kind"], "runtime")
         self.assertEqual(failure["error_code"], "cad_link_group_payload_invalid")
         self.assertEqual(failure["raw_detail"], {"body": "r_thigh_yaw"})
+        self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
+
+    def test_codified_native_failure_projects_its_recorded_context(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="capture")
+        job["error"] = "Capture preparation did not end in a fully rebuilt read-only state"
+        job["error_code"] = "cad_rebuild_incomplete"
+        job["detail"] = {
+            "path": (
+                "C:\\description-v1-review\\endpoint-deliveries\\capture\\"
+                "evidence.partial\\source\\M3.0.3_20261016.SLDASM"
+            ),
+            "rebuilt": True,
+            "state": {
+                "configuration": "Default",
+                "configuration_needs_rebuild": False,
+                "needs_rebuild2_value": 1,
+                "read_only": True,
+                "save_flag": True,
+            },
+        }
+        job["activity_final"] = {
+            "action": "prepare_capture",
+            "current_object": "M3.0.3_20261016.SLDASM",
+            "phase": "capture",
+        }
+        job["diagnostic_path"] = (
+            "C:\\description-v1-review\\endpoint-deliveries\\261ea3ec-5eb0-5746-9760-389b1c21c2d4.failed"
+        )
+
+        failure = build_report(job)["failure"]
+
+        self.assertEqual(failure["stage"], "capture")
+        self.assertEqual(failure["title"], "Native CAD stage failed")
+        self.assertEqual(failure["kind"], "runtime")
+        self.assertEqual(failure["error_code"], "cad_rebuild_incomplete")
+        self.assertEqual(failure["object"], "M3.0.3_20261016.SLDASM")
+        self.assertEqual(failure["phase"], "prepare_capture")
+        self.assertEqual(
+            failure["cause"],
+            "Capture preparation did not end in a fully rebuilt read-only state",
+        )
+        self.assertEqual(failure["values"]["rebuilt"], True)
+        self.assertEqual(failure["values"]["state"]["needs_rebuild2_value"], 1)
+        self.assertEqual(failure["evidence_path"], job["diagnostic_path"])
         self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
 
     def test_failed_summary_points_to_findings_and_never_blanks(self) -> None:

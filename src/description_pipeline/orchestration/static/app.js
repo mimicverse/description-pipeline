@@ -1170,6 +1170,24 @@ function buildFailureCard(failure, report) {
     meaning.textContent = failure.meaning;
     card.append(meaning);
   }
+  for (const [label, value] of [
+    ["Error code", failure.error_code],
+    ["Phase", failure.phase],
+    ["Cause", failure.cause],
+    ["Evidence path", failure.evidence_path],
+  ]) {
+    if (value === undefined || value === null || value === "") continue;
+    const line = document.createElement("p");
+    line.textContent = `${label}: ${value}`;
+    card.append(line);
+  }
+  if (failure.values && typeof failure.values === "object") {
+    const line = document.createElement("p");
+    line.className = "muted small";
+    line.textContent = `Recorded values: ${inlineValue(failure.values)}`;
+    card.append(line);
+    appendEvidence(card, "Recorded failure values", failure.values);
+  }
   if (failedChecks.length) {
     const heading = document.createElement("p");
     heading.textContent = `Failed automatic checks (${failedChecks.length}):`;
