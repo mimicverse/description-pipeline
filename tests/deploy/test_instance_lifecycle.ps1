@@ -201,6 +201,26 @@ Check 'windows_recovery.net_tcp_no_match' (Test-NetTcpNoMatchError ([pscustomobj
   CategoryInfo=[pscustomobject]@{Category='ObjectNotFound'}
   FullyQualifiedErrorId='CmdletizationQuery_NotFound_LocalPort,Get-NetTCPConnection'
 }))
+Check 'windows_recovery.net_tcp_no_match_without_property' (Test-NetTcpNoMatchError ([pscustomobject]@{
+  CategoryInfo=[pscustomobject]@{Category='ObjectNotFound'}
+  FullyQualifiedErrorId='CmdletizationQuery_NotFound,Get-NetTCPConnection'
+}))
+foreach ($invalid in @(
+  @('PermissionDenied', 'CmdletizationQuery_NotFound,Get-NetTCPConnection'),
+  @('InvalidOperation', 'CmdletizationQuery_NotFound_LocalPort,Get-NetTCPConnection'),
+  @('ObjectNotFound', 'CmdletizationQuery_NotFound,Get-NetUDPEndpoint'),
+  @('ObjectNotFound', 'CmdletizationQuery_NotFound_,Get-NetTCPConnection'),
+  @('ObjectNotFound', 'ProviderFailure,Get-NetTCPConnection'),
+  @('ObjectNotFound', 'PrefixCmdletizationQuery_NotFound,Get-NetTCPConnection'),
+  @('ObjectNotFound', 'CmdletizationQuery_NotFound,Get-NetTCPConnectionSuffix')
+)) {
+  Check ('windows_recovery.net_tcp_invalid_' + $invalid[0] + '_' + $invalid[1]) (-not (
+    Test-NetTcpNoMatchError ([pscustomobject]@{
+      CategoryInfo=[pscustomobject]@{Category=$invalid[0]}
+      FullyQualifiedErrorId=$invalid[1]
+    })
+  ))
+}
 Check 'windows_recovery.net_tcp_not_found_text_is_not_enough' (-not (Test-NetTcpNoMatchError ([pscustomobject]@{
   CategoryInfo=[pscustomobject]@{Category='InvalidOperation'}
   FullyQualifiedErrorId='ProviderFailure'
