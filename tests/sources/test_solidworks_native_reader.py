@@ -351,6 +351,10 @@ class _Extension:
             raise RuntimeError("fixture entity has no persistent reference")
         return list(reference)
 
+    def Rebuild(self, options):
+        self.NeedsRebuild2 = 0
+        return True
+
 
 class _ConfigurationManager:
     """Reflects the document's *currently shown* configuration at each read."""
@@ -438,8 +442,7 @@ class _Doc:
         return os.path.basename(self._path)
 
     def ForceRebuild3(self, _force):
-        self.Extension.NeedsRebuild2 = 0
-        return True
+        raise AssertionError("capture rebuild must use IModelDocExtension.Rebuild")
 
     def GetType(self):
         return self._doc_type

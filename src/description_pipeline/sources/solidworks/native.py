@@ -788,6 +788,7 @@ COMPONENT_SUPPRESSED = 0
 COMPONENT_LIGHTWEIGHT = 1
 COMPONENT_FULLY_LIGHTWEIGHT = 4
 COMPONENT_INTERNAL_ID_MISMATCH = 5
+REBUILD_OPTIONS_FORCE_ALL = 2
 _COMPONENT_STATES = (0, 1, 2, 3, 4)
 
 
@@ -4519,10 +4520,18 @@ class SolidWorksBackend(CadBackend):
         # mass cache. A document explicitly marked as fully rebuilt already has
         # the saved representation to capture: rebuilding it again changes
         # native tessellation and physical read-back state. Rebuild only the
-        # documented non-zero states; never save either path.
+        # documented non-zero states; never save either path. The extension
+        # primitive is required after dependency resolution: the legacy
+        # ForceRebuild3 call can return true there while the document-level
+        # NeedsRebuild2 status remains non-zero.
         if rebuilt:
             try:
-                rebuild_result = _member(doc, "ForceRebuild3", False)
+                extension = _member(doc, "Extension")
+                rebuild_result = _member(
+                    extension,
+                    "Rebuild",
+                    REBUILD_OPTIONS_FORCE_ALL,
+                )
             except Exception as error:  # noqa: BLE001 - raw COM failures need stable evidence
                 raise CadError(
                     "cad_rebuild_failed",
@@ -4610,7 +4619,7 @@ class SolidWorksBackend(CadBackend):
             "used_api": (
                 "IModelDocExtension.NeedsRebuild2/"
                 "IConfiguration.NeedsRebuild/"
-                "IModelDoc2.ForceRebuild3(False)"
+                "IModelDocExtension.Rebuild(swForceRebuildAll=2)"
                 if rebuilt
                 else "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild"
             ),
