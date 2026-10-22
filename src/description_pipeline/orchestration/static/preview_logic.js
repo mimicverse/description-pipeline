@@ -43,6 +43,7 @@ function warningSortKey(row) {
     row.reason,
     JSON.stringify(row.original),
     JSON.stringify(row.actual),
+    JSON.stringify(row.native_observation_errors),
   ]
     .map((value) => (value === undefined || value === null ? "" : String(value)))
     .join("\u0000");
@@ -80,6 +81,16 @@ export function warningSourceRows(warning) {
         rule_version:
           warningString(row.rule_version) || warningString(detail.rule_version) || warningString(warning.rule_version),
         reason: warningString(row.reason) || warningString(detail.reason) || warningString(warning.reason),
+        file: warningString(row.file) || warningString(detail.file),
+        sha256: warningString(row.sha256) || warningString(detail.sha256),
+        anchor: warningString(row.anchor) || warningString(detail.anchor),
+        key: warningString(row.key) || warningString(detail.key),
+        reference: warningString(row.reference) || warningString(detail.reference),
+        native_observation_errors: Array.isArray(
+          copyWarningValue(row, detail, "native_observation_errors"),
+        )
+          ? copyWarningValue(row, detail, "native_observation_errors")
+          : [],
       };
       const key = warningSortKey(normalized);
       if (seen.has(key)) return null;
@@ -88,6 +99,16 @@ export function warningSourceRows(warning) {
     })
     .filter(Boolean)
     .sort((left, right) => warningSortKey(left).localeCompare(warningSortKey(right), "en"));
+}
+
+export function registeredQualityArtifact(preview, runId) {
+  const digest = preview?.report_files?.["reports/quality.json"];
+  if (!runId || typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) return null;
+  return {
+    name: "reports/quality.json",
+    sha256: digest,
+    href: `/api/runs/${encodeURIComponent(runId)}/artifacts/reports/quality.json`,
+  };
 }
 
 // A verified delivery remains visible when it carries source warnings.

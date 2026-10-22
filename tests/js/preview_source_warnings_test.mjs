@@ -7,7 +7,7 @@ const logicSource = readFileSync(new URL("preview_logic.js", staticDir), "utf8")
 const logic = await import(
   `data:text/javascript;base64,${Buffer.from(logicSource, "utf8").toString("base64")}`
 );
-const { previewDiagnosticState, warningSourceRows } = logic;
+const { previewDiagnosticState, registeredQualityArtifact, warningSourceRows } = logic;
 const app = readFileSync(new URL("app.js", staticDir), "utf8");
 
 const warning = {
@@ -27,6 +27,12 @@ const warning = {
         native_cad_ranges: false,
         hardware_qualified: false,
         engineering_position_range_qualified: false,
+        file: "records/record.json",
+        sha256: "b".repeat(64),
+        anchor: '"limits"',
+        key: "limits",
+        reference: "joints/left.json#limits",
+        native_observation_errors: [{ mate: "native_limit", reason: "unreadable" }],
       },
       {
         object_type: "joint",
@@ -56,6 +62,30 @@ for (const row of rows) {
   assert.equal(row.rule_id, "engineering_rotation_default_window/v1");
   assert.equal(row.rule_version, "v1");
 }
+assert.deepEqual(rows[0].native_observation_errors, [
+  { mate: "native_limit", reason: "unreadable" },
+]);
+assert.equal(rows[0].file, "records/record.json");
+assert.equal(rows[0].sha256, "b".repeat(64));
+assert.equal(rows[0].anchor, '"limits"');
+assert.equal(rows[0].key, "limits");
+assert.equal(rows[0].reference, "joints/left.json#limits");
+assert.deepEqual(
+  registeredQualityArtifact(
+    { report_files: { "reports/quality.json": "a".repeat(64) } },
+    "run/id",
+  ),
+  {
+    name: "reports/quality.json",
+    sha256: "a".repeat(64),
+    href: "/api/runs/run%2Fid/artifacts/reports/quality.json",
+  },
+);
+assert.equal(registeredQualityArtifact({ report_files: {} }, "run"), null);
+assert.equal(
+  registeredQualityArtifact({ report_files: { "reports/quality.json": "A".repeat(64) } }, "run"),
+  null,
+);
 assert.deepEqual(previewDiagnosticState({ verified: false, warnings: [] }), {
   visible: true,
   unverified: true,
@@ -72,11 +102,15 @@ for (const token of [
   "diagnostic.warnings.length",
   "Source warnings",
   "appendWarningSourceRows",
+  "registeredQualityArtifact",
+  "Open registered quality report",
+  "link.textContent",
   "replaceChildren()",
   "textContent",
 ]) {
   assert.ok(renderer.includes(token), token);
 }
+assert.ok(app.includes("native_observation_errors"));
 assert.equal(renderer.includes("innerHTML"), false);
 assert.equal(renderer.includes("insertAdjacentHTML"), false);
 console.log("preview_source_warnings_test OK");

@@ -1168,6 +1168,78 @@ class ValueWarningTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "reused across joint identities"):
             _value_warning_gate(self.root, reused_source, reused_model)
 
+    def test_native_selected_author_placeholder_keeps_evidence_without_replacing_native_limits(self):
+        limits = {"lower": -1.5, "upper": 1.5, "effort": 1.0, "velocity": 1.0}
+        author_evidence = {
+            "kind": "controlled_record",
+            "file": "records/record_arm.txt",
+            "sha256": "a" * 64,
+            "anchor": '"limits"',
+            "key": "limits",
+            "reference": "joints/arm.json#limits",
+            "declared_values": {"lower": 0.0, "upper": 0.0},
+            "native_observation_errors": [],
+        }
+        node = ET.fromstring(
+            "<joint name='right_elbow_pitch_joint' type='revolute'>"
+            "<parent link='base'/><child link='tool'/>"
+            "<origin xyz='0 0 0' rpy='0 0 0'/><axis xyz='0 0 1'/>"
+            "<limit lower='-1.5' upper='1.5' effort='1' velocity='1'/>"
+            "</joint>"
+        )
+        authored = {
+            "name": "right_elbow_pitch_joint",
+            "type": "revolute",
+            "parent": "base",
+            "child": "tool",
+            "axis": [0.0, 0.0, 1.0],
+            "limits": limits,
+            "limit_source": "native",
+            "limit_evidence": copy.deepcopy(author_evidence),
+        }
+        canonical = {
+            **authored,
+            "xyz": [0.0, 0.0, 0.0],
+            "rpy": [0.0, 0.0, 0.0],
+            "provenance": {"limits_evidence": copy.deepcopy(author_evidence)},
+        }
+        body_datums = {"base": np.eye(4), "tool": np.eye(4)}
+        self.assertEqual(
+            _joint(node, authored, canonical, {}, body_datums, [])["limits"],
+            limits,
+        )
+        forged = copy.deepcopy(canonical)
+        forged["provenance"]["limits_evidence"]["sha256"] = "b" * 64
+        with self.assertRaisesRegex(PipelineError, "exact embedded controlled record"):
+            _joint(node, authored, forged, {}, body_datums, [])
+
+        source = copy.deepcopy(self.source)
+        source["joints"] = [authored]
+        model = copy.deepcopy(self.model)
+        model["joints"] = [
+            {
+                "name": "right_elbow_pitch_joint",
+                "limits": limits,
+                "provenance": {"limits_evidence": copy.deepcopy(author_evidence)},
+            }
+        ]
+        next(
+            item for item in model["provenance"]["value_warnings"] if item["code"] == "geometry.derived_from_native"
+        )["objects"].append(
+            {
+                "object_type": "joint",
+                "object": "right_elbow_pitch_joint",
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            }
+        )
+        self.assertGreaterEqual(_value_warning_gate(self.root, source, model)["objects"], 1)
+        foreign = copy.deepcopy(model)
+        foreign["joints"][0]["provenance"]["limits_evidence"]["anchor"] = '"forged"'
+        with self.assertRaisesRegex(PipelineError, "native-selected limits evidence"):
+            _value_warning_gate(self.root, source, foreign)
+
     def test_preview_policy_warning_gate_accepts_the_policy(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)

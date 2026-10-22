@@ -13,6 +13,7 @@ import {
   previewDiagnosticState,
   previewExpansion,
   purposeLabel,
+  registeredQualityArtifact,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
@@ -1100,6 +1101,12 @@ const WARNING_SOURCE_KEYS = new Set([
   "rule_id",
   "rule_version",
   "reason",
+  "file",
+  "sha256",
+  "anchor",
+  "key",
+  "reference",
+  "native_observation_errors",
 ]);
 
 function warningSourceText(value) {
@@ -1123,6 +1130,14 @@ function appendWarningSourceRows(parent, warning) {
       `original=${warningSourceText(row.original)}`,
       `actual=${warningSourceText(row.actual)}`,
       `reason=${warningSourceText(row.reason)}`,
+      row.file ? `file=${row.file}` : "",
+      row.sha256 ? `sha256=${row.sha256}` : "",
+      row.anchor ? `anchor=${row.anchor}` : "",
+      row.key ? `key=${row.key}` : "",
+      row.reference ? `reference=${row.reference}` : "",
+      row.native_observation_errors.length
+        ? `native_observation_errors=${warningSourceText(row.native_observation_errors)}`
+        : "",
     ].filter(Boolean);
     line.textContent = parts.join("; ");
     details.append(line);
@@ -2485,6 +2500,16 @@ function renderPreviewDiagnostic(preview) {
       "Recorded source warnings are neither passes nor publication evidence. " +
       "Default ranges are not native mechanical limits or hardware qualifications.";
     warningDetails.append(statement);
+    const qualityArtifact = registeredQualityArtifact(preview, state.dagRunId);
+    if (qualityArtifact) {
+      const link = document.createElement("a");
+      link.href = qualityArtifact.href;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.dataset.sha256 = qualityArtifact.sha256;
+      link.textContent = "Open registered quality report (reports/quality.json)";
+      warningDetails.append(link);
+    }
     for (const warning of diagnostic.warnings) {
       const group = document.createElement("div");
       group.className = "preview-warning";

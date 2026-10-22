@@ -1167,7 +1167,7 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         )
     provenance = canonical.get("provenance") if isinstance(canonical.get("provenance"), dict) else {}
 
-    def require_record_binding(source_key, model_key, fields):
+    def require_record_binding(source_key, model_key, fields, *, selected):
         source_evidence = authored.get(source_key)
         model_evidence = provenance.get(model_key)
         _require(
@@ -1185,7 +1185,10 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         _require(
             isinstance(declared, dict)
             and set(declared) == set(fields)
-            and all(declared[field] == limits[field] for field in fields),
+            and (
+                not selected
+                or all(declared[field] == limits[field] for field in fields)
+            ),
             f"Joint {model_key} disagrees with its affected fields",
         )
         if source_key == "limit_evidence":
@@ -1197,13 +1200,23 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
     if (
         limit_source == "declared_author" and authored["type"] != "continuous"
     ) or authored.get("limit_evidence") is not None:
-        require_record_binding("limit_evidence", "limits_evidence", ("lower", "upper"))
+        require_record_binding(
+            "limit_evidence",
+            "limits_evidence",
+            ("lower", "upper"),
+            selected=limit_source == "declared_author",
+        )
     _require(
         authored.get("drive_source") != "controlled" or authored.get("drive_evidence") is not None,
         "Controlled drive is missing its embedded-record evidence",
     )
     if authored.get("drive_evidence") is not None:
-        require_record_binding("drive_evidence", "drive_evidence", ("effort", "velocity"))
+        require_record_binding(
+            "drive_evidence",
+            "drive_evidence",
+            ("effort", "velocity"),
+            selected=True,
+        )
     unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
         unqualified.append("degenerate_position_range")
@@ -2781,13 +2794,25 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
             model_joint.get("provenance") if isinstance((model_joint or {}).get("provenance"), dict) else {}
         )
 
-        def observe_evidence(evidence, fields, limits=model_limits, joint_name=joint["name"]):
+        def observe_evidence(
+            evidence,
+            fields,
+            *,
+            selected,
+            limits=model_limits,
+            joint_name=joint["name"],
+        ):
             declared = evidence.get("declared_values")
             _require(
                 isinstance(declared, dict)
                 and set(declared) == set(fields)
-                and all(field in limits for field in fields)
-                and all(declared[field] == limits[field] for field in fields),
+                and (
+                    not selected
+                    or (
+                        all(field in limits for field in fields)
+                        and all(declared[field] == limits[field] for field in fields)
+                    )
+                ),
                 "A controlled record no longer binds its delivered joint fields",
             )
             _require(
@@ -2812,7 +2837,7 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
                     model_provenance.get("limits_evidence") == limit_evidence,
                     "Model limits evidence is missing, foreign, or differs from the controlled record",
                 )
-                observe_evidence(limit_evidence, ("lower", "upper"))
+                observe_evidence(limit_evidence, ("lower", "upper"), selected=True)
             declared = limit_evidence.get("declared_values") or {}
             for field in (() if joint.get("type") == "continuous" else ("lower", "upper")):
                 declared_author_limits.append(
@@ -2834,6 +2859,12 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
                         "reason": "controlled author position range is not a native CAD reading",
                     }
                 )
+        elif limit_evidence:
+            _require(
+                model_provenance.get("limits_evidence") == limit_evidence,
+                "Model native-selected limits evidence is missing, foreign, or forged",
+            )
+            observe_evidence(limit_evidence, ("lower", "upper"), selected=False)
         _require(
             joint.get("drive_source") != "controlled" or bool(drive_evidence),
             "Controlled drive evidence is missing from the independent source",
@@ -2843,7 +2874,7 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
                 model_provenance.get("drive_evidence") == drive_evidence,
                 "Model drive evidence is missing, foreign, or differs from the controlled record",
             )
-            observe_evidence(drive_evidence, ("effort", "velocity"))
+            observe_evidence(drive_evidence, ("effort", "velocity"), selected=True)
             declared = drive_evidence.get("declared_values") or {}
             for field in ("effort", "velocity"):
                 row = {
