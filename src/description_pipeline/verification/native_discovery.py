@@ -2452,7 +2452,43 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             "native position-limit observations disagree for one joint",
             {"pair": [left, right], "ranges": sorted(validated_native)},
         )
-        if native_read_errors and (validated_native or isinstance(native_limits, dict) or joint_type != "revolute"):
+        author_limits = None
+        author_evidence = None
+        author_reference = properties.get(f"{namespace}.joint.limits_record")
+        if isinstance(author_reference, str) and author_reference.strip():
+            entry = _find_record_entry(payload, author_reference)
+            value = _record_value(package, entry["entry"], entry["key"])
+            _require(
+                isinstance(value, dict),
+                "discovery.joint_limits_invalid",
+                "controlled limits record must contain an object",
+                {"pair": [left, right], "reference": author_reference},
+            )
+            try:
+                author_lower = float(value["lower"])
+                author_upper = float(value["upper"])
+            except (KeyError, TypeError, ValueError):
+                raise _Failure(
+                    "discovery.joint_limits_invalid",
+                    "controlled limits record lacks finite lower/upper values",
+                    {"pair": [left, right], "reference": author_reference},
+                ) from None
+            _require(
+                math.isfinite(author_lower)
+                and math.isfinite(author_upper)
+                and author_lower <= author_upper,
+                "discovery.joint_limits_invalid",
+                "controlled position limits must be finite and ordered",
+                {"pair": [left, right], "lower": author_lower, "upper": author_upper},
+            )
+            author_limits = (author_lower, author_upper)
+            author_evidence = {
+                "file": entry["entry"].get("package_file"),
+                "sha256": entry["entry"].get("sha256"),
+                "anchor": entry["entry"].get("anchor"),
+                "value": value,
+            }
+        if native_read_errors and (validated_native or isinstance(native_limits, dict)):
             raise _Failure(
                 "discovery.joint_limits_unreadable",
                 "native position-limit evidence is incomplete or unreadable",
@@ -2468,6 +2504,12 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "a continuous joint carries native position limits",
                 {"pair": [left, right]},
             )
+            _require(
+                author_limits is None,
+                "discovery.joint_limits_unexpected",
+                "a continuous joint declares an author position range",
+                {"pair": [left, right]},
+            )
         elif isinstance(native_limits, dict):
             expected_unit = "m" if joint_type == "prismatic" else "rad"
             _require(
@@ -2477,7 +2519,18 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 {"pair": [left, right], "unit": native_limits.get("unit")},
             )
             limits = {"lower": float(native_limits["lower"]), "upper": float(native_limits["upper"])}
+            if author_limits not in {None, (0.0, 0.0), (limits["lower"], limits["upper"])}:
+                raise _Failure(
+                    "discovery.joint_limits_conflict",
+                    "native range disagrees with the saved author declaration",
+                    {"pair": [left, right], "native": limits, "declared": author_limits},
+                )
+            limit_evidence = author_evidence
             limit_source = "native"
+        elif author_limits is not None:
+            limits = {"lower": author_limits[0], "upper": author_limits[1]}
+            limit_source = "declared_author"
+            limit_evidence = author_evidence
         elif purpose == "engineering" and joint_type == "revolute":
             default_policy = rotation_window_policy(
                 ENGINEERING_DEFAULT_POLICY_ID,
@@ -2491,6 +2544,12 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             )
             limits = {"lower": -ROTATION_WINDOW_RAD, "upper": ROTATION_WINDOW_RAD}
             limit_source = "default_policy"
+        elif native_read_errors:
+            raise _Failure(
+                "discovery.joint_limits_unreadable",
+                "native position-limit evidence is incomplete or unreadable",
+                {"pair": [left, right], "errors": native_read_errors},
+            )
         else:
             raise _Failure(
                 "discovery.joint_rebuild",
@@ -4150,6 +4209,25 @@ def verify_discovery(package: Path) -> dict:
                     "discovery.joints",
                     "the engineering default window is not its exact versioned contract",
                     {"joint": joint.get("name")},
+                )
+            elif joint.get("limit_source") == "declared_author" and expected_type in {"revolute", "prismatic"}:
+                _require(
+                    group["limits"] is None,
+                    "discovery.joints",
+                    "a declared author range cannot replace readable native limits",
+                    {"joint": joint.get("name")},
+                )
+                _require(
+                    isinstance(limits.get("lower"), (int, float))
+                    and not isinstance(limits.get("lower"), bool)
+                    and isinstance(limits.get("upper"), (int, float))
+                    and not isinstance(limits.get("upper"), bool)
+                    and math.isfinite(float(limits["lower"]))
+                    and math.isfinite(float(limits["upper"]))
+                    and limits["lower"] <= limits["upper"],
+                    "discovery.joints",
+                    "a declared author range is not finite and ordered",
+                    {"joint": joint.get("name"), "limits": limits},
                 )
             else:
                 _require(

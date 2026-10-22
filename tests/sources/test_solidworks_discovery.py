@@ -309,7 +309,7 @@ class DiscoveryTests(unittest.TestCase):
 
     # ------------------------------------------------------------------ helpers
 
-    def _native(self) -> tuple[Path, Path]:
+    def _native(self, joint_record: dict | None = None) -> tuple[Path, Path]:
         self.serial += 1
         root = self.tmp / f"native{self.serial}"
         for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
@@ -320,7 +320,10 @@ class DiscoveryTests(unittest.TestCase):
         path = records / "joints" / "arm.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"limits": {"lower": -1.5, "upper": 1.5}, "drive": {"effort": 6.0, "velocity": 2.0}}),
+            json.dumps(
+                joint_record
+                or {"limits": {"lower": -1.5, "upper": 1.5}, "drive": {"effort": 6.0, "velocity": 2.0}}
+            ),
             encoding="utf-8",
         )
         (records / "budget.json").write_text(
@@ -329,8 +332,8 @@ class DiscoveryTests(unittest.TestCase):
         )
         return root, records
 
-    def _prepare(self, *, mutate=None, settings=None):
-        source, records = self._native()
+    def _prepare(self, *, mutate=None, settings=None, joint_record=None):
+        source, records = self._native(joint_record)
         payload = record()
         if mutate is not None:
             mutate(payload)
@@ -1258,6 +1261,116 @@ class DiscoveryTests(unittest.TestCase):
         joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
         self.assertNotIn("effort", joint["limits"])
         self.assertNotIn("velocity", joint["limits"])
+
+    def test_mate_author_limits_precede_engineering_default(self):
+        def mutate(payload):
+            payload["mates"][0]["limits"] = None
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
+                "dp.joint.limits_record"
+            ] = "joints/arm.json#limits"
+
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
+        self.assertEqual(joint["limit_source"], "declared_author")
+        self.assertEqual(joint["limits"], {"lower": -1.5, "upper": 1.5, "effort": 6.0, "velocity": 2.0})
+        self.assertNotIn("default_policy", joint)
+        self.assertNotIn("discovery.joint_default_policy", {item["code"] for item in result.findings})
+        self.assertTrue(self._verify(output)["passed"])
+
+    def test_explicit_zero_author_range_is_preserved_not_treated_as_missing(self):
+        record_value = {
+            "limits": {"lower": 0.0, "upper": 0.0},
+            "drive": {"effort": 6.0, "velocity": 2.0},
+        }
+
+        def mutate(payload):
+            payload["mates"][0]["limits"] = None
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
+                "dp.joint.limits_record"
+            ] = "joints/arm.json#limits"
+
+        result, _source, output = self._prepare(mutate=mutate, joint_record=record_value)
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
+        self.assertEqual(joint["limit_source"], "declared_author")
+        self.assertEqual((joint["limits"]["lower"], joint["limits"]["upper"]), (0.0, 0.0))
+        self.assertNotIn("default_policy", joint)
+        finding = next(item for item in result.findings if item["code"] == "discovery.joint_limits_degenerate")
+        self.assertFalse(finding["blocking"])
+        self.assertTrue(self._verify(output)["passed"])
+
+    def test_invalid_author_range_blocks_before_engineering_default(self):
+        record_value = {
+            "limits": {"lower": 2.0, "upper": -2.0},
+            "drive": {"effort": 6.0, "velocity": 2.0},
+        }
+
+        def mutate(payload):
+            payload["mates"][0]["limits"] = None
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
+                "dp.joint.limits_record"
+            ] = "joints/arm.json#limits"
+
+        result, _source, _output = self._prepare(mutate=mutate, joint_record=record_value)
+        self.assertIn("discovery.joint_limits_invalid", self._codes(result))
+        self.assertNotIn("discovery.joint_default_policy", {item["code"] for item in result.findings})
+
+        baseline, _source, baseline_output = self._prepare(mutate=mutate)
+        self.assertTrue(baseline.passed, baseline.findings)
+        payload = json.loads((baseline_output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        limits_entry = next(item for item in payload["records"] if item["key"] == "limits")
+        invalid_bytes = json.dumps(record_value).encode("utf-8")
+        (baseline_output / limits_entry["package_file"]).write_bytes(invalid_bytes)
+        limits_entry["sha256"] = hashlib.sha256(invalid_bytes).hexdigest()
+        with self.assertRaisesRegex(Exception, "finite and ordered"):
+            rebuild_joint_facts(payload, baseline_output, purpose="engineering")
+
+    def test_native_valid_range_conflicts_with_nonzero_author_record(self):
+        record_value = {
+            "limits": {"lower": -2.0, "upper": 2.0},
+            "drive": {"effort": 6.0, "velocity": 2.0},
+        }
+
+        def mutate(payload):
+            payload["mates"][0]["limits"] = {"lower": -1.0, "upper": 1.0, "unit": "rad"}
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
+                "dp.joint.limits_record"
+            ] = "joints/arm.json#limits"
+
+        result, _source, _output = self._prepare(mutate=mutate, joint_record=record_value)
+        self.assertIn("discovery.joint_limits_conflict", self._codes(result))
+
+    def test_unreadable_native_limit_uses_default_and_retains_read_errors(self):
+        payload = record()
+        cluster_findings: list[dict] = []
+        clusters = _clusters(payload, cluster_findings)
+        self.assertFalse(cluster_findings)
+        payload["mates"][0].update(
+            {
+                "type": "limitangle",
+                "limits": None,
+                "is_advanced_mate": True,
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+                "native_limit": {"type_index": 6},
+            }
+        )
+        payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop("dp.joint.drive_record")
+        clusters.pairs[("arm-1", "base-1")]["limits"] = None
+        findings: list[dict] = []
+        joints = _joint_facts(payload, clusters, DiscoverySettings(), findings)
+        self.assertEqual(joints[0]["limit_source"], "default_policy")
+        self.assertEqual(
+            (joints[0]["limits"]["lower"], joints[0]["limits"]["upper"]),
+            (-math.pi, math.pi),
+        )
+        policy = joints[0]["default_policy"]
+        self.assertEqual(policy["native_absence"], "native_limit_observation_unreadable")
+        self.assertTrue(policy["native_observation_errors"])
+        self.assertFalse(any(item["blocking"] for item in findings), findings)
 
     def test_continuous_mate_joint_without_position_range_keeps_only_drive(self):
         def mutate(payload):

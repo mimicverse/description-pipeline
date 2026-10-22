@@ -2041,8 +2041,42 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "native position-limit evidence is readable but invalid", {"errors": native_limit_invalid},
             ))
             continue
+        declared_limit = None
+        declared_bounds = None
+        declared_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
+        if _text(declared_ref):
+            declared_limit = _resolve_record(settings, str(declared_ref), findings, obj)
+            if declared_limit is None:
+                continue
+            try:
+                declared_lower = float(declared_limit["value"]["lower"])
+                declared_upper = float(declared_limit["value"]["upper"])
+            except (KeyError, TypeError, ValueError):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "controlled record lacks finite lower/upper limits",
+                        {"file": declared_limit["file"]},
+                    )
+                )
+                continue
+            if (
+                not (math.isfinite(declared_lower) and math.isfinite(declared_upper))
+                or declared_lower > declared_upper
+            ):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "controlled position limits must be finite and ordered",
+                        {"file": declared_limit["file"], "lower": declared_lower, "upper": declared_upper},
+                    )
+                )
+                continue
+            declared_bounds = (declared_lower, declared_upper)
         default_allowed = settings.purpose == PURPOSE_ENGINEERING and joint_type == "revolute"
-        if native_limit_errors and (native_limit_values or isinstance(native, dict) or not default_allowed):
+        if native_limit_errors and (native_limit_values or isinstance(native, dict)):
             findings.append(
                 _finding(
                     "discovery.joint_limits_unreadable",
@@ -2101,48 +2135,27 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 ))
                 continue
             limit_source = "native"
-            native_record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
-            if _text(native_record_ref):
-                declared = _resolve_record(settings, str(native_record_ref), findings, obj)
-                if declared is not None:
-                    try:
-                        lower = float(declared["value"]["lower"])
-                        upper = float(declared["value"]["upper"])
-                    except (KeyError, TypeError, ValueError):
-                        findings.append(
-                            _finding(
-                                "discovery.joint_limits_invalid",
-                                obj,
-                                "controlled record lacks finite lower/upper limits",
-                                {"file": declared["file"]},
-                            )
-                        )
-                        continue
-                    if not (math.isfinite(lower) and math.isfinite(upper)):
-                        findings.append(
-                            _finding("discovery.joint_limits_invalid", obj, "controlled position limits must be finite")
-                        )
-                        continue
-                    if abs(lower - limits["lower"]) > 1e-12 or abs(upper - limits["upper"]) > 1e-12:
+            if declared_bounds is not None:
+                declared_lower, declared_upper = declared_bounds
+                if declared_bounds not in {(0.0, 0.0), (limits["lower"], limits["upper"])}:
                         findings.append(
                             _finding(
                                 "discovery.joint_limits_conflict",
                                 obj,
                                 "native mate limits and the controlled record disagree",
-                                {"native": limits, "record": {"lower": lower, "upper": upper}},
+                                {"native": limits, "record": {"lower": declared_lower, "upper": declared_upper}},
                             )
                         )
                         continue
-                    limit_evidence = declared
+                limit_evidence = declared_limit
         elif joint_type == "continuous":
-            declared_range = properties.get(f"{NAMESPACE}.joint.limits_record")
-            if _text(declared_range):
+            if declared_bounds is not None:
                 findings.append(
                     _finding(
                         "discovery.joint_limits_unexpected",
                         obj,
                         "a continuous joint references a declared position range",
-                        {"record": declared_range},
+                        {"record": declared_ref},
                     )
                 )
                 continue
@@ -2150,6 +2163,10 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             # attached below, independently of native/fallback position policy.
             limits = None
             limit_source = None
+        elif declared_bounds is not None:
+            limits = {"lower": declared_bounds[0], "upper": declared_bounds[1]}
+            limit_source = "declared_author"
+            limit_evidence = declared_limit
         elif default_allowed:
             default_policy = rotation_window_policy(
                 ENGINEERING_DEFAULT_POLICY_ID,
@@ -2168,6 +2185,16 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "engineering uses the versioned non-native default rotation window; the range is unqualified",
                 default_policy, blocking=False,
             ))
+        elif native_limit_errors:
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_unreadable",
+                    obj,
+                    "native position-limit evidence is incomplete or unreadable",
+                    {"errors": native_limit_errors},
+                )
+            )
+            continue
         else:
             findings.append(_finding(
                 "discovery.joint_limits_missing", obj,
@@ -2214,6 +2241,17 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 continue
             if default_policy is not None:
                 limits.update(effort=effort, velocity=velocity_value)
+        if joint_type != "continuous" and limits is not None and limits["lower"] == limits["upper"]:
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_degenerate",
+                    obj,
+                    "equal authored position bounds are retained for capture and generation; "
+                    "a usable joint range is not qualified",
+                    {"limits": limits, "qualification_blocker": "usable_joint_range"},
+                    blocking=False,
+                )
+            )
         joints.append(
             {
                 "mate": name,
