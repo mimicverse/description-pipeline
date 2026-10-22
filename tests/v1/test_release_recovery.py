@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import subprocess
 import sys
@@ -30,6 +31,19 @@ class Result:
 
 
 class ReleaseRecoveryTests(unittest.TestCase):
+    def add_promotion_history(self, receipt):
+        names = [
+            "linux-generation", "windows-generation", "close-admission", "drain", "backup", "stop-services",
+            "schema-migration", "windows-switch", "endpoint-identity", "switch-pointer", "config-reference",
+            "start-services", "verify", "open-admission",
+        ]
+        receipt["plan"] = names + receipt["plan"]
+        prefix = [{"verb": "promote", "step": name, "status": "completed"} for name in names]
+        receipt["steps"] = prefix + receipt["steps"]
+        for index, row in enumerate(receipt["steps"], 1):
+            row["seq"] = index
+        return receipt
+
     def make_inputs(self, root: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
         release = {
             "version": "1.5.0",
@@ -594,6 +608,9 @@ class ReleaseRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = self.completed_finalize_inputs(root)
+            history_path = Path(args.code_rollback_receipt)
+            history = self.add_promotion_history(json.loads(history_path.read_text()))
+            history_path.write_text(json.dumps(history), encoding="utf-8")
             calls = []
 
             def runner(argv, **_kwargs):
@@ -650,6 +667,55 @@ class ReleaseRecoveryTests(unittest.TestCase):
             before = len(calls)
             self.assertEqual(release_recovery.finalize(args), 0)
             self.assertEqual(len(calls), before)
+
+    def test_code_rollback_accepts_phase_history_and_latest_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.completed_finalize_inputs(Path(directory))
+            path = Path(args.code_rollback_receipt)
+            rollback_only = json.loads(path.read_text())
+            mixed = self.add_promotion_history(copy.deepcopy(rollback_only))
+            retried = copy.deepcopy(mixed)
+            retried["steps"].insert(14, {"verb": "rollback", "step": "rollback-close", "status": "failed"})
+            for history in (rollback_only, mixed, retried):
+                with self.subTest(rows=len(history["steps"])):
+                    path.write_text(json.dumps(history), encoding="utf-8")
+                    self.assertEqual(
+                        release_recovery.validate_code_rollback(path, args.install_id, args_release(args)), history
+                    )
+
+    def test_code_rollback_rejects_invalid_history_and_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.completed_finalize_inputs(Path(directory))
+            path = Path(args.code_rollback_receipt)
+            original = self.add_promotion_history(json.loads(path.read_text()))
+            mutations = {
+                "foreign_verb": lambda d: d["steps"][0].update(verb="foreign"),
+                "bad_promote": lambda d: d["steps"][0].update(status="foreign"),
+                "empty_step": lambda d: d["steps"][0].update(step=""),
+                "unknown_step": lambda d: d["steps"][0].update(step="not-in-plan"),
+                "failed_rollback": lambda d: d["steps"][-1].update(status="failed"),
+                "unknown_rollback": lambda d: d["steps"][-1].update(status="unknown"),
+                "missing_step": lambda d: d["steps"].pop(),
+                "later_failure": lambda d: d["steps"].append(
+                    {"verb": "rollback", "step": "rollback-close", "status": "failed"}
+                ),
+                "promote_cannot_complete_rollback": lambda d: d["steps"][-1].update(verb="promote"),
+                "wrong_install": lambda d: d.update(install_id="foreign"),
+                "wrong_from": lambda d: d.update({"from": str(Path(directory) / "missing")}),
+                "wrong_hash": lambda d: d.update(from_sha256="0" * 64),
+            }
+            for name, mutate in mutations.items():
+                with self.subTest(name=name):
+                    history = copy.deepcopy(original)
+                    mutate(history)
+                    path.write_text(json.dumps(history), encoding="utf-8")
+                    with self.assertRaises(release_recovery.GateError):
+                        release_recovery.validate_code_rollback(path, args.install_id, args_release(args))
+            path.write_text(json.dumps(original), encoding="utf-8")
+            with self.assertRaises(release_recovery.GateError):
+                release_recovery.validate_code_rollback(
+                    path, args.install_id, {**args_release(args), "source_commit": "c" * 40}
+                )
 
     def test_finalize_refuses_verify_only_gate_before_start(self):
         with tempfile.TemporaryDirectory() as directory:
