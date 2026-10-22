@@ -27,7 +27,9 @@ function Invoke-Main {
       throw ('{"token":"SECRET_JSON","password":"SECRET SPACE"} Bearer SECRET_BEARER ' +
         'postgresql://user:SECRET_URI@host/db Password=SECRET_DSN; ' + ('long' * 400))
     }
-    'paths' { throw 'UNC "\\SECRET_HOST\SECRET_SHARE\name" FileSystem::SECRET_PROVIDER\path file://SECRET_FILE/path' }
+    'paths' {
+      throw 'Drive "C:\Program Files\SECRET_DIR\file" UNC "\\SECRET_HOST\SECRET SHARE\name" FileSystem::SECRET_PROVIDER\path file://SECRET_FILE/path'
+    }
   }
   # A wrapped native-style exception retains both the wrapper and base HResult.
   throw [System.Reflection.TargetInvocationException]::new(

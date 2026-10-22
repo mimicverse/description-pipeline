@@ -45,7 +45,7 @@ function Protect-LifecycleDiagnostic([string]$Text, [int]$Limit = 512, [bool]$Hi
   $safe = $safe -replace '(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+:[^\s/@]+@', '$1[redacted]@'
   if ($HidePaths) {
     $safe = $safe -replace '(?i)(?:FileSystem::|file://|\\\\)[^\r\n"''<>]*', '[path]'
-    $safe = $safe -replace '(?i)(?:[A-Z]:[\\/]|/)[^\s"''<>]*', '[path]'
+    $safe = $safe -replace '(?i)(?:[A-Z]:[\\/]|/)[^\r\n"''<>]*', '[path]'
   }
   $safe = $safe -replace '[\x00-\x1f\x7f]', ' '
   if ($safe.Length -gt $Limit) { $safe = $safe.Substring(0, $Limit) }
