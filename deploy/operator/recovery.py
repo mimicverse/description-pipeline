@@ -46,6 +46,7 @@ import os
 import re
 import secrets
 import selectors
+import signal
 import shlex
 import shutil
 import socket
@@ -5020,6 +5021,127 @@ def _write_transfer_evidence(path: Path, payload: bytes) -> dict:
         temporary_path.unlink(missing_ok=True)
 
 
+def _capture_transfer_process(argv: list[str], *, timeout: int, sensitive_values: tuple[bytes, ...]):
+    """Drain both byte pipes with bounded memory and streaming redaction."""
+    secrets_to_hide = tuple(sorted({value for value in sensitive_values if value}, key=len, reverse=True))
+    longest = max((len(value) for value in secrets_to_hide), default=1)
+    states = {
+        name: {
+            "hash": hashlib.sha256(),
+            "bytes": 0,
+            "pending": bytearray(),
+            "retained": bytearray(),
+            "safe_bytes": 0,
+            "redacted": False,
+        }
+        for name in ("stdout", "stderr")
+    }
+
+    def consume(name, chunk, *, final=False):
+        state = states[name]
+        state["hash"].update(chunk)
+        state["bytes"] += len(chunk)
+        state["pending"].extend(chunk)
+        pending = state["pending"]
+        limit = len(pending) if final else max(0, len(pending) - longest + 1)
+        position = 0
+        while position < limit:
+            secret = next((value for value in secrets_to_hide if pending.startswith(value, position)), None)
+            if (
+                secret is None
+                and final
+                and any(value.startswith(bytes(pending[position:])) for value in secrets_to_hide)
+            ):
+                secret = bytes(pending[position:])
+            if secret is not None:
+                output = b"<redacted>"
+                position += len(secret)
+                state["redacted"] = True
+            elif not secrets_to_hide:
+                output = bytes(pending[position:limit])
+                position = limit
+            else:
+                output = bytes(pending[position : position + 1])
+                position += 1
+            state["safe_bytes"] += len(output)
+            available = 65536 - len(state["retained"])
+            if available > 0:
+                state["retained"].extend(output[:available])
+        del pending[:position]
+
+    process = subprocess.Popen(
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+    )
+    selector = selectors.DefaultSelector()
+    interrupted = False
+    drained = True
+    capture_error = None
+    deadline = time.monotonic() + timeout
+    try:
+        for name in states:
+            selector.register(getattr(process, name), selectors.EVENT_READ, name)
+        while selector.get_map():
+            if time.monotonic() >= deadline:
+                if interrupted:
+                    drained = False
+                    break
+                interrupted = True
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                deadline = time.monotonic() + 5
+            for key, _ in selector.select(min(0.1, max(0, deadline - time.monotonic()))):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if chunk:
+                    consume(key.data, chunk)
+                else:
+                    consume(key.data, b"", final=True)
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+        for name in states:
+            consume(name, b"", final=True)
+        try:
+            returncode = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            interrupted = True
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            returncode = process.wait()
+    except OSError as error:
+        interrupted = True
+        drained = False
+        capture_error = type(error).__name__
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        returncode = process.wait()
+        for name in states:
+            consume(name, b"", final=True)
+    finally:
+        selector.close()
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        for name in states:
+            getattr(process, name).close()
+    result = subprocess.CompletedProcess(
+        argv, returncode, bytes(states["stdout"]["retained"]), bytes(states["stderr"]["retained"])
+    )
+    result.interrupted = interrupted or not drained
+    result.capture_error = capture_error
+    result.stream_observations = {
+        name: {
+            "bytes": state["bytes"],
+            "sha256": state["hash"].hexdigest(),
+            "complete": drained,
+            "truncated": state["safe_bytes"] > 65536,
+            "redacted": state["redacted"],
+            "preview": bytes(state["retained"][:2048]).decode("utf-8", errors="replace"),
+        }
+        for name, state in states.items()
+    }
+    return result
+
+
 def _windows_scp(
     *,
     ssh_host: str,
@@ -5102,7 +5224,7 @@ def _windows_scp(
         if value in {str(path) for path in sources}:
             normalized_argv[index] = f"<{phase}>/{Path(value).name}"
 
-    def preserve(completed, *, interrupted=False):
+    def preserve(completed, *, interrupted=False, error_type=None):
         detail = {
             "phase": phase,
             "argv": normalized_argv,
@@ -5113,6 +5235,8 @@ def _windows_scp(
             "remote_dir": remote_dir,
             "remote_name": remote_name,
         }
+        if error_type is not None:
+            detail["error_type"] = error_type
         if not upload:
             present = destination.is_file() and not destination.is_symlink()
             detail["download"] = {
@@ -5140,14 +5264,19 @@ def _windows_scp(
             raw = getattr(completed, stream) or b""
             if isinstance(raw, str):
                 raw = raw.encode("utf-8")
-            safe = sanitized(raw)
-            row = {
-                "bytes": len(raw),
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "truncated": len(safe) > 65536,
-                "redacted": safe != raw,
-                "preview": safe[:2048].decode("utf-8", errors="replace"),
-            }
+            observations = getattr(completed, "stream_observations", {})
+            safe = raw if stream in observations else sanitized(raw)
+            row = (
+                dict(observations[stream])
+                if stream in observations
+                else {
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "truncated": len(safe) > 65536,
+                    "redacted": safe != raw,
+                    "preview": safe[:2048].decode("utf-8", errors="replace"),
+                }
+            )
             if evidence_dir is not None:
                 try:
                     path = evidence_dir / f"{phase}.{stream}"
@@ -5176,23 +5305,27 @@ def _windows_scp(
         return detail
 
     try:
-        completed = subprocess.run(
-            argv,
-            capture_output=True,
-            text=False,
-            timeout=timeout,
-            check=False,
-        )
+        completed = _capture_transfer_process(argv, timeout=timeout, sensitive_values=sensitive_values)
     except (OSError, subprocess.SubprocessError) as error:
         interrupted = subprocess.CompletedProcess(
             argv, None, getattr(error, "stdout", None), getattr(error, "stderr", None)
         )
-        detail = preserve(interrupted, interrupted=True)
-        detail["error_type"] = type(error).__name__
+        detail = preserve(interrupted, interrupted=True, error_type=type(error).__name__)
         raise RecoveryError(code, "the Windows recovery transfer could not run", detail) from error
     commands.append(_command_evidence(normalized_argv, completed))
-    detail = preserve(completed)
+    detail = preserve(
+        completed,
+        interrupted=getattr(completed, "interrupted", False),
+        error_type=(getattr(completed, "capture_error", None) or "TimeoutExpired")
+        if getattr(completed, "interrupted", False)
+        else None,
+    )
     commands[-1]["transfer"] = detail
+    for stream in ("stdout", "stderr"):
+        commands[-1][stream + "_sha256"] = detail[stream]["sha256"]
+    if getattr(completed, "interrupted", False):
+        detail["interrupted"] = True
+        raise RecoveryError(code, "the Windows recovery transfer capture was interrupted", detail)
     require(
         completed.returncode == 0,
         code,

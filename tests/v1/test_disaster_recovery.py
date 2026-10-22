@@ -4856,6 +4856,35 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
 
 class WindowsScpEvidenceTests(unittest.TestCase):
+    def test_streaming_capture_drains_both_flooded_pipes_with_bounded_retention(self):
+        script = "import os; [(os.write(1,b'a'*65536),os.write(2,b'b'*65536)) for _ in range(64)]"
+        result = recovery._capture_transfer_process([sys.executable, "-c", script], timeout=20, sensitive_values=())
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(result.stdout), 65536)
+        self.assertEqual(len(result.stderr), 65536)
+        for name, value in (("stdout", b"a"), ("stderr", b"b")):
+            observation = result.stream_observations[name]
+            self.assertEqual(observation["bytes"], 64 * 65536)
+            self.assertEqual(observation["sha256"], hashlib.sha256(value * (64 * 65536)).hexdigest())
+            self.assertTrue(observation["truncated"])
+            self.assertTrue(observation["complete"])
+
+    def test_streaming_redaction_crosses_chunks_and_timeout_keeps_partial(self):
+        secret = b"private-sentinel"
+        script = (
+            "import os,time; os.write(1,b'private-'); time.sleep(.1); os.write(1,b'sentinel'); "
+            "os.write(2,b'\\xfftimeout'); time.sleep(10)"
+        )
+        result = recovery._capture_transfer_process(
+            [sys.executable, "-c", script], timeout=1, sensitive_values=(secret,)
+        )
+        self.assertTrue(result.interrupted)
+        self.assertNotIn(secret, result.stdout)
+        self.assertEqual(result.stdout, b"<redacted>")
+        self.assertEqual(result.stderr, b"\xfftimeout")
+        self.assertEqual(result.stream_observations["stdout"]["sha256"], hashlib.sha256(secret).hexdigest())
+        self.assertTrue(result.stream_observations["stdout"]["redacted"])
+
     def test_failure_cleanup_keeps_referenced_sidecars_and_partial_download(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4886,7 +4915,9 @@ class WindowsScpEvidenceTests(unittest.TestCase):
             try:
                 with (
                     mock.patch.object(
-                        recovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"error")
+                        recovery,
+                        "_capture_transfer_process",
+                        return_value=subprocess.CompletedProcess([], 1, b"", b"error"),
                     ),
                     self.assertRaises(recovery.RecoveryError),
                 ):
@@ -4919,7 +4950,7 @@ class WindowsScpEvidenceTests(unittest.TestCase):
                 commands = []
                 with (
                     mock.patch.object(
-                        recovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", raw)
+                        recovery, "_capture_transfer_process", return_value=subprocess.CompletedProcess([], 1, b"", raw)
                     ),
                     self.assertRaises(recovery.RecoveryError) as raised,
                 ):
@@ -4962,7 +4993,7 @@ class WindowsScpEvidenceTests(unittest.TestCase):
                 return subprocess.CompletedProcess([], 1, b"", b"failed")
 
             with (
-                mock.patch.object(recovery.subprocess, "run", side_effect=fail_transfer),
+                mock.patch.object(recovery, "_capture_transfer_process", side_effect=fail_transfer),
                 self.assertRaises(recovery.RecoveryError) as raised,
             ):
                 recovery._windows_scp(
@@ -5060,8 +5091,8 @@ class WindowsScpEvidenceTests(unittest.TestCase):
             evidence = root / "evidence"
             with (
                 mock.patch.object(
-                    recovery.subprocess,
-                    "run",
+                    recovery,
+                    "_capture_transfer_process",
                     side_effect=subprocess.TimeoutExpired(["scp"], 5, output=b"partial", stderr=b"timeout"),
                 ),
                 self.assertRaises(recovery.RecoveryError) as raised,
@@ -5089,7 +5120,7 @@ class WindowsScpEvidenceTests(unittest.TestCase):
                 mock.patch.object(recovery, "_create_remote_dir"),
                 mock.patch.object(recovery, "_remove_remote_dir"),
                 mock.patch.object(
-                    recovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "failed")
+                    recovery, "_capture_transfer_process", return_value=subprocess.CompletedProcess([], 1, "", "failed")
                 ),
                 self.assertRaises(recovery.RecoveryError) as raised,
             ):
@@ -5116,7 +5147,7 @@ class WindowsScpEvidenceTests(unittest.TestCase):
                 with (
                     self.subTest(upload=upload),
                     mock.patch.object(
-                        recovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")
+                        recovery, "_capture_transfer_process", return_value=subprocess.CompletedProcess([], 0, "", "")
                     ) as run,
                 ):
                     recovery._windows_scp(
@@ -5146,8 +5177,8 @@ class WindowsScpEvidenceTests(unittest.TestCase):
                 with (
                     self.subTest(upload=upload),
                     mock.patch.object(
-                        recovery.subprocess,
-                        "run",
+                        recovery,
+                        "_capture_transfer_process",
                         return_value=subprocess.CompletedProcess([], 1, "raw output", stderr),
                     ),
                     self.assertRaises(recovery.RecoveryError) as raised,
@@ -5181,7 +5212,7 @@ class WindowsScpEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             source = write(Path(temporary) / "input", "payload")
             for path in ("C:/private/../escape", 'C:/private/"quoted"', "C:/private/\nline"):
-                with self.subTest(path=path), mock.patch.object(recovery.subprocess, "run") as run:
+                with self.subTest(path=path), mock.patch.object(recovery, "_capture_transfer_process") as run:
                     with self.assertRaises(recovery.RecoveryError):
                         recovery._windows_scp(
                             ssh_host="windows-fixture",
