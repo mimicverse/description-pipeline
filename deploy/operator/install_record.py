@@ -481,6 +481,16 @@ def repoint_active(state_root: Path, record_path: Path) -> dict:
         _canonical_records().validate_install_record(document)
     except Exception as error:
         die(f"rollback record invalid: {error}")
+    for entry in document["journal"]:
+        for value in entry["evidence"]:
+            evidence = Path(value)
+            require(
+                evidence.is_absolute()
+                and evidence.is_file()
+                and not evidence.is_symlink()
+                and evidence.resolve() == evidence,
+                f"recovery_history_unavailable: rollback record has unavailable evidence: {evidence}",
+            )
     active = state_root / "install-record.json"
     active.parent.mkdir(parents=True, exist_ok=True)
     temporary = active.with_name(active.name + ".repoint.tmp")
