@@ -202,6 +202,14 @@ def _short(value: object, length: int = 12) -> str:
     return text[:length] + "..." if len(text) > length else text
 
 
+def _first_text(*values: object) -> str | None:
+    """First non-empty string, preserving the recorded value without normalization."""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _failure_object(raw_type: str, message: str, raw_detail: dict | None) -> str | None:
     """Basename of the failing document, only when safely parsed; never invented."""
     if isinstance(raw_detail, dict):
@@ -551,6 +559,7 @@ def _failure(job: dict, stage: dict) -> dict:
     """Safe, non-asserting failure meaning; raw evidence always preserved."""
     raw_error = str(stage.get("error") or "")
     raw_type, _, message = raw_error.partition(": ")
+    error_code = _first_text(stage.get("error_code"))
     diagnostic = stage.get("diagnostic")
     raw_detail = diagnostic if isinstance(diagnostic, dict) and diagnostic else None
     codes = None
@@ -563,7 +572,7 @@ def _failure(job: dict, stage: dict) -> dict:
         for item in discovery.get("findings") or []
         if isinstance(item, dict) and item.get("blocking", True) and item.get("code")
     ]
-    if stage.get("error_code") == "native_discovery_main_assembly_ambiguous":
+    if error_code == "native_discovery_main_assembly_ambiguous":
         title = "Main assembly is not unique"
         meaning = (
             "Save dp.hardware_id and dp.delivery_configuration in the delivered main assembly. "
@@ -571,7 +580,7 @@ def _failure(job: dict, stage: dict) -> dict:
             "the pipeline does not guess by filename or size."
         )
         kind = "definition"
-    elif stage.get("error_code") == "cad_link_group_payload_invalid":
+    elif error_code == "cad_link_group_payload_invalid":
         kind = "runtime"
         title = "Native link-group mass read rejected"
         meaning = (
@@ -637,6 +646,13 @@ def _failure(job: dict, stage: dict) -> dict:
             "A dialog or timeout blocked the native session; the stage did not complete. "
             "Resolve it on the Windows session before retrying."
         )
+    elif error_code is not None:
+        kind = "runtime"
+        title = "Native CAD stage failed" if error_code.startswith("cad_") else f"Stage failed: {error_code}"
+        meaning = (
+            f"The stage stopped with recorded error code {error_code}. Review the recorded object, "
+            "phase, values, and evidence path before retrying."
+        )
     else:
         title = "Stage failed (cause undetermined)"
         meaning = (
@@ -649,7 +665,7 @@ def _failure(job: dict, stage: dict) -> dict:
         "title": title,
         "meaning": meaning,
         "raw_type": raw_type or None,
-        "error_code": stage.get("error_code"),
+        "error_code": error_code,
         "raw_error": raw_error or None,
         "raw_detail": raw_detail,
         "kind": kind,
@@ -660,6 +676,14 @@ def _failure(job: dict, stage: dict) -> dict:
         failure["finding_counts"] = structured_groups
         failure["finding_samples"] = structured_samples
     failed_object = _failure_object(raw_type, message, raw_detail)
+    activity = job.get("activity_final") if isinstance(job.get("activity_final"), dict) else {}
+    if error_code is not None and failed_object is None:
+        candidate = _first_text(
+            raw_detail.get("path") if isinstance(raw_detail, dict) else None,
+            activity.get("current_object"),
+        )
+        if candidate:
+            failed_object = PureWindowsPath(candidate).name or None
     if failed_object:
         failure["object"] = failed_object
     if codes is not None:
@@ -676,6 +700,50 @@ def _failure(job: dict, stage: dict) -> dict:
     if codes is not None:
         applicability = raw_detail.get("applicability") if isinstance(raw_detail, dict) else None
         failure["applicability"] = applicability if applicability in {"proven", "unproven"} else "unproven"
+    if error_code is not None:
+        detail_phase = raw_detail.get("phase") if isinstance(raw_detail, dict) else None
+        phase = _first_text(
+            detail_phase,
+            activity.get("action"),
+            activity.get("phase"),
+            stage.get("id"),
+        )
+        if phase:
+            failure["phase"] = phase
+
+        detail_cause = raw_detail.get("cause") if isinstance(raw_detail, dict) else None
+        cause = _first_text(detail_cause, raw_error)
+        if cause:
+            failure["cause"] = cause
+
+        if isinstance(raw_detail, dict):
+            values = {
+                key: value
+                for key, value in raw_detail.items()
+                if key
+                not in {
+                    "cause",
+                    "diagnostic_path",
+                    "document",
+                    "evidence_path",
+                    "object",
+                    "path",
+                    "phase",
+                }
+            }
+            if values:
+                failure["values"] = values
+
+        diagnostics = job.get("failure_diagnostics") if isinstance(job.get("failure_diagnostics"), dict) else {}
+        evidence_path = _first_text(
+            job.get("diagnostic_path"),
+            job.get("evidence_path"),
+            raw_detail.get("diagnostic_path") if isinstance(raw_detail, dict) else None,
+            raw_detail.get("evidence_path") if isinstance(raw_detail, dict) else None,
+            diagnostics.get("path"),
+        )
+        if evidence_path:
+            failure["evidence_path"] = evidence_path
     return failure
 
 

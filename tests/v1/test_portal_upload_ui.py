@@ -307,6 +307,12 @@ class ReportUiContractTests(unittest.TestCase):
         app = self.app()
         for token in (
             "buildFailureCard(report.failure, report)",
+            '["Error code", failure.error_code]',
+            '["Phase", failure.phase]',
+            '["Cause", failure.cause]',
+            '["Evidence path", failure.evidence_path]',
+            "Recorded values: ${inlineValue(failure.values)}",
+            '"Recorded failure values"',
             "Failed automatic checks (",
             "failedChecks.slice(0, 5)",
             "A source-evidence check failed.",
