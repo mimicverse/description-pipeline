@@ -35,6 +35,44 @@ function Check([string]$name, [bool]$condition, [string]$detail = '') {
     Write-Host ("FAIL {0} {1}" -f $name, $detail)
   }
 }
+function Compare-CanonicalAclRule($left, $right) {
+  $comparison = [string]::CompareOrdinal(
+    ([string]$left.sid).ToLowerInvariant(),
+    ([string]$right.sid).ToLowerInvariant())
+  if ($comparison -ne 0) { return $comparison }
+  foreach ($property in @('rights', 'access_type', 'inheritance', 'propagation', 'inherited')) {
+    $leftValue = if ($property -eq 'access_type') {
+      [string]$left.$property
+    } else {
+      [long]$left.$property
+    }
+    $rightValue = if ($property -eq 'access_type') {
+      [string]$right.$property
+    } else {
+      [long]$right.$property
+    }
+    $comparison = if ($property -eq 'access_type') {
+      [string]::CompareOrdinal($leftValue, $rightValue)
+    } elseif ($leftValue -lt $rightValue) {
+      -1
+    } elseif ($leftValue -gt $rightValue) {
+      1
+    } else {
+      0
+    }
+    if ($comparison -ne 0) { return $comparison }
+  }
+  return 0
+}
+function Test-CanonicalAclRuleOrder($rules) {
+  $rows = @($rules)
+  for ($index = 1; $index -lt $rows.Count; $index++) {
+    if ((Compare-CanonicalAclRule $rows[$index - 1] $rows[$index]) -gt 0) {
+      return $false
+    }
+  }
+  return $true
+}
 
 # ---- parse + wording gates --------------------------------------------------
 $tokens = $null
@@ -47,6 +85,7 @@ $null = [System.Management.Automation.Language.Parser]::ParseFile(
   $bootstrapScript, [ref]$bootstrapTokens, [ref]$bootstrapParseErrors)
 Check 'parse.bootstrap_clean' ($bootstrapParseErrors.Count -eq 0) (($bootstrapParseErrors | Out-String).Trim())
 $source = Get-Content -LiteralPath $ScriptPath -Raw
+$bootstrapSource = Get-Content -LiteralPath $bootstrapScript -Raw
 # Design-lead settle rules: no blind wait/retry, positive owner proof first, three-valued
 # observers, and a recorded safe restore on the failure path.
 Check 'wording.blind_retry_removed' (-not $source.Contains('waited out for')) 'the pre-change blind-retry wording is still present'
@@ -102,6 +141,29 @@ Check 'wording.launch_contract_lookup_is_non_exiting' ($lookupStart -ge 0 -and
   -not $source.Substring($lookupStart, $lookupEnd - $lookupStart).Contains('Die '))
 Check 'wording.windows_recovery_acl' ($source.Contains('Get-AclProjection') -and
   $source.Contains('Set-AclProjection') -and $source.Contains('AreAccessRulesProtected'))
+Check 'wording.windows_acl_canonical_sort' (
+  $source.Contains('} | Sort-Object -Property @(') -and
+  -not $source.Contains('} | Sort-Object sid, rights, access_type, inheritance, propagation, inherited'))
+Check 'wording.bootstrap_acl_canonical_sort' (
+  $bootstrapSource.Contains('} | Sort-Object -Property @(') -and
+  -not $bootstrapSource.Contains('} | Sort-Object sid, rights, access_type, inheritance, propagation, inherited'))
+$canonicalAclRules = @(
+  [ordered]@{
+    sid='S-1-5-18'; rights=2032127; access_type='Allow'
+    inheritance=3; propagation=0; inherited=$false
+  },
+  [ordered]@{
+    sid='S-1-5-21-1-2-3-1001'; rights=2032127; access_type='Allow'
+    inheritance=3; propagation=0; inherited=$false
+  },
+  [ordered]@{
+    sid='S-1-5-32-544'; rights=2032127; access_type='Allow'
+    inheritance=3; propagation=0; inherited=$false
+  }
+)
+Check 'windows_acl.canonical_order_fixture' (
+  (Test-CanonicalAclRuleOrder $canonicalAclRules) -and
+  -not (Test-CanonicalAclRuleOrder @($canonicalAclRules[2], $canonicalAclRules[0], $canonicalAclRules[1])))
 Check 'wording.windows_managed_acl' ($source.Contains('Set-ManagedEndpointAcls') -and
   $source.Contains('Assert-ManagedEndpointAcls') -and $source.Contains('windows_managed_acl_invalid') -and
   $source.Contains('windows_managed_acl_unsafe') -and $source.Contains('Get-ManagedCommonParent') -and
@@ -364,6 +426,13 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $serviceSid = [string]$operatorIdentity.User.Value
   $bootstrapOutput = & $bootstrapScript -ManagedRoot $aclRoot -ServiceAccount $serviceSid
   $bootstrapReceipt = ($bootstrapOutput | Select-Object -Last 1) | ConvertFrom-Json
+  $rootAclRules = @((Get-AclProjection $aclRoot).rules)
+  Check 'windows_acl.lifecycle_projection_canonical_order' (
+    Test-CanonicalAclRuleOrder $rootAclRules)
+  Check 'windows_acl.bootstrap_root_canonical_order' (
+    Test-CanonicalAclRuleOrder @($bootstrapReceipt.root_acl.rules))
+  Check 'windows_acl.bootstrap_marker_canonical_order' (
+    Test-CanonicalAclRuleOrder @($bootstrapReceipt.marker_acl.rules))
   Check 'windows_acl.bootstrap_marker' ($bootstrapReceipt.passed -eq $true -and
     $bootstrapReceipt.service_sid -eq $serviceSid -and
     $bootstrapReceipt.managed_runtime.sid -eq $serviceSid -and
@@ -553,7 +622,6 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     (Get-AclProjection $outsideSentinel).projection_sha256 -eq $outsideFileAclBefore.projection_sha256 -and
     (Sha256 $outsideSentinel) -eq $outsideHashBefore)
   [System.IO.Directory]::Delete($junctionRoot)
-  $bootstrapSource = Get-Content -LiteralPath $bootstrapScript -Raw
   Check 'windows_acl.bootstrap_transaction_source' (
     $bootstrapSource.Contains('PostflightScript') -and
     $bootstrapSource.Contains('Get-ManagedTreeSnapshot') -and
