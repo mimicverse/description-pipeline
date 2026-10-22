@@ -110,6 +110,64 @@ def journal_row_fixture(evidence: list[str]) -> dict:
     }
 
 
+class CheckpointTreeVerificationTests(unittest.TestCase):
+    def checkpoint_fixture(self, root: Path) -> tuple[Path, dict]:
+        from description_pipeline.delivery import SUBJECT_DIRECTORIES, write_delivery_manifest
+        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        tree = root / "sealed/run/discover"
+        for name in SUBJECT_DIRECTORIES:
+            (tree / name).mkdir(parents=True, exist_ok=True)
+        write(tree / "tool.json", "{}")
+        manifest = write_delivery_manifest(
+            tree,
+            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+        )
+        return tree, {"artifacts": manifest["subject"]["files"]}
+
+    def rewrite_delivery_manifest(self, tree: Path) -> None:
+        from description_pipeline.delivery import write_delivery_manifest
+        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        write_delivery_manifest(
+            tree,
+            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+        )
+
+    def verify(self, tree: Path, receipt: dict) -> None:
+        recovery.verify_checkpoint_tree(
+            tree,
+            recovery.inventory_tree(tree),
+            receipt=receipt,
+        )
+
+    def test_discover_input_records_empty_directory_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tree, receipt = self.checkpoint_fixture(Path(directory))
+            (tree / "input/records/nested-empty").mkdir(parents=True)
+            self.verify(tree, receipt)
+
+    def test_discover_input_records_unregistered_file_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tree, receipt = self.checkpoint_fixture(Path(directory))
+            write(tree / "input/records/unregistered.json", "{}")
+            self.rewrite_delivery_manifest(tree)
+            with self.assertRaisesRegex(recovery.RecoveryError, "unregistered files"):
+                self.verify(tree, receipt)
+
+    def test_unregistered_nonempty_directory_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tree, receipt = self.checkpoint_fixture(Path(directory))
+            write(tree / "input/private/unregistered.json", "{}")
+            self.rewrite_delivery_manifest(tree)
+            with self.assertRaisesRegex(recovery.RecoveryError, "unregistered files"):
+                self.verify(tree, receipt)
+
+
 def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
     task_xml = b"<Task><RegistrationInfo><URI>\\fixture-endpoint</URI></RegistrationInfo></Task>"
     config = b'{"schema_version":"solidworks-to-urdf.endpoint/v1"}\n'
