@@ -2918,6 +2918,11 @@ def journal_selection(
         )
         snapshot = record.get("snapshot")
         require(isinstance(snapshot, dict), "recovery_journal_invalid", "install record has no snapshot")
+        require(
+            Path(snapshot["path"]) == state_root / "snapshots" / (record["install_id"] + ".json"),
+            "recovery_journal_invalid",
+            "snapshot filename differs from install identity",
+        )
         add(snapshot["path"], path, "/snapshot/path", "snapshot", snapshot["digest"])
         require(
             document(Path(snapshot["path"]), "journal snapshot").get("install_id") == record["install_id"],
@@ -2936,6 +2941,15 @@ def journal_selection(
         )
         prior = record.get("previous")
         if prior is not None:
+            prior_record = document(Path(prior["record"]), "previous metadata record")
+            require(
+                prior["config"]
+                == {"path": prior_record["snapshot"]["path"], "digest": prior_record["snapshot"]["digest"]}
+                and Path(prior["record"]) == state_root / "install-records" / (prior_record["install_id"] + ".json")
+                and Path(prior["config"]["path"]) == state_root / "snapshots" / (prior_record["install_id"] + ".json"),
+                "recovery_journal_invalid",
+                "previous configuration differs from its record",
+            )
             add(prior["config"]["path"], path, "/previous/config/path", "snapshot", prior["config"]["digest"])
         for index, row in enumerate(record["journal"]):
             require(
@@ -2948,7 +2962,9 @@ def journal_selection(
             receipt_doc = document(Path(receipts[0]), "journal receipt")
             require(
                 receipt_doc.get("schema_version") == "solidworks-to-urdf.promotion/v1"
-                and receipt_doc.get("install_id") == record["install_id"],
+                and receipt_doc.get("install_id") == record["install_id"]
+                and receipt_doc.get("to") == snapshot["path"]
+                and receipt_doc.get("to_sha256") == snapshot["digest"],
                 "recovery_journal_invalid",
                 "journal receipt identity differs",
             )
@@ -3028,7 +3044,7 @@ def journal_selection(
             )
             target_snapshot = document(Path(receipt["to"]), "promotion target snapshot")
             require(
-                Path(receipt["to"]).parent == state_root / "snapshots"
+                Path(receipt["to"]) == state_root / "snapshots" / (receipt["install_id"] + ".json")
                 and target_snapshot.get("install_id") == receipt["install_id"],
                 "recovery_journal_invalid",
                 "promotion target snapshot identity differs",

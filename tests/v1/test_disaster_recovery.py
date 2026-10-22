@@ -1515,6 +1515,17 @@ class RecoverySelectionTests(unittest.TestCase):
             with self.assertRaises(recovery.RecoveryError):
                 recovery.journal_selection(root)
 
+    def test_snapshot_filename_must_match_install_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = write(root / "snapshots/wrong.json", '{"install_id":"current"}')
+            write(root / "derived/current/operator.env", "")
+            record = install_record_fixture(root, "current", snapshot)
+            write(root / "install-record.json", json.dumps(record))
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.journal_selection(root)
+            self.assertEqual(raised.exception.code, "recovery_journal_invalid")
+
     def test_capacity_refuses_before_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch.object(recovery.shutil, "disk_usage", return_value=type("Usage", (), {"free": 0})()):
