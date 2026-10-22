@@ -4595,20 +4595,25 @@ def _validate_windows_acl_policy(
     non_inheriting: bool = False,
     protected: bool = True,
 ) -> None:
-    """Require the explicit SYSTEM/Administrators DACL used at install time."""
+    """Require the exact administrator-owned runtime permission matrix."""
 
     system_sid = "S-1-5-18"
     administrators_sid = "S-1-5-32-544"
+    require(
+        operator_sid not in {system_sid, administrators_sid},
+        "windows_managed_acl_policy_invalid",
+        f"{label} service principal aliases a boundary principal",
+    )
 
     inheritance = 0 if non_inheriting or not directory else 3
     expected = {
         system_sid: 2032127,
         administrators_sid: 2032127,
+        operator_sid: 2032127,
     }
-    allowed_owners = {administrators_sid, operator_sid}
     rules = projection["rules"]
     require(
-        projection["owner_sid"] in allowed_owners
+        projection["owner_sid"] == administrators_sid
         and projection["protected"] is protected
         and len(rules) == len(expected),
         "windows_managed_acl_policy_invalid",
@@ -4633,6 +4638,23 @@ def _validate_windows_acl_policy(
         seen == set(expected),
         "windows_managed_acl_policy_invalid",
         f"{label} misses a required SID",
+    )
+
+
+def _validate_windows_runtime_leaf_acl_policy(
+    projection: dict, parent: dict, *, label: str, operator_sid: str
+) -> None:
+    """Accept only protected or inherited leaves under the protected state root."""
+
+    _validate_windows_acl_policy(
+        parent, label=f"{label}.parent", operator_sid=operator_sid, directory=True
+    )
+    _validate_windows_acl_policy(
+        projection,
+        label=label,
+        operator_sid=operator_sid,
+        directory=False,
+        protected=projection["protected"],
     )
 
 
@@ -5018,7 +5040,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
             f"windows state acl.{name}",
         )
     policies = (
-        ("common_parent", acl["common_parent"], True, True),
+        ("common_parent", acl["common_parent"], True, False),
         ("managed_root_marker", acl["managed_root_marker"], False, False),
         ("lifecycle_root", acl["lifecycle_root"], True, False),
         ("endpoint_secrets_root", acl["endpoint_secrets_root"], True, False),
@@ -5041,11 +5063,11 @@ def _validate_windows_recovery_state(document: object) -> dict:
         )
     for name in ("cad_ownership", "cad_lease"):
         if acl[name] is not None:
-            _validate_windows_acl_policy(
+            _validate_windows_runtime_leaf_acl_policy(
                 acl[name],
+                roots_acl["state_root"],
                 label=f"windows state acl.{name}",
                 operator_sid=identity["operator_sid"],
-                directory=False,
             )
     cad = _exact_keys(
         state["cad"],

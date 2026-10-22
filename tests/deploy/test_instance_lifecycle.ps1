@@ -274,6 +274,44 @@ Remove-Item -LiteralPath $jsonRoot -Recurse -Force -ErrorAction SilentlyContinue
 # harness; every existing check exercises throwing interpreters, never Die itself.
 function Die { param([string]$code, [string]$message) throw ($code + ': ' + $message) }
 
+function Test-SharedAclPolicyProjections {
+  $fixturePath = Join-Path (Join-Path $repositoryRoot 'tests/fixtures') 'windows_acl_policy.json'
+  $fixture = Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json
+  Check 'windows_acl.golden_case_count' (@($fixture.cases).Count -eq 16)
+  $parentPath = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetTempPath()) 'acl-golden-state'))
+  $leafPath = Join-Path $parentPath 'cad-ownership.json'
+  function Resolve-Sid([string]$Identity) { return $Identity }
+  function Get-AclProjection([string]$Path) {
+    if ($Path -eq $parentPath) { return $activeCase.parent }
+    return $activeCase.leaf
+  }
+  function Get-Item {
+    [CmdletBinding()] param([string]$LiteralPath, [switch]$Force)
+    $directory = ($LiteralPath -eq $parentPath) -or [bool]$activeCase.directory
+    $attributes = if ($directory) {
+      [System.IO.FileAttributes]::Directory
+    } else {
+      [System.IO.FileAttributes]::Normal
+    }
+    return [pscustomobject]@{PSIsContainer=$directory; Attributes=$attributes}
+  }
+  foreach ($activeCase in $fixture.cases) {
+    $passed = $true
+    try {
+      if ($activeCase.mutable) {
+        Assert-ManagedRuntimeLeafAcl $leafPath $parentPath $fixture.service_sid
+      } else {
+        Assert-ManagedAcl $leafPath $true $fixture.service_sid
+      }
+    } catch {
+      if ($_.Exception.Message -notmatch 'windows_managed_acl_invalid') { throw }
+      $passed = $false
+    }
+    Check ('windows_acl.golden.' + $activeCase.name) ($passed -eq [bool]$activeCase.expected)
+  }
+}
+Test-SharedAclPolicyProjections
+
 # ---- real Windows ACL boundary: inherited broad access is replaced ----------
 if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $driveRoot = ([System.IO.Path]::GetPathRoot($env:SystemRoot)).TrimEnd('\')
@@ -414,6 +452,87 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
       }).Count -eq 3
   }
   Check 'windows_acl.managed_principals_only' (@($managedAclChecks | Where-Object { -not $_ }).Count -eq 0)
+  Assert-ManagedRuntimeLeafAcl $ownershipPath $stateRoot $serviceSid
+  Check 'windows_acl.runtime_self_protected' $true
+  $testPython = $env:DESCRIPTION_TEST_PYTHON
+  if (-not $testPython) { $testPython = (Get-Command python.exe -ErrorAction Stop).Source }
+  & $testPython -I -B -c 'import os,sys,tempfile; p=sys.argv[1]; fd,t=tempfile.mkstemp(dir=os.path.dirname(p)); os.write(fd,bytes([123,125])); os.close(fd); os.replace(t,p)' $ownershipPath
+  Check 'windows_acl.atomic_replace_exit' ($LASTEXITCODE -eq 0)
+  $atomicAcl = Get-AclProjection $ownershipPath
+  Assert-ManagedRuntimeLeafAcl $ownershipPath $stateRoot $serviceSid
+  Assert-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $taskFile
+  Check 'windows_acl.atomic_replace_inherited' (-not $atomicAcl.protected -and
+    @($atomicAcl.rules | Where-Object { $_.inherited }).Count -eq 3)
+  function Assert-RuntimeLeafRejected([string]$Name, [string]$Path = $ownershipPath) {
+    $rejected = $false
+    try { Assert-ManagedRuntimeLeafAcl $Path $stateRoot $serviceSid } catch {
+      $rejected = $_.Exception.Message -match 'windows_managed_acl_(invalid|unsafe)|windows_recovery_target_unsafe'
+    }
+    Check ('windows_acl.runtime_refuses_' + $Name) $rejected
+  }
+  $stateAclBefore = Get-Acl -LiteralPath $stateRoot
+  $unprotectedState = Get-Acl -LiteralPath $stateRoot
+  $unprotectedState.SetAccessRuleProtection($false, $true)
+  Set-Acl -LiteralPath $stateRoot -AclObject $unprotectedState
+  Assert-RuntimeLeafRejected 'unprotected_parent'
+  Set-Acl -LiteralPath $stateRoot -AclObject $stateAclBefore
+  $extraInheritedState = Get-Acl -LiteralPath $stateRoot
+  [void]$extraInheritedState.AddAccessRule((New-ManagedAccessRule 'S-1-5-11' `
+    ([System.Security.AccessControl.FileSystemRights]::Read) `
+    ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit)))
+  Set-Acl -LiteralPath $stateRoot -AclObject $extraInheritedState
+  Assert-RuntimeLeafRejected 'extra_inherited'
+  Set-Acl -LiteralPath $stateRoot -AclObject $stateAclBefore
+  $leafAclBefore = Get-Acl -LiteralPath $ownershipPath
+  $extraLeaf = Get-Acl -LiteralPath $ownershipPath
+  [void]$extraLeaf.AddAccessRule((New-ManagedAccessRule 'S-1-5-11' `
+    ([System.Security.AccessControl.FileSystemRights]::Read) `
+    ([System.Security.AccessControl.InheritanceFlags]::None)))
+  Set-Acl -LiteralPath $ownershipPath -AclObject $extraLeaf
+  Assert-RuntimeLeafRejected 'extra_explicit'
+  Set-Acl -LiteralPath $ownershipPath -AclObject $leafAclBefore
+  $denyLeaf = Get-Acl -LiteralPath $ownershipPath
+  [void]$denyLeaf.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+    (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $serviceSid),
+    [System.Security.AccessControl.FileSystemRights]::Read,
+    [System.Security.AccessControl.AccessControlType]::Deny)))
+  Set-Acl -LiteralPath $ownershipPath -AclObject $denyLeaf
+  Assert-RuntimeLeafRejected 'deny'
+  Set-Acl -LiteralPath $ownershipPath -AclObject $leafAclBefore
+  $serviceOwned = Get-Acl -LiteralPath $ownershipPath
+  $serviceOwned.SetOwner((New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $serviceSid))
+  Set-Acl -LiteralPath $ownershipPath -AclObject $serviceOwned
+  Assert-RuntimeLeafRejected 'service_owner'
+  Set-Acl -LiteralPath $ownershipPath -AclObject $leafAclBefore
+  $linkPath = Join-Path $stateRoot 'cad-ownership-link.json'
+  $null = New-Item -ItemType SymbolicLink -Path $linkPath -Target $ownershipPath -ErrorAction Stop
+  Assert-RuntimeLeafRejected 'reparse' $linkPath
+  Remove-Item -LiteralPath $linkPath -Force
+  Set-ManagedAcl $ownershipPath $true $serviceSid
+  $outsideState = Join-Path $siblingRoot 'escaped-state'
+  $null = New-Item -ItemType Directory -Path $outsideState
+  $outsideSentinel = Join-Path $outsideState 'sentinel.txt'
+  [System.IO.File]::WriteAllText($outsideSentinel, 'outside-must-not-change')
+  $outsideAclBefore = Get-AclProjection $outsideState
+  $outsideFileAclBefore = Get-AclProjection $outsideSentinel
+  $outsideHashBefore = Sha256 $outsideSentinel
+  $junctionRoot = Join-Path $aclRoot 'outside-junction'
+  $null = New-Item -ItemType Junction -Path $junctionRoot -Target $siblingRoot -ErrorAction Stop
+  $junctionConfig = [pscustomobject]@{
+    package_root=$packageRoot
+    output_root=$outputRoot
+    state_root=(Join-Path $junctionRoot 'escaped-state')
+    token_file=$tokenPath
+  }
+  $junctionRejected = $false
+  try { Set-ManagedEndpointAcls $junctionConfig $endpointRoot $configPath $installIdPath $taskFile } catch {
+    $junctionRejected = $_.Exception.Message -match 'windows_recovery_target_unsafe'
+  }
+  Check 'windows_acl.ancestor_junction_refused_before_write' ($junctionRejected -and
+    (Get-AclProjection $outsideState).projection_sha256 -eq $outsideAclBefore.projection_sha256 -and
+    (Get-AclProjection $outsideSentinel).projection_sha256 -eq $outsideFileAclBefore.projection_sha256 -and
+    (Sha256 $outsideSentinel) -eq $outsideHashBefore)
+  [System.IO.Directory]::Delete($junctionRoot)
   $bootstrapSource = Get-Content -LiteralPath $bootstrapScript -Raw
   Check 'windows_acl.bootstrap_transaction_source' (
     $bootstrapSource.Contains('PostflightScript') -and

@@ -122,6 +122,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             }
             for sid, rights in (
                 ("S-1-5-18", 2032127),
+                ("S-1-5-21-1", 2032127),
                 ("S-1-5-32-544", 2032127),
             )
         ]
@@ -136,7 +137,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
         return projection
 
     acl = {
-        "common_parent": acl_projection("0", directory=True, non_inheriting=True),
+        "common_parent": acl_projection("0", directory=True),
         "managed_root_marker": acl_projection("3"),
         "lifecycle_root": acl_projection("4", directory=True),
         "endpoint_secrets_root": acl_projection("5", directory=True),
@@ -1241,6 +1242,52 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     for name in ("psql", "pg_controldata", "pg_dumpall", "pg_dump", "pg_restore"):
         (target_bin / name).chmod(0o755)
     return context
+
+
+class WindowsAclPolicyTests(unittest.TestCase):
+    def test_service_principal_must_be_distinct_and_present(self) -> None:
+        fixture = json.loads(
+            (REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text()
+        )
+        leaf = copy.deepcopy(fixture["cases"][0]["leaf"])
+        leaf["rules"] = [rule for rule in leaf["rules"] if rule["sid"] != fixture["service_sid"]]
+        for service_sid in (fixture["service_sid"], "S-1-5-18", "S-1-5-32-544"):
+            with self.subTest(service_sid=service_sid), self.assertRaises(recovery.RecoveryError):
+                recovery._validate_windows_acl_policy(
+                    leaf, label="two principals", operator_sid=service_sid, directory=False
+                )
+
+    def test_shared_windows_acl_policy_projections(self) -> None:
+        fixture = json.loads(
+            (REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text()
+        )
+        for case in fixture["cases"]:
+            with self.subTest(case=case["name"]):
+                parent = copy.deepcopy(case["parent"])
+                leaf = copy.deepcopy(case["leaf"])
+                for projection in (parent, leaf):
+                    projection["projection_sha256"] = recovery._windows_acl_projection_sha256(projection)
+                    recovery._validate_windows_acl_projection(projection, case["name"])
+
+                def validate(case=case, parent=parent, leaf=leaf):
+                    if case["mutable"]:
+                        recovery._validate_windows_runtime_leaf_acl_policy(
+                            leaf, parent, label=case["name"], operator_sid=fixture["service_sid"]
+                        )
+                    else:
+                        recovery._validate_windows_acl_policy(
+                            leaf,
+                            label=case["name"],
+                            operator_sid=fixture["service_sid"],
+                            directory=case["directory"],
+                        )
+
+                if case["expected"]:
+                    validate()
+                else:
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        validate()
+                    self.assertEqual(raised.exception.code, "windows_managed_acl_policy_invalid")
 
 
 class RecoveryControlFlowTests(unittest.TestCase):
@@ -2868,6 +2915,31 @@ class RecoveryControlFlowTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery._validate_windows_recovery_state(state)
         self.assertEqual(raised.exception.code, "windows_cad_ownership_unknown")
+
+    def test_windows_state_accepts_inherited_runtime_leaf_acls(self) -> None:
+        _out, manifest = self.backup()
+        fixture = json.loads(
+            (REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text()
+        )
+        leaf = copy.deepcopy(next(case for case in fixture["cases"] if case["name"] == "runtime_inherited")["leaf"])
+        leaf["projection_sha256"] = recovery._windows_acl_projection_sha256(leaf)
+        for role in ("cad_ownership", "cad_lease"):
+            with self.subTest(role=role):
+                state = copy.deepcopy(manifest["windows"]["state"])
+                state["acl"][role] = copy.deepcopy(leaf)
+                if role == "cad_ownership":
+                    ledger = b'{"schema_version":"solidworks-to-urdf.cad-ownership/v1","records":[]}'
+                    ledger_sha = hashlib.sha256(ledger).hexdigest()
+                    state["cad"].update(ledger_present=True, ownership_sha256=ledger_sha)
+                    state["files"].append({
+                        "role": role, "path": state["cad"]["ownership_path"],
+                        "member": "cad-ownership.json", "bytes": len(ledger), "sha256": ledger_sha,
+                    })
+                    state["members"].append({
+                        "member": "cad-ownership.json", "bytes": len(ledger), "sha256": ledger_sha,
+                    })
+                validated = recovery._validate_windows_recovery_state(state)
+                self.assertFalse(validated["acl"][role]["protected"])
 
     def test_windows_state_accepts_only_the_exact_legacy_transition_action(self) -> None:
         _out, manifest = self.backup()

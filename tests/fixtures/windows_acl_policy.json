@@ -1,0 +1,101 @@
+{
+  "service_sid": "S-1-5-21-1",
+  "cases": [
+    {
+      "name": "stable_protected",
+      "directory": false, "mutable": false, "expected": true,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_inherited",
+      "directory": false, "mutable": true, "expected": true,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_self_protected",
+      "directory": false, "mutable": true, "expected": true,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_parent_unprotected",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_parent_extra_principal",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-11","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_leaf_extra_inherited",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-11","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_leaf_explicit_rule",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_leaf_deny",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Deny","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_leaf_service_owner",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-21-1","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_leaf_wrong_rights",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":1179817,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_leaf_wrong_inheritance",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "runtime_leaf_wrong_propagation",
+      "directory": false, "mutable": true, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":1},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "stable_inherited",
+      "directory": false, "mutable": false, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "stable_service_owner",
+      "directory": false, "mutable": false, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-21-1","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":0,"propagation":0}]}
+    },
+    {
+      "name": "directory_protected",
+      "directory": true, "mutable": false, "expected": true,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]}
+    },
+    {
+      "name": "directory_inherited",
+      "directory": true, "mutable": false, "expected": false,
+      "parent": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":true,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":false,"inheritance":3,"propagation":0}]},
+      "leaf": {"owner_sid":"S-1-5-32-544","group_sid":"S-1-5-32-544","protected":false,"sddl":"O:BAG:BAD:fixture","rules":[{"sid":"S-1-5-18","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":3,"propagation":0},{"sid":"S-1-5-21-1","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":3,"propagation":0},{"sid":"S-1-5-32-544","access_type":"Allow","rights":2032127,"inherited":true,"inheritance":3,"propagation":0}]}
+    }
+  ]
+}

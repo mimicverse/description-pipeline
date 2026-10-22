@@ -1113,6 +1113,9 @@ function Assert-ManagedAcl(
   } else {
     $ServiceSid = Resolve-Sid $ServiceSid
   }
+  if ($ServiceSid -in @($administratorsSid, $systemSid)) {
+    Die 'windows_managed_acl_invalid' 'the service principal aliases a boundary principal'
+  }
   while ($pending.Count -gt 0) {
     $current = $pending.Pop()
     $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
@@ -1427,6 +1430,7 @@ function Get-ManagedEndpointAclRows(
   }
   foreach ($rule in $rules) {
     $normalized = (Normalize-PathIdentity ([string]$rule.path)).TrimEnd('/')
+    Assert-NoReparseAncestor $normalized
     $key = $normalized.ToLowerInvariant()
     if (-not $seen.ContainsKey($key)) {
       $seen[$key] = $rule
@@ -1441,6 +1445,24 @@ function Get-ManagedEndpointAclRows(
     }
   }
   return $rows
+}
+function Assert-ManagedRuntimeLeafAcl(
+  [string]$Path,
+  [string]$ParentPath,
+  [string]$ServiceSid) {
+  # Atomic runtime writes inherit the verified state directory's exact DACL.
+  Assert-NoReparseAncestor $Path
+  Assert-ManagedAcl $ParentPath $true $ServiceSid
+  $parent = Get-Item -LiteralPath $ParentPath -Force -ErrorAction Stop
+  $leaf = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if (-not $parent.PSIsContainer -or $leaf.PSIsContainer -or
+      ([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Path)) -ne
+       [System.IO.Path]::GetFullPath($ParentPath)) -or
+      (($leaf.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0)) {
+    Die 'windows_managed_acl_invalid' ('the runtime leaf is outside its writable state boundary: ' + $Path)
+  }
+  $projection = Get-AclProjection $Path
+  Assert-ManagedAcl $Path ([bool]$projection.protected) $ServiceSid
 }
 function Set-ManagedEndpointAcls(
   $Config,
@@ -1474,8 +1496,12 @@ function Assert-ManagedEndpointAcls(
       }
       continue
     }
-    Assert-ManagedAcl $row.path $true $serviceSid `
-      -NonInheriting:$row.non_inheriting -Recurse:$row.recurse
+    if ($row.role -in @('cad_ownership', 'cad_lease')) {
+      Assert-ManagedRuntimeLeafAcl $row.path ([string]$Config.state_root) $serviceSid
+    } else {
+      Assert-ManagedAcl $row.path $true $serviceSid `
+        -NonInheriting:$row.non_inheriting -Recurse:$row.recurse
+    }
   }
 }
 function Get-ManagedAclProjectionForRole($Acl, [string]$Role) {
