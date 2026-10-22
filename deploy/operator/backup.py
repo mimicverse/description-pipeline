@@ -116,9 +116,7 @@ def write_manifest(source: Path, sealed: Path, key: Path, out: Path) -> dict:
     require(source.is_dir(), f"backup source is missing: {source}")
     require(sealed.is_file(), f"sealed archive is missing: {sealed}")
     files = {
-        path.relative_to(source).as_posix(): sha256_file(path)
-        for path in sorted(source.rglob("*"))
-        if path.is_file()
+        path.relative_to(source).as_posix(): sha256_file(path) for path in sorted(source.rglob("*")) if path.is_file()
     }
     require(files, "the backup source carries no files")
     manifest = {
@@ -139,9 +137,7 @@ def seal(source: Path, key: Path, out: Path) -> str:
     require(source.is_dir(), f"backup source is missing: {source}")
     ensure_key(key)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        prefix=f".{out.name}.", suffix=".partial", dir=out.parent, delete=False
-    ) as handle:
+    with tempfile.NamedTemporaryFile(prefix=f".{out.name}.", suffix=".partial", dir=out.parent, delete=False) as handle:
         temporary = Path(handle.name)
     success = False
     try:
@@ -197,9 +193,7 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
     validated = manifest["files"]
     require(not dest.exists(), f"refuse to overwrite the restore destination: {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(
-        tempfile.mkdtemp(prefix=f".{dest.name}.", suffix=".partial", dir=dest.parent)
-    )
+    temporary = Path(tempfile.mkdtemp(prefix=f".{dest.name}.", suffix=".partial", dir=dest.parent))
     success = False
     try:
         process = subprocess.Popen(
@@ -226,7 +220,13 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
             stream_error = error
         finally:
             if process.stdout is not None:
-                with contextlib.suppress(BrokenPipeError, OSError):
+                try:
+                    while process.stdout.read(1024 * 1024):
+                        pass
+                except OSError as error:
+                    if stream_error is None:
+                        stream_error = error
+                finally:
                     process.stdout.close()
         stderr = process.stderr.read() if process.stderr is not None else b""
         returncode = process.wait()
