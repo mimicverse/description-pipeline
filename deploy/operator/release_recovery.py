@@ -635,11 +635,6 @@ def finalize(args) -> int:
 
     manifest_document = load_json(Path(restore_inputs["manifest"]))
     state_root = Path(next(row["path"] for row in manifest_document["roots"] if row["name"] == "state_root"))
-    try:
-        recovery.journal_selection(state_root, expected=manifest_document["selection"]["journal_entries"])
-        recovery.journal_selection(state_root, additional_receipts=(canonical_rollback,))
-    except recovery.RecoveryError as error:
-        raise GateError("release_recovery_gate_invalid", str(error)) from error
     source_path = require_file(Path(rollback["from"]), "rollback source install record")
     source_record = load_json(source_path)
     if sha256_file(source_path) != rollback["from_sha256"]:
@@ -655,6 +650,11 @@ def finalize(args) -> int:
         or windows_identity.get("release") != {**identity, "role": "native"}
     ):
         raise GateError("release_recovery_identity_unverified", "rollback source Windows identity is invalid")
+    try:
+        recovery.journal_selection(state_root, expected=manifest_document["selection"]["journal_entries"])
+        recovery.journal_selection(state_root, additional_receipts=(canonical_rollback,))
+    except recovery.RecoveryError as error:
+        raise GateError("release_recovery_gate_invalid", str(error)) from error
     receipt = status_dir / FINALIZE_RECEIPT
     inputs = {
         "restore_gate_sha256": sha256_file(restore_gate_path),
