@@ -11,40 +11,85 @@
 #   units ROLE      print the static managed-unit role inventory; read-only and env-free
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# One static role inventory for rendering, lifecycle control and health. It is code data only;
-# no runtime state or installation record is duplicated here.
-UNIT_MANIFEST=(
-  'description-postgres|database,services'
-  'description-solidworks-tunnel|executor,services'
-  'description-airflow-dag-processor|airflow,executor,services'
-  'description-airflow-scheduler|airflow,executor,services'
-  'description-airflow-api-server|airflow,executor,services'
-  'description-portal|operator'
-  'description-operator-proxy|operator'
-)
+# One static role inventory for rendering, lifecycle control, health, recovery and operator
+# rendering. It is code data only; no runtime state or installation record is duplicated here.
+UNIT_MANIFEST_FILE="$HERE/../systemd-units.tsv"
 unit_manifest() {
-  local requested="$1" record unit roles
-  for record in "${UNIT_MANIFEST[@]}"; do
-    IFS='|' read -r unit roles <<< "$record"
-    if [ "$requested" = "all" ]; then
-      printf '%s\n' "$unit"
-      continue
-    fi
-    case ",$roles," in
-      *",$requested,"*) printf '%s\n' "$unit" ;;
-    esac
-  done
+  local requested="$1"
+  [ -f "$UNIT_MANIFEST_FILE" ] && [ ! -L "$UNIT_MANIFEST_FILE" ] || {
+    echo "services.sh: unit manifest is missing or a link: $UNIT_MANIFEST_FILE" >&2
+    return 1
+  }
+  local manifest_output status=0
+  manifest_output="$(
+    awk -F '\t' -v requested="$requested" '
+      BEGIN {
+        count = split("airflow database executor maintenance-v1 operator services", known, " ")
+        for (i = 1; i <= count; i++) known_role[known[i]] = 1
+      }
+      NF != 3 { bad = 1; exit 2 }
+      {
+        if ($1 !~ /^description-[a-z0-9][a-z0-9_.-]*$/ || seen[$1]++) {
+          bad = 1
+          exit 3
+        }
+        if ($2 == "") { bad = 1; exit 4 }
+        delete role_seen
+        role_count = split($2, roles, ",")
+        has_order = 0
+        for (role_index = 1; role_index <= role_count; role_index++) {
+          role_name = roles[role_index]
+          if (!(role_name in known_role) || role_seen[role_name]++) {
+            bad = 1
+            exit 5
+          }
+          if (role_name == "maintenance-v1") has_order = 1
+        }
+        if (has_order) {
+          if ($3 !~ /^[1-9][0-9]*$/ || order_seen[$3]++) {
+            bad = 1
+            exit 6
+          }
+          ordered_count++
+        } else if ($3 != "-") {
+          bad = 1
+          exit 7
+        }
+        if (requested == "all" || requested in role_seen) {
+          selected_count++
+          if (requested == "maintenance-v1") printf "%08d\t%s\n", $3, $1
+          else print $1
+        }
+      }
+      END {
+        if (bad) exit
+        if (selected_count == 0) exit 8
+        for (i = 1; i <= ordered_count; i++) {
+          if (!(i in order_seen)) exit 9
+        }
+      }
+    ' "$UNIT_MANIFEST_FILE"
+  )" || status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "services.sh: unit role is missing or the manifest is invalid: $requested" >&2
+    return 1
+  fi
+  if [ "$requested" = "maintenance-v1" ]; then
+    printf '%s\n' "$manifest_output" | LC_ALL=C sort -t $'\t' -k1,1n | cut -f2-
+  else
+    printf '%s\n' "$manifest_output"
+  fi
 }
 usage() {
   echo "usage: $0 render|start|stop|stop-executors" >&2
-  echo "       $0 units all|services|airflow|executor|database|operator" >&2
+  echo "       $0 units all|services|airflow|executor|database|operator|maintenance-v1" >&2
   exit 2
 }
 case "${1:-}" in
   units)
     [ "$#" -eq 2 ] || usage
     case "$2" in
-      all|services|airflow|executor|database|operator) ;;
+      all|services|airflow|executor|database|operator|maintenance-v1) ;;
       *) usage ;;
     esac
     unit_manifest "$2"
@@ -64,21 +109,38 @@ TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 # candidate switches, and they must never take the shared database down with them. The
 # database unit is managed separately because the promotion's guarded migrations run
 # against it live.
+load_unit_role() {
+  local variable="$1" role="$2" output
+  if ! output="$(unit_manifest "$role")"; then
+    echo "services.sh: unit role is missing or invalid: $role" >&2
+    exit 1
+  fi
+  mapfile -t "$variable" <<< "$output"
+}
+load_unit_role EXECUTOR_UNITS executor
 EXECUTORS=()
-while IFS= read -r unit; do
+for unit in "${EXECUTOR_UNITS[@]}"; do
   [ "$unit" != "description-solidworks-tunnel" ] || [ -n "${SOLIDWORKS_SSH_HOST:-}" ] || continue
   EXECUTORS+=("$unit")
-done < <(unit_manifest executor)
+done
 UNITS=()
-[ -z "${POSTGRES_ROOT:-}" ] || mapfile -t UNITS < <(unit_manifest database)
+load_unit_role DATABASE_UNITS database
+[ -z "${POSTGRES_ROOT:-}" ] || UNITS+=("${DATABASE_UNITS[@]}")
 UNITS+=("${EXECUTORS[@]}")
 
 render_units() {
+  local -a render_units=()
+  local unit output
   mkdir -p "$TARGET"
+  if ! output="$(unit_manifest services)"; then
+    echo 'services.sh: unit role is missing or invalid: services' >&2
+    exit 1
+  fi
+  mapfile -t render_units <<< "$output"
   case "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT (rendered resolved.env)}" in
     *[!0-9]*|"") echo 'AIRFLOW_API_PORT must be a TCP port' >&2; exit 1 ;;
   esac
-  while IFS= read -r unit; do
+  for unit in "${render_units[@]}"; do
     case "$unit" in
       description-solidworks-tunnel)
         [ -n "${SOLIDWORKS_SSH_HOST:-}" ] || continue
@@ -119,7 +181,7 @@ render_units() {
         fi
         ;;
     esac
-  done < <(unit_manifest services)
+  done
 }
 
 # Stop verification (stop-executors): the unit must be provably not running - exactly

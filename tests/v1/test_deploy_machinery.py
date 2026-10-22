@@ -92,11 +92,29 @@ class DeployMachineryTests(unittest.TestCase):
             ),
             "database": ("description-postgres",),
             "operator": ("description-portal", "description-operator-proxy"),
+            "maintenance-v1": (
+                "description-solidworks-tunnel",
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+                "description-operator-proxy",
+                "description-portal",
+            ),
         }
         for role, units in expected.items():
             result = self.run_script(services, "units", role)
             self.assertEqual(result.returncode, 0, role)
             self.assertEqual(tuple(result.stdout.splitlines()), units, role)
+        unit_files = {
+            path.relative_to(DEPLOY).as_posix()
+            for path in DEPLOY.rglob("*.service")
+            if path.is_file()
+        }
+        self.assertEqual(
+            unit_files,
+            {f"airflow/systemd/{unit}.service" for unit in expected["all"] if unit not in expected["operator"]}
+            | {f"operator/systemd/{unit}.service" for unit in expected["operator"]},
+        )
 
         control = (DEPLOY / "operator/operatorctl.sh").read_text(encoding="utf-8")
         self.assertIn('bash "$AIRFLOW_HERE/services.sh" units "$1"', control)

@@ -3479,6 +3479,9 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "airflow" / "services.sh.real").write_bytes(
             (ROOT / "deploy" / "airflow" / "services.sh").read_bytes()
         )
+        (release / "systemd-units.tsv").write_bytes(
+            (ROOT / "deploy" / "systemd-units.tsv").read_bytes()
+        )
         write_stub(
             release / "airflow" / "services.sh",
             "#!/usr/bin/env bash\n"

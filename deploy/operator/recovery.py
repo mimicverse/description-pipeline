@@ -70,6 +70,7 @@ try:
     import install_record
     import platform_config
     import render_operator
+    systemd_units = render_operator.systemd_units
     from windows_transport import TransportDecodeError
     from windows_transport import decode_output as _decode_windows_output
     from windows_transport import run_powershell as _transport_powershell
@@ -136,14 +137,13 @@ CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 MAINTENANCE_LOCK_KEY = 0x5256435956323031
 MAINTENANCE_LOCK_DIRNAME = "locks"
 MAINTENANCE_LOCK_FILENAME = "maintenance.lock"
-MAINTENANCE_UNITS = (
-    "description-solidworks-tunnel",
-    "description-airflow-dag-processor",
-    "description-airflow-scheduler",
-    "description-airflow-api-server",
-    "description-operator-proxy",
-    "description-portal",
-)
+# The ordered role is stable with this receipt schema. A future maintenance inventory must
+# introduce a new role/schema instead of repurposing the history consumed here.
+MAINTENANCE_ROLE = f"maintenance-{MAINTENANCE_RECEIPT_SCHEMA.rsplit('/', 1)[-1]}"
+try:
+    MAINTENANCE_UNITS = systemd_units.units_for_role(MAINTENANCE_ROLE)
+except systemd_units.UnitManifestError as error:
+    raise SystemExit(f"recovery: invalid maintenance unit role {MAINTENANCE_ROLE}: {error}") from error
 
 
 class RecoveryError(Exception):

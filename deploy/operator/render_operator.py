@@ -10,6 +10,7 @@ manager); the proxy only terminates TLS on the single operator URL.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import ipaddress
 import json
 import os
@@ -26,6 +27,21 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = Path(__file__).resolve().parent / "nginx.conf.template"
 PORTAL_TEMPLATE = Path(__file__).resolve().parent / "portal.json.template"
 UNIT_TEMPLATES = Path(__file__).resolve().parent / "systemd"
+
+
+def _load_sibling_module(name: str):
+    path = Path(__file__).resolve().with_name(f"{name}.py")
+    module_name = f"description_deploy_{name}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"render_operator: cannot load the deployment module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+systemd_units = _load_sibling_module("systemd_units")
 FORBIDDEN = {Path("/"), Path("/usr"), Path("/etc"), Path("/opt"), Path("/var"), Path.home()}
 BROAD_ROOTS = {
     Path("/"),
@@ -542,23 +558,29 @@ def main() -> int:
 
     if args.units_dir:
         args.units_dir.mkdir(parents=True, exist_ok=True)
-        portal_unit = (UNIT_TEMPLATES / "description-portal.service").read_text(encoding="utf-8")
-        for token, value in (
-            ("@OPERATOR_STATE@", str(state)),
-            ("@AIRFLOW_HOME@", str(home)),
-            ("@ENV_FILE@", str(args.env_file)),
-            ("@PORTAL_COMMAND@", resolved["PORTAL_COMMAND"]),
-        ):
-            portal_unit = portal_unit.replace(token, value)
-        (args.units_dir / "description-portal.service").write_text(portal_unit, encoding="utf-8")
-        proxy_unit = (UNIT_TEMPLATES / "description-operator-proxy.service").read_text(encoding="utf-8")
-        for token, value in (
-            ("@OPERATOR_STATE@", str(state)),
-            ("@OPERATOR_NGINX_CONF@", str(nginx_conf)),
-            ("@NGINX_BIN@", nginx_bin),
-        ):
-            proxy_unit = proxy_unit.replace(token, value)
-        (args.units_dir / "description-operator-proxy.service").write_text(proxy_unit, encoding="utf-8")
+        try:
+            operator_units = systemd_units.units_for_role("operator")
+        except systemd_units.UnitManifestError as error:
+            die(f"operator unit role is invalid: {error}")
+        replacements = {
+            "@OPERATOR_STATE@": str(state),
+            "@AIRFLOW_HOME@": str(home),
+            "@ENV_FILE@": str(args.env_file),
+            "@PORTAL_COMMAND@": resolved["PORTAL_COMMAND"],
+            "@OPERATOR_NGINX_CONF@": str(nginx_conf),
+            "@NGINX_BIN@": nginx_bin,
+        }
+        for unit in operator_units:
+            template = UNIT_TEMPLATES / f"{unit}.service"
+            if not template.is_file() or template.is_symlink():
+                die(f"operator unit template is missing or a link: {template}")
+            rendered_unit = template.read_text(encoding="utf-8")
+            for token, value in replacements.items():
+                rendered_unit = rendered_unit.replace(token, value)
+            unresolved = sorted(set(re.findall(r"@[A-Z][A-Z0-9_]*@", rendered_unit)))
+            if unresolved:
+                die(f"operator unit template has unresolved values: {template}: {', '.join(unresolved)}")
+            (args.units_dir / f"{unit}.service").write_text(rendered_unit, encoding="utf-8")
         print(f"OPERATOR_UNITS={args.units_dir}")
 
     write_private(state / "resolved.env", "\n".join(encode_env_lines(resolved.items())) + "\n")
