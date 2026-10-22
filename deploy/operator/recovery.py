@@ -4751,12 +4751,13 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "Windows task does not enforce singleton instances",
     )
     raw_identity = state["identity"]
-    declared_launch_contract = None
+    missing_launch_contract = object()
+    declared_launch_contract = missing_launch_contract
     if isinstance(raw_identity, dict):
         raw_identity = dict(raw_identity)
         declared_launch_contract = raw_identity.pop(
             "runtime_launch_contract",
-            None,
+            missing_launch_contract,
         )
     identity = _exact_keys(
         raw_identity,
@@ -4784,7 +4785,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "windows state identity",
     )
     launch_contract = declared_launch_contract
-    if launch_contract is None:
+    if launch_contract is missing_launch_contract:
         launch_contract = (
             WINDOWS_LEGACY_LAUNCH_CONTRACT
             if identity["release_identity_sha256"]
@@ -4807,6 +4808,13 @@ def _validate_windows_recovery_state(document: object) -> dict:
         == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
         "windows_recovery_state_invalid",
         "the legacy launch contract is not bound to the approved release",
+    )
+    require(
+        launch_contract != WINDOWS_PYTHON_LAUNCH_CONTRACT
+        or identity["release_identity_sha256"]
+        != WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
+        "windows_recovery_state_invalid",
+        "the approved legacy release cannot use the Python module launch contract",
     )
     identity["runtime_launch_contract"] = launch_contract
     require(

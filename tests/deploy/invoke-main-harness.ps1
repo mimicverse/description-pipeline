@@ -87,6 +87,7 @@ $script:OldAction = [pscustomobject]@{
   Arguments = ('serve --config "' + $oldConfig + '"')
   WorkingDirectory = $Root}
 $script:CurrentAction = $script:OldAction
+$script:RegisteredActions = @($script:OldAction)
 $script:Calls = [System.Collections.Generic.List[string]]::new()
 $script:Sleeps = [System.Collections.Generic.List[int]]::new()
 $script:AccountEnv = @{}
@@ -96,7 +97,7 @@ function Set-AccountEnvironment { param([string]$Name, [string]$Value) $script:A
 function Get-ServedStateRoot { param([string]$configPath) return [string]$Root }
 function Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
-  [pscustomobject]@{ State='Ready'; Actions=@($script:CurrentAction) }
+  [pscustomobject]@{ State='Ready'; Actions=@($script:RegisteredActions) }
 }
 function Start-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
@@ -110,10 +111,33 @@ function New-ScheduledTaskAction {
   param([string]$Execute, [string]$Argument, [string]$WorkingDirectory)
   [pscustomobject]@{ Execute=$Execute; Arguments=$Argument }
 }
-function Set-ScheduledTask { param([string]$TaskName, [object]$Action) $script:CurrentAction=$Action }
+function Set-ScheduledTask {
+  param([string]$TaskName, [object]$Action)
+  $script:CurrentAction=$Action
+  $script:RegisteredActions=@($Action)
+}
 function Register-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName, [string]$Xml, [switch]$Force)
   $script:CurrentAction=$script:OldAction
+  if ($Scenario -eq 'restore_foreign_one_action') {
+    $script:ForeignAction=[pscustomobject]@{
+      Execute=(Join-Path $Root 'foreign.exe')
+      Arguments='foreign-action'
+      WorkingDirectory=$Root
+    }
+    $script:CurrentAction=$script:ForeignAction
+    $script:RegisteredActions=@($script:ForeignAction)
+  } elseif ($Scenario -eq 'restore_multi_action') {
+    $script:RegisteredActions=@(
+      $script:OldAction,
+      [pscustomobject]@{
+        Execute=(Join-Path $Root 'foreign.exe')
+        Arguments='foreign-action'
+        WorkingDirectory=$Root
+      })
+  } else {
+    $script:RegisteredActions=@($script:OldAction)
+  }
   $script:Calls.Add('register:old')
 }
 function Get-ManagedServiceSid { param($Task) return 'S-1-5-21-offline-harness' }

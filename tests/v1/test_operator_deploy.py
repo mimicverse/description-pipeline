@@ -309,6 +309,7 @@ contract = (
 sample = {
     "task_name": expected["task_name"],
     "task_state": "Running",
+    "action_count": 1,
     "last_task_result": 267009,
     "listener_pid": 4242,
     "process_start_utc": "2026-10-21T00:00:00Z",
@@ -910,6 +911,8 @@ class LifecycleTests(unittest.TestCase):
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
             "\"arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
+            "\"action_count\":1,\"launch_contract\":\"legacy_pip_launcher_v0\","
+            "\"action_matches_generation\":true,"
             "\"config\":\"C:/original-install with spaces/endpoint.json\",\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
@@ -924,6 +927,8 @@ class LifecycleTests(unittest.TestCase):
             "{\"execute\":\"C:/foreign/not-description.exe\","
             "\"arguments\":\"foreign-service --option x\","
             "\"working_directory\":\"C:/description-e2e/state\","
+            "\"action_count\":1,\"launch_contract\":null,"
+            "\"action_matches_generation\":false,"
             "\"config\":\"C:/foreign/foreign.json\",\"state\":\"Running\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
@@ -932,6 +937,8 @@ class LifecycleTests(unittest.TestCase):
             "\"arguments\":\"-I -m description_pipeline serve --config "
             "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
+            "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
+            "\"action_matches_generation\":true,"
             "\"config\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
             "\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
@@ -1333,6 +1340,9 @@ class LifecycleTests(unittest.TestCase):
                 "working_directory": binding["state_root"],
                 "config": target + "/endpoint.json",
                 "state": "Running",
+                "action_count": 1,
+                "launch_contract": "python_module_v1",
+                "action_matches_generation": True,
             },
             "pending": {
                 "generation": target,
@@ -1389,14 +1399,97 @@ class LifecycleTests(unittest.TestCase):
             "working_directory": binding["state_root"],
             "config": "C:/old/endpoint.json",
             "state": "Running",
+            "action_count": 1,
+            "launch_contract": "legacy_pip_launcher_v0",
+            "action_matches_generation": True,
         }
         self.assertEqual(reconcile(source_status), "before")
         source_near_match = copy.deepcopy(source_status)
         source_near_match["live_task"]["arguments"] += " --foreign"
         self.assertEqual(reconcile(source_near_match), "unknown")
-        near_match = copy.deepcopy(status)
-        near_match["live_task"]["arguments"] = exact_arguments + " --foreign"
-        self.assertEqual(reconcile(near_match), "unknown")
+        source_case_mismatch = copy.deepcopy(source_status)
+        source_case_mismatch["live_task"]["arguments"] = (
+            source_case_mismatch["live_task"]["arguments"].replace("serve", "Serve", 1)
+        )
+        self.assertEqual(reconcile(source_case_mismatch), "unknown")
+        legacy_pending = copy.deepcopy(source_status)
+        legacy_pending["live_task"].update(
+            launch_contract="legacy_pip_launcher_v0",
+            action_matches_generation=True,
+        )
+        legacy_pending["pending"].pop("source_arguments")
+        legacy_pending["pending"].pop("source_working_directory")
+        self.assertEqual(reconcile(legacy_pending), "before")
+        for label, mutate in (
+            (
+                "legacy-contract-missing",
+                lambda value: value["live_task"].pop("launch_contract"),
+            ),
+            (
+                "legacy-action-mismatch",
+                lambda value: value["live_task"].update(
+                    action_matches_generation=False
+                ),
+            ),
+            (
+                "legacy-source-arguments-unbound",
+                lambda value: value["live_task"].update(
+                    arguments=value["live_task"]["arguments"] + " --foreign"
+                ),
+            ),
+            (
+                "legacy-source-fields-partial",
+                lambda value: value["pending"].update(
+                    source_working_directory=binding["state_root"]
+                ),
+            ),
+            (
+                "legacy-source-config-unpaired",
+                lambda value: value["pending"].update(
+                    source_config="C:/unbound/endpoint.json"
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                changed = copy.deepcopy(legacy_pending)
+                mutate(changed)
+                self.assertEqual(reconcile(changed), "unknown")
+        python_source_missing_fields = copy.deepcopy(legacy_pending)
+        python_arguments = (
+            '-I -m description_pipeline serve --config "C:/old/endpoint.json"'
+        )
+        python_source_missing_fields["live_task"].update(
+            execute="C:/old/runtime/Scripts/python.exe",
+            arguments=python_arguments,
+            launch_contract="python_module_v1",
+        )
+        python_source_missing_fields["pending"][
+            "source_launcher"
+        ] = "C:/old/runtime/Scripts/python.exe"
+        self.assertEqual(reconcile(python_source_missing_fields), "unknown")
+        for label, arguments in (
+            ("additional-token", exact_arguments + " --foreign"),
+            ("interactive-flag", exact_arguments.replace("-I ", "-i ", 1)),
+            ("module-case", exact_arguments.replace("description_pipeline", "Description_Pipeline")),
+        ):
+            with self.subTest(label=label):
+                near_match = copy.deepcopy(status)
+                near_match["live_task"]["arguments"] = arguments
+                self.assertEqual(reconcile(near_match), "unknown")
+        for label, changes in (
+            ("action-not-matched", {"action_matches_generation": False}),
+            ("contract-null", {"launch_contract": None}),
+            ("contract-foreign", {"launch_contract": "foreign_launcher_v1"}),
+            ("action-count-boolean", {"action_count": True}),
+            ("action-count-float", {"action_count": 1.0}),
+            ("task-ready", {"state": "Ready"}),
+            ("task-disabled", {"state": "Disabled"}),
+            ("task-unknown", {"state": "Unknown"}),
+        ):
+            with self.subTest(label=label):
+                changed = copy.deepcopy(status)
+                changed["live_task"].update(changes)
+                self.assertEqual(reconcile(changed), "unknown")
 
     def test_resume_failure_keeps_scheduling_and_admission_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1868,6 +1961,9 @@ class LifecycleTests(unittest.TestCase):
         control = CONTROL.read_text(encoding="utf-8")
         self.assertIn('"-EncodedCommand"', control)
         self.assertNotIn('"-Command",\n            "-",', control)
+        self.assertIn("$task.Actions).Count -ne 1", control)
+        self.assertIn("$record.passed -isnot [bool]", control)
+        self.assertIn("$record.launch_contract -isnot [string]", control)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path, state, config_home, _ = self._render_units(root)
@@ -1889,6 +1985,7 @@ class LifecycleTests(unittest.TestCase):
             raw_sample = {
                 "task_name": baseline_sample["task_name"],
                 "task_state": "Running",
+                "action_count": 1,
                 "listener_pid": baseline_sample["listener_pid"],
                 "process_start_utc": baseline_sample["process_start_utc"],
                 "install_id": baseline_sample["install_id"],
@@ -2115,6 +2212,7 @@ class LifecycleTests(unittest.TestCase):
                     "sample": {
                         "task_name": "description-e2e-endpoint",
                         "task_state": task_state,
+                        "action_count": 1,
                         "last_task_result": 267009,
                         "listener_pid": 4242,
                         "process_start_utc": "2026-10-21T00:00:00Z",
@@ -2150,7 +2248,11 @@ class LifecycleTests(unittest.TestCase):
 
             for label, changes in (
                 ("wrong-contract", {"launch_contract": "foreign_launcher_v1"}),
+                ("contract-case", {"launch_contract": "Python_Module_V1"}),
                 ("action-mismatch", {"action_matches_generation": False}),
+                ("multi-action", {"action_count": 2}),
+                ("boolean-action-count", {"action_count": True}),
+                ("float-action-count", {"action_count": 1.0}),
             ):
                 with self.subTest(label=label):
                     sample = {
@@ -2158,6 +2260,7 @@ class LifecycleTests(unittest.TestCase):
                         "sample": {
                             "task_name": "description-e2e-endpoint",
                             "task_state": "Running",
+                            "action_count": 1,
                             "listener_pid": 4242,
                             "process_start_utc": "2026-10-21T00:00:00Z",
                             "install_id": identity["install_id"],
@@ -2942,6 +3045,8 @@ class InstallOrderingTests(unittest.TestCase):
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
             "\"arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
+            "\"action_count\":1,\"launch_contract\":\"legacy_pip_launcher_v0\","
+            "\"action_matches_generation\":true,"
             "\"config\":\"C:/original-install with spaces/endpoint.json\",\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
@@ -2956,6 +3061,8 @@ class InstallOrderingTests(unittest.TestCase):
             "{\"execute\":\"C:/foreign/not-description.exe\","
             "\"arguments\":\"foreign-service --option x\","
             "\"working_directory\":\"C:/description-e2e/state\","
+            "\"action_count\":1,\"launch_contract\":null,"
+            "\"action_matches_generation\":false,"
             "\"config\":\"C:/foreign/foreign.json\",\"state\":\"Running\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
@@ -2964,6 +3071,8 @@ class InstallOrderingTests(unittest.TestCase):
             "\"arguments\":\"-I -m description_pipeline serve --config "
             "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
+            "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
+            "\"action_matches_generation\":true,"
             "\"config\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
             "\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","

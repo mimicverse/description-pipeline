@@ -2967,8 +2967,23 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 "windows_recovery_state_invalid",
             ),
             (
+                "legacy_release_python_contract",
+                lambda state: state["identity"].update(
+                    release_identity_sha256=recovery.WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
+                    runtime_launch_contract=recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT,
+                ),
+                "windows_recovery_state_invalid",
+            ),
+            (
                 "missing_contract_with_python_action",
                 lambda state: state["identity"].pop("runtime_launch_contract"),
+                "windows_recovery_state_invalid",
+            ),
+            (
+                "explicit_null_contract",
+                lambda state: state["identity"].update(
+                    runtime_launch_contract=None
+                ),
                 "windows_recovery_state_invalid",
             ),
             (
