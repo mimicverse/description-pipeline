@@ -11959,7 +11959,16 @@ def main(argv: list[str] | None = None) -> int:
             manifest, _, digest = load_recovery_manifest(args.manifest)
             _, postgres = strict_json_file(args.postgres_config, "target PostgreSQL settings")
             plan = build_target_plan(manifest, digest, host_id=args.host_id, postgres=postgres)
-            write_json_once(args.out, plan)
+            require_no_links(args.out, "target plan output")
+            args.out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                descriptor = os.open(args.out, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            except FileExistsError as error:
+                raise RecoveryError("recovery_write_conflict", "target plan output already exists") from error
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(canonical_json(plan))
+                stream.flush()
+                os.fsync(stream.fileno())
             print(f"target_plan={args.out}")
             print(f"target_plan_sha256={sha256_file(args.out)}")
             return 0
