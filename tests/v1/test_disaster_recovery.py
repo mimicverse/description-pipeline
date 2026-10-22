@@ -1898,6 +1898,41 @@ class RecoveryControlFlowTests(unittest.TestCase):
             recovery._workspace_verify(repository, row)
         self.assertEqual(len(observed), 1)
 
+    def test_workspace_nonexecutable_accepts_private_permissions(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        row = self.attribute_row(repository)
+        for mode in (0o600, 0o640):
+            with self.subTest(mode=oct(mode)):
+                (repository / "tracked.txt").chmod(mode)
+                recovery._workspace_verify(repository, row)
+
+    def test_workspace_executable_accepts_private_permissions(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        (repository / "tracked.txt").chmod(0o700)
+        subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repository), "commit", "-qm", "Track executable mode"], check=True)
+        row = self.attribute_row(repository)
+        recovery._workspace_verify(repository, row)
+
+    def test_workspace_nonexecutable_rejects_untracked_execute_bit(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        row = self.attribute_row(repository)
+        subprocess.run(["git", "-C", str(repository), "config", "core.filemode", "false"], check=True)
+        (repository / "tracked.txt").chmod(0o700)
+        with self.assertRaisesRegex(recovery.RecoveryError, "workspace tracked mode differs"):
+            recovery._workspace_verify(repository, row)
+
+    def test_workspace_executable_rejects_missing_execute_bit(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        (repository / "tracked.txt").chmod(0o700)
+        subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repository), "commit", "-qm", "Track executable mode"], check=True)
+        row = self.attribute_row(repository)
+        subprocess.run(["git", "-C", str(repository), "config", "core.filemode", "false"], check=True)
+        (repository / "tracked.txt").chmod(0o600)
+        with self.assertRaisesRegex(recovery.RecoveryError, "workspace tracked mode differs"):
+            recovery._workspace_verify(repository, row)
+
     def test_workspace_tracked_unset_and_unspecified_attributes_pass(self) -> None:
         repository, _, _, _ = self.workspace_fixture()
         for attributes in ("# Attributes are unspecified\n", "tracked.txt -filter -working-tree-encoding\n"):

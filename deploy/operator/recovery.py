@@ -9127,11 +9127,6 @@ def _workspace_verify(path: Path, row: dict) -> None:
             "recovery_workspace_mismatch",
             f"workspace tracked mode differs: {relative}",
         )
-        require(
-            stat.S_IMODE(metadata.st_mode) == (0o755 if mode == 0o100755 else 0o644),
-            "recovery_workspace_mismatch",
-            f"workspace tracked permissions differ: {relative}",
-        )
         digest = hashlib.sha1()
         digest.update(f"blob {metadata.st_size}\0".encode("ascii"))
         with target.open("rb") as stream:
