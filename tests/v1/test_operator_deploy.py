@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -300,6 +301,11 @@ match = re.search(r"FromBase64String\('([^']+)'\)", script)
 if match is None:
     raise SystemExit(2)
 expected = json.loads(base64.b64decode(match.group(1)).decode())
+contract = (
+    "legacy_pip_launcher_v0"
+    if expected["release"]["source_commit"] == "55cdf8da178e37239d3ac199cd27fc50cf56540d"
+    else "python_module_v1"
+)
 sample = {
     "task_name": expected["task_name"],
     "task_state": "Running",
@@ -312,6 +318,8 @@ sample = {
     "health_install_id": expected["install_id"],
     "health_config_digest": expected["config_digest"],
     "health_release": expected["release"],
+    "launch_contract": contract,
+    "action_matches_generation": True,
 }
 print(json.dumps({"passed": True, "sample": sample}, sort_keys=True))
 PY
@@ -901,28 +909,38 @@ class LifecycleTests(unittest.TestCase):
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
             "\"arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
+            "\"working_directory\":\"C:/description-e2e/state\","
             "\"config\":\"C:/original-install with spaces/endpoint.json\",\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
             "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
+            "\"source_arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
+            "\"source_working_directory\":\"C:/description-e2e/state\","
             "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
             "\"last_promotion\":null}'\n"
             '    elif [ "${FIXTURE_STATUS:-switched}" = "foreign" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/foreign/not-description.exe\","
             "\"arguments\":\"foreign-service --option x\","
+            "\"working_directory\":\"C:/description-e2e/state\","
             "\"config\":\"C:/foreign/foreign.json\",\"state\":\"Running\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/description.exe\","
-            "\"arguments\":\"serve --config C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
+            "\"arguments\":\"-I -m description_pipeline serve --config "
+            "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
+            "\"working_directory\":\"C:/description-e2e/state\","
             "\"config\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
             "\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
-            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"},"
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
+            "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
+            "\"source_arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
+            "\"source_working_directory\":\"C:/description-e2e/state\","
+            "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
             "\"last_promotion\":null}'\n"
             "    fi ;;\n"
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
@@ -1289,6 +1307,96 @@ class LifecycleTests(unittest.TestCase):
             io.digest({**frame, "reported_stage": "freeze"}),
         )
         self.assertNotEqual(classic["params_digest"], reported["params_digest"])
+
+    def test_windows_reconciliation_requires_exact_python_module_action(self) -> None:
+        control_text = CONTROL.read_text(encoding="utf-8")
+        marker = (
+            'RECONCILIATION="$(python3 - "$RECEIPT_DIR/windows-binding.json" '
+            '"$WINDOWS_STATUS" <<\'PY\'\n'
+        )
+        start = control_text.index(marker) + len(marker)
+        end = control_text.index("\nPY\n", start)
+        script = control_text[start:end]
+        target = "C:/description-e2e/state/lifecycle/gen-2/generation"
+        previous = "C:/description-e2e/state/instance-promotions/previous-0001"
+        exact_arguments = (
+            '-I -m description_pipeline serve --config "' + target + '/endpoint.json"'
+        )
+        binding = {
+            "dir": "C:/description-e2e/state/lifecycle/gen-2",
+            "state_root": "C:/description-e2e/state",
+        }
+        status = {
+            "live_task": {
+                "execute": target + "/runtime/Scripts/python.exe",
+                "arguments": exact_arguments,
+                "working_directory": binding["state_root"],
+                "config": target + "/endpoint.json",
+                "state": "Running",
+            },
+            "pending": {
+                "generation": target,
+                "previous": previous,
+                "source_launcher": "C:/old/runtime/Scripts/description.exe",
+                "source_arguments": 'serve --config "C:/old/endpoint.json"',
+                "source_working_directory": binding["state_root"],
+                "source_config": "C:/old/endpoint.json",
+            },
+            "last_promotion": None,
+        }
+
+        def reconcile(live_status: dict) -> str:
+            with tempfile.TemporaryDirectory() as tmp:
+                binding_path = Path(tmp) / "windows-binding.json"
+                status_path = Path(tmp) / "windows-status.json"
+                binding_path.write_text(json.dumps(binding), encoding="utf-8")
+                status_path.write_text(json.dumps(live_status), encoding="utf-8")
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(binding_path), str(status_path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return result.stdout.strip()
+
+        self.assertEqual(reconcile(status), previous)
+        for separator in ("\\", "mixed"):
+            with self.subTest(separator=separator):
+                variant = copy.deepcopy(status)
+                variant["live_task"].update(
+                    execute=(
+                        target.replace("/", "\\")
+                        if separator == "\\"
+                        else target.replace("lifecycle/gen-2", "lifecycle\\gen-2")
+                    )
+                    + (
+                        "\\runtime\\Scripts\\python.exe"
+                        if separator == "\\"
+                        else "/runtime\\Scripts/python.exe"
+                    ),
+                    arguments=exact_arguments.replace("/", "\\")
+                    if separator == "\\"
+                    else exact_arguments.replace("lifecycle/gen-2", "lifecycle\\gen-2"),
+                    config=target.replace("/", "\\") + "\\endpoint.json"
+                    if separator == "\\"
+                    else target + "\\endpoint.json",
+                )
+                self.assertEqual(reconcile(variant), previous)
+        source_status = copy.deepcopy(status)
+        source_status["live_task"] = {
+            "execute": "C:/old/runtime/Scripts/description.exe",
+            "arguments": 'serve --config "C:/old/endpoint.json"',
+            "working_directory": binding["state_root"],
+            "config": "C:/old/endpoint.json",
+            "state": "Running",
+        }
+        self.assertEqual(reconcile(source_status), "before")
+        source_near_match = copy.deepcopy(source_status)
+        source_near_match["live_task"]["arguments"] += " --foreign"
+        self.assertEqual(reconcile(source_near_match), "unknown")
+        near_match = copy.deepcopy(status)
+        near_match["live_task"]["arguments"] = exact_arguments + " --foreign"
+        self.assertEqual(reconcile(near_match), "unknown")
 
     def test_resume_failure_keeps_scheduling_and_admission_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1789,6 +1897,8 @@ class LifecycleTests(unittest.TestCase):
                 "health_install_id": baseline_sample["install_id"],
                 "health_config_digest": baseline_sample["config_digest"],
                 "health_release": expected["release"],
+                "launch_contract": baseline_sample["launch_contract"],
+                "action_matches_generation": True,
             }
             raw_transport = json.dumps(
                 {"passed": True, "sample": raw_sample},
@@ -2014,6 +2124,8 @@ class LifecycleTests(unittest.TestCase):
                         "health_install_id": identity["install_id"],
                         "health_config_digest": identity["config_digest"],
                         "health_release": identity["release"],
+                        "launch_contract": "python_module_v1",
+                        "action_matches_generation": True,
                     },
                 }
                 (root / "windows-status.json").write_text(
@@ -2035,6 +2147,45 @@ class LifecycleTests(unittest.TestCase):
                     0,
                     result.stdout + result.stderr,
                 )
+
+            for label, changes in (
+                ("wrong-contract", {"launch_contract": "foreign_launcher_v1"}),
+                ("action-mismatch", {"action_matches_generation": False}),
+            ):
+                with self.subTest(label=label):
+                    sample = {
+                        "passed": True,
+                        "sample": {
+                            "task_name": "description-e2e-endpoint",
+                            "task_state": "Running",
+                            "listener_pid": 4242,
+                            "process_start_utc": "2026-10-21T00:00:00Z",
+                            "install_id": identity["install_id"],
+                            "config_digest": identity["config_digest"],
+                            "release": identity["release"],
+                            "health_install_id": identity["install_id"],
+                            "health_config_digest": identity["config_digest"],
+                            "health_release": identity["release"],
+                            "launch_contract": "python_module_v1",
+                            "action_matches_generation": True,
+                        },
+                    }
+                    sample["sample"].update(changes)
+                    (root / "windows-status.json").write_text(
+                        json.dumps(sample),
+                        encoding="utf-8",
+                    )
+                    result = run(
+                        [
+                            "bash",
+                            str(CONTROL),
+                            "status",
+                            "--config",
+                            str(config_path),
+                        ],
+                        env,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
 
             (root / "windows-status.json").write_text(
                 json.dumps(
@@ -2790,28 +2941,38 @@ class InstallOrderingTests(unittest.TestCase):
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
             "\"arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
+            "\"working_directory\":\"C:/description-e2e/state\","
             "\"config\":\"C:/original-install with spaces/endpoint.json\",\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
             "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
+            "\"source_arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
+            "\"source_working_directory\":\"C:/description-e2e/state\","
             "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
             "\"last_promotion\":null}'\n"
             '    elif [ "${FIXTURE_STATUS:-switched}" = "foreign" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/foreign/not-description.exe\","
             "\"arguments\":\"foreign-service --option x\","
+            "\"working_directory\":\"C:/description-e2e/state\","
             "\"config\":\"C:/foreign/foreign.json\",\"state\":\"Running\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/description.exe\","
-            "\"arguments\":\"serve --config C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
+            "\"arguments\":\"-I -m description_pipeline serve --config "
+            "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
+            "\"working_directory\":\"C:/description-e2e/state\","
             "\"config\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
             "\"state\":\"Running\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
-            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"},"
+            "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
+            "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
+            "\"source_arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
+            "\"source_working_directory\":\"C:/description-e2e/state\","
+            "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
             "\"last_promotion\":null}'\n"
             "    fi ;;\n"
             "esac\n"

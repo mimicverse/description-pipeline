@@ -79,6 +79,11 @@ RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-receipt/v1"
 MAINTENANCE_RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-maintenance/v1"
 SNAPSHOT_WORKER_SCHEMA = "solidworks-to-urdf.recovery-snapshot-worker/v4"
 WINDOWS_RECOVERY_SCHEMA = "solidworks-to-urdf.windows-recovery/v1"
+WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
+WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
+WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256 = (
+    "62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200"
+)
 WINDOWS_BUNDLE_MEMBER = "windows/recovery.zip"
 WINDOWS_STATE_MEMBER = "windows-state.json"
 WINDOWS_BUNDLE = "recovery.zip"
@@ -4745,8 +4750,16 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "windows_recovery_state_invalid",
         "Windows task does not enforce singleton instances",
     )
+    raw_identity = state["identity"]
+    declared_launch_contract = None
+    if isinstance(raw_identity, dict):
+        raw_identity = dict(raw_identity)
+        declared_launch_contract = raw_identity.pop(
+            "runtime_launch_contract",
+            None,
+        )
     identity = _exact_keys(
-        state["identity"],
+        raw_identity,
         {
             "operator_sid",
             "operator_administrator",
@@ -4770,6 +4783,32 @@ def _validate_windows_recovery_state(document: object) -> dict:
         },
         "windows state identity",
     )
+    launch_contract = declared_launch_contract
+    if launch_contract is None:
+        launch_contract = (
+            WINDOWS_LEGACY_LAUNCH_CONTRACT
+            if identity["release_identity_sha256"]
+            == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256
+            else None
+        )
+    require(
+        isinstance(launch_contract, str)
+        and launch_contract
+        in {
+            WINDOWS_PYTHON_LAUNCH_CONTRACT,
+            WINDOWS_LEGACY_LAUNCH_CONTRACT,
+        },
+        "windows_recovery_state_invalid",
+        "Windows runtime launch contract is unsupported",
+    )
+    require(
+        launch_contract != WINDOWS_LEGACY_LAUNCH_CONTRACT
+        or identity["release_identity_sha256"]
+        == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
+        "windows_recovery_state_invalid",
+        "the legacy launch contract is not bound to the approved release",
+    )
+    identity["runtime_launch_contract"] = launch_contract
     require(
         identity["operator_administrator"] is True,
         "windows_operator_not_administrator",
@@ -4813,9 +4852,29 @@ def _validate_windows_recovery_state(document: object) -> dict:
         )
     }
     normalized_action = {key: str(value).replace("\\", "/") for key, value in action.items()}
+    python_module_action = (
+        normalized_action["execute"]
+        == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
+        and normalized_action["arguments"]
+        == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
+    )
+    legacy_launcher_action = (
+        normalized_action["execute"]
+        == normalized["endpoint_root"] + "/runtime/Scripts/description.exe"
+        and normalized_action["arguments"]
+        == f'serve --config "{normalized["config_path"]}"'
+    )
     require(
-        normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/description.exe"
-        and normalized_action["arguments"] == f'serve --config "{normalized["config_path"]}"'
+        (
+            (
+                launch_contract == WINDOWS_PYTHON_LAUNCH_CONTRACT
+                and python_module_action
+            )
+            or (
+                launch_contract == WINDOWS_LEGACY_LAUNCH_CONTRACT
+                and legacy_launcher_action
+            )
+        )
         and normalized_action["working_directory"] == normalized["state_root"]
         and normalized["config_path"] == normalized["endpoint_root"] + "/endpoint.json"
         and normalized["install_id_path"].startswith(normalized["state_root"] + "/")

@@ -64,6 +64,13 @@ Check 'wording.no_lock_or_kill' (-not $source.Contains('Remove-Item -LiteralPath
 Check 'wording.no_system_text_json' (-not $source.Contains('System.Text.Json')) 'a Core-only JSON type the Desktop PowerShell 5.1 lifecycle cannot load is still present'
 Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfigScanPython') -and
   $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
+Check 'wording.python_module_task_action' ($source.Contains('function Runtime-LauncherArguments') -and
+  $source.Contains('function Test-Runtime-Launcher') -and
+  $source.Contains('-I -m description_pipeline serve --config') -and
+  $source.Contains('function Legacy-Launcher') -and
+  $source.Contains('function Legacy-LauncherArguments') -and
+  $source.Contains('launch_contract=(Python-Module-LaunchContract)') -and
+  $source.Contains('-Argument (Runtime-LauncherArguments $StageDir)'))
 Check 'wording.path_identity_normalization' ($source.Contains('Normalize-PathIdentity') -and
   $source.Contains("Replace('\', '/')")) 'path identity comparisons must normalize the two Windows separators'
 Check 'wording.user_domain_pins' ($source.Contains("GetEnvironmentVariable(`$Name, 'User')") -and
@@ -71,6 +78,12 @@ Check 'wording.user_domain_pins' ($source.Contains("GetEnvironmentVariable(`$Nam
 Check 'wording.windows_recovery_schema' ($source.Contains('recovery-snapshot') -and
   $source.Contains('recovery-restore') -and $source.Contains('recovery-verify') -and
   $source.Contains('solidworks-to-urdf.windows-recovery/v1'))
+$snapshotStateStart = $source.IndexOf('$state = [ordered]@{')
+$snapshotStateEnd = $source.IndexOf('files = $files', $snapshotStateStart)
+Check 'wording.recovery_snapshot_launch_contract' ($snapshotStateStart -ge 0 -and
+  $snapshotStateEnd -gt $snapshotStateStart -and
+  $source.Substring($snapshotStateStart, $snapshotStateEnd - $snapshotStateStart).Contains(
+    'runtime_launch_contract = $identity.runtime_launch_contract'))
 Check 'wording.windows_recovery_acl' ($source.Contains('Get-AclProjection') -and
   $source.Contains('Set-AclProjection') -and $source.Contains('AreAccessRulesProtected'))
 Check 'wording.windows_managed_acl' ($source.Contains('Set-ManagedEndpointAcls') -and
@@ -553,11 +566,88 @@ $null = New-Item -ItemType Directory -Path $previous -Force
 [System.IO.File]::WriteAllText((Join-Path $previous 'task.xml'), '<Task />')
 [System.IO.File]::WriteAllText(
   (Join-Path $previous 'stage-receipt.json'),
-  '{"passed":true,"verb":"stage","version":"1.4.3","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')
+  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $previous); version='1.5.0';
+     source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
+     source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
+    ConvertTo-Json -Compress))
 $configPath = Join-Path $generation 'endpoint.json'
 [System.IO.File]::WriteAllText($configPath, ('{{"state_root":"{0}"}}' -f ($root -replace '\\', '/')))
+[System.IO.File]::WriteAllText(
+  (Join-Path $generation 'stage-receipt.json'),
+  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $generation);
+     launch_contract='python_module_v1'; version='1.5.0';
+     source_commit=('b' * 40); source_sha256=('b' * 64)} | ConvertTo-Json -Compress))
 $lockPath = Join-Path $root '.endpoint.lock'
 $binding = @{ task_name = 'test-endpoint'; port = 8765; state_root = $root; generation = $generation }
+Check 'launch.python_entrypoint' ((Normalize-PathIdentity (Runtime-Launcher $generation)) -eq
+  (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\python.exe')))
+Check 'launch.module_arguments' ((Runtime-LauncherArguments $generation) -eq
+  ('-I -m description_pipeline serve --config "' + (Config-Path $generation) + '"'))
+Check 'launch.candidate_action_accepted' (Test-Runtime-Launcher (Runtime-Launcher $generation) `
+  (Runtime-LauncherArguments $generation) $generation)
+Check 'launch.argument_suffix_refused' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `
+  ((Runtime-LauncherArguments $generation) + ' --foreign') $generation))
+$legacyGeneration = Join-Path $root 'legacy-generation'
+$null = New-Item -ItemType Directory -Path $legacyGeneration
+[System.IO.File]::WriteAllText(
+  (Join-Path $legacyGeneration 'stage-receipt.json'),
+  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $legacyGeneration); version='1.5.0';
+     source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
+     source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
+    ConvertTo-Json -Compress))
+Check 'launch.legacy_description_exe_accepted_for_old_generation' (Test-Runtime-Launcher `
+  (Legacy-Launcher $legacyGeneration) (Legacy-LauncherArguments $legacyGeneration) $legacyGeneration)
+Check 'launch.legacy_description_exe_refused_for_new_generation' (-not (Test-Runtime-Launcher `
+  (Legacy-Launcher $generation) (Legacy-LauncherArguments $generation) $generation))
+$forgedLegacyGeneration = Join-Path $root 'forged-legacy-generation'
+$null = New-Item -ItemType Directory -Path $forgedLegacyGeneration
+[System.IO.File]::WriteAllText(
+  (Join-Path $forgedLegacyGeneration 'stage-receipt.json'),
+  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $legacyGeneration); version='1.5.0';
+     source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
+     source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
+    ConvertTo-Json -Compress))
+$message = ''
+try { $null = Test-Runtime-Launcher (Legacy-Launcher $forgedLegacyGeneration) `
+  (Legacy-LauncherArguments $forgedLegacyGeneration) $forgedLegacyGeneration } catch { $message = $_.Exception.Message }
+Check 'launch.forged_legacy_generation_refused' ($message -match 'belongs to another generation')
+$wrongLegacySourceGeneration = Join-Path $root 'wrong-legacy-source-generation'
+$null = New-Item -ItemType Directory -Path $wrongLegacySourceGeneration
+[System.IO.File]::WriteAllText(
+  (Join-Path $wrongLegacySourceGeneration 'stage-receipt.json'),
+  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $wrongLegacySourceGeneration);
+     version='1.5.0'; source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
+     source_sha256=('a' * 64)} | ConvertTo-Json -Compress))
+$message = ''
+try { $null = Test-Runtime-Launcher (Legacy-Launcher $wrongLegacySourceGeneration) `
+  (Legacy-LauncherArguments $wrongLegacySourceGeneration) $wrongLegacySourceGeneration } catch {
+  $message = $_.Exception.Message
+}
+Check 'launch.wrong_legacy_source_refused' ($message -match 'approved legacy release identity')
+$unsupportedGeneration = Join-Path $root 'unsupported-generation'
+$null = New-Item -ItemType Directory -Path $unsupportedGeneration
+[System.IO.File]::WriteAllText(
+  (Join-Path $unsupportedGeneration 'stage-receipt.json'),
+  '{"passed":true,"verb":"stage","launch_contract":"foreign_launcher_v1"}')
+$message = ''
+try { $null = Test-Runtime-Launcher (Runtime-Launcher $unsupportedGeneration) `
+  (Runtime-LauncherArguments $unsupportedGeneration) $unsupportedGeneration } catch { $message = $_.Exception.Message }
+Check 'launch.unsupported_contract_refused' ($message -match 'stage_launch_contract_unsupported')
+$emptyGeneration = Join-Path $root 'empty-contract-generation'
+$null = New-Item -ItemType Directory -Path $emptyGeneration
+[System.IO.File]::WriteAllText((Join-Path $emptyGeneration 'stage-receipt.json'), '{}')
+$message = ''
+try { $null = Test-Runtime-Launcher (Runtime-Launcher $emptyGeneration) `
+  (Runtime-LauncherArguments $emptyGeneration) $emptyGeneration } catch { $message = $_.Exception.Message }
+Check 'launch.empty_contract_refused' ($message -match 'stage_launch_contract_unsupported')
+$legacyIdentity = [pscustomobject]@{
+  release_identity_sha256='62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200'}
+Check 'recovery.legacy_identity_without_contract_accepted' (
+  (Resolve-RecoveryLaunchContract $legacyIdentity) -eq (Legacy-LaunchContract))
+$foreignIdentity = [pscustomobject]@{release_identity_sha256=('f' * 64)}
+$message = ''
+try { $null = Resolve-RecoveryLaunchContract $foreignIdentity } catch { $message = $_.Exception.Message }
+Check 'recovery.contractless_foreign_identity_refused' ($message -match 'not the approved legacy release')
 function Reset-State {
   $script:TaskMissing = $false
   $script:TaskState = 'Ready'
@@ -573,7 +663,10 @@ function Reset-State {
   $script:HealthProbes.Clear()
   [System.IO.File]::WriteAllText(
     (Join-Path $previous 'stage-receipt.json'),
-    '{"passed":true,"verb":"stage","version":"1.4.3","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')
+    (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $previous); version='1.5.0';
+       source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
+       source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
+      ConvertTo-Json -Compress))
   if (Test-Path -LiteralPath $lockPath) { Remove-Item -LiteralPath $lockPath -Force }
   $receipt = Join-Path $promotions 'lock-refusal.json'
   if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt -Force }
@@ -797,32 +890,45 @@ Check 'flow.non_refusal_rethrows' (($message -match 'settle window') -and ($scri
 
 # ---- failure-path restore: gated start + pinned previous identity -----------
 $sourceLauncher = Join-Path $previous 'runtime/Scripts/description.exe'
+$sourceArguments = 'serve --config "' + (Join-Path $previous 'endpoint.json') + '"'
+$sourceWorkingDirectory = $root
 Reset-State
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation $sourceLauncher
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
+  $sourceLauncher $sourceArguments $sourceWorkingDirectory
 Check 'restore.success_pinned_health' ($restore.stopped -and $restore.restored -and $restore.startable -and $restore.started -and
   ($restore.healthy -eq $true) -and ($restore.previous_generation -eq $previous) -and
-  ($script:HealthProbes.Count -eq 1) -and ($script:HealthProbes[0] -eq '1.4.3') -and
+  ($script:HealthProbes.Count -eq 1) -and ($script:HealthProbes[0] -eq '1.5.0') -and
   (($script:CallLog -join ',') -eq 'stop,register,start'))
 
 Reset-State
 [System.IO.File]::WriteAllText($lockPath, '999999')
 $script:ProcScenario = 'denied'
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation $sourceLauncher
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
+  $sourceLauncher $sourceArguments $sourceWorkingDirectory
 Check 'restore.gate_unknown_no_start' ($restore.stopped -and $restore.restored -and (-not $restore.startable) -and (-not $restore.started) -and
   ($restore.start_gate -eq 'refused') -and ($restore.error -match 'start gate is refused') -and
   (($script:CallLog -join ',') -eq 'stop,register'))
 
 Reset-State
 $script:OldHealthOk = $false
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation $sourceLauncher
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
+  $sourceLauncher $sourceArguments $sourceWorkingDirectory
 Check 'restore.health_failure_pinned' ($restore.stopped -and $restore.restored -and $restore.started -and (-not $restore.healthy) -and
-  ($restore.error -match 'did not answer') -and ($script:HealthProbes.Count -eq 1) -and ($script:HealthProbes[0] -eq '1.4.3'))
+  ($restore.error -match 'did not answer') -and ($script:HealthProbes.Count -eq 1) -and ($script:HealthProbes[0] -eq '1.5.0'))
 
 Reset-State
 Remove-Item -LiteralPath (Join-Path $previous 'stage-receipt.json') -Force
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation $sourceLauncher
-Check 'restore.missing_receipt_unjudged' ($restore.started -and ($null -eq $restore.healthy) -and
-  ($restore.error -match 'receipt is unavailable') -and ($script:HealthProbes.Count -eq 0))
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
+  $sourceLauncher $sourceArguments $sourceWorkingDirectory
+Check 'restore.missing_receipt_fails_closed' ((-not $restore.started) -and ($null -eq $restore.healthy) -and
+  ($restore.error -match 'stage_receipt_missing') -and ($script:HealthProbes.Count -eq 0))
+
+Reset-State
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
+  $sourceLauncher ($sourceArguments + ' --foreign') $sourceWorkingDirectory
+Check 'restore.foreign_source_action_fails_closed' ((-not $restore.started) -and ($null -eq $restore.healthy) -and
+  ($restore.error -match 'launch contract') -and ($script:HealthProbes.Count -eq 0) -and
+  (($script:CallLog -join ',') -eq 'stop,register'))
 
 # ---- real outer promote flow (child pwsh; real Invoke-Main) -----------------
 $harness = Join-Path $PSScriptRoot 'invoke-main-harness.ps1'
@@ -847,9 +953,8 @@ Check 'outer.startable_starts_old_with_pinned_health' ((@($outer.calls | Where-O
   ($outer.receipt.restore.healthy -eq $true) -and (@($outer.sleeps) -contains 60))
 
 $outer = Invoke-Outer 'startable_missing_receipt'
-Check 'outer.missing_receipt_health_unjudged' ((@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 1) -and
-  ($outer.receipt.restore.started -eq $true) -and ($null -eq $outer.receipt.restore.healthy) -and
-  ($outer.receipt.restore.error -match 'receipt is unavailable'))
+Check 'outer.missing_receipt_fails_closed' ((@($outer.calls).Count -eq 0) -and
+  ($outer.message -match 'stage_receipt_missing'))
 
 $outer = Invoke-Outer 'stage_unknown_key_refused'
 Check 'outer.stage_unknown_key_refused' (($outer.message -match 'endpoint_config_unknown_keys') -and

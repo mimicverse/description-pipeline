@@ -43,12 +43,18 @@ if ($Scenario -eq 'stage_duplicate_key_refused') {
 }
 [System.IO.File]::WriteAllText($oldConfig, $configurationText)
 [System.IO.File]::WriteAllText($newConfig, $configurationText)
-[System.IO.File]::WriteAllText((Join-Path $newGeneration 'stage-receipt.json'), '{}')
+[System.IO.File]::WriteAllText(
+  (Join-Path $newGeneration 'stage-receipt.json'),
+  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $newGeneration);
+     launch_contract='python_module_v1'; version='1.5.0';
+     source_commit=('b' * 40); source_sha256=('b' * 64)} | ConvertTo-Json -Compress))
 [System.IO.File]::WriteAllText((Join-Path $Root '.endpoint.lock'), '4242')
 if ($Scenario -ne 'startable_missing_receipt') {
   [System.IO.File]::WriteAllText(
     (Join-Path $oldGeneration 'stage-receipt.json'),
-    (@{passed=$true; verb='stage'; version='1.4.3'; source_commit=('a' * 40); source_sha256=('a' * 64)} |
+    (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $oldGeneration); version='1.5.0';
+       source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
+       source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
       ConvertTo-Json -Compress))
 }
 $bindingPath = Join-Path $Root 'binding.json'
@@ -78,7 +84,8 @@ if ($Scenario -notlike 'stage_*') {
 
 $script:OldAction = [pscustomobject]@{
   Execute = (Join-Path $oldGeneration 'runtime/Scripts/description.exe')
-  Arguments = ('serve --config "' + $oldConfig + '"')}
+  Arguments = ('serve --config "' + $oldConfig + '"')
+  WorkingDirectory = $Root}
 $script:CurrentAction = $script:OldAction
 $script:Calls = [System.Collections.Generic.List[string]]::new()
 $script:Sleeps = [System.Collections.Generic.List[int]]::new()
@@ -152,7 +159,8 @@ function Wait-SettleRetryDelay { param([int]$Seconds = 60) $script:Sleeps.Add($S
 function Invoke-RestMethod {
   param([string]$Uri, [hashtable]$Headers, [int]$TimeoutSec)
   @{schema_version='solidworks-to-urdf.health/v1'; ready=$true; native_platform=$true;
-    release=@{version='1.4.3'; source_commit=('a' * 40); source_sha256=('a' * 64)};
+    release=@{version='1.5.0'; source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
+      source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'};
     install=@{install_id='old-install'; config_digest='old-config'}}
 }
 function Die { param([string]$code, [string]$message) throw ('DIE:' + $code + ':' + $message) }

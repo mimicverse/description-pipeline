@@ -1183,6 +1183,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
+WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
 config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 windows = config.get("windows")
@@ -1222,6 +1224,62 @@ $expected = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
 function Read-Json([string]$path) {{
   (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json
 }}
+function Normalize-PathIdentity([string]$path) {{
+  return (([string]$path).Replace('\', '/').TrimEnd('/'))
+}}
+function Get-LaunchContract([string]$generation) {{
+  $receipt = Join-Path $generation 'stage-receipt.json'
+  if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) {{
+    throw 'the task generation has no stage receipt'
+  }}
+  $record = Read-Json $receipt
+  if ($record.passed -ne $true -or [string]$record.verb -ne 'stage') {{
+    throw 'the task generation has an incomplete stage receipt'
+  }}
+  if (-not ($record.version -and $record.source_commit -and $record.source_sha256)) {{
+    throw 'the task generation launch contract carries no release identity'
+  }}
+  if (-not $record.generation -or
+      (Normalize-PathIdentity ([string]$record.generation)) -ne
+      (Normalize-PathIdentity $generation)) {{
+    throw 'the stage receipt belongs to another generation'
+  }}
+  if ($record.PSObject.Properties.Name -contains 'launch_contract') {{
+    $contract = [string]$record.launch_contract
+    if ($contract -ne 'python_module_v1') {{
+      throw "the task generation names an unsupported launch contract: $contract"
+    }}
+    return $contract
+  }}
+  if ([string]$record.source_commit -ne '55cdf8da178e37239d3ac199cd27fc50cf56540d') {{
+    throw 'the contract-less task generation is not the approved legacy release'
+  }}
+  if ([string]$record.version -ne '1.5.0' -or
+      [string]$record.source_sha256 -ne '66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec') {{
+    throw 'the contract-less task generation does not carry the approved legacy release identity'
+  }}
+  return 'legacy_pip_launcher_v0'
+}}
+function Test-LaunchAction([string]$execute, [string]$arguments, [string]$generation, [string]$contract) {{
+  if ($contract -eq 'python_module_v1') {{
+    return (
+      (Normalize-PathIdentity $execute) -eq
+        (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\python.exe')) -and
+      $arguments -eq (
+        '-I -m description_pipeline serve --config "' +
+        (Join-Path $generation 'endpoint.json') + '"'
+      )
+    )
+  }}
+  return (
+    $contract -eq 'legacy_pip_launcher_v0' -and
+    (Normalize-PathIdentity $execute) -eq
+      (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\description.exe')) -and
+    $arguments -eq (
+      'serve --config "' + (Join-Path $generation 'endpoint.json') + '"'
+    )
+  )
+}}
 function Get-Sample {{
   $task = Get-ScheduledTask -TaskName $expected.task_name -ErrorAction Stop
   if ($task.State -ne 'Running') {{ throw "task state is $($task.State)" }}
@@ -1230,6 +1288,11 @@ function Get-Sample {{
   if (-not $match.Success) {{ throw 'task action does not bind serve --config' }}
   $configPath = $match.Groups[1].Value
   $generation = Split-Path -Parent $configPath
+  $launchContract = Get-LaunchContract $generation
+  if (-not (Test-LaunchAction ([string]$task.Actions[0].Execute) `
+      ([string]$task.Actions[0].Arguments) $generation $launchContract)) {{
+    throw 'task action does not match its generation launch contract'
+  }}
   $python = Join-Path $generation 'runtime\Scripts\python.exe'
   if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {{
     throw 'task generation runtime Python is missing'
@@ -1244,6 +1307,10 @@ function Get-Sample {{
   $probe = ((& $python -I -c $program $configPath) | Select-Object -Last 1) |
     ConvertFrom-Json
   $config = Read-Json $configPath
+  if ((Normalize-PathIdentity ([string]$task.Actions[0].WorkingDirectory)) -ne
+      (Normalize-PathIdentity ([string]$config.state_root))) {{
+    throw 'task working directory differs from the endpoint state root'
+  }}
   $installId = (
     Get-Content -LiteralPath (Join-Path ([string]$probe.state_root) 'install-id') -Raw
   ).Trim()
@@ -1273,6 +1340,8 @@ function Get-Sample {{
     process_start_utc = $process.StartTime.ToUniversalTime().ToString('o')
     install_id = [string]$installId
     config_digest = [string]$probe.config_digest
+    launch_contract = [string]$launchContract
+    action_matches_generation = $true
     release = [ordered]@{{
       version = [string]$probe.release.version
       source_commit = [string]$embedded.source_commit
@@ -1373,6 +1442,9 @@ if (
     or sample.get("health_config_digest") != identity["config_digest"]
     or sample.get("release") != identity["release"]
     or sample.get("health_release") != identity["release"]
+    or sample.get("action_matches_generation") is not True
+    or sample.get("launch_contract")
+    not in {WINDOWS_PYTHON_LAUNCH_CONTRACT, WINDOWS_LEGACY_LAUNCH_CONTRACT}
     or type(sample.get("listener_pid")) is not int
     or not isinstance(sample.get("process_start_utc"), str)
     or not sample["process_start_utc"]
@@ -1387,6 +1459,8 @@ print(
             "process_start_utc": sample["process_start_utc"],
             "install_id": sample["install_id"],
             "config_digest": sample["config_digest"],
+            "launch_contract": sample["launch_contract"],
+            "action_matches_generation": sample["action_matches_generation"],
         },
         sort_keys=True,
     )
@@ -2327,6 +2401,10 @@ def normalize(value):
     return str(value or "").replace("\\", "/").rstrip("/")
 
 
+def normalize_arguments(value):
+    return str(value or "").replace("\\", "/").strip().lower()
+
+
 binding = json.load(open(sys.argv[1], encoding="utf-8"))
 status = json.load(open(sys.argv[2], encoding="utf-8"))
 target = normalize(binding.get("dir")) + "/generation"
@@ -2337,6 +2415,8 @@ if not isinstance(live, dict):
 # The endpoint script owns task-config parsing; this side compares structured facts only.
 execute = normalize(live.get("execute")).lower()
 config = normalize(live.get("config")).lower()
+arguments = normalize_arguments(live.get("arguments"))
+working_directory = normalize(live.get("working_directory")).lower()
 if not execute or not config:
     print("unknown")
     raise SystemExit(0)
@@ -2345,13 +2425,22 @@ record = next((row for row in records if normalize(row.get("generation")) == tar
 source = normalize(record.get("previous")) if record else ""
 source_launcher = normalize(record.get("source_launcher")).lower() if record else ""
 source_config = normalize(record.get("source_config")).lower() if record else ""
+source_arguments = normalize_arguments(record.get("source_arguments")) if record else ""
+source_working_directory = normalize(record.get("source_working_directory")).lower() if record else ""
 
 
 def runs(generation):
     # The single launch convention the endpoint script uses (Runtime-Launcher + Config-Path).
     return (
-        execute == (generation + "/runtime/scripts/description.exe").lower()
+        execute == (generation + "/runtime/scripts/python.exe").lower()
         and config == (generation + "/endpoint.json").lower()
+        and arguments
+        == normalize_arguments(
+            '-i -m description_pipeline serve --config "'
+            + generation
+            + '/endpoint.json"'
+        )
+        and working_directory == normalize(binding.get("state_root")).lower()
     )
 
 
@@ -2361,8 +2450,12 @@ elif (
     source
     and source_launcher
     and source_config
+    and source_arguments
+    and source_working_directory
     and execute == source_launcher
     and config == source_config
+    and arguments == source_arguments
+    and working_directory == source_working_directory
 ):
     # Positively the ACTUAL launcher and configuration this maintenance bound as its source.
     print("before")
