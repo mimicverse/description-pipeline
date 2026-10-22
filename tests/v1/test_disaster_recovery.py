@@ -167,6 +167,21 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             with self.assertRaisesRegex(recovery.RecoveryError, "unregistered files"):
                 self.verify(tree, receipt)
 
+    def test_historical_policy_archive_is_recovery_compatible(self) -> None:
+        historical = "415813b06c4b379fbbc1b5c6ea4c3fd56cf96c6ad8bfa103eaae03326de2b7c4"
+        with tempfile.TemporaryDirectory() as directory:
+            tree, receipt = self.checkpoint_fixture(Path(directory))
+            manifest_path = tree / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["policy"]["digest"] = historical
+            manifest_path.write_text(json.dumps(manifest))
+            self.verify(tree, receipt)
+
+            manifest["policy"]["digest"] = "f" * 64
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(recovery.RecoveryError, "checkpoint delivery manifest is invalid"):
+                self.verify(tree, receipt)
+
 
 def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
     task_xml = b"<Task><RegistrationInfo><URI>\\fixture-endpoint</URI></RegistrationInfo></Task>"

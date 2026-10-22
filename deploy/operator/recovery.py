@@ -2497,11 +2497,15 @@ def verify_checkpoint_tree(
         f"checkpoint tree differs from its reference index: {tree}",
     )
     if isinstance(receipt, dict):
-        from description_pipeline.delivery import STAMPED_EXTRA, SUBJECT_DIRECTORIES, read_delivery_manifest
+        from description_pipeline.delivery import (
+            STAMPED_EXTRA,
+            SUBJECT_DIRECTORIES,
+            read_recovery_delivery_manifest,
+        )
         from description_pipeline.io import PipelineError
 
         try:
-            delivery = read_delivery_manifest(tree)
+            delivery = read_recovery_delivery_manifest(tree)
         except (PipelineError, OSError, ValueError) as error:
             raise RecoveryError("recovery_member_hash_mismatch", "checkpoint delivery manifest is invalid") from error
         artifacts = receipt.get("artifacts") or []
