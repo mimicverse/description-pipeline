@@ -2178,15 +2178,22 @@ def _record_keys_for(
 
     keys: list[str] = []
     properties = record.get("properties") if isinstance(record.get("properties"), dict) else {}
-    for group in properties.values():
-        if not isinstance(group, dict):
-            continue
-        for value in group.values():
+
+    def visit(value) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+        else:
             if not isinstance(value, str) or "#" not in value:
-                continue
+                return
             referenced, _, key = value.partition("#")
             if referenced.replace("\\", "/") == relative and key:
                 keys.append(key)
+
+    visit(properties)
     configured = (record_keys or {}).get(relative)
     if isinstance(configured, str):
         keys.append(configured)
