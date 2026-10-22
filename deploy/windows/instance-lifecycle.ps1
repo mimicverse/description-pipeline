@@ -1865,7 +1865,7 @@ function Test-NetTcpNoMatchError($ErrorRecord) {
   $category = [string]$ErrorRecord.CategoryInfo.Category
   $errorId = [string]$ErrorRecord.FullyQualifiedErrorId
   return $category -eq 'ObjectNotFound' -and
-    $errorId -match '^CmdletizationQuery_NotFound_[A-Za-z0-9_]+,Get-NetTCPConnection$'
+    $errorId -match '^CmdletizationQuery_NotFound(?:_[A-Za-z0-9_]+)?,Get-NetTCPConnection$'
 }
 function Assert-RecoveryIdle($Identity) {
   try {
