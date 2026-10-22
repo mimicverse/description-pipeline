@@ -125,6 +125,12 @@ def _canonical_value(value: Any) -> Any:
     return value
 
 
+def canonical_json_value(value: object) -> str:
+    """One stable JSON text form for warning identity, ordering, and display."""
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def canonical(data: Any) -> bytes:
     """The single canonical encoding (contracts §122): UTF-8, sorted keys, compact
     separators (no extra whitespace), NaN/Infinity refused, unified zero

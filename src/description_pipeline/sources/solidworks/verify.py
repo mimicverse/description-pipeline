@@ -397,8 +397,7 @@ def _component_context_findings(
         _append_note(
             details,
             "the assembly-context effective mass differs from the recomputed part-document basis "
-            f"for {len(equivalence)} node(s); the documented table may choose either basis — no mass "
-            "is changed automatically",
+            f"for {len(equivalence)} node(s); no basis is chosen and no mass is changed automatically",
         )
     if incomplete:
         _append_note(details, "component mass context is incomplete: " + "; ".join(incomplete))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -14,13 +15,15 @@ from description_pipeline.geometry.native_u import (
     NATIVE_SCOPE_WARNING_DETAIL_FIELDS,
     native_scope_warning_details_match,
 )
-from description_pipeline.io import PipelineError, write_json
+from description_pipeline.io import PipelineError, canonical_json_value, write_json
+from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.portal import (
     PortalError,
     _quality_warnings,
 )
 from description_pipeline.orchestration.report_view import _recorded_warnings
 from description_pipeline.repository.urdf_pr import _body
+from description_pipeline.repository import urdf_pr as urdf_pr_module
 from description_pipeline.structural_report import build_structural_report
 from description_pipeline.verification.solidworks_urdf import (
     native_gate_warning_diagnostics,
@@ -96,6 +99,33 @@ def quality_report(
 
 
 class NativeScopeWarningProjectionTests(unittest.TestCase):
+    def test_warning_consumers_share_canonical_serialization_and_body_hash(self) -> None:
+        self.assertIs(portal_module.canonical_json_value, canonical_json_value)
+        self.assertIs(urdf_pr_module.canonical_json_value, canonical_json_value)
+
+        quality = quality_report(diagnostics())
+        portal_rows = [
+            {key: value for key, value in row.items() if key != "source"}
+            for row in _quality_warnings(quality)
+        ]
+        self.assertEqual(portal_rows, urdf_pr_module._warning_diagnostics(quality))
+
+        body = _body("a" * 64, "b" * 40, quality, "engineering", **BODY_OPTIONS)
+        self.assertEqual(
+            hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "754f87f4c84e34578501d8c3cfc2b2a039b07fe5c7f4c83da1c8d4538e3ae2ca",
+        )
+        self.assertEqual(
+            canonical_json_value(portal_rows),
+            json.dumps(
+                portal_rows,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+
     def test_quality_gate_promotes_all_four_complete_warnings(self) -> None:
         rows = diagnostics()
 

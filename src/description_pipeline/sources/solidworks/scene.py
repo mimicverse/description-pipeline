@@ -534,11 +534,9 @@ def build_scene(
             payload = masses.get(component)
             if payload is None:
                 raise ConfigError(
-                    "component has no CAD mass properties; capture materials or declare the body mass explicitly",
+                    "component has no CAD mass properties; recapture the native mass properties",
                     {"body": body_id, "component": component},
                 )
-            # This initial scene holds what CAD read. Declared masses are applied later,
-            # by load_scene, and only there do they become "used" values.
             contextual = ((getattr(raw_scene, "notes", None) or {}).get("effective_instances") or {}).get(component)
             if (
                 isinstance(contextual, dict)

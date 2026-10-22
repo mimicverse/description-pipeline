@@ -39,7 +39,7 @@ from ..geometry.native_u import (
     native_scope_warning_details_match,
 )
 from ..interface_records import REQUEST_PURPOSES, validate_source_record
-from ..io import PipelineError, acquire_process_lock, confined, file_digest
+from ..io import PipelineError, acquire_process_lock, canonical_json_value, confined, file_digest
 from ..request_evidence import read_request_evidence
 from ..stages import record_check
 
@@ -603,16 +603,10 @@ _WARNING_ROW_EXTRA_KEYS = (
 )
 
 
-def _canonical_warning_value(value: object) -> str:
-    """One stable, JSON-safe value for sorting and display."""
-
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-
-
 def _body_inline(value: object, limit: int = _SUMMARY_LABEL_LIMIT) -> str:
     """Escape and bound one untrusted value for a Markdown inline-code span."""
 
-    text = value if isinstance(value, str) else _canonical_warning_value(value)
+    text = value if isinstance(value, str) else canonical_json_value(value)
     if len(text) > limit:
         omitted = len(text) - limit
         text = f"{text[:limit]}... [{omitted} characters omitted; see reports/quality.json]"
@@ -713,7 +707,7 @@ def _general_warning_rows(report: dict) -> list[dict]:
                 continue
             objects = [{}]
         rows.extend(_normalized_warning_row(code, row, diagnostic, detail) for row in objects)
-    unique = {_canonical_warning_value(row): row for row in rows}
+    unique = {canonical_json_value(row): row for row in rows}
     return [unique[key] for key in sorted(unique)]
 
 

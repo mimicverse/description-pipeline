@@ -69,7 +69,7 @@ from .airflow_client import (
     validate_main_assembly,
     verified_result,
 )
-from ..io import PipelineError, digest
+from ..io import PipelineError, canonical_json_value, digest
 from ..interface_records import REQUEST_PURPOSES
 from ..delivery import PIPELINE_ID
 from ..platform import flow
@@ -366,12 +366,6 @@ def _quality_warnings(report: dict | None) -> list[dict]:
     return warnings
 
 
-def _canonical_warning_value(value: object) -> str:
-    """One stable comparison form for a JSON-shaped warning field."""
-
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-
-
 def _preview_warnings(*groups: list[dict]) -> list[dict]:
     """Merge warning rows by display identity, then order them deterministically."""
 
@@ -381,8 +375,8 @@ def _preview_warnings(*groups: list[dict]) -> list[dict]:
             str(row.get("code") or ""),
             str(row.get("object") or ""),
             str(row.get("message") or ""),
-            _canonical_warning_value(row.get("detail")),
-            _canonical_warning_value(row.get("objects")),
+            canonical_json_value(row.get("detail")),
+            canonical_json_value(row.get("objects")),
         )
         unique.setdefault(key, row)
 
@@ -391,8 +385,8 @@ def _preview_warnings(*groups: list[dict]) -> list[dict]:
             str(row.get("code") or ""),
             str(row.get("object") or ""),
             str(row.get("message") or ""),
-            _canonical_warning_value(row.get("detail")),
-            _canonical_warning_value(row.get("objects")),
+            canonical_json_value(row.get("detail")),
+            canonical_json_value(row.get("objects")),
             str(row.get("source") or ""),
         )
 
