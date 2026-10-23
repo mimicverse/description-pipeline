@@ -42,6 +42,7 @@ from description_pipeline.sources.solidworks.native import (
     _read_only_document,
     _temporary_configuration,
 )
+import description_pipeline.sources.solidworks.native as native_module
 
 #: SolidWorks ``MathTransform.ArrayData`` order for an identity occurrence.
 SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
@@ -2171,7 +2172,16 @@ class CaptureSceneTests(unittest.TestCase):
             backend, _, _, _, _ = self._configured_occurrences(root)
             lifetimes = self._borrowed_occurrence_geometry(backend, root)
             path = root / "borrowed.stl"
-            backend.export_component_meshes({"part-long": path})["part-long"]
+            with patch.object(
+                native_module,
+                "_com_iunknown_pointer",
+                side_effect=lambda value: id(
+                    getattr(value, "inner", value)
+                ),
+            ):
+                backend.export_component_meshes({"part-long": path})[
+                    "part-long"
+                ]
             self.assertEqual(read_stl(path).triangles, 2)
             self.assertEqual(read_stl(path).high, (2.0, 2.0, 0.0))
             self.assertTrue(lifetimes)

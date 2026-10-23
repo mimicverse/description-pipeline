@@ -633,7 +633,16 @@ class NativeFinCaptureTests(unittest.TestCase):
         with patch.object(
             native_module,
             "_persistent_reference_bytes",
-            side_effect=[b"first-pass", b"changed-replay"],
+            side_effect=[
+                b"first-pass",
+                b"first-pass",
+                b"first-pass",
+                b"first-pass",
+                b"changed-replay",
+                b"changed-replay",
+                b"changed-replay",
+                b"changed-replay",
+            ],
         ), self.assertRaises(CadError) as caught:
             backend._body_face_triangles(
                 [body],
@@ -646,10 +655,28 @@ class NativeFinCaptureTests(unittest.TestCase):
             "cad_body_identity_changed",
         )
 
-    def test_preclassified_body_reference_is_reused_without_a_late_read(self):
+    def test_preclassified_body_and_owner_references_have_no_late_read(self):
         body, _face_10, _face_20, _edge, _tessellation, extension = (
             self.fixture()
         )
+        extension.body = body
+        extension.tessellation_started = False
+        extension.late_body_calls = 0
+        original_reference = extension.GetPersistReference3
+
+        def reference(value):
+            if value is body and extension.tessellation_started:
+                extension.late_body_calls += 1
+            return original_reference(value)
+
+        extension.GetPersistReference3 = reference
+        original_tessellation = body.GetTessellation
+
+        def tessellation(face_list):
+            extension.tessellation_started = True
+            return original_tessellation(face_list)
+
+        body.GetTessellation = tessellation
         temp_root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_root)
         source_path = temp_root / "fixture.SLDPRT"
@@ -667,7 +694,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 FakeHolder(body),
             )
 
-        self.assertEqual(extension.calls.count(body), 2)
+        self.assertEqual(extension.late_body_calls, 0)
 
     def test_preclassified_path_preserves_face_and_edge_owner_checks(self):
         for owner_kind in ("face", "edge", "all"):
@@ -713,13 +740,50 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "cad_native_tessellation_unreadable",
                 )
                 self.assertIn(
-                    (
-                        "face ownership is not stable"
-                        if owner_kind in {"face", "all"}
-                        else "belongs to a body other than the captured body"
-                    ),
+                    "face and edge ownership is not stable",
                     caught.exception.message,
                 )
+
+    def test_preclassified_path_rejects_same_name_foreign_proxy_body(self):
+        body, _face_10, _face_20, edge, _tessellation, _extension = (
+            self.fixture()
+        )
+        other_body = FakeBody([], None, None)
+        other_body.Name = body.Name
+        for face in body.faces:
+            face.owner = other_body
+        edge.owner = other_body
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        shared = b"shared-reference"
+
+        class SharedReferenceExtension:
+            def GetPersistReference3(self, _value):  # noqa: N802
+                return list(shared)
+
+        backend = self.body_identity_backend(
+            source_path,
+            SharedReferenceExtension(),
+        )
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(
+            CadError
+        ) as caught:
+            backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                FakeHolder(body),
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn(
+            "another owning COM object",
+            caught.exception.detail["error"],
+        )
 
     def open_boundary_fixture(self):
         body, face_10, _face_20, edge, tessellation, extension = self.fixture()

@@ -227,6 +227,18 @@ def _com_object_pointer(value) -> int:
     return int(match.group(1), 16)
 
 
+def _com_iunknown_pointer(value) -> int:
+    """Return the canonical IUnknown pointer for a live pywin32 object."""
+
+    token = getattr(value, "_oleobj_", None)
+    if token is None:
+        return _com_object_pointer(value)
+    import pythoncom
+
+    unknown = token.QueryInterface(pythoncom.IID_IUnknown)
+    return _com_object_pointer(unknown)
+
+
 def _binary64_bits(value) -> str:
     number = float(value)
     if not math.isfinite(number):
@@ -4903,6 +4915,7 @@ class SolidWorksBackend(CadBackend):
         body_name=None,
         body_reference=None,
         body_faces=None,
+        body_edges=None,
         body_owner_prebound=False,
         body_owner_pointer=None,
     ):
@@ -5025,10 +5038,13 @@ class SolidWorksBackend(CadBackend):
             )
         else:
             faces = list(body_faces)
-        edges = call(
-            "IBody2.GetEdges",
-            lambda: _as_list(_member(body, "GetEdges")),
-        )
+        if body_edges is None:
+            edges = call(
+                "IBody2.GetEdges",
+                lambda: _as_list(_member(body, "GetEdges")),
+            )
+        else:
+            edges = list(body_edges)
         face_rows = []
         for face_index, raw_face in enumerate(faces):
             face = _interface(_dynamic(raw_face), IFACE2_IID)
@@ -5082,7 +5098,7 @@ class SolidWorksBackend(CadBackend):
                         f"{kind} has no owning IBody2",
                         {**base, f"{kind}_index": row["index"]},
                     )
-                owner_pointer = _com_object_pointer(owner)
+                owner_pointer = _com_iunknown_pointer(owner)
                 owner_matches_name = (
                     call(
                         f"{interface_name}.GetBody.Name",
@@ -7545,47 +7561,60 @@ class SolidWorksBackend(CadBackend):
                         {**context, "api": "IBody2.GetFaces"},
                     )
                 try:
-                    face_owner_pointers = set()
-                    face_owner_names = set()
-                    for raw_face in faces:
-                        face = _interface(
-                            _dynamic(raw_face),
-                            IFACE2_IID,
-                        )
-                        owner = _interface(
-                            _dynamic(_method(face, "GetBody")),
-                            IBODY2_IID,
-                        )
-                        if owner is None:
-                            raise ValueError(
-                                "a face has no owning IBody2"
+                    edges = _as_list(_member(body, "GetEdges"))
+                    owner_pointers = set()
+                    owner_names = set()
+                    owner_references = set()
+                    for kind, interface_id, values in (
+                        ("face", IFACE2_IID, faces),
+                        ("edge", IEDGE_IID, edges),
+                    ):
+                        for raw_value in values:
+                            value = _interface(
+                                _dynamic(raw_value),
+                                interface_id,
                             )
-                        face_owner_pointers.add(
-                            _com_object_pointer(owner)
-                        )
-                        face_owner_names.add(
-                            _member(owner, "Name")
-                        )
-                    if len(face_owner_pointers) != 1:
+                            owner = _interface(
+                                _dynamic(_method(value, "GetBody")),
+                                IBODY2_IID,
+                            )
+                            if owner is None:
+                                raise ValueError(
+                                    f"a {kind} has no owning IBody2"
+                                )
+                            owner_pointers.add(
+                                _com_iunknown_pointer(owner)
+                            )
+                            owner_names.add(_member(owner, "Name"))
+                            owner_references.add(
+                                _persistent_reference_bytes(
+                                    extension,
+                                    owner,
+                                )
+                            )
+                    if len(owner_pointers) != 1:
                         raise ValueError(
-                            "the body faces report several owning IBody2 objects"
+                            "the body faces and edges report several owning IBody2 objects"
                         )
-                    if face_owner_names != {body_name}:
+                    if owner_names != {body_name}:
                         raise ValueError(
-                            "the body faces report another owning body name"
+                            "the body faces and edges report another owning body name"
                         )
-                    body_pointer = _com_object_pointer(body)
+                    if owner_references != {raw_reference}:
+                        raise ValueError(
+                            "the body faces and edges report another owning persistent reference"
+                        )
+                    body_pointer = _com_iunknown_pointer(body)
                     if (
-                        hasattr(body, "_oleobj_")
-                        and face_owner_pointers != {body_pointer}
+                        owner_pointers != {body_pointer}
                     ):
                         raise ValueError(
-                            "the body faces report another owning COM object"
+                            "the body faces and edges report another owning COM object"
                         )
                 except Exception as error:  # noqa: BLE001
                     raise CadError(
                         "cad_native_tessellation_unreadable",
-                        "the native body face ownership is not stable",
+                        "the native body face and edge ownership is not stable",
                         {
                             **context,
                             "error": str(error)[:300],
@@ -7596,12 +7625,8 @@ class SolidWorksBackend(CadBackend):
                         "body": body,
                         "body_index": body_index,
                         "body_name": body_name,
-                        "object_pointer": _com_object_pointer(body),
-                        "owner_pointer": (
-                            body_pointer
-                            if hasattr(body, "_oleobj_")
-                            else next(iter(face_owner_pointers))
-                        ),
+                        "object_pointer": _com_iunknown_pointer(body),
+                        "owner_pointer": body_pointer,
                         "reference": {
                             "raw": raw_reference,
                             "raw_sha256": hashlib.sha256(
@@ -7613,6 +7638,7 @@ class SolidWorksBackend(CadBackend):
                             ),
                         },
                         "faces": faces,
+                        "edges": edges,
                     }
                 )
             return rows
@@ -7626,6 +7652,7 @@ class SolidWorksBackend(CadBackend):
                 or row["object_pointer"] != replay["object_pointer"]
                 or row["owner_pointer"] != replay["owner_pointer"]
                 or len(row["faces"]) != len(replay["faces"])
+                or len(row["edges"]) != len(replay["edges"])
                 or row["reference"]["raw_sha256"]
                 != replay["reference"]["raw_sha256"]
                 or row["reference"]["typed_sha256"]
@@ -7702,6 +7729,7 @@ class SolidWorksBackend(CadBackend):
                     **row["reference"],
                 },
                 body_faces=faces,
+                body_edges=row["edges"],
                 body_owner_prebound=True,
                 body_owner_pointer=row["owner_pointer"],
             )
