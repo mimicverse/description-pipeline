@@ -4805,6 +4805,20 @@ def _offline_virtual_component_root(value: object) -> str | None:
     return text[: position].replace("/", "\\") if "\\" in value else prefix
 
 
+def _canonical_evidence_path(value: object) -> str | None:
+    """Canonicalize one recorded path without host-dependent casing."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = ntpath.normpath(value.replace("/", "\\")).replace(
+        "\\",
+        "/",
+    )
+    if normalized in {"", ".", ".."} or normalized.startswith("../"):
+        return None
+    return normalized.casefold()
+
+
 def source_scopes(root) -> dict:
     """Read source scopes and cross-check them against finite sealed anchors."""
 
@@ -5026,8 +5040,9 @@ def source_scopes(root) -> dict:
         else {}
     )
     session_documents = {
-        ntpath.normcase(ntpath.normpath(str(value)))
+        canonical
         for value in dependency.get("session_temp_documents") or []
+        if (canonical := _canonical_evidence_path(value)) is not None
     }
     delivery_root = _delivery_root(root)
     for name, scope in record.items():
@@ -5196,40 +5211,45 @@ def source_scopes(root) -> dict:
                 raise PipelineError(
                     f"Virtual source provenance is missing: {name}"
                 )
-            normalized_scope_path = ntpath.normcase(
-                ntpath.normpath(source_path)
+            normalized_scope_path = _canonical_evidence_path(source_path)
+            normalized_scope_root = _canonical_evidence_path(
+                scope["virtual_session_temp_root"]
             )
-            normalized_scope_root = ntpath.normcase(
-                ntpath.normpath(scope["virtual_session_temp_root"])
+            normalized_session_path = _canonical_evidence_path(
+                provenance.get("session_document_path")
             )
-            normalized_session_path = ntpath.normcase(
-                ntpath.normpath(
-                    str(provenance.get("session_document_path") or "")
-                )
-            )
-            normalized_session_root = ntpath.normcase(
-                ntpath.normpath(
-                    str(provenance.get("session_temp_root") or "")
-                )
+            normalized_session_root = _canonical_evidence_path(
+                provenance.get("session_temp_root")
             )
             scope_source_root = _offline_virtual_component_root(source_path)
+            canonical_scope_source_root = _canonical_evidence_path(
+                scope_source_root
+            )
             scope_relative = (
-                ntpath.normcase(
+                _canonical_evidence_path(
                     ntpath.relpath(
                         normalized_scope_path,
-                        ntpath.normcase(
-                            ntpath.normpath(scope_source_root)
-                        ),
+                        canonical_scope_source_root,
                     )
                 )
-                if scope_source_root is not None
+                if (
+                    normalized_scope_path is not None
+                    and canonical_scope_source_root is not None
+                )
                 else None
             )
-            provenance_relative = ntpath.normcase(
-                ntpath.relpath(
-                    normalized_session_path,
-                    normalized_session_root,
+            provenance_relative = (
+                _canonical_evidence_path(
+                    ntpath.relpath(
+                        normalized_session_path,
+                        normalized_session_root,
+                    )
                 )
+                if (
+                    normalized_session_path is not None
+                    and normalized_session_root is not None
+                )
+                else None
             )
             owner = provenance.get("owner")
             owner_file_sha = source_files_case.get(
@@ -5253,14 +5273,15 @@ def source_scopes(root) -> dict:
                 or owner_file_sha != scope["virtual_owner_sha256"]
                 or provenance.get("occurrence") != name
                 or scope_source_root is None
-                or session_root_pid(normalized_scope_root)
+                or canonical_scope_source_root != normalized_scope_root
+                or session_root_pid(scope["virtual_session_temp_root"])
                 != scope["virtual_native_api_pid"]
-                or session_root_pid(normalized_session_root)
+                or session_root_pid(provenance.get("session_temp_root"))
                 != provenance.get("native_api_pid")
                 or scope_relative != provenance_relative
                 or not embedded_virtual_component_under_root(
-                    normalized_session_path,
-                    normalized_session_root,
+                    provenance.get("session_document_path"),
+                    provenance.get("session_temp_root"),
                 )
                 or normalized_scope_path not in session_documents
             ):

@@ -739,6 +739,14 @@ class SourceScopeTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             source_scopes(self.root)
 
+    def test_virtual_scope_rejects_foreign_parent_with_same_pid(self):
+        scope = self.virtual_scope()
+        scope["virtual_session_temp_root"] = r"c:\foreign\swx123"
+        self.write_virtual_anchors(scope)
+
+        with self.assertRaises(PipelineError):
+            source_scopes(self.root)
+
     def test_virtual_scope_rejects_forged_owner_hash(self):
         scope = self.virtual_scope()
         self.write_virtual_anchors(scope)
