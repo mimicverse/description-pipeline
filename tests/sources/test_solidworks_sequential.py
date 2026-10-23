@@ -96,6 +96,58 @@ class SequentialSessionTests(unittest.TestCase):
         self.assertEqual(self.binders[0].call_count, source_calls)
         self.assertEqual(len(self.sessions), 2)
 
+    def test_retire_copy_closes_and_removes_only_the_copy_session(self):
+        _, _copy_app = self.source_then_copy()
+        old = self.sessions[1]
+        requested = {normalize_document_path(self.copy): "Default"}
+        self.backend._requested_configurations.update(requested)
+        self.backend._components.add("arm-1")
+        self.backend._source_components["arm-1"] = ("copy-key", "Default")
+        self.backend._source_documents["copy-key"] = (self.copy, "copy", "Default", old)
+        self.backend._scene_document_key = "copy-key"
+        self.backend._session_document_paths["artifact"] = ("copy", old)
+        self.backend._session_artifact_roots[old] = "copy-root"
+        self.backend._session_artifact_root_owners["copy-root"] = ("copy", old)
+        self.backend._staged_search_root = self.copy_root
+        self.backend._staged_search_applied.add(old.process.pid)
+
+        retirement = self.backend.retire_session("copy")
+
+        self.assertTrue(retirement["retired"])
+        self.assertEqual(retirement["before"]["pid"], 101)
+        self.assertEqual(retirement["after"]["state"], "closed")
+        self.assertTrue(old.closed)
+        self.assertIsNone(old.app)
+        self.assertFalse(old.process.alive())
+        self.assertNotIn("copy", self.backend._sessions)
+        self.assertEqual(self.backend._requested_configurations, requested)
+        self.assertEqual(self.backend._staged_search_root, self.copy_root)
+        self.assertEqual(self.backend._staged_search_applied, set())
+        self.assertEqual(self.backend._components, set())
+        self.assertEqual(self.backend._source_components, {})
+        self.assertEqual(self.backend._source_documents, {})
+        self.assertEqual(self.backend._session_document_paths, {})
+        self.assertEqual(self.backend._session_artifact_roots, {})
+        self.assertEqual(self.backend._session_artifact_root_owners, {})
+        self.assertIsNone(self.backend._scene_document_key)
+
+        with patch(
+            "description_pipeline.sources.solidworks.native.pin_search_folders",
+            return_value={
+                "before": [],
+                "before_raw": "",
+                "pinned": [self.copy_root],
+                "observed_after_pin": [self.copy_root],
+                "after_raw": self.copy_root,
+                "set_return": True,
+                "folder_type": 0,
+            },
+        ):
+            self.backend._app_for_path(self.copy)
+        self.assertEqual(len(self.sessions), 3)
+        self.assertEqual(self.sessions[2].process.pid, 102)
+        self.assertIs(self.backend._sessions["copy"], self.sessions[2])
+
     def test_closed_session_cannot_reconnect_and_close_is_idempotent(self):
         self.backend._app_for_path(self.source)
         session = self.sessions[0]

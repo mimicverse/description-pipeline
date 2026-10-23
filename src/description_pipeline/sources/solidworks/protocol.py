@@ -94,6 +94,9 @@ class CadBackend:
     def open_document(self, path: str) -> dict:
         raise NotImplementedError
 
+    def retire_session(self, role: str = "copy") -> dict:
+        raise NotImplementedError
+
     def close_document(self, name: str, confirm: bool = False) -> dict:
         raise NotImplementedError
 

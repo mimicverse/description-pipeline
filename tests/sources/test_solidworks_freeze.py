@@ -200,6 +200,52 @@ class FreezeTests(unittest.TestCase):
                     support.capture_requests(json.loads(json.dumps({**self.config, "closure": bad})))
                 )
 
+    def test_freeze_retires_the_rewrite_session_before_the_capture_environment(self) -> None:
+        freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
+
+        order = self.backend.order
+        collect_dependencies = order.index("collect_dependencies")
+        rewrite_environment = order.index("environment")
+        retirement = order.index("retire_session")
+        capture_open = order.index("open_document")
+        capture_environment = order.index("environment", rewrite_environment + 1)
+        collect_scene = order.index("collect_scene")
+        self.assertLess(collect_dependencies, rewrite_environment)
+        self.assertLess(rewrite_environment, retirement)
+        self.assertLess(retirement, capture_open)
+        self.assertLess(capture_open, capture_environment)
+        self.assertLess(capture_environment, collect_scene)
+
+        rewrite = json.loads((self.destination / "evidence" / "rewrite-environment.json").read_text())
+        capture = json.loads((self.destination / "evidence" / "environment.json").read_text())
+        self.assertEqual(rewrite["solidworks"]["sessions"]["copy"]["pid"], 100)
+        self.assertEqual(capture["solidworks"]["sessions"]["copy"]["pid"], 101)
+        self.assertEqual(self.backend.capture_session_pid, 101)
+        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text())
+        boundary = capture["session_boundary"]
+        self.assertEqual(boundary["closure_top_level"], closure["top_level"])
+        self.assertEqual(boundary["configuration"], "Default")
+        self.assertTrue(boundary["retirement"]["retired"])
+        self.assertEqual(boundary["retirement"]["before"]["pid"], 100)
+        self.assertEqual(boundary["opened"]["path"], self.backend.collected_scene_calls[0])
+        self.assertEqual(self.backend.retired_session_pids, [100])
+
+    def test_fresh_session_rejects_a_different_active_configuration(self) -> None:
+        backend, config = self._two_component_backend()
+        read = backend.document_state
+
+        def changed(path):
+            state = read(path)
+            if backend.collected and Path(path).resolve() == Path(backend.collected[0]).resolve():
+                state["active_configuration"] = "Other"
+            return state
+
+        backend.document_state = changed
+        with self.assertRaises(BridgeError) as raised:
+            freeze(config, self.destination, backend=backend)
+        self.assertEqual(raised.exception.code, "cad_session_boundary_configuration")
+        self.assertFalse(self.destination.exists())
+
     def test_freeze_retains_the_closure_carrier_evidence(self) -> None:
         config = json.loads(json.dumps(self.config))
         config["closure"] = {
@@ -479,7 +525,7 @@ class FreezeTests(unittest.TestCase):
         freeze(self.config, self.destination, backend=self.backend)
         order = self.backend.order
         window_close = order.index("close_all_documents")
-        reopen = order.index("open_document")
+        reopen = order.index("open_document", window_close)
         read = order.index("link_group_read")
         self.assertLess(order.index("collect_scene"), window_close)
         self.assertLess(order.index("verify_sources"), window_close)

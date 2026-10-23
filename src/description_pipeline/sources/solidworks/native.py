@@ -3399,6 +3399,72 @@ class SolidWorksBackend(CadBackend):
                 errors.append({**session.identity(), "error": str(error)})
         return {"terminated": terminated, "errors": errors}
 
+    def retire_session(self, role="copy"):
+        """Close and remove one owned session without dropping capture policy.
+
+        A collector may leave a document and its COM caches in a process-local
+        state that is not suitable for the subsequent capture.  Retirement is
+        an explicit process boundary: it closes the owned job, removes the role
+        binding, and invalidates state that points at the old process.  Capture
+        roots, requested configurations, sealed documents and the staged search
+        root are policy, not session state, and deliberately remain intact for
+        the next owned session.
+        """
+
+        if role not in {"source", "copy"}:
+            raise EnvironmentError_(
+                "cad_session_role_invalid",
+                "an unknown CAD session role cannot be retired",
+                {"role": str(role)},
+            )
+        with self._sessions_lock:
+            session = self._sessions.get(role)
+            if session is None:
+                raise EnvironmentError_(
+                    "cad_session_missing",
+                    "the requested CAD session role is not registered",
+                    {"role": str(role)},
+                )
+            before = session.identity()
+        if not session.closed:
+            # CadSession.close() publishes closed only after its owned process
+            # is gone. A close failure therefore leaves the role registered and
+            # must propagate instead of allowing a second process to start.
+            session.close()
+        with self._sessions_lock:
+            if self._sessions.get(role) is not session:
+                raise EnvironmentError_(
+                    "cad_session_retirement_race",
+                    "the selected CAD session changed while it was retiring",
+                    {"role": str(role)},
+                )
+            del self._sessions[role]
+            pid = before.get("pid")
+            if isinstance(pid, int):
+                self._staged_search_applied.discard(pid)
+            # All of these contain COM proxies, session identities or caches
+            # derived from the retired application. Rebuild them in the new
+            # session; never carry them across the process boundary.
+            self._components.clear()
+            self._source_components.clear()
+            self._source_documents.clear()
+            self._session_document_paths.clear()
+            self._session_artifact_roots.clear()
+            self._session_artifact_root_owners.clear()
+            self._scene_document_key = None
+            for cache_name in ("_part_mass_properties", "_effective_instance_readings"):
+                cache = getattr(self, cache_name, None)
+                if isinstance(cache, dict):
+                    cache.clear()
+            self.notes = {}
+            self.source_files = {}
+        return {
+            "role": role,
+            "retired": True,
+            "before": before,
+            "after": session.identity(),
+        }
+
     def release(self):
         if self._owner_thread is not None and self._owner_thread is not threading.current_thread():
             raise EnvironmentError_("cad_thread_mismatch", "Release CAD references on their owning STA thread")

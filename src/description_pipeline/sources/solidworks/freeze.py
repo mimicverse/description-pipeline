@@ -2398,18 +2398,91 @@ def _freeze_local(
             "closure",
             params={"documents": len(closure.get("documents") or {}), "files": len(closure.get("copy_files") or {})},
         )
-        # The source is retired and the copy is active. Persist their identities before
-        # native reads so a failed geometry capture retains its environment.
+        # Persist the rewritten copy and the pre-boundary environment before the
+        # process boundary. If the fresh capture session fails to open, the
+        # failure packet still carries the exact closure and rewrite session.
+        write_json(staging / "raw" / "dependency_closure.json", closure)
+        rewrite_environment = capture_environment(backend, worker_version)
+        write_json(staging / "evidence" / "rewrite-environment.json", rewrite_environment)
+
+        # ReplaceReferencedDocument leaves the rewrite application in a state
+        # that is not suitable for the final capture. Retire that owned copy
+        # process, reopen the exact collected top level in a fresh owned copy
+        # process, and only then record the actual capture environment.
+        retire = getattr(backend, "retire_session", None)
+        if not callable(retire):
+            raise BridgeError(
+                "cad_session_boundary_unavailable",
+                "the backend cannot retire the rewrite session before capture",
+                exit_code=3,
+            )
+        retirement = retire("copy")
+        opener = getattr(backend, "open_document", None)
+        if not callable(opener):
+            raise BridgeError(
+                "cad_session_boundary_unavailable",
+                "the backend cannot open the collected top level in a fresh session",
+                exit_code=3,
+            )
+        top = str(closure.get("top_level") or "")
+        opened = opener(top)
+        if (
+            not isinstance(opened, dict)
+            or not _same_document(str(opened.get("path") or ""), top)
+            or opened.get("read_only") is not True
+        ):
+            raise BridgeError(
+                "cad_session_boundary_failed",
+                "the collected top level did not reopen read-only in the fresh capture session",
+                {"top_level": top, "opened": opened},
+                exit_code=3,
+            )
+        state_reader = getattr(backend, "document_state", None)
+        if not callable(state_reader):
+            raise BridgeError(
+                "cad_session_boundary_unavailable",
+                "the backend cannot verify the fresh capture configuration",
+                {"top_level": top},
+                exit_code=3,
+            )
+        capture_state = state_reader(top)
+        observed_configuration = (
+            capture_state.get("active_configuration") if isinstance(capture_state, dict) else None
+        )
+        if (
+            not isinstance(capture_state, dict)
+            or not _same_document(str(capture_state.get("path") or ""), top)
+            or capture_state.get("read_only") is not True
+            or observed_configuration != str(cfg["configuration"])
+        ):
+            raise BridgeError(
+                "cad_session_boundary_configuration",
+                "the fresh capture session did not reopen the requested configuration",
+                {
+                    "top_level": top,
+                    "requested": str(cfg["configuration"]),
+                    "observed": observed_configuration,
+                    "state": capture_state,
+                },
+                exit_code=3,
+            )
         stage = "environment"
         _capture_note(activity, "environment")
         environment = capture_environment(backend, worker_version)
+        environment["session_boundary"] = {
+            "closure_top_level": top,
+            "configuration": str(cfg["configuration"]),
+            "observed_configuration": observed_configuration,
+            "capture_state": capture_state,
+            "retirement": retirement,
+            "opened": opened,
+        }
         write_json(staging / "evidence" / "environment.json", environment)
         stage = "readings"
         _capture_note(activity, "readings")
         scene, raw = _capture_readings(backend, cfg, closure, staging / "source", activity=activity)
         write_json(staging / "raw" / "scene_raw.json", raw)
         write_json(staging / "raw" / "document_state.json", state)
-        write_json(staging / "raw" / "dependency_closure.json", closure)
         write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])
         write_json(staging / "raw" / "mass_properties.json", raw["mass_properties"])
         write_json(
