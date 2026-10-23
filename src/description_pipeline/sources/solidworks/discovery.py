@@ -919,8 +919,10 @@ def validate_historical_recovery_artifacts(
         input_source = input_record.get("source") if isinstance(input_record, Mapping) else None
         if (
             not isinstance(input_record, Mapping)
+            or set(input_record) != {"hardware_id", "source"}
             or input_record.get("hardware_id") != identity.get("hardware_id")
             or not isinstance(input_source, Mapping)
+            or set(input_source) != {"assembly", "configuration"}
             or input_source.get("assembly") != identity.get("main_assembly")
             or input_source.get("configuration") != identity.get("delivery_configuration")
         ):

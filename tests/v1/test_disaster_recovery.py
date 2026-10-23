@@ -1832,6 +1832,18 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                     "legacy recovery artifacts are invalid",
                 ),
                 (
+                    "handoff-input-unknown",
+                    "input/handoff.json",
+                    lambda document: document["input"].update(forged="value"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-input-source-unknown",
+                    "input/handoff.json",
+                    lambda document: document["input"]["source"].update(forged="value"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
                     "handoff-unknown",
                     "input/handoff.json",
                     lambda document: document.update(forged=True),
