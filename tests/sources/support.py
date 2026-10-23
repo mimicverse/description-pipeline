@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import os
 import struct
 from collections import deque
@@ -27,7 +28,10 @@ from description_pipeline.geometry.native_u import (
     native_curve_endpoint_roles,
     native_curve_topology_endpoint_assignment,
     native_evaluate2_evidence,
+    native_point_error,
     native_point_roundtrip_tolerance,
+    native_tolerant_edge_boundary,
+    native_tolerant_edge_evidence,
     native_u_equal,
 )
 from description_pipeline.io import file_digest
@@ -228,33 +232,80 @@ def _u_evidence(
     domain_upper: float | None = None,
     curve_start: Sequence[float] | None = None,
     curve_end: Sequence[float] | None = None,
+    is_tolerant: bool = False,
+    tolerant_gap_m: float = 0.0,
+    edge_reference_sha256: str | None = None,
 ) -> dict[str, Any]:
     payload, packed_status = _evaluate2_evidence(point)
+    evaluated_point = tuple(payload[:3])
+    tolerant_edge_evidence = None
     if (
         domain_lower is not None
         and native_u_equal(u_parameter, domain_lower)
+        and curve_start is not None
         and curve_end is not None
     ):
-        tolerance = native_curve_endpoint_operation_tolerance(
+        tolerant_edge_metrics = native_tolerant_edge_boundary(
             point,
-            point,
+            evaluated_point,
+            curve_start,
             curve_end,
+            is_tolerant=is_tolerant,
+            gap_m=tolerant_gap_m,
+            topology_accepted=True,
         )
-        point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
+        tolerance = tolerant_edge_metrics["point_tolerance_m"]
+        point_error = tolerant_edge_metrics[
+            "evaluate_point_error_m"
+        ]
+        point_roundtrip_rule = (
+            tolerant_edge_metrics["point_roundtrip_rule"]
+            if tolerant_edge_metrics["gap_used"] is True
+            else NATIVE_CURVE_ENDPOINT_OPERATION_RULE
+        )
+        if tolerant_edge_metrics["gap_used"] is True:
+            tolerant_edge_evidence = native_tolerant_edge_evidence(
+                tolerant_edge_metrics,
+                edge_reference_sha256=edge_reference_sha256,
+                parameter_boundary="u_min",
+                eligible_gap_m=tolerant_gap_m,
+            )
     elif (
         domain_upper is not None
         and native_u_equal(u_parameter, domain_upper)
         and curve_start is not None
+        and curve_end is not None
     ):
-        tolerance = native_curve_endpoint_operation_tolerance(
+        tolerant_edge_metrics = native_tolerant_edge_boundary(
             point,
-            point,
+            evaluated_point,
+            curve_end,
             curve_start,
+            is_tolerant=is_tolerant,
+            gap_m=tolerant_gap_m,
+            topology_accepted=True,
         )
-        point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
+        tolerance = tolerant_edge_metrics["point_tolerance_m"]
+        point_error = tolerant_edge_metrics[
+            "evaluate_point_error_m"
+        ]
+        point_roundtrip_rule = (
+            tolerant_edge_metrics["point_roundtrip_rule"]
+            if tolerant_edge_metrics["gap_used"] is True
+            else NATIVE_CURVE_ENDPOINT_OPERATION_RULE
+        )
+        if tolerant_edge_metrics["gap_used"] is True:
+            tolerant_edge_evidence = native_tolerant_edge_evidence(
+                tolerant_edge_metrics,
+                edge_reference_sha256=edge_reference_sha256,
+                parameter_boundary="u_max",
+                eligible_gap_m=tolerant_gap_m,
+            )
     else:
         tolerance = native_point_roundtrip_tolerance(point, point, point)
+        point_error = native_point_error(point, evaluated_point)
         point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
+    evaluate_error = native_point_error(point, evaluated_point)
     return {
         "u": u_parameter,
         "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
@@ -269,10 +320,12 @@ def _u_evidence(
         "source_point_m": list(point),
         "projection_error_m": 0.0,
         "point_tolerance_m": tolerance,
+        "point_error_m": point_error,
         "closest_point_error_m": 0.0,
-        "evaluate_point_error_m": 0.0,
-        "source_evaluate_error_m": 0.0,
-        "closest_evaluate_error_m": 0.0,
+        "evaluate_point_error_m": point_error,
+        "source_evaluate_error_m": evaluate_error,
+        "closest_evaluate_error_m": evaluate_error,
+        "tolerant_edge_evidence": tolerant_edge_evidence,
         "closest_point_on_raw": [*point, u_parameter, 0.0],
         "parameter_input_point_m": list(point),
         "parameter_raw": [u_parameter, True],
@@ -361,6 +414,32 @@ def _curve_end_params(
     }
 
 
+def _edge_tolerance_record(is_tolerant, gap_m) -> dict[str, Any]:
+    if type(is_tolerant) is not bool:
+        raise ValueError("native edge is_tolerant must be a strict boolean")
+    if (
+        type(gap_m) is not float
+        or not math.isfinite(gap_m)
+        or not 0.0 <= gap_m <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+    ):
+        raise ValueError(
+            "native edge tolerant gap must be finite and bounded"
+        )
+    return {
+        "api": "IEdge.IsTolerant(out VARIANT VT_BYREF|VT_R8)",
+        "call_form": "one_argument_out_variant_r8",
+        "argument_count": 1,
+        "state": "success",
+        "error": None,
+        "return_value": is_tolerant,
+        "return_type": "bool",
+        "out_variant_type": 0x4005,
+        "gap_m": gap_m,
+        "gap_type": type(gap_m).__name__,
+        "gap_bits_u64": struct.unpack("<Q", struct.pack("<d", float(gap_m)))[0],
+    }
+
+
 def native_tessellation_fixture(
     face_spans: Sequence[dict[str, Any]],
     native_edges: Sequence[dict[str, Any]],
@@ -401,6 +480,15 @@ def native_tessellation_fixture(
             "mapping_source_edge_persistent_reference_sha256",
             None,
         )
+        edge.setdefault("is_tolerant", False)
+        edge.setdefault("tolerant_gap_m", 0.0)
+        if type(edge["is_tolerant"]) is not bool:
+            raise ValueError("native edge is_tolerant must be a strict boolean")
+        edge_tolerance = _edge_tolerance_record(
+            edge["is_tolerant"],
+            edge["tolerant_gap_m"],
+        )
+        edge["edge_tolerance"] = edge_tolerance
     fixture_triangles = []
     body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
     evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
@@ -670,6 +758,9 @@ def native_tessellation_fixture(
                             domain_upper=u_max,
                             curve_start=_binary32_point(edge["start_point_m"]),
                             curve_end=_binary32_point(edge["end_point_m"]),
+                            is_tolerant=edge["is_tolerant"],
+                            tolerant_gap_m=edge["tolerant_gap_m"],
+                            edge_reference_sha256=edge["edge_reference_sha256"],
                         ),
                         "end_evidence": _u_evidence(
                             first_end_u,
@@ -678,6 +769,9 @@ def native_tessellation_fixture(
                             domain_upper=u_max,
                             curve_start=_binary32_point(edge["start_point_m"]),
                             curve_end=_binary32_point(edge["end_point_m"]),
+                            is_tolerant=edge["is_tolerant"],
+                            tolerant_gap_m=edge["tolerant_gap_m"],
+                            edge_reference_sha256=edge["edge_reference_sha256"],
                         ),
                         "cofin_raw_id": -1,
                         "cofin_id": None,
@@ -728,6 +822,9 @@ def native_tessellation_fixture(
                                 domain_upper=u_max,
                                 curve_start=_binary32_point(edge["start_point_m"]),
                                 curve_end=_binary32_point(edge["end_point_m"]),
+                                is_tolerant=edge["is_tolerant"],
+                                tolerant_gap_m=edge["tolerant_gap_m"],
+                                edge_reference_sha256=edge["edge_reference_sha256"],
                             ),
                             "end_evidence": _u_evidence(
                                 first_end_u,
@@ -736,6 +833,9 @@ def native_tessellation_fixture(
                                 domain_upper=u_max,
                                 curve_start=_binary32_point(edge["start_point_m"]),
                                 curve_end=_binary32_point(edge["end_point_m"]),
+                                is_tolerant=edge["is_tolerant"],
+                                tolerant_gap_m=edge["tolerant_gap_m"],
+                                edge_reference_sha256=edge["edge_reference_sha256"],
                             ),
                             "cofin_raw_id": second_fin["fin_id"],
                             "cofin_id": second_fin["fin_id"],
@@ -754,6 +854,9 @@ def native_tessellation_fixture(
                                 domain_upper=u_max,
                                 curve_start=_binary32_point(edge["start_point_m"]),
                                 curve_end=_binary32_point(edge["end_point_m"]),
+                                is_tolerant=edge["is_tolerant"],
+                                tolerant_gap_m=edge["tolerant_gap_m"],
+                                edge_reference_sha256=edge["edge_reference_sha256"],
                             ),
                             "end_evidence": _u_evidence(
                                 second_end_u,
@@ -762,6 +865,9 @@ def native_tessellation_fixture(
                                 domain_upper=u_max,
                                 curve_start=_binary32_point(edge["start_point_m"]),
                                 curve_end=_binary32_point(edge["end_point_m"]),
+                                is_tolerant=edge["is_tolerant"],
+                                tolerant_gap_m=edge["tolerant_gap_m"],
+                                edge_reference_sha256=edge["edge_reference_sha256"],
                             ),
                             "cofin_raw_id": first_fin["fin_id"],
                             "cofin_id": first_fin["fin_id"],
@@ -843,6 +949,7 @@ def native_tessellation_fixture(
                 "curve_end_point_m": list(curve_end_point),
                 "curve_sense": curve_sense,
                 "curve_type": edge.get("curve_type", 0),
+                "edge_tolerance": edge["edge_tolerance"],
                 "curve_closed": curve_closed,
                 "curve_periodic": curve_periodic,
                 "curve_end_params": _curve_end_params(

@@ -116,6 +116,9 @@ class FakeEdge:
         self._owner = None
         self._faces = []
         self._curve = FakeCurve(self)
+        self.is_tolerant = False
+        self.tolerant_gap_m = 0.0
+        self.tolerance_calls = 0
 
     def GetStartVertex(self):  # noqa: N802 - SolidWorks API name
         return self._start
@@ -131,6 +134,11 @@ class FakeEdge:
 
     def GetCurve(self):  # noqa: N802 - SolidWorks API name
         return self._curve
+
+    def IsTolerant(self, tolerance):  # noqa: N802 - SolidWorks API name
+        self.tolerance_calls += 1
+        tolerance.value = self.tolerant_gap_m
+        return self.is_tolerant
 
     def GetCurveParams3(self):  # noqa: N802 - SolidWorks API name
         return SimpleNamespace(
@@ -688,6 +696,28 @@ class ComponentMeshExportTests(unittest.TestCase):
         )
         face_list_patch.start()
         self.addCleanup(face_list_patch.stop)
+        production_read_edge_tolerance = native_module._read_edge_tolerance
+
+        class EdgeToleranceVariant:
+            def __init__(self, varianttype, value):
+                self.varianttype = varianttype
+                self.value = value
+
+        def read_edge_tolerance(edge):
+            return production_read_edge_tolerance(
+                edge,
+                variant_factory=EdgeToleranceVariant,
+                vt_byref=0x4000,
+                vt_r8=5,
+            )
+
+        tolerance_patch = patch.object(
+            native_module,
+            "_read_edge_tolerance",
+            side_effect=read_edge_tolerance,
+        )
+        tolerance_patch.start()
+        self.addCleanup(tolerance_patch.stop)
 
     def test_sheet_only_part_exports_its_faces(self):
         body = FakeBody([FakeFace(TRIANGLE)])

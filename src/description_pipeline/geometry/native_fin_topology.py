@@ -42,7 +42,7 @@ def validate_native_edge_fin_relations(
     fins_by_id: Mapping[int, Mapping],
     vertices_by_id: Mapping[int, Sequence[float]],
 ) -> dict:
-    """Validate one edge's complete fin set against the v6 cofin contract."""
+    """Validate one edge's complete fin set against the v7 cofin contract."""
 
     _require(
         type(edge["body_type"]) is int
