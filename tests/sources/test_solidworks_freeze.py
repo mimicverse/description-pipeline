@@ -230,6 +230,22 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(boundary["opened"]["path"], self.backend.collected_scene_calls[0])
         self.assertEqual(self.backend.retired_session_pids, [100])
 
+    def test_fresh_session_rejects_a_different_active_configuration(self) -> None:
+        backend, config = self._two_component_backend()
+        read = backend.document_state
+
+        def changed(path):
+            state = read(path)
+            if backend.collected and Path(path).resolve() == Path(backend.collected[0]).resolve():
+                state["active_configuration"] = "Other"
+            return state
+
+        backend.document_state = changed
+        with self.assertRaises(BridgeError) as raised:
+            freeze(config, self.destination, backend=backend)
+        self.assertEqual(raised.exception.code, "cad_session_boundary_configuration")
+        self.assertFalse(self.destination.exists())
+
     def test_freeze_retains_the_closure_carrier_evidence(self) -> None:
         config = json.loads(json.dumps(self.config))
         config["closure"] = {

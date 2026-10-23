@@ -2437,12 +2437,43 @@ def _freeze_local(
                 {"top_level": top, "opened": opened},
                 exit_code=3,
             )
+        state_reader = getattr(backend, "document_state", None)
+        if not callable(state_reader):
+            raise BridgeError(
+                "cad_session_boundary_unavailable",
+                "the backend cannot verify the fresh capture configuration",
+                {"top_level": top},
+                exit_code=3,
+            )
+        capture_state = state_reader(top)
+        observed_configuration = (
+            capture_state.get("active_configuration") if isinstance(capture_state, dict) else None
+        )
+        if (
+            not isinstance(capture_state, dict)
+            or not _same_document(str(capture_state.get("path") or ""), top)
+            or capture_state.get("read_only") is not True
+            or observed_configuration != str(cfg["configuration"])
+        ):
+            raise BridgeError(
+                "cad_session_boundary_configuration",
+                "the fresh capture session did not reopen the requested configuration",
+                {
+                    "top_level": top,
+                    "requested": str(cfg["configuration"]),
+                    "observed": observed_configuration,
+                    "state": capture_state,
+                },
+                exit_code=3,
+            )
         stage = "environment"
         _capture_note(activity, "environment")
         environment = capture_environment(backend, worker_version)
         environment["session_boundary"] = {
             "closure_top_level": top,
             "configuration": str(cfg["configuration"]),
+            "observed_configuration": observed_configuration,
+            "capture_state": capture_state,
             "retirement": retirement,
             "opened": opened,
         }
