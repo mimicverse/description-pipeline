@@ -575,18 +575,41 @@ class NativeFinCaptureTests(unittest.TestCase):
             },
         )
 
-    def body_identity_backend(self, source_path, extension):
+    def body_identity_backend(
+        self,
+        source_path,
+        extension,
+        *,
+        occurrence_extension=None,
+    ):
         backend = SolidWorksBackend()
         document_key = object()
+        occurrence_key = object()
+        occurrence_extension = occurrence_extension or extension
         backend._source_components = {
             "part-1": (document_key, "Default")
         }
+        backend._scene_document_key = occurrence_key
         backend._source_documents = {
-            document_key: [source_path, "part", "Default", object()]
+            document_key: [source_path, "part", "Default", object()],
+            occurrence_key: [
+                source_path,
+                "assembly",
+                "Default",
+                object(),
+            ],
         }
-        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
-            Extension=extension
-        )
+
+        def captured_document(key, *_args, **_kwargs):
+            return SimpleNamespace(
+                Extension=(
+                    occurrence_extension
+                    if key == occurrence_key
+                    else extension
+                )
+            )
+
+        backend._captured_document = captured_document
         return backend
 
     def test_stable_duplicate_body_references_fail_before_tessellation(self):
@@ -618,6 +641,53 @@ class NativeFinCaptureTests(unittest.TestCase):
             caught.exception.code,
             "cad_persistent_reference_alias",
         )
+
+    def test_body_references_use_the_occurrence_document_extension(self):
+        first, *_ = self.fixture()
+        second, *_ = self.fixture()
+        second.Name = "fixture-body-2"
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+
+        class RecordingSentinelExtension:
+            def __init__(self):
+                self.calls = []
+
+            def GetPersistReference3(self, value):  # noqa: N802
+                self.calls.append(value)
+                return list(b"p" * 172)
+
+        class TwoBodyHolder:
+            def GetBodies2(self, body_type):  # noqa: N802
+                return [first, second] if body_type == 1 else []
+
+        part_extension = RecordingSentinelExtension()
+        occurrence_extension = FakeExtension()
+        backend = self.body_identity_backend(
+            source_path,
+            part_extension,
+            occurrence_extension=occurrence_extension,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            entry = backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                TwoBodyHolder(),
+            )
+
+        references = {
+            row["body_reference_sha256"]
+            for row in entry["tessellation"]["face_spans"]
+        }
+        self.assertEqual(len(references), 2)
+        self.assertTrue(occurrence_extension.calls)
+        self.assertEqual(part_extension.calls, [])
 
     def test_body_identity_set_requires_a_stable_complete_replay(self):
         body, *_ = self.fixture()
@@ -4357,12 +4427,27 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
 
     def test_scope_witness_stays_in_the_owned_document_session(self):
-        body, _face_10, _face_20, _edge, _tessellation, extension = (
+        body, _face_10, _face_20, _edge, _tessellation, _extension = (
             self.fixture()
         )
 
+        class PrefixExtension:
+            def __init__(self, prefix):
+                self.prefix = prefix
+                self.references = {}
+
+            def GetPersistReference3(self, value):  # noqa: N802
+                reference = hashlib.sha256(
+                    f"{self.prefix}-{id(value)}".encode()
+                ).digest()
+                self.references[id(value)] = reference
+                return list(reference)
+
+        occurrence_extension = PrefixExtension("occurrence")
+        part_extension = PrefixExtension("part")
+
         class OwnedDocument:
-            Extension = extension
+            Extension = part_extension
 
             def OpenDoc6(self, *_args):  # noqa: N802 - SolidWorks API name
                 raise AssertionError("the witness path must not open a document")
@@ -4411,6 +4496,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     0,
                     body,
                     body.faces,
+                    occurrence_extension=occurrence_extension,
                 )
 
         self.assertEqual(len(captured), 1)
@@ -4424,6 +4510,24 @@ class NativeFinCaptureTests(unittest.TestCase):
             ],
             "existing_owned_session_no_close",
         )
+        occurrence_hashes = {
+            hashlib.sha256(reference).hexdigest()
+            for reference in occurrence_extension.references.values()
+        }
+        part_hashes = {
+            hashlib.sha256(reference).hexdigest()
+            for reference in part_extension.references.values()
+        }
+        self.assertTrue(occurrence_hashes)
+        self.assertTrue(part_hashes)
+        witness_hashes = {
+            witness["persistent_reference_sha256"]
+            for group in witnesses.values()
+            for witness in group.values()
+        }
+        self.assertTrue(witness_hashes)
+        self.assertLessEqual(witness_hashes, part_hashes)
+        self.assertTrue(witness_hashes.isdisjoint(occurrence_hashes))
 
     def test_vertex_alias_with_persistent_edges_round_trips(self):
         body, _face_10, _face_20, _edge, _tessellation, extension = (
