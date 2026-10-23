@@ -5136,13 +5136,16 @@ def source_scopes(root) -> dict:
                 raise PipelineError(
                     f"File source document is missing: {name}"
                 )
-            document_posix = document.replace("\\", "/")
             document_path = ntpath.normpath(document).replace("\\", "/")
             document_key = document_path.casefold()
             expected_source_sha = discovery_files_case.get(document_key)
             raw_source_sha = source_files_case.get(document_key)
-            mapping_copy = f"source/{document_path}"
-            mapping_copy_key = mapping_copy.casefold()
+            mapping_copy = _canonical_evidence_path(
+                scope["source_copy_path"]
+            )
+            mapping_copy_key = (
+                mapping_copy.casefold() if mapping_copy is not None else None
+            )
             mapping_rows = [
                 row
                 for row in dependency.get("mapping") or []
@@ -5150,7 +5153,7 @@ def source_scopes(root) -> dict:
                 and ntpath.normpath(str(row.get("copy") or ""))
                 .replace("\\", "/")
                 .casefold()
-                == mapping_copy_key
+                == (mapping_copy_key or "")
             ]
             mapping_source = (
                 mapping_rows[0].get("source")
@@ -5166,16 +5169,27 @@ def source_scopes(root) -> dict:
                 if isinstance(mapping_source, str)
                 else None
             )
-            copy_sha = copy_files_case.get(mapping_copy_key)
+            copy_sha = (
+                copy_files_case.get(mapping_copy_key)
+                if mapping_copy_key is not None
+                else None
+            )
             normalized_source_path = (
                 ntpath.normpath(source_path).replace("\\", "/").casefold()
+            )
+            normalized_mapping_source = (
+                ntpath.normpath(str(mapping_source))
+                .replace("\\", "/")
+                .casefold()
+                if isinstance(mapping_source, str)
+                else ""
             )
             if (
                 expected_source_sha is None
                 or expected_source_sha != scope["source_document_sha256"]
                 or raw_source_sha is None
                 or raw_source_sha != scope["source_document_sha256"]
-                or scope["source_copy_path"].casefold() != mapping_copy_key
+                or mapping_copy_key is None
                 or len(mapping_rows) != 1
                 or not isinstance(mapping_source, str)
                 or original_sha != scope["source_document_sha256"]
@@ -5184,6 +5198,9 @@ def source_scopes(root) -> dict:
                 or copy_sha != scope["source_copy_sha256"]
                 or ntpath.basename(mapping_source).casefold()
                 != ntpath.basename(document).casefold()
+                or not normalized_mapping_source.endswith(
+                    "/" + document_key
+                )
                 or not normalized_source_path.endswith(
                     "/" + mapping_copy_key
                 )
@@ -5195,7 +5212,7 @@ def source_scopes(root) -> dict:
                 )
             frozen_source = confined(
                 delivery_root,
-                f"evidence/source/{document_posix}",
+                f"evidence/{scope['source_copy_path']}",
             )
             if (
                 not frozen_source.is_file()

@@ -514,6 +514,61 @@ class SourceScopeTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             source_scopes(self.root)
 
+    def test_file_scope_rejects_same_bytes_from_other_original_directory(self):
+        scope = self.file_scope()
+        self.write_file_anchors(scope)
+        nested_source = self.root / "evidence/source/a/Part.SLDPRT"
+        nested_source.parent.mkdir(parents=True)
+        nested_source.write_bytes(b"frozen-file")
+        copy_sha256 = hashlib.sha256(b"frozen-file").hexdigest()
+        source_sha256 = scope["source_document_sha256"]
+        discovery = json.loads(
+            (self.root / "evidence/discovery.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        discovery["raw"]["components"][0]["document"] = "a/Part.SLDPRT"
+        discovery["raw"]["files"] = {"a/Part.SLDPRT": source_sha256}
+        discovery["files"] = [
+            {"path": "a/Part.SLDPRT", "sha256": source_sha256}
+        ]
+        self.write("evidence/discovery.json", discovery)
+        scene = json.loads(
+            (self.root / "evidence/raw/scene_raw.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        scene["components"][0]["path"] = "C:/staged/source/a/Part.SLDPRT"
+        self.write("evidence/raw/scene_raw.json", scene)
+        closure = json.loads(
+            (self.root / "evidence/raw/dependency_closure.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        closure["mapping"] = [
+            {
+                "instance": "part-1",
+                "copy": "source/a/Part.SLDPRT",
+                "copy_sha256": copy_sha256,
+                "source": "C:/other/b/Part.SLDPRT",
+                "source_sha256": source_sha256,
+            }
+        ]
+        closure["original_files"] = {
+            "C:/other/b/Part.SLDPRT": source_sha256
+        }
+        closure["copy_files"] = {"source/a/Part.SLDPRT": copy_sha256}
+        self.write("evidence/raw/dependency_closure.json", closure)
+        scope["source_document_path"] = "C:/staged/source/a/Part.SLDPRT"
+        scope["source_copy_path"] = "source/a/Part.SLDPRT"
+        self.write(
+            "evidence/raw/source_scopes.json",
+            {"part-1": scope},
+        )
+
+        with self.assertRaises(PipelineError):
+            source_scopes(self.root)
+
     def test_file_scope_rejects_duplicate_normalized_path_anchors(self):
         mutations = (
             (

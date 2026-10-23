@@ -55,6 +55,20 @@ def capture_record() -> dict:
     return record
 
 
+def fixture_mass_payload(
+    mass: float,
+    com: tuple[float, float, float],
+) -> dict:
+    """Mass fixture with the configuration consumed by source-scope checks."""
+
+    payload = support.mass_payload(mass, com)
+    payload["reference"] = {
+        **payload["reference"],
+        "configuration": "Default",
+    }
+    return payload
+
+
 class AxisFixtureBackend(support.FixtureCadBackend):
     """Fixture backend that can resolve the authored joint axis selector."""
 
@@ -241,12 +255,15 @@ class SplitRoundtripTests(unittest.TestCase):
                     "name": "base-1",
                     "transform": support.placement((0.0, 0.0, 0.0)),
                     # Off-axis COM: the product signal proves the convention at capture time.
-                    "mass": support.mass_payload(0.192, (0.01, 0.02, 0.0)),
+                    "mass": fixture_mass_payload(0.192, (0.01, 0.02, 0.0)),
                 },
                 {
                     "name": "arm-1",
                     "transform": support.placement((0.0, 0.0, 0.1)),
-                    "mass": support.mass_payload(0.105654866776462, (0.0, 0.0, 0.05)),
+                    "mass": fixture_mass_payload(
+                        0.105654866776462,
+                        (0.0, 0.0, 0.05),
+                    ),
                 },
             ],
             dependencies=[
