@@ -8,11 +8,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
+from description_pipeline.backends.urdf import generate_urdf
 from description_pipeline.geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     NATIVE_SCOPE_IDENTITY_RULE,
     NATIVE_SCOPE_WARNING_DETAIL_FIELDS,
+    NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE,
+    NATIVE_OPEN_EDGE_SCOPE_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS,
     NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
@@ -22,12 +26,16 @@ from description_pipeline.geometry.native_u import (
     NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
     NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS,
     NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS,
+    NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
     NATIVE_TOLERANT_EDGE_WARNING_REASON,
     native_scope_warning_details_match,
+    native_curve_topology_endpoint_set_assignment,
+    native_tolerant_edge_value_warning,
     native_tolerant_edge_warning_details_match,
 )
 from description_pipeline.io import PipelineError, canonical_json_value, write_json
+from description_pipeline.model import Robot
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.portal import (
     PortalError,
@@ -90,10 +98,39 @@ def diagnostics() -> list[dict]:
     return native_gate_warning_diagnostics({"warnings": raw_warnings()})
 
 
+def tolerant_source_scope() -> dict:
+    source_sha256 = hashlib.sha256(b"native-source").hexdigest()
+    copy_sha256 = hashlib.sha256(b"frozen-copy").hexdigest()
+    return {
+        "rule_version": NATIVE_OPEN_EDGE_SCOPE_RULE,
+        "component": "part-1",
+        "source_document_path": "C:/staged/source/Part.SLDPRT",
+        "source_copy_path": "source/Part.SLDPRT",
+        "source_document_sha256": source_sha256,
+        "source_copy_sha256": copy_sha256,
+        "source_document_identity_sha256": source_sha256,
+        "source_document_identity_kind": "file_sha256",
+        "referenced_configuration": "Default",
+        "occurrence_scope": "part-1",
+        "virtual_owner": None,
+        "virtual_owner_sha256": None,
+        "virtual_session_document_path": None,
+        "virtual_session_temp_root": None,
+        "virtual_native_api_pid": None,
+    }
+
+
 def tolerant_warning() -> dict:
+    topology = native_curve_topology_endpoint_set_assignment(
+        (0.0, 0.0, 0.0),
+        (1e-7, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (1e-7, 0.0, 0.0),
+    )
     return {
         "code": NATIVE_TOLERANT_EDGE_GAP_WARNING,
         "blocking": False,
+        "message": NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
         "component": "part-1",
         "body_type": 1,
         "body_index": 0,
@@ -118,6 +155,11 @@ def tolerant_warning() -> dict:
         "affected_fields": list(NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS),
         "reason": NATIVE_TOLERANT_EDGE_WARNING_REASON,
         "qualification": NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
+        "topology_endpoint_set": topology,
+        "source_scope": tolerant_source_scope(),
+        "open_edge_boundary_identity_sha256": hashlib.sha256(
+            NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE.encode("ascii")
+        ).hexdigest(),
     }
 
 
@@ -312,6 +354,64 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             {row["code"] for row in structural["findings"]},
         )
 
+    def test_tolerant_warning_is_a_complete_urdf_value_warning(self) -> None:
+        raw = tolerant_warning()
+        value_warning, = native_tolerant_edge_value_warning([raw])
+
+        self.assertEqual(value_warning["code"], NATIVE_TOLERANT_EDGE_GAP_WARNING)
+        self.assertEqual(
+            value_warning["message"],
+            NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
+        )
+        self.assertEqual(len(value_warning["objects"]), 1)
+        subject = value_warning["objects"][0]
+        self.assertEqual(subject["object_type"], "native_tessellation_fin_endpoint")
+        self.assertEqual(subject["component"], "part-1")
+        self.assertEqual(
+            subject["topology_endpoint_set"],
+            raw["topology_endpoint_set"],
+        )
+        self.assertEqual(subject["source_scope"], raw["source_scope"])
+        self.assertEqual(
+            subject["open_edge_boundary_identity_sha256"],
+            raw["open_edge_boundary_identity_sha256"],
+        )
+
+        changed = copy.deepcopy(raw)
+        changed["source_scope"]["virtual_owner"] = "Foreign.SLDASM"
+        with self.assertRaises(ValueError):
+            native_tolerant_edge_value_warning([changed])
+
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = json.loads(
+            (source / "scene.json").read_text(encoding="utf-8")
+        )
+        scene["provenance"]["value_warnings"] = [value_warning]
+        with tempfile.TemporaryDirectory() as directory:
+            output = generate_urdf(
+                Robot.from_dict(scene),
+                source,
+                Path(directory),
+                name="native_warning",
+            )
+            parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+            document = ET.fromstring(output.read_bytes(), parser=parser)
+        comments = [
+            child.text or ""
+            for child in document
+            if child.tag is ET.Comment
+        ]
+        self.assertEqual(len(comments), 1)
+        self.assertIn(
+            f"WARNING {NATIVE_TOLERANT_EDGE_GAP_WARNING}:",
+            comments[0],
+        )
+        self.assertIn(
+            subject["open_edge_boundary_identity_sha256"],
+            comments[0],
+        )
+        self.assertIn('"source_copy_path": "source/Part.SLDPRT"', comments[0])
+
     def test_tolerant_edge_warning_identity_keeps_part_occurrences_distinct(
         self,
     ) -> None:
@@ -319,6 +419,8 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         second = copy.deepcopy(first)
         second["component"] = "part-2"
         second["body_index"] = 1
+        second["source_scope"]["component"] = "part-2"
+        second["source_scope"]["occurrence_scope"] = "part-2"
 
         projected = native_gate_warning_diagnostics(
             {"warnings": [first, second]}

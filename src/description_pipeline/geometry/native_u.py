@@ -62,6 +62,11 @@ NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS = (
 NATIVE_TOLERANT_EDGE_GAP_WARNING = (
     "cad_native_tolerant_edge_boundary_projection"
 )
+NATIVE_TOLERANT_EDGE_WARNING_MESSAGE = (
+    "Native tolerant-edge boundary projection used a source-bound unordered "
+    "endpoint-set authority and, where needed, an independently replayed "
+    "open-edge identity."
+)
 NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS = frozenset(
     {
         "component",
@@ -85,6 +90,9 @@ NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS = frozenset(
         "gap_cap_m",
         "edge_tolerance_out_variant_type",
         "field",
+        "topology_endpoint_set",
+        "source_scope",
+        "open_edge_boundary_identity_sha256",
     }
 )
 NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS = (
@@ -354,12 +362,36 @@ def native_tolerant_edge_warning_is_valid(item: object) -> bool:
         "composed_projection_tolerance_m",
         "gap_cap_m",
     )
+    topology = detail["topology_endpoint_set"]
+    identity_sha256 = detail["open_edge_boundary_identity_sha256"]
+    if (
+        not isinstance(topology, dict)
+        or not native_source_scope_is_valid(
+            detail["source_scope"],
+            detail["component"],
+        )
+        or (identity_sha256 is not None and not isinstance(identity_sha256, str))
+        or (
+            isinstance(identity_sha256, str)
+            and _HEX64.fullmatch(identity_sha256) is None
+        )
+    ):
+        return False
+    try:
+        recomputed_topology = native_curve_topology_endpoint_set_assignment(
+            topology["expected_start_point_m"],
+            topology["expected_end_point_m"],
+            topology["actual_start_point_m"],
+            topology["actual_end_point_m"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
     return (
         item["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING
         and item["blocking"] is False
         and item["severity"] == "warning"
         and isinstance(item["message"], str)
-        and bool(item["message"].strip())
+        and item["message"] == NATIVE_TOLERANT_EDGE_WARNING_MESSAGE
         and item["object"] == detail["component"]
         and isinstance(detail["component"], str)
         and bool(detail["component"])
@@ -408,7 +440,60 @@ def native_tolerant_edge_warning_is_valid(item: object) -> bool:
         and detail["reason"] == NATIVE_TOLERANT_EDGE_WARNING_REASON
         and detail["qualification"]
         == NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION
+        and topology == recomputed_topology
+        and (
+            (topology["complete_match_count"] == 1 and identity_sha256 is None)
+            or (
+                topology["complete_match_count"] == 2
+                and isinstance(identity_sha256, str)
+            )
+        )
     )
+
+
+def native_tolerant_edge_value_warning(raw_warnings: list[dict]) -> list[dict]:
+    """Return the model-level value warning for verified tolerant-edge authority."""
+
+    objects = []
+    for item in raw_warnings:
+        if not isinstance(item, dict):
+            raise ValueError("native tessellation warning is not an object")
+        if item.get("code") != NATIVE_TOLERANT_EDGE_GAP_WARNING:
+            continue
+        projected = native_scope_warning_projection(item)
+        if not native_tolerant_edge_warning_is_valid(projected):
+            raise ValueError("native tolerant-edge warning is incomplete")
+        detail = projected["detail"]
+        objects.append(
+            {
+                "object_type": "native_tessellation_fin_endpoint",
+                "object": (
+                    f"{detail['component']}:"
+                    f"body:{detail['body_type']}/{detail['body_index']}:"
+                    f"edge:{detail['edge_reference_sha256']}:"
+                    f"fin:{detail['fin_id']}:{detail['fin_endpoint']}"
+                ),
+                **detail,
+            }
+        )
+    if not objects:
+        return []
+    objects.sort(
+        key=lambda value: json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    return [
+        {
+            "code": NATIVE_TOLERANT_EDGE_GAP_WARNING,
+            "message": NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
+            "objects": objects,
+        }
+    ]
 
 
 def native_tolerant_edge_warning_details_match(
@@ -1492,15 +1577,6 @@ def native_curve_topology_endpoint_set_assignment(
         "distinct_endpoint_sets": distinct_endpoints,
         "accepted": accepted,
     }
-    record["endpoint_set_sha256"] = hashlib.sha256(
-        json.dumps(
-            record,
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("ascii")
-    ).hexdigest()
     return record
 
 
@@ -1933,9 +2009,6 @@ def native_open_edge_boundary_identity(
             "end": roles[1],
         },
         "curve_sense": curve_sense,
-        "curve_sense_metadata": {
-            "used_for_decision": False,
-        },
         "gap": {
             "metric": "euclidean",
             "value_m": gap,
@@ -1947,14 +2020,6 @@ def native_open_edge_boundary_identity(
         "fin_to_edge_mapping": fin_mapping,
         "selected_fin_to_edge": fin_to_edge,
         "selected_curve_to_edge": curve_to_edge,
-        "fin_vertex_com_mapping": {
-            "required": False,
-            "used_for_gate": False,
-        },
-        "direction_dot": {
-            "used_for_decision": False,
-        },
-        "accepted": True,
     }
     record["identity_chain_sha256"] = hashlib.sha256(
         json.dumps(

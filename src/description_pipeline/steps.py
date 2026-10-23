@@ -850,6 +850,9 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
     from .backends.urdf import generate_urdf
     from .model import Robot
     from .sources.solidworks.scene import load_scene
+    from .verification.native_mesh_observations import (
+        native_geometry_value_warnings,
+    )
 
     _state(on_event, "generate", "running")
     checked(
@@ -862,7 +865,17 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
     )
     name = definition["source"]["robot_name"]
     write_json(staging / "tool.json", tool_record())
-    robot = Robot.from_dict(load_scene(staging / "evidence"))
+    scene = load_scene(staging / "evidence")
+    # URDF comments are written before the verify stage.  Derive their native
+    # geometry claims from evidence here; _value_warning_gate recomputes them
+    # independently and refuses any missing, forged, or stale model warning.
+    native_warnings = native_geometry_value_warnings(staging)
+    if native_warnings:
+        scene["provenance"]["value_warnings"] = [
+            *(scene["provenance"].get("value_warnings") or []),
+            *native_warnings,
+        ]
+    robot = Robot.from_dict(scene)
     write_json(staging / "model/robot.json", robot.to_dict())
     generate_urdf(robot, staging / "evidence", staging, name=name)
     from .delivery import write_delivery_manifest

@@ -24,8 +24,11 @@ from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, 
 from ..geometry import stl
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    NATIVE_TOLERANT_EDGE_GAP_WARNING,
+    NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     native_scope_warning_details_match,
     native_scope_warning_projection,
+    native_tolerant_edge_value_warning,
     native_tolerant_edge_warning_set_matches,
 )
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
@@ -2054,15 +2057,28 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
             diagnostics.extend(projected)
             return native_details
 
-        gates.add("geometry.native_tessellation", _verify_native_tessellation)
+        native_geometry = gates.add(
+            "geometry.native_tessellation",
+            _verify_native_tessellation,
+        )
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add(
             "verification.complete",
-            lambda: _verify_model(root, gates, definition, model, raw, diagnostics),
+            lambda: _verify_model(
+                root,
+                gates,
+                definition,
+                model,
+                raw,
+                diagnostics,
+                native_geometry=native_geometry,
+            ),
         )
     if model is not None:
         for warning in (model.get("provenance") or {}).get("value_warnings") or []:
             if isinstance(warning, dict) and warning.get("code"):
+                if warning["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING:
+                    continue
                 diagnostics.append(
                     {
                         "code": str(warning["code"]),
@@ -2258,7 +2274,16 @@ def _mass_closure_equality(root, definition=None):
     return verify_urdf_mass_equality(root, (definition or {}).get("source"))
 
 
-def _verify_model(root, gates, definition, model, raw, diagnostics):
+def _verify_model(
+    root,
+    gates,
+    definition,
+    model,
+    raw,
+    diagnostics,
+    *,
+    native_geometry=None,
+):
     from .solidworks_physics import verify_physics
 
     source = definition["source"]
@@ -2274,6 +2299,11 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             model,
             carrier,
             native_geometry_rows=native_geometry_rows,
+            native_warnings=(
+                native_geometry.get("warnings")
+                if isinstance(native_geometry, dict)
+                else None
+            ),
         ),
     )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
@@ -2484,7 +2514,15 @@ def _carrier_binding(source, carrier):
     return {"bodies": len(native), "joints": len(delivered)}
 
 
-def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_rows=None):
+def _value_warning_gate(
+    root,
+    source,
+    model,
+    carrier=None,
+    *,
+    native_geometry_rows=None,
+    native_warnings=None,
+):
     """Re-derive every non-native value warning from source facts and the model."""
 
     from ..sources.solidworks.naming import (
@@ -3176,7 +3214,20 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
             "Link mass properties are transformed, translated or recombined from native readings."
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
+        NATIVE_TOLERANT_EDGE_GAP_WARNING: NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     }
+    try:
+        native_value_warnings = native_tolerant_edge_value_warning(
+            native_warnings or []
+        )
+    except (TypeError, ValueError) as error:
+        raise PipelineError(
+            "Native geometry value-warning projection is incomplete"
+        ) from error
+    for native_warning in native_value_warnings:
+        expected.setdefault(native_warning["code"], []).extend(
+            native_warning["objects"]
+        )
     _require(
         set(actual) == set(expected),
         "Non-native value provenance warning classes differ from the delivery: "
