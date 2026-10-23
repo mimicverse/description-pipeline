@@ -557,10 +557,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-failed"))
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-unproven"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-mapped"))
-        self.assertEqual(
-            run_ownership.retry_assessment_for_run(auth.ALLOWED_DAG_ID, "missing-run").reason,
-            "run_missing",
-        )
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="missing-run"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-success"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-running"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-no-failed"))

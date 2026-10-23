@@ -40,6 +40,13 @@ from ..sources.solidworks.native_limits import (
     PREVIEW_POLICY_ID,
     PREVIEW_WINDOW_RAD,
 )
+from ..sources.solidworks.evidence import (
+    METADATA_WARNING_CODE,
+    METADATA_WARNING_MESSAGE,
+    REWRITE_ENVIRONMENT_EVIDENCE,
+    RUNTIME_EVIDENCE,
+    metadata_value_warnings,
+)
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
     CHECK_POLICY_V1,
@@ -2071,6 +2078,7 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
                 model,
                 raw,
                 diagnostics,
+                manifest,
                 native_geometry=native_geometry,
             ),
         )
@@ -2281,6 +2289,7 @@ def _verify_model(
     model,
     raw,
     diagnostics,
+    manifest,
     *,
     native_geometry=None,
 ):
@@ -2289,6 +2298,7 @@ def _verify_model(
     source = definition["source"]
     carrier = source.get("carrier")
     native_geometry_rows = evidence.geometry(root)
+    metadata_warnings = _metadata_value_warnings(root, source, manifest)
     gates.add("model.policy", lambda: _policy(source, model))
     gates.add("source.carrier_binding", lambda: _carrier_binding(source, carrier))
     gates.add(
@@ -2304,6 +2314,7 @@ def _verify_model(
                 if isinstance(native_geometry, dict)
                 else None
             ),
+            metadata_warnings=metadata_warnings,
         ),
     )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
@@ -2431,6 +2442,31 @@ def _verify_model(
     gates.add("consumer.urdf", lambda: load_consumer(root))
 
 
+def _metadata_value_warnings(root, source, manifest):
+    if not isinstance(manifest, dict):
+        raise PipelineError("Delivery manifest is unavailable for metadata provenance")
+    records = manifest.get("subject", {}).get("files", [])
+    digests = {
+        record.get("path"): record.get("sha256")
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get("path"), str)
+    }
+    try:
+        runtime = evidence.runtime(root)
+        rewrite = read_data(confined(root, REWRITE_ENVIRONMENT_EVIDENCE))
+        closure = evidence.dependency_closure(root)
+        return metadata_value_warnings(
+            runtime,
+            rewrite,
+            runtime_sha256=digests[RUNTIME_EVIDENCE],
+            rewrite_sha256=digests[REWRITE_ENVIRONMENT_EVIDENCE],
+            expected_configuration=str(source.get("configuration") or ""),
+            closure_top_level=str(closure.get("top_level") or ""),
+        )
+    except (KeyError, TypeError) as error:
+        raise PipelineError("Metadata evidence is not fully bound by the delivery manifest") from error
+
+
 def _author_expectations(gates, definition, model, points):
     """Execute only supplied design expectations; absence is not a passed check."""
     expectations = definition.get("checks") or {}
@@ -2522,6 +2558,7 @@ def _value_warning_gate(
     *,
     native_geometry_rows=None,
     native_warnings=None,
+    metadata_warnings=None,
 ):
     """Re-derive every non-native value warning from source facts and the model."""
 
@@ -2651,6 +2688,18 @@ def _value_warning_gate(
 
     def add(code, value):
         expected.setdefault(code, []).append(value)
+
+    for warning in metadata_warnings or []:
+        _require(
+            isinstance(warning, dict)
+            and warning.get("code") == METADATA_WARNING_CODE
+            and warning.get("message") == METADATA_WARNING_MESSAGE
+            and isinstance(warning.get("objects"), list)
+            and bool(warning["objects"]),
+            "Re-derived metadata provenance warning is malformed",
+        )
+        for object_row in warning["objects"]:
+            add(warning["code"], object_row)
 
     for body in bodies:
         source_name = str(body.get("source_name") or body["name"])
@@ -3215,6 +3264,7 @@ def _value_warning_gate(
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
         NATIVE_TOLERANT_EDGE_GAP_WARNING: NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
+        METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
     }
     try:
         native_value_warnings = native_tolerant_edge_value_warning(

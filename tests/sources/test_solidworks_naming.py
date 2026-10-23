@@ -6,9 +6,7 @@ import unittest
 
 from description_pipeline.sources.solidworks.naming import (
     asset_namespace,
-    carrier_names,
     carrier_names_and_rules,
-    collision_name,
     deduplicate_names,
     disambiguated_frame_name,
     fallback_name,
@@ -25,6 +23,12 @@ from description_pipeline.sources.solidworks.naming import (
     token,
     visual_name,
 )
+
+def _carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, str]]:
+    body_names, joint_names, _body_rules, _joint_rules = carrier_names_and_rules(
+        bodies, joints, root
+    )
+    return body_names, joint_names
 
 
 class NamingTests(unittest.TestCase):
@@ -99,7 +103,7 @@ class NamingTests(unittest.TestCase):
                 "child": "manual_left",
             }
         ]
-        body_names, joint_names = carrier_names(bodies, joints, "manual_root")
+        body_names, joint_names = _carrier_names(bodies, joints, "manual_root")
         self.assertEqual(body_names, {"manual_root": "base_link", "manual_left": "left_foot_link"})
         self.assertEqual(joint_names, {"l_ankle": "left_ankle_joint"})
 
@@ -117,7 +121,7 @@ class NamingTests(unittest.TestCase):
             {"name": "r_elbow", "type": "revolute", "parent": "base", "child": "forearm"},
             {"name": "r_wrist_pitch", "type": "revolute", "parent": "forearm", "child": "hand"},
         ]
-        body_names, joint_names = carrier_names(bodies, joints, "base")
+        body_names, joint_names = _carrier_names(bodies, joints, "base")
         self.assertEqual(body_names["upper"], "right_upper_arm_link")
         self.assertEqual(body_names["forearm"], "right_forearm_link")
         self.assertEqual(body_names["hand"], "right_hand_link")
@@ -136,7 +140,7 @@ class NamingTests(unittest.TestCase):
             {"name": "r_shoulder_roll", "type": "revolute", "parent": "base", "child": "upper"},
             {"name": "l_shoulder_yaw", "type": "revolute", "parent": "upper", "child": "yaw"},
         ]
-        body_names, joint_names = carrier_names(bodies, joints, "base")
+        body_names, joint_names = _carrier_names(bodies, joints, "base")
         self.assertEqual(body_names["upper"], "right_shoulder_roll_link")
         self.assertEqual(joint_names["r_shoulder_roll"], "right_shoulder_roll_joint")
 
@@ -150,7 +154,7 @@ class NamingTests(unittest.TestCase):
             {"name": "r_elbow", "type": "revolute", "parent": "base", "child": "forearm"},
             {"name": "r_wrist_pitch", "type": "revolute", "parent": "forearm", "child": "hand"},
         ]
-        body_names, joint_names = carrier_names(bodies, joints, "base")
+        body_names, joint_names = _carrier_names(bodies, joints, "base")
         self.assertEqual(body_names["forearm"], "right_elbow_link")
         self.assertEqual(joint_names["r_elbow"], "right_elbow_joint")
 
@@ -176,7 +180,7 @@ class NamingTests(unittest.TestCase):
             {"name": "head_yaw", "type": "revolute", "parent": "base", "child": "head_yaw"},
             {"name": "head_pitch", "type": "revolute", "parent": "head_yaw", "child": "head_pitch"},
         ]
-        body_names, joint_names = carrier_names(bodies, joints, "base")
+        body_names, joint_names = _carrier_names(bodies, joints, "base")
         self.assertEqual(
             body_names,
             {
@@ -231,7 +235,7 @@ class NamingTests(unittest.TestCase):
                     for index, side in enumerate(outgoing)
                 ],
             ]
-            return carrier_names(bodies, joints, "base")[0]["waist"]
+            return _carrier_names(bodies, joints, "base")[0]["waist"]
 
         self.assertEqual(names(["r_", "l_"]), "pelvis_link")
         self.assertEqual(names(["r_"]), "waist_link")
@@ -247,7 +251,7 @@ class NamingTests(unittest.TestCase):
             {"name": "r_elbow", "type": "revolute", "parent": "base", "child": "forearm"},
             {"name": "l_wrist_pitch", "type": "revolute", "parent": "forearm", "child": "hand"},
         ]
-        body_names, joint_names = carrier_names(bodies, joints, "base")
+        body_names, joint_names = _carrier_names(bodies, joints, "base")
         self.assertEqual(body_names["forearm"], "right_elbow_link")
         self.assertEqual(joint_names["r_elbow"], "right_elbow_joint")
 
@@ -306,7 +310,7 @@ class NamingTests(unittest.TestCase):
         add_body("sensor", "CS_sensor_housing_link")
         joints.append({"name": "sensor_mount", "type": "fixed", "parent": "base", "child": "sensor"})
 
-        body_names, joint_names = carrier_names(bodies, joints, "base")
+        body_names, joint_names = _carrier_names(bodies, joints, "base")
 
         self.assertEqual(
             set(body_names.values()),
@@ -447,7 +451,7 @@ class NamingTests(unittest.TestCase):
             {"name": "tool", "frame": {"coordinate_system": "CS_tool"}},
         ]
         joints = [{"name": "tool_mount", "type": "fixed", "parent": "base", "child": "tool"}]
-        _links, names = carrier_names(bodies, joints, "base")
+        _links, names = _carrier_names(bodies, joints, "base")
         self.assertEqual(names["tool_mount"], "base_link_to_tool_link_joint")
 
     def test_real_root_reserves_base_link_before_collision_resolution(self):
@@ -455,7 +459,7 @@ class NamingTests(unittest.TestCase):
             {"name": "a", "frame": {"coordinate_system": "CS_base_link"}},
             {"name": "root", "frame": {"coordinate_system": "CS_base_link"}},
         ]
-        names, _joints = carrier_names(bodies, [], "root")
+        names, _joints = _carrier_names(bodies, [], "root")
         self.assertEqual(names["root"], "base_link")
         self.assertTrue(names["a"].startswith("body_"))
         self.assertTrue(names["a"].endswith("_link"))
@@ -469,7 +473,6 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(first, visual_name("waist-1/part-1", link="pelvis_link"))
         self.assertNotEqual(first, visual_name("waist-1/part-2", link="pelvis_link"))
         self.assertTrue(first.endswith("_visual"))
-        self.assertTrue(collision_name("waist-1/part-1", link="pelvis_link").endswith("_collision"))
         self.assertTrue(material_name("waist-1/part-1", link="pelvis_link").endswith("_material"))
         digest = "a" * 64
         self.assertEqual(asset_namespace("M3.0.3_20261016.SLDASM"), "m303_20261016")

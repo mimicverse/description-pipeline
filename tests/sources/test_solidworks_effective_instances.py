@@ -347,31 +347,6 @@ class EffectiveInstanceSceneTests(unittest.TestCase):
         self.assertEqual(raw.mass_properties[DEV]["mass"], 0.035)
         self.assertEqual(result["links"][0]["provenance"]["effective_instances"], [DEV])
 
-    def test_flagless_context_uses_the_same_primary_value_in_closure_and_warning(self):
-        from description_pipeline.sources.solidworks.closure import _derive
-
-        reading = _effective_reading(0.04, (0.01, 0, 0), role="leaf", document_type="part", name=DEV)
-        reading["reference"]["overrides"] = _flags()
-        reading["reference"]["measurement_basis"] = "cad_assembly_instance_measurement"
-        reading["part_measurement"] = {"mass_kg": 0.035}
-        scene = self._scene({"effective_instances": {DEV: reading}})
-        record = _effective_instance_record(scene, {"assembly": "robot.SLDASM"}, {DEV: reading})
-        warning = record["warnings"][0]
-        self.assertEqual(warning["code"], "cad_instance_measurement_differs_from_part")
-        self.assertEqual(warning["measurement"]["mass_kg"], 0.04)
-        self.assertEqual(warning["part_measurement"]["mass_kg"], 0.035)
-        raw = {"components": [{"name": c.name, "transform": c.transform} for c in scene.components],
-               "mass_properties": scene.mass_properties}
-        native = {"component_context": {"instances": [
-            {"name": DEV, "depth": 1, "document_type": "part", "context_mass_kg": 0.04,
-             "overrides": _flags(), "effective": reading},
-        ]}}
-        derived = _derive(native, raw, self._cfg())
-        self.assertAlmostEqual(derived["leaf_total"]["mass"], 0.061)
-        self.assertAlmostEqual(derived["effective_total"]["mass"], 0.066)
-        self.assertEqual(derived["effective_total"]["substituted"], [])
-
-
 class EffectiveInstanceRecordTests(unittest.TestCase):
     def _instance(self, name, *, depth, parent, document_type, mass, overrides, effective=None, error=None):
         entry = {

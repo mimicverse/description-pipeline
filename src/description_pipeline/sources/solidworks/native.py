@@ -9009,14 +9009,31 @@ class SolidWorksBackend(CadBackend):
         }
         for key, member in (("build", "GetBuildNumbers"), ("license", "GetCurrentLicenseType")):
             try:
-                facts[key] = _member(app, member)
+                value = _member(app, member)
             except Exception as exc:  # noqa: BLE001 - optional API surface
                 facts[key] = None
                 facts.setdefault("unavailable", {})[member] = str(exc)
+                continue
+            valid = (type(value) is str and bool(value)) if key == "build" else type(value) is int
+            if not valid:
+                raise CadError(
+                    "cad_environment_value_invalid",
+                    f"{member} returned an unsupported type",
+                    {"member": member, "type": type(value).__name__, "value": repr(value)},
+                )
+            facts[key] = value
         try:
-            facts["visible"] = bool(_member(app, "Visible"))
-        except Exception:  # noqa: BLE001
+            visible = _member(app, "Visible")
+        except Exception:  # noqa: BLE001 - unreadable visibility remains an explicit failure placeholder
             facts["visible"] = None
+        else:
+            if type(visible) is not bool:
+                raise CadError(
+                    "cad_environment_value_invalid",
+                    "Visible returned an unsupported type",
+                    {"member": "Visible", "type": type(visible).__name__, "value": repr(visible)},
+                )
+            facts["visible"] = visible
         return facts
 
     def license_type(self):
@@ -9077,10 +9094,18 @@ class SolidWorksBackend(CadBackend):
 
         doc = self._ensure_document(path)
         _manager, active = _active_configuration_view(doc)
+        save_flag = _member(doc, "GetSaveFlag")
+        if type(save_flag) is not bool:
+            raise CadError(
+                "cad_save_flag_invalid",
+                "GetSaveFlag returned an unsupported type",
+                {"member": "GetSaveFlag", "type": type(save_flag).__name__, "value": repr(save_flag)},
+            )
         state = {
             "path": _member(doc, "GetPathName"),
             "title": _member(doc, "GetTitle"),
-            "saved": not bool(_member(doc, "GetSaveFlag")),
+            "save_flag": save_flag,
+            "saved": not save_flag,
             "active_configuration": _member(active, "Name"),
             "configurations": self.list_configurations(path),
         }

@@ -763,6 +763,42 @@ class ReportViewTests(unittest.TestCase):
         check = next(row for row in verify["independent"] if row["id"] == "discovery.declarations")
         self.assertEqual(check["state"], "passed")
 
+    def test_metadata_quality_diagnostic_survives_the_verify_report_projection(self) -> None:
+        job = passed_job()
+        metadata_object = {
+            "object_type": "metadata",
+            "object": "evidence/native-runtime.json",
+            "fields": ["/session_boundary/opened/read_only"],
+            "source": "open_document operation claim",
+            "rule_id": "metadata.operation_claim",
+            "rule_version": "v1",
+            "reason": "read_only is declared; capture_state.read_only is the actual observation",
+            "file": "evidence/native-runtime.json",
+            "sha256": "c" * 64,
+            "reference": "evidence/native-runtime.json",
+        }
+        job["result"]["quality"]["diagnostics"] = [
+            {
+                "code": "metadata.non_native",
+                "blocking": False,
+                "message": "Platform metadata is not a direct CAD engineering read.",
+                "detail": {"objects": [metadata_object]},
+            }
+        ]
+
+        report = build_report(job)
+        verify = next(stage for stage in report["stages"] if stage["id"] == "verify")
+
+        self.assertEqual(verify["counts"]["warnings"], 1)
+        warning = verify["warnings"][0]
+        self.assertEqual(warning["code"], "metadata.non_native")
+        self.assertEqual(
+            warning["label"],
+            "Platform metadata provenance (not direct CAD readings)",
+        )
+        self.assertEqual(warning["objects"], [metadata_object])
+        self.assertIs(warning["blocking"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

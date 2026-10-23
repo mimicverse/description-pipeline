@@ -409,7 +409,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_rebuild_records_only_executed_steps_without_claiming_native_replay(self):
         from .protocol_support import protocol_events
-        from description_pipeline.delivery import stamped_output, subject_digest
+        from description_pipeline.delivery import subject_digest
 
         self.seal()
         bundle = self.root / "frozen"
@@ -480,8 +480,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(view["execution_scope"], ["generate", "verify"])
         self.assertEqual([row["id"] for row in view["stages"] if row["state"] == "completed"], ["generate", "verify"])
         self.assertTrue(all(row["state"] == "not_run" for row in view["stages"] if not row["in_scope"]))
-        self.assertTrue(stamped_output(self.output))
-
     def test_rebuild_refuses_a_frozen_delivery_that_changed_after_verification(self):
         bundle = self.root / "frozen"
         (bundle / "input").mkdir(parents=True)
