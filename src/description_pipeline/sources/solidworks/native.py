@@ -691,128 +691,6 @@ def _scope_owner_key(
     )
 
 
-def _scope_mapping_rows(mapping: dict[int, int], source_rows: list[dict]) -> list[dict]:
-    """Return one canonical component-to-part index mapping."""
-
-    return [
-        {
-            "component_index": component_index,
-            "source_index": source_index,
-            "source_reference_sha256": source_rows[source_index][
-                "reference_sha256"
-            ],
-        }
-        for component_index, source_index in sorted(mapping.items())
-    ]
-
-
-def _body_scope_topology_signature(witness: dict) -> str:
-    """Hash the complete bidirectional face/edge/vertex body witness."""
-
-    return native_scope_identity_sha256(
-        {
-            "faces": witness["faces"],
-            "edges": witness["edges"],
-            "vertices": witness["vertices"],
-        }
-    )
-
-
-def _body_scope_identity(
-    *,
-    owner_scope: dict,
-    body_type: int,
-    body_index: int,
-    body_name: str,
-    body_reference_sha256: str,
-    witness: dict,
-) -> dict:
-    """Build the versioned non-persistent identity for one aliased body."""
-
-    return {
-        "rule_version": NATIVE_SCOPE_IDENTITY_RULE,
-        "entity_kind": "body",
-        "identity_kind": "mapped_scope_local",
-        "persistent": False,
-        "owner_scope_key": _scope_owner_key(
-            owner_scope,
-            body_type=body_type,
-            body_index=body_index,
-            body_name=body_name,
-        ),
-        "source_document_sha256": owner_scope["source_document_sha256"],
-        "referenced_configuration": owner_scope["referenced_configuration"],
-        "occurrence_scope": owner_scope["occurrence"],
-        "body_type": body_type,
-        "body_index": body_index,
-        "body_name": body_name,
-        "native_body_reference_sha256": body_reference_sha256,
-        "mapping_source_part_document_sha256": witness[
-            "part_document_sha256"
-        ],
-        "mapping_source_body_reference_sha256": witness[
-            "part_body_reference_sha256"
-        ],
-        "mapping_source_body_index": witness["part_body_index"],
-        "mapping_source_body_name": witness["part_body_name"],
-        "mapped_source_faces": witness["faces"],
-        "mapped_source_edges": witness["edges"],
-        "mapped_source_vertices": witness["vertices"],
-        "topology_signature_sha256": witness["topology_signature_sha256"],
-        "mapping_method": (
-            "direct_part_reference_witness+"
-            "bidirectional_face_edge_vertex_topology_replay+body_name"
-        ),
-        "source_authority": NATIVE_SCOPE_SOURCE_AUTHORITY,
-        "warnings": [
-            NATIVE_COMPONENT_REFERENCE_ALIASED,
-            NATIVE_PART_WITNESS_DERIVED,
-            NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
-            NATIVE_TOPOLOGY_IDENTITY_DERIVED,
-        ],
-    }
-
-
-def _body_reference_identity_mode(raw_sha256s: list[str]) -> str:
-    """Classify one complete component/body-type persistent-reference set."""
-
-    if not raw_sha256s or any(
-        not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
-        for value in raw_sha256s
-    ):
-        raise ValueError("native body reference hashes are missing or malformed")
-    if len(set(raw_sha256s)) == len(raw_sha256s):
-        return NATIVE_PERSISTENT_IDENTITY_RULE
-    if len(set(raw_sha256s)) == 1:
-        return NATIVE_SCOPE_IDENTITY_RULE
-    raise ValueError(
-        "native body references mix aliased and distinct values"
-    )
-
-
-def _part_body_witnesses_are_unique(
-    witnesses: list[dict],
-) -> bool:
-    """Whether aliased component bodies bind distinct frozen part bodies."""
-
-    if not witnesses:
-        return False
-    indices = [witness["part_body_index"] for witness in witnesses]
-    names = [witness["part_body_name"] for witness in witnesses]
-    references = [
-        witness["part_body_reference_sha256"] for witness in witnesses
-    ]
-    topology = [
-        witness["topology_signature_sha256"] for witness in witnesses
-    ]
-    return (
-        len(indices) == len(set(indices))
-        and len(names) == len(set(names))
-        and len(references) == len(set(references))
-        and len(topology) == len(set(topology))
-    )
-
-
 def _component(value):
     """Bind a native occurrence to its published component interface."""
     return _interface(value, ICOMPONENT2_IID)
@@ -3063,6 +2941,8 @@ class _NativeReferenceRegistry:
         }
         previous = self.identity_owners.get(identity_sha256)
         if previous is not None:
+            if previous == recorded_owner:
+                return
             raise CadError(
                 "cad_scope_identity_alias",
                 "a scope-local identity is not unique",
@@ -5022,7 +4902,8 @@ class SolidWorksBackend(CadBackend):
         scope_witnesses=None,
         body_name=None,
         body_reference=None,
-        body_identity=None,
+        body_faces=None,
+        body_owner_prebound=False,
     ):
         """Capture one body's finite topology and orientation evidence.
 
@@ -5127,8 +5008,8 @@ class SolidWorksBackend(CadBackend):
                 {**base, "api": "IBody2.Name"},
             )
         if body_reference is None:
-            body_reference = persistent(body, "body", audit=False)
-        if body_identity is None:
+            body_reference = persistent(body, "body")
+        else:
             registry.claim(
                 kind="body",
                 raw_sha256=body_reference["raw_sha256"],
@@ -5136,20 +5017,13 @@ class SolidWorksBackend(CadBackend):
                 owner={"kind": "body", **base},
                 base=base,
             )
-        else:
-            identity_sha256 = native_scope_identity_sha256(body_identity)
-            registry.claim_scope(
-                kind="body",
-                raw_sha256=body_reference["raw_sha256"],
-                identity_sha256=identity_sha256,
-                owner={"kind": "body", **base},
-                base=base,
+        if body_faces is None:
+            faces = call(
+                "IBody2.GetFaces",
+                lambda: _as_list(_member(body, "GetFaces")),
             )
-            body_reference["typed_sha256"] = identity_sha256
-        faces = call(
-            "IBody2.GetFaces",
-            lambda: _as_list(_member(body, "GetFaces")),
-        )
+        else:
+            faces = list(body_faces)
         edges = call(
             "IBody2.GetEdges",
             lambda: _as_list(_member(body, "GetEdges")),
@@ -5193,41 +5067,48 @@ class SolidWorksBackend(CadBackend):
             ("edge", "IEdge", edge_rows),
         ):
             for row in rows:
-                owner = call(
-                    f"{interface_name}.GetBody",
-                    lambda value=row["object"]: _interface(
-                        _dynamic(_method(value, "GetBody")),
-                        IBODY2_IID,
-                    ),
-                    **{f"{kind}_index": row["index"]},
-                )
-                if owner is None:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        f"{kind} has no owning IBody2",
-                        {**base, f"{kind}_index": row["index"]},
+                if body_owner_prebound:
+                    owner_reference = body_reference
+                else:
+                    owner = call(
+                        f"{interface_name}.GetBody",
+                        lambda value=row["object"]: _interface(
+                            _dynamic(_method(value, "GetBody")),
+                            IBODY2_IID,
+                        ),
+                        **{f"{kind}_index": row["index"]},
                     )
-                owner_reference = persistent(
-                    owner,
-                    "body",
-                    audit=False,
-                    owner_of=kind,
-                    **{f"{kind}_index": row["index"]},
-                )
-                if (
-                    owner_reference["raw_sha256"]
-                    != body_reference["raw_sha256"]
-                ):
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        f"{kind} belongs to a body other than the captured body",
-                        {
-                            **base,
-                            f"{kind}_index": row["index"],
-                            "body_reference_sha256": body_reference["typed_sha256"],
-                            "owner_reference_sha256": owner_reference["typed_sha256"],
-                        },
+                    if owner is None:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            f"{kind} has no owning IBody2",
+                            {**base, f"{kind}_index": row["index"]},
+                        )
+                    owner_reference = persistent(
+                        owner,
+                        "body",
+                        audit=False,
+                        owner_of=kind,
+                        **{f"{kind}_index": row["index"]},
                     )
+                    if (
+                        owner_reference["raw_sha256"]
+                        != body_reference["raw_sha256"]
+                    ):
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            f"{kind} belongs to a body other than the captured body",
+                            {
+                                **base,
+                                f"{kind}_index": row["index"],
+                                "body_reference_sha256": body_reference[
+                                    "typed_sha256"
+                                ],
+                                "owner_reference_sha256": owner_reference[
+                                    "typed_sha256"
+                                ],
+                            },
+                        )
                 row["owner_body_reference"] = owner_reference
 
         for edge_row in edge_rows:
@@ -7130,17 +7011,7 @@ class SolidWorksBackend(CadBackend):
             "itessellation_body": {
                 "body_type": body_type,
                 "body_index": body_index,
-                "body_name": body_name,
                 "body_reference_sha256": body_reference["typed_sha256"],
-                "native_body_reference_sha256": body_reference[
-                    "raw_sha256"
-                ],
-                "body_identity_mode": (
-                    NATIVE_SCOPE_IDENTITY_RULE
-                    if body_identity is not None
-                    else NATIVE_PERSISTENT_IDENTITY_RULE
-                ),
-                "body_identity": body_identity,
                 "tessellate_result": tessellate_result,
                 "request": tessellation_request,
                 "properties": tessellation_properties,
@@ -7299,265 +7170,6 @@ class SolidWorksBackend(CadBackend):
             ),
         }
 
-    def _scope_body_witness_from_part(
-        self,
-        component,
-        body_type,
-        body_index,
-        body,
-        faces,
-        extension,
-        part_body,
-        part_body_index,
-        part_extension,
-        source_document_sha256,
-        referenced_configuration,
-    ):
-        """Map one component body to a part body inside one config window."""
-
-        body_name = str(_member(body, "Name") or "")
-        if str(_member(part_body, "Name") or "") != body_name:
-            raise ValueError("the frozen part body name differs")
-        part_body_reference_sha256 = _persistent_reference_sha256(
-            part_extension,
-            part_body,
-        )
-        part_faces = _as_list(_member(part_body, "GetFaces"))
-        if len(part_faces) != len(faces):
-            raise ValueError("the frozen part face count differs")
-        component_face_rows = _scope_face_rows(faces, extension)
-        part_face_rows = _scope_face_rows(part_faces, part_extension)
-        face_map = _scope_bijection(component_face_rows, part_face_rows)
-        face_index_map = {
-            row["mapping_index"]: face_map[row["mapping_key"]]
-            for row in component_face_rows
-        }
-        component_edge_rows = _scope_edge_rows(
-            body,
-            extension,
-            component_face_rows,
-        )
-        part_edge_rows = _scope_edge_rows(
-            part_body,
-            part_extension,
-            part_face_rows,
-        )
-        for row in component_edge_rows:
-            row["mapping_index"] = row["edge_index"]
-            row["mapping_key"] = _scope_edge_mapping_key(
-                row,
-                sorted(
-                    face_index_map[face_index]
-                    for face_index in row["face_indices"]
-                ),
-            )
-        for row in part_edge_rows:
-            row["mapping_index"] = row["edge_index"]
-            row["mapping_key"] = _scope_edge_mapping_key(
-                row,
-                row["face_indices"],
-            )
-        edge_map = _scope_bijection(component_edge_rows, part_edge_rows)
-        edge_index_map = {
-            row["mapping_index"]: edge_map[row["mapping_key"]]
-            for row in component_edge_rows
-        }
-        component_vertex_rows = _scope_vertex_rows(
-            component_edge_rows,
-            edge_index_map,
-        )
-        part_vertex_rows = _scope_vertex_rows(part_edge_rows)
-        vertex_map = _scope_bijection(
-            component_vertex_rows,
-            part_vertex_rows,
-        )
-        vertex_index_map = {
-            row["mapping_index"]: vertex_map[row["mapping_key"]]
-            for row in component_vertex_rows
-        }
-        if (
-            len({
-                row["reference_sha256"] for row in part_face_rows
-            })
-            != len(part_face_rows)
-            or len({
-                row["reference_sha256"] for row in part_edge_rows
-            })
-            != len(part_edge_rows)
-            or len({
-                row["reference_sha256"] for row in part_vertex_rows
-            })
-            != len(part_vertex_rows)
-        ):
-            raise ValueError(
-                "the frozen part witness references are not unique"
-            )
-        mappings = {
-            "faces": _scope_mapping_rows(face_index_map, part_face_rows),
-            "edges": _scope_mapping_rows(edge_index_map, part_edge_rows),
-            "vertices": _scope_mapping_rows(
-                vertex_index_map,
-                part_vertex_rows,
-            ),
-        }
-        witness = {
-            "part_document_sha256": source_document_sha256,
-            "part_body_reference_sha256": part_body_reference_sha256,
-            "part_body_index": part_body_index,
-            "part_body_name": body_name,
-            **mappings,
-        }
-        witness["topology_signature_sha256"] = (
-            _body_scope_topology_signature(witness)
-        )
-        self.notes[
-            f"scope_witness:{component}:{body_type}:{body_index}"
-        ] = {
-            "source_document_sha256": source_document_sha256,
-            "referenced_configuration": referenced_configuration,
-            "component_body_name": body_name,
-            "face_count": len(face_index_map),
-            "edge_count": len(edge_index_map),
-            "vertex_count": len(vertex_index_map),
-            "body_type": body_type,
-            "part_body_index": part_body_index,
-            "part_body_reference_sha256": part_body_reference_sha256,
-            "topology_signature_sha256": witness[
-                "topology_signature_sha256"
-            ],
-            "status": "bidirectional_one_to_one",
-            "document_ownership": "existing_owned_session_no_close",
-        }
-        return {
-            "body": witness,
-            "face": {
-                component_index: {
-                    "part_document_sha256": source_document_sha256,
-                    "part_body_reference_sha256":
-                        part_body_reference_sha256,
-                    "face_index": part_index,
-                    "persistent_reference_sha256": part_face_rows[
-                        part_index
-                    ]["reference_sha256"],
-                }
-                for component_index, part_index in face_index_map.items()
-            },
-            "edge": {
-                component_index: {
-                    "part_document_sha256": source_document_sha256,
-                    "part_body_reference_sha256":
-                        part_body_reference_sha256,
-                    "edge_index": part_index,
-                    "persistent_reference_sha256": part_edge_rows[
-                        part_index
-                    ]["reference_sha256"],
-                }
-                for component_index, part_index in edge_index_map.items()
-            },
-            "vertex": {
-                component_index: {
-                    "part_document_sha256": source_document_sha256,
-                    "part_body_reference_sha256":
-                        part_body_reference_sha256,
-                    "vertex_index": part_index,
-                    "persistent_reference_sha256": part_vertex_rows[
-                        part_index
-                    ]["reference_sha256"],
-                }
-                for component_index, part_index in vertex_index_map.items()
-            },
-        }
-
-    def _scope_witnesses_for_bodies(
-        self,
-        component,
-        body_type,
-        rows,
-    ):
-        """Resolve a complete body set inside one referenced-config window."""
-
-        document_key = self._source_components[component][0]
-        source_path = self._source_documents[document_key][0]
-        component_doc = self._captured_document(
-            document_key,
-            component,
-            "scope_witness",
-        )
-        extension = _member(component_doc, "Extension")
-        referenced_configuration = self._source_components[component][1]
-        source_sha256_before = _hash(source_path)
-        witnesses = {}
-        try:
-            with _temporary_configuration(
-                lambda: component_doc,
-                referenced_configuration,
-                component,
-            ) as (part_doc, _previous):
-                part_extension = _member(part_doc, "Extension")
-                part_bodies = defaultdict(list)
-                for part_index, candidate in enumerate(
-                    _part_bodies(part_doc, body_type)
-                ):
-                    candidate = _dynamic(candidate)
-                    body_name = _member(candidate, "Name")
-                    if (
-                        not isinstance(body_name, str)
-                        or not body_name.strip()
-                    ):
-                        raise ValueError(
-                            "the frozen part has a body without a stable name"
-                        )
-                    part_bodies[body_name].append(
-                        (part_index, candidate)
-                    )
-                if any(len(items) != 1 for items in part_bodies.values()):
-                    raise ValueError(
-                        "the frozen part body names are not unique"
-                    )
-                for row in rows:
-                    matches = part_bodies.get(row["body_name"], [])
-                    if len(matches) != 1:
-                        raise ValueError(
-                            "the frozen part body is missing or ambiguous"
-                        )
-                    part_body_index, part_body = matches[0]
-                    witnesses[row["body_index"]] = (
-                        self._scope_body_witness_from_part(
-                            component,
-                            body_type,
-                            row["body_index"],
-                            row["body"],
-                            row["faces"],
-                            extension,
-                            part_body,
-                            part_body_index,
-                            part_extension,
-                            source_sha256_before,
-                            referenced_configuration,
-                        )
-                    )
-        except Exception as error:  # noqa: BLE001
-            raise CadError(
-                "cad_scope_witness_mapping_invalid",
-                "the frozen part witness set could not be bound one-to-one",
-                {
-                    "component": component,
-                    "body_type": body_type,
-                    "error": str(error)[:300],
-                },
-            ) from error
-        source_sha256_after = _hash(source_path)
-        if source_sha256_before != source_sha256_after:
-            raise CadError(
-                "cad_source_changed",
-                "the frozen part changed during scope witness capture",
-                {
-                    "component": component,
-                    "source_path": source_path,
-                },
-            )
-        return witnesses
-
     def _scope_witnesses_for_body(
         self,
         component,
@@ -7577,19 +7189,207 @@ class SolidWorksBackend(CadBackend):
                 body,
                 faces,
             )
-        body_name = str(_member(body, "Name") or "")
-        return self._scope_witnesses_for_bodies(
+        document_key = self._source_components[component][0]
+        source_path = self._source_documents[document_key][0]
+        component_doc = self._captured_document(
+            document_key,
             component,
-            body_type,
-            [
-                {
-                    "body_index": body_index,
-                    "body_name": body_name,
-                    "body": body,
-                    "faces": faces,
+            "scope_witness",
+        )
+        extension = _member(component_doc, "Extension")
+
+        source_sha256_before = _hash(source_path)
+        referenced_configuration = self._source_components[component][1]
+        body_name = str(_member(body, "Name") or "")
+        try:
+            with _temporary_configuration(
+                lambda: component_doc,
+                referenced_configuration,
+                component,
+            ) as (part_doc, _previous):
+                part_extension = _member(part_doc, "Extension")
+                part_bodies = [
+                    candidate
+                    for candidate in _part_bodies(part_doc, body_type)
+                    if str(_member(candidate, "Name") or "") == body_name
+                ]
+                if len(part_bodies) != 1:
+                    raise ValueError(
+                        "the frozen part body is missing or ambiguous"
+                    )
+                part_body = _dynamic(part_bodies[0])
+                part_body_reference_sha256 = (
+                    _persistent_reference_sha256(
+                        part_extension,
+                        part_body,
+                    )
+                )
+                part_faces = _as_list(_member(part_body, "GetFaces"))
+                if len(part_faces) != len(faces):
+                    raise ValueError(
+                        "the frozen part face count differs"
+                    )
+
+                component_face_rows = _scope_face_rows(
+                    faces,
+                    extension,
+                )
+                part_face_rows = _scope_face_rows(
+                    part_faces,
+                    part_extension,
+                )
+                face_map = _scope_bijection(
+                    component_face_rows,
+                    part_face_rows,
+                )
+                face_index_map = {
+                    row["mapping_index"]: face_map[row["mapping_key"]]
+                    for row in component_face_rows
                 }
-            ],
-        )[body_index]
+
+                component_edge_rows = _scope_edge_rows(
+                    body,
+                    extension,
+                    component_face_rows,
+                )
+                part_edge_rows = _scope_edge_rows(
+                    part_body,
+                    part_extension,
+                    part_face_rows,
+                )
+                for row in component_edge_rows:
+                    row["mapping_index"] = row["edge_index"]
+                    row["mapping_key"] = _scope_edge_mapping_key(
+                        row,
+                        sorted(
+                            face_index_map[face_index]
+                            for face_index in row["face_indices"]
+                        ),
+                    )
+                for row in part_edge_rows:
+                    row["mapping_index"] = row["edge_index"]
+                    row["mapping_key"] = _scope_edge_mapping_key(
+                        row,
+                        row["face_indices"],
+                    )
+                edge_map = _scope_bijection(
+                    component_edge_rows,
+                    part_edge_rows,
+                )
+                edge_index_map = {
+                    row["mapping_index"]: edge_map[row["mapping_key"]]
+                    for row in component_edge_rows
+                }
+                component_vertex_rows = _scope_vertex_rows(
+                    component_edge_rows,
+                    edge_index_map,
+                )
+                part_vertex_rows = _scope_vertex_rows(part_edge_rows)
+                vertex_map = _scope_bijection(
+                    component_vertex_rows,
+                    part_vertex_rows,
+                )
+                vertex_index_map = {
+                    row["mapping_index"]: vertex_map[row["mapping_key"]]
+                    for row in component_vertex_rows
+                }
+
+                if (
+                    len({
+                        row["reference_sha256"]
+                        for row in part_face_rows
+                    })
+                    != len(part_face_rows)
+                    or len({
+                        row["reference_sha256"]
+                        for row in part_edge_rows
+                    })
+                    != len(part_edge_rows)
+                    or len({
+                        row["reference_sha256"]
+                        for row in part_vertex_rows
+                    })
+                    != len(part_vertex_rows)
+                ):
+                    raise ValueError(
+                        "the frozen part witness references are not unique"
+                    )
+        except Exception as error:
+            raise CadError(
+                "cad_scope_witness_mapping_invalid",
+                "the frozen part witness could not be bound one-to-one",
+                {
+                    "component": component,
+                    "body_type": body_type,
+                    "body_index": body_index,
+                    "error": str(error)[:300],
+                },
+            ) from error
+        source_sha256_after = _hash(source_path)
+        if source_sha256_before != source_sha256_after:
+            raise CadError(
+                "cad_source_changed",
+                "the frozen part changed during scope witness capture",
+                {
+                    "component": component,
+                    "source_path": source_path,
+                },
+            )
+
+        witnesses = {
+            "face": {
+                component_index: {
+                    "part_document_sha256": source_sha256_after,
+                    "part_body_reference_sha256":
+                        part_body_reference_sha256,
+                    "face_index": part_index,
+                    "persistent_reference_sha256": part_face_rows[
+                        part_index
+                    ]["reference_sha256"],
+                }
+                for component_index, part_index in face_index_map.items()
+            },
+            "edge": {
+                component_index: {
+                    "part_document_sha256": source_sha256_after,
+                    "part_body_reference_sha256":
+                        part_body_reference_sha256,
+                    "edge_index": part_index,
+                    "persistent_reference_sha256": part_edge_rows[
+                        part_index
+                    ]["reference_sha256"],
+                }
+                for component_index, part_index in edge_index_map.items()
+            },
+            "vertex": {
+                component_index: {
+                    "part_document_sha256": source_sha256_after,
+                    "part_body_reference_sha256":
+                        part_body_reference_sha256,
+                    "vertex_index": part_index,
+                    "persistent_reference_sha256": part_vertex_rows[
+                        part_index
+                    ]["reference_sha256"],
+                }
+                for component_index, part_index in vertex_index_map.items()
+            },
+        }
+        self.notes[
+            f"scope_witness:{component}:{body_type}:{body_index}"
+        ] = {
+            "source_document": normalize_document_path(
+                os.path.abspath(source_path)
+            ),
+            "source_document_sha256": source_sha256_after,
+            "referenced_configuration": referenced_configuration,
+            "component_body_name": body_name,
+            "face_count": len(face_index_map),
+            "edge_count": len(edge_index_map),
+            "vertex_count": len(vertex_index_map),
+            "status": "bidirectional_one_to_one",
+            "document_ownership": "existing_owned_session_no_close",
+        }
+        return witnesses
 
     def _body_face_triangles(
         self,
@@ -7671,192 +7471,129 @@ class SolidWorksBackend(CadBackend):
                 ][1],
             }
 
-        def raw_reference_sha256(entity, *, context):
-            try:
-                raw = bytes(
-                    int(value) & 0xFF
-                    for value in _member(extension, "GetPersistReference3", entity)
-                )
-            except Exception as error:  # noqa: BLE001
-                raise CadError(
-                    "cad_persistent_reference_unavailable",
-                    "a native topology object has no persistent identity",
-                    {**context, "error": str(error)[:300]},
-                ) from error
-            if not raw:
-                raise CadError(
-                    "cad_persistent_reference_unavailable",
-                    "a native topology object has an empty persistent identity",
-                    context,
-                )
-            return hashlib.sha256(raw).hexdigest()
-
-        body_rows = []
-        for body_index, raw_body in enumerate(bodies):
-            body = _dynamic(raw_body)
-            context = {
-                "component": component,
-                "body_type": body_type,
-                "body_index": body_index,
-            }
-            try:
-                body_name = _member(body, "Name")
-                raw_reference = _persistent_reference_bytes(
-                    extension,
-                    body,
-                )
-            except Exception as error:  # noqa: BLE001
-                raise CadError(
-                    "cad_persistent_reference_unavailable",
-                    "a native body has no readable persistent identity",
-                    {**context, "error": str(error)[:300]},
-                ) from error
-            if not isinstance(body_name, str) or not body_name.strip():
-                raise CadError(
-                    "cad_body_identity_unreadable",
-                    "a native body has no stable name",
-                    context,
-                )
-            if not raw_reference:
-                raise CadError(
-                    "cad_persistent_reference_unavailable",
-                    "a native body has an empty persistent identity",
-                    context,
-                )
-            try:
-                faces = _as_list(_member(body, "GetFaces"))
-            except Exception as error:  # noqa: BLE001
-                raise CadError(
-                    "cad_body_faces_unreadable",
-                    "the occurrence body's faces could not be read",
-                    {**context, "api": "IBody2.GetFaces", "error": str(error)},
-                ) from error
-            if not faces:
-                raise CadError(
-                    "cad_mesh_export_failed",
-                    "a native body carries no faces",
-                    {**context, "api": "IBody2.GetFaces"},
-                )
-            body_rows.append(
-                {
-                    "body": body,
+        def read_body_rows():
+            rows = []
+            for body_index, raw_body in enumerate(bodies):
+                body = _dynamic(raw_body)
+                context = {
+                    "component": component,
+                    "body_type": body_type,
                     "body_index": body_index,
-                    "body_name": body_name,
-                    "object_pointer": _com_object_pointer(body),
-                    "reference": {
-                        "raw": raw_reference,
-                        "raw_sha256": hashlib.sha256(
-                            raw_reference
-                        ).hexdigest(),
-                        "typed_sha256": _typed_reference_sha256(
-                            "body",
-                            raw_reference,
-                        ),
-                    },
-                    "faces": faces,
                 }
-            )
+                try:
+                    body_name = _member(body, "Name")
+                    raw_reference = _persistent_reference_bytes(
+                        extension,
+                        body,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    raise CadError(
+                        "cad_persistent_reference_unavailable",
+                        "a native body has no readable persistent identity",
+                        {**context, "error": str(error)[:300]},
+                    ) from error
+                if (
+                    not isinstance(body_name, str)
+                    or not body_name.strip()
+                ):
+                    raise CadError(
+                        "cad_body_identity_unreadable",
+                        "a native body has no stable name",
+                        context,
+                    )
+                if not raw_reference:
+                    raise CadError(
+                        "cad_persistent_reference_unavailable",
+                        "a native body has an empty persistent identity",
+                        context,
+                    )
+                try:
+                    faces = _as_list(_member(body, "GetFaces"))
+                except Exception as error:  # noqa: BLE001
+                    raise CadError(
+                        "cad_body_faces_unreadable",
+                        "the occurrence body's faces could not be read",
+                        {
+                            **context,
+                            "api": "IBody2.GetFaces",
+                            "error": str(error),
+                        },
+                    ) from error
+                if not faces:
+                    raise CadError(
+                        "cad_mesh_export_failed",
+                        "a native body carries no faces",
+                        {**context, "api": "IBody2.GetFaces"},
+                    )
+                rows.append(
+                    {
+                        "body": body,
+                        "body_index": body_index,
+                        "body_name": body_name,
+                        "object_pointer": _com_object_pointer(body),
+                        "reference": {
+                            "raw": raw_reference,
+                            "raw_sha256": hashlib.sha256(
+                                raw_reference
+                            ).hexdigest(),
+                            "typed_sha256": _typed_reference_sha256(
+                                "body",
+                                raw_reference,
+                            ),
+                        },
+                        "faces": faces,
+                    }
+                )
+            return rows
 
-        raw_body_references = {
+        body_rows = read_body_rows()
+        replay_rows = read_body_rows()
+        for row, replay in zip(body_rows, replay_rows, strict=True):
+            if (
+                row["body_index"] != replay["body_index"]
+                or row["body_name"] != replay["body_name"]
+                or row["object_pointer"] != replay["object_pointer"]
+                or len(row["faces"]) != len(replay["faces"])
+                or row["reference"]["raw_sha256"]
+                != replay["reference"]["raw_sha256"]
+                or row["reference"]["typed_sha256"]
+                != replay["reference"]["typed_sha256"]
+            ):
+                raise CadError(
+                    "cad_body_identity_changed",
+                    "the complete native body identity set is not stable",
+                    {
+                        "component": component,
+                        "body_type": body_type,
+                        "body_index": row["body_index"],
+                        "body_name": row["body_name"],
+                        "first_reference_sha256": row["reference"][
+                            "raw_sha256"
+                        ],
+                        "replay_reference_sha256": replay["reference"][
+                            "raw_sha256"
+                        ],
+                    },
+                )
+        raw_body_references = [
             row["reference"]["raw_sha256"] for row in body_rows
-        }
-        try:
-            body_identity_mode = _body_reference_identity_mode(
-                [
-                    row["reference"]["raw_sha256"]
-                    for row in body_rows
-                ]
-            )
-        except ValueError as error:
+        ]
+        if len(set(raw_body_references)) != len(raw_body_references):
             raise CadError(
                 "cad_persistent_reference_alias",
-                str(error),
+                "a persistent body identity is not unique",
                 {
                     "component": component,
                     "body_type": body_type,
-                    "reference_sha256": sorted(raw_body_references),
+                    "reference_sha256": raw_body_references,
                 },
-            ) from error
-        body_aliased = body_identity_mode == NATIVE_SCOPE_IDENTITY_RULE
-        body_scope_identities = {}
-        body_witnesses = {}
-        if body_aliased:
-            base = {"component": component, "body_type": body_type}
-            _require_scope_owner(scope_context or {}, base)
-            if (
-                len({row["body_name"] for row in body_rows})
-                != len(body_rows)
-                or len({row["object_pointer"] for row in body_rows})
-                != len(body_rows)
-            ):
-                raise CadError(
-                    "cad_scope_identity_ambiguous",
-                    "aliased native bodies do not have unique names and COM objects",
-                    base,
-                )
-            body_witnesses = self._scope_witnesses_for_bodies(
-                component,
-                body_type,
-                body_rows,
             )
-            for row in body_rows:
-                witness = body_witnesses[row["body_index"]]["body"]
-                if (
-                    witness["part_document_sha256"]
-                    != scope_context["source_document_sha256"]
-                    or witness["part_body_name"]
-                    != row["body_name"]
-                ):
-                    raise CadError(
-                        "cad_scope_witness_mapping_invalid",
-                        "an aliased native body has no complete frozen-part witness",
-                        {
-                            **base,
-                            "body_index": row["body_index"],
-                            "body_name": row["body_name"],
-                        },
-                    )
-            if not _part_body_witnesses_are_unique(
-                [
-                    witnesses["body"]
-                    for witnesses in body_witnesses.values()
-                ]
-            ):
-                raise CadError(
-                    "cad_scope_identity_ambiguous",
-                    "aliased native bodies reuse a frozen part body witness",
-                    base,
-                )
-            scope_identity_sha256s = set()
-            for row in body_rows:
-                witness = body_witnesses[row["body_index"]]["body"]
-                identity = _body_scope_identity(
-                    owner_scope=scope_context,
-                    body_type=body_type,
-                    body_index=row["body_index"],
-                    body_name=row["body_name"],
-                    body_reference_sha256=row["reference"]["raw_sha256"],
-                    witness=witness,
-                )
-                identity_sha256 = native_scope_identity_sha256(identity)
-                if identity_sha256 in scope_identity_sha256s:
-                    raise CadError(
-                        "cad_scope_identity_ambiguous",
-                        "aliased native body identities are not unique",
-                        {
-                            **base,
-                            "body_index": row["body_index"],
-                        },
-                    )
-                scope_identity_sha256s.add(identity_sha256)
-                body_scope_identities[row["body_index"]] = identity
 
         for row in body_rows:
             body = row["body"]
             body_index = row["body_index"]
             body_name = row["body_name"]
             faces = row["faces"]
-            body_identity = body_scope_identities.get(body_index)
             context = {
                 "component": component,
                 "body_type": body_type,
@@ -7870,11 +7607,7 @@ class SolidWorksBackend(CadBackend):
                 body_index=body_index,
                 body=body,
                 faces=faces,
-                body_witnesses=body_witnesses,
-                body_identity=body_identity,
             ):
-                if body_identity is not None:
-                    return body_witnesses[body_index]
                 return self._scope_witnesses_for_body(
                     component,
                     body_type,
@@ -7896,7 +7629,8 @@ class SolidWorksBackend(CadBackend):
                 body_reference={
                     **row["reference"],
                 },
-                body_identity=body_identity,
+                body_faces=faces,
+                body_owner_prebound=True,
             )
             for key, value in graph["u_observation_stats"].items():
                 evidence["u_observation_stats"][key] += value
@@ -8012,18 +7746,6 @@ class SolidWorksBackend(CadBackend):
             evidence["solidworks_vertex_identities"].extend(
                 graph["solidworks_vertex_identities"]
             )
-            if (
-                raw_reference_sha256(
-                    body,
-                    context={**context, "identity_kind": "body"},
-                )
-                != graph["body_reference"]["raw_sha256"]
-            ):
-                raise CadError(
-                    "cad_body_identity_changed",
-                    "the native body identity changed during tessellation",
-                    context,
-                )
         evidence["native_edges"].sort(
             key=lambda row: (
                 row["body_type"],

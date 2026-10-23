@@ -11,7 +11,7 @@ import struct
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,13 +27,9 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
 )
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
     _NativeReferenceRegistry,
-    _body_reference_identity_mode,
-    _body_scope_identity,
-    _body_scope_topology_signature,
     _com_object_identity,
     _fin_edge_row_map,
     _group_vertex_observations,
-    _part_body_witnesses_are_unique,
     _scope_bijection,
     _scope_edge_rows,
     _scope_edge_mapping_key,
@@ -44,10 +40,7 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_COLLAPSED_U_FIN_RULE,
-    NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_SCOPE_MAPPING_METHOD,
-    NATIVE_SCOPE_IDENTITY_RULE,
-    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
     NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
@@ -155,123 +148,6 @@ def fake_read_end_params(curve):
         }
     )
     return result
-
-
-def body_alias_fixture():
-    """Build the two-sheet-body collision shape reproduced by the real E2E."""
-
-    source_document = "a" * 64
-    raw_body_alias = hashlib.sha256(b"component-body-alias").hexdigest()
-    owner_scope = {
-        "occurrence": "part-1",
-        "source_document_path": "C:/fixture.SLDPRT",
-        "source_document_sha256": source_document,
-        "source_document_identity_sha256": source_document,
-        "source_document_identity_kind": "file_sha256",
-        "active_configuration": "Default",
-        "referenced_configuration": "Default",
-    }
-    body_identities = {}
-    spans = []
-    for body_index in range(2):
-        witness = {
-            "part_document_sha256": source_document,
-            "part_body_reference_sha256": hashlib.sha256(
-                f"part-body-reference-{body_index}".encode()
-            ).hexdigest(),
-            "part_body_index": body_index,
-            "part_body_name": f"BODY-{body_index}",
-            "faces": [
-                {
-                    "component_index": 0,
-                    "source_index": 0,
-                    "source_reference_sha256": hashlib.sha256(
-                        f"part-face-{body_index}".encode()
-                    ).hexdigest(),
-                }
-            ],
-            "edges": [],
-            "vertices": [],
-        }
-        witness["topology_signature_sha256"] = (
-            _body_scope_topology_signature(witness)
-        )
-        identity = _body_scope_identity(
-            owner_scope=owner_scope,
-            body_type=1,
-            body_index=body_index,
-            body_name=f"BODY-{body_index}",
-            body_reference_sha256=raw_body_alias,
-            witness=witness,
-        )
-        body_identities[(1, body_index)] = identity
-        spans.append(
-            {
-                "body_type": 1,
-                "body_index": body_index,
-                "body_name": f"BODY-{body_index}",
-                "body_reference_sha256": native_scope_identity_sha256(
-                    identity
-                ),
-                "native_body_reference_sha256": raw_body_alias,
-                "face_index": 0,
-                "face_reference_sha256": hashlib.sha256(
-                    f"face-{body_index}".encode()
-                ).hexdigest(),
-                "face_owner_id": body_index + 1,
-                "edge_references": [],
-                "triangle_start": body_index,
-                "triangle_count": 1,
-                "triangle_records_sha256": "0" * 64,
-            }
-        )
-    return support.native_tessellation_fixture(
-        spans,
-        [],
-        body_identities=body_identities,
-    )
-
-
-def rebind_body_identity(tessellation, body_index):
-    """Recompute the effective body digest after one intentional mutation."""
-
-    body = next(
-        row
-        for row in tessellation["itessellation"]["bodies"]
-        if row["body_type"] == 1 and row["body_index"] == body_index
-    )
-    identity = body["body_identity"]
-    identity["owner_scope_key"] = _scope_owner_key(
-        {
-            "occurrence": identity["occurrence_scope"],
-            "source_document_sha256": identity["source_document_sha256"],
-            "source_document_identity_sha256": identity[
-                "source_document_sha256"
-            ],
-            "source_document_identity_kind": "file_sha256",
-            "referenced_configuration": identity[
-                "referenced_configuration"
-            ],
-            "active_configuration": identity["referenced_configuration"],
-            "source_document_path": "C:/fixture.SLDPRT",
-        },
-        body_type=identity["body_type"],
-        body_index=identity["body_index"],
-        body_name=identity["body_name"],
-    )
-    identity["topology_signature_sha256"] = native_scope_identity_sha256(
-        {
-            "faces": identity["mapped_source_faces"],
-            "edges": identity["mapped_source_edges"],
-            "vertices": identity["mapped_source_vertices"],
-        }
-    )
-    digest = native_scope_identity_sha256(identity)
-    body["body_reference_sha256"] = digest
-    for span in tessellation["face_spans"]:
-        if (span["body_type"], span["body_index"]) == (1, body_index):
-            span["body_reference_sha256"] = digest
-    return body
 
 
 class FakeExtension:
@@ -698,6 +574,100 @@ class NativeFinCaptureTests(unittest.TestCase):
                 "referenced_configuration": "Default",
             },
         )
+
+    def body_identity_backend(self, source_path, extension):
+        backend = SolidWorksBackend()
+        document_key = object()
+        backend._source_components = {
+            "part-1": (document_key, "Default")
+        }
+        backend._source_documents = {
+            document_key: [source_path, "part", "Default", object()]
+        }
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
+            Extension=extension
+        )
+        return backend
+
+    def test_stable_duplicate_body_references_fail_before_tessellation(self):
+        first, *_ = self.fixture()
+        second, *_ = self.fixture()
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        shared = hashlib.sha256(b"shared-body-reference").digest()
+
+        class DuplicateExtension:
+            def GetPersistReference3(self, _value):  # noqa: N802
+                return list(shared)
+
+        backend = self.body_identity_backend(
+            source_path,
+            DuplicateExtension(),
+        )
+
+        with self.assertRaises(CadError) as caught:
+            backend._body_face_triangles(
+                [first, second],
+                1,
+                "part-1",
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_persistent_reference_alias",
+        )
+
+    def test_body_identity_set_requires_a_stable_complete_replay(self):
+        body, *_ = self.fixture()
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        backend = self.body_identity_backend(
+            source_path,
+            FakeExtension(),
+        )
+
+        with patch.object(
+            native_module,
+            "_persistent_reference_bytes",
+            side_effect=[b"first-pass", b"changed-replay"],
+        ), self.assertRaises(CadError) as caught:
+            backend._body_face_triangles(
+                [body],
+                1,
+                "part-1",
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_body_identity_changed",
+        )
+
+    def test_preclassified_body_reference_is_reused_without_a_late_read(self):
+        body, _face_10, _face_20, _edge, _tessellation, extension = (
+            self.fixture()
+        )
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        backend = self.body_identity_backend(source_path, extension)
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                FakeHolder(body),
+            )
+
+        self.assertEqual(extension.calls.count(body), 2)
 
     def open_boundary_fixture(self):
         body, face_10, _face_20, edge, tessellation, extension = self.fixture()
@@ -3801,417 +3771,6 @@ class NativeFinCaptureTests(unittest.TestCase):
                 base={"component": "part-1"},
             )
         self.assertEqual(caught.exception.code, "cad_scope_identity_alias")
-
-    def test_body_reference_mode_requires_a_complete_alias_or_unique_set(self):
-        unique = [hashlib.sha256(f"body-{index}".encode()).hexdigest() for index in range(3)]
-        aliased = [hashlib.sha256(b"body-alias").hexdigest()] * 3
-        mixed = [aliased[0], aliased[0], unique[2]]
-
-        self.assertEqual(
-            _body_reference_identity_mode(unique),
-            NATIVE_PERSISTENT_IDENTITY_RULE,
-        )
-        self.assertEqual(
-            _body_reference_identity_mode(aliased),
-            NATIVE_SCOPE_IDENTITY_RULE,
-        )
-        with self.assertRaisesRegex(ValueError, "mix aliased"):
-            _body_reference_identity_mode(mixed)
-        with self.assertRaisesRegex(ValueError, "missing or malformed"):
-            _body_reference_identity_mode([])
-
-    def test_body_scope_identity_binds_the_unique_part_body_witness(self):
-        owner_scope = {
-            "occurrence": "part-1",
-            "source_document_path": "C:/fixture.SLDPRT",
-            "source_document_sha256": "a" * 64,
-            "source_document_identity_sha256": "a" * 64,
-            "source_document_identity_kind": "file_sha256",
-            "active_configuration": "Default",
-            "referenced_configuration": "Default",
-        }
-        raw_body = hashlib.sha256(b"component-body-alias").hexdigest()
-        identities = []
-        for body_index in range(2):
-            witness = {
-                "part_document_sha256": "a" * 64,
-                "part_body_reference_sha256": hashlib.sha256(
-                    f"part-body-{body_index}".encode()
-                ).hexdigest(),
-                "part_body_index": body_index,
-                "part_body_name": f"BODY-{body_index}",
-                "faces": [
-                    {
-                        "component_index": 0,
-                        "source_index": body_index,
-                        "source_reference_sha256": hashlib.sha256(
-                            f"part-face-{body_index}".encode()
-                        ).hexdigest(),
-                    }
-                ],
-                "edges": [],
-                "vertices": [],
-            }
-            witness["topology_signature_sha256"] = (
-                _body_scope_topology_signature(witness)
-            )
-            identity = _body_scope_identity(
-                owner_scope=owner_scope,
-                body_type=1,
-                body_index=body_index,
-                body_name=f"BODY-{body_index}",
-                body_reference_sha256=raw_body,
-                witness=witness,
-            )
-            identities.append((identity, native_scope_identity_sha256(identity)))
-
-        self.assertNotEqual(identities[0][1], identities[1][1])
-        self.assertTrue(
-            all(identity["persistent"] is False for identity, _ in identities)
-        )
-        self.assertTrue(
-            all(identity["entity_kind"] == "body" for identity, _ in identities)
-        )
-        self.assertEqual(
-            {identity["native_body_reference_sha256"] for identity, _ in identities},
-            {raw_body},
-        )
-
-    def test_part_body_witness_requires_unique_persistent_references(self):
-        shared_reference = hashlib.sha256(b"shared-part-body").hexdigest()
-        unique = [
-            {
-                "part_body_index": index,
-                "part_body_reference_sha256": hashlib.sha256(
-                    f"unique-part-body-{index}".encode()
-                ).hexdigest(),
-                "part_body_name": f"BODY-{index}",
-                "topology_signature_sha256": hashlib.sha256(
-                    f"topology-{index}".encode()
-                ).hexdigest(),
-            }
-            for index in range(2)
-        ]
-        duplicate = [
-            {
-                "part_body_index": index,
-                "part_body_reference_sha256": shared_reference,
-                "part_body_name": "BODY",
-                "topology_signature_sha256": "1" * 64,
-            }
-            for index in range(2)
-        ]
-
-        self.assertTrue(_part_body_witnesses_are_unique(unique))
-        self.assertFalse(_part_body_witnesses_are_unique(duplicate))
-
-    def test_parser_accepts_complete_body_alias_scope_with_warnings(self):
-        evidence = body_alias_fixture()
-        warnings = []
-
-        spans = parse_native_tessellation(
-            "part-1",
-            evidence,
-            {"solid": 0, "sheet": 2},
-            2,
-            None,
-            native_identity_warnings=warnings,
-        )
-
-        self.assertEqual(len(spans), 2)
-        bodies = evidence["itessellation"]["bodies"]
-        self.assertEqual(
-            {row["body_identity_mode"] for row in bodies},
-            {NATIVE_SCOPE_IDENTITY_RULE},
-        )
-        self.assertEqual(
-            len({row["body_reference_sha256"] for row in bodies}),
-            2,
-        )
-        self.assertEqual(
-            evidence["itessellation"]["reference_alias_audit"]["body"],
-            [bodies[0]["native_body_reference_sha256"]],
-        )
-        self.assertEqual(len(warnings), 8)
-        for body_index in range(2):
-            group = [
-                row
-                for row in warnings
-                if row["detail"]["entity_kind"] == "body"
-                and row["detail"]["body_index"] == body_index
-            ]
-            self.assertEqual(
-                {row["code"] for row in group},
-                NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-            )
-
-    def test_parser_rejects_mixed_body_reference_modes(self):
-        evidence = copy.deepcopy(body_alias_fixture())
-        body = evidence["itessellation"]["bodies"][1]
-        native_reference = hashlib.sha256(b"distinct-body").hexdigest()
-        body["native_body_reference_sha256"] = native_reference
-        body["body_identity_mode"] = NATIVE_PERSISTENT_IDENTITY_RULE
-        body["body_identity"] = None
-        body["body_reference_sha256"] = hashlib.sha256(
-            b"distinct-body-typed"
-        ).hexdigest()
-        for span in evidence["face_spans"]:
-            if (span["body_type"], span["body_index"]) == (1, 1):
-                span["native_body_reference_sha256"] = native_reference
-                span["body_reference_sha256"] = body[
-                    "body_reference_sha256"
-                ]
-
-        with self.assertRaisesRegex(
-            PipelineError,
-            "identity modes do not match reference reuse",
-        ):
-            parse_native_tessellation(
-                "part-1",
-                evidence,
-                {"solid": 0, "sheet": 2},
-                2,
-                None,
-            )
-
-    def test_parser_rejects_shared_part_reference_after_rehash(self):
-        evidence = copy.deepcopy(body_alias_fixture())
-        shared_reference = hashlib.sha256(
-            b"shared-frozen-part-body-reference"
-        ).hexdigest()
-        for body_index in range(2):
-            identity = evidence["itessellation"]["bodies"][body_index][
-                "body_identity"
-            ]
-            identity[
-                "mapping_source_body_reference_sha256"
-            ] = shared_reference
-            rebind_body_identity(evidence, body_index)
-
-        with self.assertRaisesRegex(
-            PipelineError,
-            "persistent reference|part body",
-        ):
-            parse_native_tessellation(
-                "part-1",
-                evidence,
-                {"solid": 0, "sheet": 2},
-                2,
-                None,
-            )
-
-    def test_parser_rejects_body_scope_witness_reuse_and_mapping_overflow(self):
-        mutations = []
-
-        duplicate_index = copy.deepcopy(body_alias_fixture())
-        identity = duplicate_index["itessellation"]["bodies"][1][
-            "body_identity"
-        ]
-        identity["mapping_source_body_index"] = 0
-        rebind_body_identity(duplicate_index, 1)
-        mutations.append((duplicate_index, "part body index"))
-
-        duplicate_topology = copy.deepcopy(body_alias_fixture())
-        first = duplicate_topology["itessellation"]["bodies"][0][
-            "body_identity"
-        ]
-        second_body = duplicate_topology["itessellation"]["bodies"][1]
-        second = second_body["body_identity"]
-        second["mapped_source_faces"] = copy.deepcopy(
-            first["mapped_source_faces"]
-        )
-        second["topology_signature_sha256"] = first[
-            "topology_signature_sha256"
-        ]
-        rebind_body_identity(duplicate_topology, 1)
-        mutations.append((duplicate_topology, "topology signature"))
-
-        overflow = copy.deepcopy(body_alias_fixture())
-        identity = overflow["itessellation"]["bodies"][1]["body_identity"]
-        identity["mapped_source_faces"].append(
-            {
-                "component_index": 1,
-                "source_index": 1,
-                "source_reference_sha256": "f" * 64,
-            }
-        )
-        rebind_body_identity(overflow, 1)
-        mutations.append((overflow, "mapping"))
-
-        for evidence, message in mutations:
-            with self.subTest(message=message), self.assertRaises(
-                PipelineError
-            ) as caught:
-                parse_native_tessellation(
-                    "part-1",
-                    evidence,
-                    {"solid": 0, "sheet": 2},
-                    2,
-                    None,
-                )
-            self.assertIn(message, str(caught.exception))
-
-    def test_parser_rejects_duplicate_component_body_names_only_for_alias(self):
-        evidence = copy.deepcopy(body_alias_fixture())
-        second_body = evidence["itessellation"]["bodies"][1]
-        identity = second_body["body_identity"]
-        second_body["body_name"] = "BODY-0"
-        identity["body_name"] = "BODY-0"
-        identity["mapping_source_body_name"] = "BODY-0"
-        for span in evidence["face_spans"]:
-            if (span["body_type"], span["body_index"]) == (1, 1):
-                span["body_name"] = "BODY-0"
-        rebind_body_identity(evidence, 1)
-
-        with self.assertRaisesRegex(PipelineError, "names are not unique"):
-            parse_native_tessellation(
-                "part-1",
-                evidence,
-                {"solid": 0, "sheet": 2},
-                2,
-                None,
-            )
-
-    def test_parser_keeps_unique_persistent_bodies_with_shared_name(self):
-        spans = []
-        for body_index in range(2):
-            spans.append(
-                {
-                    "body_type": 1,
-                    "body_index": body_index,
-                    "body_name": "SAME-NAME",
-                    "body_reference_sha256": hashlib.sha256(
-                        f"unique-body-{body_index}".encode()
-                    ).hexdigest(),
-                    "face_index": 0,
-                    "face_reference_sha256": hashlib.sha256(
-                        f"unique-face-{body_index}".encode()
-                    ).hexdigest(),
-                    "face_owner_id": body_index + 1,
-                    "edge_references": [],
-                    "triangle_start": body_index,
-                    "triangle_count": 1,
-                    "triangle_records_sha256": "0" * 64,
-                }
-            )
-        evidence = support.native_tessellation_fixture(spans, [])
-
-        parsed = parse_native_tessellation(
-            "part-1",
-            evidence,
-            {"solid": 0, "sheet": 2},
-            2,
-            None,
-        )
-
-        self.assertEqual(len(parsed), 2)
-        self.assertEqual(
-            {row["body_name"] for row in parsed},
-            {"SAME-NAME"},
-        )
-
-    def test_v6_schema_is_rejected_after_body_identity_schema_bump(self):
-        evidence = body_alias_fixture()
-        evidence["schema_version"] = (
-            "solidworks-to-urdf.native-tessellation/v6"
-        )
-
-        with self.assertRaisesRegex(
-            PipelineError,
-            "unsupported native tessellation schema",
-        ):
-            parse_native_tessellation(
-                "part-1",
-                evidence,
-                {"solid": 0, "sheet": 2},
-                2,
-                None,
-            )
-
-    def test_body_scope_batch_uses_one_referenced_configuration_window(self):
-        temp_root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_root)
-        source_path = temp_root / "fixture.SLDPRT"
-        source_path.write_bytes(b"fixture")
-        part_doc = SimpleNamespace(
-            Extension=object(),
-            GetBodies2=lambda body_type, include_surfaces: [
-                SimpleNamespace(Name=f"BODY-{index}")
-                for index in range(217)
-            ],
-        )
-        component_doc = SimpleNamespace(Extension=object())
-        backend = SolidWorksBackend()
-        backend._source_components = {"part-1": (object(), "Default")}
-        backend._source_documents = {
-            backend._source_components["part-1"][0]: [
-                source_path,
-                "part",
-                "Default",
-                object(),
-            ]
-        }
-        backend._captured_document = lambda *_args, **_kwargs: component_doc
-        active = {"value": False}
-        context_calls = []
-
-        @contextmanager
-        def temporary_configuration(*_args, **_kwargs):
-            context_calls.append("enter")
-            active["value"] = True
-            try:
-                yield part_doc, "Default"
-            finally:
-                active["value"] = False
-
-        def witness_from_part(*args, **_kwargs):
-            self.assertTrue(active["value"])
-            part_body = args[6]
-            part_body_index = args[7]
-            return {
-                "body": {
-                    "part_document_sha256": args[9],
-                    "part_body_reference_sha256": hashlib.sha256(
-                        part_body.Name.encode()
-                    ).hexdigest(),
-                    "part_body_index": part_body_index,
-                    "part_body_name": part_body.Name,
-                    "faces": [],
-                    "edges": [],
-                    "vertices": [],
-                    "topology_signature_sha256": hashlib.sha256(
-                        part_body.Name.encode()
-                    ).hexdigest(),
-                }
-            }
-
-        rows = [
-            {
-                "body_index": index,
-                "body_name": f"BODY-{index}",
-                "body": SimpleNamespace(Name=f"BODY-{index}"),
-                "faces": [],
-            }
-            for index in range(217)
-        ]
-        with patch.object(
-            native_module,
-            "_temporary_configuration",
-            temporary_configuration,
-        ), patch.object(
-            backend,
-            "_scope_body_witness_from_part",
-            side_effect=witness_from_part,
-        ):
-            witnesses = backend._scope_witnesses_for_bodies(
-                "part-1",
-                1,
-                rows,
-            )
-
-        self.assertEqual(context_calls, ["enter"])
-        self.assertEqual(set(witnesses), set(range(217)))
-
     def test_com_object_identity_uses_underlying_dispatch(self):
         native_object = object()
         wrapper_a = SimpleNamespace(_oleobj_=native_object)
@@ -4638,7 +4197,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertEqual(
             set(witnesses),
-            {"body", "face", "edge", "vertex"},
+            {"face", "edge", "vertex"},
         )
         self.assertEqual(
             backend.notes["scope_witness:part-1:0:0"][
