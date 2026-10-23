@@ -727,6 +727,37 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "cad_body_identity_changed",
                 )
 
+    def test_second_enumeration_cannot_mutate_the_first_body_snapshot(self):
+        body, *_ = self.fixture()
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        backend = self.body_identity_backend(
+            source_path,
+            FakeExtension(),
+        )
+
+        class MutatingHolder:
+            def GetBodies2(self, body_type):  # noqa: N802
+                if body_type == 1:
+                    body.Name = "mutated-body"
+                    return [body]
+                return []
+
+        with self.assertRaises(CadError) as caught:
+            backend._body_face_triangles(
+                [body],
+                1,
+                "part-1",
+                body_holder=MutatingHolder(),
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_body_identity_changed",
+        )
+
     def test_preclassified_body_and_owner_references_have_no_late_read(self):
         body, _face_10, _face_20, _edge, _tessellation, extension = (
             self.fixture()

@@ -7512,23 +7512,6 @@ class SolidWorksBackend(CadBackend):
                 ][1],
             }
 
-        replay_bodies = (
-            list(bodies)
-            if body_holder is None
-            else self._body_list(body_holder, body_type, component)
-        )
-        if len(replay_bodies) != len(bodies):
-            raise CadError(
-                "cad_body_identity_changed",
-                "the complete native body identity set changed size",
-                {
-                    "component": component,
-                    "body_type": body_type,
-                    "first_body_count": len(bodies),
-                    "replay_body_count": len(replay_bodies),
-                },
-            )
-
         def read_body_rows(current_bodies):
             rows = []
             for body_index, raw_body in enumerate(current_bodies):
@@ -7667,6 +7650,22 @@ class SolidWorksBackend(CadBackend):
             return rows
 
         body_rows = read_body_rows(bodies)
+        replay_bodies = (
+            list(bodies)
+            if body_holder is None
+            else self._body_list(body_holder, body_type, component)
+        )
+        if len(replay_bodies) != len(bodies):
+            raise CadError(
+                "cad_body_identity_changed",
+                "the complete native body identity set changed size",
+                {
+                    "component": component,
+                    "body_type": body_type,
+                    "first_body_count": len(bodies),
+                    "replay_body_count": len(replay_bodies),
+                },
+            )
         replay_rows = read_body_rows(replay_bodies)
         for row, replay in zip(body_rows, replay_rows, strict=True):
             if (
