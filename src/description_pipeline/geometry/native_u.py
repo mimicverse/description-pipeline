@@ -7,6 +7,7 @@ import json
 import math
 import re
 import struct
+from fractions import Fraction
 
 NATIVE_U_IDENTITY_RULE = "native-u-identity-128ulp-v1"
 NATIVE_U_POINT_PARAMETER_RULE = "native-u-point-parameter-authoritative-v2"
@@ -19,10 +20,70 @@ NATIVE_POINT_ROUNDTRIP_RULE = "native-point-float32-pair-v3"
 NATIVE_CURVE_ENDPOINT_OPERATION_RULE = (
     "native-curve-endpoint-float32-operation-v4"
 )
+NATIVE_TOLERANT_EDGE_BOUNDARY_RULE = (
+    "native-tolerant-edge-boundary-euclidean-v5"
+)
 NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
     "tessellation-edge-projection-v1"
 )
 NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M = 50e-6
+NATIVE_TOLERANT_EDGE_GAP_SOURCE = (
+    "IEdge.IsTolerant(out VARIANT VT_BYREF|VT_R8)"
+)
+NATIVE_TOLERANT_EDGE_GAP_SOURCE_FIELD = (
+    "native_edges[].edge_tolerance.gap_m"
+)
+NATIVE_TOLERANT_EDGE_EVALUATE_METRIC = "max_abs_coordinate"
+NATIVE_TOLERANT_EDGE_PROJECTION_METRIC = "euclidean"
+NATIVE_TOLERANT_EDGE_WARNING_REASON = (
+    "tolerant boundary projection exceeds the binary32 v4 bound "
+    "and uses the native gap"
+)
+NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION = (
+    "native_declared_tolerant_edge;euclidean_projected_endpoint_bound"
+)
+NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS = (
+    "point_tolerance_m",
+    "point_error_m",
+    "point_roundtrip_rule",
+    "tolerant_edge_evidence.evaluate_point_error_m",
+    "projection_to_curve_l2_error_m",
+    "eligible_gap_m",
+    "composed_projection_tolerance_m",
+    "gap_used",
+)
+NATIVE_TOLERANT_EDGE_GAP_WARNING = (
+    "cad_native_tolerant_edge_boundary_projection"
+)
+NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS = frozenset(
+    {
+        "component",
+        "body_type",
+        "body_index",
+        "edge_reference_sha256",
+        "fin_id",
+        "fin_endpoint",
+        "parameter_boundary",
+        "point_roundtrip_rule",
+        "evaluate_rule_version",
+        "evaluate_metric",
+        "evaluate_point_error_m",
+        "point_tolerance_m",
+        "projection_metric",
+        "projection_to_curve_l2_error_m",
+        "eligible_gap_m",
+        "gap_used",
+        "composed_projection_tolerance_m",
+        "gap_source_api",
+        "gap_cap_m",
+        "edge_tolerance_out_variant_type",
+        "field",
+    }
+)
+NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS = (
+    NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS
+    | {"affected_fields", "reason", "qualification"}
+)
 NATIVE_CURVE_TOPOLOGY_PAIRING_RULE = "native-curve-topology-paired-endpoints-v1"
 NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE = (
     "NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M"
@@ -262,6 +323,172 @@ def native_scope_warning_projection(item: dict) -> dict:
         ),
         "detail": detail,
     }
+
+
+def native_tolerant_edge_warning_is_valid(item: object) -> bool:
+    """Whether one projected v5 warning retains complete field provenance."""
+
+    if not isinstance(item, dict) or set(item) != {
+        "code",
+        "blocking",
+        "severity",
+        "message",
+        "object",
+        "detail",
+    }:
+        return False
+    detail = item.get("detail")
+    if (
+        not isinstance(detail, dict)
+        or set(detail) != NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS
+    ):
+        return False
+    numeric_fields = (
+        "evaluate_point_error_m",
+        "point_tolerance_m",
+        "projection_to_curve_l2_error_m",
+        "eligible_gap_m",
+        "composed_projection_tolerance_m",
+        "gap_cap_m",
+    )
+    return (
+        item["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING
+        and item["blocking"] is False
+        and item["severity"] == "warning"
+        and isinstance(item["message"], str)
+        and bool(item["message"].strip())
+        and item["object"] == detail["component"]
+        and isinstance(detail["component"], str)
+        and bool(detail["component"])
+        and type(detail["body_type"]) is int
+        and detail["body_type"] in (0, 1)
+        and type(detail["body_index"]) is int
+        and detail["body_index"] >= 0
+        and isinstance(detail["edge_reference_sha256"], str)
+        and bool(_HEX64.fullmatch(detail["edge_reference_sha256"]))
+        and type(detail["fin_id"]) is int
+        and detail["fin_id"] >= 0
+        and detail["fin_endpoint"] in {"start", "end"}
+        and detail["parameter_boundary"] in {"u_min", "u_max"}
+        and detail["point_roundtrip_rule"]
+        == NATIVE_TOLERANT_EDGE_BOUNDARY_RULE
+        and detail["evaluate_rule_version"]
+        == NATIVE_CURVE_ENDPOINT_OPERATION_RULE
+        and detail["evaluate_metric"] == NATIVE_TOLERANT_EDGE_EVALUATE_METRIC
+        and detail["projection_metric"] == NATIVE_TOLERANT_EDGE_PROJECTION_METRIC
+        and all(
+            type(detail[field]) in (int, float)
+            and math.isfinite(float(detail[field]))
+            and detail[field] >= 0.0
+            for field in numeric_fields
+        )
+        and detail["evaluate_point_error_m"]
+        <= detail["point_tolerance_m"]
+        and detail["eligible_gap_m"]
+        <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+        and detail["projection_to_curve_l2_error_m"]
+        <= detail["composed_projection_tolerance_m"]
+        and detail["gap_used"] is True
+        and detail["gap_source_api"] == NATIVE_TOLERANT_EDGE_GAP_SOURCE
+        and detail["gap_cap_m"]
+        == NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+        and type(detail["edge_tolerance_out_variant_type"]) is int
+        and detail["edge_tolerance_out_variant_type"] == 0x4005
+        and isinstance(detail["field"], str)
+        and detail["field"]
+        == f"{detail['fin_endpoint']}_evidence.tolerant_edge_evidence"
+        and detail["affected_fields"] == list(
+            NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS
+        )
+        and isinstance(detail["reason"], str)
+        and bool(detail["reason"].strip())
+        and detail["reason"] == NATIVE_TOLERANT_EDGE_WARNING_REASON
+        and detail["qualification"]
+        == NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION
+    )
+
+
+def native_tolerant_edge_warning_details_match(
+    diagnostics: list[dict],
+    raw_warnings: list[dict],
+) -> bool:
+    """Require quality diagnostics to reproduce every v5 warning exactly."""
+
+    def comparable(items):
+        return sorted(
+            json.dumps(
+                item,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            for item in items
+        )
+
+    projected = [
+        native_scope_warning_projection(item)
+        for item in raw_warnings
+        if isinstance(item, dict)
+        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
+    ]
+    v5_diagnostics = [
+        item
+        for item in diagnostics
+        if isinstance(item, dict)
+        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
+    ]
+    def identities(items):
+        return [
+            (
+                item["detail"]["component"],
+                item["detail"]["body_type"],
+                item["detail"]["body_index"],
+                item["detail"]["edge_reference_sha256"],
+                item["detail"]["fin_id"],
+                item["detail"]["fin_endpoint"],
+                item["detail"]["parameter_boundary"],
+                item["detail"]["field"],
+            )
+            for item in items
+        ]
+
+    return (
+        all(native_tolerant_edge_warning_is_valid(item) for item in projected)
+        and all(
+            native_tolerant_edge_warning_is_valid(item)
+            for item in v5_diagnostics
+        )
+        and len(identities(projected)) == len(set(identities(projected)))
+        and len(identities(v5_diagnostics))
+        == len(set(identities(v5_diagnostics)))
+        and comparable(projected) == comparable(v5_diagnostics)
+    )
+
+
+def native_tolerant_edge_warning_set_matches(
+    diagnostics: list[dict],
+    raw_warnings: list[dict],
+) -> bool:
+    """Validate the paired tolerant warning sets without consumer-specific filters."""
+
+    tolerant_diagnostics = [
+        item
+        for item in diagnostics
+        if isinstance(item, dict)
+        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
+    ]
+    tolerant_raw = [
+        item
+        for item in raw_warnings
+        if isinstance(item, dict)
+        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
+    ]
+    if not tolerant_diagnostics and not tolerant_raw:
+        return True
+    return native_tolerant_edge_warning_details_match(
+        tolerant_diagnostics,
+        tolerant_raw,
+    )
 
 
 def native_scope_warning_diagnostics_are_complete(
@@ -621,6 +848,46 @@ def native_point_error(
     )
 
 
+def native_point_euclidean_error(
+    left: tuple[float | int, float | int, float | int],
+    right: tuple[float | int, float | int, float | int],
+) -> float:
+    """Return the Euclidean XYZ distance between two finite native points."""
+
+    if len(left) != 3 or len(right) != 3:
+        raise ValueError("points must contain three coordinates")
+    values = [
+        _native_u(left[index]) - _native_u(right[index])
+        for index in range(3)
+    ]
+    if not all(map(math.isfinite, values)):
+        raise ValueError("points must contain finite coordinates")
+    return math.hypot(*values)
+
+
+def native_point_within_euclidean_bound(left, right, bound_m) -> bool:
+    """Compare one Euclidean distance to an outward binary64 bound exactly."""
+
+    if len(left) != 3 or len(right) != 3:
+        raise ValueError("points must contain three coordinates")
+    if type(bound_m) not in (int, float):
+        raise ValueError("Euclidean bound must be a JSON number")
+    bound = float(bound_m)
+    if not math.isfinite(bound) or bound < 0.0:
+        raise ValueError("Euclidean bound must be finite and non-negative")
+    squared = Fraction(0)
+    for left_value, right_value in zip(left, right, strict=True):
+        left_float = _native_u(left_value)
+        right_float = _native_u(right_value)
+        if not math.isfinite(left_float) or not math.isfinite(right_float):
+            raise ValueError("points must contain finite coordinates")
+        delta = Fraction.from_float(left_float) - Fraction.from_float(
+            right_float
+        )
+        squared += delta * delta
+    return squared <= Fraction.from_float(bound) ** 2
+
+
 def native_point_roundtrip_tolerance(*points) -> float:
     """Bound the largest coordinate-wise roundtrip between any two XYZ points."""
 
@@ -657,6 +924,127 @@ def native_curve_endpoint_operation_tolerance(*points) -> float:
         native_point_roundtrip_tolerance(endpoint, evaluated)
         + native_point_roundtrip_tolerance(endpoint, opposite)
     )
+
+
+def native_tolerant_edge_gap(gap_m: float | int) -> float:
+    """Validate the source-bound tolerant-edge gap against the global bound."""
+
+    if type(gap_m) is not float:
+        raise ValueError("tolerant edge gap must be a float")
+    gap = float(gap_m)
+    if (
+        not math.isfinite(gap)
+        or gap < 0.0
+        or gap > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+    ):
+        raise ValueError(
+            "tolerant edge gap must be finite and within the 50 micrometre bound"
+        )
+    return gap
+
+
+def native_tolerant_edge_boundary(
+    projected_point,
+    evaluated_point,
+    curve_endpoint,
+    opposite_curve_endpoint,
+    *,
+    is_tolerant,
+    gap_m,
+    topology_accepted,
+) -> dict:
+    """Evaluate one successful boundary fin with separate v4 and v5 metrics."""
+
+    if type(is_tolerant) is not bool:
+        raise ValueError("tolerant edge state must be a strict boolean")
+    if type(topology_accepted) is not bool:
+        raise ValueError("topology acceptance must be a strict boolean")
+    gap = native_tolerant_edge_gap(gap_m)
+    points = (
+        projected_point,
+        evaluated_point,
+        curve_endpoint,
+        opposite_curve_endpoint,
+    )
+    if any(len(point) != 3 for point in points):
+        raise ValueError("points must contain three coordinates")
+    curve_tolerance = native_curve_endpoint_operation_tolerance(
+        curve_endpoint,
+        evaluated_point,
+        opposite_curve_endpoint,
+    )
+    curve_error = native_point_error(curve_endpoint, evaluated_point)
+    projected_error = native_point_euclidean_error(
+        projected_point,
+        curve_endpoint,
+    )
+    projected_tolerance = math.nextafter(
+        curve_tolerance + gap,
+        math.inf,
+    )
+    ordinary_projection_closes = native_point_within_euclidean_bound(
+        projected_point,
+        curve_endpoint,
+        curve_tolerance,
+    )
+    projected_within = native_point_within_euclidean_bound(
+        projected_point,
+        curve_endpoint,
+        projected_tolerance,
+    )
+    gap_used = (
+        not ordinary_projection_closes
+        and curve_error <= curve_tolerance
+        and is_tolerant
+        and topology_accepted
+        and projected_within
+    )
+    accepted = curve_error <= curve_tolerance and (
+        ordinary_projection_closes or gap_used
+    )
+    return {
+        "point_roundtrip_rule": NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
+        "evaluate_rule_version": NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
+        "evaluate_metric": NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,
+        "evaluate_point_error_m": curve_error,
+        "point_tolerance_m": curve_tolerance,
+        "projection_metric": NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
+        "ordinary_projection_closes": ordinary_projection_closes,
+        "projection_to_curve_l2_error_m": projected_error,
+        "composed_projection_tolerance_m": projected_tolerance,
+        "gap_used": gap_used,
+        "accepted": accepted,
+    }
+
+
+def native_tolerant_edge_evidence(
+    metrics: dict,
+    *,
+    edge_reference_sha256: str,
+    parameter_boundary: str,
+    eligible_gap_m: float,
+) -> dict:
+    """Format one canonical v5 evidence row from independently computed metrics."""
+
+    return {
+        "point_roundtrip_rule": metrics["point_roundtrip_rule"],
+        "evaluate_rule_version": metrics["evaluate_rule_version"],
+        "evaluate_metric": metrics["evaluate_metric"],
+        "projection_metric": metrics["projection_metric"],
+        "edge_reference_sha256": edge_reference_sha256,
+        "parameter_boundary": parameter_boundary,
+        "gap_used": metrics["gap_used"],
+        "eligible_gap_m": eligible_gap_m,
+        "gap_source_field": NATIVE_TOLERANT_EDGE_GAP_SOURCE_FIELD,
+        "evaluate_point_error_m": metrics["evaluate_point_error_m"],
+        "point_tolerance_m": metrics["point_tolerance_m"],
+        "projection_to_curve_l2_error_m": metrics[
+            "projection_to_curve_l2_error_m"
+        ],
+        "composed_projection_tolerance_m": metrics[
+            "composed_projection_tolerance_m"
+        ],
+    }
 
 
 def native_curve_topology_endpoint_assignment(

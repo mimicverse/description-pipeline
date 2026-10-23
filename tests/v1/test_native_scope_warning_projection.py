@@ -13,7 +13,19 @@ from description_pipeline.geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     NATIVE_SCOPE_IDENTITY_RULE,
     NATIVE_SCOPE_WARNING_DETAIL_FIELDS,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+    NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS,
+    NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
+    NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,
+    NATIVE_TOLERANT_EDGE_GAP_SOURCE,
+    NATIVE_TOLERANT_EDGE_GAP_WARNING,
+    NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
+    NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS,
+    NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS,
+    NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
+    NATIVE_TOLERANT_EDGE_WARNING_REASON,
     native_scope_warning_details_match,
+    native_tolerant_edge_warning_details_match,
 )
 from description_pipeline.io import PipelineError, canonical_json_value, write_json
 from description_pipeline.orchestration import portal as portal_module
@@ -78,6 +90,37 @@ def diagnostics() -> list[dict]:
     return native_gate_warning_diagnostics({"warnings": raw_warnings()})
 
 
+def tolerant_warning() -> dict:
+    return {
+        "code": NATIVE_TOLERANT_EDGE_GAP_WARNING,
+        "blocking": False,
+        "component": "part-1",
+        "body_type": 1,
+        "body_index": 0,
+        "edge_reference_sha256": "a" * 64,
+        "fin_id": 329,
+        "fin_endpoint": "end",
+        "parameter_boundary": "u_max",
+        "point_roundtrip_rule": NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
+        "evaluate_rule_version": "native-curve-endpoint-float32-operation-v4",
+        "evaluate_metric": NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,
+        "evaluate_point_error_m": 1e-12,
+        "point_tolerance_m": 7.45e-9,
+        "projection_metric": NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
+        "projection_to_curve_l2_error_m": 4.98e-8,
+        "eligible_gap_m": 5e-7,
+        "gap_used": True,
+        "composed_projection_tolerance_m": 5e-7,
+        "gap_source_api": NATIVE_TOLERANT_EDGE_GAP_SOURCE,
+        "gap_cap_m": NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+        "edge_tolerance_out_variant_type": 0x4005,
+        "field": "end_evidence.tolerant_edge_evidence",
+        "affected_fields": list(NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS),
+        "reason": NATIVE_TOLERANT_EDGE_WARNING_REASON,
+        "qualification": NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
+    }
+
+
 def quality_report(
     rows: list[dict] | None = None,
     raw: list[dict] | None = None,
@@ -99,6 +142,201 @@ def quality_report(
 
 
 class NativeScopeWarningProjectionTests(unittest.TestCase):
+    def test_tolerant_edge_warning_projection_is_exact_and_complete(self) -> None:
+        raw = tolerant_warning()
+        projected = native_gate_warning_diagnostics({"warnings": [raw]})
+
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(projected[0]["code"], NATIVE_TOLERANT_EDGE_GAP_WARNING)
+        self.assertEqual(
+            set(projected[0]["detail"]),
+            set(NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS),
+        )
+        self.assertTrue(
+            native_tolerant_edge_warning_details_match(projected, [raw])
+        )
+        self.assertFalse(
+            native_tolerant_edge_warning_details_match([], [raw])
+        )
+        self.assertFalse(
+            native_tolerant_edge_warning_details_match(
+                [projected[0], projected[0]],
+                [raw, raw],
+            )
+        )
+
+        for field in sorted(NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS):
+            with self.subTest(missing=field):
+                changed = copy.deepcopy(raw)
+                changed.pop(field)
+                with self.assertRaises(PipelineError):
+                    native_gate_warning_diagnostics(
+                        {"warnings": [changed]}
+                    )
+
+        for field, value in (
+            ("evaluate_metric", NATIVE_TOLERANT_EDGE_PROJECTION_METRIC),
+            ("projection_metric", NATIVE_TOLERANT_EDGE_EVALUATE_METRIC),
+            ("edge_reference_sha256", "f" * 64),
+            ("gap_used", False),
+            ("point_roundtrip_rule", "forged"),
+            ("field", "start_evidence.tolerant_edge_evidence"),
+            ("affected_fields", []),
+            (
+                "affected_fields",
+                ["point_tolerance_m", "point_tolerance_m"],
+            ),
+            ("affected_fields", ["point_tolerance_m"]),
+            ("reason", ""),
+            ("qualification", "forged"),
+        ):
+            with self.subTest(field=field):
+                changed = native_gate_warning_diagnostics(
+                    {"warnings": [raw]}
+                )
+                changed[0]["detail"][field] = value
+                self.assertFalse(
+                    native_tolerant_edge_warning_details_match(
+                        changed,
+                        [raw],
+                    )
+                )
+
+        quality = quality_report(projected, [raw])
+        rows = [
+            {
+                "id": "geometry.native_tessellation",
+                "state": "passed",
+                "raw_details": {"warnings": [raw]},
+            }
+        ]
+        report_view_rows = _recorded_warnings(
+            {"id": "verify", "name": "Verify"},
+            [],
+            rows,
+            projected,
+        )
+        self.assertEqual(
+            report_view_rows[0]["code"],
+            NATIVE_TOLERANT_EDGE_GAP_WARNING,
+        )
+        self.assertEqual(
+            report_view_rows[0]["detail"],
+            projected[0]["detail"],
+        )
+        self.assertEqual(
+            set(report_view_rows[0]["detail"]),
+            set(NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS),
+        )
+        ordered_rows = [
+            {
+                "id": "source.other",
+                "state": "passed",
+                "raw_details": {
+                    "warnings": [
+                        {
+                            "code": "other.warning",
+                            "blocking": False,
+                        }
+                    ]
+                },
+            },
+            *rows,
+        ]
+        ordered = _recorded_warnings(
+            {"id": "verify", "name": "Verify"},
+            [],
+            ordered_rows,
+            projected,
+        )
+        self.assertEqual(
+            [row["code"] for row in ordered],
+            ["other.warning", NATIVE_TOLERANT_EDGE_GAP_WARNING],
+        )
+        portal_warning = _quality_warnings(quality)[0]
+        self.assertEqual(
+            portal_warning["code"],
+            NATIVE_TOLERANT_EDGE_GAP_WARNING,
+        )
+        self.assertEqual(portal_warning["detail"], projected[0]["detail"])
+        self.assertEqual(
+            urdf_pr_module._warning_diagnostics(quality)[0]["code"],
+            NATIVE_TOLERANT_EDGE_GAP_WARNING,
+        )
+        pr_rows = urdf_pr_module._general_warning_rows(quality)
+        pr_tolerant, = [
+            row
+            for row in pr_rows
+            if row["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING
+        ]
+        self.assertEqual(pr_tolerant["detail"], projected[0]["detail"])
+
+        forged = native_gate_warning_diagnostics({"warnings": [raw]})
+        forged[0]["detail"]["evaluate_metric"] = (
+            NATIVE_TOLERANT_EDGE_PROJECTION_METRIC
+        )
+        with self.assertRaises(PipelineError):
+            _recorded_warnings(
+                {"id": "verify", "name": "Verify"},
+                [],
+                rows,
+                forged,
+            )
+        with self.assertRaises((PipelineError, PortalError)):
+            _quality_warnings(quality_report(forged, [raw]))
+        with self.assertRaises(PipelineError):
+            urdf_pr_module._warning_diagnostics(quality_report(forged, [raw]))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(
+                root / "reports/quality.json",
+                quality_report(forged, [raw]),
+            )
+            structural = build_structural_report({}, evidence_root=root)
+        self.assertIn(
+            "report.native_tolerant_edge_warning_invalid",
+            {row["code"] for row in structural["findings"]},
+        )
+
+        without_diagnostics = quality_report(projected, [raw])
+        without_diagnostics.pop("diagnostics")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(
+                root / "reports/quality.json",
+                without_diagnostics,
+            )
+            structural = build_structural_report({}, evidence_root=root)
+        self.assertIn(
+            "report.native_tolerant_edge_warning_invalid",
+            {row["code"] for row in structural["findings"]},
+        )
+
+    def test_tolerant_edge_warning_identity_keeps_part_occurrences_distinct(
+        self,
+    ) -> None:
+        first = tolerant_warning()
+        second = copy.deepcopy(first)
+        second["component"] = "part-2"
+        second["body_index"] = 1
+
+        projected = native_gate_warning_diagnostics(
+            {"warnings": [first, second]}
+        )
+
+        self.assertTrue(
+            native_tolerant_edge_warning_details_match(
+                projected,
+                [first, second],
+            )
+        )
+        self.assertFalse(
+            native_tolerant_edge_warning_details_match(
+                [projected[0], copy.deepcopy(projected[0])],
+                [first, copy.deepcopy(first)],
+            )
+        )
+
     def test_warning_consumers_share_canonical_serialization_and_body_hash(self) -> None:
         self.assertIs(portal_module.canonical_json_value, canonical_json_value)
         self.assertIs(urdf_pr_module.canonical_json_value, canonical_json_value)
@@ -124,6 +362,41 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
                 separators=(",", ":"),
                 default=str,
             ),
+        )
+
+    def test_report_view_compares_tolerant_gate_only_on_native_row(self) -> None:
+        raw = tolerant_warning()
+        projected = native_gate_warning_diagnostics({"warnings": [raw]})
+        rows = [
+            {
+                "id": "source.earlier",
+                "state": "passed",
+                "raw_details": {
+                    "warnings": [
+                        {
+                            "code": "source.earlier.warning",
+                            "blocking": False,
+                        }
+                    ]
+                },
+            },
+            {
+                "id": "geometry.native_tessellation",
+                "state": "passed",
+                "raw_details": {"warnings": [raw]},
+            },
+        ]
+
+        warnings = _recorded_warnings(
+            {"id": "verify", "name": "Verify"},
+            [],
+            rows,
+            projected,
+        )
+
+        self.assertEqual(
+            [row["code"] for row in warnings],
+            ["source.earlier.warning", NATIVE_TOLERANT_EDGE_GAP_WARNING],
         )
 
     def test_quality_gate_promotes_all_four_complete_warnings(self) -> None:

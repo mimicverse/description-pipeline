@@ -36,7 +36,9 @@ from ..delivery import (
 )
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    NATIVE_TOLERANT_EDGE_GAP_WARNING,
     native_scope_warning_details_match,
+    native_tolerant_edge_warning_set_matches,
 )
 from ..interface_records import REQUEST_PURPOSES, validate_source_record
 from ..io import PipelineError, acquire_process_lock, canonical_json_value, confined, file_digest
@@ -667,6 +669,8 @@ def _normalized_warning_row(
         present, value = _warning_value(object_row, diagnostic, detail, key)
         if present:
             row[key] = value
+    if code == NATIVE_TOLERANT_EDGE_GAP_WARNING:
+        row["detail"] = detail
     return row
 
 
@@ -676,7 +680,7 @@ def _warning_diagnostics(report: dict) -> list[dict]:
     diagnostics = report.get("diagnostics", [])
     if not isinstance(diagnostics, list):
         raise PipelineError("Quality diagnostics are malformed")
-    return [
+    warning_diagnostics = [
         diagnostic
         for diagnostic in diagnostics
         if isinstance(diagnostic, dict)
@@ -684,6 +688,23 @@ def _warning_diagnostics(report: dict) -> list[dict]:
         and isinstance(diagnostic.get("code"), str)
         and diagnostic["code"]
     ]
+    gate_warnings = []
+    for check in report.get("checks") or []:
+        if not isinstance(check, dict) or check.get("id") != "geometry.native_tessellation":
+            continue
+        details = check.get("details")
+        recorded = details.get("warnings") if isinstance(details, dict) else None
+        if isinstance(recorded, list):
+            gate_warnings = recorded
+        break
+    if not native_tolerant_edge_warning_set_matches(
+        warning_diagnostics,
+        gate_warnings,
+    ):
+        raise PipelineError(
+            "Native tolerant-edge warning projection is incomplete or forged"
+        )
+    return warning_diagnostics
 
 
 def _general_warning_rows(report: dict) -> list[dict]:

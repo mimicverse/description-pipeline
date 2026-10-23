@@ -40,10 +40,19 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_COLLAPSED_U_FIN_RULE,
+    NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
+    NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_SCOPE_MAPPING_METHOD,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
     NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+    NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,
+    NATIVE_TOLERANT_EDGE_GAP_SOURCE_FIELD,
+    NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
+    NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
+    NATIVE_TOLERANT_EDGE_GAP_WARNING,
+    NATIVE_U_CLOSEST_FALLBACK_RULE,
     NATIVE_U_IDENTITY_RULE,
     native_binary32_spacing,
     native_curve_endpoint_roles,
@@ -57,6 +66,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     native_point_error,
     native_point_roundtrip_tolerance,
     native_scope_identity_sha256,
+    native_tolerant_edge_boundary,
     native_u_equal,
     native_u_domain_is_resolvable,
     native_u_intervals_cover,
@@ -214,6 +224,7 @@ class FakeEdge:
         self.parameter_calls = 0
         self.evaluate_calls = 0
         self.sense_calls = 0
+        self.tolerance_calls = 0
         self.u_min = u_min
         self.u_max = u_max
         self.curve_start_point = [0.0, 0.0, 0.0]
@@ -226,6 +237,8 @@ class FakeEdge:
         self.evaluate_points = []
         self.evaluate_raw = []
         self.evaluate_u_points = {}
+        self.is_tolerant = False
+        self.tolerant_gap_m = 0.0
         self.curve = FakeCurve(u_min, u_max)
 
     def GetBody(self):  # noqa: N802 - SolidWorks API name
@@ -243,6 +256,11 @@ class FakeEdge:
 
     def GetCurve(self):  # noqa: N802 - SolidWorks API name
         return self.curve
+
+    def IsTolerant(self, tolerance):  # noqa: N802 - SolidWorks API name
+        self.tolerance_calls += 1
+        tolerance.value = self.tolerant_gap_m
+        return self.is_tolerant
 
     def GetCurveParams3(self):  # noqa: N802 - SolidWorks API name
         closed = self.curve.is_closed
@@ -522,6 +540,24 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         helper_patch.start()
         self.addCleanup(helper_patch.stop)
+        production_read_edge_tolerance = native_module._read_edge_tolerance
+        self.production_read_edge_tolerance = production_read_edge_tolerance
+
+        def read_edge_tolerance(edge):
+            return production_read_edge_tolerance(
+                edge,
+                variant_factory=FakeVariant,
+                vt_byref=0x4000,
+                vt_r8=5,
+            )
+
+        tolerance_patch = patch.object(
+            native_module,
+            "_read_edge_tolerance",
+            side_effect=read_edge_tolerance,
+        )
+        tolerance_patch.start()
+        self.addCleanup(tolerance_patch.stop)
 
     def fixture(self):
         body = FakeBody([], None, None)
@@ -1033,9 +1069,48 @@ class NativeFinCaptureTests(unittest.TestCase):
         }
         return start, end, evaluated_start, evaluated_end
 
-    def group_333_tessellation(self, *, topology_start=None):
+    def group_333_tessellation(
+        self,
+        *,
+        topology_start=None,
+        tessellation_start=None,
+        is_tolerant=False,
+        tolerant_gap_m=0.0,
+    ):
         body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
-        self.configure_group_333(edge, tessellation)
+        _start, _end, evaluated_start, evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        edge.is_tolerant = is_tolerant
+        edge.tolerant_gap_m = tolerant_gap_m
+        if tessellation_start is not None:
+            original_vertex_point = tessellation.GetVertexPoint
+            tessellation.GetVertexPoint = lambda vertex_id: {
+                1: tessellation_start,
+                2: evaluated_end,
+                3: (0.0, 1.0, 0.0),
+                4: (1.0, 1.0, 0.0),
+            }.get(vertex_id, original_vertex_point(vertex_id))
+            edge.vertices[0] = FakeVertex(tessellation_start)
+            u_by_point = {
+                tuple(tessellation_start): edge.u_min,
+                tuple(evaluated_end): edge.u_max,
+            }
+            edge.GetClosestPointOn = lambda x, y, z: [
+                x,
+                y,
+                z,
+                u_by_point[(x, y, z)],
+                0.0,
+            ]
+            edge.GetParameter = lambda x, y, z: [
+                u_by_point[(x, y, z)],
+                True,
+            ]
+            edge.evaluate_u_points = {
+                edge.u_min: evaluated_start,
+                edge.u_max: evaluated_end,
+            }
         if topology_start is not None:
             edge.vertices[0] = FakeVertex(topology_start)
         backend = SolidWorksBackend()
@@ -1056,6 +1131,116 @@ class NativeFinCaptureTests(unittest.TestCase):
             )
             triangles = self.stl_triangles(destination)
         return entry["tessellation"], triangles
+
+    def tolerant_boundary_tessellation(
+        self,
+        *,
+        gap_m=5e-7,
+        offset=(1e-8, 0.0, 0.0),
+        is_tolerant=True,
+        boundary="u_min",
+    ):
+        evidence, triangles = self.group_333_tessellation()
+        edge = evidence["native_edges"][0]
+        edge["edge_tolerance"] = support._edge_tolerance_record(
+            is_tolerant,
+            gap_m,
+        )
+        if boundary == "u_min":
+            curve_endpoint = tuple(edge["curve_start_point_m"])
+            opposite_endpoint = tuple(edge["curve_end_point_m"])
+            parameter_u = edge["u_min"]
+            evaluation_name = "start"
+        elif boundary == "u_max":
+            curve_endpoint = tuple(edge["curve_end_point_m"])
+            opposite_endpoint = tuple(edge["curve_start_point_m"])
+            parameter_u = edge["u_max"]
+            evaluation_name = "end"
+        else:
+            raise ValueError("unknown parameter boundary")
+        evaluated_point = tuple(
+            edge["curve_endpoint_evaluations"][evaluation_name]["payload"][:3]
+        )
+        projected_point = tuple(
+            curve_endpoint[index] + offset[index]
+            for index in range(3)
+        )
+        metrics = native_tolerant_edge_boundary(
+            projected_point,
+            evaluated_point,
+            curve_endpoint,
+            opposite_endpoint,
+            is_tolerant=is_tolerant,
+            gap_m=gap_m,
+            topology_accepted=True,
+        )
+        nested = None
+        if metrics["gap_used"] is True:
+            nested = {
+                "point_roundtrip_rule": metrics["point_roundtrip_rule"],
+                "evaluate_rule_version": metrics["evaluate_rule_version"],
+                "evaluate_metric": metrics["evaluate_metric"],
+                "projection_metric": metrics["projection_metric"],
+                "edge_reference_sha256": edge["edge_reference_sha256"],
+                "parameter_boundary": boundary,
+                "gap_used": True,
+                "eligible_gap_m": gap_m,
+                "gap_source_field": NATIVE_TOLERANT_EDGE_GAP_SOURCE_FIELD,
+                "evaluate_point_error_m": metrics["evaluate_point_error_m"],
+                "point_tolerance_m": metrics["point_tolerance_m"],
+                "projection_to_curve_l2_error_m": metrics[
+                    "projection_to_curve_l2_error_m"
+                ],
+                "composed_projection_tolerance_m": metrics[
+                    "composed_projection_tolerance_m"
+                ],
+            }
+        affected_vertices = set()
+        for fin in evidence["itessellation"]["bodies"][0]["fins"]:
+            if fin["classification"] == "internal_only":
+                continue
+            for vertex_id, fin_u, fin_evidence in (
+                (fin["vertex_ids"][0], fin["start_u"], fin["start_evidence"]),
+                (fin["vertex_ids"][1], fin["end_u"], fin["end_evidence"]),
+            ):
+                if not native_u_equal(fin_u, parameter_u):
+                    continue
+                affected_vertices.add(vertex_id)
+                fin_evidence.update(
+                    {
+                        "source_point_m": list(projected_point),
+                        "projection_error_m": 0.0,
+                        "closest_point_error_m": 0.0,
+                        "point_tolerance_m": metrics["point_tolerance_m"],
+                        "point_error_m": metrics["evaluate_point_error_m"],
+                        "evaluate_point_error_m": metrics[
+                            "evaluate_point_error_m"
+                        ],
+                        "source_evaluate_error_m": native_point_error(
+                            projected_point,
+                            evaluated_point,
+                        ),
+                        "closest_evaluate_error_m": native_point_error(
+                            projected_point,
+                            evaluated_point,
+                        ),
+                        "point_roundtrip_rule": (
+                            metrics["point_roundtrip_rule"]
+                            if metrics["gap_used"] is True
+                            else NATIVE_CURVE_ENDPOINT_OPERATION_RULE
+                        ),
+                        "tolerant_edge_evidence": nested,
+                    }
+                )
+                fin_evidence["closest_point_on_raw"][:3] = projected_point
+                fin_evidence["parameter_input_point_m"] = list(
+                    projected_point
+                )
+                fin_evidence["evaluate_payload"][:3] = evaluated_point
+        for vertex in evidence["itessellation"]["vertices"]:
+            if vertex["vertex_id"] in affected_vertices:
+                vertex["point_m"] = list(projected_point)
+        return evidence, triangles, edge, metrics
 
     @staticmethod
     def collapsed_u_tessellation():
@@ -1155,6 +1340,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "point_tolerance_m": (
                         NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
                     ),
+                    "point_error_m": error,
                     "parameter_raw": [u_parameter, 0.0],
                     "parameter_success_raw": 0.0,
                     "parameter_success_raw_type": "float",
@@ -1163,6 +1349,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "evaluate_point_error_m": error,
                     "source_evaluate_error_m": error,
                     "closest_evaluate_error_m": error,
+                    "tolerant_edge_evidence": None,
                 }
             )
             evidence_row["evaluate_payload"][:3] = list(evaluated)
@@ -2992,12 +3179,17 @@ class NativeFinCaptureTests(unittest.TestCase):
         evaluated_start = tuple(
             edge["curve_endpoint_evaluations"]["start"]["payload"][:3]
         )
-        tolerance = native_curve_endpoint_operation_tolerance(
+        boundary = native_tolerant_edge_boundary(
             start,
             evaluated_start,
+            start,
             end,
+            is_tolerant=False,
+            gap_m=0.0,
+            topology_accepted=True,
         )
-        error = native_point_error(start, evaluated_start)
+        tolerance = boundary["point_tolerance_m"]
+        error = boundary["evaluate_point_error_m"]
         affected_vertices = set()
         for fin in evidence["itessellation"]["bodies"][0]["fins"]:
             if fin["classification"] == "internal_only":
@@ -3016,9 +3208,11 @@ class NativeFinCaptureTests(unittest.TestCase):
                 fin_evidence["projection_error_m"] = 0.0
                 fin_evidence["source_evaluate_error_m"] = error
                 fin_evidence["point_tolerance_m"] = tolerance
+                fin_evidence["point_error_m"] = error
                 fin_evidence["closest_point_error_m"] = 0.0
                 fin_evidence["evaluate_point_error_m"] = error
                 fin_evidence["closest_evaluate_error_m"] = error
+                fin_evidence["tolerant_edge_evidence"] = None
         for vertex in evidence["itessellation"]["vertices"]:
             if vertex["vertex_id"] in affected_vertices:
                 vertex["point_m"] = list(start)
@@ -3046,12 +3240,17 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         source = (projected[0] + 1.9e-6, projected[1], projected[2])
         projection_error = native_point_error(source, projected)
-        tolerance = native_curve_endpoint_operation_tolerance(
+        boundary = native_tolerant_edge_boundary(
             projected,
             evaluated,
+            projected,
             edge["curve_end_point_m"],
+            is_tolerant=False,
+            gap_m=0.0,
+            topology_accepted=True,
         )
-        error = native_point_error(projected, evaluated)
+        tolerance = boundary["point_tolerance_m"]
+        error = boundary["evaluate_point_error_m"]
         affected_vertices = set()
         for fin in evidence["itessellation"]["bodies"][0]["fins"]:
             if fin["classification"] == "internal_only":
@@ -3070,6 +3269,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 fin_evidence["projection_error_m"] = projection_error
                 fin_evidence["closest_point_error_m"] = projection_error
                 fin_evidence["point_tolerance_m"] = tolerance
+                fin_evidence["point_error_m"] = error
                 fin_evidence["point_roundtrip_rule"] = (
                     "native-curve-endpoint-float32-operation-v4"
                 )
@@ -3079,6 +3279,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     source,
                     evaluated,
                 )
+                fin_evidence["tolerant_edge_evidence"] = None
         for vertex in evidence["itessellation"]["vertices"]:
             if vertex["vertex_id"] in affected_vertices:
                 vertex["point_m"] = list(source)
@@ -3134,6 +3335,15 @@ class NativeFinCaptureTests(unittest.TestCase):
             opposite,
         )
         projection_error = native_point_error(source, projected)
+        boundary = native_tolerant_edge_boundary(
+            projected,
+            projected,
+            projected,
+            opposite,
+            is_tolerant=False,
+            gap_m=0.0,
+            topology_accepted=True,
+        )
         payload = [*projected, 0.0, 0.0, 0.0]
         packed_status = native_evaluate2_evidence(
             [*payload, packed_evaluate_status(1)]
@@ -3153,10 +3363,12 @@ class NativeFinCaptureTests(unittest.TestCase):
             "source_point_m": list(source),
             "projection_error_m": projection_error,
             "point_tolerance_m": projected_tolerance,
+            "point_error_m": boundary["evaluate_point_error_m"],
             "closest_point_error_m": projection_error,
             "evaluate_point_error_m": 0.0,
             "source_evaluate_error_m": projection_error,
             "closest_evaluate_error_m": 0.0,
+            "tolerant_edge_evidence": None,
             "closest_point_on_raw": [*projected, 0.0, 0.0],
             "parameter_input_point_m": list(projected),
             "parameter_raw": [0.0, success],
@@ -3178,8 +3390,789 @@ class NativeFinCaptureTests(unittest.TestCase):
                 1.0,
                 opposite,
                 opposite,
+                "0" * 64,
+                support._edge_tolerance_record(False, 0.0),
+                True,
             )
         )
+
+    def test_parser_accepts_v5_and_emits_bound_warning(self):
+        evidence, triangles, edge, metrics = (
+            self.tolerant_boundary_tessellation()
+        )
+        resolutions = []
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            None,
+            native_fin_resolutions=resolutions,
+        )
+
+        self.assertEqual(len(spans), 2)
+        self.assertIs(metrics["ordinary_projection_closes"], False)
+        self.assertIs(metrics["gap_used"], True)
+        self.assertIs(metrics["accepted"], True)
+        self.assertLessEqual(
+            metrics["evaluate_point_error_m"],
+            metrics["point_tolerance_m"],
+        )
+        affected = [
+            fin["start_evidence"]
+            for fin in evidence["itessellation"]["bodies"][0]["fins"]
+            if fin["classification"] == "native_edge"
+            and fin["start_evidence"]["tolerant_edge_evidence"] is not None
+        ]
+        self.assertTrue(
+            all(
+                item["closest_evaluate_error_m"]
+                > item["point_tolerance_m"]
+                for item in affected
+            )
+        )
+        self.assertTrue(
+            all(
+                item["evaluate_point_error_m"]
+                == item["point_error_m"]
+                <= item["point_tolerance_m"]
+                for item in affected
+            )
+        )
+        self.assertTrue(resolutions)
+        self.assertEqual(
+            {row["code"] for row in resolutions},
+            {NATIVE_TOLERANT_EDGE_GAP_WARNING},
+        )
+        for row in resolutions:
+            self.assertEqual(row["edge_reference_sha256"], edge["edge_reference_sha256"])
+            self.assertEqual(
+                row["point_roundtrip_rule"],
+                NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
+            )
+            self.assertEqual(row["evaluate_rule_version"], NATIVE_CURVE_ENDPOINT_OPERATION_RULE)
+            self.assertEqual(
+                row["evaluate_metric"],
+                NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,
+            )
+            self.assertEqual(
+                row["projection_metric"],
+                NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
+            )
+            self.assertEqual(row["eligible_gap_m"], edge["edge_tolerance"]["gap_m"])
+            self.assertEqual(row["gap_used"], True)
+            self.assertEqual(
+                row["edge_tolerance_out_variant_type"],
+                0x4005,
+            )
+            self.assertLessEqual(
+                row["evaluate_point_error_m"],
+                row["point_tolerance_m"],
+            )
+            self.assertTrue(row["field"].endswith("tolerant_edge_evidence"))
+
+    def test_tolerant_edge_with_ordinary_v4_pass_stays_v4(self):
+        evidence, triangles, _edge, metrics = (
+            self.tolerant_boundary_tessellation(offset=(0.0, 0.0, 0.0))
+        )
+        resolutions = []
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            None,
+            native_fin_resolutions=resolutions,
+        )
+
+        self.assertEqual(len(spans), 2)
+        self.assertIs(metrics["gap_used"], False)
+        self.assertEqual(resolutions, [])
+        for fin in evidence["itessellation"]["bodies"][0]["fins"]:
+            if fin["classification"] != "native_edge":
+                continue
+            for name in ("start_evidence", "end_evidence"):
+                if fin[name]["tolerant_edge_evidence"] is not None:
+                    continue
+                self.assertNotEqual(
+                    fin[name]["point_roundtrip_rule"],
+                    NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
+                )
+
+    def test_ordinary_v4_passes_when_tolerance_read_is_unavailable(self):
+        evidence, triangles, edge, _metrics = (
+            self.tolerant_boundary_tessellation(offset=(0.0, 0.0, 0.0))
+        )
+        edge["edge_tolerance"] = {
+            **edge["edge_tolerance"],
+            "state": "error",
+            "error": "IEdge.IsTolerant failed",
+            "return_value": None,
+            "return_type": None,
+            "out_variant_type": None,
+            "gap_m": None,
+            "gap_type": None,
+            "gap_bits_u64": None,
+        }
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            None,
+        )
+        self.assertEqual(len(spans), 2)
+
+    def test_v5_rejects_euclidean_diagonal_that_axis_bound_would_accept(self):
+        gap = 1e-6
+        offset = (0.8 * gap, 0.8 * gap, 0.8 * gap)
+        curve = (0.0, 0.0, 0.0)
+        opposite = (0.0, 1.0, 0.0)
+        evaluated = (0.0, 0.0, 0.0)
+        projected = tuple(curve[index] + offset[index] for index in range(3))
+
+        metrics = native_tolerant_edge_boundary(
+            projected,
+            evaluated,
+            curve,
+            opposite,
+            is_tolerant=True,
+            gap_m=gap,
+            topology_accepted=True,
+        )
+
+        self.assertLess(
+            max(abs(offset[index]) for index in range(3)),
+            gap,
+        )
+        self.assertGreater(
+            metrics["projection_to_curve_l2_error_m"],
+            metrics["composed_projection_tolerance_m"],
+        )
+        self.assertIs(metrics["ordinary_projection_closes"], False)
+        self.assertIs(metrics["gap_used"], False)
+        self.assertIs(metrics["accepted"], False)
+
+        evidence, triangles, _edge, _metrics = (
+            self.tolerant_boundary_tessellation(gap_m=gap, offset=offset)
+        )
+        with self.assertRaisesRegex(
+            PipelineError,
+            "U evidence is not independently reproducible",
+        ):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                None,
+            )
+
+    def test_v5_requires_curve_endpoint_v4_and_exact_boundary(self):
+        curve = (0.0, 0.0, 0.0)
+        opposite = (0.0, 1.0, 0.0)
+        gap = 1e-6
+        failing = native_tolerant_edge_boundary(
+            curve,
+            (1e-3, 0.0, 0.0),
+            curve,
+            opposite,
+            is_tolerant=True,
+            gap_m=gap,
+            topology_accepted=True,
+        )
+        self.assertGreater(
+            failing["evaluate_point_error_m"],
+            failing["point_tolerance_m"],
+        )
+        self.assertIs(failing["accepted"], False)
+
+        passing = native_tolerant_edge_boundary(
+            curve,
+            curve,
+            curve,
+            opposite,
+            is_tolerant=True,
+            gap_m=gap,
+            topology_accepted=True,
+        )
+        boundary = passing["composed_projection_tolerance_m"]
+        at_boundary = native_tolerant_edge_boundary(
+            (boundary, 0.0, 0.0),
+            curve,
+            curve,
+            opposite,
+            is_tolerant=True,
+            gap_m=gap,
+            topology_accepted=True,
+        )
+        beyond = math.nextafter(boundary, math.inf)
+        over_boundary = native_tolerant_edge_boundary(
+            (beyond, 0.0, 0.0),
+            curve,
+            curve,
+            opposite,
+            is_tolerant=True,
+            gap_m=gap,
+            topology_accepted=True,
+        )
+        self.assertIs(at_boundary["accepted"], True)
+        self.assertIs(over_boundary["accepted"], False)
+
+        rounded = native_tolerant_edge_boundary(
+            (2**-23, 2**-23 * 2**-27, 0.0),
+            curve,
+            curve,
+            (1.0, 0.0, 0.0),
+            is_tolerant=False,
+            gap_m=0.0,
+            topology_accepted=False,
+        )
+        self.assertEqual(rounded["point_tolerance_m"], 2**-23)
+        self.assertEqual(rounded["projection_to_curve_l2_error_m"], 2**-23)
+        self.assertIs(rounded["ordinary_projection_closes"], False)
+        self.assertIs(rounded["gap_used"], False)
+        self.assertIs(rounded["accepted"], False)
+
+        curve = (0.0, 0.0, 0.0)
+        opposite = (0.0, 1.0, 0.0)
+        projected = (2**-22, 0.0, 0.0)
+        for is_tolerant, topology_accepted in (
+            (False, True),
+            (True, False),
+        ):
+            with self.subTest(
+                is_tolerant=is_tolerant,
+                topology_accepted=topology_accepted,
+            ):
+                blocked = native_tolerant_edge_boundary(
+                    projected,
+                    curve,
+                    curve,
+                    opposite,
+                    is_tolerant=is_tolerant,
+                    gap_m=1e-6,
+                    topology_accepted=topology_accepted,
+                )
+                self.assertIs(blocked["ordinary_projection_closes"], False)
+                self.assertIs(blocked["gap_used"], False)
+                self.assertIs(blocked["accepted"], False)
+
+    def test_parser_rejects_malformed_edge_tolerance_records(self):
+        mutations = (
+            lambda row: row.update({"api": "IEdge.GetTolerance"}),
+            lambda row: row.update({"call_form": "property"}),
+            lambda row: row.update({"argument_count": True}),
+            lambda row: row.update({"return_value": 1}),
+            lambda row: row.update({"out_variant_type": 0x4000}),
+            lambda row: row.update({"gap_m": -1.0}),
+            lambda row: row.update({"gap_m": math.nan}),
+            lambda row: row.update({"gap_m": math.inf}),
+            lambda row: row.update(
+                {
+                    "gap_m": math.nextafter(
+                        NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+                        math.inf,
+                    )
+                }
+            ),
+            lambda row: row.update({"gap_m": True}),
+            lambda row: row.update({"gap_m": "0.0000005"}),
+            lambda row: row.update({"gap_m": 1}),
+            lambda row: row.update(
+                {
+                    "state": "error",
+                    "error": "unreadable",
+                    "return_value": None,
+                    "return_type": None,
+                    "out_variant_type": None,
+                    "gap_m": None,
+                    "gap_type": None,
+                    "gap_bits_u64": None,
+                }
+            ),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                evidence, triangles, edge, _metrics = (
+                    self.tolerant_boundary_tessellation()
+                )
+                mutation(edge["edge_tolerance"])
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation(
+                        "part-1",
+                        evidence,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        None,
+                    )
+
+    def test_v7_parser_rejects_previous_tessellation_schema(self):
+        evidence, triangles = self.group_333_tessellation()
+        evidence["schema_version"] = (
+            "solidworks-to-urdf.native-tessellation/v6"
+        )
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "unsupported native tessellation schema",
+        ):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
+    def test_parser_accepts_gap_cap_boundary_and_rejects_next_float(self):
+        for gap in (5e-7, NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M):
+            with self.subTest(gap=gap):
+                evidence, triangles, _edge, _metrics = (
+                    self.tolerant_boundary_tessellation(gap_m=gap)
+                )
+                spans = parse_native_tessellation(
+                    "part-1",
+                    evidence,
+                    {"solid": 1, "sheet": 0},
+                    len(triangles),
+                    None,
+                )
+                self.assertEqual(len(spans), 2)
+
+        evidence, triangles, _edge, metrics = (
+            self.tolerant_boundary_tessellation(boundary="u_max")
+        )
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            None,
+        )
+        self.assertEqual(len(spans), 2)
+        self.assertIs(metrics["gap_used"], True)
+
+    def test_parser_rejects_forged_v5_evidence_and_foreign_bindings(self):
+        mutations = (
+            lambda nested: nested.update({"point_roundtrip_rule": "forged"}),
+            lambda nested: nested.update(
+                {
+                    "evaluate_metric": (
+                        NATIVE_TOLERANT_EDGE_PROJECTION_METRIC
+                    )
+                }
+            ),
+            lambda nested: nested.update(
+                {
+                    "projection_metric": (
+                        NATIVE_TOLERANT_EDGE_EVALUATE_METRIC
+                    )
+                }
+            ),
+            lambda nested: nested.update({"edge_reference_sha256": "f" * 64}),
+            lambda nested: nested.update({"eligible_gap_m": 1e-7}),
+            lambda nested: nested.update({"gap_used": False}),
+            lambda nested: nested.update(
+                {"composed_projection_tolerance_m": 0.0}
+            ),
+            lambda nested: nested.update({"forged": True}),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                evidence, triangles, _edge, _metrics = (
+                    self.tolerant_boundary_tessellation()
+                )
+                fin = next(
+                    row
+                    for row in evidence["itessellation"]["bodies"][0]["fins"]
+                    if row["classification"] == "native_edge"
+                    and row["start_evidence"]["tolerant_edge_evidence"]
+                    is not None
+                )
+                mutation(fin["start_evidence"]["tolerant_edge_evidence"])
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation(
+                        "part-1",
+                        evidence,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        None,
+                    )
+
+        required_fields = {
+            "point_roundtrip_rule",
+            "evaluate_rule_version",
+            "evaluate_metric",
+            "projection_metric",
+            "edge_reference_sha256",
+            "parameter_boundary",
+            "gap_used",
+            "eligible_gap_m",
+            "gap_source_field",
+            "evaluate_point_error_m",
+            "point_tolerance_m",
+            "projection_to_curve_l2_error_m",
+            "composed_projection_tolerance_m",
+        }
+        for missing in required_fields:
+            with self.subTest(missing=missing):
+                evidence, triangles, _edge, _metrics = (
+                    self.tolerant_boundary_tessellation()
+                )
+                fin = next(
+                    row
+                    for row in evidence["itessellation"]["bodies"][0]["fins"]
+                    if row["classification"] == "native_edge"
+                    and row["start_evidence"]["tolerant_edge_evidence"]
+                    is not None
+                )
+                fin["start_evidence"]["tolerant_edge_evidence"].pop(missing)
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation(
+                        "part-1",
+                        evidence,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        None,
+                    )
+
+    def test_parser_rejects_v5_label_when_gap_not_used(self):
+        evidence, triangles, _edge, _metrics = (
+            self.tolerant_boundary_tessellation(offset=(0.0, 0.0, 0.0))
+        )
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+            and native_u_equal(row["start_u"], evidence["native_edges"][0]["u_min"])
+        )
+        fin["start_evidence"]["point_roundtrip_rule"] = (
+            NATIVE_TOLERANT_EDGE_BOUNDARY_RULE
+        )
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "U evidence is not independently reproducible",
+        ):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                None,
+            )
+
+    def test_parser_rejects_mislabeled_official_v5_errors(self):
+        for field in ("point_error_m", "evaluate_point_error_m"):
+            with self.subTest(field=field):
+                evidence, triangles, _edge, _metrics = (
+                    self.tolerant_boundary_tessellation()
+                )
+                fin = next(
+                    row
+                    for row in evidence["itessellation"]["bodies"][0]["fins"]
+                    if row["classification"] == "native_edge"
+                    and row["start_evidence"]["tolerant_edge_evidence"]
+                    is not None
+                )
+                fin["start_evidence"][field] = (
+                    fin["start_evidence"]["closest_evaluate_error_m"]
+                )
+                with self.assertRaisesRegex(
+                    PipelineError,
+                    "U evidence is not independently reproducible",
+                ):
+                    parse_native_tessellation(
+                        "part-1",
+                        evidence,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        None,
+                    )
+
+    def test_pseudo_v5_fallback_and_interior_paths_are_rejected(self):
+        for mode in ("fallback", "interior"):
+            with self.subTest(mode=mode):
+                evidence, triangles, edge, _metrics = (
+                    self.tolerant_boundary_tessellation()
+                )
+                fin = next(
+                    row
+                    for row in evidence["itessellation"]["bodies"][0]["fins"]
+                    if row["classification"] == "native_edge"
+                    and row["start_evidence"]["tolerant_edge_evidence"]
+                    is not None
+                )
+                changed = fin["start_evidence"]
+                if mode == "fallback":
+                    changed.update(
+                        {
+                            "u_parameter_rule": NATIVE_U_CLOSEST_FALLBACK_RULE,
+                            "parameter_u_source": "closest_point_fallback",
+                            "fallback_reason": "get_parameter_false",
+                            "point_roundtrip_rule": (
+                                NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
+                            ),
+                            "point_tolerance_m": (
+                                NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+                            ),
+                            "parameter_raw": [edge["u_min"], 0.0],
+                            "parameter_success_raw": 0.0,
+                            "parameter_success_raw_type": "float",
+                            "parameter_success_bit": 0,
+                            "parameter_success_parsed": False,
+                        }
+                    )
+                else:
+                    middle = (edge["u_min"] + edge["u_max"]) / 2.0
+                    changed["u"] = middle
+                    changed["closest_point_on_raw"][3] = middle
+                    changed["parameter_raw"][0] = middle
+                    changed["point_roundtrip_rule"] = (
+                        NATIVE_POINT_ROUNDTRIP_RULE
+                    )
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation(
+                        "part-1",
+                        evidence,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        None,
+                    )
+
+    def test_v5_requires_tolerance_true_and_accepted_topology(self):
+        for is_tolerant, mutate_topology in (
+            (False, None),
+            (
+                True,
+                lambda edge: edge.__setitem__(
+                    "topology_endpoint_assignment",
+                    None,
+                ),
+            ),
+        ):
+            with self.subTest(
+                is_tolerant=is_tolerant,
+                mutate_topology=mutate_topology is not None,
+            ):
+                evidence, triangles, edge, _metrics = (
+                    self.tolerant_boundary_tessellation(
+                        is_tolerant=is_tolerant
+                    )
+                )
+                if mutate_topology is not None:
+                    mutate_topology(edge)
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation(
+                        "part-1",
+                        evidence,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        None,
+                    )
+
+    def test_parser_rejects_wrong_body_for_tolerant_edge(self):
+        evidence, triangles, edge, _metrics = (
+            self.tolerant_boundary_tessellation()
+        )
+        edge["body_index"] = 1
+
+        with self.assertRaises(PipelineError):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                None,
+            )
+
+    def test_edge_tolerance_uses_one_strict_byref_call(self):
+        edge = FakeEdge(None, [], [None, None])
+        edge.is_tolerant = True
+        edge.tolerant_gap_m = 5e-7
+
+        result = self.production_read_edge_tolerance(
+            edge,
+            variant_factory=FakeVariant,
+            vt_byref=0x4000,
+            vt_r8=5,
+        )
+
+        self.assertEqual(edge.tolerance_calls, 1)
+        self.assertFalse(hasattr(edge, "GetTolerance"))
+        self.assertEqual(
+            result["api"],
+            "IEdge.IsTolerant(out VARIANT VT_BYREF|VT_R8)",
+        )
+        self.assertEqual(result["call_form"], "one_argument_out_variant_r8")
+        self.assertEqual(result["argument_count"], 1)
+        self.assertIs(result["return_value"], True)
+        self.assertEqual(result["out_variant_type"], 0x4005)
+        self.assertEqual(result["gap_m"], 5e-7)
+        self.assertEqual(result["gap_type"], "float")
+
+        edge.is_tolerant = False
+        edge.tolerant_gap_m = 0.0
+        ordinary = self.production_read_edge_tolerance(
+            edge,
+            variant_factory=FakeVariant,
+            vt_byref=0x4000,
+            vt_r8=5,
+        )
+        self.assertIs(ordinary["return_value"], False)
+        self.assertEqual(ordinary["gap_m"], 0.0)
+
+        invalid_values = (
+            (1, 5e-7),
+            ("true", 5e-7),
+            (True, -1.0),
+            (True, math.nan),
+            (True, math.inf),
+            (
+                True,
+                math.nextafter(
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+                    math.inf,
+                ),
+            ),
+            (True, True),
+            (True, "0.0000005"),
+            (True, 1),
+        )
+        for tolerance, gap in invalid_values:
+            with self.subTest(tolerance=tolerance, gap=gap):
+                edge.is_tolerant = tolerance
+                edge.tolerant_gap_m = gap
+                failed = self.production_read_edge_tolerance(
+                    edge,
+                    variant_factory=FakeVariant,
+                    vt_byref=0x4000,
+                    vt_r8=5,
+                )
+                self.assertEqual(failed["state"], "error")
+                self.assertEqual(failed["return_value"], None)
+                self.assertEqual(failed["gap_m"], None)
+
+        class WrongVariant(FakeVariant):
+            def __init__(self, _varianttype, value):
+                super().__init__(0x4000, value)
+
+        edge.is_tolerant = True
+        edge.tolerant_gap_m = 5e-7
+        failed = self.production_read_edge_tolerance(
+            edge,
+            variant_factory=WrongVariant,
+            vt_byref=0x4000,
+            vt_r8=5,
+        )
+        self.assertEqual(failed["state"], "error")
+
+    def test_producer_serializes_one_edge_tolerance_record_and_caps_gap(self):
+        for gap in (5e-7, NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M):
+            with self.subTest(gap=gap):
+                evidence, _triangles = self.group_333_tessellation(
+                    is_tolerant=True,
+                    tolerant_gap_m=gap,
+                )
+                record = evidence["native_edges"][0]["edge_tolerance"]
+                self.assertEqual(
+                    record["api"],
+                    "IEdge.IsTolerant(out VARIANT VT_BYREF|VT_R8)",
+                )
+                self.assertEqual(record["state"], "success")
+                self.assertIs(record["return_value"], True)
+                self.assertEqual(record["out_variant_type"], 0x4005)
+                self.assertEqual(record["gap_m"], gap)
+
+        for gap in (
+            math.nextafter(
+                NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+                math.inf,
+            ),
+            -1.0,
+            math.nan,
+            math.inf,
+            True,
+            "0.0000005",
+            1,
+        ):
+            with self.subTest(gap=gap):
+                ordinary_evidence, _ordinary_triangles = (
+                    self.group_333_tessellation(
+                        is_tolerant=True,
+                        tolerant_gap_m=gap,
+                    )
+                )
+                self.assertEqual(
+                    ordinary_evidence["native_edges"][0][
+                        "edge_tolerance"
+                    ]["state"],
+                    "error",
+                )
+                with self.assertRaises(CadError):
+                    self.group_333_tessellation(
+                        tessellation_start=(
+                            -0.005322360050934642,
+                            0.00013700629315608413,
+                            -0.0021180644098793633,
+                        ),
+                        is_tolerant=True,
+                        tolerant_gap_m=gap,
+                    )
+
+    def test_producer_survives_v5_stable_same_u_branch(self):
+        curve_start = (
+            -0.005322370050934642,
+            0.00013700629315608413,
+            -0.0021180644098793633,
+        )
+        projected_start = (
+            curve_start[0] + 1e-8,
+            curve_start[1],
+            curve_start[2],
+        )
+        evidence, triangles = self.group_333_tessellation(
+            tessellation_start=projected_start,
+            is_tolerant=True,
+            tolerant_gap_m=5e-7,
+        )
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+            and native_u_equal(
+                row["start_u"],
+                evidence["native_edges"][0]["u_min"],
+            )
+        )
+        self.assertIsNotNone(
+            fin["start_evidence"]["tolerant_edge_evidence"]
+        )
+        reversed_fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+            and native_u_equal(
+                row["end_u"],
+                evidence["native_edges"][0]["u_min"],
+            )
+        )
+        self.assertIsNotNone(
+            reversed_fin["end_evidence"]["tolerant_edge_evidence"]
+        )
+        resolutions = []
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            triangles,
+            native_fin_resolutions=resolutions,
+        )
+        self.assertEqual(len(spans), 2)
+        self.assertTrue(resolutions)
 
     def test_parser_accepts_closest_u_fallback_for_exact_false_status(self):
         evidence, triangles = self.group_333_tessellation()
@@ -3206,6 +4199,13 @@ class NativeFinCaptureTests(unittest.TestCase):
             "tessellation-edge-projection-v1"
         )
         fin_evidence["point_tolerance_m"] = 50e-6
+        fin_evidence["point_error_m"] = (
+            fin_evidence["closest_evaluate_error_m"]
+        )
+        fin_evidence["evaluate_point_error_m"] = (
+            fin_evidence["closest_evaluate_error_m"]
+        )
+        fin_evidence["tolerant_edge_evidence"] = None
 
         spans = parse_native_tessellation(
             "part-1",
@@ -3740,13 +4740,22 @@ class NativeFinCaptureTests(unittest.TestCase):
                         evidence["parameter_input_point_m"] = [0.0, 0.0, 0.0]
                         evidence["projection_error_m"] = 0.0
                         evidence["source_evaluate_error_m"] = 0.0
-                        evidence["point_tolerance_m"] = (
-                            native_curve_endpoint_operation_tolerance(
-                                [0.0, 0.0, 0.0],
-                                [0.0, 0.0, 0.0],
-                                [0.0, 0.0, 0.0],
-                            )
+                        boundary = native_tolerant_edge_boundary(
+                            [0.0, 0.0, 0.0],
+                            [0.0, 0.0, 0.0],
+                            [0.0, 0.0, 0.0],
+                            [0.0, 0.0, 0.0],
+                            is_tolerant=False,
+                            gap_m=0.0,
+                            topology_accepted=True,
                         )
+                        evidence["point_tolerance_m"] = boundary[
+                            "point_tolerance_m"
+                        ]
+                        evidence["point_error_m"] = boundary[
+                            "evaluate_point_error_m"
+                        ]
+                        evidence["tolerant_edge_evidence"] = None
                         evidence["closest_point_error_m"] = 0.0
                         evidence["evaluate_point_error_m"] = 0.0
                         evidence["closest_evaluate_error_m"] = 0.0

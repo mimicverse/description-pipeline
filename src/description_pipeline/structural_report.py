@@ -14,6 +14,7 @@ from .geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     native_scope_warning_details_match,
     native_scope_warning_diagnostic_is_valid,
+    native_tolerant_edge_warning_set_matches,
 )
 from .geometry.native_tessellation import parse_native_tessellation
 from .io import PipelineError, file_digest, read_data, write_json
@@ -509,6 +510,28 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 if isinstance(warnings, list):
                     native_gate_warnings = warnings
                 break
+    if not native_tolerant_edge_warning_set_matches(
+        quality_diagnostics if isinstance(quality_diagnostics, list) else [],
+        native_gate_warnings or [],
+    ):
+        entries.append(
+            {
+                "severity": "blocker",
+                "code": "report.native_tolerant_edge_warning_invalid",
+                "object": receipt.get("main_assembly"),
+                "message": (
+                    "Native tolerant-edge warning projection is incomplete or forged"
+                ),
+                "source": "reports/quality.json/diagnostics",
+                "evidence": {
+                    "quality_diagnostics_present": isinstance(
+                        quality_diagnostics,
+                        list,
+                    ),
+                    "native_gate_warnings_present": native_gate_warnings is not None,
+                },
+            }
+        )
     if quality_diagnostics is not None:
         if not isinstance(quality_diagnostics, list):
             entries.append(

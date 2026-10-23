@@ -26,6 +26,7 @@ from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     native_scope_warning_details_match,
     native_scope_warning_projection,
+    native_tolerant_edge_warning_set_matches,
 )
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
@@ -2010,6 +2011,13 @@ def native_gate_warning_diagnostics(details: dict) -> list[dict]:
     _require(
         native_scope_warning_details_match(scope_projection, warnings),
         "Native scope warning projection is incomplete, forged or mismatched",
+    )
+    _require(
+        native_tolerant_edge_warning_set_matches(
+            projected,
+            warnings,
+        ),
+        "Native tolerant-edge warning projection is incomplete, forged or mismatched",
     )
     return projected
 

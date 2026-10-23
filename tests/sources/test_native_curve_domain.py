@@ -504,7 +504,7 @@ class NativeCurveDomainTests(unittest.TestCase):
         with self.assertRaises(PipelineError) as caught:
             self.parse(tessellation, triangles)
 
-        self.assertIn("endpoint conflicts with fin", str(caught.exception))
+        self.assertIn("U evidence is not independently reproducible", str(caught.exception))
 
     def test_transform_version_cannot_be_reused_as_old_domain_rule(self):
         tessellation, triangles = self.tessellation()
