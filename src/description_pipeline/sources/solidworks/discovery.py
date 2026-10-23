@@ -868,6 +868,14 @@ def validate_historical_recovery_artifacts(
     sources = identity_resolution.get("sources")
     if not isinstance(sources, Mapping):
         raise PipelineError("historical identity resolution has no source map")
+    expected_hardware_source = {
+        "cad": "cad",
+        "platform_configuration": "platform-config",
+    }.get(sources.get("hardware_id"))
+    if source["selection"]["hardware_source"] != expected_hardware_source:
+        raise PipelineError(
+            "historical source hardware origin differs from identity resolution"
+        )
     expected_summary_source = {
         "cad": "cad",
         "submission": "submission",
@@ -881,6 +889,21 @@ def validate_historical_recovery_artifacts(
         raise PipelineError("historical handoff carries an unsupported key set")
     if "errors" in handoff and handoff.get("errors") != []:
         raise PipelineError("historical handoff carries errors")
+    expected_cad_revision = {
+        "hardware_id": source["identity"]["hardware_id"],
+        "revision": source["metadata"]["revision"],
+        "owner": source["metadata"]["owner"],
+        "control": source["metadata"]["control"],
+        "change_summary": source["metadata"]["change_summary"],
+    }
+    if "cad_revision" in handoff and (
+        handoff.get("cad_revision") != expected_cad_revision
+        or handoff.get("warnings") != []
+        or handoff.get("resolved") is not None
+    ):
+        raise PipelineError(
+            "historical handoff revision and status differ from source identity"
+        )
     if (
         "main_assembly" in handoff
         and handoff.get("main_assembly") != identity.get("main_assembly")
@@ -903,7 +926,11 @@ def validate_historical_recovery_artifacts(
         ):
             raise PipelineError("historical handoff input identity differs from discovery")
     input_receipt = handoff.get("input_receipt")
-    if not isinstance(input_receipt, Mapping) or input_receipt.get("inventory") != dict(files):
+    if (
+        not isinstance(input_receipt, Mapping)
+        or set(input_receipt) != {"inventory"}
+        or input_receipt.get("inventory") != dict(files)
+    ):
         raise PipelineError("historical handoff inventory differs from discovery")
     expected_package_files = dict(physical)
     expected_package_files["source.json"] = hashlib.sha256(

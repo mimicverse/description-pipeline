@@ -1227,6 +1227,7 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             write(source_path, canonical(source))
             handoff_path = tree / "input/handoff.json"
             handoff = json.loads(handoff_path.read_text())
+            handoff["cad_revision"]["change_summary"] = value
             handoff["package_files"]["source.json"] = hashlib.sha256(
                 source_path.read_bytes()
             ).hexdigest()
@@ -1414,6 +1415,15 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 }
             ]
             with self.assertRaisesRegex(recovery.RecoveryError, "authority"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "traversal-capture-output")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][2]["outputs"][0].update(
+                files={"evidence/geometry/../ghost.stl": "f" * 64},
+                availability="recorded",
+            )
+            with self.assertRaisesRegex(recovery.RecoveryError, "not confined"):
                 self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
 
             tree, receipt, view = self.legacy_discovery_fixture(base / "forged-discover-output")
@@ -1748,6 +1758,12 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                     "legacy recovery artifacts are invalid",
                 ),
                 (
+                    "source-hardware-origin",
+                    "input/source.json",
+                    lambda document: document["selection"].update(hardware_source="cad"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
                     "handoff-inventory",
                     "input/handoff.json",
                     lambda document: document["input_receipt"]["inventory"].pop("base.SLDPRT"),
@@ -1763,6 +1779,56 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                     "handoff-main",
                     "input/handoff.json",
                     lambda document: document.update(main_assembly="forged.SLDASM"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-hardware",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(hardware_id="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-owner",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(owner="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-id",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(revision="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-control",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(control={"forged": True}),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-summary",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(change_summary="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-warnings",
+                    "input/handoff.json",
+                    lambda document: document.update(
+                        warnings=[
+                            {
+                                "code": "forged",
+                                "message": "forged",
+                                "detail": None,
+                            }
+                        ]
+                    ),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-resolved",
+                    "input/handoff.json",
+                    lambda document: document.update(resolved={}),
                     "legacy recovery artifacts are invalid",
                 ),
                 (

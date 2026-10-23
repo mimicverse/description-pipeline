@@ -2557,6 +2557,15 @@ def _verify_native_stage_file_maps(
 
     universe: dict[str, str] = {}
 
+    def require_file_map_path(value: object, where: str) -> None:
+        try:
+            confined_member(value, f"native stage file map {where}")
+        except RecoveryError as error:
+            raise RecoveryError(
+                "recovery_member_hash_mismatch",
+                f"native stage file map path is not confined: {where}: {value!r}",
+            ) from error
+
     def record_file_map(value: object, where: str) -> dict[str, str]:
         require(
             isinstance(value, dict),
@@ -2571,6 +2580,7 @@ def _verify_native_stage_file_maps(
                 "recovery_member_hash_mismatch",
                 f"native stage file map is malformed: {where}",
             )
+            require_file_map_path(member, f"{where}:{member}")
         return dict(value)
 
     physical = {
@@ -2783,6 +2793,8 @@ def _verify_native_stage_file_maps(
                     "recovery_member_hash_mismatch",
                     f"native stage file map is malformed: {where}",
                 )
+                for path in actual:
+                    require_file_map_path(path, f"{where}:{path}")
                 stage_maps.append((where, item, actual))
                 for path, checksum in actual.items():
                     stage_map_values.setdefault(path, set()).add(checksum)
