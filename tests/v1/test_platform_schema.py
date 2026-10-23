@@ -133,6 +133,18 @@ class SchemaQualifierTests(unittest.TestCase):
             "the platform-service reconcile reads the terminal attempt number",
         )
 
+    def test_unbound_cancel_controls_do_not_fabricate_a_scheduling_row(self) -> None:
+        text = (PLATFORM_DIR / "views.sql").read_text(encoding="utf-8")
+        self.assertIn(
+            "o.kind <> 'cancel'\n"
+            "          OR (\n"
+            "              o.dag_id IS NOT NULL\n"
+            "              AND o.dag_run_id IS NOT NULL\n"
+            "              AND o.task_id IS NOT NULL\n"
+            "              AND o.map_index IS NOT NULL\n",
+            text,
+        )
+
     def test_operatorctl_uses_the_single_airflow_grants_owner(self) -> None:
         text = (ROOT / "deploy/operator/operatorctl.sh").read_text(encoding="utf-8")
         self.assertIn("--airflow-grants", text)
