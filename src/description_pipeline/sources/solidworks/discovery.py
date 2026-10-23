@@ -68,7 +68,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from ...io import PipelineError, artifact_path_parts, confined, digest, inventory, parse_data, read_data
+from ...io import PipelineError, artifact_path_parts, canonical, confined, digest, inventory, parse_data, read_data
 from ...interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 from ...request_evidence import read_request_evidence
 from .jsonio import write_json
@@ -137,6 +137,47 @@ _HISTORICAL_DISCOVERY_KEYS = frozenset(
 )
 _HISTORICAL_DERIVATION_KEYS = frozenset(
     {"configuration", "frozen_names", "main_assembly", "record_roots"}
+)
+_HISTORICAL_CAPTURE_PLAN_KEYS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "handoff_sha256",
+        "discovery_sha256",
+        "main_assembly",
+        "configuration",
+        "identity",
+        "selection",
+        "objects",
+        "groups",
+        "axis_requests",
+        "datums",
+        "evidence_requests",
+    }
+)
+_HISTORICAL_CAPTURE_EVIDENCE = [
+    "evidence/capture.json",
+    "evidence/geometry/",
+    "evidence/native-runtime.json",
+]
+_HISTORICAL_HANDOFF_KEYSETS = frozenset(
+    {
+        frozenset({"passed", "package_files", "input_receipt"}),
+        frozenset(
+            {
+                "cad_revision",
+                "configuration",
+                "errors",
+                "input",
+                "input_receipt",
+                "main_assembly",
+                "package_files",
+                "passed",
+                "resolved",
+                "warnings",
+            }
+        ),
+    }
 )
 _HISTORICAL_IDENTITY_KEYS = frozenset(
     {
@@ -712,11 +753,36 @@ def validate_historical_discovery_document(
     if not isinstance(native_tool, dict):
         raise PipelineError("historical discovery native tool must be an object")
     native_runtime = native_tool.get("runtime")
+    expected_native_packages = None
+    if isinstance(native_runtime, dict) and "packages" in native_runtime:
+        from packaging.utils import canonicalize_name
+
+        from ...runtime import RUNTIME_VERSIONS, required_packages
+
+        expected_native_packages = {
+            canonicalize_name(name): RUNTIME_VERSIONS[name]
+            for name in required_packages("native")
+        }
     if (
         native_tool.get("schema_version") != TOOL_SCHEMA
         or native_tool.get("pipeline_id") != PIPELINE_ID
         or not isinstance(native_runtime, dict)
         or native_runtime.get("role") != "native"
+        or (
+            "system" in native_runtime
+            and native_runtime.get("system") != "Windows"
+        )
+        or (
+            "python" in native_runtime
+            and (
+                not isinstance(native_runtime.get("python"), str)
+                or re.fullmatch(r"3\.12(?:\.\d+)?", native_runtime["python"]) is None
+            )
+        )
+        or (
+            "packages" in native_runtime
+            and native_runtime.get("packages") != expected_native_packages
+        )
         or source_selection["selection"].get("reader_sha256") != native_tool.get("source_sha256")
     ):
         raise PipelineError("historical discovery source selection does not bind the native reader")
@@ -752,6 +818,186 @@ def validate_historical_discovery_document(
     result["findings"] = findings
     result["records"] = records
     return result
+
+
+def validate_historical_recovery_artifacts(
+    *,
+    discovery: Mapping[str, object],
+    capture_plan: object,
+    handoff: object,
+    source_record: object,
+    request_record: Mapping[str, object],
+    identity_resolution: Mapping[str, object],
+    native_inventory: Mapping[str, str],
+    input_inventory: Mapping[str, str],
+    discovery_sha256: str,
+    handoff_sha256: str,
+) -> None:
+    """Bind the remaining recovery sidecars to one discovery identity."""
+
+    from ...interface_records import validate_request_record, validate_source_record
+    from .selection import validate_file_index
+
+    identity = discovery.get("identity")
+    raw = discovery.get("raw")
+    if not isinstance(identity, Mapping) or not isinstance(raw, Mapping):
+        raise PipelineError("historical recovery artifacts have no discovery identity")
+    request = validate_request_record(request_record)
+    source = validate_source_record(source_record)
+    files = validate_file_index(native_inventory)
+    physical = validate_file_index(input_inventory)
+
+    if source["identity"]["handoff_digest"] != request["handoff_digest"]:
+        raise PipelineError("historical source identity differs from the frozen request upload")
+    if (
+        source["identity"]["main_assembly"] != identity.get("main_assembly")
+        or source["identity"]["configuration"] != identity.get("delivery_configuration")
+        or source["identity"]["hardware_id"] != identity.get("hardware_id")
+    ):
+        raise PipelineError("historical source identity differs from discovery")
+    if source["identity"]["records"] != []:
+        raise PipelineError("historical source identity records differ from discovery")
+    metadata = source["metadata"]
+    if (
+        metadata["revision"] != identity.get("revision")
+        or metadata["owner"] != identity.get("owner")
+        or metadata["control"] != identity.get("control")
+        or metadata["change_summary"] != identity.get("change_summary")
+    ):
+        raise PipelineError("historical source metadata differs from discovery")
+    sources = identity_resolution.get("sources")
+    if not isinstance(sources, Mapping):
+        raise PipelineError("historical identity resolution has no source map")
+    expected_summary_source = {
+        "cad": "cad",
+        "submission": "submission",
+    }.get(sources.get("change_summary"), "generated")
+    if metadata["change_summary_source"] != expected_summary_source:
+        raise PipelineError("historical source change-summary origin differs from identity resolution")
+
+    if not isinstance(handoff, dict) or handoff.get("passed") is not True:
+        raise PipelineError("historical handoff did not pass")
+    if frozenset(handoff) not in _HISTORICAL_HANDOFF_KEYSETS:
+        raise PipelineError("historical handoff carries an unsupported key set")
+    if "errors" in handoff and handoff.get("errors") != []:
+        raise PipelineError("historical handoff carries errors")
+    if (
+        "main_assembly" in handoff
+        and handoff.get("main_assembly") != identity.get("main_assembly")
+    ):
+        raise PipelineError("historical handoff names another main assembly")
+    if (
+        "configuration" in handoff
+        and handoff.get("configuration") != identity.get("delivery_configuration")
+    ):
+        raise PipelineError("historical handoff names another configuration")
+    if "input" in handoff:
+        input_record = handoff["input"]
+        input_source = input_record.get("source") if isinstance(input_record, Mapping) else None
+        if (
+            not isinstance(input_record, Mapping)
+            or input_record.get("hardware_id") != identity.get("hardware_id")
+            or not isinstance(input_source, Mapping)
+            or input_source.get("assembly") != identity.get("main_assembly")
+            or input_source.get("configuration") != identity.get("delivery_configuration")
+        ):
+            raise PipelineError("historical handoff input identity differs from discovery")
+    input_receipt = handoff.get("input_receipt")
+    if not isinstance(input_receipt, Mapping) or input_receipt.get("inventory") != dict(files):
+        raise PipelineError("historical handoff inventory differs from discovery")
+    expected_package_files = dict(physical)
+    expected_package_files["source.json"] = hashlib.sha256(
+        canonical(source_record)
+    ).hexdigest()
+    if handoff.get("package_files") != expected_package_files:
+        raise PipelineError("historical handoff package inventory is not exact")
+
+    plan = _require_exact_keys(
+        capture_plan,
+        _HISTORICAL_CAPTURE_PLAN_KEYS,
+        "historical capture plan",
+    )
+    if (
+        plan["schema_version"] != PLAN_SCHEMA
+        or plan["run_id"] != discovery.get("run_id")
+        or plan["handoff_sha256"] != handoff_sha256
+        or plan["discovery_sha256"] != discovery_sha256
+        or plan["main_assembly"] != identity.get("main_assembly")
+        or plan["configuration"] != identity.get("delivery_configuration")
+        or plan["identity"]
+        != {
+            "hardware_id": identity.get("hardware_id"),
+            "revision": identity.get("revision"),
+        }
+        or plan["selection"] != {"files": dict(files)}
+        or plan["evidence_requests"] != _HISTORICAL_CAPTURE_EVIDENCE
+    ):
+        raise PipelineError("historical capture plan differs from discovery")
+    raw_components = raw.get("components")
+    if not isinstance(raw_components, list) or any(
+        not isinstance(component, dict) for component in raw_components
+    ):
+        raise PipelineError("historical capture plan has no native component inventory")
+    expected_objects = {
+        native_component_identity(component): component.get("suppression_state")
+        for component in raw_components
+        if not component.get("suppressed")
+    }
+    objects = plan["objects"]
+    if not isinstance(objects, list):
+        raise PipelineError("historical capture plan objects are not a list")
+    planned: dict[str, object] = {}
+    for item in objects:
+        if (
+            not isinstance(item, dict)
+            or set(item) - {"name", "document", "state"}
+            or not _authored_text(item.get("name"))
+            or type(item.get("state")) is not int
+            or item["state"] not in {0, 1, 2, 3, 4}
+            or item["name"] in planned
+        ):
+            raise PipelineError("historical capture plan object selector is invalid")
+        planned[item["name"]] = item["state"]
+    if planned != expected_objects:
+        raise PipelineError("historical capture plan selectors differ from discovery")
+    groups = plan["groups"]
+    if (
+        not isinstance(groups, list)
+        or any(
+            not isinstance(group, dict)
+            or set(group) != {"name", "components"}
+            or not _authored_text(group.get("name"))
+            or not isinstance(group.get("components"), list)
+            or any(
+                not _authored_text(component)
+                or component not in planned
+                for component in group["components"]
+            )
+            for group in groups
+        )
+        or len({group["name"] for group in groups}) != len(groups)
+    ):
+        raise PipelineError("historical capture plan groups differ from discovery selectors")
+    axis_requests = plan["axis_requests"]
+    if (
+        not isinstance(axis_requests, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"name", "axis_reference"}
+            or not _authored_text(item.get("name"))
+            or not isinstance(item.get("axis_reference"), dict)
+            for item in axis_requests
+        )
+        or len({item["name"] for item in axis_requests}) != len(axis_requests)
+    ):
+        raise PipelineError("historical capture plan axis requests are invalid")
+    datums = plan["datums"]
+    if (
+        not isinstance(datums, list)
+        or any(not _authored_text(datum) for datum in datums)
+        or len(set(datums)) != len(datums)
+    ):
+        raise PipelineError("historical capture plan datums are invalid")
 
 
 def validate_historical_identity_resolution(
