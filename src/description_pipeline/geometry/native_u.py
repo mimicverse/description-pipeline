@@ -440,9 +440,13 @@ def native_tolerant_edge_warning_details_match(
     def identities(items):
         return [
             (
+                item["detail"]["component"],
+                item["detail"]["body_type"],
+                item["detail"]["body_index"],
                 item["detail"]["edge_reference_sha256"],
                 item["detail"]["fin_id"],
                 item["detail"]["fin_endpoint"],
+                item["detail"]["parameter_boundary"],
                 item["detail"]["field"],
             )
             for item in items

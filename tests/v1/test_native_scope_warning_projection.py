@@ -312,6 +312,31 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             {row["code"] for row in structural["findings"]},
         )
 
+    def test_tolerant_edge_warning_identity_keeps_part_occurrences_distinct(
+        self,
+    ) -> None:
+        first = tolerant_warning()
+        second = copy.deepcopy(first)
+        second["component"] = "part-2"
+        second["body_index"] = 1
+
+        projected = native_gate_warning_diagnostics(
+            {"warnings": [first, second]}
+        )
+
+        self.assertTrue(
+            native_tolerant_edge_warning_details_match(
+                projected,
+                [first, second],
+            )
+        )
+        self.assertFalse(
+            native_tolerant_edge_warning_details_match(
+                [projected[0], copy.deepcopy(projected[0])],
+                [first, copy.deepcopy(first)],
+            )
+        )
+
     def test_warning_consumers_share_canonical_serialization_and_body_hash(self) -> None:
         self.assertIs(portal_module.canonical_json_value, canonical_json_value)
         self.assertIs(urdf_pr_module.canonical_json_value, canonical_json_value)
