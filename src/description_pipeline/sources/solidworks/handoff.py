@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import os
-import shutil
-import stat
-import tempfile
-import zipfile
 from pathlib import Path
 
-from ...io import PipelineError, _filesystem_path, artifact_path_parts, confined, digest, inventory
-from .revision import NATIVE_SUFFIXES, package_inventory
+from ...io import PipelineError, confined, digest
+from .revision import package_inventory
 
 HANDOFF_SCHEMA = "solidworks-to-urdf.handoff/v1"
 MAX_HANDOFF_BYTES = 16 * 1024**3
@@ -89,129 +85,3 @@ def describe_handoff(source: Path) -> dict:
         "handoff_sha256": digest(files),
         "files": files,
     }
-
-
-def freeze_handoff(source: Path, store: Path) -> tuple[Path, dict]:
-    """Copy validated bytes into a content-addressed, reusable managed folder."""
-    source = _directory(source)
-    identity = describe_handoff(source)
-    store = _directory(Path(store), exists=False)
-    if store.is_relative_to(source):
-        raise PipelineError("The managed import store must be separate from the engineering source directory")
-    store.mkdir(parents=True, exist_ok=True)
-    store = _directory(store)
-    target = store / identity["handoff_sha256"]
-    if target.exists():
-        if describe_handoff(target) != identity:
-            raise PipelineError("Managed handoff inventory was modified; retain its diagnostics and repair the store")
-        return target, identity
-    with tempfile.TemporaryDirectory(prefix=".handoff-", dir=store) as temporary:
-        staging = Path(temporary) / "package"
-        staging.mkdir()
-        for name in identity["files"]:
-            original = confined(source, name)
-            copied = confined(staging, name, exists=False)
-            physical = Path(_filesystem_path(copied))
-            physical.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(_filesystem_path(original), physical)
-        if package_inventory(source) != identity["files"] or describe_handoff(staging) != identity:
-            raise PipelineError("Mechanical handoff changed during import; no native job was started")
-        try:
-            os.rename(staging, target)
-        except OSError:
-            # Another import may have installed these same bytes concurrently.
-            if not target.is_dir() or describe_handoff(target) != identity:
-                raise
-    return target, identity
-
-
-def prepare_archive(source: Path, archive: Path) -> dict:
-    """Create a bounded transport ZIP, excluding transient SolidWorks locks."""
-    source = _directory(source)
-    identity = describe_handoff(source)
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as output:
-        for name in sorted(identity["files"]):
-            output.write(_filesystem_path(confined(source, name)), arcname=name)
-    if package_inventory(source) != identity["files"]:
-        Path(archive).unlink(missing_ok=True)
-        raise PipelineError("Mechanical handoff changed while preparing transport")
-    if Path(archive).stat().st_size > MAX_HANDOFF_BYTES:
-        Path(archive).unlink(missing_ok=True)
-        raise PipelineError("Mechanical handoff transport exceeds the 16 GiB limit")
-    return identity
-
-
-def _native_lock_member(name: str) -> bool:
-    """The exact ``~$*`` native-lock predicate of ``package_inventory``."""
-
-    path = Path(name)
-    return path.name.startswith("~$") and path.suffix.lower() in NATIVE_SUFFIXES
-
-
-def import_archive(archive: Path, store: Path) -> tuple[Path, dict]:
-    """Extract only regular, portable files, validate in place, install atomically.
-
-    The extracted tree is probed as the package itself and renamed into the
-    content-addressed store: one extraction and no second whole-package copy.
-    SolidWorks lock transients are skipped at extraction; the raw physical
-    inventory then has to equal the bound inventory exactly, so any other
-    unexpected path fails closed.  Immutable target, identical-bytes reuse and
-    concurrent-install tolerance are unchanged.
-    """
-    if Path(archive).stat().st_size > MAX_HANDOFF_BYTES:
-        raise PipelineError("Mechanical handoff transport exceeds the 16 GiB limit")
-    store = _directory(Path(store), exists=False)
-    store.mkdir(parents=True, exist_ok=True)
-    store = _directory(store)
-    with tempfile.TemporaryDirectory(prefix=".upload-", dir=store) as temporary:
-        package = Path(temporary) / "package"
-        package.mkdir()
-        try:
-            with zipfile.ZipFile(archive) as incoming:
-                members = incoming.infolist()
-                if not members or len(members) > MAX_HANDOFF_FILES:
-                    raise PipelineError("Handoff ZIP has an empty or excessive inventory")
-                if sum(member.file_size for member in members) > MAX_HANDOFF_BYTES:
-                    raise PipelineError("Expanded handoff ZIP exceeds the 16 GiB limit")
-                names = set()
-                for member in members:
-                    name = member.filename
-                    parts = artifact_path_parts(name)
-                    if not parts or "/".join(parts) != name or name.casefold() in names:
-                        raise PipelineError("Handoff ZIP contains duplicate or noncanonical paths")
-                    names.add(name.casefold())
-                    mode = stat.S_IFMT(member.external_attr >> 16)
-                    if member.is_dir() or mode not in {0, stat.S_IFREG} or member.flag_bits & 1:
-                        raise PipelineError("Handoff ZIP may contain only unencrypted regular files")
-                    if member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
-                        raise PipelineError("Unsupported handoff ZIP compression")
-                for member in members:
-                    if _native_lock_member(member.filename):
-                        # SolidWorks locks are never handoff content: skipping them
-                        # here keeps the installed package exactly the bound inventory.
-                        continue
-                    member_path = Path(_filesystem_path(confined(package, member.filename, exists=False)))
-                    member_path.parent.mkdir(parents=True, exist_ok=True)
-                    with incoming.open(member) as original, member_path.open("xb") as output:
-                        shutil.copyfileobj(original, output, length=1024 * 1024)
-        except (zipfile.BadZipFile, EOFError, RuntimeError) as error:
-            raise PipelineError(f"Invalid handoff ZIP: {error}") from error
-        identity = describe_handoff(package)
-        # The raw physical inventory must equal the bound inventory: any path that
-        # appeared beyond the identity fails closed instead of being deleted.
-        if inventory(package) != identity["files"]:
-            raise PipelineError("Mechanical handoff changed during import; no native job was started")
-        target = store / identity["handoff_sha256"]
-        if target.exists():
-            if describe_handoff(target) != identity:
-                raise PipelineError(
-                    "Managed handoff inventory was modified; retain its diagnostics and repair the store"
-                )
-            return target, identity
-        try:
-            os.rename(package, target)
-        except OSError:
-            # Another import may have installed these same bytes concurrently.
-            if not target.is_dir() or describe_handoff(target) != identity:
-                raise
-    return target, identity

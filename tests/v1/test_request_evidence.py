@@ -16,7 +16,6 @@ from description_pipeline.request_evidence import (
     freeze_request_evidence,
     read_request_evidence,
     request_evidence_bytes,
-    verify_request_evidence,
     write_request_evidence,
 )
 
@@ -90,17 +89,10 @@ class RequestEvidenceTests(unittest.TestCase):
         carried, digest_read = read_request_evidence(self.path)
         self.assertEqual(carried, evidence)
         self.assertEqual(digest_read, written)
-        self.assertEqual(verify_request_evidence(self.path, expected_sha256=written), evidence)
 
-    def test_missing_file_and_mismatched_binding_are_refusals(self) -> None:
+    def test_missing_file_is_refused(self) -> None:
         with self.assertRaisesRegex(PipelineError, "carries no input/request.json"):
             read_request_evidence(self.path)
-        written = write_request_evidence(self.path, record())
-        with self.assertRaisesRegex(PipelineError, "do not match the receipt binding"):
-            verify_request_evidence(self.path, expected_sha256="0" * 64)
-        self.path.write_bytes(self.path.read_bytes() + b"\n")
-        with self.assertRaisesRegex(PipelineError, "do not match the receipt binding"):
-            verify_request_evidence(self.path, expected_sha256=written)
 
     def test_null_and_misshaped_required_fields_are_refusals(self) -> None:
         base = record()

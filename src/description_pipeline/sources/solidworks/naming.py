@@ -381,16 +381,6 @@ def visual_name(native_component_identity: str, *, link: str = "link") -> str:
     return f"{token(link)}_{_component_token(identity)}_{digest}_visual"
 
 
-def collision_name(native_component_identity: str, *, link: str = "link") -> str:
-    """Stable collision name from owner link and exact native occurrence identity."""
-
-    identity = str(native_component_identity)
-    if not identity:
-        raise ValueError("native collision identity is empty")
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-    return f"{token(link)}_{_component_token(identity)}_{digest}_collision"
-
-
 def material_name(native_component_identity: str, *, link: str = "link") -> str:
     """Stable display material name for one visual component."""
 
@@ -590,12 +580,3 @@ def carrier_names_and_rules(
         if joint_names.get(native) == target
     }
     return body_names, joint_names, body_rules, joint_rules
-
-
-def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, str]]:
-    """Return only the canonical carrier names (see ``carrier_names_and_rules``)."""
-
-    body_names, joint_names, _body_rules, _joint_rules = carrier_names_and_rules(
-        bodies, joints, root
-    )
-    return body_names, joint_names

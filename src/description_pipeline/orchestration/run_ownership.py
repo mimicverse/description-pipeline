@@ -235,15 +235,6 @@ def recorded_run_facts(dag_id: str, run_id: str) -> tuple[str | None, object, di
     return recorded_actor_principal(run.triggering_user_name), run.state, task_states
 
 
-def retry_assessment_for_run(dag_id: str, run_id: str) -> RecoveryAssessment:
-    """The authoritative classification of one run; a missing row refuses as ``run_missing``."""
-    facts = recorded_run_facts(dag_id, run_id)
-    if facts is None:
-        return RecoveryAssessment(False, "", "run_missing", ())
-    _, run_state, task_states = facts
-    return classify_recovery(run_state, task_states)
-
-
 def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
     """True only for the caller's own run that is a positively classified transport recovery."""
     facts = recorded_run_facts(dag_id, run_id)

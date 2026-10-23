@@ -94,7 +94,14 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
     evidence_class = "cad"
 
     def environment(self) -> dict:
-        return {"revision": "34.0.0", "license": "hermetic-test"}
+        return {
+            "revision": "34.0.0",
+            "input_mode": "saved_documents",
+            "sessions": {},
+            "build": "hermetic-test",
+            "license": 1,
+            "visible": True,
+        }
 
     def assembly_mass_properties(self, path: str) -> dict:
         entries = []
@@ -406,7 +413,84 @@ class HermeticSixStageTests(unittest.TestCase):
         self.assertIs(verified["passed"], True)
         self.assertEqual(verified["subject_sha256"], generated_subject)
         self.assertEqual(read_delivery_manifest(self.root / "verify")["subject"]["digest"], generated_subject)
+        quality = json.loads((self.root / "verify/reports/quality.json").read_text(encoding="utf-8"))
+        metadata_diagnostics = [
+            diagnostic
+            for diagnostic in quality["diagnostics"]
+            if diagnostic.get("code") == "metadata.non_native"
+        ]
+        self.assertEqual(len(metadata_diagnostics), 1)
+        self.assertTrue(
+            all(
+                row.get("fields")
+                and row.get("file")
+                and row.get("sha256")
+                and row.get("reference")
+                for row in metadata_diagnostics[0]["detail"]["objects"]
+            )
+        )
+        urdf = (self.root / "verify/urdf/robot.urdf").read_text(encoding="utf-8")
+        self.assertIn("WARNING metadata.non_native", urdf)
         return original_handoff, native, verified
+
+    def _capture_with_environment_mutation(self, mutate) -> tuple[Path, dict]:
+        from description_pipeline.sources.solidworks import freeze as freeze_module
+
+        write_json = freeze_module.write_json
+
+        def injected_write(path, payload):
+            if Path(path).name == "environment.json":
+                mutate(payload)
+            write_json(path, payload)
+
+        with patch.object(freeze_module, "write_json", side_effect=injected_write):
+            return self._prepare_and_capture()
+
+    def _assert_capture_mutation_rejected(self, mutate, expected_error: str) -> None:
+        capture, native = self._capture_with_environment_mutation(mutate)
+        generated = solidworks.generate(
+            capture,
+            self.root / "generate",
+            run_id=RUN_ID,
+            handoff_sha256=native["capture"]["handoff_sha256"],
+            prior_events=self.events,
+            on_event=self._record,
+        )
+        self.assertEqual(generated["state"], "failed")
+        self.assertIn(expected_error, generated["error"])
+
+    def test_sealed_environment_active_configuration_must_match_frozen_selection(self) -> None:
+        def mutate(environment):
+            boundary = environment["session_boundary"]
+            boundary["observed_configuration"] = "Other"
+            boundary["capture_state"]["active_configuration"] = "Other"
+            boundary["capture_state"]["configurations"] = ["Other"]
+
+        self._assert_capture_mutation_rejected(
+            mutate,
+            "capture_state.active_configuration differs from the frozen source configuration",
+        )
+
+    def test_sealed_environment_paths_must_match_the_dependency_closure(self) -> None:
+        def mutate(environment):
+            boundary = environment["session_boundary"]
+            other = str(Path(boundary["opened"]["path"]).with_name("other.SLDASM"))
+            boundary["opened"]["path"] = other
+            boundary["capture_state"]["path"] = other
+
+        self._assert_capture_mutation_rejected(
+            mutate,
+            "opened and captured paths do not match the dependency closure",
+        )
+
+    def test_sealed_environment_open_errors_must_be_zero(self) -> None:
+        def mutate(environment):
+            environment["session_boundary"]["opened"]["errors"] = 1
+
+        self._assert_capture_mutation_rejected(
+            mutate,
+            "OpenDoc6 reported a failed or invalid open",
+        )
 
     def test_frozen_evidence_passes_real_generate_verify_and_local_git_publish(self) -> None:
         original_handoff, native, verified = self._generate_and_verify()

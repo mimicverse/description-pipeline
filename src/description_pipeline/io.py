@@ -7,7 +7,6 @@ import json
 import math
 import ntpath
 import os
-import shlex
 import sys
 import tempfile
 from pathlib import Path, PureWindowsPath
@@ -88,11 +87,6 @@ def acquire_process_lock(path: Path) -> int:
     if handle is None:
         raise OSError(f"the ownership lock is already held by another process: {path}")
     return handle
-
-
-def quote_argument(value: str) -> str:
-    """Quote a displayed command argument for the platform's usual operator shell."""
-    return "'" + value.replace("'", "''") + "'" if os.name == "nt" else shlex.quote(value)
 
 
 def pin_utf8_streams() -> None:
