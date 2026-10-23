@@ -25,7 +25,7 @@ from description_pipeline.geometry.native_u import (
     NATIVE_U_RESOLUTION_RULE,
     native_curve_domain_transform,
     native_curve_endpoint_operation_tolerance,
-    native_curve_endpoint_roles,
+    native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
     native_open_edge_boundary_identity,
@@ -239,7 +239,7 @@ def _u_evidence(
     edge_reference_sha256: str | None = None,
     topology_accepted: bool = True,
     open_edge_identity_sha256: str | None = None,
-    topology_direction_accepted: bool = False,
+    topology_endpoint_set_accepted: bool = False,
 ) -> dict[str, Any]:
     payload, packed_status = _evaluate2_evidence(point)
     evaluated_point = tuple(payload[:3])
@@ -341,7 +341,7 @@ def _u_evidence(
         "evaluate_payload": payload,
         "evaluate_packed_status": packed_status,
         "open_edge_identity_sha256": open_edge_identity_sha256,
-        "topology_direction_accepted": topology_direction_accepted,
+        "topology_endpoint_set_accepted": topology_endpoint_set_accepted,
     }
 
 
@@ -498,9 +498,15 @@ def native_tessellation_fixture(
         )
         edge["edge_tolerance"] = edge_tolerance
     fixture_triangles = []
-    scope_context = copy.deepcopy(scope) if scope is not None else {
+    scope_context = {
+        "rule_version": "native-open-edge-scope-binding-v1",
         "component": "part-1",
+        "source_document_path": "C:/fixture/part-1.SLDPRT",
+        "source_copy_path": "source/part-1.SLDPRT",
         "source_document_sha256": hashlib.sha256(
+            b"fixture-source"
+        ).hexdigest(),
+        "source_copy_sha256": hashlib.sha256(
             b"fixture-source"
         ).hexdigest(),
         "source_document_identity_sha256": hashlib.sha256(
@@ -509,7 +515,14 @@ def native_tessellation_fixture(
         "source_document_identity_kind": "file_sha256",
         "referenced_configuration": "Default",
         "occurrence_scope": "part-1",
+        "virtual_owner": None,
+        "virtual_owner_sha256": None,
+        "virtual_session_document_path": None,
+        "virtual_session_temp_root": None,
+        "virtual_native_api_pid": None,
     }
+    if scope is not None:
+        scope_context.update(copy.deepcopy(scope))
     body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
     evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
     body_rows = []
@@ -925,10 +938,9 @@ def native_tessellation_fixture(
         )
         if curve_domain_transform["rule_version"] != NATIVE_CURVE_DOMAIN_RULE:
             raise ValueError("native curve domain rule differs")
-        _, topology_endpoints = native_curve_endpoint_roles(
+        topology_endpoints = native_curve_parameter_endpoints(
             curve_start_point,
             curve_end_point,
-            curve_sense,
         )
         topology_assignment = native_curve_topology_endpoint_set_assignment(
             topology_endpoints[0],
@@ -936,11 +948,9 @@ def native_tessellation_fixture(
             edge["start_point_m"],
             edge["end_point_m"],
         )
-        directed_topology_accepted = (
+        unique_topology_accepted = (
             topology_assignment["accepted"] is True
-            and topology_assignment["direct_error_m"]
-            <= topology_assignment["tolerance_m"]
-            < topology_assignment["swapped_error_m"]
+            and topology_assignment["complete_match_count"] == 1
         )
         fins_by_id = {fin["fin_id"]: fin for fin in body["fins"]}
         for fin_id in edge_fin_ids:
@@ -960,8 +970,15 @@ def native_tessellation_fixture(
                 face_identity = face_span["face_identity"]
                 scope_binding = native_open_edge_scope_binding(
                     component=scope_context["component"],
+                    source_document_path=scope_context[
+                        "source_document_path"
+                    ],
+                    source_copy_path=scope_context["source_copy_path"],
                     source_document_sha256=scope_context[
                         "source_document_sha256"
+                    ],
+                    source_copy_sha256=scope_context[
+                        "source_copy_sha256"
                     ],
                     source_document_identity_sha256=scope_context[
                         "source_document_identity_sha256"
@@ -973,6 +990,19 @@ def native_tessellation_fixture(
                         "referenced_configuration"
                     ],
                     occurrence_scope=scope_context["occurrence_scope"],
+                    virtual_owner=scope_context["virtual_owner"],
+                    virtual_owner_sha256=scope_context[
+                        "virtual_owner_sha256"
+                    ],
+                    virtual_session_document_path=scope_context[
+                        "virtual_session_document_path"
+                    ],
+                    virtual_session_temp_root=scope_context[
+                        "virtual_session_temp_root"
+                    ],
+                    virtual_native_api_pid=scope_context[
+                        "virtual_native_api_pid"
+                    ],
                     body_type=body_type,
                     body_index=body_index,
                     body_reference_sha256=face_span[
@@ -1042,11 +1072,11 @@ def native_tessellation_fixture(
                     evidence["open_edge_identity_sha256"] = open_identity[
                         "identity_chain_sha256"
                     ]
-                    evidence["topology_direction_accepted"] = True
+                    evidence["topology_endpoint_set_accepted"] = True
             else:
                 for evidence in fin_evidence:
-                    evidence["topology_direction_accepted"] = (
-                        directed_topology_accepted
+                    evidence["topology_endpoint_set_accepted"] = (
+                        unique_topology_accepted
                     )
         edge_rows.append(
             {
@@ -1284,10 +1314,9 @@ def refresh_topology_endpoint_assignment(tessellation: dict[str, Any]) -> None:
         if edge["start_point_m"] is None or edge["end_point_m"] is None:
             edge["topology_endpoint_assignment"] = None
             continue
-        _, topology_endpoints = native_curve_endpoint_roles(
+        topology_endpoints = native_curve_parameter_endpoints(
             edge["curve_start_point_m"],
             edge["curve_end_point_m"],
-            edge["curve_sense"],
         )
         edge["topology_endpoint_assignment"] = (
             native_curve_topology_endpoint_set_assignment(

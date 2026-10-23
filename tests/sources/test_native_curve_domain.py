@@ -20,7 +20,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE,
     native_curve_topology_endpoint_set_assignment,
     native_curve_endpoint_operation_tolerance,
-    native_curve_endpoint_roles,
+    native_curve_parameter_endpoints,
     native_curve_domain_transform,
     native_u_equal,
 )
@@ -244,10 +244,9 @@ class NativeCurveDomainTests(unittest.TestCase):
             row["curve_sense"],
             curve["is_periodic"],
         )
-        _, topology_endpoints = native_curve_endpoint_roles(
+        topology_endpoints = native_curve_parameter_endpoints(
             row["curve_start_point_m"],
             row["curve_end_point_m"],
-            row["curve_sense"],
         )
         row["topology_endpoint_assignment"] = (
             native_curve_topology_endpoint_set_assignment(

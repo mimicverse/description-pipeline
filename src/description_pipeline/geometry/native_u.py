@@ -1081,11 +1081,19 @@ OPEN_EDGE_SCOPE_FIELDS = frozenset(
     {
         "rule_version",
         "component",
+        "source_document_path",
+        "source_copy_path",
         "source_document_sha256",
+        "source_copy_sha256",
         "source_document_identity_sha256",
         "source_document_identity_kind",
         "referenced_configuration",
         "occurrence_scope",
+        "virtual_owner",
+        "virtual_owner_sha256",
+        "virtual_session_document_path",
+        "virtual_session_temp_root",
+        "virtual_native_api_pid",
         "body_type",
         "body_index",
         "body_reference_sha256",
@@ -1101,13 +1109,121 @@ OPEN_EDGE_SCOPE_FIELDS = frozenset(
 )
 
 
+SOURCE_SCOPE_FIELDS = frozenset(
+    {
+        "rule_version",
+        "component",
+        "source_document_path",
+        "source_copy_path",
+        "source_document_sha256",
+        "source_copy_sha256",
+        "source_document_identity_sha256",
+        "source_document_identity_kind",
+        "referenced_configuration",
+        "occurrence_scope",
+        "virtual_owner",
+        "virtual_owner_sha256",
+        "virtual_session_document_path",
+        "virtual_session_temp_root",
+        "virtual_native_api_pid",
+    }
+)
+
+
+def _virtual_component_relative_path(value: object) -> str | None:
+    """Return the exact VC~~ subtree without binding one session root."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.replace("\\", "/")
+    marker = "/vc~~/"
+    position = text.casefold().find(marker)
+    if position < 0:
+        return None
+    relative = text[position + 1 :]
+    if not relative or any(
+        part in {"", ".", ".."} for part in relative.split("/")
+    ):
+        return None
+    return relative.casefold()
+
+
+def native_source_scope_is_valid(
+    value: object,
+    component: str | None = None,
+) -> bool:
+    """Validate one sealed source scope without trusting tessellation scope."""
+
+    if not isinstance(value, dict) or set(value) != SOURCE_SCOPE_FIELDS:
+        return False
+    component_name = value["component"]
+    path = value["source_document_path"]
+    path_is_text = isinstance(path, str) and bool(path)
+    copy_path = value["source_copy_path"]
+    session_path = value["virtual_session_document_path"]
+    path_virtual_relative = _virtual_component_relative_path(path)
+    session_virtual_relative = _virtual_component_relative_path(session_path)
+    file_identity = (
+        value["source_document_identity_kind"] == "file_sha256"
+        and isinstance(value["source_document_sha256"], str)
+        and bool(_HEX64.fullmatch(value["source_document_sha256"]))
+        and value["source_document_sha256"]
+        == value["source_document_identity_sha256"]
+        and isinstance(value["source_copy_sha256"], str)
+        and bool(_HEX64.fullmatch(value["source_copy_sha256"]))
+        and isinstance(copy_path, str)
+        and copy_path.startswith("source/")
+        and "\\" not in copy_path
+        and all(
+            part not in {"", ".", ".."}
+            for part in copy_path.split("/")
+        )
+        and value["virtual_owner"] is None
+        and value["virtual_owner_sha256"] is None
+        and value["virtual_session_document_path"] is None
+        and value["virtual_session_temp_root"] is None
+        and value["virtual_native_api_pid"] is None
+    )
+    virtual_identity = (
+        value["source_document_identity_kind"] == "virtual_path_sha256"
+        and copy_path is None
+        and value["source_document_sha256"] is None
+        and value["source_copy_sha256"] is None
+        and path_is_text
+        and value["source_document_identity_sha256"]
+        == hashlib.sha256(path.encode("utf-8")).hexdigest()
+        and isinstance(value["virtual_owner"], str)
+        and bool(value["virtual_owner"])
+        and isinstance(value["virtual_owner_sha256"], str)
+        and bool(_HEX64.fullmatch(value["virtual_owner_sha256"]))
+        and path_virtual_relative is not None
+        and session_virtual_relative == path_virtual_relative
+        and isinstance(value["virtual_session_temp_root"], str)
+        and bool(value["virtual_session_temp_root"])
+        and type(value["virtual_native_api_pid"]) is int
+        and value["virtual_native_api_pid"] > 0
+    )
+    return (
+        value["rule_version"] == NATIVE_OPEN_EDGE_SCOPE_RULE
+        and isinstance(component_name, str)
+        and bool(component_name)
+        and (component is None or component_name == component)
+        and value["occurrence_scope"] == component_name
+        and path_is_text
+        and isinstance(value["source_document_identity_sha256"], str)
+        and bool(_HEX64.fullmatch(value["source_document_identity_sha256"]))
+        and (file_identity or virtual_identity)
+        and isinstance(value["referenced_configuration"], str)
+        and bool(value["referenced_configuration"])
+    )
+
+
 def _valid_open_edge_scope_binding(value: object) -> bool:
     """Whether one scope record binds the exact component, body, and face."""
 
     if not isinstance(value, dict) or set(value) != OPEN_EDGE_SCOPE_FIELDS:
         return False
     hashes = (
-        "source_document_sha256",
         "source_document_identity_sha256",
         "body_reference_sha256",
         "native_body_reference_sha256",
@@ -1116,17 +1232,79 @@ def _valid_open_edge_scope_binding(value: object) -> bool:
         "native_face_reference_sha256",
         "face_identity_sha256",
     )
+    path_is_text = (
+        isinstance(value["source_document_path"], str)
+        and bool(value["source_document_path"])
+    )
+    copy_path = value["source_copy_path"]
+    path_virtual_relative = _virtual_component_relative_path(
+        value["source_document_path"]
+    )
+    session_virtual_relative = _virtual_component_relative_path(
+        value["virtual_session_document_path"]
+    )
     return (
         value["rule_version"] == NATIVE_OPEN_EDGE_SCOPE_RULE
         and isinstance(value["component"], str)
         and bool(value["component"])
+        and path_is_text
         and all(
             isinstance(value[field], str)
             and bool(_HEX64.fullmatch(value[field]))
             for field in hashes
         )
-        and value["source_document_identity_kind"]
-        in {"file_sha256", "virtual_path_sha256"}
+        and (
+            (
+                value["source_document_identity_kind"] == "file_sha256"
+                and isinstance(value["source_document_sha256"], str)
+                and bool(
+                    _HEX64.fullmatch(value["source_document_sha256"])
+                )
+                and value["source_document_sha256"]
+                == value["source_document_identity_sha256"]
+                and isinstance(value["source_copy_sha256"], str)
+                and bool(
+                    _HEX64.fullmatch(value["source_copy_sha256"])
+                )
+                and isinstance(copy_path, str)
+                and copy_path.startswith("source/")
+                and "\\" not in copy_path
+                and all(
+                    part not in {"", ".", ".."}
+                    for part in copy_path.split("/")
+                )
+                and value["virtual_owner"] is None
+                and value["virtual_owner_sha256"] is None
+                and value["virtual_session_document_path"] is None
+                and value["virtual_session_temp_root"] is None
+                and value["virtual_native_api_pid"] is None
+            )
+            or (
+                value["source_document_identity_kind"]
+                == "virtual_path_sha256"
+                and copy_path is None
+                and value["source_document_sha256"] is None
+                and value["source_copy_sha256"] is None
+                and path_is_text
+                and value["source_document_identity_sha256"]
+                == hashlib.sha256(
+                    value["source_document_path"].encode("utf-8")
+                ).hexdigest()
+                and isinstance(value["virtual_owner"], str)
+                and bool(value["virtual_owner"])
+                and isinstance(value["virtual_owner_sha256"], str)
+                and bool(_HEX64.fullmatch(value["virtual_owner_sha256"]))
+                and path_virtual_relative is not None
+                and session_virtual_relative == path_virtual_relative
+                and isinstance(
+                    value["virtual_session_temp_root"],
+                    str,
+                )
+                and bool(value["virtual_session_temp_root"])
+                and type(value["virtual_native_api_pid"]) is int
+                and value["virtual_native_api_pid"] > 0
+            )
+        )
         and isinstance(value["referenced_configuration"], str)
         and bool(value["referenced_configuration"])
         and isinstance(value["occurrence_scope"], str)
@@ -1165,11 +1343,19 @@ def _valid_open_edge_scope_binding(value: object) -> bool:
 def native_open_edge_scope_binding(
     *,
     component: str,
+    source_document_path: str,
+    source_copy_path: str | None,
     source_document_sha256: str,
+    source_copy_sha256: str,
     source_document_identity_sha256: str,
     source_document_identity_kind: str,
     referenced_configuration: str,
     occurrence_scope: str,
+    virtual_owner: str | None,
+    virtual_owner_sha256: str | None,
+    virtual_session_document_path: str | None,
+    virtual_session_temp_root: str | None,
+    virtual_native_api_pid: int | None,
     body_type: int,
     body_index: int,
     body_reference_sha256: str,
@@ -1185,11 +1371,19 @@ def native_open_edge_scope_binding(
     record = {
         "rule_version": NATIVE_OPEN_EDGE_SCOPE_RULE,
         "component": component,
+        "source_document_path": source_document_path,
+        "source_copy_path": source_copy_path,
         "source_document_sha256": source_document_sha256,
+        "source_copy_sha256": source_copy_sha256,
         "source_document_identity_sha256": source_document_identity_sha256,
         "source_document_identity_kind": source_document_identity_kind,
         "referenced_configuration": referenced_configuration,
         "occurrence_scope": occurrence_scope,
+        "virtual_owner": virtual_owner,
+        "virtual_owner_sha256": virtual_owner_sha256,
+        "virtual_session_document_path": virtual_session_document_path,
+        "virtual_session_temp_root": virtual_session_temp_root,
+        "virtual_native_api_pid": virtual_native_api_pid,
         "body_type": body_type,
         "body_index": body_index,
         "body_reference_sha256": body_reference_sha256,
@@ -1667,27 +1861,18 @@ def native_open_edge_boundary_identity(
     return record
 
 
-def native_curve_endpoint_roles(
+def native_curve_parameter_endpoints(
     curve_start: tuple[float | int, float | int, float | int],
     curve_end: tuple[float | int, float | int, float | int],
-    sense: bool,
-) -> tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...]:
-    """Return U-ordered parameter endpoints and sense-directed topology endpoints."""
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Return ICurveParamData endpoints in raw parameter order."""
 
-    if type(sense) is not bool:
-        raise ValueError("edge sense must be bool")
     points = []
     for point in (curve_start, curve_end):
         if len(point) != 3:
             raise ValueError("curve endpoints must contain three coordinates")
         points.append(tuple(_native_u(value) for value in point))
-    parameter_endpoints = (points[0], points[1])
-    topology_endpoints = (
-        parameter_endpoints
-        if sense
-        else (parameter_endpoints[1], parameter_endpoints[0])
-    )
-    return parameter_endpoints, topology_endpoints
+    return points[0], points[1]
 
 
 def native_curve_domain_transform(
@@ -1698,7 +1883,12 @@ def native_curve_domain_transform(
     sense: bool,
     is_periodic: bool | None,
 ) -> dict:
-    """Classify an edge U domain against underlying-curve and periodicity evidence."""
+    """Classify an edge U domain against underlying-curve periodicity.
+
+    ``Sense`` may orient the periodic parameter lift only. It never changes the
+    raw ``UMin``/``StartPoint`` and ``UMax``/``EndPoint`` correspondence or the
+    unordered curve/edge endpoint-set identity.
+    """
 
     curve_start = _native_u(underlying_start)
     curve_end = _native_u(underlying_end)

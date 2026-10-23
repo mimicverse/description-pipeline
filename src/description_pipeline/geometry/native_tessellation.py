@@ -40,7 +40,7 @@ from .native_u import (
     NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
-    native_curve_endpoint_roles,
+    native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_fin_interval,
     native_get_parameter_success,
@@ -49,6 +49,7 @@ from .native_u import (
     native_point_error,
     native_point_roundtrip_tolerance,
     native_point_within_euclidean_bound,
+    native_source_scope_is_valid,
     native_tolerant_edge_boundary,
     native_tolerant_edge_evidence,
     native_u_equal,
@@ -588,40 +589,7 @@ def _valid_edge_tolerance(value: object) -> bool:
 def _valid_body_scope(value: object, component: str) -> bool:
     """Validate one body-local occurrence/document/configuration scope."""
 
-    if not isinstance(value, dict) or set(value) != {
-        "component",
-        "source_document_sha256",
-        "source_document_identity_sha256",
-        "source_document_identity_kind",
-        "referenced_configuration",
-        "occurrence_scope",
-    }:
-        return False
-    source_fields = (
-        value["source_document_sha256"],
-        value["source_document_identity_sha256"],
-        value["source_document_identity_kind"],
-    )
-    source_absent = all(field is None for field in source_fields)
-    source_present = (
-        isinstance(value["source_document_sha256"], str)
-        and bool(HEX64.fullmatch(value["source_document_sha256"]))
-        and isinstance(value["source_document_identity_sha256"], str)
-        and bool(
-            HEX64.fullmatch(
-                value["source_document_identity_sha256"]
-            )
-        )
-        and value["source_document_identity_kind"]
-        in {"file_sha256", "virtual_path_sha256"}
-    )
-    return (
-        value["component"] == component
-        and value["occurrence_scope"] == component
-        and isinstance(value["referenced_configuration"], str)
-        and bool(value["referenced_configuration"])
-        and (source_absent or source_present)
-    )
+    return native_source_scope_is_valid(value, component)
 
 
 def _valid_u_evidence(
@@ -667,7 +635,7 @@ def _valid_u_evidence(
         "evaluate_payload",
         "evaluate_packed_status",
         "open_edge_identity_sha256",
-        "topology_direction_accepted",
+        "topology_endpoint_set_accepted",
     }:
         return False
     closest = value["closest_point_on_raw"]
@@ -725,7 +693,7 @@ def _valid_u_evidence(
         or not math.isfinite(float(u_parameter))
         or type(value["u"]) not in numeric
         or not math.isfinite(float(value["u"]))
-        or type(value["topology_direction_accepted"]) is not bool
+        or type(value["topology_endpoint_set_accepted"]) is not bool
         or (
             value["open_edge_identity_sha256"] is not None
             and (
@@ -736,7 +704,7 @@ def _valid_u_evidence(
         or value["open_edge_identity_sha256"] != open_edge_identity_sha256
         or (
             value["open_edge_identity_sha256"] is not None
-            and value["topology_direction_accepted"] is not True
+            and value["topology_endpoint_set_accepted"] is not True
         )
     ):
         return False
@@ -807,7 +775,7 @@ def _valid_u_evidence(
                 else NATIVE_CURVE_ENDPOINT_OPERATION_RULE
             )
             if tolerant_edge_metrics["gap_used"] is True:
-                if value["topology_direction_accepted"] is not True:
+                if value["topology_endpoint_set_accepted"] is not True:
                     return False
                 tolerant_edge_evidence = native_tolerant_edge_evidence(
                     tolerant_edge_metrics,
@@ -1033,6 +1001,7 @@ def parse_native_tessellation(
     *,
     native_fin_resolutions: list[dict] | None = None,
     native_identity_warnings: list[dict] | None = None,
+    expected_source_scope: dict | None = None,
 ) -> list[dict]:
     """Validate the one current tessellation schema and return its face spans."""
 
@@ -1462,12 +1431,9 @@ def parse_native_tessellation(
                 + "without an alias",
             )
         else:
-            _parameter_endpoints, topology_endpoints = (
-                native_curve_endpoint_roles(
-                    edge["curve_start_point_m"],
-                    edge["curve_end_point_m"],
-                    edge["curve_sense"],
-                )
+            topology_endpoints = native_curve_parameter_endpoints(
+                edge["curve_start_point_m"],
+                edge["curve_end_point_m"],
             )
             identity_start_point = (
                 start_point
@@ -1709,10 +1675,9 @@ def parse_native_tessellation(
             component
             + f": native edge {index} curve endpoint evaluation is malformed",
         )
-        parameter_endpoints, _ = native_curve_endpoint_roles(
+        parameter_endpoints = native_curve_parameter_endpoints(
             edge["curve_start_point_m"],
             edge["curve_end_point_m"],
-            edge["curve_sense"],
         )
         for index, (name, expected_point) in enumerate(
             zip(
@@ -1911,6 +1876,7 @@ def parse_native_tessellation(
         triangle_vertices,
         native_fin_resolutions,
         native_identity_warnings,
+        expected_source_scope,
     )
     return spans
 
@@ -1927,6 +1893,7 @@ def _parse_itessellation_evidence(
     triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None,
     native_fin_resolutions: list[dict] | None,
     native_identity_warnings: list[dict] | None,
+    expected_source_scope: dict | None,
 ) -> None:
     """Validate body-local ITessellation facet/fin evidence fail closed."""
 
@@ -2251,8 +2218,11 @@ def _parse_itessellation_evidence(
         _require(
             not requires_scope
             or (
-                "scope" in body
+                expected_source_scope is not None
+                and _valid_body_scope(expected_source_scope, component)
+                and "scope" in body
                 and _valid_body_scope(body["scope"], component)
+                and body["scope"] == expected_source_scope
             ),
             component
             + f": native tessellation v8 body {body_key} "
@@ -2264,7 +2234,9 @@ def _parse_itessellation_evidence(
             spans_by_body[body_key],
             face_spans_by_key,
         )
-        body_evidence[body_key]["scope"] = body.get("scope")
+        body_evidence[body_key]["scope"] = (
+            expected_source_scope if requires_scope else None
+        )
         body_counts[body_key] = {
             "facet_count": body["facet_count"],
             "fin_count": body["fin_count"],
@@ -3051,10 +3023,9 @@ def _parse_itessellation_evidence(
                 )
                 topology_assignments[reference] = None
                 continue
-            _, topology_endpoints = native_curve_endpoint_roles(
+            topology_endpoints = native_curve_parameter_endpoints(
                 edge["curve_start_point_m"],
                 edge["curve_end_point_m"],
-                edge["curve_sense"],
             )
             assignment = native_curve_topology_endpoint_set_assignment(
                 topology_endpoints[0],
@@ -3080,12 +3051,10 @@ def _parse_itessellation_evidence(
                 + f": native fin {fin['fin_id']} has no captured edge domain",
             )
             assignment = topology_assignments[reference]
-            directed_topology_accepted = (
+            unique_topology_accepted = (
                 assignment is not None
                 and assignment["accepted"] is True
-                and assignment["direct_error_m"]
-                <= assignment["tolerance_m"]
-                < assignment["swapped_error_m"]
+                and assignment["complete_match_count"] == 1
             )
             endpoint_set_mode = (
                 assignment is not None
@@ -3104,8 +3073,8 @@ def _parse_itessellation_evidence(
             )
             recomputed_open_identity = None
             open_identity_sha256 = None
-            topology_accepted = directed_topology_accepted
-            if uses_tolerant_gap and directed_topology_accepted:
+            topology_accepted = unique_topology_accepted
+            if uses_tolerant_gap and unique_topology_accepted:
                 _require(
                     fin["open_edge_boundary_identity"] is None,
                     component
@@ -3129,8 +3098,17 @@ def _parse_itessellation_evidence(
                     face_identity = face_span["face_identity"]
                     scope_binding = native_open_edge_scope_binding(
                         component=component,
+                        source_document_path=evidence["scope"][
+                            "source_document_path"
+                        ],
+                        source_copy_path=evidence["scope"][
+                            "source_copy_path"
+                        ],
                         source_document_sha256=evidence["scope"][
                             "source_document_sha256"
+                        ],
+                        source_copy_sha256=evidence["scope"][
+                            "source_copy_sha256"
                         ],
                         source_document_identity_sha256=evidence["scope"][
                             "source_document_identity_sha256"
@@ -3143,6 +3121,19 @@ def _parse_itessellation_evidence(
                         ],
                         occurrence_scope=evidence["scope"][
                             "occurrence_scope"
+                        ],
+                        virtual_owner=evidence["scope"]["virtual_owner"],
+                        virtual_owner_sha256=evidence["scope"][
+                            "virtual_owner_sha256"
+                        ],
+                        virtual_session_document_path=evidence["scope"][
+                            "virtual_session_document_path"
+                        ],
+                        virtual_session_temp_root=evidence["scope"][
+                            "virtual_session_temp_root"
+                        ],
+                        virtual_native_api_pid=evidence["scope"][
+                            "virtual_native_api_pid"
                         ],
                         body_type=body_key[0],
                         body_index=body_key[1],
@@ -3442,10 +3433,9 @@ def _parse_itessellation_evidence(
                 edge["end_point_m"],
             )
             if all(point is not None for point in endpoint_points):
-                _, topology_endpoints = native_curve_endpoint_roles(
+                topology_endpoints = native_curve_parameter_endpoints(
                     edge["curve_start_point_m"],
                     edge["curve_end_point_m"],
-                    edge["curve_sense"],
                 )
                 assignment = native_curve_topology_endpoint_set_assignment(
                     topology_endpoints[0],
@@ -3481,12 +3471,7 @@ def _parse_itessellation_evidence(
                     for fin_id in actual
                 )
                 _require(
-                    (
-                        assignment["accepted"] is True
-                        and assignment["direct_error_m"]
-                        <= assignment["tolerance_m"]
-                        < assignment["swapped_error_m"]
-                    )
+                    unique_topology_accepted
                     or open_identity_accepted
                     or (
                         endpoint_set_mode
@@ -3494,20 +3479,7 @@ def _parse_itessellation_evidence(
                     ),
                     component
                     + f": native tessellation v8 edge {reference} "
-                    + (
-                        "topology endpoint disagrees with curve direction"
-                        if (
-                            assignment["direct_error_m"]
-                            > assignment["tolerance_m"]
-                            or (
-                                assignment["swapped_error_m"]
-                                > assignment["tolerance_m"]
-                                and assignment["direct_error_m"]
-                                > assignment["tolerance_m"]
-                            )
-                        )
-                        else "topology endpoint direction is not uniquely proven"
-                    ),
+                    + "topology endpoint set has no unique or open-edge proof",
                 )
             else:
                 _require(
@@ -3998,7 +3970,13 @@ def _validate_facet_stl_binding(
         )
 
 
-def summarize_native_topology(tessellation: dict, spans: list[dict]) -> dict:
+def summarize_native_topology(
+    tessellation: dict,
+    spans: list[dict],
+    *,
+    component: str | None = None,
+    expected_source_scope: dict | None = None,
+) -> dict:
     """Summarize native edge incidence without inventing geometric adjacency."""
 
     _require(
@@ -4042,11 +4020,12 @@ def summarize_native_topology(tessellation: dict, spans: list[dict]) -> dict:
         )
         triangle_count += span["triangle_count"]
     reparsed_spans = parse_native_tessellation(
-        "native topology summary",
+        component or "native topology summary",
         tessellation,
         body_counts,
         triangle_count,
         None,
+        expected_source_scope=expected_source_scope,
     )
     _require(
         spans == reparsed_spans,
