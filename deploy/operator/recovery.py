@@ -2495,6 +2495,399 @@ LEGACY_DISCOVERY_SIDECARS = frozenset(
     }
 )
 NATIVE_STAGES_MEMBER = "reports/native-stages.json"
+_CAPTURE_INTEGRITY_FIXED = frozenset(
+    {
+        "evidence/evidence/collection.json",
+        "evidence/evidence/environment.json",
+        "evidence/manifest.json",
+        "evidence/raw/axis_references.json",
+        "evidence/raw/coordinate_systems.json",
+        "evidence/raw/declared_masses.json",
+        "evidence/raw/dependency_closure.json",
+        "evidence/raw/document_state.json",
+        "evidence/raw/effective_instances.json",
+        "evidence/raw/geometry.json",
+        "evidence/raw/inertia_convention.json",
+        "evidence/raw/link_group_mass_properties.json",
+        "evidence/raw/mass_closure.json",
+        "evidence/raw/mass_properties.json",
+        "evidence/raw/material_provenance.json",
+        "evidence/raw/scene_raw.json",
+    }
+)
+
+
+def _verify_native_stage_file_maps(
+    tree: Path,
+    files: list[dict],
+    artifact_paths: set[str],
+    policy_digest: str,
+) -> None:
+    """Verify every declared native stage file map against its exact policy projection."""
+
+    if NATIVE_STAGES_MEMBER not in artifact_paths:
+        return
+    from description_pipeline.interface_records import (
+        RECOVERY_HISTORICAL_POLICY_DIGESTS,
+        check_policy_digest,
+    )
+    from description_pipeline.io import canonical
+    from description_pipeline.stages import CONTRACT
+
+    historical = policy_digest in RECOVERY_HISTORICAL_POLICY_DIGESTS
+    require(
+        historical or policy_digest == check_policy_digest(),
+        "recovery_member_hash_mismatch",
+        "native stage file-map policy is unsupported",
+    )
+    raw, native_stages = strict_json_file(tree / NATIVE_STAGES_MEMBER, "native stage view")
+    require(
+        raw == canonical(native_stages) and isinstance(native_stages, dict),
+        "recovery_member_hash_mismatch",
+        "native stage file-map view is malformed",
+    )
+    rows = native_stages.get("stages")
+    require(
+        isinstance(rows, list)
+        and [row.get("id") if isinstance(row, dict) else None for row in rows]
+        == [stage["id"] for stage in CONTRACT["stages"]],
+        "recovery_member_hash_mismatch",
+        "native stage file-map rows differ from the installed contract",
+    )
+
+    universe: dict[str, str] = {}
+
+    def require_file_map_path(value: object, where: str) -> None:
+        try:
+            confined_member(value, f"native stage file map {where}")
+        except RecoveryError as error:
+            raise RecoveryError(
+                "recovery_member_hash_mismatch",
+                f"native stage file map path is not confined: {where}: {value!r}",
+            ) from error
+
+    def record_file_map(value: object, where: str) -> dict[str, str]:
+        require(
+            isinstance(value, dict),
+            "recovery_member_hash_mismatch",
+            f"native stage file map is malformed: {where}",
+        )
+        for member, checksum in value.items():
+            require(
+                isinstance(member, str)
+                and isinstance(checksum, str)
+                and re.fullmatch(r"[0-9a-f]{64}", checksum) is not None,
+                "recovery_member_hash_mismatch",
+                f"native stage file map is malformed: {where}",
+            )
+            require_file_map_path(member, f"{where}:{member}")
+        return dict(value)
+
+    physical = {
+        row["path"]: row["sha256"]
+        for row in files
+        if row["type"] == "file"
+    }
+    universe.update(
+        {
+            path: checksum
+            for path, checksum in physical.items()
+            if historical or not path.startswith("input/discovery/")
+        }
+    )
+    if historical:
+        for alias, relative in DISCOVERY_ALIAS_FILES.items():
+            target = tree / relative
+            require(
+                target.is_file(),
+                "recovery_member_hash_mismatch",
+                f"historical stage alias source is missing: {relative}",
+            )
+            universe[alias] = sha256_file(target)
+
+    qc_maps: dict[tuple[str, str], dict[str, str]] = {}
+    for definition, row in zip(CONTRACT["stages"], rows, strict=True):
+        for boundary in ("input_qc", "output_qc"):
+            checks = row.get(boundary) or []
+            require(
+                isinstance(checks, list),
+                "recovery_member_hash_mismatch",
+                f"native stage checks are malformed: {row['id']}.{boundary}",
+            )
+            if checks:
+                require(
+                    [check.get("id") if isinstance(check, dict) else None for check in checks]
+                    == [check["id"] for check in definition[boundary]],
+                    "recovery_member_hash_mismatch",
+                    f"native stage checks differ from the installed contract: {row['id']}.{boundary}",
+                )
+            for index, check in enumerate(checks):
+                require(
+                    isinstance(check, dict)
+                    and check.get("state") in {"passed", "failed", "not_run"}
+                    and isinstance(check.get("details"), dict),
+                    "recovery_member_hash_mismatch",
+                    f"native stage checks are malformed: {row['id']}.{boundary}[{index}]",
+                )
+                details = check.get("details") if isinstance(check, dict) else None
+                if isinstance(details, dict) and "files" in details:
+                    qc_maps[(row["id"], check["id"])] = record_file_map(
+                        details["files"],
+                        f"{row['id']}.{boundary}[{index}].details.files",
+                    )
+
+    allowed_qc_ids = {"discovery.binding", "input.valid", "capture.integrity"}
+    require(
+        {qc_id for _stage, qc_id in qc_maps} <= allowed_qc_ids,
+        "recovery_member_hash_mismatch",
+        "native stage QC file-map policy is unsupported",
+    )
+    cad_inventory = {
+        path.removeprefix("input/cad/"): checksum
+        for path, checksum in physical.items()
+        if path.startswith("input/cad/")
+    }
+    discovery_binding = qc_maps.get(("discover", "discovery.binding"))
+    if discovery_binding is not None:
+        expected_paths = {
+            *(f"input/{name}" for name in cad_inventory),
+            "input/source.json",
+            "input/capture-plan.json",
+            *DISCOVERY_ALIAS_FILES,
+        }
+        require(
+            set(discovery_binding) == expected_paths,
+            "recovery_member_hash_mismatch",
+            "native discovery binding inventory is not exact",
+        )
+        for name, checksum in cad_inventory.items():
+            require(
+                discovery_binding[f"input/{name}"] == checksum,
+                "recovery_member_hash_mismatch",
+                f"native discovery binding differs from input/cad: {name}",
+            )
+        for path in ("input/source.json", "input/capture-plan.json"):
+            physical_path = (
+                "evidence/capture-plan.json"
+                if path == "input/capture-plan.json"
+                else path
+            )
+            require(
+                physical_path in physical
+                and discovery_binding[path] == physical[physical_path],
+                "recovery_member_hash_mismatch",
+                f"native discovery binding differs from its artifact: {path}",
+            )
+        if historical:
+            for alias in DISCOVERY_ALIAS_FILES:
+                require(
+                    discovery_binding[alias] == universe[alias],
+                    "recovery_member_hash_mismatch",
+                    f"native discovery binding differs from its alias: {alias}",
+                )
+        universe.update(discovery_binding)
+
+    capture_input = qc_maps.get(("capture", "input.valid"))
+    if capture_input is not None:
+        expected_input = {
+            **{
+                f"input/cad/{name}": checksum
+                for name, checksum in cad_inventory.items()
+            },
+            "input/source.json": physical.get("input/source.json"),
+        }
+        require(
+            capture_input == expected_input,
+            "recovery_member_hash_mismatch",
+            "native capture input inventory is not exact",
+        )
+        universe.update(capture_input)
+
+    capture_integrity = qc_maps.get(("capture", "capture.integrity"))
+    if capture_integrity is not None and not capture_integrity and historical:
+        capture_integrity = None
+    if capture_integrity is not None:
+        capture_row = rows[
+            [stage["id"] for stage in CONTRACT["stages"]].index("capture")
+        ]
+        geometry = {}
+        for output in capture_row.get("outputs") or []:
+            if (
+                isinstance(output, dict)
+                and output.get("path") == "evidence/geometry/"
+                and isinstance(output.get("files"), dict)
+            ):
+                geometry = record_file_map(
+                    output["files"],
+                    "capture.outputs:evidence/geometry/",
+                )
+        expected_integrity = {
+            *_CAPTURE_INTEGRITY_FIXED,
+            *(
+                f"evidence/source/{name}"
+                for name in cad_inventory
+            ),
+            *geometry,
+        }
+        require(
+            set(capture_integrity) == expected_integrity,
+            "recovery_member_hash_mismatch",
+            "native capture integrity inventory is not exact",
+        )
+        require(
+            all(
+                capture_integrity[path] == checksum
+                for path, checksum in geometry.items()
+            ),
+            "recovery_member_hash_mismatch",
+            "native capture geometry differs from its output authority",
+        )
+        universe.update(capture_integrity)
+
+    contract_output_files = {
+        output["path"]
+        for stage in CONTRACT["stages"]
+        for output in stage["outputs"]
+        if " + " not in output["path"] and not output["path"].endswith("/")
+    }
+    authorized_paths = set(universe) | contract_output_files
+
+    def matches(path: str, selector: str) -> bool:
+        return path == selector or (
+            selector.endswith("/") and path.startswith(selector)
+        )
+
+    stage_maps = []
+    stage_map_values: dict[str, set[str]] = {}
+    for definition, row in zip(CONTRACT["stages"], rows, strict=True):
+        for boundary in ("inputs", "outputs"):
+            items = row.get(boundary) or []
+            require(
+                isinstance(items, list)
+                and len(items) == len(definition[boundary])
+                and all(
+                    isinstance(item, dict)
+                    and item.get("path") == expected["path"]
+                    for item, expected in zip(
+                        items,
+                        definition[boundary],
+                        strict=True,
+                    )
+                ),
+                "recovery_member_hash_mismatch",
+                f"native stage {boundary} differ from the installed contract: {row['id']}",
+            )
+            for index, item in enumerate(items):
+                if not isinstance(item, dict) or "files" not in item:
+                    continue
+                where = f"{row['id']}.{boundary}[{index}]"
+                actual = item["files"]
+                require(
+                    isinstance(actual, dict)
+                    and all(
+                        isinstance(member, str)
+                        and isinstance(checksum, str)
+                        and re.fullmatch(r"[0-9a-f]{64}", checksum) is not None
+                        for member, checksum in actual.items()
+                    ),
+                    "recovery_member_hash_mismatch",
+                    f"native stage file map is malformed: {where}",
+                )
+                for path in actual:
+                    require_file_map_path(path, f"{where}:{path}")
+                stage_maps.append((where, item, actual))
+                for path, checksum in actual.items():
+                    stage_map_values.setdefault(path, set()).add(checksum)
+
+    inconsistent = {
+        path: sorted(values)
+        for path, values in stage_map_values.items()
+        if len(values) != 1
+    }
+    require(
+        not inconsistent,
+        "recovery_member_hash_mismatch",
+        f"native stage file map values conflict across boundaries: {inconsistent}",
+    )
+
+    for where, item, actual in stage_maps:
+        selectors = str(item.get("path") or "").split(" + ")
+        require(
+            all(
+                path in authorized_paths
+                and any(matches(path, selector) for selector in selectors)
+                for path in actual
+            ),
+            "recovery_member_hash_mismatch",
+            f"native stage file map path has no receipt-bound authority: {where}",
+        )
+        for path, checksum in actual.items():
+            if universe.get(path) == checksum:
+                continue
+            require(
+                path in {"input/handoff.json", "evidence/manifest.json"}
+                and stage_map_values.get(path) == {checksum},
+                "recovery_member_hash_mismatch",
+                f"native stage file map hash differs from its authority: {where}:{path}",
+            )
+        availability = "recorded" if actual else "not_produced"
+        require(
+            item.get("availability") == availability,
+            "recovery_member_hash_mismatch",
+            f"native stage file-map availability differs: {where}",
+        )
+
+    discovery = rows[[stage["id"] for stage in CONTRACT["stages"]].index("discover")]
+    discovery_binding = next(
+        (
+            check
+            for check in discovery.get("output_qc") or []
+            if isinstance(check, dict) and check.get("id") == "discovery.binding"
+        ),
+        None,
+    )
+    if isinstance(discovery_binding, dict):
+        details = discovery_binding.get("details")
+        source_map = details.get("files") if isinstance(details, dict) else None
+        cad_inventory = {
+            row["path"].removeprefix("input/cad/"): row["sha256"]
+            for row in files
+            if row["type"] == "file" and row["path"].startswith("input/cad/")
+        }
+        expected_sources = {
+            f"input/{name}": checksum for name, checksum in cad_inventory.items()
+        }
+        require(
+            isinstance(source_map, dict)
+            and "input/source.json" in universe
+            and "input/capture-plan.json" in universe,
+            "recovery_member_hash_mismatch",
+            "native discovery binding inventory is not closed",
+        )
+        expected_sources.update(
+            {
+                "input/source.json": universe["input/source.json"],
+                "input/capture-plan.json": universe["input/capture-plan.json"],
+                **{
+                    alias: universe[alias]
+                    for alias in DISCOVERY_ALIAS_FILES
+                },
+            }
+        )
+        require(
+            set(source_map) == set(expected_sources)
+            and all(
+                source_map[path] == checksum
+                for path, checksum in expected_sources.items()
+                if not path.startswith("input/discovery/") or historical
+            )
+            and all(
+                source_map[path] == universe[path]
+                for path in DISCOVERY_ALIAS_FILES
+            ),
+            "recovery_member_hash_mismatch",
+            "native discovery binding inventory is not exact",
+        )
 
 
 def _legacy_discovery_sidecars(
@@ -2549,6 +2942,7 @@ def _legacy_discovery_sidecars(
         FINDING_SCHEMA,
         validate_historical_discovery_document,
         validate_historical_identity_resolution,
+        validate_historical_recovery_artifacts,
     )
 
     try:
@@ -2607,11 +3001,6 @@ def _legacy_discovery_sidecars(
         "recovery_member_hash_mismatch",
         "legacy discover output details are not an object",
     )
-    require(
-        all(set(DISCOVERY_ALIAS_FILES) <= set(files) for files in allowed_positions),
-        "recovery_member_hash_mismatch",
-        "legacy discover aliases are not declared at every exact stage position",
-    )
     allowed_file_maps = {id(files) for files in allowed_positions}
 
     def walk(value: object) -> None:
@@ -2641,6 +3030,15 @@ def _legacy_discovery_sidecars(
                 walk(item)
 
     walk(native_stages)
+    for file_map in allowed_positions:
+        require(
+            all(
+                isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item) is not None
+                for item in file_map.values()
+            ),
+            "recovery_member_hash_mismatch",
+            "legacy discovery stage inventory carries a malformed SHA-256",
+        )
     for alias, path in DISCOVERY_ALIAS_FILES.items():
         present = path in actual_paths
         bound = references[path]
@@ -2685,38 +3083,137 @@ def _legacy_discovery_sidecars(
             "recovery_member_hash_mismatch",
             "legacy findings has no receipt-bound discovery evidence",
         )
-        try:
-            discovery_bytes, discovery = strict_json_file(
-                tree / "evidence/discovery.json", "discovery evidence"
-            )
-        except RecoveryError as error:
-            raise RecoveryError(
+        for required in (
+            "evidence/capture-plan.json",
+            "input/handoff.json",
+            "input/request.json",
+            "input/source.json",
+            "reports/native-tool.json",
+        ):
+            require(
+                required in artifact_paths,
                 "recovery_member_hash_mismatch",
-                "receipt-bound discovery evidence is unreadable",
-            ) from error
-        require(
-            discovery_bytes == canonical(discovery),
-            "recovery_member_hash_mismatch",
-            "receipt-bound discovery evidence is not canonical JSON",
-        )
+                f"legacy discovery recovery is missing a bound member: {required}",
+            )
+        native_inventory = {
+            row["path"].removeprefix("input/cad/"): row["sha256"]
+            for row in files
+            if row["type"] == "file" and row["path"].startswith("input/cad/")
+        }
+        artifact_hashes = {
+            row["path"]: row["sha256"]
+            for row in files
+            if row["type"] == "file" and row["path"] in artifact_paths
+        }
+        input_inventory = {
+            path.removeprefix("input/"): checksum
+            for path, checksum in artifact_hashes.items()
+            if path.startswith("input/")
+            and path not in {"input/request.json", "input/handoff.json"}
+            and not path.startswith("input/discovery/")
+        }
+        documents = {}
+        for relative, label in (
+            ("evidence/capture-plan.json", "capture plan"),
+            ("evidence/discovery.json", "discovery evidence"),
+            ("input/handoff.json", "frozen handoff"),
+            ("input/request.json", "frozen request"),
+            ("input/source.json", "source identity"),
+            ("reports/native-tool.json", "native tool"),
+        ):
+            try:
+                raw, document = strict_json_file(tree / relative, label)
+            except RecoveryError as error:
+                raise RecoveryError(
+                    "recovery_member_hash_mismatch",
+                    "legacy discovery recovery bindings are unreadable",
+                ) from error
+            require(
+                raw == canonical(document),
+                "recovery_member_hash_mismatch",
+                f"receipt-bound {label} is not canonical JSON",
+            )
+            documents[relative] = (raw, document)
+        discovery_bytes, discovery = documents["evidence/discovery.json"]
+        capture_plan = documents["evidence/capture-plan.json"][1]
+        handoff = documents["input/handoff.json"][1]
+        request_record = documents["input/request.json"][1]
+        source_record = documents["input/source.json"][1]
+        native_tool = documents["reports/native-tool.json"][1]
         require(
             discovery_qc_details.get("discovery_sha256")
             == hashlib.sha256(discovery_bytes).hexdigest(),
             "recovery_member_hash_mismatch",
             "legacy discover output carries another discovery digest",
         )
-        native_inventory = {
-            row["path"].removeprefix("input/cad/"): row["sha256"]
-            for row in files
-            if row["type"] == "file" and row["path"].startswith("input/cad/")
+        native_stage_files = {
+            f"input/{name}": checksum for name, checksum in native_inventory.items()
+        }
+        alias_files = {
+            alias: sha256_file(tree / path)
+            for alias, path in DISCOVERY_ALIAS_FILES.items()
+        }
+        qc_files = {}
+        for row in stages:
+            for boundary in ("input_qc", "output_qc"):
+                for check in row.get(boundary) or []:
+                    details = check.get("details") if isinstance(check, dict) else None
+                    if isinstance(details, dict) and isinstance(details.get("files"), dict):
+                        qc_files.update(details["files"])
+            for output in row.get("outputs") or []:
+                output_files = output.get("files") if isinstance(output, dict) else None
+                path = output.get("path") if isinstance(output, dict) else None
+                if isinstance(output_files, dict) and set(output_files) == {path}:
+                    qc_files.update(output_files)
+        discover_files = {
+            **native_stage_files,
+            "input/capture-plan.json": artifact_hashes["evidence/capture-plan.json"],
+            "input/source.json": artifact_hashes["input/source.json"],
+            **alias_files,
+        }
+        complete_files = {
+            **discover_files,
+            **{
+                f"input/cad/{name}": checksum
+                for name, checksum in native_inventory.items()
+            },
+            "input/handoff.json": None,
+        }
+        full_files = {
+            **complete_files,
+            **{
+                path: checksum
+                for path, checksum in qc_files.items()
+                if path.startswith("evidence/")
+            },
+        }
+        if "evidence/manifest.json" in full_files:
+            full_files["evidence/manifest.json"] = None
+        require(
+            discovery_qc_details.get("files") == discover_files,
+            "recovery_member_hash_mismatch",
+            "legacy discover output inventory is not exact",
+        )
+        exact_downstream_inventories = {
+            "aliases-v1": alias_files,
+            "discovery-v1": discover_files,
+            "complete-input-v1": complete_files,
+            "full-evidence-v1": full_files,
         }
         require(
             all(
-                discovery_qc_details["files"].get(f"input/{name}") == checksum
-                for name, checksum in native_inventory.items()
+                any(
+                    set(files) == set(expected)
+                    and all(
+                        value is None or files[path] == value
+                        for path, value in expected.items()
+                    )
+                    for expected in exact_downstream_inventories.values()
+                )
+                for files in allowed_positions[1:]
             ),
             "recovery_member_hash_mismatch",
-            "legacy discover output differs from the input/cad inventory",
+            "legacy verify or publish stage inventory is not an exact supported version",
         )
         try:
             discovery = validate_historical_discovery_document(
@@ -2724,6 +3221,8 @@ def _legacy_discovery_sidecars(
                 run_id=producer_run_id,
                 handoff_sha256=handoff_sha256,
                 native_inventory=native_inventory,
+                request_record=request_record,
+                native_tool=native_tool,
             )
         except PipelineError as error:
             raise RecoveryError(
@@ -2731,11 +3230,33 @@ def _legacy_discovery_sidecars(
                 "receipt-bound discovery evidence is invalid",
             ) from error
         try:
-            validate_historical_identity_resolution(identity, discovery=discovery)
+            validated_identity = validate_historical_identity_resolution(
+                identity,
+                discovery=discovery,
+                request_record=request_record,
+            )
         except PipelineError as error:
             raise RecoveryError(
                 "recovery_member_hash_mismatch",
                 "legacy identity resolution is invalid",
+            ) from error
+        try:
+            validate_historical_recovery_artifacts(
+                discovery=discovery,
+                capture_plan=capture_plan,
+                handoff=handoff,
+                source_record=source_record,
+                request_record=request_record,
+                identity_resolution=validated_identity,
+                native_inventory=native_inventory,
+                input_inventory=input_inventory,
+                discovery_sha256=hashlib.sha256(discovery_bytes).hexdigest(),
+                handoff_sha256=handoff_sha256,
+            )
+        except PipelineError as error:
+            raise RecoveryError(
+                "recovery_member_hash_mismatch",
+                "legacy recovery artifacts are invalid",
             ) from error
         expected = canonical(
             {
@@ -2807,6 +3328,12 @@ def verify_checkpoint_tree(
             tree,
             files,
             receipt,
+            artifact_paths,
+            delivery["policy"]["digest"],
+        )
+        _verify_native_stage_file_maps(
+            tree,
+            files,
             artifact_paths,
             delivery["policy"]["digest"],
         )
