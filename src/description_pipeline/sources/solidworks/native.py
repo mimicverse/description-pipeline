@@ -7436,6 +7436,8 @@ class SolidWorksBackend(CadBackend):
         body_type,
         component,
         reference_registry=None,
+        *,
+        body_holder=None,
     ):
         """Capture the production v3 tessellation stream from ITessellation."""
 
@@ -7510,9 +7512,26 @@ class SolidWorksBackend(CadBackend):
                 ][1],
             }
 
-        def read_body_rows():
+        replay_bodies = (
+            list(bodies)
+            if body_holder is None
+            else self._body_list(body_holder, body_type, component)
+        )
+        if len(replay_bodies) != len(bodies):
+            raise CadError(
+                "cad_body_identity_changed",
+                "the complete native body identity set changed size",
+                {
+                    "component": component,
+                    "body_type": body_type,
+                    "first_body_count": len(bodies),
+                    "replay_body_count": len(replay_bodies),
+                },
+            )
+
+        def read_body_rows(current_bodies):
             rows = []
-            for body_index, raw_body in enumerate(bodies):
+            for body_index, raw_body in enumerate(current_bodies):
                 body = _dynamic(raw_body)
                 context = {
                     "component": component,
@@ -7647,8 +7666,8 @@ class SolidWorksBackend(CadBackend):
                 )
             return rows
 
-        body_rows = read_body_rows()
-        replay_rows = read_body_rows()
+        body_rows = read_body_rows(bodies)
+        replay_rows = read_body_rows(replay_bodies)
         for row, replay in zip(body_rows, replay_rows, strict=True):
             if (
                 row["body_index"] != replay["body_index"]
@@ -7976,6 +7995,7 @@ class SolidWorksBackend(CadBackend):
                     body_type,
                     component,
                     reference_registry,
+                    body_holder=holder,
                 )
                 triangle_offset = len(values) // 9
                 values.extend(body_values)

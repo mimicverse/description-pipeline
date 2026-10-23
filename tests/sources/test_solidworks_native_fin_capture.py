@@ -655,6 +655,78 @@ class NativeFinCaptureTests(unittest.TestCase):
             "cad_body_identity_changed",
         )
 
+    def test_write_path_enumerates_each_nonempty_body_type_twice(self):
+        body, _face_10, _face_20, _edge, _tessellation, extension = (
+            self.fixture()
+        )
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        backend = self.body_identity_backend(source_path, extension)
+
+        class CountingHolder:
+            def __init__(self):
+                self.calls = []
+
+            def GetBodies2(self, body_type):  # noqa: N802
+                self.calls.append(body_type)
+                return [body] if body_type == 1 else []
+
+        holder = CountingHolder()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                holder,
+            )
+
+        self.assertEqual(holder.calls, [0, 1, 1])
+
+    def test_body_set_replay_rejects_reorder_replacement_and_size_drift(self):
+        first, *_ = self.fixture()
+        second, *_ = self.fixture()
+        replacement, *_ = self.fixture()
+
+        class ReplayHolder:
+            def __init__(self, replay):
+                self.replay = replay
+
+            def GetBodies2(self, body_type):  # noqa: N802
+                return list(self.replay) if body_type == 1 else []
+
+        for label, replay in (
+            ("reorder", [second, first]),
+            ("replacement", [first, replacement]),
+            ("size", [first]),
+        ):
+            with self.subTest(label=label):
+                temp_root = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, temp_root)
+                source_path = temp_root / "fixture.SLDPRT"
+                source_path.write_bytes(b"fixture")
+                extension = FakeExtension()
+                backend = self.body_identity_backend(
+                    source_path,
+                    extension,
+                )
+                with self.assertRaises(CadError) as caught:
+                    backend._body_face_triangles(
+                        [first, second],
+                        1,
+                        "part-1",
+                        body_holder=ReplayHolder(replay),
+                    )
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_body_identity_changed",
+                )
+
     def test_preclassified_body_and_owner_references_have_no_late_read(self):
         body, _face_10, _face_20, _edge, _tessellation, extension = (
             self.fixture()
