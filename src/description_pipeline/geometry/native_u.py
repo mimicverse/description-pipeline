@@ -23,6 +23,12 @@ NATIVE_CURVE_ENDPOINT_OPERATION_RULE = (
 NATIVE_TOLERANT_EDGE_BOUNDARY_RULE = (
     "native-tolerant-edge-boundary-euclidean-v5"
 )
+NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE = (
+    "native-curve-topology-endpoint-set-v2"
+)
+NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE = (
+    "native-open-edge-boundary-identity-v1"
+)
 NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
     "tessellation-edge-projection-v1"
 )
@@ -83,10 +89,6 @@ NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS = frozenset(
 NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS = (
     NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS
     | {"affected_fields", "reason", "qualification"}
-)
-NATIVE_CURVE_TOPOLOGY_PAIRING_RULE = "native-curve-topology-paired-endpoints-v1"
-NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE = (
-    "NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M"
 )
 NATIVE_COLLAPSED_U_FIN_RULE = "native-fin-u-collapse-v1"
 NATIVE_PERIODIC_FIN_INTERVAL_RULE = "native-periodic-fin-interval-v1"
@@ -865,6 +867,33 @@ def native_point_euclidean_error(
     return math.hypot(*values)
 
 
+def native_point_within_max_coordinate_bound(
+    left,
+    right,
+    bound_m,
+) -> bool:
+    """Compare max-coordinate distance using exact binary64 differences."""
+
+    if len(left) != 3 or len(right) != 3:
+        raise ValueError("points must contain three coordinates")
+    if type(bound_m) not in (int, float):
+        raise ValueError("coordinate bound must be a JSON number")
+    bound = float(bound_m)
+    if not math.isfinite(bound) or bound < 0.0:
+        raise ValueError("coordinate bound must be finite and non-negative")
+    bound_fraction = Fraction.from_float(bound)
+    for left_value, right_value in zip(left, right, strict=True):
+        left_float = _native_u(left_value)
+        right_float = _native_u(right_value)
+        difference = abs(
+            Fraction.from_float(left_float)
+            - Fraction.from_float(right_float)
+        )
+        if difference > bound_fraction:
+            return False
+    return True
+
+
 def native_point_within_euclidean_bound(left, right, bound_m) -> bool:
     """Compare one Euclidean distance to an outward binary64 bound exactly."""
 
@@ -1047,24 +1076,25 @@ def native_tolerant_edge_evidence(
     }
 
 
-def native_curve_topology_endpoint_assignment(
+def native_curve_topology_endpoint_set_assignment(
     expected_start,
     expected_end,
     actual_start,
     actual_end,
-    *,
-    tolerance_m: float = NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
 ) -> dict:
-    """Prove the sense-directed curve endpoints uniquely match the edge topology."""
+    """Match unordered native endpoint sets without assigning edge direction."""
 
     points = (expected_start, expected_end, actual_start, actual_end)
-    if any(len(point) != 3 for point in points):
+    if any(
+        not isinstance(point, (list, tuple))
+        or len(point) != 3
+        for point in points
+    ):
         raise ValueError("topology endpoint points must contain three coordinates")
-    tolerance = _native_u(tolerance_m)
-    if not math.isfinite(tolerance) or tolerance < 0.0:
-        raise ValueError("topology endpoint tolerance must be finite and non-negative")
-    if tolerance != NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M:
-        raise ValueError("topology endpoint tolerance must use the fixed native bound")
+    expected_start = tuple(_native_u(value) for value in expected_start)
+    expected_end = tuple(_native_u(value) for value in expected_end)
+    actual_start = tuple(_native_u(value) for value in actual_start)
+    actual_end = tuple(_native_u(value) for value in actual_end)
     direct_error = max(
         native_point_error(expected_start, actual_start),
         native_point_error(expected_end, actual_end),
@@ -1073,31 +1103,423 @@ def native_curve_topology_endpoint_assignment(
         native_point_error(expected_start, actual_end),
         native_point_error(expected_end, actual_start),
     )
-    accepted = direct_error <= tolerance < swapped_error
-    if accepted:
-        result = "sense_directed"
-    elif direct_error <= tolerance:
-        result = "ambiguous"
-    elif swapped_error <= tolerance:
-        result = "swapped_only"
+    tolerance = NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+    direct_complete = (
+        native_point_within_max_coordinate_bound(
+            expected_start,
+            actual_start,
+            tolerance,
+        )
+        and native_point_within_max_coordinate_bound(
+            expected_end,
+            actual_end,
+            tolerance,
+        )
+    )
+    swapped_complete = (
+        native_point_within_max_coordinate_bound(
+            expected_start,
+            actual_end,
+            tolerance,
+        )
+        and native_point_within_max_coordinate_bound(
+            expected_end,
+            actual_start,
+            tolerance,
+        )
+    )
+    matching_count = int(direct_complete) + int(swapped_complete)
+    distinct_endpoints = (
+        expected_start != expected_end
+        and actual_start != actual_end
+    )
+    accepted = distinct_endpoints and matching_count >= 1
+    if direct_complete and not swapped_complete:
+        canonical_result = "direct"
+        canonical_error = direct_error
+        alternative_error = swapped_error
+    elif swapped_complete and not direct_complete:
+        canonical_result = "swapped"
+        canonical_error = swapped_error
+        alternative_error = direct_error
+    elif direct_complete and swapped_complete:
+        canonical_result = "direct"
+        canonical_error = min(direct_error, swapped_error)
+        alternative_error = abs(swapped_error - direct_error)
     else:
-        result = "unmatched"
-    return {
-        "rule_version": NATIVE_CURVE_TOPOLOGY_PAIRING_RULE,
+        canonical_result = None
+        canonical_error = None
+        alternative_error = None
+    record = {
+        "rule_version": NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE,
         "metric": "max_abs_coordinate",
+        "tolerance_m": tolerance,
         "expected_start_point_m": list(expected_start),
         "expected_end_point_m": list(expected_end),
         "actual_start_point_m": list(actual_start),
         "actual_end_point_m": list(actual_end),
         "direct_error_m": direct_error,
         "swapped_error_m": swapped_error,
-        "direct_margin_to_tolerance_m": tolerance - direct_error,
-        "wrong_assignment_margin_m": swapped_error - tolerance,
-        "point_tolerance_m": tolerance,
-        "point_tolerance_source": NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE,
-        "result": result,
+        "complete_match_count": matching_count,
+        "canonical_result": canonical_result,
+        "canonical_error_m": canonical_error,
+        "alternative_margin_m": alternative_error,
+        "distinct_endpoint_sets": distinct_endpoints,
         "accepted": accepted,
     }
+    record["endpoint_set_sha256"] = hashlib.sha256(
+        json.dumps(
+            record,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    return record
+
+
+def _boundary_role(
+    u_value: float,
+    u_min: float,
+    u_max: float,
+) -> str | None:
+    at_min = native_u_equal(u_value, u_min)
+    at_max = native_u_equal(u_value, u_max)
+    if at_min == at_max:
+        return None
+    return "u_min" if at_min else "u_max"
+
+
+def _gap_mapping_options(
+    source_start,
+    source_end,
+    target_start,
+    target_end,
+    gap_m: float,
+) -> dict:
+    def pair_error(left, right) -> float:
+        return native_point_euclidean_error(tuple(left), tuple(right))
+
+    direct_errors = (
+        pair_error(source_start, target_start),
+        pair_error(source_end, target_end),
+    )
+    swapped_errors = (
+        pair_error(source_start, target_end),
+        pair_error(source_end, target_start),
+    )
+    direct_complete = (
+        native_point_within_euclidean_bound(
+            source_start,
+            target_start,
+            gap_m,
+        )
+        and native_point_within_euclidean_bound(
+            source_end,
+            target_end,
+            gap_m,
+        )
+    )
+    swapped_complete = (
+        native_point_within_euclidean_bound(
+            source_start,
+            target_end,
+            gap_m,
+        )
+        and native_point_within_euclidean_bound(
+            source_end,
+            target_start,
+            gap_m,
+        )
+    )
+    options = []
+    for name, errors, complete in (
+        ("direct", direct_errors, direct_complete),
+        ("swapped", swapped_errors, swapped_complete),
+    ):
+        options.append(
+            {
+                "result": name,
+                "start_error_m": errors[0],
+                "end_error_m": errors[1],
+                "maximum_error_m": max(errors),
+                "complete": complete,
+            }
+        )
+    accepted = [item for item in options if item["complete"]]
+    selected = accepted[0] if len(accepted) == 1 else None
+    rejected = [item for item in options if not item["complete"]]
+    margin = (
+        min(item["maximum_error_m"] for item in rejected) - selected["maximum_error_m"]
+        if selected is not None
+        else None
+    )
+    return {
+        "metric": "euclidean",
+        "gap_m": gap_m,
+        "options": options,
+        "complete_match_count": len(accepted),
+        "selected_result": selected["result"] if selected is not None else None,
+        "selected_maximum_error_m": (
+            selected["maximum_error_m"] if selected is not None else None
+        ),
+        "matching_margin_m": margin,
+        "unique": selected is not None,
+    }
+
+
+def native_open_edge_boundary_identity(
+    *,
+    edge_reference_sha256: str,
+    edge_endpoint_refs: tuple[str, str],
+    edge_start_point: tuple,
+    edge_end_point: tuple,
+    fin_id: int,
+    fin_vertex_ids: tuple[int, int],
+    fin_start_point: tuple,
+    fin_end_point: tuple,
+    curve_start_point: tuple,
+    curve_end_point: tuple,
+    curve_u_min: float,
+    curve_u_max: float,
+    fin_endpoint_u: tuple[float, float],
+    fin_endpoint_success: tuple[bool, bool],
+    curve_sense: bool,
+    gap_m: float,
+    body_type: int,
+    face_count: int,
+    cofin_raw_id: int,
+    edge_fin_ids: tuple[int, ...],
+    topology_set_accepted: bool,
+) -> dict:
+    """Prove one open sheet boundary fin through unordered native identities."""
+
+    if (
+        not isinstance(edge_reference_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", edge_reference_sha256) is None
+    ):
+        raise ValueError("edge reference must be a SHA-256")
+    if (
+        not isinstance(edge_endpoint_refs, tuple)
+        or len(edge_endpoint_refs) != 2
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in edge_endpoint_refs
+        )
+        or edge_endpoint_refs[0] == edge_endpoint_refs[1]
+    ):
+        raise ValueError("edge endpoint refs must be two distinct SHA-256 values")
+    if (
+        not isinstance(fin_vertex_ids, tuple)
+        or len(fin_vertex_ids) != 2
+        or any(type(value) is not int or value < 0 for value in fin_vertex_ids)
+        or fin_vertex_ids[0] == fin_vertex_ids[1]
+    ):
+        raise ValueError("fin vertex IDs must be two distinct non-negative integers")
+    if type(fin_id) is not int or fin_id < 0:
+        raise ValueError("fin ID must be a non-negative integer")
+    if (
+        not isinstance(edge_fin_ids, tuple)
+        or not edge_fin_ids
+        or any(type(value) is not int or value < 0 for value in edge_fin_ids)
+        or len(edge_fin_ids) != len(set(edge_fin_ids))
+        or fin_id not in edge_fin_ids
+    ):
+        raise ValueError("fin must belong to one unique edge fin set")
+    if (
+        type(body_type) is not int
+        or type(face_count) is not int
+        or type(cofin_raw_id) is not int
+        or body_type != 1
+        or face_count != 1
+        or cofin_raw_id != -1
+    ):
+        raise ValueError("open-edge identity requires a one-face sheet boundary fin")
+    if type(curve_sense) is not bool:
+        raise ValueError("curve sense must be a strict boolean")
+    if (
+        not isinstance(fin_endpoint_success, tuple)
+        or len(fin_endpoint_success) != 2
+        or any(type(value) is not bool or value is not True for value in fin_endpoint_success)
+    ):
+        raise ValueError("both fin endpoints require successful GetParameter")
+    if (
+        not isinstance(fin_endpoint_u, tuple)
+        or len(fin_endpoint_u) != 2
+        or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in fin_endpoint_u)
+    ):
+        raise ValueError("fin endpoint U values must be finite numbers")
+    if type(topology_set_accepted) is not bool or topology_set_accepted is not True:
+        raise ValueError("unordered curve/edge endpoint identity must be accepted")
+    if (
+        type(curve_u_min) not in (int, float)
+        or type(curve_u_max) not in (int, float)
+        or not math.isfinite(float(curve_u_min))
+        or not math.isfinite(float(curve_u_max))
+        or float(curve_u_min) >= float(curve_u_max)
+    ):
+        raise ValueError("curve U boundaries must be finite and increasing")
+    gap = native_tolerant_edge_gap(gap_m)
+    points = (
+        edge_start_point,
+        edge_end_point,
+        fin_start_point,
+        fin_end_point,
+        curve_start_point,
+        curve_end_point,
+    )
+    if any(
+        not isinstance(point, (list, tuple))
+        or len(point) != 3
+        for point in points
+    ):
+        raise ValueError("identity points must contain three coordinates")
+    edge_start_point = tuple(_native_u(value) for value in edge_start_point)
+    edge_end_point = tuple(_native_u(value) for value in edge_end_point)
+    fin_start_point = tuple(_native_u(value) for value in fin_start_point)
+    fin_end_point = tuple(_native_u(value) for value in fin_end_point)
+    curve_start_point = tuple(_native_u(value) for value in curve_start_point)
+    curve_end_point = tuple(_native_u(value) for value in curve_end_point)
+
+    roles = (
+        _boundary_role(float(fin_endpoint_u[0]), curve_u_min, curve_u_max),
+        _boundary_role(float(fin_endpoint_u[1]), curve_u_min, curve_u_max),
+    )
+    if set(roles) != {"u_min", "u_max"}:
+        raise ValueError("fin endpoints must map to opposite exact U boundaries")
+
+    fin_mapping = _gap_mapping_options(
+        fin_start_point,
+        fin_end_point,
+        edge_start_point,
+        edge_end_point,
+        gap,
+    )
+    curve_mapping = _gap_mapping_options(
+        curve_start_point,
+        curve_end_point,
+        edge_start_point,
+        edge_end_point,
+        gap,
+    )
+    if not fin_mapping["unique"] or not curve_mapping["unique"]:
+        raise ValueError("gap-bounded endpoint mapping is not unique")
+
+    two_gap = math.nextafter(2.0 * gap, math.inf)
+    separation_diagnostics = {
+        "possible_ambiguity_bound_m": two_gap,
+        "edge_separation_at_most_bound": (
+            native_point_within_euclidean_bound(
+                edge_start_point,
+                edge_end_point,
+                two_gap,
+            )
+        ),
+        "fin_separation_at_most_bound": (
+            native_point_within_euclidean_bound(
+                fin_start_point,
+                fin_end_point,
+                two_gap,
+            )
+        ),
+        "curve_separation_at_most_bound": (
+            native_point_within_euclidean_bound(
+                curve_start_point,
+                curve_end_point,
+                two_gap,
+            )
+        ),
+        "used_for_decision": False,
+    }
+
+    def endpoint_name(result: str, source: str) -> str:
+        if result == "direct":
+            return "start" if source == "start" else "end"
+        return "end" if source == "start" else "start"
+
+    fin_to_edge = {
+        "start": endpoint_name(fin_mapping["selected_result"], "start"),
+        "end": endpoint_name(fin_mapping["selected_result"], "end"),
+    }
+    curve_to_edge = {
+        "start": endpoint_name(curve_mapping["selected_result"], "start"),
+        "end": endpoint_name(curve_mapping["selected_result"], "end"),
+    }
+    for fin_endpoint, role in zip(("start", "end"), roles, strict=True):
+        curve_endpoint = "start" if role == "u_min" else "end"
+        if fin_to_edge[fin_endpoint] != curve_to_edge[curve_endpoint]:
+            raise ValueError("fin U boundary and gap mapping disagree on edge endpoint")
+
+    record = {
+        "rule_version": NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE,
+        "edge_reference_sha256": edge_reference_sha256,
+        "edge_endpoint_refs": {
+            "start": edge_endpoint_refs[0],
+            "end": edge_endpoint_refs[1],
+        },
+        "body_type": body_type,
+        "face_count": face_count,
+        "cofin_raw_id": cofin_raw_id,
+        "edge_fin_ids": list(edge_fin_ids),
+        "fin_id": fin_id,
+        "fin_vertex_ids": list(fin_vertex_ids),
+        "edge_endpoint_points_m": {
+            "start": list(edge_start_point),
+            "end": list(edge_end_point),
+        },
+        "fin_endpoint_points_m": {
+            "start": list(fin_start_point),
+            "end": list(fin_end_point),
+        },
+        "curve_endpoint_points_m": {
+            "start": list(curve_start_point),
+            "end": list(curve_end_point),
+        },
+        "curve_u_boundaries": {
+            "u_min": float(curve_u_min),
+            "u_max": float(curve_u_max),
+        },
+        "fin_endpoint_u": {
+            "start": float(fin_endpoint_u[0]),
+            "end": float(fin_endpoint_u[1]),
+        },
+        "fin_endpoint_boundary_roles": {
+            "start": roles[0],
+            "end": roles[1],
+        },
+        "curve_sense": curve_sense,
+        "gap": {
+            "metric": "max_abs_coordinate",
+            "value_m": gap,
+            "inclusive": True,
+            "source": NATIVE_TOLERANT_EDGE_GAP_SOURCE,
+        },
+        "separation_diagnostics": separation_diagnostics,
+        "curve_to_edge_mapping": curve_mapping,
+        "fin_to_edge_mapping": fin_mapping,
+        "selected_fin_to_edge": fin_to_edge,
+        "selected_curve_to_edge": curve_to_edge,
+        "fin_vertex_com_mapping": {
+            "required": False,
+            "used_for_gate": False,
+        },
+        "direction_dot": {
+            "used_for_decision": False,
+        },
+        "accepted": True,
+    }
+    record["identity_chain_sha256"] = hashlib.sha256(
+        json.dumps(
+            record,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    return record
 
 
 def native_curve_endpoint_roles(

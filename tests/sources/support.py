@@ -26,8 +26,9 @@ from description_pipeline.geometry.native_u import (
     native_curve_domain_transform,
     native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
-    native_curve_topology_endpoint_assignment,
+    native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
+    native_open_edge_boundary_identity,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_tolerant_edge_boundary,
@@ -235,6 +236,9 @@ def _u_evidence(
     is_tolerant: bool = False,
     tolerant_gap_m: float = 0.0,
     edge_reference_sha256: str | None = None,
+    topology_accepted: bool = True,
+    open_edge_identity_sha256: str | None = None,
+    topology_direction_accepted: bool = False,
 ) -> dict[str, Any]:
     payload, packed_status = _evaluate2_evidence(point)
     evaluated_point = tuple(payload[:3])
@@ -252,7 +256,7 @@ def _u_evidence(
             curve_end,
             is_tolerant=is_tolerant,
             gap_m=tolerant_gap_m,
-            topology_accepted=True,
+            topology_accepted=topology_accepted,
         )
         tolerance = tolerant_edge_metrics["point_tolerance_m"]
         point_error = tolerant_edge_metrics[
@@ -283,7 +287,7 @@ def _u_evidence(
             curve_start,
             is_tolerant=is_tolerant,
             gap_m=tolerant_gap_m,
-            topology_accepted=True,
+            topology_accepted=topology_accepted,
         )
         tolerance = tolerant_edge_metrics["point_tolerance_m"]
         point_error = tolerant_edge_metrics[
@@ -335,6 +339,8 @@ def _u_evidence(
         "parameter_success_parsed": True,
         "evaluate_payload": payload,
         "evaluate_packed_status": packed_status,
+        "open_edge_identity_sha256": open_edge_identity_sha256,
+        "topology_direction_accepted": topology_direction_accepted,
     }
 
 
@@ -578,6 +584,7 @@ def native_tessellation_fixture(
                             "end_evidence": None,
                             "cofin_raw_id": None,
                             "cofin_id": None,
+                            "open_edge_boundary_identity": None,
                         }
                     )
                 facets.append(
@@ -775,6 +782,7 @@ def native_tessellation_fixture(
                         ),
                         "cofin_raw_id": -1,
                         "cofin_id": None,
+                        "open_edge_boundary_identity": None,
                     }
                 )
                 body["assigned_fin_ids"].add(first_fin["fin_id"])
@@ -839,6 +847,7 @@ def native_tessellation_fixture(
                             ),
                             "cofin_raw_id": second_fin["fin_id"],
                             "cofin_id": second_fin["fin_id"],
+                            "open_edge_boundary_identity": None,
                         }
                     )
                     second_fin.update(
@@ -871,6 +880,7 @@ def native_tessellation_fixture(
                             ),
                             "cofin_raw_id": first_fin["fin_id"],
                             "cofin_id": first_fin["fin_id"],
+                            "open_edge_boundary_identity": None,
                         }
                     )
                     body["assigned_fin_ids"].update(
@@ -906,12 +916,81 @@ def native_tessellation_fixture(
             curve_end_point,
             curve_sense,
         )
-        topology_assignment = native_curve_topology_endpoint_assignment(
+        topology_assignment = native_curve_topology_endpoint_set_assignment(
             topology_endpoints[0],
             topology_endpoints[1],
             edge["start_point_m"],
             edge["end_point_m"],
         )
+        directed_topology_accepted = (
+            topology_assignment["accepted"] is True
+            and topology_assignment["direct_error_m"]
+            <= topology_assignment["tolerance_m"]
+            < topology_assignment["swapped_error_m"]
+        )
+        fins_by_id = {fin["fin_id"]: fin for fin in body["fins"]}
+        for fin_id in edge_fin_ids:
+            fin = fins_by_id[fin_id]
+            fin_evidence = (
+                fin["start_evidence"],
+                fin["end_evidence"],
+            )
+            uses_tolerant_gap = any(
+                evidence["tolerant_edge_evidence"] is not None
+                for evidence in fin_evidence
+            )
+            if uses_tolerant_gap:
+                open_identity = native_open_edge_boundary_identity(
+                    edge_reference_sha256=edge["edge_reference_sha256"],
+                    edge_endpoint_refs=(
+                        edge["start_vertex_reference_sha256"],
+                        edge["end_vertex_reference_sha256"],
+                    ),
+                    edge_start_point=tuple(edge["start_point_m"]),
+                    edge_end_point=tuple(edge["end_point_m"]),
+                    fin_id=fin_id,
+                    fin_vertex_ids=tuple(fin["vertex_ids"]),
+                    fin_start_point=body["points_by_vertex_id"][
+                        fin["vertex_ids"][0]
+                    ],
+                    fin_end_point=body["points_by_vertex_id"][
+                        fin["vertex_ids"][1]
+                    ],
+                    curve_start_point=curve_start_point,
+                    curve_end_point=curve_end_point,
+                    curve_u_min=u_min,
+                    curve_u_max=u_max,
+                    fin_endpoint_u=(
+                        fin["start_u"],
+                        fin["end_u"],
+                    ),
+                    fin_endpoint_success=(
+                        fin["start_evidence"][
+                            "parameter_success_parsed"
+                        ],
+                        fin["end_evidence"][
+                            "parameter_success_parsed"
+                        ],
+                    ),
+                    curve_sense=curve_sense,
+                    gap_m=edge["tolerant_gap_m"],
+                    body_type=body_type,
+                    face_count=len(face_indices),
+                    cofin_raw_id=fin["cofin_raw_id"],
+                    edge_fin_ids=tuple(sorted(edge_fin_ids)),
+                    topology_set_accepted=topology_assignment["accepted"],
+                )
+                fin["open_edge_boundary_identity"] = open_identity
+                for evidence in fin_evidence:
+                    evidence["open_edge_identity_sha256"] = open_identity[
+                        "identity_chain_sha256"
+                    ]
+                    evidence["topology_direction_accepted"] = True
+            else:
+                for evidence in fin_evidence:
+                    evidence["topology_direction_accepted"] = (
+                        directed_topology_accepted
+                    )
         edge_rows.append(
             {
                 "body_type": body_key[0],
@@ -1153,7 +1232,7 @@ def refresh_topology_endpoint_assignment(tessellation: dict[str, Any]) -> None:
             edge["curve_sense"],
         )
         edge["topology_endpoint_assignment"] = (
-            native_curve_topology_endpoint_assignment(
+            native_curve_topology_endpoint_set_assignment(
                 topology_endpoints[0],
                 topology_endpoints[1],
                 edge["start_point_m"],
