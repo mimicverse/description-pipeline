@@ -38,6 +38,10 @@ NATIVE_SCOPE_MAPPING_METHOD = (
     "direct_part_reference_witness+exact_native_area+"
     "exact_tessellation_bbox+bidirectional_one_to_one+topology_replay"
 )
+NATIVE_SCOPE_BODY_MAPPING_METHOD = (
+    "direct_part_reference_witness+"
+    "bidirectional_face_edge_vertex_topology_replay+body_name"
+)
 NATIVE_SCOPE_VERTEX_MAPPING_METHOD = (
     "direct_part_reference_witness+exact_native_point+"
     "coincident_ordinal+topology_incidence_replay"
@@ -92,7 +96,7 @@ def native_scope_warning_detail_is_valid(detail: object) -> bool:
         and set(detail) == NATIVE_SCOPE_WARNING_DETAIL_FIELDS
         and isinstance(detail.get("component"), str)
         and bool(detail["component"])
-        and detail.get("entity_kind") in {"face", "edge", "vertex"}
+        and detail.get("entity_kind") in {"body", "face", "edge", "vertex"}
         and type(detail.get("body_type")) is int
         and detail["body_type"] in {0, 1}
         and type(detail.get("body_index")) is int
@@ -127,7 +131,7 @@ def native_scope_warning_detail_is_valid(detail: object) -> bool:
             or isinstance(detail["body_name"], str)
         )
         and (
-            detail["entity_kind"] != "face"
+            detail["entity_kind"] not in {"body", "face"}
             or (
                 isinstance(detail["referenced_configuration"], str)
                 and bool(detail["referenced_configuration"])
@@ -135,6 +139,20 @@ def native_scope_warning_detail_is_valid(detail: object) -> bool:
                 and detail["occurrence_scope"] == detail["component"]
                 and isinstance(detail["body_name"], str)
                 and bool(detail["body_name"])
+            )
+        )
+        and (
+            detail["entity_kind"] != "body"
+            or (
+                len(detail["object_indices"]) == 1
+                and len(detail["mapped_source_indices"]) == 1
+                and len(
+                    detail[
+                        "mapped_source_persistent_reference_sha256"
+                    ]
+                )
+                == 1
+                and len(detail["topology_signature_sha256s"]) == 1
             )
         )
         and isinstance(

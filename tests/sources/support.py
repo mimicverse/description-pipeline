@@ -17,6 +17,7 @@ from description_pipeline.geometry.native_u import (
     NATIVE_IDENTITY_POLICY_RULE,
     NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
+    NATIVE_SCOPE_IDENTITY_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_IDENTITY_RULE,
@@ -367,6 +368,7 @@ def native_tessellation_fixture(
     no_facets_faces: Sequence[dict[str, Any]] = (),
     *,
     triangle_vertices: Sequence[Sequence[Sequence[float]]] | None = None,
+    body_identities: dict[tuple[int, int], dict[str, Any]] | None = None,
 ) -> NativeTessellationV3Fixture:
     """Build one closed v3 graph and its byte-identical binary STL projection."""
 
@@ -883,6 +885,7 @@ def native_tessellation_fixture(
             }
         )
 
+    body_identities = body_identities or {}
     for body_type, body_index in body_keys:
         body_key = (body_type, body_index)
         body = evidence_by_body[body_key]
@@ -897,7 +900,20 @@ def native_tessellation_fixture(
             {
                 "body_type": body_type,
                 "body_index": body_index,
+                "body_name": body["spans"][0]["body_name"],
                 "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
+                "native_body_reference_sha256": body["spans"][0].get(
+                    "native_body_reference_sha256",
+                    body["spans"][0]["body_reference_sha256"],
+                ),
+                "body_identity_mode": (
+                    NATIVE_SCOPE_IDENTITY_RULE
+                    if body_key in body_identities
+                    else NATIVE_PERSISTENT_IDENTITY_RULE
+                ),
+                "body_identity": copy.deepcopy(
+                    body_identities.get(body_key)
+                ),
                 "tessellate_result": True,
                 "request": native_tessellation_request(body_face_references),
                 "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
@@ -994,6 +1010,27 @@ def native_tessellation_fixture(
         ).hexdigest()
         cursor += span["triangle_count"]
     stl_bytes = bytes(stl_payload)
+    body_alias_audit = sorted(
+        {
+            raw_reference
+            for raw_reference, identities in (
+                (
+                    raw_reference,
+                    {
+                        span["body_reference_sha256"]
+                        for span in spans
+                        if span["native_body_reference_sha256"]
+                        == raw_reference
+                    },
+                )
+                for raw_reference in {
+                    span["native_body_reference_sha256"]
+                    for span in spans
+                }
+            )
+            if len(identities) > 1
+        }
+    )
     envelope = {
         "schema_version": NATIVE_TESSELLATION_SCHEMA,
         "faces": len(spans),
@@ -1015,7 +1052,7 @@ def native_tessellation_fixture(
             },
             "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
             "reference_alias_audit": {
-                "body": [],
+                "body": body_alias_audit,
                 "face": [],
                 "edge": [],
                 "vertex": [],
