@@ -1493,6 +1493,176 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             with self.assertRaisesRegex(recovery.RecoveryError, "authority"):
                 self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
 
+    def test_legacy_capture_plan_binds_selectors_groups_axes_and_datums(self) -> None:
+        from description_pipeline.io import canonical
+
+        def fixture(name: str) -> tuple[Path, dict, dict]:
+            tree, receipt, view = self.legacy_discovery_fixture(base / name)
+            discovery_path = tree / "evidence/discovery.json"
+            discovery = json.loads(discovery_path.read_text())
+            raw = discovery["raw"]
+            raw["components"] = [
+                {
+                    "instance_id": "base-1",
+                    "name2": "base-1",
+                    "document": "base.SLDPRT",
+                    "configuration": "Default",
+                    "suppressed": False,
+                    "suppression_state": 2,
+                    "fixed": True,
+                },
+                {
+                    "instance_id": "base-2",
+                    "name2": "base-2",
+                    "document": "base.SLDPRT",
+                    "configuration": "Default",
+                    "suppressed": False,
+                    "suppression_state": 2,
+                    "fixed": False,
+                },
+            ]
+            selector = {
+                "component": "",
+                "feature_name": "a_joint",
+                "kind": "reference_axis",
+            }
+            raw["reference_axes"] = [
+                {
+                    "kind": "reference_axis",
+                    "selector": selector,
+                }
+            ]
+            raw["datums"] = [
+                {
+                    "name": "c_base",
+                    "owner": "",
+                    "configuration": "Default",
+                }
+            ]
+            write(discovery_path, canonical(discovery))
+
+            plan_path = tree / "evidence/capture-plan.json"
+            plan = json.loads(plan_path.read_text())
+            plan["discovery_sha256"] = hashlib.sha256(
+                discovery_path.read_bytes()
+            ).hexdigest()
+            plan["objects"] = [
+                {"name": "base-1", "document": "base.SLDPRT", "state": 2},
+                {"name": "base-2", "document": "base.SLDPRT", "state": 2},
+            ]
+            plan["groups"] = [
+                {
+                    "name": "base_link",
+                    "components": ["base-1", "base-2"],
+                }
+            ]
+            plan["axis_requests"] = [
+                {"name": "joint", "axis_reference": selector}
+            ]
+            plan["datums"] = ["c_base"]
+            write(plan_path, canonical(plan))
+            receipt, view = self.rewrite_legacy_bindings(tree, receipt, view)
+            return tree, receipt, view
+
+        def rewritten_plan(
+            name: str,
+            mutate,
+        ) -> tuple[Path, dict]:
+            tree, receipt, view = fixture(name)
+            plan_path = tree / "evidence/capture-plan.json"
+            plan = json.loads(plan_path.read_text())
+            mutate(plan)
+            write(plan_path, canonical(plan))
+            receipt, _view = self.rewrite_legacy_bindings(
+                tree,
+                receipt,
+                view,
+            )
+            return tree, receipt
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, _view = fixture("complete")
+            self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "forged-document",
+                lambda plan: plan["objects"][0].update(
+                    document="forged-selector.SLDPRT"
+                ),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "empty-groups",
+                lambda plan: plan.update(groups=[]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "partial-groups",
+                lambda plan: plan["groups"][0].update(components=["base-1"]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "empty-axes",
+                lambda plan: plan.update(axis_requests=[]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "forged-axis",
+                lambda plan: plan["axis_requests"][0].update(
+                    axis_reference={
+                        "component": "",
+                        "feature_name": "forged-axis",
+                        "kind": "reference_axis",
+                    }
+                ),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "empty-datums",
+                lambda plan: plan.update(datums=[]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "forged-datum",
+                lambda plan: plan.update(datums=["c_forged"]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
     def test_legacy_recovery_binds_request_reader_and_native_observations(self) -> None:
         from description_pipeline.io import canonical
 

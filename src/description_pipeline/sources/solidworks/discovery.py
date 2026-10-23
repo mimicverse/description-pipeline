@@ -938,11 +938,24 @@ def validate_historical_recovery_artifacts(
         not isinstance(component, dict) for component in raw_components
     ):
         raise PipelineError("historical capture plan has no native component inventory")
-    expected_objects = {
-        native_component_identity(component): component.get("suppression_state")
+    component_names = [
+        native_component_identity(component)
         for component in raw_components
+    ]
+    if len(set(component_names)) != len(component_names):
+        raise PipelineError("historical capture plan repeats a native component identity")
+    components_by_name = dict(zip(component_names, raw_components, strict=True))
+    expected_objects = {
+        name: component.get("suppression_state")
+        for name, component in components_by_name.items()
         if not component.get("suppressed")
     }
+    raw_documents = {
+        name: str(component.get("document") or "").replace("\\", "/")
+        for name, component in components_by_name.items()
+        if not component.get("suppressed")
+    }
+    raw_selection = raw.get("source_selection")
     objects = plan["objects"]
     if not isinstance(objects, list):
         raise PipelineError("historical capture plan objects are not a list")
@@ -957,7 +970,49 @@ def validate_historical_recovery_artifacts(
             or item["name"] in planned
         ):
             raise PipelineError("historical capture plan object selector is invalid")
-        planned[item["name"]] = item["state"]
+        name = item["name"]
+        component = components_by_name.get(name)
+        if component is None:
+            raise PipelineError("historical capture plan names an unknown native component")
+        document = item.get("document")
+        if document is None:
+            virtual = sealed_embedded_virtual_document(component, name, files)
+            cached = sealed_cached_import_materialization(
+                component,
+                name,
+                files,
+                raw_selection,
+            )
+            if not (virtual or cached):
+                raise PipelineError(
+                    "historical capture plan omits a selector document without session proof"
+                )
+        else:
+            if (
+                not isinstance(document, str)
+                or not document
+                or sealed_cached_import_materialization(
+                    component,
+                    name,
+                    files,
+                    raw_selection,
+                )
+            ):
+                raise PipelineError("historical capture plan has an unusable selector document")
+            try:
+                artifact_path_parts(document)
+            except PipelineError as error:
+                raise PipelineError(
+                    "historical capture plan has an unsafe selector document"
+                ) from error
+            if not document.lower().endswith((".sldprt", ".sldasm")):
+                raise PipelineError("historical capture plan has a non-CAD selector document")
+            recorded_document = raw_documents.get(name, "")
+            if recorded_document and recorded_document != document.replace("\\", "/"):
+                raise PipelineError(
+                    "historical capture plan binds another document to a native component"
+                )
+        planned[name] = item["state"]
     if planned != expected_objects:
         raise PipelineError("historical capture plan selectors differ from discovery")
     groups = plan["groups"]
@@ -968,6 +1023,7 @@ def validate_historical_recovery_artifacts(
             or set(group) != {"name", "components"}
             or not _authored_text(group.get("name"))
             or not isinstance(group.get("components"), list)
+            or not group["components"]
             or any(
                 not _authored_text(component)
                 or component not in planned
@@ -978,6 +1034,34 @@ def validate_historical_recovery_artifacts(
         or len({group["name"] for group in groups}) != len(groups)
     ):
         raise PipelineError("historical capture plan groups differ from discovery selectors")
+    container_names = {
+        name
+        for name in planned
+        if raw_documents.get(name, "").lower().endswith(".sldasm")
+        or any(other != name and other.startswith(name + "/") for other in component_names)
+    }
+    leaf_names = set(planned) - container_names
+    grouped = [
+        component
+        for group in groups
+        for component in group["components"]
+    ]
+    if (
+        len(grouped) != len(set(grouped))
+        or set(grouped) != leaf_names
+        or (bool(groups) != bool(leaf_names))
+    ):
+        raise PipelineError("historical capture plan link groups are incomplete")
+    raw_axes = raw.get("reference_axes")
+    if not isinstance(raw_axes, list):
+        raise PipelineError("historical capture plan has no native reference-axis inventory")
+    raw_axis_selectors = [
+        item.get("selector")
+        for item in raw_axes
+        if isinstance(item, dict)
+    ]
+    if any(not isinstance(selector, dict) for selector in raw_axis_selectors):
+        raise PipelineError("historical capture plan has an unusable native reference-axis inventory")
     axis_requests = plan["axis_requests"]
     if (
         not isinstance(axis_requests, list)
@@ -989,15 +1073,33 @@ def validate_historical_recovery_artifacts(
             for item in axis_requests
         )
         or len({item["name"] for item in axis_requests}) != len(axis_requests)
+        or bool(axis_requests) != bool(raw_axis_selectors)
+        or any(
+            item["axis_reference"] not in raw_axis_selectors
+            for item in axis_requests
+        )
     ):
-        raise PipelineError("historical capture plan axis requests are invalid")
+        raise PipelineError("historical capture plan axis requests differ from discovery")
     datums = plan["datums"]
+    raw_datums = raw.get("datums")
+    if not isinstance(raw_datums, list) or any(
+        not isinstance(item, dict) for item in raw_datums
+    ):
+        raise PipelineError("historical capture plan has no native datum inventory")
+    raw_datum_names = {
+        str(item.get("name"))
+        for item in raw_datums
+        if _authored_text(item.get("name"))
+    }
     if (
         not isinstance(datums, list)
         or any(not _authored_text(datum) for datum in datums)
         or len(set(datums)) != len(datums)
+        or datums != sorted(datums)
+        or bool(datums) != bool(raw_datum_names)
+        or not set(datums) <= raw_datum_names
     ):
-        raise PipelineError("historical capture plan datums are invalid")
+        raise PipelineError("historical capture plan datums differ from discovery")
 
 
 def validate_historical_identity_resolution(
