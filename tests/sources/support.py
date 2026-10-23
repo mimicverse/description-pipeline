@@ -1620,7 +1620,13 @@ class FixtureCadBackend(CadBackend):
         order.append("open_document")
         self.capture_session_pid = self.session_pid
         self.open_documents.append(str(path))
-        return {"opened": Path(path).name, "path": str(path), "read_only": True}
+        return {
+            "opened": Path(path).name,
+            "path": str(path),
+            "read_only": True,
+            "errors": 0,
+            "warnings": 0,
+        }
 
     def close_document(self, name: str, confirm: bool = False) -> dict[str, Any]:
         return {"closed": name}
@@ -1632,14 +1638,17 @@ class FixtureCadBackend(CadBackend):
             # an edit made in the session during the capture: the file on disk is
             # untouched, only the in-memory state moved
             active = "Other"
+        saved = bool(self.saved and str(path) not in self.unsaved_paths)
         return {
             "path": str(path),
             "title": Path(path).name,
-            "saved": self.saved and str(path) not in self.unsaved_paths,
+            "save_flag": not saved,
+            "saved": saved,
             "active_configuration": active,
             "configurations": list(self.configurations),
             "read_only": True,
-            "lightweight": False,
+            "lightweight": None,
+            "unsupported": ["lightweight"],
         }
 
     def save_flag_documents(self) -> list[str]:
@@ -2005,7 +2014,10 @@ class FixtureCadBackend(CadBackend):
         order.append("environment")
         return {
             "revision": "fixture-2026",
-            "license": "fixture",
+            "input_mode": "saved_documents",
+            "build": "fixture-2026",
+            "license": 0,
+            "visible": True,
             "sessions": {
                 "copy": {
                     "pid": self.session_pid,
@@ -2984,6 +2996,10 @@ def seal_scene_inputs(
         records=controlled,
         record_keys=record_keys,
     )
+    runtime = Path(destination) / "native-runtime.json"
+    environment = Path(destination) / "evidence/environment.json"
+    if not runtime.is_file():
+        runtime.write_bytes(environment.read_bytes())
     from description_pipeline.sources.snapshot import write_manifest
 
     manifest = json.loads((Path(destination) / "manifest.json").read_text(encoding="utf-8"))

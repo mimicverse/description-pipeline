@@ -569,26 +569,12 @@ class StructuralReportTests(unittest.TestCase):
             self.assertNotIn("report.effective_instances_missing", codes)
             self.assertNotIn("report.effective_instances_invalid", codes)
 
-    def test_mass_closure_records_are_projected_and_allowlisted(self):
+    def test_raw_mass_closure_errors_are_projected(self):
         from description_pipeline.structural_report import is_sealed_diagnostic_member
 
         self.assertTrue(is_sealed_diagnostic_member("evidence/raw/mass_closure.json"))
-        self.assertTrue(is_sealed_diagnostic_member("reports/mass-closure.json"))
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            write_json(
-                root / "reports/mass-closure.json",
-                {
-                    "findings": [
-                        {
-                            "code": "closure.effective_total_mismatch",
-                            "object": "board-1",
-                            "blocking": True,
-                            "message": "有效实例总质量与闭包不一致",
-                        }
-                    ]
-                },
-            )
             write_json(
                 root / "evidence/raw/mass_closure.json",
                 {
@@ -599,11 +585,7 @@ class StructuralReportTests(unittest.TestCase):
             pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
             report = json.loads((root / pins["json"]["path"]).read_text())
             codes = [item["code"] for item in report["findings"]]
-            self.assertIn("closure.effective_total_mismatch", codes)
             self.assertIn("closure.context_missing", codes)
-            blocker = next(item for item in report["findings"] if item["code"] == "closure.effective_total_mismatch")
-            self.assertEqual(blocker["severity"], "blocker")
-            self.assertEqual(blocker["object"], "board-1")
 
     def test_partial_evidence_resolves_via_gated_failure_roots(self):
         from description_pipeline.structural_report import diagnostic_file_sources
@@ -955,71 +937,6 @@ class StructuralReportTests(unittest.TestCase):
             pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
             report = json.loads((root / pins["json"]["path"]).read_text())
             self.assertIn("report.geometry_metadata_missing", [item["code"] for item in report["findings"]])
-
-    def _selection_record(self, unassigned, **overrides):
-        selection = {
-            "native_mass_kg": 10.0,
-            "selected_mass_kg": 10.0 - sum(row["mass_kg"] for row in unassigned),
-            "unassigned_mass_kg": sum(row["mass_kg"] for row in unassigned),
-            "unassigned": unassigned,
-            "accounting_delta_kg": 0,
-            "whole_mass_qualified": not unassigned,
-        }
-        selection.update(overrides)
-        return {"derived": {"selection": selection}}
-
-    def _washer_row(self):
-        return {
-            "component": "headM3.0-1/垫片2-2",
-            "document": "垫片2.SLDPRT",
-            "configuration": "默认",
-            "parent": "base_link",
-            "mass_kg": 0.0000725,
-        }
-
-    def test_unassigned_occurrence_and_native_gap_warn_with_qualification_withheld(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(root / "reports/mass-closure.json", self._selection_record([self._washer_row()]))
-            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            row = next(item for item in report["findings"] if item["code"] == "cad_unassigned_occurrence_mass")
-            self.assertEqual(row["object"], "headM3.0-1/垫片2-2")
-            self.assertIn("7.25e-05", row["message"])
-            self.assertIn("engineering qualification of its mass ownership is withheld", row["message"])
-            self.assertIn("does not claim missing input or pipeline failure", row["message"])
-            gap = next(item for item in report["findings"] if item["code"] == "cad_native_mass_gap_unqualified")
-            self.assertIn("no normalization was applied", gap["message"])
-            self.assertEqual(report["summary"]["blockers"], 0)
-
-    def test_selection_accounting_schema_and_residual_fail_closed(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            bad = self._washer_row()
-            bad["extra"] = True
-            write_json(root / "reports/mass-closure.json", self._selection_record([bad]))
-            pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            self.assertIn("report.selection_accounting_invalid", [item["code"] for item in report["findings"]])
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(
-                root / "reports/mass-closure.json",
-                self._selection_record([], accounting_delta_kg=0.0001),
-            )
-            pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            blocker = next(item for item in report["findings"] if item["code"] == "report.selection_accounting_invalid")
-            self.assertIn("1e-12 kg", blocker["message"])
-
-    def test_selection_accounting_uses_the_native_equality_tolerance(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(root / "reports/mass-closure.json", self._selection_record([], accounting_delta_kg=2e-16))
-            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            self.assertNotIn("report.selection_accounting_invalid", [row["code"] for row in report["findings"]])
-
 
 if __name__ == "__main__":
     unittest.main()

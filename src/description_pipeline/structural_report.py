@@ -23,8 +23,6 @@ from .schemas import EFFECTIVE_INSTANCES_SCHEMA
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
 JSON_PATH = "reports/structural-team.json"
-MASS_CLOSURE_REPORT = "reports/mass-closure.json"
-
 #: Diagnostic-bundle schema the native worker seals and the Linux side renders from.
 DIAGNOSTIC_SCHEMA = "solidworks-to-urdf.failure-diagnostics/v1"
 
@@ -42,7 +40,6 @@ REPORT_EVIDENCE_FILES = (
     "evidence/raw/mass_closure.json",
     "evidence/raw/geometry.json",
     "evidence/raw/source_scopes.json",
-    MASS_CLOSURE_REPORT,
 )
 
 #: Files sealed for one failed job: the projected evidence plus the snapshot
@@ -861,124 +858,6 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         ),
                         "source": "evidence/raw/geometry.json/tessellation/no_facets_faces",
                         "evidence": row,
-                    }
-                )
-    selection_source = MASS_CLOSURE_REPORT
-    selection_report = sources.get(selection_source)
-    selection = None
-    if isinstance(selection_report, dict):
-        derived = selection_report.get("derived")
-        if isinstance(derived, dict):
-            selection = derived.get("selection")
-    if selection is not None:
-        import math as _math
-
-        valid = isinstance(selection, dict) and all(
-            key in selection
-            for key in (
-                "native_mass_kg",
-                "selected_mass_kg",
-                "unassigned_mass_kg",
-                "unassigned",
-                "accounting_delta_kg",
-                "whole_mass_qualified",
-            )
-        )
-        unassigned = selection.get("unassigned") if valid else None
-        if not isinstance(unassigned, list) or not isinstance(selection.get("whole_mass_qualified"), bool):
-            valid = False
-        if valid:
-            for key in ("native_mass_kg", "selected_mass_kg", "unassigned_mass_kg", "accounting_delta_kg"):
-                value = selection.get(key)
-                if isinstance(value, bool) or not isinstance(value, (int, float)) or not _math.isfinite(value):
-                    valid = False
-                    break
-        if valid:
-            for row in unassigned:
-                if (
-                    not isinstance(row, dict)
-                    or set(row) != {"component", "document", "configuration", "parent", "mass_kg"}
-                    or not isinstance(row.get("component"), str)
-                    or not row["component"].strip()
-                    or not isinstance(row.get("document"), str)
-                    or not isinstance(row.get("configuration"), str)
-                    or (row.get("parent") is not None and not isinstance(row.get("parent"), str))
-                ):
-                    valid = False
-                    break
-                mass = row.get("mass_kg")
-                if (
-                    isinstance(mass, bool)
-                    or not isinstance(mass, (int, float))
-                    or not _math.isfinite(mass)
-                    or mass <= 0
-                ):
-                    valid = False
-                    break
-        if not valid:
-            entries.append(
-                {
-                    "severity": "blocker",
-                    "code": "report.selection_accounting_invalid",
-                    "object": receipt.get("main_assembly"),
-                    "message": (
-                        "Selection-accounting evidence does not match the approved schema. The "
-                        "evidence is invalid and independent verification must fail; this report uses "
-                        "no defaults or substitute interpretation."
-                    ),
-                    "source": f"{selection_source}/derived/selection",
-                    "evidence": selection,
-                }
-            )
-        else:
-            if abs(selection["accounting_delta_kg"]) > 1e-12:
-                entries.append(
-                    {
-                        "severity": "blocker",
-                        "code": "report.selection_accounting_invalid",
-                        "object": receipt.get("main_assembly"),
-                        "message": (
-                            f"Selection-accounting residual is {selection['accounting_delta_kg']!r} "
-                            "kg (tolerance 1e-12 kg). The evidence is invalid and independent "
-                            "verification must fail."
-                        ),
-                        "source": f"{selection_source}/derived/selection",
-                        "evidence": selection,
-                    }
-                )
-            for row in unassigned:
-                entries.append(
-                    {
-                        "severity": "warning",
-                        "code": "cad_unassigned_occurrence_mass",
-                        "object": row["component"],
-                        "message": (
-                            f"This CAD instance is not in the selected delivery "
-                            f"(component {row['component']}; parent {row['parent']}; "
-                            f"document {row['document']}; configuration {row['configuration']}): "
-                            f"native mass is {row['mass_kg']!r} kg; engineering qualification of "
-                            "its mass ownership is withheld. "
-                            "This report does not claim missing input or pipeline failure from that fact."
-                        ),
-                        "source": f"{selection_source}/derived/selection/unassigned",
-                        "evidence": row,
-                    }
-                )
-            if unassigned:
-                entries.append(
-                    {
-                        "severity": "warning",
-                        "code": "cad_native_mass_gap_unqualified",
-                        "object": receipt.get("main_assembly"),
-                        "message": (
-                            "The difference between native whole-assembly mass and selected-delivery mass is "
-                            f"{selection['native_mass_kg'] - selection['selected_mass_kg']!r} kg"
-                            f" (native {selection['native_mass_kg']!r} - selected {selection['selected_mass_kg']!r}; "
-                            f"unassigned total {selection['unassigned_mass_kg']!r} kg; no normalization was applied). "
-                            "Whole-mass qualification remains withheld while unassigned instances exist."
-                        ),
-                        "source": f"{selection_source}/derived/selection",
-                        "evidence": selection,
                     }
                 )
     material_provenance = sources.get(material_source)

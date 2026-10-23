@@ -19,7 +19,6 @@ from description_pipeline.stages import (
     contract_markdown,
     record_check,
     require_complete,
-    stage_host,
     stage_view,
 )
 from description_pipeline.verification.solidworks_urdf import evaluate_bundle, require_qualified_report
@@ -43,11 +42,6 @@ class StageTests(unittest.TestCase):
         view = stage_view()
         self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in view["stages"]}, expected)
         self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in compact_view(view)["stages"]}, expected)
-        self.assertEqual(stage_host("generate"), ("linux",))
-        self.assertEqual(stage_host("discover"), ("windows", "linux"))
-        with self.assertRaises(PipelineError):
-            stage_host("wait_for_job")
-
     def test_missing_results_and_green_events_cannot_pass_checks(self):
         for job in ({}, {"events": [{"stage": "capture", "state": "completed"}]}):
             view = stage_view(job)

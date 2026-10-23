@@ -10,6 +10,7 @@ from ..geometry.native_tessellation import (
     parse_native_tessellation,
     summarize_native_topology,
 )
+from ..geometry.native_u import native_tolerant_edge_value_warning
 from ..io import PipelineError, confined
 from ..sources.snapshot import verify_snapshot
 from . import native_discovery as evidence
@@ -232,3 +233,15 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             row["area_m2"] for row in untessellated_warnings
         ),
     }
+
+
+def native_geometry_value_warnings(bundle: Path) -> list[dict]:
+    """Return canonical value warnings re-derived from native geometry evidence."""
+
+    details = verify_native_mesh_observations(Path(bundle))
+    try:
+        return native_tolerant_edge_value_warning(details["warnings"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise PipelineError(
+            "Native geometry value warnings are not reproducible"
+        ) from error

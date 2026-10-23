@@ -33,6 +33,7 @@ from .native_u import (
     NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS,
     NATIVE_TOLERANT_EDGE_GAP_SOURCE,
     NATIVE_TOLERANT_EDGE_GAP_WARNING,
+    NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
     NATIVE_TOLERANT_EDGE_WARNING_REASON,
     NATIVE_U_CLOSEST_FALLBACK_RULE,
@@ -3267,10 +3268,20 @@ def _parse_itessellation_evidence(
                     and tolerant is not None
                     and tolerant["gap_used"] is True
                 ):
+                    _require(
+                        expected_source_scope is not None
+                        and _valid_body_scope(
+                            expected_source_scope,
+                            component,
+                        ),
+                        component
+                        + ": tolerant-edge warning has no immutable source scope",
+                    )
                     native_fin_resolutions.append(
                         {
                             "code": NATIVE_TOLERANT_EDGE_GAP_WARNING,
                             "blocking": False,
+                            "message": NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
                             "component": component,
                             "body_type": body_key[0],
                             "body_index": body_key[1],
@@ -3325,6 +3336,11 @@ def _parse_itessellation_evidence(
                             ],
                             "qualification": (
                                 NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION
+                            ),
+                            "topology_endpoint_set": assignment,
+                            "source_scope": expected_source_scope,
+                            "open_edge_boundary_identity_sha256": (
+                                open_identity_sha256
                             ),
                         }
                     )

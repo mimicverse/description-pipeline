@@ -42,6 +42,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_COLLAPSED_U_FIN_RULE,
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_PERSISTENT_IDENTITY_RULE,
+    NATIVE_OPEN_EDGE_SCOPE_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_SCOPE_MAPPING_METHOD,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
@@ -53,6 +54,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
     NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
     NATIVE_TOLERANT_EDGE_GAP_WARNING,
+    NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     NATIVE_U_CLOSEST_FALLBACK_RULE,
     NATIVE_U_IDENTITY_RULE,
     native_binary32_spacing,
@@ -86,6 +88,27 @@ POINTS = {
     3: (0.0, 1.0, 0.0),
     4: (1.0, 1.0, 0.0),
 }
+
+
+def fixture_source_scope(component="part-1"):
+    source_sha256 = hashlib.sha256(b"fixture-source").hexdigest()
+    return {
+        "rule_version": NATIVE_OPEN_EDGE_SCOPE_RULE,
+        "component": component,
+        "source_document_path": f"C:/fixture/{component}.SLDPRT",
+        "source_copy_path": f"source/{component}.SLDPRT",
+        "source_document_sha256": source_sha256,
+        "source_copy_sha256": source_sha256,
+        "source_document_identity_sha256": source_sha256,
+        "source_document_identity_kind": "file_sha256",
+        "referenced_configuration": "Default",
+        "occurrence_scope": component,
+        "virtual_owner": None,
+        "virtual_owner_sha256": None,
+        "virtual_session_document_path": None,
+        "virtual_session_temp_root": None,
+        "virtual_native_api_pid": None,
+    }
 
 
 def fixture_open_edge_scope_binding(
@@ -2508,7 +2531,6 @@ class NativeFinCaptureTests(unittest.TestCase):
             "native-open-edge-boundary-identity-v2",
         )
         self.assertEqual(identity["identity_mode"], "full_edge")
-        self.assertIs(identity["accepted"], True)
         self.assertEqual(
             identity["fin_to_edge_mapping"]["complete_match_count"],
             1,
@@ -2520,18 +2542,6 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(
             identity["curve_to_edge_mapping"]["complete_match_count"],
             1,
-        )
-        self.assertIs(
-            identity["fin_vertex_com_mapping"]["used_for_gate"],
-            False,
-        )
-        self.assertIs(
-            identity["direction_dot"]["used_for_decision"],
-            False,
-        )
-        self.assertIs(
-            identity["curve_sense_metadata"]["used_for_decision"],
-            False,
         )
         self.assertEqual(identity["gap"]["metric"], "euclidean")
         self.assertEqual(
@@ -3063,7 +3073,6 @@ class NativeFinCaptureTests(unittest.TestCase):
             topology_set_accepted=True,
         )
 
-        self.assertIs(identity["accepted"], True)
         self.assertEqual(
             identity["separation_diagnostics"][
                 "possible_ambiguity_bound_m"
@@ -3111,7 +3120,6 @@ class NativeFinCaptureTests(unittest.TestCase):
             topology_set_accepted=True,
         )
 
-        self.assertIs(identity["accepted"], True)
         self.assertEqual(identity["identity_mode"], "segmented")
         self.assertEqual(
             identity["fin_endpoint_boundary_roles"],
@@ -3138,10 +3146,6 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(mapping["interior_u"], 0.4)
         self.assertEqual(mapping["complete_match_count"], 1)
         self.assertIs(mapping["unique"], True)
-        self.assertIs(
-            identity["curve_sense_metadata"]["used_for_decision"],
-            False,
-        )
 
     def test_open_boundary_identity_rejects_wrong_segment_boundary(self):
         with self.assertRaisesRegex(
@@ -4664,6 +4668,10 @@ class NativeFinCaptureTests(unittest.TestCase):
             {NATIVE_TOLERANT_EDGE_GAP_WARNING},
         )
         for row in resolutions:
+            self.assertEqual(
+                row["message"],
+                NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
+            )
             self.assertEqual(row["edge_reference_sha256"], edge["edge_reference_sha256"])
             self.assertEqual(
                 row["point_roundtrip_rule"],
@@ -4689,6 +4697,22 @@ class NativeFinCaptureTests(unittest.TestCase):
                 row["point_tolerance_m"],
             )
             self.assertTrue(row["field"].endswith("tolerant_edge_evidence"))
+            self.assertEqual(row["source_scope"], entry["source_scope"])
+            self.assertEqual(
+                row["topology_endpoint_set"],
+                edge["topology_endpoint_assignment"],
+            )
+            self.assertEqual(
+                row["open_edge_boundary_identity_sha256"],
+                next(
+                    fin["open_edge_boundary_identity"][
+                        "identity_chain_sha256"
+                    ]
+                    for fin in evidence["itessellation"]["bodies"][0]["fins"]
+                    if fin["classification"] == "native_edge"
+                    and fin["open_edge_boundary_identity"] is not None
+                ),
+            )
 
     def test_tolerant_edge_with_ordinary_v4_pass_stays_v4(self):
         evidence, triangles, _edge, metrics = (
@@ -5405,6 +5429,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             len(triangles),
             triangles,
             native_fin_resolutions=resolutions,
+            expected_source_scope=fixture_source_scope(),
         )
         self.assertEqual(len(spans), 2)
         self.assertTrue(resolutions)

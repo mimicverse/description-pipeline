@@ -109,7 +109,6 @@ class ContractConvergenceTests(unittest.TestCase):
                 "TOOL_SCHEMA",
                 "EFFECTIVE_INSTANCES_SCHEMA",
                 "LINK_GROUP_MASS_SCHEMA",
-                "MASS_CLOSURE_REPORT_SCHEMA",
                 "HEALTH_SCHEMA",
                 "RESOURCE_POLICY_SCHEMA",
                 "CACHE_RELEASE_SCHEMA",

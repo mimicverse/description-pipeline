@@ -1495,8 +1495,8 @@ def _component_context_record(reading: dict[str, Any], assembly_mass: float | No
     Windows records only what CAD answered: per-instance identity, context
     mass/volume, override flags, effective readings and their failures.
     Document basis, deltas, totals, coverage and the effective recombination
-    are rebuilt on Linux (``closure.derive_mass_closure``); there is no
-    compatibility format and no computed field survives here.
+    are rebuilt on Linux from the sealed evidence; there is no compatibility
+    format and no computed field survives here.
     """
 
     instances = []
@@ -1606,8 +1606,8 @@ def _mass_closure(backend: Any, cfg: dict[str, Any], document: str | None = None
     The Windows boundary records what CAD answered (whole-assembly reading,
     per-instance context with overrides and effective readings) plus explicit
     unavailable/error receipts.  All comparison math - leaf totals, deltas,
-    totals, coverage and the effective recombination - lives on Linux
-    (``closure.derive_mass_closure``); no computed field survives here.
+    totals, coverage and the effective recombination - lives on Linux from the
+    sealed evidence; no computed field survives here.
     """
 
     closure_reader = getattr(backend, "assembly_mass_properties", None)

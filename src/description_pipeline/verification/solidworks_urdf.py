@@ -24,8 +24,11 @@ from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, 
 from ..geometry import stl
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    NATIVE_TOLERANT_EDGE_GAP_WARNING,
+    NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     native_scope_warning_details_match,
     native_scope_warning_projection,
+    native_tolerant_edge_value_warning,
     native_tolerant_edge_warning_set_matches,
 )
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
@@ -36,6 +39,13 @@ from ..sources.solidworks.native_limits import (
     ENGINEERING_DEFAULT_POLICY_ID,
     PREVIEW_POLICY_ID,
     PREVIEW_WINDOW_RAD,
+)
+from ..sources.solidworks.evidence import (
+    METADATA_WARNING_CODE,
+    METADATA_WARNING_MESSAGE,
+    REWRITE_ENVIRONMENT_EVIDENCE,
+    RUNTIME_EVIDENCE,
+    metadata_value_warnings,
 )
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
@@ -2054,15 +2064,29 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
             diagnostics.extend(projected)
             return native_details
 
-        gates.add("geometry.native_tessellation", _verify_native_tessellation)
+        native_geometry = gates.add(
+            "geometry.native_tessellation",
+            _verify_native_tessellation,
+        )
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add(
             "verification.complete",
-            lambda: _verify_model(root, gates, definition, model, raw, diagnostics),
+            lambda: _verify_model(
+                root,
+                gates,
+                definition,
+                model,
+                raw,
+                diagnostics,
+                manifest,
+                native_geometry=native_geometry,
+            ),
         )
     if model is not None:
         for warning in (model.get("provenance") or {}).get("value_warnings") or []:
             if isinstance(warning, dict) and warning.get("code"):
+                if warning["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING:
+                    continue
                 diagnostics.append(
                     {
                         "code": str(warning["code"]),
@@ -2258,12 +2282,23 @@ def _mass_closure_equality(root, definition=None):
     return verify_urdf_mass_equality(root, (definition or {}).get("source"))
 
 
-def _verify_model(root, gates, definition, model, raw, diagnostics):
+def _verify_model(
+    root,
+    gates,
+    definition,
+    model,
+    raw,
+    diagnostics,
+    manifest,
+    *,
+    native_geometry=None,
+):
     from .solidworks_physics import verify_physics
 
     source = definition["source"]
     carrier = source.get("carrier")
     native_geometry_rows = evidence.geometry(root)
+    metadata_warnings = _metadata_value_warnings(root, source, manifest)
     gates.add("model.policy", lambda: _policy(source, model))
     gates.add("source.carrier_binding", lambda: _carrier_binding(source, carrier))
     gates.add(
@@ -2274,6 +2309,12 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             model,
             carrier,
             native_geometry_rows=native_geometry_rows,
+            native_warnings=(
+                native_geometry.get("warnings")
+                if isinstance(native_geometry, dict)
+                else None
+            ),
+            metadata_warnings=metadata_warnings,
         ),
     )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
@@ -2401,6 +2442,31 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     gates.add("consumer.urdf", lambda: load_consumer(root))
 
 
+def _metadata_value_warnings(root, source, manifest):
+    if not isinstance(manifest, dict):
+        raise PipelineError("Delivery manifest is unavailable for metadata provenance")
+    records = manifest.get("subject", {}).get("files", [])
+    digests = {
+        record.get("path"): record.get("sha256")
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get("path"), str)
+    }
+    try:
+        runtime = evidence.runtime(root)
+        rewrite = read_data(confined(root, REWRITE_ENVIRONMENT_EVIDENCE))
+        closure = evidence.dependency_closure(root)
+        return metadata_value_warnings(
+            runtime,
+            rewrite,
+            runtime_sha256=digests[RUNTIME_EVIDENCE],
+            rewrite_sha256=digests[REWRITE_ENVIRONMENT_EVIDENCE],
+            expected_configuration=str(source.get("configuration") or ""),
+            closure_top_level=str(closure.get("top_level") or ""),
+        )
+    except (KeyError, TypeError) as error:
+        raise PipelineError("Metadata evidence is not fully bound by the delivery manifest") from error
+
+
 def _author_expectations(gates, definition, model, points):
     """Execute only supplied design expectations; absence is not a passed check."""
     expectations = definition.get("checks") or {}
@@ -2484,7 +2550,16 @@ def _carrier_binding(source, carrier):
     return {"bodies": len(native), "joints": len(delivered)}
 
 
-def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_rows=None):
+def _value_warning_gate(
+    root,
+    source,
+    model,
+    carrier=None,
+    *,
+    native_geometry_rows=None,
+    native_warnings=None,
+    metadata_warnings=None,
+):
     """Re-derive every non-native value warning from source facts and the model."""
 
     from ..sources.solidworks.naming import (
@@ -2613,6 +2688,18 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
 
     def add(code, value):
         expected.setdefault(code, []).append(value)
+
+    for warning in metadata_warnings or []:
+        _require(
+            isinstance(warning, dict)
+            and warning.get("code") == METADATA_WARNING_CODE
+            and warning.get("message") == METADATA_WARNING_MESSAGE
+            and isinstance(warning.get("objects"), list)
+            and bool(warning["objects"]),
+            "Re-derived metadata provenance warning is malformed",
+        )
+        for object_row in warning["objects"]:
+            add(warning["code"], object_row)
 
     for body in bodies:
         source_name = str(body.get("source_name") or body["name"])
@@ -3176,7 +3263,21 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
             "Link mass properties are transformed, translated or recombined from native readings."
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
+        NATIVE_TOLERANT_EDGE_GAP_WARNING: NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
+        METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
     }
+    try:
+        native_value_warnings = native_tolerant_edge_value_warning(
+            native_warnings or []
+        )
+    except (TypeError, ValueError) as error:
+        raise PipelineError(
+            "Native geometry value-warning projection is incomplete"
+        ) from error
+    for native_warning in native_value_warnings:
+        expected.setdefault(native_warning["code"], []).extend(
+            native_warning["objects"]
+        )
     _require(
         set(actual) == set(expected),
         "Non-native value provenance warning classes differ from the delivery: "

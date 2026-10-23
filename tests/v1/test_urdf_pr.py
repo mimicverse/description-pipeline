@@ -1242,6 +1242,51 @@ class PublishTests(unittest.TestCase):
 
         self.assertEqual(warning_summary(body), warning_summary(reverse))
 
+    def test_pr_body_binds_metadata_object_details_to_the_quality_report(self) -> None:
+        locator = "/session_boundary/opened/read_only"
+        report = {
+            "checks": [],
+            "qualifications": [],
+            "diagnostics": [
+                {
+                    "code": "metadata.non_native",
+                    "blocking": False,
+                    "message": "Platform metadata is not a direct CAD engineering read.",
+                    "detail": {
+                        "objects": [
+                            {
+                                "object_type": "metadata",
+                                "object": "evidence/native-runtime.json",
+                                "fields": [locator],
+                                "source": "open_document operation claim",
+                                "rule_id": "metadata.operation_claim",
+                                "rule_version": "v1",
+                                "reason": "read_only is declared, not observed",
+                                "file": "evidence/native-runtime.json",
+                                "sha256": "c" * 64,
+                                "reference": "evidence/native-runtime.json",
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        quality_sha256 = "e" * 64
+
+        body = render_body(report, quality_sha256=quality_sha256)
+        rows = urdf_pr._general_warning_rows(report)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["fields"], [locator])
+        self.assertIn("`metadata.non_native` groups=1 rows=1", body)
+        self.assertIn(
+            f"https://github.com/{BODY_SLUG}/blob/{'b' * 40}/reports/quality.json",
+            body,
+        )
+        self.assertIn(f"`sha256:{quality_sha256}`", body)
+        self.assertNotIn(locator, body)
+        self.assertIn("the complete candidate source above is the sole detailed authority", body)
+
     def test_pr_body_bounds_large_qualification_summary_without_silent_loss(self) -> None:
         qualifications = [
             {
