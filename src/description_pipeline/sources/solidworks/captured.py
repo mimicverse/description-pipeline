@@ -66,8 +66,6 @@ def derive_scene(root: Path, manifest: dict) -> dict:
         link_group_mass_properties=link_groups,
     )
     scene = build_scene(config, readings, geometry)
-    if manifest.get("evidence_class") != "cad":
-        return scene
 
     files = manifest.get("files")
     if not isinstance(files, dict):

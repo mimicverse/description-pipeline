@@ -2014,7 +2014,10 @@ class FixtureCadBackend(CadBackend):
         order.append("environment")
         return {
             "revision": "fixture-2026",
-            "license": "fixture",
+            "input_mode": "saved_documents",
+            "build": "fixture-2026",
+            "license": 0,
+            "visible": True,
             "sessions": {
                 "copy": {
                     "pid": self.session_pid,
@@ -2993,6 +2996,10 @@ def seal_scene_inputs(
         records=controlled,
         record_keys=record_keys,
     )
+    runtime = Path(destination) / "native-runtime.json"
+    environment = Path(destination) / "evidence/environment.json"
+    if not runtime.is_file():
+        runtime.write_bytes(environment.read_bytes())
     from description_pipeline.sources.snapshot import write_manifest
 
     manifest = json.loads((Path(destination) / "manifest.json").read_text(encoding="utf-8"))

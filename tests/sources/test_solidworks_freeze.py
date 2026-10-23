@@ -879,6 +879,45 @@ class FreezeTests(unittest.TestCase):
             )
         )
 
+    def test_fixture_derivation_keeps_bound_metadata_provenance(self) -> None:
+        freeze(self.config, self.destination, backend=self.backend)
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
+
+        manifest = json.loads((self.destination / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["evidence_class"], "fixture")
+        self.assertIn("native-runtime.json", manifest["files"])
+        self.assertIn("evidence/rewrite-environment.json", manifest["files"])
+
+        scene = load_scene(self.destination)
+        metadata = [
+            warning
+            for warning in scene["provenance"]["value_warnings"]
+            if warning["code"] == "metadata.non_native"
+        ]
+        self.assertEqual(len(metadata), 1)
+        self.assertTrue(metadata[0]["objects"])
+
+    def test_fixture_derivation_rejects_partial_metadata_evidence(self) -> None:
+        from description_pipeline.io import PipelineError
+        from description_pipeline.sources.snapshot import write_manifest
+
+        for missing in ("native-runtime.json", "evidence/rewrite-environment.json"):
+            with self.subTest(missing=missing):
+                destination = self.tmp / ("partial-" + missing.replace("/", "-"))
+                freeze(self.config, destination, backend=self.backend)
+                _compose_scene_inputs(destination, self.tmp / "cad", with_arm=True, with_joint=True)
+                manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+                (destination / missing).unlink()
+                write_manifest(
+                    destination,
+                    kind=manifest["kind"],
+                    identity=manifest["identity"],
+                    evidence_class=manifest["evidence_class"],
+                )
+
+                with self.assertRaisesRegex(PipelineError, "not bound by the manifest"):
+                    load_scene(destination)
+
     def test_resealed_source_configuration_cannot_change_capture_identity(self) -> None:
         # The sealed capture identity replaced the retired raw/source_config.json
         # carrier (356baed): re-sealing a tampered assembly identity still refuses.
