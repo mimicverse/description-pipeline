@@ -700,10 +700,6 @@ class FreezeTests(unittest.TestCase):
                 "description_pipeline.sources.solidworks.scene.build_scene",
                 side_effect=AssertionError("scene construction is portable work"),
             ),
-            patch(
-                "description_pipeline.sources.solidworks.closure.derive_mass_closure",
-                side_effect=AssertionError("closure comparison is portable work"),
-            ),
         ):
             freeze(self.config, self.destination, backend=self.backend)
         _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
@@ -712,6 +708,60 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
         self.assertEqual(inventory(self.destination), before)
         self.assertNotIn("scene.json", before)
+
+    def test_cad_derivation_adds_one_metadata_warning_group_from_bound_evidence(self) -> None:
+        from description_pipeline.io import read_data, write_json
+        from description_pipeline.sources.snapshot import write_manifest
+
+        manifest = freeze(self.config, self.destination, backend=self.backend)
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
+
+        runtime = read_data(self.destination / "evidence/environment.json")
+        runtime["solidworks"].update(
+            input_mode="saved_documents",
+            build="fixture-build",
+            license=1,
+            visible=True,
+        )
+        capture_state = runtime["session_boundary"]["capture_state"]
+        capture_state["save_flag"] = not capture_state["saved"]
+        capture_state["lightweight"] = None
+        capture_state["unsupported"] = ["lightweight"]
+        runtime["session_boundary"]["opened"].update(errors=0, warnings=0)
+        write_json(self.destination / "native-runtime.json", runtime)
+
+        rewrite = read_data(self.destination / "evidence/rewrite-environment.json")
+        rewrite["solidworks"].update(
+            input_mode="saved_documents",
+            build="fixture-build",
+            license=1,
+            visible=True,
+        )
+        write_json(self.destination / "evidence/rewrite-environment.json", rewrite)
+        write_manifest(
+            self.destination,
+            kind=manifest["kind"],
+            identity=manifest["identity"],
+            evidence_class="cad",
+        )
+
+        scene = load_scene(self.destination)
+        metadata = [
+            warning
+            for warning in scene["provenance"]["value_warnings"]
+            if warning["code"] == "metadata.non_native"
+        ]
+        self.assertEqual(len(metadata), 1)
+        self.assertTrue(
+            all(
+                row["file"] in {
+                    "evidence/native-runtime.json",
+                    "evidence/evidence/rewrite-environment.json",
+                }
+                and row["fields"]
+                for row in metadata[0]["objects"]
+            )
+        )
 
     def test_resealed_source_configuration_cannot_change_capture_identity(self) -> None:
         # The sealed capture identity replaced the retired raw/source_config.json

@@ -1,10 +1,9 @@
 """True producer -> independent verifier integration for effective instances.
 
 The snapshot is built through the native producer entry points
-(``freeze._mass_closure`` and ``freeze._effective_instance_record``), the Linux
-report through ``closure.derive_mass_closure``, and the acceptance decision
-runs through the independent physics verifier and the real snapshot
-``load_scene``.  Nothing here hand-builds the producer's derived block.
+(``freeze._mass_closure`` and ``freeze._effective_instance_record``), and the
+acceptance decision runs through the independent physics verifier and the real
+snapshot ``load_scene``.  Nothing here hand-builds the producer's derived block.
 """
 
 from __future__ import annotations
@@ -22,11 +21,14 @@ import numpy as np
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.solidworks_physics import verify_physics
 from tests.sources import support
+from tests.sources.test_solidworks_metadata_provenance import (
+    environment as _metadata_environment,
+    runtime_environment as _runtime_metadata_environment,
+)
 
 # The package re-exports ``freeze`` as a function; bind the modules explicitly.
 freeze_module = importlib.import_module("description_pipeline.sources.solidworks.freeze")
 scene_module = importlib.import_module("description_pipeline.sources.solidworks.scene")
-closure_module = importlib.import_module("description_pipeline.sources.solidworks.closure")
 
 
 def _fixture_link_group_record(source, components, notes, masses, assembly):
@@ -119,6 +121,27 @@ def _publish(bundle: Path, evidence: Path) -> dict:
     write_manifest(delivery_evidence, kind="solidworks", identity=dict(native_identity), evidence_class="cad")
     support.seal_delivery(Path(bundle) / "delivery")
     return source
+
+
+def _write_native_metadata_fixture(evidence: Path, *, closure_top_level: str) -> None:
+    """Bind the minimum valid native metadata consumed by a CAD snapshot fixture."""
+
+    from description_pipeline.io import write_json
+
+    runtime = _runtime_metadata_environment()
+    boundary = runtime["session_boundary"]
+    boundary["closure_top_level"] = closure_top_level
+    boundary["capture_state"]["path"] = closure_top_level
+    boundary["capture_state"]["title"] = Path(closure_top_level).name
+    boundary["opened"]["path"] = closure_top_level
+    boundary["opened"]["opened"] = Path(closure_top_level).name
+    runtime_path = evidence / "native-runtime.json"
+    rewrite_path = evidence / "evidence/rewrite-environment.json"
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    rewrite_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(evidence / "raw/dependency_closure.json", {"top_level": closure_top_level})
+    write_json(runtime_path, runtime)
+    write_json(rewrite_path, _metadata_environment(session_role="source"))
 
 
 def placement(rotation, translation):
@@ -591,15 +614,14 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             frozen, producer / "prepared", "fixture-run", backend=_NestedBackend(), configuration="Default"
         )
         _write_json(self.bundle / "evidence" / "discovery.json", _read_data(prepared.discovery_path))
+        _write_native_metadata_fixture(self.evidence, closure_top_level=COLLECTED)
         write_manifest(
             self.evidence,
             kind="solidworks",
             identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
             evidence_class="cad",
         )
-        report = closure_module.derive_mass_closure(self.evidence)
         _publish(self.bundle, self.evidence)
-        self.report = report
         return record
 
     def _verify(self):
@@ -610,10 +632,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
 
     def test_producer_outputs_pass_the_independent_verifier(self):
         record = self._build_snapshot()
-        native = json.loads((self.evidence / "raw/mass_closure.json").read_text())
-        self.assertEqual(self.report["native"], native)
-        self.assertEqual(self.report["derived"]["blockers"], [])
-        self.assertEqual(self.report["derived"]["effective_total"]["substituted"], [PARENT])
         self.assertEqual(record["assembly"], ORIGINAL)
         self.assertEqual(record["readings"][PCB]["reference"]["assembly_document"], COLLECTED)
         codes = sorted(warning["code"] for warning in record["warnings"])
@@ -631,7 +649,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         link = next(link for link in loaded["links"] if link["name"] == "base_link")
         mass, com, _inertia = self._expected_total()
         self.assertAlmostEqual(link["inertial"]["mass"], mass, places=12)
-        self.assertAlmostEqual(self.report["derived"]["effective_total"]["mass"], mass, places=12)
         self.assertTrue(np.allclose(link["inertial"]["xyz"], com, atol=1e-12))
 
     def test_effective_closure_drift_is_rejected(self):
@@ -642,6 +659,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         native = json.loads(native_path.read_text())
         native["top_level"]["mass"] += 0.01
         native_path.write_text(json.dumps(native), encoding="utf-8")
+        _write_native_metadata_fixture(self.evidence, closure_top_level=COLLECTED)
         write_manifest(
             self.evidence,
             kind="solidworks",
@@ -663,6 +681,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         raw_path.write_text(json.dumps(native), encoding="utf-8")
         # Re-publish so the delivery binding layer cannot mask the drift the
         # physics gates must detect on their own.
+        _write_native_metadata_fixture(self.evidence, closure_top_level=COLLECTED)
         write_manifest(
             self.evidence,
             kind="solidworks",
@@ -992,15 +1011,15 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             frozen, producer / "prepared", "fixture-run", backend=_PartBackend(), configuration="Default"
         )
         _write_json(self.bundle / "evidence" / "discovery.json", _read_data(prepared.discovery_path))
+        _write_native_metadata_fixture(self.evidence, closure_top_level=COLLECTED)
         write_manifest(
             self.evidence,
             kind="solidworks",
             identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
             evidence_class="cad",
         )
-        report = closure_module.derive_mass_closure(self.evidence)
         _publish(self.bundle, self.evidence)
-        return record, report
+        return record
 
     def _verify(self):
         loaded = scene_module.load_scene(self.evidence)
@@ -1009,7 +1028,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
         return loaded, {check["id"]: check for check in checks}
 
     def test_flagless_instance_measurement_is_primary_and_bound(self):
-        record, report = self._build()
+        record = self._build()
         warning = record["warnings"][0]
         self.assertEqual(warning["code"], "cad_instance_measurement_differs_from_part")
         self.assertEqual(
@@ -1018,8 +1037,6 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             "not geometry-derived, not independently physically qualified",
         )
         self.assertEqual(warning["part_measurement"]["mass_kg"], 1.0)
-        self.assertEqual(report["derived"]["leaf_total"]["mass"], 1.0)
-        self.assertAlmostEqual(report["derived"]["effective_total"]["mass"], 1.5, places=12)
         loaded, checks = self._verify()
         failed = [name for name, check in checks.items() if not check["passed"]]
         self.assertEqual(failed, [], checks)
@@ -1039,6 +1056,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
         scene = json.loads(scene_path.read_text())
         scene["notes"]["effective_instances"] = json.loads(json.dumps(record["readings"]))
         scene_path.write_text(json.dumps(scene), encoding="utf-8")
+        _write_native_metadata_fixture(self.evidence, closure_top_level=COLLECTED)
         write_manifest(
             self.evidence,
             kind="solidworks",

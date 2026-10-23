@@ -18,6 +18,7 @@ from ..geometry.native_u import (
     native_scope_warning_details_match,
 )
 from ..io import PipelineError
+from ..sources.solidworks.evidence import METADATA_WARNING_CODE
 from ..stages import FIXED_REQUIRED_CHECKS, stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
@@ -128,6 +129,7 @@ _DIAGNOSTIC_CODE_LABELS = {
     "v14.mate_inference_unavailable": "Mate inference unavailable (diagnostic)",
     "v14.pose_diagnostics_unread": "Saved-pose diagnostics not read (diagnostic)",
     "v14.membership_unread": "Link membership not read (diagnostic)",
+    METADATA_WARNING_CODE: "Platform metadata provenance (not direct CAD readings)",
 }
 
 #: Readable descriptions for the contract's declared input/output records.
@@ -989,6 +991,20 @@ def _recorded_warnings(
         raise PipelineError(
             "Native scope diagnostics have no matching gate warnings"
         )
+    if stage.get("id") == "verify":
+        metadata_diagnostics = [
+            item
+            for item in quality_diagnostics or []
+            if isinstance(item, dict)
+            and item.get("code") == METADATA_WARNING_CODE
+            and item.get("blocking") is False
+        ]
+        if len(metadata_diagnostics) > 1:
+            raise PipelineError("Metadata provenance diagnostics are duplicated")
+        if metadata_diagnostics and not any(
+            item.get("code") == METADATA_WARNING_CODE for item in warnings if isinstance(item, dict)
+        ):
+            warnings.extend(_warning_row(stage, item) for item in metadata_diagnostics)
     return warnings
 
 

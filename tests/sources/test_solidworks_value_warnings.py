@@ -213,6 +213,49 @@ class ValueWarningTests(unittest.TestCase):
         result = _value_warning_gate(self.root, self.source, self.model)
         self.assertEqual(result["objects"], 8)
 
+    def test_metadata_warning_is_compared_as_an_exact_existing_value_warning(self):
+        metadata_group = {
+            "code": "metadata.non_native",
+            "message": (
+                "Platform metadata includes values that are not direct CAD engineering readings; "
+                "each field is bound to recorded evidence."
+            ),
+            "objects": [
+                {
+                    "object_type": "metadata",
+                    "object": "evidence/native-runtime.json",
+                    "fields": ["/session_boundary/opened/read_only"],
+                    "source": "native operation claim",
+                    "rule_id": "metadata.operation_claim",
+                    "rule_version": "v1",
+                    "reason": "read_only is declared, not observed",
+                    "file": "evidence/native-runtime.json",
+                    "sha256": "c" * 64,
+                    "reference": "evidence/native-runtime.json",
+                }
+            ],
+        }
+        model = copy.deepcopy(self.model)
+        model["provenance"]["value_warnings"].append(copy.deepcopy(metadata_group))
+
+        result = _value_warning_gate(
+            self.root,
+            self.source,
+            model,
+            metadata_warnings=[metadata_group],
+        )
+        self.assertEqual(result["objects"], 9)
+
+        forged = copy.deepcopy(metadata_group)
+        forged["objects"][0]["fields"] = ["/captured_at"]
+        with self.assertRaisesRegex(PipelineError, "metadata.non_native"):
+            _value_warning_gate(
+                self.root,
+                self.source,
+                model,
+                metadata_warnings=[forged],
+            )
+
     def test_missing_spoofed_or_wrong_field_warnings_are_rejected(self):
         mutations = (
             lambda warnings: warnings.pop(),

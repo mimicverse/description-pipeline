@@ -36,26 +36,6 @@ TRANSFER_FILES = ("reports/native-tool.json", "reports/native-stages.json", "tra
 STAMPED_EXTRA = ("reports", "transfer-manifest.json", ".gitattributes", "README.md")
 
 
-def stamped_output(path: Path) -> bool:
-    """True when a directory is shaped like a pipeline output (read-only format check).
-
-    This predicate never grants write permission: a directory's name or shape
-    does not prove who owns its content.  It only validates the format of bytes
-    this pipeline already produced.
-    """
-
-    path = Path(path)
-    if not path.exists():
-        return True
-    if path.is_symlink() or path.is_junction() or not path.is_dir():
-        return False
-    entries = {entry.name for entry in path.iterdir()}
-    if not entries:
-        return True
-    allowed = set(SUBJECT_DIRECTORIES) | set(SUBJECT_FILES) | {"manifest.json"} | set(STAMPED_EXTRA)
-    return "reports" in entries and entries <= allowed and (path / "reports").is_dir()
-
-
 def writable_output(path: Path) -> bool:
     """True when a pipeline install may write here: the path is absent or empty.
 

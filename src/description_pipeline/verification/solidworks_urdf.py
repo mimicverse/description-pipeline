@@ -36,6 +36,13 @@ from ..sources.solidworks.native_limits import (
     PREVIEW_POLICY_ID,
     PREVIEW_WINDOW_RAD,
 )
+from ..sources.solidworks.evidence import (
+    METADATA_WARNING_CODE,
+    METADATA_WARNING_MESSAGE,
+    REWRITE_ENVIRONMENT_EVIDENCE,
+    RUNTIME_EVIDENCE,
+    metadata_value_warnings,
+)
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
     CHECK_POLICY_V1,
@@ -2050,7 +2057,7 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add(
             "verification.complete",
-            lambda: _verify_model(root, gates, definition, model, raw, diagnostics),
+            lambda: _verify_model(root, gates, definition, model, raw, diagnostics, manifest),
         )
     if model is not None:
         for warning in (model.get("provenance") or {}).get("value_warnings") or []:
@@ -2250,12 +2257,13 @@ def _mass_closure_equality(root, definition=None):
     return verify_urdf_mass_equality(root, (definition or {}).get("source"))
 
 
-def _verify_model(root, gates, definition, model, raw, diagnostics):
+def _verify_model(root, gates, definition, model, raw, diagnostics, manifest):
     from .solidworks_physics import verify_physics
 
     source = definition["source"]
     carrier = source.get("carrier")
     native_geometry_rows = evidence.geometry(root)
+    metadata_warnings = _metadata_value_warnings(root, source, manifest)
     gates.add("model.policy", lambda: _policy(source, model))
     gates.add("source.carrier_binding", lambda: _carrier_binding(source, carrier))
     gates.add(
@@ -2266,6 +2274,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             model,
             carrier,
             native_geometry_rows=native_geometry_rows,
+            metadata_warnings=metadata_warnings,
         ),
     )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
@@ -2393,6 +2402,31 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     gates.add("consumer.urdf", lambda: load_consumer(root))
 
 
+def _metadata_value_warnings(root, source, manifest):
+    if not isinstance(manifest, dict):
+        raise PipelineError("Delivery manifest is unavailable for metadata provenance")
+    records = manifest.get("subject", {}).get("files", [])
+    digests = {
+        record.get("path"): record.get("sha256")
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get("path"), str)
+    }
+    try:
+        runtime = evidence.runtime(root)
+        rewrite = read_data(confined(root, REWRITE_ENVIRONMENT_EVIDENCE))
+        closure = evidence.dependency_closure(root)
+        return metadata_value_warnings(
+            runtime,
+            rewrite,
+            runtime_sha256=digests[RUNTIME_EVIDENCE],
+            rewrite_sha256=digests[REWRITE_ENVIRONMENT_EVIDENCE],
+            expected_configuration=str(source.get("configuration") or ""),
+            closure_top_level=str(closure.get("top_level") or ""),
+        )
+    except (KeyError, TypeError) as error:
+        raise PipelineError("Metadata evidence is not fully bound by the delivery manifest") from error
+
+
 def _author_expectations(gates, definition, model, points):
     """Execute only supplied design expectations; absence is not a passed check."""
     expectations = definition.get("checks") or {}
@@ -2476,7 +2510,15 @@ def _carrier_binding(source, carrier):
     return {"bodies": len(native), "joints": len(delivered)}
 
 
-def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_rows=None):
+def _value_warning_gate(
+    root,
+    source,
+    model,
+    carrier=None,
+    *,
+    native_geometry_rows=None,
+    metadata_warnings=None,
+):
     """Re-derive every non-native value warning from source facts and the model."""
 
     from ..sources.solidworks.naming import (
@@ -2605,6 +2647,18 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
 
     def add(code, value):
         expected.setdefault(code, []).append(value)
+
+    for warning in metadata_warnings or []:
+        _require(
+            isinstance(warning, dict)
+            and warning.get("code") == METADATA_WARNING_CODE
+            and warning.get("message") == METADATA_WARNING_MESSAGE
+            and isinstance(warning.get("objects"), list)
+            and bool(warning["objects"]),
+            "Re-derived metadata provenance warning is malformed",
+        )
+        for object_row in warning["objects"]:
+            add(warning["code"], object_row)
 
     for body in bodies:
         source_name = str(body.get("source_name") or body["name"])
@@ -3168,6 +3222,7 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
             "Link mass properties are transformed, translated or recombined from native readings."
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
+        METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
     }
     _require(
         set(actual) == set(expected),

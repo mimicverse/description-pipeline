@@ -105,15 +105,6 @@ def read_request_evidence(path: str | Path) -> tuple[dict, str]:
     return record, hashlib.sha256(payload).hexdigest()
 
 
-def verify_request_evidence(path: str | Path, *, expected_sha256: str) -> dict:
-    """The receipt's binding check: the carried bytes must equal the frozen digest."""
-
-    record, actual = read_request_evidence(path)
-    if actual != expected_sha256:
-        raise PipelineError("The frozen request evidence bytes do not match the receipt binding")
-    return record
-
-
 def freeze_request_evidence(
     run_dir: str | Path,
     *,

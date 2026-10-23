@@ -13,6 +13,11 @@ from ...io import PipelineError, confined, read_data
 
 def derive_scene(root: Path, manifest: dict) -> dict:
     """Construct a scene using only members of a verified SolidWorks snapshot."""
+    from .evidence import (
+        REWRITE_ENVIRONMENT_EVIDENCE,
+        RUNTIME_EVIDENCE,
+        metadata_value_warnings,
+    )
     from .scene import build_scene
 
     raw = read_data(confined(root, manifest["scene"]))
@@ -60,4 +65,46 @@ def derive_scene(root: Path, manifest: dict) -> dict:
         document=raw.get("document"),
         link_group_mass_properties=link_groups,
     )
-    return build_scene(config, readings, geometry)
+    scene = build_scene(config, readings, geometry)
+    if manifest.get("evidence_class") != "cad":
+        return scene
+
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise PipelineError("Captured evidence manifest has no file inventory")
+
+    def evidence_source(delivery_path: str, snapshot_path: str) -> tuple[dict, str]:
+        digest = files.get(snapshot_path)
+        if not isinstance(digest, str):
+            raise PipelineError(f"Captured evidence is not bound by the manifest: {delivery_path}")
+        payload = read_data(confined(root, snapshot_path))
+        if not isinstance(payload, dict):
+            raise PipelineError(f"Captured evidence must be an object: {delivery_path}")
+        return payload, digest
+
+    runtime, runtime_sha256 = evidence_source(RUNTIME_EVIDENCE, "native-runtime.json")
+    rewrite, rewrite_sha256 = evidence_source(
+        REWRITE_ENVIRONMENT_EVIDENCE,
+        "evidence/rewrite-environment.json",
+    )
+    closure = read_data(confined(root, "raw/dependency_closure.json"))
+    if not isinstance(closure, dict):
+        raise PipelineError("Captured dependency closure must be an object")
+    metadata_warnings = metadata_value_warnings(
+        runtime,
+        rewrite,
+        runtime_sha256=runtime_sha256,
+        rewrite_sha256=rewrite_sha256,
+        expected_configuration=str(config.get("configuration") or ""),
+        closure_top_level=str(closure.get("top_level") or ""),
+    )
+    provenance = scene.setdefault("provenance", {})
+    existing = provenance.get("value_warnings")
+    if existing is None:
+        existing = []
+    if not isinstance(existing, list):
+        raise PipelineError("Constructed scene value warnings must be a list")
+    if any(item.get("code") == metadata_warnings[0]["code"] for item in existing if isinstance(item, dict)):
+        raise PipelineError("Metadata provenance warning was emitted twice")
+    provenance["value_warnings"] = [*existing, *metadata_warnings]
+    return scene

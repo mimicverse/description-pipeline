@@ -369,15 +369,6 @@ def activity_view(job) -> dict:
     return view
 
 
-def stage_host(stage_id: str) -> tuple[str, ...]:
-    """The declared execution hosts of one engineering stage (frozen role tokens)."""
-
-    try:
-        return HOST_BY_STAGE[stage_id]
-    except KeyError as error:
-        raise PipelineError(f"Unknown engineering stage: {stage_id!r}") from error
-
-
 def _boundary(stage, boundary, identifier):
     definition = next((item for item in CONTRACT["stages"] if item["id"] == stage), None)
     if (
