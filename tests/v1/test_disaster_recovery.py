@@ -157,7 +157,8 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
         root: Path,
         *,
         main_assembly: str = "robot.SLDASM",
-        robot_name_technical: str = "robot",
+        hardware_id: str | None = "m3.0",
+        robot_name_technical: str = "m3_0",
     ) -> tuple[Path, dict, dict]:
         from description_pipeline import interface_records as ir
         from description_pipeline.delivery import PIPELINE_ID
@@ -203,7 +204,7 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             "change_summary": "fixture summary",
             "control": None,
             "delivery_configuration": "Default",
-            "hardware_id": "m3.0",
+            "hardware_id": hardware_id,
             "main_assembly": main_assembly,
             "owner": None,
             "parent_revision": None,
@@ -309,13 +310,13 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             "schema_version": IDENTITY_SCHEMA,
             "run_id": run_id,
             "handoff_sha256": handoff_sha256,
-            "hardware_id": "m3.0",
+            "hardware_id": hardware_id,
             "parent_revision": None,
             "revision": None,
             "sources": {
                 "change_summary": "submission",
                 "control": "absent",
-                "hardware_id": "platform_configuration",
+                "hardware_id": "platform_configuration" if hardware_id is not None else "absent",
                 "owner": "absent",
                 "parent_revision": "absent",
                 "revision": "absent",
@@ -927,7 +928,7 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             ):
                 self.verify(tree, receipt)
 
-    def test_legacy_technical_robot_name_uses_main_assembly_filename(self) -> None:
+    def test_legacy_technical_robot_name_uses_historical_hardware_rule(self) -> None:
         from description_pipeline.io import canonical
 
         with tempfile.TemporaryDirectory() as directory:
@@ -935,14 +936,14 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             tree, receipt, _view = self.legacy_discovery_fixture(
                 base / "real",
                 main_assembly="M3.0.3_20261016.SLDASM",
-                robot_name_technical="m3_0_3_20261016",
+                robot_name_technical="m3_0",
             )
             self.verify(tree, receipt)
 
             tree, receipt, _view = self.legacy_discovery_fixture(
                 base / "constructed",
                 main_assembly="Dex Hand.SLDASM",
-                robot_name_technical="dex_hand",
+                robot_name_technical="m3_0",
             )
             self.verify(tree, receipt)
 
@@ -956,9 +957,9 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             self.verify(tree, receipt)
 
             tree, receipt, _view = self.legacy_discovery_fixture(
-                base / "hardware-derived",
+                base / "main-derived",
                 main_assembly="M3.0.3_20261016.SLDASM",
-                robot_name_technical="m3_0",
+                robot_name_technical="m3_0_3_20261016",
             )
             with self.assertRaisesRegex(
                 recovery.RecoveryError,
@@ -981,6 +982,7 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             tree, receipt, _view = self.legacy_discovery_fixture(
                 base / "fallback",
                 main_assembly="---.SLDASM",
+                hardware_id=None,
                 robot_name_technical="m3_0",
             )
             with self.assertRaisesRegex(

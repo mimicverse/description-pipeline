@@ -740,10 +740,7 @@ def validate_historical_discovery_document(
         if identity["robot_name"] != robot_name or identity["robot_name_technical"] is not None:
             raise PipelineError("historical discovery robot-name provenance differs from CAD")
     else:
-        try:
-            expected_technical = format_robot_name(Path(main_assembly).name)
-        except ValueError:
-            expected_technical = "robot"
+        expected_technical = _snake(identity["hardware_id"]) or "robot"
         if (
             identity["robot_name"] is not None
             or identity["robot_name_technical"] != expected_technical
