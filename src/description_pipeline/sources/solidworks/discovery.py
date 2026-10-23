@@ -544,6 +544,15 @@ def _historical_raw_identity_value(raw: Mapping[str, object], field: str) -> obj
     identity = raw.get("identity")
     if not isinstance(identity, Mapping):
         raise PipelineError("historical discovery raw identity must be an object")
+
+    def present_text(value: object, label: str, *, multiline: bool = False) -> str | None:
+        if value is None:
+            return None
+        valid = _authored_multiline_text(value) if multiline else _authored_text(value)
+        if not valid:
+            raise PipelineError(f"historical discovery {label} is present but invalid")
+        return value.strip()
+
     if field == "control":
         control = identity.get("control")
         if isinstance(control, Mapping):
@@ -552,11 +561,24 @@ def _historical_raw_identity_value(raw: Mapping[str, object], field: str) -> obj
         else:
             system = _scalar(dict(raw), NAMESPACE, "control.system")
             reference = _scalar(dict(raw), NAMESPACE, "control.reference")
-        if not _text(system) or not _text(reference):
+        system_text = present_text(system, "raw control.system")
+        reference_text = present_text(reference, "raw control.reference")
+        if system_text is None and reference_text is None:
             return None
-        return {"system": str(system).strip(), "reference": str(reference).strip()}
-    value = _identity_value(dict(raw), NAMESPACE, field)
-    return str(value).strip() if _text(value) else None
+        if system_text is None or reference_text is None:
+            raise PipelineError("historical discovery raw control is present but incomplete")
+        return {"system": system_text, "reference": reference_text}
+    direct = identity.get(field)
+    if direct is not None:
+        return present_text(
+            direct,
+            f"raw identity.{field}",
+            multiline=field == "change_summary",
+        )
+    value = _scalar(dict(raw), NAMESPACE, field)
+    if field == "delivery_configuration" and value is None:
+        value = raw.get("saved_configuration")
+    return present_text(value, f"raw {field}", multiline=field == "change_summary")
 
 
 def validate_historical_discovery_document(
@@ -565,11 +587,17 @@ def validate_historical_discovery_document(
     run_id: str,
     handoff_sha256: str,
     native_inventory: Mapping[str, str],
+    request_record: Mapping[str, object],
+    native_tool: Mapping[str, object],
 ) -> dict:
     """Validate one exact historical prepared-discovery document during recovery."""
 
+    from ...delivery import PIPELINE_ID
+    from ...interface_records import validate_request_record
+    from ...schemas import TOOL_SCHEMA
     from .selection import selection_bindings, validate_file_index
 
+    request = validate_request_record(request_record)
     discovery = _require_exact_keys(document, _HISTORICAL_DISCOVERY_KEYS, "historical discovery")
     if discovery["schema_version"] != DISCOVERY_SCHEMA:
         raise PipelineError("historical discovery carries another schema")
@@ -596,7 +624,9 @@ def validate_historical_discovery_document(
     derivation = _require_exact_keys(
         discovery["derivation"], _HISTORICAL_DERIVATION_KEYS, "historical discovery derivation"
     )
-    _require_optional_text(derivation["configuration"], "historical discovery derivation.configuration")
+    derivation_configuration = _require_optional_text(
+        derivation["configuration"], "historical discovery derivation.configuration"
+    )
     record_roots = derivation["record_roots"]
     if (
         not isinstance(record_roots, list)
@@ -604,16 +634,27 @@ def validate_historical_discovery_document(
         or len(record_roots) != len(set(record_roots))
     ):
         raise PipelineError("historical discovery derivation.record_roots must be unique non-empty text")
-    _require_text_map(
+    derivation_names = _require_text_map(
         derivation["frozen_names"], "historical discovery derivation.frozen_names"
     )
-    _require_text_map(discovery["frozen_names"], "historical discovery frozen_names")
+    frozen_names = _require_text_map(discovery["frozen_names"], "historical discovery frozen_names")
+    if derivation_names or frozen_names:
+        raise PipelineError("historical discovery v1 frozen-name views must both be empty")
     identity = _validate_historical_identity(discovery["identity"], technical=True)
     main_assembly = identity["main_assembly"]
+    if (
+        derivation_configuration is not None
+        and derivation_configuration != identity["delivery_configuration"]
+    ):
+        raise PipelineError("historical discovery derivation configuration differs from its identity")
     if derivation["main_assembly"] != main_assembly:
         raise PipelineError("historical discovery derivation names another main assembly")
     if main_assembly not in native_files:
         raise PipelineError("historical discovery main assembly is outside native inventory")
+    if request["main_assembly"] != main_assembly:
+        raise PipelineError("historical discovery main assembly differs from the frozen request")
+    if identity["hardware_id"] is not None and identity["hardware_id"] != request["target_hardware"]:
+        raise PipelineError("historical discovery hardware identity differs from the frozen request")
 
     findings = _validate_historical_findings(discovery["findings"])
     records = _validate_historical_records(discovery["records"])
@@ -645,6 +686,13 @@ def validate_historical_discovery_document(
     raw_control = _historical_raw_identity_value(raw, "control")
     if raw_control is not None and identity["control"] != raw_control:
         raise PipelineError("historical discovery raw identity.control differs from its CAD value")
+    raw_summary = _historical_raw_identity_value(raw, "change_summary")
+    if (
+        raw_summary is None
+        and identity["change_summary"] is not None
+        and identity["change_summary"] != request["change_summary"]
+    ):
+        raise PipelineError("historical discovery summary differs from the frozen request")
     selection = _require_exact_keys(
         raw["selection"], frozenset({"main_assembly", "mode"}), "historical discovery raw selection"
     )
@@ -659,6 +707,19 @@ def validate_historical_discovery_document(
         raise PipelineError("historical discovery source selection differs from its handoff")
     if source_selection["main_assembly"] != main_assembly:
         raise PipelineError("historical discovery source selection differs from its main assembly")
+    if source_selection["upload_sha256"] != request["handoff_digest"]:
+        raise PipelineError("historical discovery source selection differs from the frozen request upload")
+    if not isinstance(native_tool, dict):
+        raise PipelineError("historical discovery native tool must be an object")
+    native_runtime = native_tool.get("runtime")
+    if (
+        native_tool.get("schema_version") != TOOL_SCHEMA
+        or native_tool.get("pipeline_id") != PIPELINE_ID
+        or not isinstance(native_runtime, dict)
+        or native_runtime.get("role") != "native"
+        or source_selection["selection"].get("reader_sha256") != native_tool.get("source_sha256")
+    ):
+        raise PipelineError("historical discovery source selection does not bind the native reader")
     for field in ("components", "datums", "masses", "mates", "reference_axes"):
         if not isinstance(raw[field], list):
             raise PipelineError(f"historical discovery raw.{field} must be a list")
@@ -669,6 +730,25 @@ def validate_historical_discovery_document(
             raise PipelineError(f"historical discovery raw.{field} must be an object")
     if not _text(raw["saved_configuration"]):
         raise PipelineError("historical discovery raw.saved_configuration must be non-empty text")
+    delivery_configuration = identity["delivery_configuration"]
+    if delivery_configuration is not None and not _saved_configuration_observed(
+        dict(raw), delivery_configuration
+    ):
+        raise PipelineError("historical discovery delivery configuration is not observed")
+    robot_name = _historical_raw_identity_value(raw, "robot_name")
+    if robot_name is not None:
+        if identity["robot_name"] != robot_name or identity["robot_name_technical"] is not None:
+            raise PipelineError("historical discovery robot-name provenance differs from CAD")
+    else:
+        try:
+            expected_technical = format_robot_name(Path(main_assembly).name)
+        except ValueError:
+            expected_technical = "robot"
+        if (
+            identity["robot_name"] is not None
+            or identity["robot_name_technical"] != expected_technical
+        ):
+            raise PipelineError("historical discovery technical robot name is not reproducible")
     result = dict(discovery)
     result["identity"] = identity
     result["native_files"] = native_files
@@ -677,8 +757,15 @@ def validate_historical_discovery_document(
     return result
 
 
-def validate_historical_identity_resolution(document: object, *, discovery: Mapping[str, object]) -> dict:
+def validate_historical_identity_resolution(
+    document: object,
+    *,
+    discovery: Mapping[str, object],
+    request_record: Mapping[str, object],
+) -> dict:
     """Validate the exact historical identity-resolution sidecar and its sources."""
+
+    from ...interface_records import validate_request_record
 
     resolution = _require_exact_keys(
         document, _IDENTITY_RESOLUTION_KEYS, "historical identity resolution"
@@ -702,11 +789,14 @@ def validate_historical_identity_resolution(document: object, *, discovery: Mapp
     sources = _require_exact_keys(
         resolution["sources"], _IDENTITY_RESOLUTION_SOURCES, "historical identity resolution sources"
     )
+    request = validate_request_record(request_record)
     for field, origin in sources.items():
         if not isinstance(origin, str) or origin not in _IDENTITY_SOURCE_ORIGINS[field]:
             raise PipelineError(f"historical identity resolution source {field} has an invalid origin")
         derived = identity.get(field)
         raw_value = _historical_raw_identity_value(raw, field)
+        if field == "hardware_id" and derived != request["target_hardware"]:
+            raise PipelineError("historical identity resolution hardware differs from the frozen request")
         if origin == "absent":
             if derived is not None:
                 raise PipelineError(f"historical identity resolution source {field} contradicts its value")
@@ -724,6 +814,8 @@ def validate_historical_identity_resolution(document: object, *, discovery: Mapp
         elif origin == "submission":
             if field != "change_summary" or derived is None or raw_value is not None:
                 raise PipelineError("historical identity resolution summary source contradicts its value")
+            if derived != request["change_summary"]:
+                raise PipelineError("historical identity resolution summary differs from the frozen request")
         else:
             raise PipelineError(f"historical identity resolution source {field} has an invalid origin")
     raw_delivery = raw_identity.get("delivery_configuration")
