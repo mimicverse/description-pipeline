@@ -1291,6 +1291,11 @@ class FixtureCadBackend(CadBackend):
         self.drift_configuration_after_reading = False
         self._drifted = False
         self._original_paths = {str(self.document), *(str(path) for path in self._dependencies)}
+        # The fixture models the two owned processes used by the real freeze:
+        # collection/rewrite and the post-boundary capture session.
+        self.session_pid = 100
+        self.capture_session_pid: int | None = None
+        self.retired_session_pids: list[int] = []
 
     def health(self) -> dict[str, Any]:
         return {
@@ -1309,6 +1314,7 @@ class FixtureCadBackend(CadBackend):
         if order is None:
             order = self.order = []
         order.append("open_document")
+        self.capture_session_pid = self.session_pid
         self.open_documents.append(str(path))
         return {"opened": Path(path).name, "path": str(path), "read_only": True}
 
@@ -1363,6 +1369,10 @@ class FixtureCadBackend(CadBackend):
         closure_documents=None,
         required_paths=(),
     ) -> dict[str, Any]:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("collect_dependencies")
         self.collect_skips = {
             "skip_missing": sorted(str(item) for item in skip_missing),
             "excluded_paths": sorted(str(item) for item in excluded_paths),
@@ -1648,6 +1658,34 @@ class FixtureCadBackend(CadBackend):
         self.open_documents.clear()
         return {"closed": True}
 
+    def retire_session(self, role: str = "copy") -> dict[str, Any]:
+        """Model the rewrite-to-capture owned-process boundary."""
+
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("retire_session")
+        if role != "copy":
+            raise AssertionError(f"unexpected retired role: {role}")
+        before = {
+            "pid": self.session_pid,
+            "state": "active",
+            "role": role,
+        }
+        self.retired_session_pids.append(self.session_pid)
+        self.open_documents.clear()
+        self.session_pid += 1
+        return {
+            "role": role,
+            "retired": True,
+            "before": before,
+            "after": {
+                "pid": self.session_pid,
+                "state": "active",
+                "role": role,
+            },
+        }
+
     def verify_sources_unchanged(self) -> dict[str, Any]:
         order = getattr(self, "order", None)
         if order is None:
@@ -1657,7 +1695,21 @@ class FixtureCadBackend(CadBackend):
         return {str(item): {"sha256": file_digest(Path(item))} for item in files if Path(item).is_file()}
 
     def environment(self) -> dict[str, Any]:
-        return {"revision": "fixture-2026", "license": "fixture"}
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("environment")
+        return {
+            "revision": "fixture-2026",
+            "license": "fixture",
+            "sessions": {
+                "copy": {
+                    "pid": self.session_pid,
+                    "state": "active",
+                    "role": "copy",
+                }
+            },
+        }
 
 
 def make_cad_tree(root: Path) -> Path:
