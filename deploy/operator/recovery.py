@@ -2546,17 +2546,24 @@ def _legacy_discovery_sidecars(
     from description_pipeline.io import PipelineError, canonical
     from description_pipeline.platform.native_recovery import validate_native_discovery_stage
     from description_pipeline.sources.solidworks.discovery import (
-        DISCOVERY_SCHEMA,
         FINDING_SCHEMA,
-        IDENTITY_SCHEMA,
+        validate_historical_discovery_document,
+        validate_historical_identity_resolution,
     )
 
     try:
-        _, native_stages = strict_json_file(tree / NATIVE_STAGES_MEMBER, "native stage view")
+        native_stages_bytes, native_stages = strict_json_file(
+            tree / NATIVE_STAGES_MEMBER, "native stage view"
+        )
         require(
             isinstance(native_stages, dict),
             "recovery_member_hash_mismatch",
             "native stage view is not an object",
+        )
+        require(
+            native_stages_bytes == canonical(native_stages),
+            "recovery_member_hash_mismatch",
+            "native stage view is not canonical JSON",
         )
         producer_run_id = tree.parent.name
         require(
@@ -2579,8 +2586,9 @@ def _legacy_discovery_sidecars(
     references = {path: [] for path in DISCOVERY_ALIAS_FILES.values()}
     try:
         stages = native_stages["stages"]
+        discovery_qc_details = stages[1]["output_qc"][1]["details"]
         allowed_positions = [
-            stages[1]["output_qc"][1]["details"]["files"],
+            discovery_qc_details["files"],
             stages[4]["inputs"][0]["files"],
             stages[5]["inputs"][0]["files"],
         ]
@@ -2593,6 +2601,11 @@ def _legacy_discovery_sidecars(
         all(isinstance(files, dict) for files in allowed_positions),
         "recovery_member_hash_mismatch",
         "legacy discovery alias stage position is not a file map",
+    )
+    require(
+        isinstance(discovery_qc_details, dict),
+        "recovery_member_hash_mismatch",
+        "legacy discover output details are not an object",
     )
     require(
         all(set(DISCOVERY_ALIAS_FILES) <= set(files) for files in allowed_positions),
@@ -2653,7 +2666,7 @@ def _legacy_discovery_sidecars(
     )
     if "discovery/identity-resolution.json" in candidates:
         try:
-            _, identity = strict_json_file(
+            identity_bytes, identity = strict_json_file(
                 tree / "discovery/identity-resolution.json",
                 "legacy identity resolution",
             )
@@ -2663,43 +2676,67 @@ def _legacy_discovery_sidecars(
                 "legacy identity resolution is unreadable",
             ) from error
         require(
+            identity_bytes == canonical(identity),
+            "recovery_member_hash_mismatch",
+            "legacy identity resolution is not canonical JSON",
+        )
+        require(
             "evidence/discovery.json" in artifact_paths,
             "recovery_member_hash_mismatch",
             "legacy findings has no receipt-bound discovery evidence",
         )
         try:
-            _, discovery = strict_json_file(tree / "evidence/discovery.json", "discovery evidence")
+            discovery_bytes, discovery = strict_json_file(
+                tree / "evidence/discovery.json", "discovery evidence"
+            )
         except RecoveryError as error:
             raise RecoveryError(
                 "recovery_member_hash_mismatch",
                 "receipt-bound discovery evidence is unreadable",
             ) from error
         require(
-            isinstance(discovery, dict)
-            and discovery.get("schema_version") == DISCOVERY_SCHEMA
-            and discovery.get("run_id") == producer_run_id
-            and discovery.get("handoff_sha256") == handoff_sha256
-            and isinstance(discovery.get("findings"), list),
+            discovery_bytes == canonical(discovery),
             "recovery_member_hash_mismatch",
-            "receipt-bound discovery evidence differs from the native stage view",
-        )
-        identity_document = discovery.get("identity")
-        require(
-            isinstance(identity_document, dict),
-            "recovery_member_hash_mismatch",
-            "receipt-bound discovery evidence has no identity",
+            "receipt-bound discovery evidence is not canonical JSON",
         )
         require(
-            isinstance(identity, dict)
-            and identity.get("schema_version") == IDENTITY_SCHEMA
-            and identity.get("run_id") == producer_run_id
-            and identity.get("handoff_sha256") == handoff_sha256
-            and identity.get("hardware_id") == identity_document.get("hardware_id")
-            and identity.get("parent_revision") == identity_document.get("parent_revision")
-            and identity.get("revision") == identity_document.get("revision"),
+            discovery_qc_details.get("discovery_sha256")
+            == hashlib.sha256(discovery_bytes).hexdigest(),
             "recovery_member_hash_mismatch",
-            "legacy identity resolution differs from discovery identity",
+            "legacy discover output carries another discovery digest",
         )
+        native_inventory = {
+            row["path"].removeprefix("input/cad/"): row["sha256"]
+            for row in files
+            if row["type"] == "file" and row["path"].startswith("input/cad/")
+        }
+        require(
+            all(
+                discovery_qc_details["files"].get(f"input/{name}") == checksum
+                for name, checksum in native_inventory.items()
+            ),
+            "recovery_member_hash_mismatch",
+            "legacy discover output differs from the input/cad inventory",
+        )
+        try:
+            discovery = validate_historical_discovery_document(
+                discovery,
+                run_id=producer_run_id,
+                handoff_sha256=handoff_sha256,
+                native_inventory=native_inventory,
+            )
+        except PipelineError as error:
+            raise RecoveryError(
+                "recovery_member_hash_mismatch",
+                "receipt-bound discovery evidence is invalid",
+            ) from error
+        try:
+            validate_historical_identity_resolution(identity, discovery=discovery)
+        except PipelineError as error:
+            raise RecoveryError(
+                "recovery_member_hash_mismatch",
+                "legacy identity resolution is invalid",
+            ) from error
         expected = canonical(
             {
                 "schema_version": FINDING_SCHEMA,

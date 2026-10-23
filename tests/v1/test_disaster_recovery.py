@@ -155,30 +155,107 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
     def legacy_discovery_fixture(self, root: Path) -> tuple[Path, dict, dict]:
         from description_pipeline import interface_records as ir
         from description_pipeline.delivery import PIPELINE_ID
-        from description_pipeline.io import canonical
+        from description_pipeline.io import canonical, digest
         from description_pipeline.sources.solidworks.discovery import (
+            CONTRACT as DISCOVERY_CONTRACT,
             DISCOVERY_SCHEMA,
             FINDING_SCHEMA,
+            GENERATOR,
+            GENERATOR_VERSION,
             IDENTITY_SCHEMA,
+            NAMESPACE,
+            NATIVE_READER_GENERATOR,
         )
-        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+        from description_pipeline.stages import CONTRACT as STAGE_CONTRACT, CONTRACT_SHA256
+        from tests.sources.selection_support import sealed_selection
 
         run_id = "run"
-        handoff_sha256 = "a" * 64
+        main_assembly = "robot.SLDASM"
+        native_files = {
+            "base.SLDPRT": hashlib.sha256(b"base").hexdigest(),
+            main_assembly: hashlib.sha256(b"assembly").hexdigest(),
+        }
+        handoff_sha256 = digest(native_files)
+        source_selection = sealed_selection(native_files, main_assembly, stage_root="C:\\stage")
+        identity_document = {
+            "change_summary": "fixture summary",
+            "control": None,
+            "delivery_configuration": "Default",
+            "hardware_id": "m3.0",
+            "main_assembly": main_assembly,
+            "owner": None,
+            "parent_revision": None,
+            "revision": None,
+            "robot_name": None,
+            "robot_name_technical": "m3_0",
+        }
+        raw_identity = {
+            "change_summary": None,
+            "control": {"system": None, "reference": None},
+            "delivery_configuration": None,
+            "hardware_id": None,
+            "main_assembly": main_assembly,
+            "owner": None,
+            "parent_revision": None,
+            "revision": None,
+            "robot_name": None,
+        }
+        finding = {
+            "schema_version": FINDING_SCHEMA,
+            "code": "legacy.finding",
+            "object": "assembly",
+            "message": "fixture finding",
+            "detail": None,
+            "blocking": False,
+        }
         discovery = {
             "schema_version": DISCOVERY_SCHEMA,
+            "contract": DISCOVERY_CONTRACT,
+            "namespace": NAMESPACE,
             "run_id": run_id,
+            "generator": GENERATOR,
+            "generator_version": GENERATOR_VERSION,
             "handoff_sha256": handoff_sha256,
-            "findings": [{"code": "legacy.finding", "object": "assembly"}],
-            "identity": {
-                "hardware_id": "m3.0",
-                "parent_revision": None,
-                "revision": "A.3",
+            "native_files": native_files,
+            "derivation": {
+                "record_roots": ["/home/andy/description-specifications"],
+                "main_assembly": main_assembly,
+                "configuration": None,
+                "frozen_names": {},
             },
+            "identity": identity_document,
+            "records": [],
+            "frozen_names": {},
+            "raw": {
+                "schema_version": DISCOVERY_SCHEMA,
+                "contract": DISCOVERY_CONTRACT,
+                "namespace": NAMESPACE,
+                "generator": NATIVE_READER_GENERATOR,
+                "files": native_files,
+                "identity": raw_identity,
+                "selection": {"main_assembly": main_assembly, "mode": "explicit"},
+                "source_selection": source_selection,
+                "saved_configuration": "Default",
+                "components": [],
+                "datums": [],
+                "masses": [],
+                "mates": [],
+                "notes": None,
+                "reference_axes": [],
+                "properties": {"document": {}, "components": {}, "mates": {}},
+                "document_state": {"before": {}, "after": {}, "used_api": "fixture"},
+                "solidworks": {},
+                "exporter": {},
+            },
+            "findings": [finding],
         }
         tree, receipt = self.checkpoint_fixture(
             root,
-            subject_files={"evidence/discovery.json": canonical(discovery)},
+            subject_files={
+                "evidence/discovery.json": canonical(discovery),
+                "input/cad/base.SLDPRT": b"base",
+                "input/cad/robot.SLDASM": b"assembly",
+            },
         )
         findings_bytes = canonical(
             {
@@ -192,8 +269,15 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             "handoff_sha256": handoff_sha256,
             "hardware_id": "m3.0",
             "parent_revision": None,
-            "revision": "A.3",
-            "sources": [],
+            "revision": None,
+            "sources": {
+                "change_summary": "submission",
+                "control": "absent",
+                "hardware_id": "platform_configuration",
+                "owner": "absent",
+                "parent_revision": "absent",
+                "revision": "absent",
+            },
         }
         write(tree / "discovery/findings.json", findings_bytes)
         write(tree / "discovery/identity-resolution.json", canonical(identity))
@@ -211,10 +295,12 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
         }
         rows = [
             {"id": stage["id"], "state": "not_run", "in_scope": False, "input_qc": [], "output_qc": []}
-            for stage in CONTRACT["stages"]
+            for stage in STAGE_CONTRACT["stages"]
         ]
         by_id = {row["id"]: row for row in rows}
-        discover_definition = next(stage for stage in CONTRACT["stages"] if stage["id"] == "discover")
+        discover_definition = next(
+            stage for stage in STAGE_CONTRACT["stages"] if stage["id"] == "discover"
+        )
         by_id["discover"].update(
             state="completed",
             in_scope=True,
@@ -227,7 +313,14 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 for item in discover_definition["output_qc"]
             ],
         )
-        by_id["discover"]["output_qc"][1]["details"]["files"] = dict(aliases)
+        discover_details = by_id["discover"]["output_qc"][1]["details"]
+        discover_details["files"] = {
+            **{f"input/{name}": checksum for name, checksum in native_files.items()},
+            **aliases,
+        }
+        discover_details["discovery_sha256"] = hashlib.sha256(
+            (tree / "evidence/discovery.json").read_bytes()
+        ).hexdigest()
         by_id["capture"].update(state="failed", in_scope=True)
         by_id["verify"]["inputs"] = [{"files": dict(aliases)}]
         by_id["publish"]["inputs"] = [{"files": dict(aliases)}]
@@ -271,6 +364,59 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
         row["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         updated["native_stages_sha256"] = row["sha256"]
         return updated
+
+    def rewrite_legacy_bindings(
+        self, tree: Path, receipt: dict, view: dict
+    ) -> tuple[dict, dict]:
+        from description_pipeline.delivery import write_delivery_manifest
+        from description_pipeline.io import canonical
+        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+
+        manifest_path = tree / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        historical_policy = manifest["policy"]["digest"]
+        manifest = write_delivery_manifest(
+            tree,
+            contract=manifest["contract"],
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+        )
+        manifest["policy"]["digest"] = historical_policy
+        manifest_path.write_bytes(canonical(manifest))
+        updated = copy.deepcopy(receipt)
+        updated["artifacts"] = [dict(row) for row in manifest["subject"]["files"]]
+
+        aliases = {
+            alias: hashlib.sha256((tree / relative).read_bytes()).hexdigest()
+            for alias, relative in recovery.DISCOVERY_ALIAS_FILES.items()
+        }
+
+        def update_aliases(value: object) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in aliases:
+                        value[key] = aliases[key]
+                    else:
+                        update_aliases(item)
+            elif isinstance(value, list):
+                for item in value:
+                    update_aliases(item)
+
+        update_aliases(view)
+        view["stages"][1]["output_qc"][1]["details"]["discovery_sha256"] = hashlib.sha256(
+            (tree / "evidence/discovery.json").read_bytes()
+        ).hexdigest()
+        native_stages = tree / "reports/native-stages.json"
+        native_stages.write_bytes(canonical(view))
+        native_stages_sha256 = hashlib.sha256(native_stages.read_bytes()).hexdigest()
+        updated["native_stages_sha256"] = native_stages_sha256
+        updated["artifacts"].append(
+            {
+                "path": "reports/native-stages.json",
+                "bytes": native_stages.stat().st_size,
+                "sha256": native_stages_sha256,
+            }
+        )
+        return updated, view
 
     def copy_checkpoint_tree(self, source: Path, destination: Path) -> Path:
         copied = destination / source.parent.name / source.name
@@ -411,7 +557,7 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                         update_identity(item)
 
             update_identity(malformed_view)
-            with self.assertRaisesRegex(recovery.RecoveryError, "identity resolution differs"):
+            with self.assertRaisesRegex(recovery.RecoveryError, "legacy identity resolution is invalid"):
                 self.verify(
                     malformed_identity,
                     self.rewrite_native_stages(malformed_identity, receipt, malformed_view),
@@ -436,6 +582,173 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                     stage_drift,
                     self.rewrite_native_stages(stage_drift, receipt, changed_view),
                 )
+
+    def test_legacy_discovery_documents_require_exact_versioned_semantics(self) -> None:
+        from description_pipeline.io import canonical
+
+        def wrong_contract(discovery: dict, _identity: dict) -> None:
+            discovery["contract"] = "wrong-contract"
+
+        def wrong_namespace(discovery: dict, _identity: dict) -> None:
+            discovery["namespace"] = "wrong"
+
+        def wrong_generator(discovery: dict, _identity: dict) -> None:
+            discovery["generator"] = "wrong-generator"
+
+        def unknown_discovery_key(discovery: dict, _identity: dict) -> None:
+            discovery["unexpected"] = True
+
+        def inventory_drift(discovery: dict, _identity: dict) -> None:
+            discovery["native_files"]["base.SLDPRT"] = "f" * 64
+
+        def unknown_raw_key(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["unexpected"] = True
+
+        def raw_generator_drift(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["generator"] = "wrong-reader"
+
+        def raw_cad_value_drift(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = "forged"
+
+        def source_selection_inventory_drift(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["source_selection"]["files"]["base.SLDPRT"] = "e" * 64
+
+        def source_selection_handoff_drift(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["source_selection"]["handoff_sha256"] = "e" * 64
+
+        def sources_list(_discovery: dict, identity: dict) -> None:
+            identity["sources"] = []
+
+        def unknown_source_key(_discovery: dict, identity: dict) -> None:
+            identity["sources"]["unexpected"] = "cad"
+
+        def source_value_mismatch(_discovery: dict, identity: dict) -> None:
+            identity["sources"]["owner"] = "cad"
+
+        def invalid_source_origin(_discovery: dict, identity: dict) -> None:
+            identity["sources"]["hardware_id"] = "submission"
+
+        def non_string_source_origin(_discovery: dict, identity: dict) -> None:
+            identity["sources"]["hardware_id"] = []
+
+        def unknown_identity_key(_discovery: dict, identity: dict) -> None:
+            identity["unexpected"] = True
+
+        cases = (
+            ("contract", wrong_contract, "receipt-bound discovery evidence is invalid"),
+            ("namespace", wrong_namespace, "receipt-bound discovery evidence is invalid"),
+            ("generator", wrong_generator, "receipt-bound discovery evidence is invalid"),
+            (
+                "unknown-discovery-key",
+                unknown_discovery_key,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            ("inventory-drift", inventory_drift, "receipt-bound discovery evidence is invalid"),
+            ("unknown-raw-key", unknown_raw_key, "receipt-bound discovery evidence is invalid"),
+            ("raw-generator", raw_generator_drift, "receipt-bound discovery evidence is invalid"),
+            (
+                "raw-cad-value",
+                raw_cad_value_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "source-selection-inventory",
+                source_selection_inventory_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "source-selection-handoff",
+                source_selection_handoff_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            ("sources-list", sources_list, "legacy identity resolution is invalid"),
+            ("unknown-source-key", unknown_source_key, "legacy identity resolution is invalid"),
+            (
+                "source-value-mismatch",
+                source_value_mismatch,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "invalid-source-origin",
+                invalid_source_origin,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "non-string-source-origin",
+                non_string_source_origin,
+                "legacy identity resolution is invalid",
+            ),
+            ("unknown-identity-key", unknown_identity_key, "legacy identity resolution is invalid"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            for name, mutate, message in cases:
+                with self.subTest(name=name):
+                    tree, receipt, view = self.legacy_discovery_fixture(base / name)
+                    discovery = json.loads((tree / "evidence/discovery.json").read_text())
+                    identity = json.loads(
+                        (tree / "discovery/identity-resolution.json").read_text()
+                    )
+                    mutate(discovery, identity)
+                    write(tree / "evidence/discovery.json", canonical(discovery))
+                    write(tree / "discovery/identity-resolution.json", canonical(identity))
+                    receipt, view = self.rewrite_legacy_bindings(tree, receipt, view)
+                    with self.assertRaisesRegex(recovery.RecoveryError, message):
+                        self.verify(tree, receipt)
+
+    def test_legacy_discovery_files_require_canonical_json_bytes(self) -> None:
+        def noncanonical(document: dict) -> bytes:
+            return json.dumps(document, ensure_ascii=False, indent=2).encode()
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            cases = (
+                ("discovery", "evidence/discovery.json", "not canonical JSON"),
+                (
+                    "identity",
+                    "discovery/identity-resolution.json",
+                    "not canonical JSON",
+                ),
+                ("findings", "discovery/findings.json", "canonical discovery projection"),
+            )
+            for name, relative, message in cases:
+                with self.subTest(name=name):
+                    tree, receipt, view = self.legacy_discovery_fixture(base / name)
+                    document = json.loads((tree / relative).read_text())
+                    write(tree / relative, noncanonical(document))
+                    receipt, view = self.rewrite_legacy_bindings(tree, receipt, view)
+                    with self.assertRaisesRegex(recovery.RecoveryError, message):
+                        self.verify(tree, receipt)
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "native-stages")
+            native_stages = tree / "reports/native-stages.json"
+            write(native_stages, noncanonical(view))
+            updated = copy.deepcopy(receipt)
+            row = next(
+                item for item in updated["artifacts"] if item["path"] == "reports/native-stages.json"
+            )
+            row["bytes"] = native_stages.stat().st_size
+            row["sha256"] = hashlib.sha256(native_stages.read_bytes()).hexdigest()
+            updated["native_stages_sha256"] = row["sha256"]
+            with self.assertRaisesRegex(recovery.RecoveryError, "invalid native stage view"):
+                self.verify(tree, updated)
+
+    def test_legacy_native_stage_binds_discovery_digest_and_cad_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, view = self.legacy_discovery_fixture(base / "discovery-digest")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][1]["output_qc"][1]["details"]["discovery_sha256"] = "f" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "another discovery digest"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "cad-inventory")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][1]["output_qc"][1]["details"]["files"][
+                "input/base.SLDPRT"
+            ] = "f" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "input/cad inventory"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
 
     def test_discover_input_records_empty_directory_is_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

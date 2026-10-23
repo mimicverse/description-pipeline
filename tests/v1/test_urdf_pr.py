@@ -17,7 +17,7 @@ from description_pipeline.io import digest
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.repository import urdf_pr
 from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
-from description_pipeline.stages import CONTRACT
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
 BRANCH = "work/solidworks/m3.0/engineering"
 INSPECTION_BRANCH = "work/solidworks/m3.0/inspection_preview"
@@ -199,7 +199,7 @@ class Fixture:
     def write_manifest(self) -> None:
         write_delivery_manifest(
             self.bundle,
-            contract={"schema_version": CONTRACT["schema_version"], "digest": "a" * 64},
+            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
             policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
         )
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from description_pipeline.io import PipelineError, digest
+from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA
 from description_pipeline.verification.solidworks_urdf import _dependencies
 
 from . import support
@@ -73,7 +74,7 @@ class CopyCoverageTests(unittest.TestCase):
         native = {name: _sha(data) for name, data in originals.items()}
         files_rows = [{"path": name, "sha256": checksum} for name, checksum in sorted(native.items())]
         discovery = {
-            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "schema_version": NATIVE_DISCOVERY_SCHEMA,
             "run_id": "copy-coverage",
             "contract": "native-discovery/v1",
             "namespace": "dp",

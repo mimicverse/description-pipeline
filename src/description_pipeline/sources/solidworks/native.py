@@ -61,7 +61,7 @@ from ...geometry.native_fin_topology import (
     NativeFinRelationError,
     validate_native_edge_fin_relations,
 )
-from ...schemas import NATIVE_TESSELLATION_SCHEMA
+from ...schemas import NATIVE_DISCOVERY_SCHEMA, NATIVE_TESSELLATION_SCHEMA
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
 from .session_artifacts import (
@@ -9621,7 +9621,7 @@ class SolidWorksBackend(CadBackend):
                 params={"components": len(components), "mates": len(mates), "datums": len(datums)},
             )
             return {
-                "schema_version": "solidworks-to-urdf.native-discovery/v1",
+                "schema_version": NATIVE_DISCOVERY_SCHEMA,
                 "contract": "native-discovery/v1",
                 "namespace": "dp",
                 "generator": "solidworks-native-reader",

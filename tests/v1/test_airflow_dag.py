@@ -18,6 +18,7 @@ from tests.v1._airflow_env import pinned_airflow_home
 from description_pipeline.io import digest, file_digest
 from description_pipeline.orchestration.airflow_client import EndpointConfig
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
+from description_pipeline.schemas import NATIVE_DISCOVERY_FINDING_SCHEMA
 
 ROOT = Path(__file__).resolve().parents[2]
 DAG_DIR = ROOT / "deploy/airflow/dags"
@@ -3685,7 +3686,7 @@ class PlatformRegistrationTests(unittest.TestCase):
                         "detail": {"publication_blocker": "revision"},
                         "message": "structural revision is not recorded in the CAD records",
                         "object": "assembly",
-                        "schema_version": "solidworks-to-urdf.discovery-finding/v1",
+                        "schema_version": NATIVE_DISCOVERY_FINDING_SCHEMA,
                     },
                     {
                         "blocking": True,
@@ -3718,7 +3719,7 @@ class PlatformRegistrationTests(unittest.TestCase):
                             "a recorded name alone is not evidence"
                         ),
                         "object": "assembly",
-                        "schema_version": "solidworks-to-urdf.discovery-finding/v1",
+                        "schema_version": NATIVE_DISCOVERY_FINDING_SCHEMA,
                     },
                     {
                         "blocking": True,
@@ -3732,7 +3733,7 @@ class PlatformRegistrationTests(unittest.TestCase):
                             "and delivery configuration"
                         ),
                         "object": "assembly",
-                        "schema_version": "solidworks-to-urdf.discovery-finding/v1",
+                        "schema_version": NATIVE_DISCOVERY_FINDING_SCHEMA,
                     },
                 ],
                 "hardware_id": "m3.0",
