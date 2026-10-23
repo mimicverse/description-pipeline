@@ -50,6 +50,7 @@ from ...geometry.native_u import (
     native_fin_interval,
     native_get_parameter_success,
     native_open_edge_boundary_identity,
+    native_open_edge_scope_binding,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_scope_identity_sha256,
@@ -5076,6 +5077,29 @@ class SolidWorksBackend(CadBackend):
             "body_index": body_index,
         }
         owner_scope = dict(scope_context or {})
+        configured_component = self._source_components.get(component)
+        referenced_configuration = (
+            owner_scope.get("referenced_configuration")
+            or (
+                configured_component[1]
+                if configured_component is not None
+                else None
+            )
+        )
+        body_scope = {
+            "component": component,
+            "source_document_sha256": owner_scope.get(
+                "source_document_sha256"
+            ),
+            "source_document_identity_sha256": owner_scope.get(
+                "source_document_identity_sha256"
+            ),
+            "source_document_identity_kind": owner_scope.get(
+                "source_document_identity_kind"
+            ),
+            "referenced_configuration": referenced_configuration,
+            "occurrence_scope": owner_scope.get("occurrence") or component,
+        }
         witness_cache = None
 
         def get_witness_rows():
@@ -6965,6 +6989,7 @@ class SolidWorksBackend(CadBackend):
         u_cache_hits = 0
         for fin_id, row in fins_by_id.items():
             row["vertex_ids"] = fin_vertices[fin_id]
+            row["face_index"] = facets[row["facet_id"]]["face_index"]
             edge_row = fin_to_edge_row.get(fin_id)
             row["edge_reference_sha256"] = (
                 edge_row["reference"]["typed_sha256"]
@@ -7223,8 +7248,58 @@ class SolidWorksBackend(CadBackend):
                             },
                         )
                     endpoints = edge["endpoints"]
+                    face_row = face_rows[row["face_index"]]
+                    face_identity = face_row.get("identity")
+                    face_identity_mode = (
+                        NATIVE_SCOPE_IDENTITY_RULE
+                        if face_identity is not None
+                        else NATIVE_PERSISTENT_IDENTITY_RULE
+                    )
                     try:
+                        scope_binding = native_open_edge_scope_binding(
+                            component=component,
+                            source_document_sha256=body_scope[
+                                "source_document_sha256"
+                            ],
+                            source_document_identity_sha256=body_scope[
+                                "source_document_identity_sha256"
+                            ],
+                            source_document_identity_kind=body_scope[
+                                "source_document_identity_kind"
+                            ],
+                            referenced_configuration=body_scope[
+                                "referenced_configuration"
+                            ],
+                            occurrence_scope=body_scope[
+                                "occurrence_scope"
+                            ],
+                            body_type=body_type,
+                            body_index=body_index,
+                            body_reference_sha256=body_reference[
+                                "typed_sha256"
+                            ],
+                            native_body_reference_sha256=body_reference[
+                                "raw_sha256"
+                            ],
+                            face_index=row["face_index"],
+                            face_reference_sha256=face_row["reference"][
+                                "typed_sha256"
+                            ],
+                            native_face_reference_sha256=face_row[
+                                "reference"
+                            ][
+                                "raw_sha256"
+                            ],
+                            face_identity_mode=face_identity_mode,
+                            owner_scope_key=(
+                                face_identity.get("owner_scope_key")
+                                if isinstance(face_identity, dict)
+                                else None
+                            ),
+                        )
                         open_identity = native_open_edge_boundary_identity(
+                            component=component,
+                            scope_binding=scope_binding,
                             edge_reference_sha256=edge["reference"][
                                 "typed_sha256"
                             ],
@@ -7464,6 +7539,7 @@ class SolidWorksBackend(CadBackend):
                 "body_type": body_type,
                 "body_index": body_index,
                 "body_reference_sha256": body_reference["typed_sha256"],
+                "scope": body_scope,
                 "tessellate_result": tessellate_result,
                 "request": tessellation_request,
                 "properties": tessellation_properties,

@@ -45,6 +45,7 @@ from .native_u import (
     native_fin_interval,
     native_get_parameter_success,
     native_open_edge_boundary_identity,
+    native_open_edge_scope_binding,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_point_within_euclidean_bound,
@@ -584,6 +585,45 @@ def _valid_edge_tolerance(value: object) -> bool:
     )
 
 
+def _valid_body_scope(value: object, component: str) -> bool:
+    """Validate one body-local occurrence/document/configuration scope."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "component",
+        "source_document_sha256",
+        "source_document_identity_sha256",
+        "source_document_identity_kind",
+        "referenced_configuration",
+        "occurrence_scope",
+    }:
+        return False
+    source_fields = (
+        value["source_document_sha256"],
+        value["source_document_identity_sha256"],
+        value["source_document_identity_kind"],
+    )
+    source_absent = all(field is None for field in source_fields)
+    source_present = (
+        isinstance(value["source_document_sha256"], str)
+        and bool(HEX64.fullmatch(value["source_document_sha256"]))
+        and isinstance(value["source_document_identity_sha256"], str)
+        and bool(
+            HEX64.fullmatch(
+                value["source_document_identity_sha256"]
+            )
+        )
+        and value["source_document_identity_kind"]
+        in {"file_sha256", "virtual_path_sha256"}
+    )
+    return (
+        value["component"] == component
+        and value["occurrence_scope"] == component
+        and isinstance(value["referenced_configuration"], str)
+        and bool(value["referenced_configuration"])
+        and (source_absent or source_present)
+    )
+
+
 def _valid_u_evidence(
     value: object,
     u_parameter: object,
@@ -694,6 +734,10 @@ def _valid_u_evidence(
             )
         )
         or value["open_edge_identity_sha256"] != open_edge_identity_sha256
+        or (
+            value["open_edge_identity_sha256"] is not None
+            and value["topology_direction_accepted"] is not True
+        )
     ):
         return False
     closest_point = tuple(closest[:3])
@@ -2118,7 +2162,8 @@ def _parse_itessellation_evidence(
         _require(
             isinstance(body, dict)
             and set(body)
-            == {
+            in (
+                {
                 "body_type",
                 "body_index",
                 "body_reference_sha256",
@@ -2131,7 +2176,23 @@ def _parse_itessellation_evidence(
                 "faces",
                 "facets",
                 "fins",
-            },
+                },
+                {
+                    "body_type",
+                    "body_index",
+                    "body_reference_sha256",
+                    "scope",
+                    "tessellate_result",
+                    "request",
+                    "properties",
+                    "facet_count",
+                    "fin_count",
+                    "vertex_count",
+                    "faces",
+                    "facets",
+                    "fins",
+                },
+            ),
             component + f": native tessellation v8 body {index} has an unknown shape",
         )
         body_key = (body["body_type"], body["body_index"])
@@ -2182,12 +2243,28 @@ def _parse_itessellation_evidence(
             and isinstance(body["fins"], list),
             component + f": native tessellation v8 body {body_key} is incomplete",
         )
+        requires_scope = any(
+            isinstance(fin, dict)
+            and fin.get("open_edge_boundary_identity") is not None
+            for fin in body["fins"]
+        )
+        _require(
+            not requires_scope
+            or (
+                "scope" in body
+                and _valid_body_scope(body["scope"], component)
+            ),
+            component
+            + f": native tessellation v8 body {body_key} "
+            + "lacks an exact open-edge scope",
+        )
         body_evidence[body_key] = _parse_itessellation_body(
             component,
             body,
             spans_by_body[body_key],
             face_spans_by_key,
         )
+        body_evidence[body_key]["scope"] = body.get("scope")
         body_counts[body_key] = {
             "facet_count": body["facet_count"],
             "fin_count": body["fin_count"],
@@ -3046,7 +3123,54 @@ def _parse_itessellation_evidence(
                     + "uses a tolerant gap without open-edge endpoint identity",
                 )
                 try:
+                    face_span = face_spans_by_key[
+                        (*body_key, fin["face_index"])
+                    ]
+                    face_identity = face_span["face_identity"]
+                    scope_binding = native_open_edge_scope_binding(
+                        component=component,
+                        source_document_sha256=evidence["scope"][
+                            "source_document_sha256"
+                        ],
+                        source_document_identity_sha256=evidence["scope"][
+                            "source_document_identity_sha256"
+                        ],
+                        source_document_identity_kind=evidence["scope"][
+                            "source_document_identity_kind"
+                        ],
+                        referenced_configuration=evidence["scope"][
+                            "referenced_configuration"
+                        ],
+                        occurrence_scope=evidence["scope"][
+                            "occurrence_scope"
+                        ],
+                        body_type=body_key[0],
+                        body_index=body_key[1],
+                        body_reference_sha256=face_span[
+                            "body_reference_sha256"
+                        ],
+                        native_body_reference_sha256=face_span[
+                            "native_body_reference_sha256"
+                        ],
+                        face_index=face_span["face_index"],
+                        face_reference_sha256=face_span[
+                            "face_reference_sha256"
+                        ],
+                        native_face_reference_sha256=face_span[
+                            "native_face_reference_sha256"
+                        ],
+                        face_identity_mode=face_span[
+                            "face_identity_mode"
+                        ],
+                        owner_scope_key=(
+                            face_identity["owner_scope_key"]
+                            if isinstance(face_identity, dict)
+                            else None
+                        ),
+                    )
                     recomputed_open_identity = native_open_edge_boundary_identity(
+                        component=component,
+                        scope_binding=scope_binding,
                         edge_reference_sha256=edge[
                             "edge_reference_sha256"
                         ],

@@ -29,6 +29,7 @@ NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE = (
 NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE = (
     "native-open-edge-boundary-identity-v1"
 )
+NATIVE_OPEN_EDGE_SCOPE_RULE = "native-open-edge-scope-binding-v1"
 NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
     "tessellation-edge-projection-v1"
 )
@@ -1076,6 +1077,136 @@ def native_tolerant_edge_evidence(
     }
 
 
+OPEN_EDGE_SCOPE_FIELDS = frozenset(
+    {
+        "rule_version",
+        "component",
+        "source_document_sha256",
+        "source_document_identity_sha256",
+        "source_document_identity_kind",
+        "referenced_configuration",
+        "occurrence_scope",
+        "body_type",
+        "body_index",
+        "body_reference_sha256",
+        "native_body_reference_sha256",
+        "body_identity_sha256",
+        "face_index",
+        "face_reference_sha256",
+        "native_face_reference_sha256",
+        "face_identity_mode",
+        "face_identity_sha256",
+        "owner_scope_key",
+    }
+)
+
+
+def _valid_open_edge_scope_binding(value: object) -> bool:
+    """Whether one scope record binds the exact component, body, and face."""
+
+    if not isinstance(value, dict) or set(value) != OPEN_EDGE_SCOPE_FIELDS:
+        return False
+    hashes = (
+        "source_document_sha256",
+        "source_document_identity_sha256",
+        "body_reference_sha256",
+        "native_body_reference_sha256",
+        "body_identity_sha256",
+        "face_reference_sha256",
+        "native_face_reference_sha256",
+        "face_identity_sha256",
+    )
+    return (
+        value["rule_version"] == NATIVE_OPEN_EDGE_SCOPE_RULE
+        and isinstance(value["component"], str)
+        and bool(value["component"])
+        and all(
+            isinstance(value[field], str)
+            and bool(_HEX64.fullmatch(value[field]))
+            for field in hashes
+        )
+        and value["source_document_identity_kind"]
+        in {"file_sha256", "virtual_path_sha256"}
+        and isinstance(value["referenced_configuration"], str)
+        and bool(value["referenced_configuration"])
+        and isinstance(value["occurrence_scope"], str)
+        and value["occurrence_scope"] == value["component"]
+        and type(value["body_type"]) is int
+        and value["body_type"] in {0, 1}
+        and type(value["body_index"]) is int
+        and value["body_index"] >= 0
+        and value["body_identity_sha256"]
+        == value["body_reference_sha256"]
+        and type(value["face_index"]) is int
+        and value["face_index"] >= 0
+        and value["face_identity_sha256"]
+        == value["face_reference_sha256"]
+        and value["face_identity_mode"]
+        in {
+            NATIVE_PERSISTENT_IDENTITY_RULE,
+            NATIVE_SCOPE_IDENTITY_RULE,
+        }
+        and (
+            (
+                value["face_identity_mode"]
+                == NATIVE_PERSISTENT_IDENTITY_RULE
+                and value["owner_scope_key"] is None
+            )
+            or (
+                value["face_identity_mode"]
+                == NATIVE_SCOPE_IDENTITY_RULE
+                and isinstance(value["owner_scope_key"], str)
+                and bool(_HEX64.fullmatch(value["owner_scope_key"]))
+            )
+        )
+    )
+
+
+def native_open_edge_scope_binding(
+    *,
+    component: str,
+    source_document_sha256: str,
+    source_document_identity_sha256: str,
+    source_document_identity_kind: str,
+    referenced_configuration: str,
+    occurrence_scope: str,
+    body_type: int,
+    body_index: int,
+    body_reference_sha256: str,
+    native_body_reference_sha256: str,
+    face_index: int,
+    face_reference_sha256: str,
+    native_face_reference_sha256: str,
+    face_identity_mode: str,
+    owner_scope_key: str | None,
+) -> dict:
+    """Build one exact component/body/face binding for an open-edge identity."""
+
+    record = {
+        "rule_version": NATIVE_OPEN_EDGE_SCOPE_RULE,
+        "component": component,
+        "source_document_sha256": source_document_sha256,
+        "source_document_identity_sha256": source_document_identity_sha256,
+        "source_document_identity_kind": source_document_identity_kind,
+        "referenced_configuration": referenced_configuration,
+        "occurrence_scope": occurrence_scope,
+        "body_type": body_type,
+        "body_index": body_index,
+        "body_reference_sha256": body_reference_sha256,
+        "native_body_reference_sha256": native_body_reference_sha256,
+        "body_identity_sha256": body_reference_sha256,
+        "face_index": face_index,
+        "face_reference_sha256": face_reference_sha256,
+        "native_face_reference_sha256": native_face_reference_sha256,
+        "face_identity_mode": face_identity_mode,
+        "face_identity_sha256": face_reference_sha256,
+        "owner_scope_key": owner_scope_key,
+    }
+    if not _valid_open_edge_scope_binding(record):
+        raise ValueError("open-edge scope binding is incomplete")
+    return record
+
+
 def native_curve_topology_endpoint_set_assignment(
     expected_start,
     expected_end,
@@ -1271,6 +1402,8 @@ def _gap_mapping_options(
 
 def native_open_edge_boundary_identity(
     *,
+    component: str,
+    scope_binding: dict,
     edge_reference_sha256: str,
     edge_endpoint_refs: tuple[str, str],
     edge_start_point: tuple,
@@ -1295,6 +1428,14 @@ def native_open_edge_boundary_identity(
 ) -> dict:
     """Prove one open sheet boundary fin through unordered native identities."""
 
+    if not isinstance(component, str) or not component:
+        raise ValueError("component must be a non-empty string")
+    if (
+        not _valid_open_edge_scope_binding(scope_binding)
+        or scope_binding["component"] != component
+        or scope_binding["body_type"] != body_type
+    ):
+        raise ValueError("open-edge scope binding differs from the native object")
     if (
         not isinstance(edge_reference_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", edge_reference_sha256) is None
@@ -1454,6 +1595,7 @@ def native_open_edge_boundary_identity(
 
     record = {
         "rule_version": NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE,
+        "scope_binding": scope_binding,
         "edge_reference_sha256": edge_reference_sha256,
         "edge_endpoint_refs": {
             "start": edge_endpoint_refs[0],
@@ -1490,8 +1632,11 @@ def native_open_edge_boundary_identity(
             "end": roles[1],
         },
         "curve_sense": curve_sense,
+        "curve_sense_metadata": {
+            "used_for_decision": False,
+        },
         "gap": {
-            "metric": "max_abs_coordinate",
+            "metric": "euclidean",
             "value_m": gap,
             "inclusive": True,
             "source": NATIVE_TOLERANT_EDGE_GAP_SOURCE,

@@ -29,6 +29,7 @@ from description_pipeline.geometry.native_u import (
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
     native_open_edge_boundary_identity,
+    native_open_edge_scope_binding,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_tolerant_edge_boundary,
@@ -452,6 +453,7 @@ def native_tessellation_fixture(
     no_facets_faces: Sequence[dict[str, Any]] = (),
     *,
     triangle_vertices: Sequence[Sequence[Sequence[float]]] | None = None,
+    scope: dict[str, Any] | None = None,
 ) -> NativeTessellationV3Fixture:
     """Build one closed v3 graph and its byte-identical binary STL projection."""
 
@@ -496,6 +498,18 @@ def native_tessellation_fixture(
         )
         edge["edge_tolerance"] = edge_tolerance
     fixture_triangles = []
+    scope_context = copy.deepcopy(scope) if scope is not None else {
+        "component": "part-1",
+        "source_document_sha256": hashlib.sha256(
+            b"fixture-source"
+        ).hexdigest(),
+        "source_document_identity_sha256": hashlib.sha256(
+            b"fixture-source"
+        ).hexdigest(),
+        "source_document_identity_kind": "file_sha256",
+        "referenced_configuration": "Default",
+        "occurrence_scope": "part-1",
+    }
     body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
     evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
     body_rows = []
@@ -940,7 +954,50 @@ def native_tessellation_fixture(
                 for evidence in fin_evidence
             )
             if uses_tolerant_gap:
+                face_span = span_by_face[
+                    (*body_key, fin["face_index"])
+                ]
+                face_identity = face_span["face_identity"]
+                scope_binding = native_open_edge_scope_binding(
+                    component=scope_context["component"],
+                    source_document_sha256=scope_context[
+                        "source_document_sha256"
+                    ],
+                    source_document_identity_sha256=scope_context[
+                        "source_document_identity_sha256"
+                    ],
+                    source_document_identity_kind=scope_context[
+                        "source_document_identity_kind"
+                    ],
+                    referenced_configuration=scope_context[
+                        "referenced_configuration"
+                    ],
+                    occurrence_scope=scope_context["occurrence_scope"],
+                    body_type=body_type,
+                    body_index=body_index,
+                    body_reference_sha256=face_span[
+                        "body_reference_sha256"
+                    ],
+                    native_body_reference_sha256=face_span[
+                        "native_body_reference_sha256"
+                    ],
+                    face_index=face_span["face_index"],
+                    face_reference_sha256=face_span[
+                        "face_reference_sha256"
+                    ],
+                    native_face_reference_sha256=face_span[
+                        "native_face_reference_sha256"
+                    ],
+                    face_identity_mode=face_span["face_identity_mode"],
+                    owner_scope_key=(
+                        face_identity["owner_scope_key"]
+                        if isinstance(face_identity, dict)
+                        else None
+                    ),
+                )
                 open_identity = native_open_edge_boundary_identity(
+                    component=scope_context["component"],
+                    scope_binding=scope_binding,
                     edge_reference_sha256=edge["edge_reference_sha256"],
                     edge_endpoint_refs=(
                         edge["start_vertex_reference_sha256"],
@@ -1084,6 +1141,7 @@ def native_tessellation_fixture(
                 "body_type": body_type,
                 "body_index": body_index,
                 "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
+                "scope": copy.deepcopy(scope_context),
                 "tessellate_result": True,
                 "request": native_tessellation_request(body_face_references),
                 "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),

@@ -64,6 +64,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     native_fin_interval,
     native_get_parameter_success,
     native_open_edge_boundary_identity,
+    native_open_edge_scope_binding,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_scope_identity_sha256,
@@ -84,6 +85,44 @@ POINTS = {
     3: (0.0, 1.0, 0.0),
     4: (1.0, 1.0, 0.0),
 }
+
+
+def fixture_open_edge_scope_binding(
+    *,
+    component="part-1",
+    body_type=1,
+    body_index=0,
+    face_index=0,
+):
+    return native_open_edge_scope_binding(
+        component=component,
+        source_document_sha256=hashlib.sha256(
+            b"fixture-source"
+        ).hexdigest(),
+        source_document_identity_sha256=hashlib.sha256(
+            b"fixture-source"
+        ).hexdigest(),
+        source_document_identity_kind="file_sha256",
+        referenced_configuration="Default",
+        occurrence_scope=component,
+        body_type=body_type,
+        body_index=body_index,
+        body_reference_sha256=hashlib.sha256(
+            b"fixture-body"
+        ).hexdigest(),
+        native_body_reference_sha256=hashlib.sha256(
+            b"fixture-native-body"
+        ).hexdigest(),
+        face_index=face_index,
+        face_reference_sha256=hashlib.sha256(
+            b"fixture-face"
+        ).hexdigest(),
+        native_face_reference_sha256=hashlib.sha256(
+            b"fixture-native-face"
+        ).hexdigest(),
+        face_identity_mode="native-persistent-reference-v1",
+        owner_scope_key=None,
+    )
 
 
 def packed_evaluate_status(value):
@@ -1072,16 +1111,26 @@ class NativeFinCaptureTests(unittest.TestCase):
             0.0: fin_start,
             1.0: fin_end,
         }
-        backend = SolidWorksBackend()
-        backend._source_components = {"part-1": (object(), "Default")}
-        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
-            Extension=extension
-        )
         with tempfile.TemporaryDirectory() as directory, patch.object(
             native_module,
             "_read_curve_end_params",
             fake_read_end_params,
         ):
+            source_path = Path(directory) / "fixture.SLDPRT"
+            source_path.write_bytes(b"fixture-source")
+            source_key = object()
+            backend = SolidWorksBackend()
+            backend._source_components = {
+                "part-1": (source_key, "Default")
+            }
+            backend._source_documents = {
+                source_key: (source_path, "part", "Default", None)
+            }
+            backend._captured_document = (
+                lambda *_args, **_kwargs: SimpleNamespace(
+                    Extension=extension
+                )
+            )
             destination = Path(directory) / "mesh.stl"
             entry = backend._write_component_mesh(
                 "part-1",
@@ -1107,6 +1156,20 @@ class NativeFinCaptureTests(unittest.TestCase):
             parse_native_tessellation(
                 "part-1",
                 tessellation,
+                entry["bodies"],
+                entry["triangles"],
+                triangles,
+            )
+
+    def assert_r3_tessellation_mutation_rejected(self, mutate):
+        _body, _edge, entry, triangles = (
+            self.r3_open_tolerant_tessellation()
+        )
+        mutate(entry["tessellation"], entry["bodies"])
+        with self.assertRaises(PipelineError):
+            parse_native_tessellation(
+                "part-1",
+                entry["tessellation"],
                 entry["bodies"],
                 entry["triangles"],
                 triangles,
@@ -2218,6 +2281,19 @@ class NativeFinCaptureTests(unittest.TestCase):
             identity["direction_dot"]["used_for_decision"],
             False,
         )
+        self.assertIs(
+            identity["curve_sense_metadata"]["used_for_decision"],
+            False,
+        )
+        self.assertEqual(identity["gap"]["metric"], "euclidean")
+        self.assertEqual(
+            identity["scope_binding"]["component"],
+            "part-1",
+        )
+        self.assertEqual(
+            identity["scope_binding"]["rule_version"],
+            "native-open-edge-scope-binding-v1",
+        )
         self.assertEqual(
             fin["start_evidence"]["open_edge_identity_sha256"],
             identity["identity_chain_sha256"],
@@ -2266,6 +2342,49 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assert_r3_open_mutation_rejected(mutate)
 
+    def test_parser_rejects_forged_open_identity_source_scope(self):
+        def mutate(_edge, fin):
+            fin["open_edge_boundary_identity"]["scope_binding"][
+                "source_document_sha256"
+            ] = "f" * 64
+
+        self.assert_r3_open_mutation_rejected(mutate)
+
+    def test_parser_rejects_forged_open_identity_configuration_scope(self):
+        def mutate(_edge, fin):
+            fin["open_edge_boundary_identity"]["scope_binding"][
+                "referenced_configuration"
+            ] = "Other"
+
+        self.assert_r3_open_mutation_rejected(mutate)
+
+    def test_parser_rejects_forged_open_identity_body_face_scope(self):
+        def mutate(_edge, fin):
+            scope = fin["open_edge_boundary_identity"]["scope_binding"]
+            scope["body_index"] += 1
+            scope["face_index"] += 1
+
+        self.assert_r3_open_mutation_rejected(mutate)
+
+    def test_parser_rejects_forged_serialized_scope(self):
+        def mutate(_edge, fin):
+            fin["open_edge_boundary_identity"]["scope_binding"][
+                "source_document_identity_sha256"
+            ] = "e" * 64
+            fin["open_edge_boundary_identity"][
+                "identity_chain_sha256"
+            ] = "d" * 64
+
+        self.assert_r3_open_mutation_rejected(mutate)
+
+    def test_parser_rejects_foreign_serialized_body_scope(self):
+        def mutate(tessellation, _bodies):
+            scope = tessellation["itessellation"]["bodies"][0]["scope"]
+            scope["component"] = "foreign-component"
+            scope["occurrence_scope"] = "foreign-component"
+
+        self.assert_r3_tessellation_mutation_rejected(mutate)
+
     def test_parser_rejects_wrong_open_identity_body(self):
         def mutate(_edge, fin):
             fin["open_edge_boundary_identity"]["body_type"] = 0
@@ -2293,6 +2412,12 @@ class NativeFinCaptureTests(unittest.TestCase):
             evidence["parameter_success_raw_type"] = "bool"
             evidence["parameter_success_bit"] = 0
             evidence["parameter_success_parsed"] = False
+
+        self.assert_r3_open_mutation_rejected(mutate)
+
+    def test_parser_requires_open_identity_flag_on_both_endpoints(self):
+        def mutate(_edge, fin):
+            fin["end_evidence"]["topology_direction_accepted"] = False
 
         self.assert_r3_open_mutation_rejected(mutate)
 
@@ -2328,6 +2453,8 @@ class NativeFinCaptureTests(unittest.TestCase):
         gap = 5e-7
         separation = 7.5e-7
         identity = native_open_edge_boundary_identity(
+            component="part-1",
+            scope_binding=fixture_open_edge_scope_binding(),
             edge_reference_sha256=hashlib.sha256(b"short-edge").hexdigest(),
             edge_endpoint_refs=(
                 hashlib.sha256(b"short-start").hexdigest(),
@@ -2378,6 +2505,8 @@ class NativeFinCaptureTests(unittest.TestCase):
             "not unique",
         ):
             native_open_edge_boundary_identity(
+                component="part-1",
+                scope_binding=fixture_open_edge_scope_binding(),
                 edge_reference_sha256=hashlib.sha256(
                     b"collapsed-edge"
                 ).hexdigest(),
@@ -2414,6 +2543,8 @@ class NativeFinCaptureTests(unittest.TestCase):
             "not unique",
         ):
             native_open_edge_boundary_identity(
+                component="part-1",
+                scope_binding=fixture_open_edge_scope_binding(),
                 edge_reference_sha256=hashlib.sha256(
                     b"diagonal-edge"
                 ).hexdigest(),
@@ -6118,6 +6249,14 @@ class NativeFinCaptureTests(unittest.TestCase):
             spans,
             native_edges,
             triangle_vertices=triangles,
+            scope={
+                "component": "edge-alias",
+                "source_document_sha256": "a" * 64,
+                "source_document_identity_sha256": "a" * 64,
+                "source_document_identity_kind": "file_sha256",
+                "referenced_configuration": "Default",
+                "occurrence_scope": "edge-alias",
+            },
         )
         source_sha256 = "a" * 64
         part_body_reference = hashlib.sha256(
