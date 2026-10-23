@@ -4212,46 +4212,6 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(context_calls, ["enter"])
         self.assertEqual(set(witnesses), set(range(217)))
 
-    def test_body_identity_set_requires_a_stable_complete_replay(self):
-        body, _face_10, _face_20, _edge, _tessellation, extension = (
-            self.fixture()
-        )
-        temp_root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_root)
-        source_path = temp_root / "fixture.SLDPRT"
-        source_path.write_bytes(b"fixture")
-        backend = SolidWorksBackend()
-        document_key = object()
-        backend._source_components = {
-            "part-1": (document_key, "Default")
-        }
-        backend._source_documents = {
-            document_key: [source_path, "part", "Default", object()]
-        }
-        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
-            Extension=extension
-        )
-
-        with patch.object(
-            native_module,
-            "_persistent_reference_bytes",
-            side_effect=[b"first-pass", b"changed-replay"],
-        ), self.assertRaises(CadError) as caught:
-            backend._body_face_triangles(
-                [body],
-                0,
-                "part-1",
-            )
-
-        self.assertEqual(
-            caught.exception.code,
-            "cad_body_identity_changed",
-        )
-        self.assertIn(
-            "complete native body identity set is not stable",
-            caught.exception.message,
-        )
-
     def test_com_object_identity_uses_underlying_dispatch(self):
         native_object = object()
         wrapper_a = SimpleNamespace(_oleobj_=native_object)
