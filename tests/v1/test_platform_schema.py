@@ -137,11 +137,10 @@ class SchemaQualifierTests(unittest.TestCase):
         text = (PLATFORM_DIR / "views.sql").read_text(encoding="utf-8")
         self.assertIn(
             "o.kind <> 'cancel'\n"
-            "          OR (\n"
-            "              o.dag_id IS NOT NULL\n"
-            "              AND o.dag_run_id IS NOT NULL\n"
-            "              AND o.task_id IS NOT NULL\n"
-            "              AND o.map_index IS NOT NULL\n",
+            "          OR o.dag_id IS NOT NULL\n"
+            "          OR o.dag_run_id IS NOT NULL\n"
+            "          OR o.task_id IS NOT NULL\n"
+            "          OR o.map_index IS NOT NULL\n",
             text,
         )
 
