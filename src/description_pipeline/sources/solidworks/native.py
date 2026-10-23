@@ -234,8 +234,12 @@ def _com_iunknown_pointer(value) -> int:
     if token is None:
         return _com_object_pointer(value)
     import pythoncom
+    import pywintypes
 
-    unknown = token.QueryInterface(pythoncom.IID_IUnknown)
+    unknown = token.QueryInterface(
+        pywintypes.IID(pythoncom.IID_IUnknown),
+        pythoncom.IID_IUnknown,
+    )
     return _com_object_pointer(unknown)
 
 
