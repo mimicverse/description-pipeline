@@ -700,7 +700,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(entry["tessellation_sources"], ["sheet_itessellation"])
         self.assertEqual(entry["bodies"], {"solid": 0, "sheet": 1})
         self.assertIn("ITessellation", entry["used_api"])
-        self.assertEqual(component.body_calls, [(0,), (1,)])
+        self.assertEqual(component.body_calls, [(0,), (1,), (1,)])
         self.assertEqual(
             body.tessellation_face_lists[-1],
             "VT_ARRAY|VT_DISPATCH",
@@ -818,7 +818,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(entry["bodies"], {"solid": 2, "sheet": 0})
         self.assertIn("ITessellation", entry["used_api"])
         self.assertNotIn("GetTessTriangles", entry["used_api"])
-        self.assertEqual(component.body_calls, [(0,), (1,)])
+        self.assertEqual(component.body_calls, [(0,), (0,), (1,)])
         self.assertEqual(
             [span["triangle_start"] for span in entry["tessellation"]["face_spans"]],
             [0, 1],

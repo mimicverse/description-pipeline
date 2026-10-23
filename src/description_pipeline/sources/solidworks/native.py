@@ -227,6 +227,22 @@ def _com_object_pointer(value) -> int:
     return int(match.group(1), 16)
 
 
+def _com_iunknown_pointer(value) -> int:
+    """Return the canonical IUnknown pointer for a live pywin32 object."""
+
+    token = getattr(value, "_oleobj_", None)
+    if token is None:
+        return _com_object_pointer(value)
+    import pythoncom
+    import pywintypes
+
+    unknown = token.QueryInterface(
+        pywintypes.IID(pythoncom.IID_IUnknown),
+        pythoncom.IID_IUnknown,
+    )
+    return _com_object_pointer(unknown)
+
+
 def _binary64_bits(value) -> str:
     number = float(value)
     if not math.isfinite(number):
@@ -276,13 +292,19 @@ def _face_scope_geometry(face) -> dict:
 
 
 def _persistent_reference_sha256(extension, value) -> str:
-    raw = bytes(
-        int(item) & 0xFF
-        for item in _member(extension, "GetPersistReference3", value)
-    )
+    raw = _persistent_reference_bytes(extension, value)
     if not raw:
         raise ValueError("the native persistent reference is empty")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _persistent_reference_bytes(extension, value) -> bytes:
+    """Return one native persistent reference without normalizing its bytes."""
+
+    return bytes(
+        int(item) & 0xFF
+        for item in _member(extension, "GetPersistReference3", value)
+    )
 
 
 def _scope_face_rows(faces, extension) -> list[dict]:
@@ -4894,6 +4916,12 @@ class SolidWorksBackend(CadBackend):
         read_end_params=None,
         scope_context=None,
         scope_witnesses=None,
+        body_name=None,
+        body_reference=None,
+        body_faces=None,
+        body_edges=None,
+        body_owner_prebound=False,
+        body_owner_pointer=None,
     ):
         """Capture one body's finite topology and orientation evidence.
 
@@ -4989,22 +5017,38 @@ class SolidWorksBackend(CadBackend):
             }
 
         body = _dynamic(body)
-        body_name = call("IBody2.Name", lambda: _member(body, "Name"))
+        if body_name is None:
+            body_name = call("IBody2.Name", lambda: _member(body, "Name"))
         if not isinstance(body_name, str) or not body_name.strip():
             raise CadError(
                 "cad_native_tessellation_unreadable",
                 "the captured body has no stable name",
                 {**base, "api": "IBody2.Name"},
             )
-        body_reference = persistent(body, "body")
-        faces = call(
-            "IBody2.GetFaces",
-            lambda: _as_list(_member(body, "GetFaces")),
-        )
-        edges = call(
-            "IBody2.GetEdges",
-            lambda: _as_list(_member(body, "GetEdges")),
-        )
+        if body_reference is None:
+            body_reference = persistent(body, "body")
+        else:
+            registry.claim(
+                kind="body",
+                raw_sha256=body_reference["raw_sha256"],
+                typed_sha256=body_reference["typed_sha256"],
+                owner={"kind": "body", **base},
+                base=base,
+            )
+        if body_faces is None:
+            faces = call(
+                "IBody2.GetFaces",
+                lambda: _as_list(_member(body, "GetFaces")),
+            )
+        else:
+            faces = list(body_faces)
+        if body_edges is None:
+            edges = call(
+                "IBody2.GetEdges",
+                lambda: _as_list(_member(body, "GetEdges")),
+            )
+        else:
+            edges = list(body_edges)
         face_rows = []
         for face_index, raw_face in enumerate(faces):
             face = _interface(_dynamic(raw_face), IFACE2_IID)
@@ -5058,22 +5102,50 @@ class SolidWorksBackend(CadBackend):
                         f"{kind} has no owning IBody2",
                         {**base, f"{kind}_index": row["index"]},
                     )
-                owner_reference = persistent(
-                    owner,
-                    "body",
-                    audit=False,
-                    owner_of=kind,
-                    **{f"{kind}_index": row["index"]},
+                owner_pointer = _com_iunknown_pointer(owner)
+                owner_matches_name = (
+                    call(
+                        f"{interface_name}.GetBody.Name",
+                        lambda value=owner: _member(value, "Name"),
+                        **{f"{kind}_index": row["index"]},
+                    )
+                    == body_name
                 )
-                if owner_reference["raw_sha256"] != body_reference["raw_sha256"]:
+                if body_owner_prebound:
+                    owner_reference = body_reference
+                    owner_matches = (
+                        owner_matches_name
+                        and owner_pointer == body_owner_pointer
+                    )
+                else:
+                    owner_reference = persistent(
+                        owner,
+                        "body",
+                        audit=False,
+                        owner_of=kind,
+                        **{f"{kind}_index": row["index"]},
+                    )
+                    owner_matches = (
+                        owner_matches_name
+                        and
+                        owner_reference["raw_sha256"]
+                        == body_reference["raw_sha256"]
+                    )
+                if not owner_matches:
                     raise CadError(
                         "cad_native_tessellation_unreadable",
                         f"{kind} belongs to a body other than the captured body",
                         {
                             **base,
                             f"{kind}_index": row["index"],
-                            "body_reference_sha256": body_reference["typed_sha256"],
-                            "owner_reference_sha256": owner_reference["typed_sha256"],
+                            "body_reference_sha256": body_reference[
+                                "typed_sha256"
+                            ],
+                            "owner_reference_sha256": owner_reference[
+                                "typed_sha256"
+                            ],
+                            "body_owner_pointer": body_owner_pointer,
+                            "owner_pointer": owner_pointer,
                         },
                     )
                 row["owner_body_reference"] = owner_reference
@@ -7364,6 +7436,8 @@ class SolidWorksBackend(CadBackend):
         body_type,
         component,
         reference_registry=None,
+        *,
+        body_holder=None,
     ):
         """Capture the production v3 tessellation stream from ITessellation."""
 
@@ -7438,48 +7512,215 @@ class SolidWorksBackend(CadBackend):
                 ][1],
             }
 
-        def raw_reference_sha256(entity, *, context):
-            try:
-                raw = bytes(
-                    int(value) & 0xFF
-                    for value in _member(extension, "GetPersistReference3", entity)
+        def read_body_rows(current_bodies):
+            rows = []
+            for body_index, raw_body in enumerate(current_bodies):
+                body = _dynamic(raw_body)
+                context = {
+                    "component": component,
+                    "body_type": body_type,
+                    "body_index": body_index,
+                }
+                try:
+                    body_name = _member(body, "Name")
+                    raw_reference = _persistent_reference_bytes(
+                        extension,
+                        body,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    raise CadError(
+                        "cad_persistent_reference_unavailable",
+                        "a native body has no readable persistent identity",
+                        {**context, "error": str(error)[:300]},
+                    ) from error
+                if (
+                    not isinstance(body_name, str)
+                    or not body_name.strip()
+                ):
+                    raise CadError(
+                        "cad_body_identity_unreadable",
+                        "a native body has no stable name",
+                        context,
+                    )
+                if not raw_reference:
+                    raise CadError(
+                        "cad_persistent_reference_unavailable",
+                        "a native body has an empty persistent identity",
+                        context,
+                    )
+                try:
+                    faces = _as_list(_member(body, "GetFaces"))
+                except Exception as error:  # noqa: BLE001
+                    raise CadError(
+                        "cad_body_faces_unreadable",
+                        "the occurrence body's faces could not be read",
+                        {
+                            **context,
+                            "api": "IBody2.GetFaces",
+                            "error": str(error),
+                        },
+                    ) from error
+                if not faces:
+                    raise CadError(
+                        "cad_mesh_export_failed",
+                        "a native body carries no faces",
+                        {**context, "api": "IBody2.GetFaces"},
+                    )
+                try:
+                    edges = _as_list(_member(body, "GetEdges"))
+                    owner_pointers = set()
+                    owner_names = set()
+                    owner_references = set()
+                    for kind, interface_id, values in (
+                        ("face", IFACE2_IID, faces),
+                        ("edge", IEDGE_IID, edges),
+                    ):
+                        for raw_value in values:
+                            value = _interface(
+                                _dynamic(raw_value),
+                                interface_id,
+                            )
+                            owner = _interface(
+                                _dynamic(_method(value, "GetBody")),
+                                IBODY2_IID,
+                            )
+                            if owner is None:
+                                raise ValueError(
+                                    f"a {kind} has no owning IBody2"
+                                )
+                            owner_pointers.add(
+                                _com_iunknown_pointer(owner)
+                            )
+                            owner_names.add(_member(owner, "Name"))
+                            owner_references.add(
+                                _persistent_reference_bytes(
+                                    extension,
+                                    owner,
+                                )
+                            )
+                    if len(owner_pointers) != 1:
+                        raise ValueError(
+                            "the body faces and edges report several owning IBody2 objects"
+                        )
+                    if owner_names != {body_name}:
+                        raise ValueError(
+                            "the body faces and edges report another owning body name"
+                        )
+                    if owner_references != {raw_reference}:
+                        raise ValueError(
+                            "the body faces and edges report another owning persistent reference"
+                        )
+                    body_pointer = _com_iunknown_pointer(body)
+                    if (
+                        owner_pointers != {body_pointer}
+                    ):
+                        raise ValueError(
+                            "the body faces and edges report another owning COM object"
+                        )
+                except Exception as error:  # noqa: BLE001
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "the native body face and edge ownership is not stable",
+                        {
+                            **context,
+                            "error": str(error)[:300],
+                        },
+                    ) from error
+                rows.append(
+                    {
+                        "body": body,
+                        "body_index": body_index,
+                        "body_name": body_name,
+                        "object_pointer": _com_iunknown_pointer(body),
+                        "owner_pointer": body_pointer,
+                        "reference": {
+                            "raw": raw_reference,
+                            "raw_sha256": hashlib.sha256(
+                                raw_reference
+                            ).hexdigest(),
+                            "typed_sha256": _typed_reference_sha256(
+                                "body",
+                                raw_reference,
+                            ),
+                        },
+                        "faces": faces,
+                        "edges": edges,
+                    }
                 )
-            except Exception as error:  # noqa: BLE001
-                raise CadError(
-                    "cad_persistent_reference_unavailable",
-                    "a native topology object has no persistent identity",
-                    {**context, "error": str(error)[:300]},
-                ) from error
-            if not raw:
-                raise CadError(
-                    "cad_persistent_reference_unavailable",
-                    "a native topology object has an empty persistent identity",
-                    context,
-                )
-            return hashlib.sha256(raw).hexdigest()
+            return rows
 
-        for body_index, raw_body in enumerate(bodies):
-            body = _dynamic(raw_body)
+        body_rows = read_body_rows(bodies)
+        replay_bodies = (
+            list(bodies)
+            if body_holder is None
+            else self._body_list(body_holder, body_type, component)
+        )
+        if len(replay_bodies) != len(bodies):
+            raise CadError(
+                "cad_body_identity_changed",
+                "the complete native body identity set changed size",
+                {
+                    "component": component,
+                    "body_type": body_type,
+                    "first_body_count": len(bodies),
+                    "replay_body_count": len(replay_bodies),
+                },
+            )
+        replay_rows = read_body_rows(replay_bodies)
+        for row, replay in zip(body_rows, replay_rows, strict=True):
+            if (
+                row["body_index"] != replay["body_index"]
+                or row["body_name"] != replay["body_name"]
+                or row["object_pointer"] != replay["object_pointer"]
+                or row["owner_pointer"] != replay["owner_pointer"]
+                or len(row["faces"]) != len(replay["faces"])
+                or len(row["edges"]) != len(replay["edges"])
+                or row["reference"]["raw_sha256"]
+                != replay["reference"]["raw_sha256"]
+                or row["reference"]["typed_sha256"]
+                != replay["reference"]["typed_sha256"]
+            ):
+                raise CadError(
+                    "cad_body_identity_changed",
+                    "the complete native body identity set is not stable",
+                    {
+                        "component": component,
+                        "body_type": body_type,
+                        "body_index": row["body_index"],
+                        "body_name": row["body_name"],
+                        "first_reference_sha256": row["reference"][
+                            "raw_sha256"
+                        ],
+                        "replay_reference_sha256": replay["reference"][
+                            "raw_sha256"
+                        ],
+                    },
+                )
+        raw_body_references = [
+            row["reference"]["raw_sha256"] for row in body_rows
+        ]
+        if len(set(raw_body_references)) != len(raw_body_references):
+            raise CadError(
+                "cad_persistent_reference_alias",
+                "a persistent body identity is not unique",
+                {
+                    "component": component,
+                    "body_type": body_type,
+                    "reference_sha256": raw_body_references,
+                },
+            )
+
+        for row in body_rows:
+            body = row["body"]
+            body_index = row["body_index"]
+            body_name = row["body_name"]
+            faces = row["faces"]
             context = {
                 "component": component,
                 "body_type": body_type,
                 "body_index": body_index,
                 "completed_faces": completed_faces,
             }
-            try:
-                faces = _as_list(_member(body, "GetFaces"))
-            except Exception as error:  # noqa: BLE001
-                raise CadError(
-                    "cad_body_faces_unreadable",
-                    "the occurrence body's faces could not be read",
-                    {**context, "api": "IBody2.GetFaces", "error": str(error)},
-                ) from error
-            if not faces:
-                raise CadError(
-                    "cad_mesh_export_failed",
-                    "a native body carries no faces",
-                    {**context, "api": "IBody2.GetFaces"},
-                )
 
             def scope_witnesses(
                 component=component,
@@ -7505,6 +7746,14 @@ class SolidWorksBackend(CadBackend):
                 reference_registry=registry,
                 scope_context=scope_context,
                 scope_witnesses=scope_witnesses,
+                body_name=body_name,
+                body_reference={
+                    **row["reference"],
+                },
+                body_faces=faces,
+                body_edges=row["edges"],
+                body_owner_prebound=True,
+                body_owner_pointer=row["owner_pointer"],
             )
             for key, value in graph["u_observation_stats"].items():
                 evidence["u_observation_stats"][key] += value
@@ -7620,18 +7869,6 @@ class SolidWorksBackend(CadBackend):
             evidence["solidworks_vertex_identities"].extend(
                 graph["solidworks_vertex_identities"]
             )
-            if (
-                raw_reference_sha256(
-                    body,
-                    context={**context, "identity_kind": "body"},
-                )
-                != graph["body_reference"]["raw_sha256"]
-            ):
-                raise CadError(
-                    "cad_body_identity_changed",
-                    "the native body identity changed during tessellation",
-                    context,
-                )
         evidence["native_edges"].sort(
             key=lambda row: (
                 row["body_type"],
@@ -7757,6 +7994,7 @@ class SolidWorksBackend(CadBackend):
                     body_type,
                     component,
                     reference_registry,
+                    body_holder=holder,
                 )
                 triangle_offset = len(values) // 9
                 values.extend(body_values)

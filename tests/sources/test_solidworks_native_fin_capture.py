@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import math
+import shutil
 import struct
 import sys
 import tempfile
@@ -572,6 +573,319 @@ class NativeFinCaptureTests(unittest.TestCase):
                 "active_configuration": "Default",
                 "referenced_configuration": "Default",
             },
+        )
+
+    def body_identity_backend(self, source_path, extension):
+        backend = SolidWorksBackend()
+        document_key = object()
+        backend._source_components = {
+            "part-1": (document_key, "Default")
+        }
+        backend._source_documents = {
+            document_key: [source_path, "part", "Default", object()]
+        }
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
+            Extension=extension
+        )
+        return backend
+
+    def test_stable_duplicate_body_references_fail_before_tessellation(self):
+        first, *_ = self.fixture()
+        second, *_ = self.fixture()
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        shared = hashlib.sha256(b"shared-body-reference").digest()
+
+        class DuplicateExtension:
+            def GetPersistReference3(self, _value):  # noqa: N802
+                return list(shared)
+
+        backend = self.body_identity_backend(
+            source_path,
+            DuplicateExtension(),
+        )
+
+        with self.assertRaises(CadError) as caught:
+            backend._body_face_triangles(
+                [first, second],
+                1,
+                "part-1",
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_persistent_reference_alias",
+        )
+
+    def test_body_identity_set_requires_a_stable_complete_replay(self):
+        body, *_ = self.fixture()
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        backend = self.body_identity_backend(
+            source_path,
+            FakeExtension(),
+        )
+
+        with patch.object(
+            native_module,
+            "_persistent_reference_bytes",
+            side_effect=[
+                b"first-pass",
+                b"first-pass",
+                b"first-pass",
+                b"first-pass",
+                b"changed-replay",
+                b"changed-replay",
+                b"changed-replay",
+                b"changed-replay",
+            ],
+        ), self.assertRaises(CadError) as caught:
+            backend._body_face_triangles(
+                [body],
+                1,
+                "part-1",
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_body_identity_changed",
+        )
+
+    def test_write_path_enumerates_each_nonempty_body_type_twice(self):
+        body, _face_10, _face_20, _edge, _tessellation, extension = (
+            self.fixture()
+        )
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        backend = self.body_identity_backend(source_path, extension)
+
+        class CountingHolder:
+            def __init__(self):
+                self.calls = []
+
+            def GetBodies2(self, body_type):  # noqa: N802
+                self.calls.append(body_type)
+                return [body] if body_type == 1 else []
+
+        holder = CountingHolder()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                holder,
+            )
+
+        self.assertEqual(holder.calls, [0, 1, 1])
+
+    def test_body_set_replay_rejects_reorder_replacement_and_size_drift(self):
+        first, *_ = self.fixture()
+        second, *_ = self.fixture()
+        replacement, *_ = self.fixture()
+
+        class ReplayHolder:
+            def __init__(self, replay):
+                self.replay = replay
+
+            def GetBodies2(self, body_type):  # noqa: N802
+                return list(self.replay) if body_type == 1 else []
+
+        for label, replay in (
+            ("reorder", [second, first]),
+            ("replacement", [first, replacement]),
+            ("size", [first]),
+        ):
+            with self.subTest(label=label):
+                temp_root = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, temp_root)
+                source_path = temp_root / "fixture.SLDPRT"
+                source_path.write_bytes(b"fixture")
+                extension = FakeExtension()
+                backend = self.body_identity_backend(
+                    source_path,
+                    extension,
+                )
+                with self.assertRaises(CadError) as caught:
+                    backend._body_face_triangles(
+                        [first, second],
+                        1,
+                        "part-1",
+                        body_holder=ReplayHolder(replay),
+                    )
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_body_identity_changed",
+                )
+
+    def test_second_enumeration_cannot_mutate_the_first_body_snapshot(self):
+        body, *_ = self.fixture()
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        backend = self.body_identity_backend(
+            source_path,
+            FakeExtension(),
+        )
+
+        class MutatingHolder:
+            def GetBodies2(self, body_type):  # noqa: N802
+                if body_type == 1:
+                    body.Name = "mutated-body"
+                    return [body]
+                return []
+
+        with self.assertRaises(CadError) as caught:
+            backend._body_face_triangles(
+                [body],
+                1,
+                "part-1",
+                body_holder=MutatingHolder(),
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_body_identity_changed",
+        )
+
+    def test_preclassified_body_and_owner_references_have_no_late_read(self):
+        body, _face_10, _face_20, _edge, _tessellation, extension = (
+            self.fixture()
+        )
+        extension.body = body
+        extension.tessellation_started = False
+        extension.late_body_calls = 0
+        original_reference = extension.GetPersistReference3
+
+        def reference(value):
+            if value is body and extension.tessellation_started:
+                extension.late_body_calls += 1
+            return original_reference(value)
+
+        extension.GetPersistReference3 = reference
+        original_tessellation = body.GetTessellation
+
+        def tessellation(face_list):
+            extension.tessellation_started = True
+            return original_tessellation(face_list)
+
+        body.GetTessellation = tessellation
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        backend = self.body_identity_backend(source_path, extension)
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                FakeHolder(body),
+            )
+
+        self.assertEqual(extension.late_body_calls, 0)
+
+    def test_preclassified_path_preserves_face_and_edge_owner_checks(self):
+        for owner_kind in ("face", "edge", "all"):
+            with self.subTest(owner_kind=owner_kind):
+                (
+                    body,
+                    face_10,
+                    _face_20,
+                    edge,
+                    _tessellation,
+                    extension,
+                ) = self.fixture()
+                other_body = FakeBody([], None, None)
+                other_body.Name = "other-body"
+                if owner_kind == "face":
+                    face_10.owner = other_body
+                elif owner_kind == "edge":
+                    edge.owner = other_body
+                else:
+                    for face in body.faces:
+                        face.owner = other_body
+                    edge.owner = other_body
+                temp_root = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, temp_root)
+                source_path = temp_root / "fixture.SLDPRT"
+                source_path.write_bytes(b"fixture")
+                backend = self.body_identity_backend(
+                    source_path,
+                    extension,
+                )
+
+                with tempfile.TemporaryDirectory() as directory, self.assertRaises(
+                    CadError
+                ) as caught:
+                    backend._write_component_mesh(
+                        "part-1",
+                        Path(directory) / "mesh.stl",
+                        FakeHolder(body),
+                    )
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_native_tessellation_unreadable",
+                )
+                self.assertIn(
+                    "face and edge ownership is not stable",
+                    caught.exception.message,
+                )
+
+    def test_preclassified_path_rejects_same_name_foreign_proxy_body(self):
+        body, _face_10, _face_20, edge, _tessellation, _extension = (
+            self.fixture()
+        )
+        other_body = FakeBody([], None, None)
+        other_body.Name = body.Name
+        for face in body.faces:
+            face.owner = other_body
+        edge.owner = other_body
+        temp_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_root)
+        source_path = temp_root / "fixture.SLDPRT"
+        source_path.write_bytes(b"fixture")
+        shared = b"shared-reference"
+
+        class SharedReferenceExtension:
+            def GetPersistReference3(self, _value):  # noqa: N802
+                return list(shared)
+
+        backend = self.body_identity_backend(
+            source_path,
+            SharedReferenceExtension(),
+        )
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(
+            CadError
+        ) as caught:
+            backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                FakeHolder(body),
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn(
+            "another owning COM object",
+            caught.exception.detail["error"],
         )
 
     def open_boundary_fixture(self):

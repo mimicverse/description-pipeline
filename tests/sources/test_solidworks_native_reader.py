@@ -42,6 +42,7 @@ from description_pipeline.sources.solidworks.native import (
     _read_only_document,
     _temporary_configuration,
 )
+import description_pipeline.sources.solidworks.native as native_module
 
 #: SolidWorks ``MathTransform.ArrayData`` order for an identity occurrence.
 SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
@@ -1728,15 +1729,20 @@ class CaptureSceneTests(unittest.TestCase):
             def GetBodies2(self, body_type):
                 if body_type != 0:
                     return []
-                triangles = {
-                    "Short": [0, 0, 0, 1, 0, 0, 0, 1, 0],
-                    "Long": [0, 0, 0, 2, 0, 0, 0, 2, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0],
-                }[self.ReferencedConfiguration]
-                face = _mesh_face(
-                    lambda _quality, values=triangles: values,
-                    self.ReferencedConfiguration,
-                )
-                return [_mesh_body([face], self.ReferencedConfiguration)]
+                if not hasattr(self, "_configured_body"):
+                    triangles = {
+                        "Short": [0, 0, 0, 1, 0, 0, 0, 1, 0],
+                        "Long": [0, 0, 0, 2, 0, 0, 0, 2, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0],
+                    }[self.ReferencedConfiguration]
+                    face = _mesh_face(
+                        lambda _quality, values=triangles: values,
+                        self.ReferencedConfiguration,
+                    )
+                    self._configured_body = _mesh_body(
+                        [face],
+                        self.ReferencedConfiguration,
+                    )
+                return [self._configured_body]
 
         class ConfiguredBackend(_CaptureBackend):
             def _mass_properties_document(self, doc, require_material=True):
@@ -2171,7 +2177,16 @@ class CaptureSceneTests(unittest.TestCase):
             backend, _, _, _, _ = self._configured_occurrences(root)
             lifetimes = self._borrowed_occurrence_geometry(backend, root)
             path = root / "borrowed.stl"
-            backend.export_component_meshes({"part-long": path})["part-long"]
+            with patch.object(
+                native_module,
+                "_com_iunknown_pointer",
+                side_effect=lambda value: id(
+                    getattr(value, "inner", value)
+                ),
+            ):
+                backend.export_component_meshes({"part-long": path})[
+                    "part-long"
+                ]
             self.assertEqual(read_stl(path).triangles, 2)
             self.assertEqual(read_stl(path).high, (2.0, 2.0, 0.0))
             self.assertTrue(lifetimes)
@@ -2187,7 +2202,8 @@ class CaptureSceneTests(unittest.TestCase):
             )
             face.GetEdges = list
             face._persist_reference = b"fixture-shaft-face"
-            short.GetBodies2 = lambda body_type: [_mesh_body([face], "shaft")]
+            shaft_body = _mesh_body([face], "shaft")
+            short.GetBodies2 = lambda body_type: [shaft_body]
             lifetimes = self._borrowed_occurrence_geometry(backend, root)
             result = backend.capture_axis_reference({"component": "part-short", "feature_name": "shaft"})
             self.assertEqual(result["axis_direction"], [0.0, 0.0, 1.0])
@@ -2200,8 +2216,9 @@ class CaptureSceneTests(unittest.TestCase):
             backend, _, _, short, _ = self._configured_occurrences(root)
             good = _mesh_face(lambda _quality: [0, 0, 0, 1, 0, 0, 0, 1, 0], "good")
             failed = _mesh_face(_raiser(RuntimeError("RPC_S_UNKNOWN_IF")), "failed")
+            failure_body = _mesh_body([good, failed], "failure")
             short.GetBodies2 = lambda body_type: (
-                [_mesh_body([good, failed], "failure")] if body_type == 0 else []
+                [failure_body] if body_type == 0 else []
             )
             path = root / "failed.stl"
             with self.assertRaises(CadError) as caught:
