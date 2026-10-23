@@ -12,8 +12,11 @@
 --   binding key never matches - equality against NULL matches nothing, and no key is ever
 --   manufactured (no COALESCE): the retained row stays visible with state NULL / bucket
 --   unknown (no INNER JOIN, no silent loss).  Only an explicit map_index = -1 (the real
---   unmapped-task value) can bind.  For a present source row updated_at freezes to
---   end_date, falling back to start_date.
+--   unmapped-task value) can bind.  A cancel operation with no binding fields at all is a
+--   platform control command, not a scheduler side effect; it remains visible as its
+--   terminal operation row and never fabricates a scheduling row.  A partially bound cancel
+--   stays schedulable so the missing key remains visible as unknown.  For a present source
+--   row updated_at freezes to end_date, falling back to start_date.
 --   dag_run rows: one per DagRun referenced by a platform operation (the same binding the
 --   scheduling rows use), carrying the real dag_run.state raw - the settledness evidence of
 --   the actual Airflow schedule on the same association.  A live DagRun is activity for the
@@ -89,6 +92,13 @@ FROM (
           AND ti.run_id = o.dag_run_id
           AND ti.map_index = o.map_index
     WHERE o.kind IN ('dispatch', 'native', 'publish', 'cancel')
+      AND (
+          o.kind <> 'cancel'
+          OR o.dag_id IS NOT NULL
+          OR o.dag_run_id IS NOT NULL
+          OR o.task_id IS NOT NULL
+          OR o.map_index IS NOT NULL
+      )
     UNION ALL
     SELECT 'dag_run'::text,
            dr.dag_id || '/' || dr.run_id,
