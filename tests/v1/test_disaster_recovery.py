@@ -152,7 +152,13 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             receipt=receipt,
         )
 
-    def legacy_discovery_fixture(self, root: Path) -> tuple[Path, dict, dict]:
+    def legacy_discovery_fixture(
+        self,
+        root: Path,
+        *,
+        main_assembly: str = "robot.SLDASM",
+        robot_name_technical: str = "robot",
+    ) -> tuple[Path, dict, dict]:
         from description_pipeline import interface_records as ir
         from description_pipeline.delivery import PIPELINE_ID
         from description_pipeline.io import canonical, digest
@@ -166,17 +172,33 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             NAMESPACE,
             NATIVE_READER_GENERATOR,
         )
+        from description_pipeline.schemas import TOOL_SCHEMA
         from description_pipeline.stages import CONTRACT as STAGE_CONTRACT, CONTRACT_SHA256
         from tests.sources.selection_support import sealed_selection
 
         run_id = "run"
-        main_assembly = "robot.SLDASM"
         native_files = {
             "base.SLDPRT": hashlib.sha256(b"base").hexdigest(),
             main_assembly: hashlib.sha256(b"assembly").hexdigest(),
         }
         handoff_sha256 = digest(native_files)
         source_selection = sealed_selection(native_files, main_assembly, stage_root="C:\\stage")
+        request_record = {
+            "schema_version": ir.REQUEST_RECORD_SCHEMA,
+            "request_id": "fixture-request",
+            "purpose": "engineering",
+            "target_hardware": "m3.0",
+            "change_summary": "fixture summary",
+            "main_assembly": main_assembly,
+            "handoff_digest": source_selection["upload_sha256"],
+            "platform_config_digest": "b" * 64,
+        }
+        native_tool = {
+            "schema_version": TOOL_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "source_sha256": source_selection["reader_sha256"],
+            "runtime": {"role": "native"},
+        }
         identity_document = {
             "change_summary": "fixture summary",
             "control": None,
@@ -187,7 +209,7 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             "parent_revision": None,
             "revision": None,
             "robot_name": None,
-            "robot_name_technical": "m3_0",
+            "robot_name_technical": robot_name_technical,
         }
         raw_identity = {
             "change_summary": None,
@@ -243,7 +265,23 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 "notes": None,
                 "reference_axes": [],
                 "properties": {"document": {}, "components": {}, "mates": {}},
-                "document_state": {"before": {}, "after": {}, "used_api": "fixture"},
+                "document_state": {
+                    "before": {
+                        "configuration": "Default",
+                        "configuration_needs_rebuild": False,
+                        "needs_rebuild2_value": 1,
+                        "read_only": True,
+                        "save_flag": True,
+                    },
+                    "after": {
+                        "configuration": "Default",
+                        "configuration_needs_rebuild": False,
+                        "needs_rebuild2_value": 0,
+                        "read_only": True,
+                        "save_flag": True,
+                    },
+                    "used_api": "fixture",
+                },
                 "solidworks": {},
                 "exporter": {},
             },
@@ -253,8 +291,12 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             root,
             subject_files={
                 "evidence/discovery.json": canonical(discovery),
+                "evidence/capture-plan.json": canonical({"fixture": "capture-plan"}),
+                "input/handoff.json": canonical({"fixture": "handoff"}),
                 "input/cad/base.SLDPRT": b"base",
-                "input/cad/robot.SLDASM": b"assembly",
+                f"input/cad/{main_assembly}": b"assembly",
+                "input/request.json": canonical(request_record),
+                "input/source.json": canonical({"fixture": "source"}),
             },
         )
         findings_bytes = canonical(
@@ -314,8 +356,17 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             ],
         )
         discover_details = by_id["discover"]["output_qc"][1]["details"]
+        common_files = {
+            "input/capture-plan.json": hashlib.sha256(
+                (tree / "evidence/capture-plan.json").read_bytes()
+            ).hexdigest(),
+            "input/source.json": hashlib.sha256(
+                (tree / "input/source.json").read_bytes()
+            ).hexdigest(),
+        }
         discover_details["files"] = {
             **{f"input/{name}": checksum for name, checksum in native_files.items()},
+            **common_files,
             **aliases,
         }
         discover_details["discovery_sha256"] = hashlib.sha256(
@@ -334,6 +385,7 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             "stages": rows,
         }
         native_stages = write(tree / "reports/native-stages.json", canonical(view))
+        native_tool_path = write(tree / "reports/native-tool.json", canonical(native_tool))
         native_stages_sha256 = hashlib.sha256(native_stages.read_bytes()).hexdigest()
         receipt = {
             **receipt,
@@ -349,6 +401,11 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 "path": "reports/native-stages.json",
                 "bytes": native_stages.stat().st_size,
                 "sha256": native_stages_sha256,
+            },
+            {
+                "path": "reports/native-tool.json",
+                "bytes": native_tool_path.stat().st_size,
+                "sha256": hashlib.sha256(native_tool_path.read_bytes()).hexdigest(),
             },
         ]
         return tree, receipt, view
@@ -414,6 +471,14 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 "path": "reports/native-stages.json",
                 "bytes": native_stages.stat().st_size,
                 "sha256": native_stages_sha256,
+            }
+        )
+        native_tool = tree / "reports/native-tool.json"
+        updated["artifacts"].append(
+            {
+                "path": "reports/native-tool.json",
+                "bytes": native_tool.stat().st_size,
+                "sha256": hashlib.sha256(native_tool.read_bytes()).hexdigest(),
             }
         )
         return updated, view
@@ -610,11 +675,42 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
         def raw_cad_value_drift(discovery: dict, _identity: dict) -> None:
             discovery["raw"]["identity"]["hardware_id"] = "forged"
 
+        def identity_empty_scalar(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = ""
+
+        def identity_whitespace_scalar(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = "   "
+
+        def identity_control_scalar(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = "invalid\nidentifier"
+
+        def property_empty_scalar(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["properties"]["document"]["dp.hardware_id"] = ""
+
+        def derivation_configuration_drift(discovery: dict, _identity: dict) -> None:
+            discovery["derivation"]["configuration"] = "Forged"
+
+        def top_frozen_name_drift(discovery: dict, _identity: dict) -> None:
+            discovery["frozen_names"]["forged"] = "forged_link"
+
+        def derivation_frozen_name_drift(discovery: dict, _identity: dict) -> None:
+            discovery["derivation"]["frozen_names"]["forged"] = "forged_link"
+
+        def both_frozen_name_drift(discovery: dict, _identity: dict) -> None:
+            discovery["frozen_names"]["forged"] = "forged_link"
+            discovery["derivation"]["frozen_names"]["forged"] = "forged_link"
+
         def source_selection_inventory_drift(discovery: dict, _identity: dict) -> None:
             discovery["raw"]["source_selection"]["files"]["base.SLDPRT"] = "e" * 64
 
         def source_selection_handoff_drift(discovery: dict, _identity: dict) -> None:
             discovery["raw"]["source_selection"]["handoff_sha256"] = "e" * 64
+
+        def source_selection_main_assembly_drift(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["source_selection"]["main_assembly"] = "other.SLDASM"
+
+        def source_selection_unknown_key(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["source_selection"]["unexpected"] = True
 
         def sources_list(_discovery: dict, identity: dict) -> None:
             identity["sources"] = []
@@ -624,6 +720,29 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
 
         def source_value_mismatch(_discovery: dict, identity: dict) -> None:
             identity["sources"]["owner"] = "cad"
+
+        def cad_hardware_without_authored(discovery: dict, identity: dict) -> None:
+            identity["sources"]["hardware_id"] = "cad"
+
+        def platform_hardware_with_authored(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = "m3.0"
+
+        def cad_summary_without_authored(discovery: dict, identity: dict) -> None:
+            identity["sources"]["change_summary"] = "cad"
+
+        def submission_summary_with_authored(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["change_summary"] = "fixture summary"
+
+        def platform_hardware_without_request_binding(
+            discovery: dict, identity: dict
+        ) -> None:
+            discovery["identity"]["hardware_id"] = "forged"
+            identity["hardware_id"] = "forged"
+
+        def submission_summary_without_request_binding(
+            discovery: dict, _identity: dict
+        ) -> None:
+            discovery["identity"]["change_summary"] = "forged"
 
         def invalid_source_origin(_discovery: dict, identity: dict) -> None:
             identity["sources"]["hardware_id"] = "submission"
@@ -652,6 +771,46 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 "receipt-bound discovery evidence is invalid",
             ),
             (
+                "identity-empty-scalar",
+                identity_empty_scalar,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "identity-whitespace-scalar",
+                identity_whitespace_scalar,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "identity-control-scalar",
+                identity_control_scalar,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "property-empty-scalar",
+                property_empty_scalar,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "derivation-configuration",
+                derivation_configuration_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "top-frozen-name",
+                top_frozen_name_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "derivation-frozen-name",
+                derivation_frozen_name_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "both-frozen-name",
+                both_frozen_name_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
                 "source-selection-inventory",
                 source_selection_inventory_drift,
                 "receipt-bound discovery evidence is invalid",
@@ -661,12 +820,52 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 source_selection_handoff_drift,
                 "receipt-bound discovery evidence is invalid",
             ),
+            (
+                "source-selection-main-assembly",
+                source_selection_main_assembly_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "source-selection-unknown-key",
+                source_selection_unknown_key,
+                "receipt-bound discovery evidence is invalid",
+            ),
             ("sources-list", sources_list, "legacy identity resolution is invalid"),
             ("unknown-source-key", unknown_source_key, "legacy identity resolution is invalid"),
             (
                 "source-value-mismatch",
                 source_value_mismatch,
                 "legacy identity resolution is invalid",
+            ),
+            (
+                "cad-hardware-without-authored",
+                cad_hardware_without_authored,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "platform-hardware-with-authored",
+                platform_hardware_with_authored,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "cad-summary-without-authored",
+                cad_summary_without_authored,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "submission-summary-with-authored",
+                submission_summary_with_authored,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "platform-hardware-without-request-binding",
+                platform_hardware_without_request_binding,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "submission-summary-without-request-binding",
+                submission_summary_without_request_binding,
+                "receipt-bound discovery evidence is invalid",
             ),
             (
                 "invalid-source-origin",
@@ -695,6 +894,100 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                     receipt, view = self.rewrite_legacy_bindings(tree, receipt, view)
                     with self.assertRaisesRegex(recovery.RecoveryError, message):
                         self.verify(tree, receipt)
+
+    def test_legacy_discovery_summary_uses_multiline_authored_text_rules(self) -> None:
+        from description_pipeline.io import canonical
+
+        def rewrite_summary(root: Path, value: str) -> tuple[Path, dict]:
+            tree, receipt, view = self.legacy_discovery_fixture(root)
+            discovery = json.loads((tree / "evidence/discovery.json").read_text())
+            identity = json.loads(
+                (tree / "discovery/identity-resolution.json").read_text()
+            )
+            discovery["raw"]["identity"]["change_summary"] = value
+            discovery["identity"]["change_summary"] = value
+            identity["sources"]["change_summary"] = "cad"
+            write(tree / "evidence/discovery.json", canonical(discovery))
+            write(
+                tree / "discovery/identity-resolution.json",
+                canonical(identity),
+            )
+            updated, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            return tree, updated
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt = rewrite_summary(base / "lf", "first line\nsecond line")
+            self.verify(tree, receipt)
+
+            tree, receipt = rewrite_summary(base / "control", "first line\tsecond line")
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "receipt-bound discovery evidence is invalid",
+            ):
+                self.verify(tree, receipt)
+
+    def test_legacy_technical_robot_name_uses_main_assembly_filename(self) -> None:
+        from description_pipeline.io import canonical
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, _view = self.legacy_discovery_fixture(
+                base / "real",
+                main_assembly="M3.0.3_20261016.SLDASM",
+                robot_name_technical="m3_0_3_20261016",
+            )
+            self.verify(tree, receipt)
+
+            tree, receipt, _view = self.legacy_discovery_fixture(
+                base / "constructed",
+                main_assembly="Dex Hand.SLDASM",
+                robot_name_technical="dex_hand",
+            )
+            self.verify(tree, receipt)
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "authored")
+            discovery = json.loads((tree / "evidence/discovery.json").read_text())
+            discovery["raw"]["identity"]["robot_name"] = "authored_robot"
+            discovery["identity"]["robot_name"] = "authored_robot"
+            discovery["identity"]["robot_name_technical"] = None
+            write(tree / "evidence/discovery.json", canonical(discovery))
+            receipt, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            self.verify(tree, receipt)
+
+            tree, receipt, _view = self.legacy_discovery_fixture(
+                base / "hardware-derived",
+                main_assembly="M3.0.3_20261016.SLDASM",
+                robot_name_technical="m3_0",
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "receipt-bound discovery evidence is invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "authored-technical")
+            discovery = json.loads((tree / "evidence/discovery.json").read_text())
+            discovery["raw"]["identity"]["robot_name"] = "authored_robot"
+            discovery["identity"]["robot_name"] = "authored_robot"
+            write(tree / "evidence/discovery.json", canonical(discovery))
+            receipt, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "receipt-bound discovery evidence is invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt, _view = self.legacy_discovery_fixture(
+                base / "fallback",
+                main_assembly="---.SLDASM",
+                robot_name_technical="m3_0",
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "receipt-bound discovery evidence is invalid",
+            ):
+                self.verify(tree, receipt)
 
     def test_legacy_discovery_files_require_canonical_json_bytes(self) -> None:
         def noncanonical(document: dict) -> bytes:
@@ -749,6 +1042,83 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             ] = "f" * 64
             with self.assertRaisesRegex(recovery.RecoveryError, "input/cad inventory"):
                 self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "ghost-extra")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][4]["inputs"][0]["files"]["input/ghost.SLDPRT"] = "f" * 64
+            self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+    def test_legacy_recovery_binds_request_reader_and_native_observations(self) -> None:
+        from description_pipeline.io import canonical
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            def mutate_document(case_index: int, relative: str, mutate) -> object:
+                tree, receipt, view = self.legacy_discovery_fixture(
+                    base / f"case-{case_index}"
+                )
+                document = json.loads((tree / relative).read_text())
+                mutate(document)
+                write(tree / relative, canonical(document))
+                receipt, view = self.rewrite_legacy_bindings(tree, receipt, view)
+                return tree, receipt
+
+            cases = (
+                (
+                    "request-target",
+                    "input/request.json",
+                    lambda document: document.update(target_hardware="forged"),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "request-summary",
+                    "input/request.json",
+                    lambda document: document.update(change_summary="forged"),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "request-upload",
+                    "input/request.json",
+                    lambda document: document.update(handoff_digest="f" * 64),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "native-reader",
+                    "reports/native-tool.json",
+                    lambda document: document.update(source_sha256="f" * 64),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "empty-document-state",
+                    "evidence/discovery.json",
+                    lambda document: document["raw"].update(
+                        document_state={"before": {}, "after": {}, "used_api": "fixture"}
+                    ),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "invalid-cad-scalar",
+                    "evidence/discovery.json",
+                    lambda document: document["raw"]["properties"]["document"].update(
+                        **{"dp.hardware_id": 123}
+                    ),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "robot-technical-name",
+                    "evidence/discovery.json",
+                    lambda document: document["identity"].update(
+                        robot_name_technical="forged"
+                    ),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+            )
+            for case_index, (name, relative, mutate, message) in enumerate(cases, 1):
+                with self.subTest(name=name):
+                    tree, receipt = mutate_document(case_index, relative, mutate)
+                    with self.assertRaisesRegex(recovery.RecoveryError, message):
+                        self.verify(tree, receipt)
 
     def test_discover_input_records_empty_directory_is_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
