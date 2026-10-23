@@ -2685,6 +2685,18 @@ def _legacy_discovery_sidecars(
             "recovery_member_hash_mismatch",
             "legacy findings has no receipt-bound discovery evidence",
         )
+        for required in (
+            "evidence/capture-plan.json",
+            "input/handoff.json",
+            "input/request.json",
+            "input/source.json",
+            "reports/native-tool.json",
+        ):
+            require(
+                required in artifact_paths,
+                "recovery_member_hash_mismatch",
+                f"legacy discovery recovery is missing a bound member: {required}",
+            )
         try:
             discovery_bytes, discovery = strict_json_file(
                 tree / "evidence/discovery.json", "discovery evidence"
@@ -2710,6 +2722,14 @@ def _legacy_discovery_sidecars(
             for row in files
             if row["type"] == "file" and row["path"].startswith("input/cad/")
         }
+        try:
+            _, request_record = strict_json_file(tree / "input/request.json", "frozen request")
+            _, native_tool = strict_json_file(tree / "reports/native-tool.json", "native tool")
+        except RecoveryError as error:
+            raise RecoveryError(
+                "recovery_member_hash_mismatch",
+                "legacy discovery recovery bindings are unreadable",
+            ) from error
         require(
             all(
                 discovery_qc_details["files"].get(f"input/{name}") == checksum
@@ -2724,6 +2744,8 @@ def _legacy_discovery_sidecars(
                 run_id=producer_run_id,
                 handoff_sha256=handoff_sha256,
                 native_inventory=native_inventory,
+                request_record=request_record,
+                native_tool=native_tool,
             )
         except PipelineError as error:
             raise RecoveryError(
@@ -2731,7 +2753,11 @@ def _legacy_discovery_sidecars(
                 "receipt-bound discovery evidence is invalid",
             ) from error
         try:
-            validate_historical_identity_resolution(identity, discovery=discovery)
+            validate_historical_identity_resolution(
+                identity,
+                discovery=discovery,
+                request_record=request_record,
+            )
         except PipelineError as error:
             raise RecoveryError(
                 "recovery_member_hash_mismatch",
