@@ -45,7 +45,7 @@ from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data, read_data
 from ..sources.solidworks.direction import canonicalize_axis
 from ..sources.solidworks.naming import robot_name as format_robot_name
-from ..schemas import exporter_declaration_present
+from ..schemas import NATIVE_DISCOVERY_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     embedded_virtual_component_under_root,
@@ -65,7 +65,7 @@ from ..sources.solidworks.native_limits import (
 )
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
-DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
+DISCOVERY_SCHEMA = NATIVE_DISCOVERY_SCHEMA
 
 SUPPORTED_MATES = {
     "coincident",

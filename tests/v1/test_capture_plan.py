@@ -11,6 +11,7 @@ from pathlib import Path
 
 from description_pipeline import steps
 from description_pipeline.io import PipelineError, digest, write_json
+from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA
 from description_pipeline.sources.solidworks import discovery
 from tests.sources.selection_support import sealed_selection
 
@@ -21,7 +22,7 @@ def build_package(root: Path) -> Path:
     """One prepared package: sealed discovery, sealed source identity, sealed plan."""
 
     discovery = {
-        "schema_version": "solidworks-to-urdf.native-discovery/v1",
+        "schema_version": NATIVE_DISCOVERY_SCHEMA,
         "run_id": "r-1",
         "derivation": {"main_assembly": MAIN, "configuration": None},
         "native_files": {

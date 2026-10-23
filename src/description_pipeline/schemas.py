@@ -14,6 +14,9 @@ EFFECTIVE_INSTANCES_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 MASS_CLOSURE_REPORT_SCHEMA = "solidworks-to-urdf.mass-closure-report/v1"
 NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v6"
+NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
+NATIVE_DISCOVERY_FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
+NATIVE_IDENTITY_RESOLUTION_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"
 
 #: W1 machine schemas for records crossing the platform / endpoint boundary
 #: (frozen-interfaces-v1.1 IF-04/09/10/11/16).  One owner module; consumers

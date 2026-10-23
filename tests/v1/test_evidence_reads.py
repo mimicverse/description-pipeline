@@ -11,7 +11,7 @@ from description_pipeline.delivery import write_delivery_manifest
 from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
-from description_pipeline.stages import CONTRACT
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 from description_pipeline.verification import native_discovery as ev
 
 HEX = "a" * 64
@@ -81,7 +81,7 @@ class EvidenceReadTests(unittest.TestCase):
         (self.root / "evidence/capture.json").write_text(json.dumps(capture))
         write_delivery_manifest(
             self.root,
-            contract={"schema_version": CONTRACT["schema_version"], "digest": HEX},
+            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
             policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
         )
 

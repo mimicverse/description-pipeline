@@ -262,7 +262,7 @@ def manifest() -> dict:
     return {
         "schema_version": DELIVERY_MANIFEST_SCHEMA,
         "subject": {"files": files, "digest": digest(mapping)},
-        "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX},
+        "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
         "policy": {"schema_version": CHECK_POLICY_SCHEMA, "digest": ir.check_policy_digest()},
     }
 
@@ -1004,6 +1004,9 @@ class InterfaceRecordTests(unittest.TestCase):
         bad["policy"]["digest"] = OTHER_HEX
         self.reject("delivery_manifest_policy_mismatch", lambda: ir.validate_delivery_manifest(bad))
         bad = copy.deepcopy(manifest_value)
+        bad["contract"]["digest"] = OTHER_HEX
+        self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
+        bad = copy.deepcopy(manifest_value)
         bad["subject"]["digest"] = OTHER_HEX
         self.reject("delivery_manifest_subject_mismatch", lambda: ir.validate_delivery_manifest(bad))
         bad = copy.deepcopy(manifest_value)
@@ -1018,6 +1021,25 @@ class InterfaceRecordTests(unittest.TestCase):
         bad = copy.deepcopy(manifest_value)
         bad["extra"] = True
         self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
+
+    def test_delivery_manifest_policy_reader_boundary(self) -> None:
+        historical = "415813b06c4b379fbbc1b5c6ea4c3fd56cf96c6ad8bfa103eaae03326de2b7c4"
+        manifest_value = manifest()
+        manifest_value["policy"]["digest"] = historical
+        self.reject("delivery_manifest_policy_mismatch", lambda: ir.validate_delivery_manifest(manifest_value))
+        ir.validate_recovery_delivery_manifest(manifest_value)
+        unknown = copy.deepcopy(manifest_value)
+        unknown["policy"]["digest"] = OTHER_HEX
+        self.reject(
+            "delivery_manifest_policy_mismatch",
+            lambda: ir.validate_recovery_delivery_manifest(unknown),
+        )
+        wrong_contract = copy.deepcopy(manifest_value)
+        wrong_contract["contract"]["digest"] = OTHER_HEX
+        self.reject(
+            "delivery_manifest_invalid",
+            lambda: ir.validate_recovery_delivery_manifest(wrong_contract),
+        )
 
     def test_source_record_identity_binding(self) -> None:
         record = source_record()

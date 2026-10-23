@@ -12,6 +12,7 @@ from description_pipeline.delivery import (
     SUBJECT_FILES,
     check_layout,
     read_delivery_manifest,
+    read_recovery_delivery_manifest,
     read_source_record,
     subject_digest,
     subject_inventory,
@@ -19,7 +20,7 @@ from description_pipeline.delivery import (
 )
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
-from description_pipeline.stages import CONTRACT
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
 HEX = "a" * 64
 OTHER_HEX = "b" * 64
@@ -67,7 +68,7 @@ class DeliveryTests(unittest.TestCase):
         (self.root / "reports").mkdir()
         (self.root / "reports/quality.json").write_text('{"passed": true}')
         (self.root / "input/source.json").write_text("{}")
-        self.contract = {"schema_version": CONTRACT["schema_version"], "digest": HEX}
+        self.contract = {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256}
         self.policy = {"schema_version": CHECK_POLICY_SCHEMA, "digest": ir.check_policy_digest()}
         write_delivery_manifest(self.root, contract=self.contract, policy=self.policy)
 
@@ -104,6 +105,36 @@ class DeliveryTests(unittest.TestCase):
         )
         with self.assertRaises(ir.InterfaceRecordError):
             read_delivery_manifest(self.root)
+
+    def test_recovery_manifest_reader_uses_the_exact_historical_policy_allowlist(self):
+        historical = next(iter(ir.RECOVERY_HISTORICAL_POLICY_DIGESTS))
+        manifest_path = self.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["contract"]["digest"] = CONTRACT_SHA256
+        manifest["policy"]["digest"] = historical
+        manifest_path.write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ir.InterfaceRecordError, "delivery_manifest_policy_mismatch"):
+            read_delivery_manifest(self.root)
+        recovered = read_recovery_delivery_manifest(self.root)
+        self.assertEqual(recovered["policy"]["digest"], historical)
+
+        manifest["policy"]["digest"] = OTHER_HEX
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ir.InterfaceRecordError, "delivery_manifest_policy_mismatch"):
+            read_recovery_delivery_manifest(self.root)
+
+        manifest["policy"]["digest"] = historical
+        manifest_path.write_text(json.dumps(manifest))
+        (self.root / "model/subject.txt").write_text("changed")
+        with self.assertRaisesRegex(PipelineError, "files differ"):
+            read_recovery_delivery_manifest(self.root)
+        (self.root / "model/subject.txt").write_text("model")
+
+        manifest["contract"]["digest"] = OTHER_HEX
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ir.InterfaceRecordError, "delivery_manifest_invalid"):
+            read_recovery_delivery_manifest(self.root)
 
     def test_manifest_reader_rebinds_every_subject_record(self):
         manifest_path = self.root / "manifest.json"

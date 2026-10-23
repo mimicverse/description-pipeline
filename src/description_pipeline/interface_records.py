@@ -1291,7 +1291,16 @@ def subject_file_records(files, code: str, where: str = "subject.files") -> tupl
     return mapping, paths
 
 
-def validate_delivery_manifest(manifest) -> dict:
+#: Derived by check_policy_digest() at commit f4d0785c0c6addb9b8f4e090eb3e12eedfe481b8 and
+#: retained unchanged through historical sealed archives. New policies are never inferred.
+RECOVERY_HISTORICAL_POLICY_DIGESTS = frozenset(
+    {
+        "415813b06c4b379fbbc1b5c6ea4c3fd56cf96c6ad8bfa103eaae03326de2b7c4",
+    }
+)
+
+
+def _validate_delivery_manifest(manifest, *, allowed_policy_digests: frozenset[str]) -> dict:
     """``manifest.json`` (IF-13): subject inventory, subject digest, identities."""
 
     code = "delivery_manifest_invalid"
@@ -1311,6 +1320,11 @@ def validate_delivery_manifest(manifest) -> dict:
         manifest["contract"]["schema_version"] == CONTRACT["schema_version"], code, {"where": "contract.schema_version"}
     )
     _hex64(manifest["contract"]["digest"], code, "contract.digest")
+    _require(
+        manifest["contract"]["digest"] == CONTRACT_SHA256,
+        code,
+        {"where": "contract.digest", "expected": CONTRACT_SHA256},
+    )
     _exact_keys(manifest["policy"], {"schema_version", "digest"}, code, "policy")
     _require(
         manifest["policy"]["schema_version"] == CHECK_POLICY_SCHEMA,
@@ -1319,11 +1333,38 @@ def validate_delivery_manifest(manifest) -> dict:
     )
     _hex64(manifest["policy"]["digest"], code, "policy.digest")
     _require(
-        manifest["policy"]["digest"] == check_policy_digest(),
+        manifest["policy"]["digest"] in allowed_policy_digests,
         "delivery_manifest_policy_mismatch",
-        {"rule": "the manifest must reference this release's canonical check policy"},
+        {
+            "rule": "the manifest policy is not allowed by this reader",
+            "actual": manifest["policy"]["digest"],
+            "allowed": sorted(allowed_policy_digests),
+        },
     )
     return manifest
+
+
+def validate_delivery_manifest(manifest) -> dict:
+    """Validate a current delivery manifest against this release's exact policy."""
+
+    return _validate_delivery_manifest(
+        manifest,
+        allowed_policy_digests=frozenset({check_policy_digest()}),
+    )
+
+
+def validate_recovery_delivery_manifest(manifest) -> dict:
+    """Validate a sealed archive against the exact recovery policy allowlist."""
+
+    return _validate_delivery_manifest(
+        manifest,
+        allowed_policy_digests=frozenset(
+            {
+                check_policy_digest(),
+                *RECOVERY_HISTORICAL_POLICY_DIGESTS,
+            }
+        ),
+    )
 
 
 def validate_source_record(record) -> dict:
