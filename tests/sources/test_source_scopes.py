@@ -11,6 +11,7 @@ from pathlib import Path
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.io import PipelineError, digest  # noqa: E402
+from description_pipeline.schemas import SOURCE_RECORD_SCHEMA  # noqa: E402
 from description_pipeline.verification.native_discovery import (  # noqa: E402
     source_scopes,
 )
@@ -38,7 +39,7 @@ class SourceScopeTests(unittest.TestCase):
         self.write(
             "input/source.json",
             {
-                "schema_version": "solidworks-to-urdf.source-record/v1",
+                "schema_version": SOURCE_RECORD_SCHEMA,
                 "source_revision_id": digest(identity),
                 "identity": identity,
                 "selection": {
