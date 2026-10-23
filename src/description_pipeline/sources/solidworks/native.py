@@ -7282,6 +7282,8 @@ class SolidWorksBackend(CadBackend):
         body_index,
         body,
         faces,
+        *,
+        occurrence_extension,
     ):
         """Return frozen-part witness rows for aliased native entities."""
 
@@ -7301,7 +7303,6 @@ class SolidWorksBackend(CadBackend):
             component,
             "scope_witness",
         )
-        extension = _member(component_doc, "Extension")
 
         source_sha256_before = _hash(source_path)
         referenced_configuration = self._source_components[component][1]
@@ -7337,7 +7338,7 @@ class SolidWorksBackend(CadBackend):
 
                 component_face_rows = _scope_face_rows(
                     faces,
-                    extension,
+                    occurrence_extension,
                 )
                 part_face_rows = _scope_face_rows(
                     part_faces,
@@ -7354,7 +7355,7 @@ class SolidWorksBackend(CadBackend):
 
                 component_edge_rows = _scope_edge_rows(
                     body,
-                    extension,
+                    occurrence_extension,
                     component_face_rows,
                 )
                 part_edge_rows = _scope_edge_rows(
@@ -7534,14 +7535,14 @@ class SolidWorksBackend(CadBackend):
             },
         }
         completed_faces = 0
-        document_key = self._source_components[component][0]
-        document = self._captured_document(
-            document_key,
+        source_document_key = self._source_components[component][0]
+        occurrence_document = self._captured_document(
+            self._scene_document_key,
             component,
             "geometry",
         )
-        extension = _member(document, "Extension")
-        source_entry = self._source_documents.get(document_key)
+        extension = _member(occurrence_document, "Extension")
+        source_entry = self._source_documents.get(source_document_key)
         scope_context = None
         if source_entry is not None:
             source_path = source_entry[0]
@@ -7801,6 +7802,7 @@ class SolidWorksBackend(CadBackend):
                     body_index,
                     body,
                     faces,
+                    occurrence_extension=extension,
                 )
 
             graph = self._capture_body_tessellation(
