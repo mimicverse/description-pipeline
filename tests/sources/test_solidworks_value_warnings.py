@@ -104,6 +104,30 @@ def native_tolerant_warning() -> dict:
     }
 
 
+def metadata_value_warning() -> dict:
+    return {
+        "code": "metadata.non_native",
+        "message": (
+            "Platform metadata includes values that are not direct CAD engineering readings; "
+            "each field is bound to recorded evidence."
+        ),
+        "objects": [
+            {
+                "object_type": "metadata",
+                "object": "evidence/native-runtime.json",
+                "fields": ["/session_boundary/opened/read_only"],
+                "source": "native operation claim",
+                "rule_id": "metadata.operation_claim",
+                "rule_version": "v1",
+                "reason": "read_only is declared, not observed",
+                "file": "evidence/native-runtime.json",
+                "sha256": "c" * 64,
+                "reference": "evidence/native-runtime.json",
+            }
+        ],
+    }
+
+
 class ValueWarningTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -289,27 +313,7 @@ class ValueWarningTests(unittest.TestCase):
         self.assertEqual(result["objects"], 8)
 
     def test_metadata_warning_is_compared_as_an_exact_existing_value_warning(self):
-        metadata_group = {
-            "code": "metadata.non_native",
-            "message": (
-                "Platform metadata includes values that are not direct CAD engineering readings; "
-                "each field is bound to recorded evidence."
-            ),
-            "objects": [
-                {
-                    "object_type": "metadata",
-                    "object": "evidence/native-runtime.json",
-                    "fields": ["/session_boundary/opened/read_only"],
-                    "source": "native operation claim",
-                    "rule_id": "metadata.operation_claim",
-                    "rule_version": "v1",
-                    "reason": "read_only is declared, not observed",
-                    "file": "evidence/native-runtime.json",
-                    "sha256": "c" * 64,
-                    "reference": "evidence/native-runtime.json",
-                }
-            ],
-        }
+        metadata_group = metadata_value_warning()
         model = copy.deepcopy(self.model)
         model["provenance"]["value_warnings"].append(copy.deepcopy(metadata_group))
 
@@ -422,6 +426,26 @@ class ValueWarningTests(unittest.TestCase):
                 forged,
                 native_warnings=[raw],
             )
+
+    def test_metadata_and_native_warnings_are_reconciled_together(self):
+        raw = native_tolerant_warning()
+        native = native_tolerant_edge_value_warning([raw])
+        metadata = metadata_value_warning()
+        model = copy.deepcopy(self.model)
+        model["provenance"]["value_warnings"].extend(
+            [copy.deepcopy(metadata), *native]
+        )
+
+        result = _value_warning_gate(
+            self.root,
+            self.source,
+            model,
+            native_warnings=[raw],
+            metadata_warnings=[metadata],
+        )
+        self.assertIn(NATIVE_TOLERANT_EDGE_GAP_WARNING, result["codes"])
+        self.assertIn("metadata.non_native", result["codes"])
+        self.assertEqual(result["objects"], 10)
 
     def test_model_cannot_self_claim_cad_material_when_raw_schema_has_no_appearance(self):
         model = copy.deepcopy(self.model)
