@@ -25,9 +25,11 @@ from description_pipeline.geometry.native_u import (
     NATIVE_U_RESOLUTION_RULE,
     native_curve_domain_transform,
     native_curve_endpoint_operation_tolerance,
-    native_curve_endpoint_roles,
-    native_curve_topology_endpoint_assignment,
+    native_curve_parameter_endpoints,
+    native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
+    native_open_edge_boundary_identity,
+    native_open_edge_scope_binding,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_tolerant_edge_boundary,
@@ -235,6 +237,9 @@ def _u_evidence(
     is_tolerant: bool = False,
     tolerant_gap_m: float = 0.0,
     edge_reference_sha256: str | None = None,
+    topology_accepted: bool = True,
+    open_edge_identity_sha256: str | None = None,
+    topology_endpoint_set_accepted: bool = False,
 ) -> dict[str, Any]:
     payload, packed_status = _evaluate2_evidence(point)
     evaluated_point = tuple(payload[:3])
@@ -252,7 +257,7 @@ def _u_evidence(
             curve_end,
             is_tolerant=is_tolerant,
             gap_m=tolerant_gap_m,
-            topology_accepted=True,
+            topology_accepted=topology_accepted,
         )
         tolerance = tolerant_edge_metrics["point_tolerance_m"]
         point_error = tolerant_edge_metrics[
@@ -283,7 +288,7 @@ def _u_evidence(
             curve_start,
             is_tolerant=is_tolerant,
             gap_m=tolerant_gap_m,
-            topology_accepted=True,
+            topology_accepted=topology_accepted,
         )
         tolerance = tolerant_edge_metrics["point_tolerance_m"]
         point_error = tolerant_edge_metrics[
@@ -335,6 +340,8 @@ def _u_evidence(
         "parameter_success_parsed": True,
         "evaluate_payload": payload,
         "evaluate_packed_status": packed_status,
+        "open_edge_identity_sha256": open_edge_identity_sha256,
+        "topology_endpoint_set_accepted": topology_endpoint_set_accepted,
     }
 
 
@@ -446,6 +453,7 @@ def native_tessellation_fixture(
     no_facets_faces: Sequence[dict[str, Any]] = (),
     *,
     triangle_vertices: Sequence[Sequence[Sequence[float]]] | None = None,
+    scope: dict[str, Any] | None = None,
 ) -> NativeTessellationV3Fixture:
     """Build one closed v3 graph and its byte-identical binary STL projection."""
 
@@ -490,6 +498,31 @@ def native_tessellation_fixture(
         )
         edge["edge_tolerance"] = edge_tolerance
     fixture_triangles = []
+    scope_context = {
+        "rule_version": "native-open-edge-scope-binding-v1",
+        "component": "part-1",
+        "source_document_path": "C:/fixture/part-1.SLDPRT",
+        "source_copy_path": "source/part-1.SLDPRT",
+        "source_document_sha256": hashlib.sha256(
+            b"fixture-source"
+        ).hexdigest(),
+        "source_copy_sha256": hashlib.sha256(
+            b"fixture-source"
+        ).hexdigest(),
+        "source_document_identity_sha256": hashlib.sha256(
+            b"fixture-source"
+        ).hexdigest(),
+        "source_document_identity_kind": "file_sha256",
+        "referenced_configuration": "Default",
+        "occurrence_scope": "part-1",
+        "virtual_owner": None,
+        "virtual_owner_sha256": None,
+        "virtual_session_document_path": None,
+        "virtual_session_temp_root": None,
+        "virtual_native_api_pid": None,
+    }
+    if scope is not None:
+        scope_context.update(copy.deepcopy(scope))
     body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
     evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
     body_rows = []
@@ -578,6 +611,7 @@ def native_tessellation_fixture(
                             "end_evidence": None,
                             "cofin_raw_id": None,
                             "cofin_id": None,
+                            "open_edge_boundary_identity": None,
                         }
                     )
                 facets.append(
@@ -775,6 +809,7 @@ def native_tessellation_fixture(
                         ),
                         "cofin_raw_id": -1,
                         "cofin_id": None,
+                        "open_edge_boundary_identity": None,
                     }
                 )
                 body["assigned_fin_ids"].add(first_fin["fin_id"])
@@ -839,6 +874,7 @@ def native_tessellation_fixture(
                             ),
                             "cofin_raw_id": second_fin["fin_id"],
                             "cofin_id": second_fin["fin_id"],
+                            "open_edge_boundary_identity": None,
                         }
                     )
                     second_fin.update(
@@ -871,6 +907,7 @@ def native_tessellation_fixture(
                             ),
                             "cofin_raw_id": first_fin["fin_id"],
                             "cofin_id": first_fin["fin_id"],
+                            "open_edge_boundary_identity": None,
                         }
                     )
                     body["assigned_fin_ids"].update(
@@ -901,17 +938,146 @@ def native_tessellation_fixture(
         )
         if curve_domain_transform["rule_version"] != NATIVE_CURVE_DOMAIN_RULE:
             raise ValueError("native curve domain rule differs")
-        _, topology_endpoints = native_curve_endpoint_roles(
+        topology_endpoints = native_curve_parameter_endpoints(
             curve_start_point,
             curve_end_point,
-            curve_sense,
         )
-        topology_assignment = native_curve_topology_endpoint_assignment(
+        topology_assignment = native_curve_topology_endpoint_set_assignment(
             topology_endpoints[0],
             topology_endpoints[1],
             edge["start_point_m"],
             edge["end_point_m"],
         )
+        unique_topology_accepted = (
+            topology_assignment["accepted"] is True
+            and topology_assignment["complete_match_count"] == 1
+        )
+        fins_by_id = {fin["fin_id"]: fin for fin in body["fins"]}
+        for fin_id in edge_fin_ids:
+            fin = fins_by_id[fin_id]
+            fin_evidence = (
+                fin["start_evidence"],
+                fin["end_evidence"],
+            )
+            uses_tolerant_gap = any(
+                evidence["tolerant_edge_evidence"] is not None
+                for evidence in fin_evidence
+            )
+            if uses_tolerant_gap:
+                face_span = span_by_face[
+                    (*body_key, fin["face_index"])
+                ]
+                face_identity = face_span["face_identity"]
+                scope_binding = native_open_edge_scope_binding(
+                    component=scope_context["component"],
+                    source_document_path=scope_context[
+                        "source_document_path"
+                    ],
+                    source_copy_path=scope_context["source_copy_path"],
+                    source_document_sha256=scope_context[
+                        "source_document_sha256"
+                    ],
+                    source_copy_sha256=scope_context[
+                        "source_copy_sha256"
+                    ],
+                    source_document_identity_sha256=scope_context[
+                        "source_document_identity_sha256"
+                    ],
+                    source_document_identity_kind=scope_context[
+                        "source_document_identity_kind"
+                    ],
+                    referenced_configuration=scope_context[
+                        "referenced_configuration"
+                    ],
+                    occurrence_scope=scope_context["occurrence_scope"],
+                    virtual_owner=scope_context["virtual_owner"],
+                    virtual_owner_sha256=scope_context[
+                        "virtual_owner_sha256"
+                    ],
+                    virtual_session_document_path=scope_context[
+                        "virtual_session_document_path"
+                    ],
+                    virtual_session_temp_root=scope_context[
+                        "virtual_session_temp_root"
+                    ],
+                    virtual_native_api_pid=scope_context[
+                        "virtual_native_api_pid"
+                    ],
+                    body_type=body_type,
+                    body_index=body_index,
+                    body_reference_sha256=face_span[
+                        "body_reference_sha256"
+                    ],
+                    native_body_reference_sha256=face_span[
+                        "native_body_reference_sha256"
+                    ],
+                    face_index=face_span["face_index"],
+                    face_reference_sha256=face_span[
+                        "face_reference_sha256"
+                    ],
+                    native_face_reference_sha256=face_span[
+                        "native_face_reference_sha256"
+                    ],
+                    face_identity_mode=face_span["face_identity_mode"],
+                    owner_scope_key=(
+                        face_identity["owner_scope_key"]
+                        if isinstance(face_identity, dict)
+                        else None
+                    ),
+                )
+                open_identity = native_open_edge_boundary_identity(
+                    component=scope_context["component"],
+                    scope_binding=scope_binding,
+                    edge_reference_sha256=edge["edge_reference_sha256"],
+                    edge_endpoint_refs=(
+                        edge["start_vertex_reference_sha256"],
+                        edge["end_vertex_reference_sha256"],
+                    ),
+                    edge_start_point=tuple(edge["start_point_m"]),
+                    edge_end_point=tuple(edge["end_point_m"]),
+                    fin_id=fin_id,
+                    fin_vertex_ids=tuple(fin["vertex_ids"]),
+                    fin_start_point=body["points_by_vertex_id"][
+                        fin["vertex_ids"][0]
+                    ],
+                    fin_end_point=body["points_by_vertex_id"][
+                        fin["vertex_ids"][1]
+                    ],
+                    curve_start_point=curve_start_point,
+                    curve_end_point=curve_end_point,
+                    curve_u_min=u_min,
+                    curve_u_max=u_max,
+                    fin_endpoint_u=(
+                        fin["start_u"],
+                        fin["end_u"],
+                    ),
+                    fin_endpoint_success=(
+                        fin["start_evidence"][
+                            "parameter_success_parsed"
+                        ],
+                        fin["end_evidence"][
+                            "parameter_success_parsed"
+                        ],
+                    ),
+                    curve_sense=curve_sense,
+                    gap_m=edge["tolerant_gap_m"],
+                    body_type=body_type,
+                    face_count=len(face_indices),
+                    cofin_raw_id=fin["cofin_raw_id"],
+                    edge_fin_ids=tuple(sorted(edge_fin_ids)),
+                    topology_set_accepted=topology_assignment["accepted"],
+                )
+                fin["open_edge_boundary_identity"] = open_identity
+                for evidence in fin_evidence:
+                    evidence["open_edge_identity_sha256"] = open_identity[
+                        "identity_chain_sha256"
+                    ]
+                    evidence["topology_endpoint_set_accepted"] = True
+            else:
+                for evidence in fin_evidence:
+                    evidence["topology_endpoint_set_accepted"] = (
+                        unique_topology_accepted
+                    )
         edge_rows.append(
             {
                 "body_type": body_key[0],
@@ -1005,6 +1171,7 @@ def native_tessellation_fixture(
                 "body_type": body_type,
                 "body_index": body_index,
                 "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
+                "scope": copy.deepcopy(scope_context),
                 "tessellate_result": True,
                 "request": native_tessellation_request(body_face_references),
                 "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
@@ -1147,13 +1314,12 @@ def refresh_topology_endpoint_assignment(tessellation: dict[str, Any]) -> None:
         if edge["start_point_m"] is None or edge["end_point_m"] is None:
             edge["topology_endpoint_assignment"] = None
             continue
-        _, topology_endpoints = native_curve_endpoint_roles(
+        topology_endpoints = native_curve_parameter_endpoints(
             edge["curve_start_point_m"],
             edge["curve_end_point_m"],
-            edge["curve_sense"],
         )
         edge["topology_endpoint_assignment"] = (
-            native_curve_topology_endpoint_assignment(
+            native_curve_topology_endpoint_set_assignment(
                 topology_endpoints[0],
                 topology_endpoints[1],
                 edge["start_point_m"],

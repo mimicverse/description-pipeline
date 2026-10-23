@@ -31,6 +31,7 @@ from ...geometry.native_u import (
     NATIVE_PART_WITNESS_DERIVED,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_PERSISTENT_IDENTITY_RULE,
+    NATIVE_OPEN_EDGE_SCOPE_RULE,
     NATIVE_SCOPE_IDENTITY_RULE,
     NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
     NATIVE_SCOPE_MAPPING_METHOD,
@@ -44,11 +45,13 @@ from ...geometry.native_u import (
     NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
-    native_curve_endpoint_roles,
-    native_curve_topology_endpoint_assignment,
+    native_curve_parameter_endpoints,
+    native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
     native_fin_interval,
     native_get_parameter_success,
+    native_open_edge_boundary_identity,
+    native_open_edge_scope_binding,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_scope_identity_sha256,
@@ -69,6 +72,7 @@ from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
+    embedded_virtual_component_marker,
     embedded_virtual_component_path,
     embedded_virtual_component_root,
     session_artifact_path,
@@ -3186,7 +3190,10 @@ class SolidWorksBackend(CadBackend):
         self._staged_search_evidence: list[dict] = []
         self._components = set()
         self._source_components = {}
+        self._source_provenance = {}
+        self._source_scope_overrides = {}
         self._source_documents = {}
+        self._scene_source_root = None
         self._scene_document_key = None
         self.notes = {}
         self.source_files = {}
@@ -4830,6 +4837,10 @@ class SolidWorksBackend(CadBackend):
     def collect_scene(self, doc_path, coordinate_systems, on_activity=None, require_material=True):
         activity = _ActivityEmitter(on_activity)
         source_root = Path(doc_path).resolve().parent
+        try:
+            native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
+        except Exception:  # noqa: BLE001 - unresolved PID keeps source scope incomplete
+            native_api_pid = None
 
         def note(action: str, **fields) -> None:
             activity.emit(action, phase="capture", **fields)
@@ -4842,7 +4853,10 @@ class SolidWorksBackend(CadBackend):
         self._record_save_flag(doc, doc_path)
         self._components = set()
         self._source_components = {}
+        self._source_provenance = {}
+        self._source_scope_overrides = {}
         self._source_documents = {}
+        self._scene_source_root = source_root
         self._session_document_paths = {}
         self._session_artifact_roots = {}
         self._session_artifact_root_owners = {}
@@ -4851,7 +4865,10 @@ class SolidWorksBackend(CadBackend):
         _manager, config = _active_configuration_view(doc)
         self._scene_document_key = self._record_source_document(doc_path, str(_member(config, "Name")))
         root = _component(_member(config, "GetRootComponent3", True))
-        stack = list(_method(root, "GetChildren") or ())
+        stack = [
+            (component, doc_path)
+            for component in list(_method(root, "GetChildren") or ())
+        ]
         borrowed_components = []
         occurrences = []
         components, properties = [], {}
@@ -4887,7 +4904,8 @@ class SolidWorksBackend(CadBackend):
 
         record_datums(doc, "", None)
         while stack:
-            comp = _component(stack.pop())
+            raw_component, owner_path = stack.pop()
+            comp = _component(raw_component)
             if _measured_component_state(comp) == COMPONENT_SUPPRESSED:
                 continue
             borrowed_components.append(comp)
@@ -4906,6 +4924,23 @@ class SolidWorksBackend(CadBackend):
                 raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
             source_document = _component_source_document(comp, source_root, native_path=path)
             provenance = source_document.get("source_provenance")
+            if provenance is not None:
+                owner_relative = _relative_document(
+                    owner_path,
+                    source_root,
+                )
+                provenance["owner"] = (
+                    owner_relative
+                    or normalize_document_path(str(owner_path))
+                )
+                provenance["owner_sha256"] = (
+                    _hash(str(owner_path))
+                    if os.path.isfile(owner_path)
+                    else None
+                )
+                provenance["occurrence"] = name
+                provenance["native_api_pid"] = native_api_pid
+                self._source_provenance[name] = provenance
             session_document = (
                 isinstance(provenance, dict)
                 and provenance.get("state")
@@ -4927,7 +4962,9 @@ class SolidWorksBackend(CadBackend):
                 if _member(part, "GetType") != 2:
                     raise CadError("cad_component_type", name)
                 document_type, fixed = "assembly", False
-                stack.extend(children)
+                stack.extend(
+                    (child, path) for child in children
+                )
             else:
                 if _member(part, "GetType") != 1:
                     raise CadError("cad_empty_subassembly", name)
@@ -4947,7 +4984,7 @@ class SolidWorksBackend(CadBackend):
             occurrences.append((RawComponent(name, path, placement, fixed, document_type), referenced))
 
         borrowed_components.clear()
-        comp = children = part = root = stack = None
+        raw_component = owner_path = comp = children = part = root = stack = None
         note("walk", completed=len(occurrences), total=len(occurrences), force=True)
         for index, (occurrence, referenced) in enumerate(occurrences, start=1):
             name, path = occurrence.name, occurrence.path
@@ -5051,6 +5088,7 @@ class SolidWorksBackend(CadBackend):
         reference_registry=None,
         read_end_params=None,
         scope_context=None,
+        source_scope=None,
         scope_witnesses=None,
         body_name=None,
         body_reference=None,
@@ -5075,6 +5113,7 @@ class SolidWorksBackend(CadBackend):
             "body_index": body_index,
         }
         owner_scope = dict(scope_context or {})
+        body_scope = dict(source_scope or {})
         witness_cache = None
 
         def get_witness_rows():
@@ -5493,12 +5532,9 @@ class SolidWorksBackend(CadBackend):
                         "curve_type": repr(curve_type)[:60],
                     },
                 )
-            parameter_endpoints, topology_endpoints = (
-                native_curve_endpoint_roles(
-                    curve_start,
-                    curve_end,
-                    curve_sense,
-                )
+            parameter_endpoints = native_curve_parameter_endpoints(
+                curve_start,
+                curve_end,
             )
             edge_row["curve"] = {
                 "u_min": float(umin),
@@ -5708,26 +5744,17 @@ class SolidWorksBackend(CadBackend):
                     },
                 )
             if set(endpoint_states.values()) == {"present"}:
-                topology_assignment = native_curve_topology_endpoint_assignment(
-                    topology_endpoints[0],
-                    topology_endpoints[1],
+                topology_assignment = native_curve_topology_endpoint_set_assignment(
+                    parameter_endpoints[0],
+                    parameter_endpoints[1],
                     endpoints["start"]["point_m"],
                     endpoints["end"]["point_m"],
                 )
                 edge_row["topology_endpoint_assignment"] = topology_assignment
-                if topology_assignment["result"] not in {
-                    "sense_directed",
-                    "ambiguous",
-                }:
+                if topology_assignment["accepted"] is not True:
                     raise CadError(
                         "cad_native_tessellation_unreadable",
-                        (
-                            "edge topology endpoints disagree with curve "
-                            "parameter direction"
-                            if topology_assignment["direct_error_m"]
-                            > topology_assignment["point_tolerance_m"]
-                            else "edge topology endpoint direction is ambiguous"
-                        ),
+                        "edge topology endpoints do not form a complete curve endpoint set",
                         {
                             **base,
                             "edge_index": edge_row["index"],
@@ -6462,12 +6489,9 @@ class SolidWorksBackend(CadBackend):
                 for face_index in edge_row["face_indices"]
             )
             curve = edge_row["curve"]
-            _parameter_endpoints, topology_endpoints = (
-                native_curve_endpoint_roles(
-                    curve["start_point_m"],
-                    curve["end_point_m"],
-                    curve["sense"],
-                )
+            topology_endpoints = native_curve_parameter_endpoints(
+                curve["start_point_m"],
+                curve["end_point_m"],
             )
             identity_endpoints = {
                 name: (
@@ -6961,12 +6985,15 @@ class SolidWorksBackend(CadBackend):
                 "evaluate_packed_status": evaluate_evidence[
                     "packed_status"
                 ],
+                "open_edge_identity_sha256": None,
+                "topology_endpoint_set_accepted": False,
             }
 
         u_observation_cache = {}
         u_cache_hits = 0
         for fin_id, row in fins_by_id.items():
             row["vertex_ids"] = fin_vertices[fin_id]
+            row["face_index"] = facets[row["facet_id"]]["face_index"]
             edge_row = fin_to_edge_row.get(fin_id)
             row["edge_reference_sha256"] = (
                 edge_row["reference"]["typed_sha256"]
@@ -6986,108 +7013,12 @@ class SolidWorksBackend(CadBackend):
                         "end_evidence": None,
                         "cofin_raw_id": None,
                         "cofin_id": None,
+                        "open_edge_boundary_identity": None,
                     }
                 )
             else:
                 edge = edge_row
                 domain = edge["curve"]
-                endpoint_evidence = []
-                for endpoint, vertex_id in zip(
-                    ("start", "end"),
-                    row["vertex_ids"],
-                    strict=True,
-                ):
-                    point = vertex_points_binary64[vertex_id]
-                    point_hash = hashlib.sha256(
-                        struct.pack("<3d", *point)
-                    ).hexdigest()
-                    cache_key = (
-                        row["edge_reference_sha256"],
-                        vertex_id,
-                        point_hash,
-                    )
-                    evidence = u_observation_cache.get(cache_key)
-                    if evidence is None:
-                        evidence = fin_endpoint_u(
-                            edge["object"],
-                            point,
-                            domain,
-                            fin_id=fin_id,
-                            endpoint=endpoint,
-                            edge_reference_sha256=(
-                                edge["reference"]["typed_sha256"]
-                            ),
-                            edge_tolerance=edge["edge_tolerance"],
-                            topology_accepted=(
-                                (edge["topology_endpoint_assignment"] or {})
-                                .get("accepted")
-                                is True
-                            ),
-                        )
-                        u_observation_cache[cache_key] = evidence
-                    else:
-                        u_cache_hits += 1
-                    tolerant_edge_evidence = evidence[
-                        "tolerant_edge_evidence"
-                    ]
-                    if tolerant_edge_evidence is not None:
-                        parameter_endpoint = (
-                            "start"
-                            if native_u_equal(
-                                evidence["u"],
-                                domain["u_min"],
-                            )
-                            else "end"
-                        )
-                        repeated = edge["curve_endpoint_evaluations"][
-                            parameter_endpoint
-                        ]
-                        repeated_point = (
-                            tuple(repeated["payload"][:3])
-                            if repeated["payload"] is not None
-                            else None
-                        )
-                        repeated_tolerance = (
-                            native_point_roundtrip_tolerance(
-                                repeated_point,
-                                tuple(evidence["evaluate_payload"][:3]),
-                            )
-                            if repeated_point is not None
-                            else None
-                        )
-                        if (
-                            repeated["error"] is not None
-                            or repeated_point is None
-                            or repeated_tolerance is None
-                            or not native_u_equal(
-                                repeated["u"],
-                                evidence["u"],
-                            )
-                            or native_point_error(
-                                repeated_point,
-                                evidence["evaluate_payload"][:3],
-                            )
-                            > repeated_tolerance
-                        ):
-                            raise CadError(
-                                "cad_native_tessellation_unreadable",
-                                "tolerant-edge Evaluate2 evidence is unstable at the boundary",
-                                {
-                                    **base,
-                                    "fin_id": fin_id,
-                                    "endpoint": endpoint,
-                                    "edge_reference_sha256": (
-                                        edge["reference"]["typed_sha256"]
-                                    ),
-                                    "u": evidence["u"],
-                                },
-                            )
-                    endpoint_evidence.append(evidence)
-                start_evidence, end_evidence = endpoint_evidence
-                row["start_u"] = start_evidence["u"]
-                row["end_u"] = end_evidence["u"]
-                row["start_evidence"] = start_evidence
-                row["end_evidence"] = end_evidence
                 cofin_id = call(
                     "ITessellation.GetFinCoFin",
                     lambda fin=fin_id: _method(tessellation, "GetFinCoFin", fin),
@@ -7155,6 +7086,305 @@ class SolidWorksBackend(CadBackend):
                             "face_indices": tuple(edge_row["face_indices"]),
                         },
                     )
+                topology_assignment = edge["topology_endpoint_assignment"]
+                direct_error = (
+                    topology_assignment["direct_error_m"]
+                    if topology_assignment is not None
+                    else None
+                )
+                swapped_error = (
+                    topology_assignment["swapped_error_m"]
+                    if topology_assignment is not None
+                    else None
+                )
+                tolerance = (
+                    topology_assignment["tolerance_m"]
+                    if topology_assignment is not None
+                    else None
+                )
+                unique_topology_accepted = (
+                    topology_assignment is not None
+                    and topology_assignment["accepted"] is True
+                    and topology_assignment["complete_match_count"] == 1
+                )
+                endpoint_set_mode = (
+                    topology_assignment is not None
+                    and direct_error <= tolerance
+                    and swapped_error <= tolerance
+                )
+                open_identity_candidate = (
+                    body_type == 1
+                    and incidence == 1
+                    and cofin_id == -1
+                )
+                endpoint_evidence = []
+                for endpoint, vertex_id in zip(
+                    ("start", "end"),
+                    row["vertex_ids"],
+                    strict=True,
+                ):
+                    point = vertex_points_binary64[vertex_id]
+                    point_hash = hashlib.sha256(
+                        struct.pack("<3d", *point)
+                    ).hexdigest()
+                    cache_key = (
+                        row["edge_reference_sha256"],
+                        vertex_id,
+                        point_hash,
+                    )
+                    evidence = u_observation_cache.get(cache_key)
+                    if evidence is None:
+                        evidence = fin_endpoint_u(
+                            edge["object"],
+                            point,
+                            domain,
+                            fin_id=fin_id,
+                            endpoint=endpoint,
+                            edge_reference_sha256=(
+                                edge["reference"]["typed_sha256"]
+                            ),
+                            edge_tolerance=edge["edge_tolerance"],
+                            topology_accepted=(
+                                unique_topology_accepted
+                                or (
+                                    endpoint_set_mode
+                                    and open_identity_candidate
+                                )
+                            ),
+                        )
+                        u_observation_cache[cache_key] = evidence
+                    else:
+                        u_cache_hits += 1
+                    tolerant_edge_evidence = evidence[
+                        "tolerant_edge_evidence"
+                    ]
+                    if tolerant_edge_evidence is not None:
+                        parameter_endpoint = (
+                            "start"
+                            if native_u_equal(
+                                evidence["u"],
+                                domain["u_min"],
+                            )
+                            else "end"
+                        )
+                        repeated = edge["curve_endpoint_evaluations"][
+                            parameter_endpoint
+                        ]
+                        repeated_point = (
+                            tuple(repeated["payload"][:3])
+                            if repeated["payload"] is not None
+                            else None
+                        )
+                        repeated_tolerance = (
+                            native_point_roundtrip_tolerance(
+                                repeated_point,
+                                tuple(evidence["evaluate_payload"][:3]),
+                            )
+                            if repeated_point is not None
+                            else None
+                        )
+                        if (
+                            repeated["error"] is not None
+                            or repeated_point is None
+                            or repeated_tolerance is None
+                            or not native_u_equal(
+                                repeated["u"],
+                                evidence["u"],
+                            )
+                            or native_point_error(
+                                repeated_point,
+                                evidence["evaluate_payload"][:3],
+                            )
+                            > repeated_tolerance
+                        ):
+                            raise CadError(
+                                "cad_native_tessellation_unreadable",
+                                "tolerant-edge Evaluate2 evidence is unstable at the boundary",
+                                {
+                                    **base,
+                                    "fin_id": fin_id,
+                                    "endpoint": endpoint,
+                                    "edge_reference_sha256": (
+                                        edge["reference"]["typed_sha256"]
+                                    ),
+                                    "u": evidence["u"],
+                                },
+                            )
+                    endpoint_evidence.append(evidence)
+                start_evidence, end_evidence = endpoint_evidence
+                row["start_u"] = start_evidence["u"]
+                row["end_u"] = end_evidence["u"]
+                row["start_evidence"] = start_evidence
+                row["end_evidence"] = end_evidence
+                uses_tolerant_gap = any(
+                    evidence["tolerant_edge_evidence"] is not None
+                    for evidence in endpoint_evidence
+                )
+                row["open_edge_boundary_identity"] = None
+                if uses_tolerant_gap and not unique_topology_accepted:
+                    if (
+                        not endpoint_set_mode
+                        or not open_identity_candidate
+                    ):
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "tolerant gap use requires an open-edge endpoint identity",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "fin_id": fin_id,
+                                "direct_error_m": direct_error,
+                                "swapped_error_m": swapped_error,
+                                "face_count": incidence,
+                                "cofin_raw_id": cofin_id,
+                            },
+                        )
+                    edge_tolerance = edge["edge_tolerance"]
+                    if edge_tolerance["state"] != "success":
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "tolerant gap use requires a successful IsTolerant read",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "fin_id": fin_id,
+                                "edge_tolerance": edge_tolerance,
+                            },
+                        )
+                    endpoints = edge["endpoints"]
+                    face_row = face_rows[row["face_index"]]
+                    face_identity = face_row.get("identity")
+                    face_identity_mode = (
+                        NATIVE_SCOPE_IDENTITY_RULE
+                        if face_identity is not None
+                        else NATIVE_PERSISTENT_IDENTITY_RULE
+                    )
+                    try:
+                        scope_binding = native_open_edge_scope_binding(
+                            component=component,
+                            source_document_path=body_scope[
+                                "source_document_path"
+                            ],
+                            source_copy_path=body_scope[
+                                "source_copy_path"
+                            ],
+                            source_document_sha256=body_scope[
+                                "source_document_sha256"
+                            ],
+                            source_copy_sha256=body_scope[
+                                "source_copy_sha256"
+                            ],
+                            source_document_identity_sha256=body_scope[
+                                "source_document_identity_sha256"
+                            ],
+                            source_document_identity_kind=body_scope[
+                                "source_document_identity_kind"
+                            ],
+                            referenced_configuration=body_scope[
+                                "referenced_configuration"
+                            ],
+                            occurrence_scope=body_scope[
+                                "occurrence_scope"
+                            ],
+                            virtual_owner=body_scope["virtual_owner"],
+                            virtual_owner_sha256=body_scope[
+                                "virtual_owner_sha256"
+                            ],
+                            virtual_session_document_path=body_scope[
+                                "virtual_session_document_path"
+                            ],
+                            virtual_session_temp_root=body_scope[
+                                "virtual_session_temp_root"
+                            ],
+                            virtual_native_api_pid=body_scope[
+                                "virtual_native_api_pid"
+                            ],
+                            body_type=body_type,
+                            body_index=body_index,
+                            body_reference_sha256=body_reference[
+                                "typed_sha256"
+                            ],
+                            native_body_reference_sha256=body_reference[
+                                "raw_sha256"
+                            ],
+                            face_index=row["face_index"],
+                            face_reference_sha256=face_row["reference"][
+                                "typed_sha256"
+                            ],
+                            native_face_reference_sha256=face_row[
+                                "reference"
+                            ][
+                                "raw_sha256"
+                            ],
+                            face_identity_mode=face_identity_mode,
+                            owner_scope_key=(
+                                face_identity.get("owner_scope_key")
+                                if isinstance(face_identity, dict)
+                                else None
+                            ),
+                        )
+                        open_identity = native_open_edge_boundary_identity(
+                            component=component,
+                            scope_binding=scope_binding,
+                            edge_reference_sha256=edge["reference"][
+                                "typed_sha256"
+                            ],
+                            edge_endpoint_refs=(
+                                endpoints["start"]["reference"]["typed_sha256"],
+                                endpoints["end"]["reference"]["typed_sha256"],
+                            ),
+                            edge_start_point=endpoints["start"]["point_m"],
+                            edge_end_point=endpoints["end"]["point_m"],
+                            fin_id=fin_id,
+                            fin_vertex_ids=row["vertex_ids"],
+                            fin_start_point=vertex_points_binary64[
+                                row["vertex_ids"][0]
+                            ],
+                            fin_end_point=vertex_points_binary64[
+                                row["vertex_ids"][1]
+                            ],
+                            curve_start_point=domain["start_point_m"],
+                            curve_end_point=domain["end_point_m"],
+                            curve_u_min=domain["u_min"],
+                            curve_u_max=domain["u_max"],
+                            fin_endpoint_u=(
+                                start_evidence["u"],
+                                end_evidence["u"],
+                            ),
+                            fin_endpoint_success=(
+                                start_evidence["parameter_success_parsed"],
+                                end_evidence["parameter_success_parsed"],
+                            ),
+                            curve_sense=domain["sense"],
+                            gap_m=edge_tolerance["gap_m"],
+                            body_type=body_type,
+                            face_count=incidence,
+                            cofin_raw_id=cofin_id,
+                            edge_fin_ids=tuple(edge["fin_ids"]),
+                            topology_set_accepted=(
+                                topology_assignment["accepted"] is True
+                            ),
+                        )
+                    except ValueError as error:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "open-edge boundary identity is not reproducible",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "fin_id": fin_id,
+                                "error": str(error)[:300],
+                            },
+                        ) from error
+                    row["open_edge_boundary_identity"] = open_identity
+                    for evidence in endpoint_evidence:
+                        evidence["open_edge_identity_sha256"] = open_identity[
+                            "identity_chain_sha256"
+                        ]
+                        evidence["topology_endpoint_set_accepted"] = True
+                elif unique_topology_accepted:
+                    for evidence in endpoint_evidence:
+                        evidence["topology_endpoint_set_accepted"] = True
         for edge_row in edge_rows:
             incidence = len(edge_row["face_indices"])
             relation_fins = {
@@ -7335,6 +7565,7 @@ class SolidWorksBackend(CadBackend):
                 "body_type": body_type,
                 "body_index": body_index,
                 "body_reference_sha256": body_reference["typed_sha256"],
+                "scope": body_scope,
                 "tessellate_result": tessellate_result,
                 "request": tessellation_request,
                 "properties": tessellation_properties,
@@ -7375,6 +7606,9 @@ class SolidWorksBackend(CadBackend):
                         "end_evidence": fin["end_evidence"],
                         "cofin_raw_id": fin["cofin_raw_id"],
                         "cofin_id": fin["cofin_id"],
+                        "open_edge_boundary_identity": fin[
+                            "open_edge_boundary_identity"
+                        ],
                     }
                     for fin_id, fin in sorted(fins_by_id.items())
                 ],
@@ -7797,7 +8031,6 @@ class SolidWorksBackend(CadBackend):
                     component
                 ][1],
             }
-
         def read_body_rows(current_bodies):
             rows = []
             for body_index, raw_body in enumerate(current_bodies):
@@ -8032,6 +8265,7 @@ class SolidWorksBackend(CadBackend):
                 body_index=body_index,
                 reference_registry=registry,
                 scope_context=scope_context,
+                source_scope=self._component_source_scope(component),
                 scope_witnesses=scope_witnesses,
                 body_name=body_name,
                 body_reference={
@@ -8226,6 +8460,111 @@ class SolidWorksBackend(CadBackend):
             note("mesh_export", completed=total, total=total, force=True)
             return entries
 
+    def _component_source_scope(self, component):
+        """Bind the occurrence's exact source identity and virtual owner path."""
+
+        override = self._source_scope_overrides.get(component)
+        if override is not None:
+            return dict(override)
+        configured = self._source_components.get(component)
+        if configured is None:
+            return None
+        source_entry = self._source_documents.get(configured[0])
+        if source_entry is None:
+            return None
+        source_path = normalize_document_path(
+            os.path.abspath(source_entry[0])
+        )
+        provenance = self._source_provenance.get(component) or {}
+        state = provenance.get("state")
+        if (
+            state == "embedded_virtual_component"
+            and provenance.get("is_virtual") is True
+            and provenance.get("kind")
+            == "native_embedded_virtual_component"
+            and embedded_virtual_component_path(source_path)
+        ):
+            source_sha256 = None
+            identity_sha256 = hashlib.sha256(
+                source_path.encode("utf-8")
+            ).hexdigest()
+            identity_kind = "virtual_path_sha256"
+            source_copy_path = None
+            virtual_owner = provenance.get("owner")
+            virtual_owner_sha256 = provenance.get("owner_sha256")
+            virtual_session_document_path = provenance.get(
+                "session_document_path"
+            )
+            virtual_session_temp_root = provenance.get(
+                "session_temp_root"
+            )
+            virtual_native_api_pid = provenance.get("native_api_pid")
+        elif state is None:
+            if not os.path.isfile(source_entry[0]):
+                return None
+            if (
+                embedded_virtual_component_marker(source_path)
+                or session_materialization_path(source_path)
+            ):
+                return None
+            source_sha256 = _hash(source_entry[0])
+            identity_sha256 = source_sha256
+            identity_kind = "file_sha256"
+            relative_source = (
+                _relative_document(
+                    source_entry[0],
+                    self._scene_source_root,
+                )
+                if self._scene_source_root is not None
+                else Path(source_entry[0]).name
+            )
+            if not relative_source:
+                return None
+            source_copy_path = f"source/{relative_source}"
+            virtual_owner = None
+            virtual_owner_sha256 = None
+            virtual_session_document_path = None
+            virtual_session_temp_root = None
+            virtual_native_api_pid = None
+        else:
+            return None
+        return {
+            "rule_version": NATIVE_OPEN_EDGE_SCOPE_RULE,
+            "component": component,
+            "source_document_path": source_path,
+            "source_copy_path": source_copy_path,
+            "source_document_sha256": source_sha256,
+            "source_copy_sha256": source_sha256,
+            "source_document_identity_sha256": identity_sha256,
+            "source_document_identity_kind": identity_kind,
+            "referenced_configuration": configured[1],
+            "occurrence_scope": component,
+            "virtual_owner": virtual_owner,
+            "virtual_owner_sha256": virtual_owner_sha256,
+            "virtual_session_document_path": (
+                normalize_document_path(str(virtual_session_document_path))
+                if virtual_session_document_path
+                else None
+            ),
+            "virtual_session_temp_root": virtual_session_temp_root,
+            "virtual_native_api_pid": virtual_native_api_pid,
+        }
+
+    def source_scopes(self, components):
+        """Return the exact immutable source scope for each requested occurrence."""
+
+        scopes = {}
+        for component in sorted(components):
+            scope = self._component_source_scope(component)
+            if scope is None:
+                raise CadError(
+                    "cad_source_scope_missing",
+                    "a component has no exact source scope",
+                    {"component": component},
+                )
+            scopes[component] = scope
+        return scopes
+
     def _write_component_mesh(self, component, dest_path, holder):
         """Write the occurrence's solids and sheets within its owning geometry phase."""
         sources: list[str] = []
@@ -8390,6 +8729,7 @@ class SolidWorksBackend(CadBackend):
             "representation": "CAD_native_itessellation",
             "tessellation_sources": sources,
             "bodies": body_counts,
+            "source_scope": self._component_source_scope(component),
             "tessellation": {
                 "schema_version": tessellation["schema_version"],
                 "faces": tessellation["faces"],
@@ -9588,6 +9928,7 @@ class SolidWorksBackend(CadBackend):
                         provenance["occurrence"] = path_name
                         provenance["owner"] = owner_relative
                         provenance["defining_anchor"] = anchor
+                        self._source_provenance[path_name] = provenance
                     local_transform = []
                     # Mechanical placement is the fixed False form only; the True
                     # form includes the presentation transform and must never

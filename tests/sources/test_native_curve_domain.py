@@ -17,12 +17,11 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_CURVE_DOMAIN_RULE,
-    NATIVE_CURVE_TOPOLOGY_PAIRING_RULE,
-    NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE,
+    NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE,
+    native_curve_topology_endpoint_set_assignment,
     native_curve_endpoint_operation_tolerance,
-    native_curve_endpoint_roles,
+    native_curve_parameter_endpoints,
     native_curve_domain_transform,
-    native_curve_topology_endpoint_assignment,
     native_u_equal,
 )
 from description_pipeline.io import PipelineError  # noqa: E402
@@ -46,7 +45,7 @@ class NativeCurveDomainTests(unittest.TestCase):
             expected_start[2] - 9.72215465027256e-11,
         )
 
-        result = native_curve_topology_endpoint_assignment(
+        result = native_curve_topology_endpoint_set_assignment(
             expected_start,
             expected_end,
             actual_start,
@@ -54,54 +53,56 @@ class NativeCurveDomainTests(unittest.TestCase):
         )
 
         self.assertTrue(result["accepted"])
-        self.assertEqual(result["rule_version"], NATIVE_CURVE_TOPOLOGY_PAIRING_RULE)
-        self.assertEqual(result["result"], "sense_directed")
         self.assertEqual(
-            result["point_tolerance_source"],
-            NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE,
+            result["rule_version"],
+            NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE,
         )
-        self.assertLess(result["direct_error_m"], result["point_tolerance_m"])
+        self.assertEqual(result["canonical_result"], "direct")
+        self.assertEqual(result["complete_match_count"], 1)
+        self.assertLess(result["direct_error_m"], result["tolerance_m"])
         self.assertGreater(
             result["swapped_error_m"],
-            result["point_tolerance_m"],
+            result["tolerance_m"],
         )
-        self.assertGreater(result["wrong_assignment_margin_m"], 0.0)
+        self.assertGreater(result["alternative_margin_m"], 0.0)
 
-    def test_topology_pairing_rejects_swapped_endpoints(self):
-        result = native_curve_topology_endpoint_assignment(
+    def test_topology_endpoint_set_identifies_swapped_endpoints(self):
+        result = native_curve_topology_endpoint_set_assignment(
             (0.0, 0.0, 0.0),
             (0.010, 0.0, 0.0),
             (0.010, 0.0, 0.0),
             (0.0, 0.0, 0.0),
         )
 
-        self.assertFalse(result["accepted"])
-        self.assertEqual(result["result"], "swapped_only")
-        self.assertGreater(result["direct_error_m"], result["point_tolerance_m"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["canonical_result"], "swapped")
+        self.assertEqual(result["complete_match_count"], 1)
+        self.assertGreater(result["direct_error_m"], result["tolerance_m"])
 
-    def test_topology_pairing_rejects_ambiguous_short_edge(self):
-        result = native_curve_topology_endpoint_assignment(
+    def test_topology_endpoint_set_records_ambiguous_short_edge(self):
+        result = native_curve_topology_endpoint_set_assignment(
             (0.0, 0.0, 0.0),
             (40e-6, 0.0, 0.0),
             (0.0, 0.0, 0.0),
             (40e-6, 0.0, 0.0),
         )
 
-        self.assertFalse(result["accepted"])
-        self.assertEqual(result["result"], "ambiguous")
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["complete_match_count"], 2)
+        self.assertEqual(result["canonical_result"], "direct")
         self.assertLessEqual(
             result["swapped_error_m"],
-            result["point_tolerance_m"],
+            result["tolerance_m"],
         )
 
-    def test_topology_pairing_tolerance_boundary_is_inclusive(self):
-        accepted = native_curve_topology_endpoint_assignment(
+    def test_topology_endpoint_set_tolerance_boundary_is_inclusive(self):
+        accepted = native_curve_topology_endpoint_set_assignment(
             (0.0, 0.0, 0.0),
             (0.010, 0.0, 0.0),
             (50e-6, 0.0, 0.0),
             (0.010, 0.0, 0.0),
         )
-        rejected = native_curve_topology_endpoint_assignment(
+        rejected = native_curve_topology_endpoint_set_assignment(
             (0.0, 0.0, 0.0),
             (0.010, 0.0, 0.0),
             (50e-6 + 1e-12, 0.0, 0.0),
@@ -109,38 +110,37 @@ class NativeCurveDomainTests(unittest.TestCase):
         )
 
         self.assertTrue(accepted["accepted"])
-        self.assertEqual(accepted["direct_error_m"], accepted["point_tolerance_m"])
+        self.assertEqual(accepted["direct_error_m"], accepted["tolerance_m"])
         self.assertFalse(rejected["accepted"])
-        self.assertEqual(rejected["result"], "unmatched")
+        self.assertIsNone(rejected["canonical_result"])
         self.assertGreater(
             rejected["direct_error_m"],
-            rejected["point_tolerance_m"],
+            rejected["tolerance_m"],
         )
 
-        swapped_boundary = native_curve_topology_endpoint_assignment(
+        swapped_boundary = native_curve_topology_endpoint_set_assignment(
             (0.0, 0.0, 0.0),
             (50e-6, 0.0, 0.0),
             (0.0, 0.0, 0.0),
             (50e-6, 0.0, 0.0),
         )
-        self.assertFalse(swapped_boundary["accepted"])
-        self.assertEqual(swapped_boundary["result"], "ambiguous")
+        self.assertTrue(swapped_boundary["accepted"])
+        self.assertEqual(swapped_boundary["complete_match_count"], 2)
 
-    def test_topology_pairing_rejects_malformed_inputs(self):
+    def test_topology_endpoint_set_rejects_malformed_inputs(self):
         with self.assertRaisesRegex(ValueError, "three coordinates"):
-            native_curve_topology_endpoint_assignment(
+            native_curve_topology_endpoint_set_assignment(
                 (0.0, 0.0),
                 (1.0, 0.0, 0.0),
                 (0.0, 0.0, 0.0),
                 (1.0, 0.0, 0.0),
             )
         with self.assertRaisesRegex(ValueError, "finite"):
-            native_curve_topology_endpoint_assignment(
+            native_curve_topology_endpoint_set_assignment(
                 (0.0, 0.0, 0.0),
                 (1.0, 0.0, 0.0),
                 (0.0, 0.0, 0.0),
-                (1.0, 0.0, 0.0),
-                tolerance_m=float("nan"),
+                (float("nan"), 0.0, 0.0),
             )
 
     def counterexample(self):
@@ -244,13 +244,12 @@ class NativeCurveDomainTests(unittest.TestCase):
             row["curve_sense"],
             curve["is_periodic"],
         )
-        _, topology_endpoints = native_curve_endpoint_roles(
+        topology_endpoints = native_curve_parameter_endpoints(
             row["curve_start_point_m"],
             row["curve_end_point_m"],
-            row["curve_sense"],
         )
         row["topology_endpoint_assignment"] = (
-            native_curve_topology_endpoint_assignment(
+            native_curve_topology_endpoint_set_assignment(
                 topology_endpoints[0],
                 topology_endpoints[1],
                 row["start_point_m"],

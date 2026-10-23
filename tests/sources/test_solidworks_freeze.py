@@ -16,6 +16,7 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError, ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
+    _bind_source_scope_origins,
     _dependency_closure,
     _relative_document_name,
     _source_inputs,
@@ -173,6 +174,121 @@ class FreezeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         support.cleanup(self.tmp)
+
+    def test_source_scopes_bind_shared_copy_without_instance_rows(self) -> None:
+        source_root = self.tmp / "collected"
+        source_root.mkdir()
+        source = source_root / "Part.SLDPRT"
+        source.write_bytes(b"frozen-copy")
+        copy_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+        original_sha256 = hashlib.sha256(b"original-source").hexdigest()
+        source_path = r"C:\source\Part.SLDPRT"
+        template = {
+            "rule_version": "native-open-edge-scope-binding-v1",
+            "component": "part-1",
+            "source_document_path": str(source),
+            "source_copy_path": "source/Part.SLDPRT",
+            "source_document_sha256": copy_sha256,
+            "source_copy_sha256": copy_sha256,
+            "source_document_identity_sha256": copy_sha256,
+            "source_document_identity_kind": "file_sha256",
+            "referenced_configuration": "Default",
+            "occurrence_scope": "part-1",
+            "virtual_owner": None,
+            "virtual_owner_sha256": None,
+            "virtual_session_document_path": None,
+            "virtual_session_temp_root": None,
+            "virtual_native_api_pid": None,
+        }
+        scopes = {
+            "part-1": template,
+            "part-2": dict(
+                template,
+                component="part-2",
+                occurrence_scope="part-2",
+            ),
+        }
+        closure = {
+            "mapping": [
+                {
+                    "instance": "part-1",
+                    "copy": "source/Part.SLDPRT",
+                    "copy_sha256": copy_sha256,
+                    "source": source_path,
+                    "source_sha256": copy_sha256,
+                }
+            ],
+            "original_files": {source_path: original_sha256},
+            "copy_files": {"source/Part.SLDPRT": copy_sha256},
+        }
+
+        bound = _bind_source_scope_origins(scopes, closure, source_root)
+
+        self.assertEqual(set(bound), {"part-1", "part-2"})
+        for scope in bound.values():
+            self.assertEqual(
+                scope["source_document_sha256"],
+                original_sha256,
+            )
+            self.assertEqual(
+                scope["source_document_identity_sha256"],
+                original_sha256,
+            )
+            self.assertEqual(scope["source_copy_sha256"], copy_sha256)
+
+    def test_source_scopes_do_not_match_same_basename_elsewhere(self) -> None:
+        source_root = self.tmp / "collected"
+        first = source_root / "first" / "Part.SLDPRT"
+        second = source_root / "second" / "Part.SLDPRT"
+        first.parent.mkdir(parents=True)
+        second.parent.mkdir(parents=True)
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        first_sha256 = hashlib.sha256(first.read_bytes()).hexdigest()
+        second_sha256 = hashlib.sha256(second.read_bytes()).hexdigest()
+        original_sha256 = hashlib.sha256(b"original").hexdigest()
+        scope = {
+            "rule_version": "native-open-edge-scope-binding-v1",
+            "component": "part-1",
+            "source_document_path": str(first),
+            "source_copy_path": "source/first/Part.SLDPRT",
+            "source_document_sha256": first_sha256,
+            "source_copy_sha256": first_sha256,
+            "source_document_identity_sha256": first_sha256,
+            "source_document_identity_kind": "file_sha256",
+            "referenced_configuration": "Default",
+            "occurrence_scope": "part-1",
+            "virtual_owner": None,
+            "virtual_owner_sha256": None,
+            "virtual_session_document_path": None,
+            "virtual_session_temp_root": None,
+            "virtual_native_api_pid": None,
+        }
+        closure = {
+            "mapping": [
+                {
+                    "instance": "part-1",
+                    "copy": "source/second/Part.SLDPRT",
+                    "copy_sha256": second_sha256,
+                    "source": r"C:\source\Part.SLDPRT",
+                    "source_sha256": second_sha256,
+                }
+            ],
+            "original_files": {
+                r"C:\source\Part.SLDPRT": original_sha256
+            },
+            "copy_files": {
+                "source/first/Part.SLDPRT": first_sha256,
+                "source/second/Part.SLDPRT": second_sha256,
+            },
+        }
+
+        with self.assertRaises(BridgeError):
+            _bind_source_scope_origins(
+                {"part-1": scope},
+                closure,
+                source_root,
+            )
 
     def test_source_config_carries_the_sealed_native_closure(self) -> None:
         from description_pipeline.sources.solidworks.freeze import validate_source_config

@@ -31,13 +31,17 @@ DIAGNOSTIC_SCHEMA = "solidworks-to-urdf.failure-diagnostics/v1"
 #: Evidence files the report builder projects into findings.
 REPORT_EVIDENCE_FILES = (
     "input/handoff.json",
+    "input/source.json",
     "reports/quality.json",
+    "evidence/capture.json",
     "evidence/discovery.json",
     "evidence/raw/dependency_closure.json",
+    "evidence/raw/scene_raw.json",
     "evidence/raw/material_provenance.json",
     "evidence/raw/effective_instances.json",
     "evidence/raw/mass_closure.json",
     "evidence/raw/geometry.json",
+    "evidence/raw/source_scopes.json",
     MASS_CLOSURE_REPORT,
 )
 
@@ -256,7 +260,10 @@ def _canonical_effective_warnings(value) -> list | None:
     return warnings
 
 
-def _canonical_untessellated_faces(value) -> list | None:
+def _canonical_untessellated_faces(
+    value,
+    source_scopes,
+) -> list | None:
     """The canonical ``no_facets_faces`` rows of ``raw/geometry.json``, or ``None``.
 
     The file is a list of per-component entries; each row is returned with its
@@ -298,6 +305,11 @@ def _canonical_untessellated_faces(value) -> list | None:
                 entry.get("triangles"),
                 native_fin_resolutions=[],
                 native_identity_warnings=[],
+                expected_source_scope=(
+                    source_scopes.get(component)
+                    if isinstance(source_scopes, dict)
+                    else None
+                ),
             )
         except PipelineError:
             return None
@@ -478,7 +490,15 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             }
         )
     for source, value in sources.items():
-        if source in {material_source, effective_source, "evidence/raw/geometry.json"}:
+        if source in {
+            material_source,
+            effective_source,
+            "evidence/raw/geometry.json",
+            "evidence/raw/source_scopes.json",
+            "evidence/capture.json",
+            "evidence/raw/scene_raw.json",
+            "input/source.json",
+        }:
             # Projected explicitly below: the raw warning entries carry their own
             # code/message and must not be double-reported by the generic walk.
             continue
@@ -749,6 +769,16 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     }
                 )
     geometry_source = "evidence/raw/geometry.json"
+    source_scopes = None
+    if evidence_root is not None:
+        from .verification.native_discovery import (  # noqa: PLC0415
+            source_scopes as validated_source_scopes,
+        )
+
+        try:
+            source_scopes = validated_source_scopes(Path(evidence_root))
+        except PipelineError:
+            source_scopes = None
     geometry = sources.get(geometry_source)
     if isinstance(geometry, dict) and geometry.get("errors"):
         entries.extend(_findings(geometry, geometry_source))
@@ -784,7 +814,10 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 }
             )
     else:
-        untessellated = _canonical_untessellated_faces(geometry)
+        untessellated = _canonical_untessellated_faces(
+            geometry,
+            source_scopes,
+        )
         if untessellated is None:
             entries.append(
                 {

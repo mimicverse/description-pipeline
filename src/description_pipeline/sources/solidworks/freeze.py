@@ -352,6 +352,125 @@ def _copy_inventory(source_dir: Path) -> dict[str, str]:
     return {f"source/{path}": digest for path, digest in inventory(source_dir, exclude=locks).items()}
 
 
+def _normalized_posix_path(value: object) -> str | None:
+    """Return one bounded relative snapshot path for exact matching."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    path = PurePosixPath(value.replace("\\", "/"))
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    return path.as_posix().casefold()
+
+
+def _bind_source_scope_origins(
+    source_scopes: dict[str, dict[str, Any]],
+    closure: dict[str, Any],
+    source_root: Path,
+) -> dict[str, dict[str, Any]]:
+    """Bind each occurrence scope to one exact collected copy and original file."""
+
+    mapping_by_copy: dict[str, list[dict[str, Any]]] = {}
+    for row in closure.get("mapping") or []:
+        if not isinstance(row, dict):
+            raise BridgeError(
+                "cad_source_scope_mapping",
+                "a dependency mapping row is malformed",
+                exit_code=3,
+            )
+        copy_path = _normalized_posix_path(row.get("copy"))
+        if copy_path is None:
+            raise BridgeError(
+                "cad_source_scope_mapping",
+                "a dependency mapping copy path is malformed",
+                {"mapping": row},
+                exit_code=3,
+            )
+        mapping_by_copy.setdefault(copy_path, []).append(row)
+    copy_files = {
+        path: checksum
+        for value, checksum in (closure.get("copy_files") or {}).items()
+        if (path := _normalized_posix_path(value)) is not None
+    }
+    original_files = {
+        os.path.normcase(os.path.abspath(str(value))): checksum
+        for value, checksum in (closure.get("original_files") or {}).items()
+    }
+    root = Path(source_root).resolve()
+    bound: dict[str, dict[str, Any]] = {}
+    for component, raw_scope in source_scopes.items():
+        scope = dict(raw_scope)
+        if scope.get("source_document_identity_kind") != "file_sha256":
+            bound[component] = scope
+            continue
+        try:
+            relative = Path(scope["source_document_path"]).resolve().relative_to(
+                root
+            )
+        except (KeyError, OSError, ValueError) as error:
+            raise BridgeError(
+                "cad_source_scope_mapping",
+                "a source scope is outside the collected source root",
+                {
+                    "component": component,
+                    "source_document_path": scope.get(
+                        "source_document_path"
+                    ),
+                    "source_root": str(root),
+                },
+                exit_code=3,
+            ) from error
+        copy_path = (PurePosixPath("source") / relative.as_posix()).as_posix()
+        normalized_copy = _normalized_posix_path(copy_path)
+        mapping_rows = (
+            mapping_by_copy.get(normalized_copy, [])
+            if normalized_copy is not None
+            else []
+        )
+        mapping_source = (
+            mapping_rows[0].get("source")
+            if len(mapping_rows) == 1
+            else None
+        )
+        original_sha256 = (
+            original_files.get(
+                os.path.normcase(os.path.abspath(str(mapping_source)))
+            )
+            if isinstance(mapping_source, str)
+            else None
+        )
+        if (
+            scope.get("source_copy_path") not in (None, copy_path)
+            or len(mapping_rows) != 1
+            or not isinstance(original_sha256, str)
+            or SHA256_RE.fullmatch(original_sha256) is None
+            or mapping_rows[0].get("copy_sha256")
+            != scope.get("source_copy_sha256")
+            or copy_files.get(normalized_copy) != scope.get("source_copy_sha256")
+        ):
+            raise BridgeError(
+                "cad_source_scope_mapping",
+                "a source scope lacks one exact dependency mapping",
+                {
+                    "component": component,
+                    "source_copy_path": copy_path,
+                    "scope_copy_sha256": scope.get("source_copy_sha256"),
+                    "mapping_rows": mapping_rows,
+                    "mapped_copy_sha256": (
+                        copy_files.get(normalized_copy)
+                        if normalized_copy is not None
+                        else None
+                    ),
+                },
+                exit_code=3,
+            )
+        scope["source_copy_path"] = copy_path
+        scope["source_document_sha256"] = original_sha256
+        scope["source_document_identity_sha256"] = original_sha256
+        bound[component] = scope
+    return bound
+
+
 def _document_parts(value: str) -> tuple[str, list[str]]:
     """A Windows or POSIX document path as (drive letter, path segments).
 
@@ -2521,11 +2640,21 @@ def _freeze_local(
             staging / "raw" / "effective_instances.json",
             _effective_instance_record(scene, cfg, backend_readings, cache_error),
         )
+        components = [component.name for component in scene.components]
+        source_scopes = {}
+        scope_reader = getattr(backend, "source_scopes", None)
+        if callable(scope_reader):
+            source_scopes = _bind_source_scope_origins(
+                scope_reader(components),
+                closure,
+                staging / "source",
+            )
+            backend._source_scope_overrides = source_scopes
+        write_json(staging / "raw" / "source_scopes.json", source_scopes)
         geometry_entries: list[dict[str, Any]] = []
         if cfg["geometry"].get("enabled", True):
             stage = "geometry"
             _capture_note(activity, "geometry")
-            components = [component.name for component in scene.components]
             geometry_entries = _export_geometry(backend, cfg, staging / "geometry", components, activity=activity)
             write_json(staging / "raw" / "geometry.json", geometry_entries)
 

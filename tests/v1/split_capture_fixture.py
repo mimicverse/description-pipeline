@@ -24,7 +24,11 @@ from description_pipeline.sources.solidworks.revision import package_inventory
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend
-from tests.v1.test_split_roundtrip import AxisFixtureBackend, capture_record
+from tests.v1.test_split_roundtrip import (
+    AxisFixtureBackend,
+    capture_record,
+    fixture_mass_payload,
+)
 
 #: The release-only gates a control fixture can never satisfy; any other failure is a defect.
 CONTROL_LIMITS = frozenset(
@@ -135,12 +139,15 @@ def build_fixture_capture(
                 "name": "base-1",
                 "transform": support.placement((0.0, 0.0, 0.0)),
                 # Off-axis COM: the product signal proves the convention at capture time.
-                "mass": support.mass_payload(0.192, (0.01, 0.02, 0.0)),
+                "mass": fixture_mass_payload(0.192, (0.01, 0.02, 0.0)),
             },
             {
                 "name": "arm-1",
                 "transform": support.placement((0.0, 0.0, 0.1)),
-                "mass": support.mass_payload(0.105654866776462, (0.0, 0.0, 0.05)),
+                "mass": fixture_mass_payload(
+                    0.105654866776462,
+                    (0.0, 0.0, 0.05),
+                ),
             },
         ],
         dependencies=[prepared_package / "cad/base.SLDPRT", prepared_package / "cad/arm.SLDPRT"],

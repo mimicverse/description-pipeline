@@ -1561,7 +1561,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "malformed|cofin"):
             self.parse(tessellation, triangles)
 
-    def test_curve_sense_requires_directed_topology_mapping(self):
+    def test_curve_sense_does_not_flip_raw_curve_endpoint_order(self):
         tessellation, triangles = self.fixture()
         edge = tessellation["native_edges"][0]
         edge["curve_sense"] = False
@@ -1575,11 +1575,15 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         )
         support.refresh_topology_endpoint_assignment(tessellation)
 
-        with self.assertRaisesRegex(
-            PipelineError,
-            "topology endpoint disagrees with curve direction",
-        ):
-            self.parse(tessellation, triangles)
+        self.assertEqual(
+            len(self.parse(tessellation, triangles)),
+            len(tessellation["face_spans"]),
+        )
+        self.assertIs(edge["curve_sense"], False)
+        self.assertEqual(
+            edge["topology_endpoint_assignment"]["canonical_result"],
+            "direct",
+        )
 
     def test_curved_native_edge_rejects_same_u_direction(self):
         tessellation, triangles = self.fixture()

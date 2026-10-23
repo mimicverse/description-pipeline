@@ -8,6 +8,7 @@ portable role).  The control fixture is explicitly NOT native CAD qualification.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -54,8 +55,93 @@ def capture_record() -> dict:
     return record
 
 
+def fixture_mass_payload(
+    mass: float,
+    com: tuple[float, float, float],
+) -> dict:
+    """Mass fixture with the configuration consumed by source-scope checks."""
+
+    payload = support.mass_payload(mass, com)
+    payload["reference"] = {
+        **payload["reference"],
+        "configuration": "Default",
+    }
+    return payload
+
+
 class AxisFixtureBackend(support.FixtureCadBackend):
     """Fixture backend that can resolve the authored joint axis selector."""
+
+    def collect_scene(self, doc_path, coordinate_systems, on_activity=None, require_material=True):
+        self._capture_document = Path(doc_path).resolve()
+        scene = super().collect_scene(
+            doc_path,
+            coordinate_systems,
+            on_activity=on_activity,
+            require_material=require_material,
+        )
+        for row in scene.components:
+            row.path = str(self._source_path(row.name))
+        return scene
+
+    def _source_path(self, component):
+        capture_root = getattr(self, "_capture_document", self.document).parent
+        entry = next(
+            (
+                row
+                for row in self.components
+                if str(row.get("name")) == str(component)
+            ),
+            None,
+        )
+        path_name = (
+            Path(str(entry.get("path"))).name
+            if entry is not None and entry.get("path")
+            else f"{str(component).split('-', 1)[0]}.SLDPRT"
+        )
+        source_path = capture_root / path_name
+        if not source_path.is_file():
+            source_path = next(
+                (
+                    capture_root / dependency.name
+                    for dependency in self._dependencies
+                    if dependency.name.casefold() == path_name.casefold()
+                ),
+                source_path,
+            )
+        if not source_path.is_file():
+            raise RuntimeError(
+                f"control fixture source scope has no source file: {component}"
+            )
+        return source_path
+
+    def source_scopes(self, components):
+        """Supply the control fixture's exact source scope records."""
+
+        scopes = {}
+        for component in components:
+            source_path = self._source_path(component)
+            sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            scopes[str(component)] = {
+                "rule_version": "native-open-edge-scope-binding-v1",
+                "component": str(component),
+                "source_document_path": str(source_path),
+                "source_copy_path": None,
+                "source_document_sha256": sha256,
+                "source_copy_sha256": sha256,
+                "source_document_identity_sha256": sha256,
+                "source_document_identity_kind": "file_sha256",
+                "referenced_configuration": str(
+                    self.configurations[0]
+                ),
+                "occurrence_scope": str(component),
+                "virtual_owner": None,
+                "virtual_owner_sha256": None,
+                "virtual_session_document_path": None,
+                "virtual_session_temp_root": None,
+                "virtual_native_api_pid": None,
+            }
+        return scopes
 
     def assembly_mass_properties(self, path):
         from description_pipeline.sources.solidworks.errors import CadError
@@ -169,12 +255,15 @@ class SplitRoundtripTests(unittest.TestCase):
                     "name": "base-1",
                     "transform": support.placement((0.0, 0.0, 0.0)),
                     # Off-axis COM: the product signal proves the convention at capture time.
-                    "mass": support.mass_payload(0.192, (0.01, 0.02, 0.0)),
+                    "mass": fixture_mass_payload(0.192, (0.01, 0.02, 0.0)),
                 },
                 {
                     "name": "arm-1",
                     "transform": support.placement((0.0, 0.0, 0.1)),
-                    "mass": support.mass_payload(0.105654866776462, (0.0, 0.0, 0.05)),
+                    "mass": fixture_mass_payload(
+                        0.105654866776462,
+                        (0.0, 0.0, 0.05),
+                    ),
                 },
             ],
             dependencies=[
@@ -226,6 +315,27 @@ class SplitRoundtripTests(unittest.TestCase):
         archive = self.capture_output / transfer.CAPTURE_ARCHIVE
         manifest_path = self.capture_output / transfer.CAPTURE_MANIFEST
         self.assertTrue(archive.is_file() and manifest_path.is_file())
+        source_scopes = json.loads(
+            (
+                self.capture_output
+                / "evidence/raw/source_scopes.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(set(source_scopes), {"base-1", "arm-1"})
+        for component, scope in source_scopes.items():
+            self.assertEqual(scope["component"], component)
+            self.assertEqual(
+                scope["source_copy_path"],
+                f"source/{component.split('-', 1)[0]}.SLDPRT",
+            )
+            self.assertEqual(
+                scope["source_document_identity_kind"],
+                "file_sha256",
+            )
+            self.assertEqual(
+                scope["source_document_sha256"],
+                scope["source_document_identity_sha256"],
+            )
         native_stages = json.loads((self.capture_output / "reports/native-stages.json").read_text(encoding="utf-8"))
         self.assertEqual(native_stages["execution_scope"], ["freeze", "discover", "capture"])
         self.assertTrue(native_stages["events"])

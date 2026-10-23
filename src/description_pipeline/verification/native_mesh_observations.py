@@ -89,6 +89,7 @@ def _stl_triangle_vertices(path: Path, triangles: int) -> list[tuple[tuple[float
 
 def verify_native_mesh_observations(bundle: Path) -> dict:
     manifest = verify_snapshot(Path(bundle) / "evidence")
+    source_scopes = evidence.source_scopes(bundle)
     native = ((manifest.get("identity") or {}).get("capture") or {}).get("evidence_class") == "cad"
     rows = evidence.geometry(bundle)
     warnings = []
@@ -124,10 +125,16 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             _stl_triangle_vertices(path, triangles),
             native_fin_resolutions=native_fin_resolutions,
             native_identity_warnings=native_identity_warnings,
+            expected_source_scope=source_scopes.get(component),
         )
         warnings.extend(native_fin_resolutions)
         warnings.extend(native_identity_warnings)
-        topology = summarize_native_topology(tessellation, spans)
+        topology = summarize_native_topology(
+            tessellation,
+            spans,
+            component=component,
+            expected_source_scope=source_scopes.get(component),
+        )
         _require(
             topology["status"] == "evidence_complete",
             component + ": native body-local topology evidence is unresolved",

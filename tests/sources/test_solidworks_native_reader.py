@@ -1594,6 +1594,49 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertIn(str(virtual_path), {component.path for component in scene.components})
             self.assertNotIn(str(virtual_path), backend.source_files)
             self.assertNotIn(str(virtual_path), backend.verify_sources_unchanged())
+            scopes = backend.source_scopes([virtual.Name2])
+            scope = scopes[virtual.Name2]
+            self.assertEqual(
+                scope["source_document_identity_kind"],
+                "virtual_path_sha256",
+            )
+            self.assertEqual(
+                scope["virtual_owner"],
+                "robot.SLDASM",
+            )
+            self.assertEqual(
+                scope["virtual_session_document_path"].replace(
+                    "\\",
+                    "/",
+                ),
+                str(virtual_path).lower().replace("\\", "/"),
+            )
+            self.assertEqual(
+                scope["virtual_session_temp_root"],
+                str(virtual_path.parent.parent.parent),
+            )
+            self.assertEqual(scope["virtual_native_api_pid"], 21040)
+            backend._source_provenance = {}
+            with self.assertRaises(CadError):
+                backend.source_scopes([virtual.Name2])
+
+    def test_capture_source_scopes_fail_closed_for_missing_frozen_file(self) -> None:
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "part.SLDPRT")
+            component = _Component("part-1", part)
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = _CaptureBackend(
+                session_factory=lambda: _Session(
+                    _App({assembly: main, part: _Doc(part)})
+                )
+            )
+            backend.collect_scene(str(assembly), [])
+            part.unlink()
+
+            with self.assertRaises(CadError):
+                backend.source_scopes([component.Name2])
 
     def test_copy_inspection_releases_occurrences_before_read_only_mutation(self):
         with TemporaryDirectory() as tmp, _com_stubs():
