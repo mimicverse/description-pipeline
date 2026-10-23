@@ -7,6 +7,7 @@ Failures raise stable error codes and only owned process trees are reclaimed.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import math
 import ntpath
@@ -52,6 +53,7 @@ from ...geometry.native_u import (
     native_get_parameter_success,
     native_open_edge_boundary_identity,
     native_open_edge_scope_binding,
+    native_point_euclidean_error,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_scope_identity_sha256,
@@ -7134,7 +7136,7 @@ class SolidWorksBackend(CadBackend):
                     )
                     evidence = u_observation_cache.get(cache_key)
                     if evidence is None:
-                        evidence = fin_endpoint_u(
+                        observed = fin_endpoint_u(
                             edge["object"],
                             point,
                             domain,
@@ -7152,9 +7154,13 @@ class SolidWorksBackend(CadBackend):
                                 )
                             ),
                         )
-                        u_observation_cache[cache_key] = evidence
+                        u_observation_cache[cache_key] = copy.deepcopy(
+                            observed
+                        )
+                        evidence = copy.deepcopy(observed)
                     else:
                         u_cache_hits += 1
+                        evidence = copy.deepcopy(evidence)
                     tolerant_edge_evidence = evidence[
                         "tolerant_edge_evidence"
                     ]
@@ -7374,6 +7380,84 @@ class SolidWorksBackend(CadBackend):
                                 "edge_index": edge_row["index"],
                                 "fin_id": fin_id,
                                 "error": str(error)[:300],
+                                "body_reference_sha256": body_reference[
+                                    "typed_sha256"
+                                ],
+                                "native_body_reference_sha256": (
+                                    body_reference["raw_sha256"]
+                                ),
+                                "face_index": row["face_index"],
+                                "face_reference_sha256": face_row[
+                                    "reference"
+                                ]["typed_sha256"],
+                                "native_face_reference_sha256": face_row[
+                                    "reference"
+                                ]["raw_sha256"],
+                                "edge_reference_sha256": edge[
+                                    "reference"
+                                ]["typed_sha256"],
+                                "edge_endpoint_refs": [
+                                    endpoints["start"]["reference"][
+                                        "typed_sha256"
+                                    ],
+                                    endpoints["end"]["reference"][
+                                        "typed_sha256"
+                                    ],
+                                ],
+                                "edge_start_point_m": endpoints["start"][
+                                    "point_m"
+                                ],
+                                "edge_end_point_m": endpoints["end"][
+                                    "point_m"
+                                ],
+                                "edge_length_m": native_point_euclidean_error(
+                                    endpoints["start"]["point_m"],
+                                    endpoints["end"]["point_m"],
+                                ),
+                                "curve_u_min": domain["u_min"],
+                                "curve_u_max": domain["u_max"],
+                                "curve_start_point_m": domain[
+                                    "start_point_m"
+                                ],
+                                "curve_end_point_m": domain["end_point_m"],
+                                "fin_endpoint_u": [
+                                    start_evidence["u"],
+                                    end_evidence["u"],
+                                ],
+                                "fin_endpoint_points_m": [
+                                    vertex_points_binary64[
+                                        row["vertex_ids"][0]
+                                    ],
+                                    vertex_points_binary64[
+                                        row["vertex_ids"][1]
+                                    ],
+                                ],
+                                "fin_endpoint_success": [
+                                    start_evidence[
+                                        "parameter_success_parsed"
+                                    ],
+                                    end_evidence[
+                                        "parameter_success_parsed"
+                                    ],
+                                ],
+                                "tolerant_endpoints": [
+                                    start_evidence[
+                                        "tolerant_edge_evidence"
+                                    ]
+                                    is not None,
+                                    end_evidence[
+                                        "tolerant_edge_evidence"
+                                    ]
+                                    is not None,
+                                ],
+                                "edge_fin_ids": list(edge["fin_ids"]),
+                                "face_indices": list(
+                                    edge_row["face_indices"]
+                                ),
+                                "curve_sense": domain["sense"],
+                                "curve_closed": domain["is_closed"],
+                                "curve_periodic": domain["is_periodic"],
+                                "gap_m": edge_tolerance["gap_m"],
                             },
                         ) from error
                     row["open_edge_boundary_identity"] = open_identity

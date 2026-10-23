@@ -230,6 +230,8 @@ def _u_evidence(
     u_parameter: float,
     point: tuple[float, float, float],
     *,
+    projected_point_m: Sequence[float] | None = None,
+    evaluated_point_m: Sequence[float] | None = None,
     domain_lower: float | None = None,
     domain_upper: float | None = None,
     curve_start: Sequence[float] | None = None,
@@ -241,7 +243,17 @@ def _u_evidence(
     open_edge_identity_sha256: str | None = None,
     topology_endpoint_set_accepted: bool = False,
 ) -> dict[str, Any]:
-    payload, packed_status = _evaluate2_evidence(point)
+    projected_point = (
+        point
+        if projected_point_m is None
+        else _binary32_point(projected_point_m)
+    )
+    evaluated_source = (
+        point
+        if evaluated_point_m is None
+        else _binary32_point(evaluated_point_m)
+    )
+    payload, packed_status = _evaluate2_evidence(evaluated_source)
     evaluated_point = tuple(payload[:3])
     tolerant_edge_evidence = None
     if (
@@ -251,7 +263,7 @@ def _u_evidence(
         and curve_end is not None
     ):
         tolerant_edge_metrics = native_tolerant_edge_boundary(
-            point,
+            projected_point,
             evaluated_point,
             curve_start,
             curve_end,
@@ -282,7 +294,7 @@ def _u_evidence(
         and curve_end is not None
     ):
         tolerant_edge_metrics = native_tolerant_edge_boundary(
-            point,
+            projected_point,
             evaluated_point,
             curve_end,
             curve_start,
@@ -310,7 +322,12 @@ def _u_evidence(
         tolerance = native_point_roundtrip_tolerance(point, point, point)
         point_error = native_point_error(point, evaluated_point)
         point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
+    projection_error = native_point_error(point, projected_point)
     evaluate_error = native_point_error(point, evaluated_point)
+    closest_evaluate_error = native_point_error(
+        projected_point,
+        evaluated_point,
+    )
     return {
         "u": u_parameter,
         "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
@@ -323,16 +340,16 @@ def _u_evidence(
             NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
         ),
         "source_point_m": list(point),
-        "projection_error_m": 0.0,
+        "projection_error_m": projection_error,
         "point_tolerance_m": tolerance,
         "point_error_m": point_error,
-        "closest_point_error_m": 0.0,
+        "closest_point_error_m": projection_error,
         "evaluate_point_error_m": point_error,
         "source_evaluate_error_m": evaluate_error,
-        "closest_evaluate_error_m": evaluate_error,
+        "closest_evaluate_error_m": closest_evaluate_error,
         "tolerant_edge_evidence": tolerant_edge_evidence,
-        "closest_point_on_raw": [*point, u_parameter, 0.0],
-        "parameter_input_point_m": list(point),
+        "closest_point_on_raw": [*projected_point, u_parameter, 0.0],
+        "parameter_input_point_m": list(projected_point),
         "parameter_raw": [u_parameter, True],
         "parameter_success_raw": True,
         "parameter_success_raw_type": "bool",
@@ -764,56 +781,70 @@ def native_tessellation_fixture(
             if current != body["vertex_ids_by_point"][_binary32_point(edge["end_point_m"])]:
                 raise ValueError("native edge face path does not reach its endpoint")
             if len(active_faces) == 1:
-                if len(canonical_segments) != 1:
-                    raise ValueError(
-                        "open native edge fixture requires exactly one boundary fin"
+                step = (u_max - u_min) / len(canonical_segments)
+                for index, (segment, first_fin) in enumerate(
+                    canonical_segments
+                ):
+                    low = u_min + step * index
+                    high = u_min + step * (index + 1)
+                    first_reversed = (
+                        first_fin["vertex_ids"][0] != segment[0]
                     )
-                _segment, first_fin = canonical_segments[0]
-                first_start_u = (
-                    u_max
-                    if first_fin["vertex_ids"][0] != source
-                    else u_min
-                )
-                first_end_u = (
-                    u_min
-                    if first_fin["vertex_ids"][0] != source
-                    else u_max
-                )
-                first_fin.update(
-                    {
-                        "edge_reference_sha256": edge["edge_reference_sha256"],
-                        "classification": "native_edge",
-                        "start_u": first_start_u,
-                        "end_u": first_end_u,
-                        "start_evidence": _u_evidence(
-                            first_start_u,
-                            body["points_by_vertex_id"][first_fin["vertex_ids"][0]],
-                            domain_lower=u_min,
-                            domain_upper=u_max,
-                            curve_start=_binary32_point(edge["start_point_m"]),
-                            curve_end=_binary32_point(edge["end_point_m"]),
-                            is_tolerant=edge["is_tolerant"],
-                            tolerant_gap_m=edge["tolerant_gap_m"],
-                            edge_reference_sha256=edge["edge_reference_sha256"],
-                        ),
-                        "end_evidence": _u_evidence(
-                            first_end_u,
-                            body["points_by_vertex_id"][first_fin["vertex_ids"][1]],
-                            domain_lower=u_min,
-                            domain_upper=u_max,
-                            curve_start=_binary32_point(edge["start_point_m"]),
-                            curve_end=_binary32_point(edge["end_point_m"]),
-                            is_tolerant=edge["is_tolerant"],
-                            tolerant_gap_m=edge["tolerant_gap_m"],
-                            edge_reference_sha256=edge["edge_reference_sha256"],
-                        ),
-                        "cofin_raw_id": -1,
-                        "cofin_id": None,
-                        "open_edge_boundary_identity": None,
-                    }
-                )
-                body["assigned_fin_ids"].add(first_fin["fin_id"])
-                edge_fin_ids.append(first_fin["fin_id"])
+                    first_start_u = high if first_reversed else low
+                    first_end_u = low if first_reversed else high
+                    first_fin.update(
+                        {
+                            "edge_reference_sha256": edge[
+                                "edge_reference_sha256"
+                            ],
+                            "classification": "native_edge",
+                            "start_u": first_start_u,
+                            "end_u": first_end_u,
+                            "start_evidence": _u_evidence(
+                                first_start_u,
+                                body["points_by_vertex_id"][
+                                    first_fin["vertex_ids"][0]
+                                ],
+                                domain_lower=u_min,
+                                domain_upper=u_max,
+                                curve_start=_binary32_point(
+                                    edge["start_point_m"]
+                                ),
+                                curve_end=_binary32_point(
+                                    edge["end_point_m"]
+                                ),
+                                is_tolerant=edge["is_tolerant"],
+                                tolerant_gap_m=edge["tolerant_gap_m"],
+                                edge_reference_sha256=edge[
+                                    "edge_reference_sha256"
+                                ],
+                            ),
+                            "end_evidence": _u_evidence(
+                                first_end_u,
+                                body["points_by_vertex_id"][
+                                    first_fin["vertex_ids"][1]
+                                ],
+                                domain_lower=u_min,
+                                domain_upper=u_max,
+                                curve_start=_binary32_point(
+                                    edge["start_point_m"]
+                                ),
+                                curve_end=_binary32_point(
+                                    edge["end_point_m"]
+                                ),
+                                is_tolerant=edge["is_tolerant"],
+                                tolerant_gap_m=edge["tolerant_gap_m"],
+                                edge_reference_sha256=edge[
+                                    "edge_reference_sha256"
+                                ],
+                            ),
+                            "cofin_raw_id": -1,
+                            "cofin_id": None,
+                            "open_edge_boundary_identity": None,
+                        }
+                    )
+                    body["assigned_fin_ids"].add(first_fin["fin_id"])
+                    edge_fin_ids.append(first_fin["fin_id"])
             else:
                 second_path = paths_by_face[second_face]
                 path_senses[second_face] = second_path[0]["vertex_ids"][0] == body[

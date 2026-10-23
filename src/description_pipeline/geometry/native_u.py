@@ -27,7 +27,7 @@ NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE = (
     "native-curve-topology-endpoint-set-v2"
 )
 NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE = (
-    "native-open-edge-boundary-identity-v1"
+    "native-open-edge-boundary-identity-v2"
 )
 NATIVE_OPEN_EDGE_SCOPE_RULE = "native-open-edge-scope-binding-v1"
 NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
@@ -1718,20 +1718,32 @@ def native_open_edge_boundary_identity(
     curve_start_point = tuple(_native_u(value) for value in curve_start_point)
     curve_end_point = tuple(_native_u(value) for value in curve_end_point)
 
+    def endpoint_name(result: str, source: str) -> str:
+        if result == "direct":
+            return "start" if source == "start" else "end"
+        return "end" if source == "start" else "start"
+
     roles = (
         _boundary_role(float(fin_endpoint_u[0]), curve_u_min, curve_u_max),
         _boundary_role(float(fin_endpoint_u[1]), curve_u_min, curve_u_max),
     )
-    if set(roles) != {"u_min", "u_max"}:
-        raise ValueError("fin endpoints must map to opposite exact U boundaries")
+    boundary_roles = tuple(role for role in roles if role is not None)
+    if not boundary_roles:
+        raise ValueError("fin must contain an exact edge boundary endpoint")
+    if (
+        len(boundary_roles) == 2
+        and boundary_roles[0] == boundary_roles[1]
+    ):
+        raise ValueError(
+            "fin endpoints must not collapse to one exact edge boundary"
+        )
+    full_edge = set(roles) == {"u_min", "u_max"}
+    segmented = len(boundary_roles) == 1
+    if not full_edge and not segmented:
+        raise ValueError(
+            "fin endpoints must identify a full or segmented edge interval"
+        )
 
-    fin_mapping = _gap_mapping_options(
-        fin_start_point,
-        fin_end_point,
-        edge_start_point,
-        edge_end_point,
-        gap,
-    )
     curve_mapping = _gap_mapping_options(
         curve_start_point,
         curve_end_point,
@@ -1739,8 +1751,120 @@ def native_open_edge_boundary_identity(
         edge_end_point,
         gap,
     )
-    if not fin_mapping["unique"] or not curve_mapping["unique"]:
+    if not curve_mapping["unique"]:
         raise ValueError("gap-bounded endpoint mapping is not unique")
+    curve_to_edge = {
+        "start": endpoint_name(curve_mapping["selected_result"], "start"),
+        "end": endpoint_name(curve_mapping["selected_result"], "end"),
+    }
+
+    fin_to_edge = {"start": None, "end": None}
+    if full_edge:
+        fin_mapping = _gap_mapping_options(
+            fin_start_point,
+            fin_end_point,
+            edge_start_point,
+            edge_end_point,
+            gap,
+        )
+        if not fin_mapping["unique"]:
+            raise ValueError("gap-bounded fin endpoint mapping is not unique")
+        fin_to_edge = {
+            "start": endpoint_name(fin_mapping["selected_result"], "start"),
+            "end": endpoint_name(fin_mapping["selected_result"], "end"),
+        }
+        for fin_endpoint, role in zip(("start", "end"), roles, strict=True):
+            curve_endpoint = "start" if role == "u_min" else "end"
+            if fin_to_edge[fin_endpoint] != curve_to_edge[curve_endpoint]:
+                raise ValueError(
+                    "fin U boundary and gap mapping disagree on edge endpoint"
+                )
+    else:
+        boundary_index = 0 if roles[0] is not None else 1
+        interior_index = 1 - boundary_index
+        boundary_role = roles[boundary_index]
+        interior_u = float(fin_endpoint_u[interior_index])
+        if (
+            not native_u_in_closed_interval(
+                interior_u,
+                curve_u_min,
+                curve_u_max,
+            )
+            or native_u_equal(interior_u, curve_u_min)
+            or native_u_equal(interior_u, curve_u_max)
+        ):
+            raise ValueError(
+                "segmented fin interior endpoint must be strictly inside the U domain"
+            )
+        curve_endpoint = "start" if boundary_role == "u_min" else "end"
+        edge_endpoint = curve_to_edge[curve_endpoint]
+        fin_endpoint = "start" if boundary_index == 0 else "end"
+        fin_boundary_point = (
+            fin_start_point if boundary_index == 0 else fin_end_point
+        )
+        curve_boundary_point = (
+            curve_start_point if curve_endpoint == "start" else curve_end_point
+        )
+        opposite_curve_point = (
+            curve_end_point if curve_endpoint == "start" else curve_start_point
+        )
+        boundary_to_curve_tolerance = math.nextafter(
+            native_curve_endpoint_operation_tolerance(
+                fin_boundary_point,
+                fin_boundary_point,
+                opposite_curve_point,
+            )
+            + gap,
+            math.inf,
+        )
+        boundary_to_curve_error = native_point_euclidean_error(
+            fin_boundary_point,
+            curve_boundary_point,
+        )
+        if boundary_to_curve_error > boundary_to_curve_tolerance:
+            raise ValueError(
+                "segmented fin boundary endpoint does not match its curve boundary"
+            )
+        target_point = (
+            edge_start_point if edge_endpoint == "start" else edge_end_point
+        )
+        boundary_error = native_point_euclidean_error(
+            curve_boundary_point,
+            target_point,
+        )
+        candidates = []
+        for candidate_name, candidate_point in (
+            ("start", edge_start_point),
+            ("end", edge_end_point),
+        ):
+            if native_point_within_euclidean_bound(
+                curve_boundary_point,
+                candidate_point,
+                gap,
+            ):
+                candidates.append(candidate_name)
+        if candidates != [edge_endpoint]:
+            raise ValueError(
+                "segmented fin boundary endpoint does not map uniquely to its edge endpoint"
+            )
+        fin_to_edge[fin_endpoint] = edge_endpoint
+        fin_mapping = {
+            "mode": "segmented",
+            "metric": "euclidean",
+            "gap_m": gap,
+            "boundary_endpoint": fin_endpoint,
+            "boundary_role": boundary_role,
+            "edge_endpoint": edge_endpoint,
+            "boundary_error_m": boundary_error,
+            "fin_boundary_to_curve_error_m": boundary_to_curve_error,
+            "fin_boundary_to_curve_tolerance_m": (
+                boundary_to_curve_tolerance
+            ),
+            "interior_endpoint": "end" if interior_index == 1 else "start",
+            "interior_u": interior_u,
+            "complete_match_count": 1,
+            "unique": True,
+        }
 
     two_gap = math.nextafter(2.0 * gap, math.inf)
     separation_diagnostics = {
@@ -1769,26 +1893,9 @@ def native_open_edge_boundary_identity(
         "used_for_decision": False,
     }
 
-    def endpoint_name(result: str, source: str) -> str:
-        if result == "direct":
-            return "start" if source == "start" else "end"
-        return "end" if source == "start" else "start"
-
-    fin_to_edge = {
-        "start": endpoint_name(fin_mapping["selected_result"], "start"),
-        "end": endpoint_name(fin_mapping["selected_result"], "end"),
-    }
-    curve_to_edge = {
-        "start": endpoint_name(curve_mapping["selected_result"], "start"),
-        "end": endpoint_name(curve_mapping["selected_result"], "end"),
-    }
-    for fin_endpoint, role in zip(("start", "end"), roles, strict=True):
-        curve_endpoint = "start" if role == "u_min" else "end"
-        if fin_to_edge[fin_endpoint] != curve_to_edge[curve_endpoint]:
-            raise ValueError("fin U boundary and gap mapping disagree on edge endpoint")
-
     record = {
         "rule_version": NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE,
+        "identity_mode": "full_edge" if full_edge else "segmented",
         "scope_binding": scope_binding,
         "edge_reference_sha256": edge_reference_sha256,
         "edge_endpoint_refs": {
