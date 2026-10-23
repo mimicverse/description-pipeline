@@ -89,8 +89,8 @@ def _stl_triangle_vertices(path: Path, triangles: int) -> list[tuple[tuple[float
 
 def verify_native_mesh_observations(bundle: Path) -> dict:
     manifest = verify_snapshot(Path(bundle) / "evidence")
+    source_scopes = evidence.source_scopes(bundle)
     native = ((manifest.get("identity") or {}).get("capture") or {}).get("evidence_class") == "cad"
-    source_scopes = evidence.source_scopes(bundle) if native else {}
     rows = evidence.geometry(bundle)
     warnings = []
     untessellated_warnings = []

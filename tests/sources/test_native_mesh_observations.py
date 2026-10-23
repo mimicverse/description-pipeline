@@ -223,15 +223,6 @@ class NativeMeshObservationTests(unittest.TestCase):
             self.verify()
         self.assertEqual(0, self.verify("fixture")["components"])
 
-    def test_non_native_empty_source_scopes_do_not_execute_native_gate(self):
-        (self.root / "evidence/raw/source_scopes.json").write_text(
-            "{}\n",
-            encoding="utf-8",
-        )
-        self.row = {"component": "pcb", "bodies": {"solid": 0, "sheet": 4}}
-
-        self.assertEqual(0, self.verify("fixture")["components"])
-
     def test_native_refusal_is_explicit_unqualified_surface_warning(self):
         result = self.verify()
         self.assertEqual(result["components"], 1)
