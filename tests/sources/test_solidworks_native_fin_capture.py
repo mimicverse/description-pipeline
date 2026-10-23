@@ -669,6 +669,58 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertEqual(extension.calls.count(body), 2)
 
+    def test_preclassified_path_preserves_face_and_edge_owner_checks(self):
+        for owner_kind in ("face", "edge", "all"):
+            with self.subTest(owner_kind=owner_kind):
+                (
+                    body,
+                    face_10,
+                    _face_20,
+                    edge,
+                    _tessellation,
+                    extension,
+                ) = self.fixture()
+                other_body = FakeBody([], None, None)
+                other_body.Name = "other-body"
+                if owner_kind == "face":
+                    face_10.owner = other_body
+                elif owner_kind == "edge":
+                    edge.owner = other_body
+                else:
+                    for face in body.faces:
+                        face.owner = other_body
+                    edge.owner = other_body
+                temp_root = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, temp_root)
+                source_path = temp_root / "fixture.SLDPRT"
+                source_path.write_bytes(b"fixture")
+                backend = self.body_identity_backend(
+                    source_path,
+                    extension,
+                )
+
+                with tempfile.TemporaryDirectory() as directory, self.assertRaises(
+                    CadError
+                ) as caught:
+                    backend._write_component_mesh(
+                        "part-1",
+                        Path(directory) / "mesh.stl",
+                        FakeHolder(body),
+                    )
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_native_tessellation_unreadable",
+                )
+                self.assertIn(
+                    (
+                        "face ownership is not stable"
+                        if owner_kind in {"face", "all"}
+                        else "belongs to a body other than the captured body"
+                    ),
+                    caught.exception.message,
+                )
+
     def open_boundary_fixture(self):
         body, face_10, _face_20, edge, tessellation, extension = self.fixture()
         body.faces = [face_10]

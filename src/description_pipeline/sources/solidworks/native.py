@@ -4904,6 +4904,7 @@ class SolidWorksBackend(CadBackend):
         body_reference=None,
         body_faces=None,
         body_owner_prebound=False,
+        body_owner_pointer=None,
     ):
         """Capture one body's finite topology and orientation evidence.
 
@@ -5067,23 +5068,36 @@ class SolidWorksBackend(CadBackend):
             ("edge", "IEdge", edge_rows),
         ):
             for row in rows:
-                if body_owner_prebound:
-                    owner_reference = body_reference
-                else:
-                    owner = call(
-                        f"{interface_name}.GetBody",
-                        lambda value=row["object"]: _interface(
-                            _dynamic(_method(value, "GetBody")),
-                            IBODY2_IID,
-                        ),
+                owner = call(
+                    f"{interface_name}.GetBody",
+                    lambda value=row["object"]: _interface(
+                        _dynamic(_method(value, "GetBody")),
+                        IBODY2_IID,
+                    ),
+                    **{f"{kind}_index": row["index"]},
+                )
+                if owner is None:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        f"{kind} has no owning IBody2",
+                        {**base, f"{kind}_index": row["index"]},
+                    )
+                owner_pointer = _com_object_pointer(owner)
+                owner_matches_name = (
+                    call(
+                        f"{interface_name}.GetBody.Name",
+                        lambda value=owner: _member(value, "Name"),
                         **{f"{kind}_index": row["index"]},
                     )
-                    if owner is None:
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            f"{kind} has no owning IBody2",
-                            {**base, f"{kind}_index": row["index"]},
-                        )
+                    == body_name
+                )
+                if body_owner_prebound:
+                    owner_reference = body_reference
+                    owner_matches = (
+                        owner_matches_name
+                        and owner_pointer == body_owner_pointer
+                    )
+                else:
                     owner_reference = persistent(
                         owner,
                         "body",
@@ -5091,24 +5105,29 @@ class SolidWorksBackend(CadBackend):
                         owner_of=kind,
                         **{f"{kind}_index": row["index"]},
                     )
-                    if (
+                    owner_matches = (
+                        owner_matches_name
+                        and
                         owner_reference["raw_sha256"]
-                        != body_reference["raw_sha256"]
-                    ):
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            f"{kind} belongs to a body other than the captured body",
-                            {
-                                **base,
-                                f"{kind}_index": row["index"],
-                                "body_reference_sha256": body_reference[
-                                    "typed_sha256"
-                                ],
-                                "owner_reference_sha256": owner_reference[
-                                    "typed_sha256"
-                                ],
-                            },
-                        )
+                        == body_reference["raw_sha256"]
+                    )
+                if not owner_matches:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        f"{kind} belongs to a body other than the captured body",
+                        {
+                            **base,
+                            f"{kind}_index": row["index"],
+                            "body_reference_sha256": body_reference[
+                                "typed_sha256"
+                            ],
+                            "owner_reference_sha256": owner_reference[
+                                "typed_sha256"
+                            ],
+                            "body_owner_pointer": body_owner_pointer,
+                            "owner_pointer": owner_pointer,
+                        },
+                    )
                 row["owner_body_reference"] = owner_reference
 
         for edge_row in edge_rows:
@@ -7525,12 +7544,64 @@ class SolidWorksBackend(CadBackend):
                         "a native body carries no faces",
                         {**context, "api": "IBody2.GetFaces"},
                     )
+                try:
+                    face_owner_pointers = set()
+                    face_owner_names = set()
+                    for raw_face in faces:
+                        face = _interface(
+                            _dynamic(raw_face),
+                            IFACE2_IID,
+                        )
+                        owner = _interface(
+                            _dynamic(_method(face, "GetBody")),
+                            IBODY2_IID,
+                        )
+                        if owner is None:
+                            raise ValueError(
+                                "a face has no owning IBody2"
+                            )
+                        face_owner_pointers.add(
+                            _com_object_pointer(owner)
+                        )
+                        face_owner_names.add(
+                            _member(owner, "Name")
+                        )
+                    if len(face_owner_pointers) != 1:
+                        raise ValueError(
+                            "the body faces report several owning IBody2 objects"
+                        )
+                    if face_owner_names != {body_name}:
+                        raise ValueError(
+                            "the body faces report another owning body name"
+                        )
+                    body_pointer = _com_object_pointer(body)
+                    if (
+                        hasattr(body, "_oleobj_")
+                        and face_owner_pointers != {body_pointer}
+                    ):
+                        raise ValueError(
+                            "the body faces report another owning COM object"
+                        )
+                except Exception as error:  # noqa: BLE001
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "the native body face ownership is not stable",
+                        {
+                            **context,
+                            "error": str(error)[:300],
+                        },
+                    ) from error
                 rows.append(
                     {
                         "body": body,
                         "body_index": body_index,
                         "body_name": body_name,
                         "object_pointer": _com_object_pointer(body),
+                        "owner_pointer": (
+                            body_pointer
+                            if hasattr(body, "_oleobj_")
+                            else next(iter(face_owner_pointers))
+                        ),
                         "reference": {
                             "raw": raw_reference,
                             "raw_sha256": hashlib.sha256(
@@ -7553,6 +7624,7 @@ class SolidWorksBackend(CadBackend):
                 row["body_index"] != replay["body_index"]
                 or row["body_name"] != replay["body_name"]
                 or row["object_pointer"] != replay["object_pointer"]
+                or row["owner_pointer"] != replay["owner_pointer"]
                 or len(row["faces"]) != len(replay["faces"])
                 or row["reference"]["raw_sha256"]
                 != replay["reference"]["raw_sha256"]
@@ -7631,6 +7703,7 @@ class SolidWorksBackend(CadBackend):
                 },
                 body_faces=faces,
                 body_owner_prebound=True,
+                body_owner_pointer=row["owner_pointer"],
             )
             for key, value in graph["u_observation_stats"].items():
                 evidence["u_observation_stats"][key] += value
