@@ -8,6 +8,7 @@ throwaway cluster and never contacts an existing platform or Airflow service.
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import threading
 import unittest
@@ -28,7 +29,7 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
-from description_pipeline.io import digest, read_data
+from description_pipeline.io import canonical, digest, read_data, write_json
 from description_pipeline.pipeline import (
     DispatchCommand,
     DispatchConf,
@@ -40,20 +41,42 @@ from description_pipeline.pipeline import (
     StageFailure,
     StageResult,
     TechnicalDispatchService,
+    VerifiedArtifact,
     VerifiedDiscoverResult,
+    VerifiedPublishIntent,
     VerifiedPredecessor,
+    VerifiedRepositorySnapshot,
+    VerifiedVerifyResult,
     build_capture_command,
     build_discover_command,
     build_freeze_command,
     build_generate_command,
+    build_publish_command,
     build_run_admission,
     build_verify_command,
     execute_stage,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
+from description_pipeline.pipeline.publish_contract import (
+    REPOSITORY_SNAPSHOT_FILE,
+    REPOSITORY_SNAPSHOT_KIND,
+    REPOSITORY_SNAPSHOT_METADATA,
+    REPOSITORY_SNAPSHOT_SCHEMA,
+)
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
+from description_pipeline.pipeline.verify_contract import (
+    CERTIFICATE_FILENAME,
+    EXECUTION_RECEIPT_FILENAME,
+)
 from description_pipeline.platform.facts import FactConflict, FactStore, FactStoreError
-from description_pipeline.schemas import DISCOVER_RESULT_SCHEMA, DISPATCH_CONF_SCHEMA, STAGE_RESULT_SCHEMA
+from description_pipeline.repository.publish import CommitSpec
+from description_pipeline.schemas import (
+    AIRFLOW_DISPATCH_CONF_SCHEMA,
+    DISCOVER_RESULT_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+    VERIFICATION_CERTIFICATE_SCHEMA,
+    VERIFY_REQUEST_SCHEMA,
+)
 from tests.v1.test_pipeline_admission import AdmissionHarness
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
@@ -319,7 +342,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.command = build_freeze_command(self.admission_harness.spec)
         self.dispatch_executor = digest({"tool": "portal-dispatch"})
         self.dispatch_conf = DispatchConf(
-            schema_version=DISPATCH_CONF_SCHEMA,
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=self.admission.run_id,
             freeze_command_id=self.command.command_id,
         )
@@ -414,7 +437,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
 
     def _dispatch_for(self, admission, command, *, conf_freeze_id=None):
         conf = DispatchConf(
-            schema_version=DISPATCH_CONF_SCHEMA,
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=admission.run_id,
             freeze_command_id=conf_freeze_id or command.command_id,
         )
@@ -490,7 +513,10 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "source_set_artifact": self.admission_harness.originals_ref.to_record(),
             "ruleset_artifact": self.admission_harness.ruleset_ref.to_record(),
             "configuration_artifact": self.admission_harness.configuration_ref.to_record(),
-            "native_tool": {"executor": "native"},
+            "native_tool": {
+                "executor": "native",
+                "source_sha256": self.admission_harness.spec.native_tool_source_sha256,
+            },
             "passed": True,
         }
 
@@ -612,7 +638,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         self.assertEqual(rows[0][0], 1)
 
-    def test_store_persists_the_five_supported_projection_stages_in_order(self) -> None:
+    def test_store_persists_the_six_supported_projection_stages_in_order(self) -> None:
         self._execute(_EffectHandler())
         freeze = self._predecessor_for(self.command)
 
@@ -686,17 +712,134 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             predecessor=generate,
             supporting_predecessors=(capture,),
         )
+        verify_request = {
+            "capture_artifact": capture.result.output_artifact.to_record(),
+            "config_snapshot_sha256": self.admission_harness.configuration_ref.set_sha256,
+            "contract_sha256": self.admission_harness.spec.contract_sha256,
+            "expected_verifier_sha256": self.admission_harness.spec.executors.verify,
+            "generate_artifact": generate.result.output_artifact.to_record(),
+            "output_contract": "solidworks-to-urdf.verification-artifact/v1",
+            "policy_sha256": self.admission_harness.spec.policy_sha256,
+            "purpose": self.admission_harness.spec.purpose,
+            "schema_version": VERIFY_REQUEST_SCHEMA,
+        }
+        certificate = {
+            "actual_verifier": {"executor": "verify"},
+            "actual_verifier_sha256": self.admission_harness.spec.executors.verify,
+            "capture_artifact": capture.result.output_artifact.to_record(),
+            "config_snapshot_sha256": self.admission_harness.configuration_ref.set_sha256,
+            "contract_sha256": self.admission_harness.spec.contract_sha256,
+            "decision": "PASS",
+            "generate_artifact": generate.result.output_artifact.to_record(),
+            "passed": True,
+            "policy_sha256": self.admission_harness.spec.policy_sha256,
+            "purpose": self.admission_harness.spec.purpose,
+            "request": verify_request,
+            "request_sha256": digest(verify_request),
+            "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
+            "subject_sha256": generate.result.output_artifact.set_sha256,
+        }
+        certificate["verification_key"] = digest(certificate)
+        certificate_bytes = canonical(certificate)
+        verify = self.admission_harness._predecessor(
+            "verify",
+            verify_command,
+            {},
+            files={
+                CERTIFICATE_FILENAME: certificate_bytes,
+                EXECUTION_RECEIPT_FILENAME: b"{}\n",
+            },
+        )
+        self._persist_predecessor_decision(verify)
+        verify_result = VerifiedVerifyResult.from_artifact_bytes(
+            verify,
+            VerifiedArtifact.from_store_record(
+                verify.result.output_artifact,
+                self.artifacts.verify(verify.result.output_artifact),
+            ),
+            certificate_bytes,
+        )
+
+        snapshot_root = Path(self.directory.name) / "publish-snapshot"
+        bundle_bytes = b"repository snapshot"
+        snapshot_metadata = {
+            "schema_version": REPOSITORY_SNAPSHOT_SCHEMA,
+            "repository": "example/robot",
+            "origin_url": "https://example.test/example/robot.git",
+            "base_ref": "main",
+            "base_oid": "1" * 40,
+            "branch_ref": "work/solidworks/robot/engineering",
+            "head_oid": None,
+            "bundle_sha256": digest({"unused": "replaced below"}),
+        }
+        snapshot_metadata["bundle_sha256"] = hashlib.sha256(bundle_bytes).hexdigest()
+        write_json(snapshot_root / REPOSITORY_SNAPSHOT_METADATA, snapshot_metadata)
+        (snapshot_root / REPOSITORY_SNAPSHOT_FILE).write_bytes(bundle_bytes)
+        snapshot_ref = self.artifacts.seal_tree(
+            snapshot_root,
+            kind=REPOSITORY_SNAPSHOT_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"tool": "snapshot"}),
+        )
+        publish_intent = VerifiedPublishIntent(
+            repository=VerifiedRepositorySnapshot.from_metadata_bytes(
+                VerifiedArtifact.from_store_record(
+                    snapshot_ref,
+                    self.artifacts.verify(snapshot_ref),
+                ),
+                (snapshot_root / REPOSITORY_SNAPSHOT_METADATA).read_bytes(),
+            ),
+            commit=CommitSpec(
+                author_name="Publish Bot",
+                author_email="publish@example.test",
+                authored_at="2026-10-25T00:00:00+00:00",
+                committer_name="Publish Bot",
+                committer_email="publish@example.test",
+                committed_at="2026-10-25T00:00:00+00:00",
+                subject="feat(robot): publish URDF",
+                body="verified publication",
+            ),
+        )
+        publish_command = build_publish_command(
+            self.admission_harness.spec,
+            verify_result,
+            publish_intent,
+        )
+        self.facts.create_command(
+            publish_command,
+            admission=self.admission,
+            predecessor=verify,
+            verify_result=verify_result,
+            publish_intent=publish_intent,
+        )
+        forged_publish = AdmissionHarness.manual(
+            publish_command,
+            request={**dict(publish_command.request), "branch_ref": "work/forged"},
+        )
+        with self.assertRaisesRegex(FactStoreError, "typed semantic validation"):
+            self.facts.create_command(
+                forged_publish,
+                admission=self.admission,
+                predecessor=verify,
+                verify_result=verify_result,
+                publish_intent=publish_intent,
+            )
         rows = self._query(
             "SELECT stage FROM command WHERE run_id = %s AND kind = 'stage' ORDER BY stage",
             (self.admission.run_id,),
         )
         self.assertEqual(
             [row[0] for row in rows],
-            ["capture", "discover", "freeze", "generate", "verify"],
+            ["capture", "discover", "freeze", "generate", "publish", "verify"],
         )
         self.assertEqual(
             self.facts.load_command(verify_command.command_id),
             verify_command,
+        )
+        self.assertEqual(
+            self.facts.load_command(publish_command.command_id),
+            publish_command,
         )
 
     def test_technical_dispatch_uses_its_own_claim_and_creates_no_stage_decision(self) -> None:

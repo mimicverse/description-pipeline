@@ -22,7 +22,6 @@ from description_pipeline.pipeline import (
     execute_stage,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
-from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 from description_pipeline.pipeline.freeze import (
     CONFIGURATION_KIND,
     FREEZE_REQUEST_SCHEMA,
@@ -31,6 +30,7 @@ from description_pipeline.pipeline.freeze import (
     RULESET_CATALOG_SCHEMA,
     RULESET_KIND,
 )
+from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 
 
 def _members(root: Path) -> list[dict]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 import shutil
@@ -10,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.io import digest, write_json
+from description_pipeline.io import canonical, digest, write_json
 from description_pipeline.pipeline import (
     AdmissionSpec,
     ArtifactRef,
@@ -20,8 +21,11 @@ from description_pipeline.pipeline import (
     StageExecutors,
     VerifiedArtifact,
     VerifiedDiscoverResult,
+    VerifiedPublishIntent,
     VerifiedPredecessor,
+    VerifiedRepositorySnapshot,
     VerifiedRuleset,
+    VerifiedVerifyResult,
     build_capture_command,
     build_discover_command,
     build_freeze_command,
@@ -33,6 +37,7 @@ from description_pipeline.pipeline import (
     validate_discover_command,
     validate_freeze_command,
     validate_generate_command,
+    validate_publish_command,
     validate_run_admission,
     validate_stage_command,
     validate_verify_command,
@@ -52,6 +57,23 @@ from description_pipeline.pipeline.discover import (
     SOURCE_SET_KIND,
 )
 from description_pipeline.pipeline.freeze import FREEZE_REQUEST_SCHEMA, RULESET_CATALOG_SCHEMA
+from description_pipeline.pipeline.publish_contract import (
+    PUBLISH_OUTPUT_CONTRACT,
+    PUBLISH_REQUEST_SCHEMA,
+    REPOSITORY_SNAPSHOT_FILE,
+    REPOSITORY_SNAPSHOT_KIND,
+    REPOSITORY_SNAPSHOT_METADATA,
+    REPOSITORY_SNAPSHOT_SCHEMA,
+)
+from description_pipeline.repository.publish import CommitSpec
+from description_pipeline.schemas import (
+    VERIFICATION_CERTIFICATE_SCHEMA,
+    VERIFY_REQUEST_SCHEMA,
+)
+from description_pipeline.pipeline.verify_contract import (
+    CERTIFICATE_FILENAME,
+    EXECUTION_RECEIPT_FILENAME,
+)
 
 
 def _plain(value):
@@ -123,7 +145,7 @@ class AdmissionHarness:
                 verify=digest({"executor": "verify"}),
                 publish=digest({"executor": "publish"}),
             ),
-            native_tool_sha256=digest({"executor": "native"}),
+            native_tool_source_sha256=digest({"executor": "native-source"}),
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": 1}),
             created_at=datetime(2026, 10, 25, 9, 30, tzinfo=UTC),
@@ -193,9 +215,25 @@ class AdmissionHarness:
         return self.predecessor("freeze", freeze_command, {"stage": "freeze"})
 
     def predecessor(self, stage: str, command: StageCommand, payload: dict) -> VerifiedPredecessor:
+        return self._predecessor(stage, command, payload)
+
+    def _predecessor(
+        self,
+        stage: str,
+        command: StageCommand,
+        payload: dict,
+        *,
+        files: dict[str, bytes] | None = None,
+    ) -> VerifiedPredecessor:
         output = self.root / f"{stage}-result-{command.command_id.replace(':', '-')}"
         output.mkdir()
-        write_json(output / "result.json", payload)
+        if files is None:
+            write_json(output / "result.json", payload)
+        else:
+            for path, content in files.items():
+                destination = output / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
         result_artifact = self.store.seal_tree(
             output,
             kind=f"stage_output:{stage}",
@@ -417,12 +455,27 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {"executor": "native"},
+            "native_tool": {
+                "executor": "native",
+                "source_sha256": self.harness.spec.native_tool_source_sha256,
+            },
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
+        self.assertEqual(
+            discover_result.native_tool_source_sha256,
+            self.harness.spec.native_tool_source_sha256,
+        )
+        self.assertEqual(
+            discover_result.native_tool_record_sha256,
+            digest(discover_payload["native_tool"]),
+        )
+        self.assertNotEqual(
+            discover_result.native_tool_source_sha256,
+            discover_result.native_tool_record_sha256,
+        )
         capture_command = build_capture_command(
             self.harness.spec,
             freeze,
@@ -471,6 +524,10 @@ class AdmissionProjectionTests(unittest.TestCase):
             ),
         )
         self.assertEqual(capture_command.request["prepared_sha256"], discover_result.prepared_sha256)
+        self.assertEqual(
+            capture_command.request["native_tool_sha256"],
+            discover_result.native_tool_source_sha256,
+        )
         self.assertNotEqual(
             capture_command.expected_executor_sha256,
             capture_command.request["native_tool_sha256"],
@@ -586,7 +643,10 @@ class AdmissionProjectionTests(unittest.TestCase):
 
         wrong_native_record = {
             **discover_payload,
-            "native_tool": {"executor": "different-native"},
+            "native_tool": {
+                "executor": "different-native",
+                "source_sha256": digest({"executor": "different-native"}),
+            },
         }
         wrong_native_result = VerifiedDiscoverResult.from_record(discover, wrong_native_record)
         sends: list[str] = []
@@ -646,7 +706,10 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {"executor": "native"},
+            "native_tool": {
+                "executor": "native",
+                "source_sha256": self.harness.spec.native_tool_source_sha256,
+            },
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
@@ -661,7 +724,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             validate_capture_command(self.harness.spec, freeze, discover, discover_result, forged)
         self.assertIn("request.prepared_sha256", raised.exception.detail["fields"])
 
-    def test_publish_boundary_is_explicitly_pending(self) -> None:
+    def test_publish_projects_only_verified_certificate_and_sealed_repository(self) -> None:
         freeze = self.harness.freeze_result(self.command)
         discover_command = build_discover_command(self.harness.spec, freeze)
         discover_payload = {
@@ -679,7 +742,10 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {"executor": "native"},
+            "native_tool": {
+                "executor": "native",
+                "source_sha256": self.harness.spec.native_tool_source_sha256,
+            },
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
@@ -689,14 +755,170 @@ class AdmissionProjectionTests(unittest.TestCase):
         capture = self.harness.predecessor("capture", capture_command, {"stage": "capture"})
         generate_command = build_generate_command(self.harness.spec, capture)
         generate = self.harness.predecessor("generate", generate_command, {"stage": "generate"})
-        verify = self.harness.predecessor(
+        verify_command = build_verify_command(self.harness.spec, generate, capture)
+        verify_request = {
+            "capture_artifact": capture.result.output_artifact.to_record(),
+            "config_snapshot_sha256": self.harness.configuration_ref.set_sha256,
+            "contract_sha256": self.harness.spec.contract_sha256,
+            "expected_verifier_sha256": self.harness.spec.executors.verify,
+            "generate_artifact": generate.result.output_artifact.to_record(),
+            "output_contract": "solidworks-to-urdf.verification-artifact/v1",
+            "policy_sha256": self.harness.spec.policy_sha256,
+            "purpose": self.harness.spec.purpose,
+            "schema_version": VERIFY_REQUEST_SCHEMA,
+        }
+        certificate = {
+            "actual_verifier": {"executor": "verify"},
+            "actual_verifier_sha256": self.harness.spec.executors.verify,
+            "capture_artifact": capture.result.output_artifact.to_record(),
+            "config_snapshot_sha256": self.harness.configuration_ref.set_sha256,
+            "contract_sha256": self.harness.spec.contract_sha256,
+            "decision": "PASS",
+            "generate_artifact": generate.result.output_artifact.to_record(),
+            "passed": True,
+            "policy_sha256": self.harness.spec.policy_sha256,
+            "purpose": self.harness.spec.purpose,
+            "request": verify_request,
+            "request_sha256": digest(verify_request),
+            "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
+            "subject_sha256": generate.result.output_artifact.set_sha256,
+        }
+        certificate["verification_key"] = digest(certificate)
+        certificate_bytes = canonical(certificate)
+        verify = self.harness._predecessor(
             "verify",
-            build_verify_command(self.harness.spec, generate, capture),
-            {"stage": "verify"},
+            verify_command,
+            {},
+            files={
+                CERTIFICATE_FILENAME: certificate_bytes,
+                EXECUTION_RECEIPT_FILENAME: b"{}\n",
+            },
+        )
+        verify_result = VerifiedVerifyResult.from_artifact_bytes(
+            verify,
+            self.harness._verified(verify.result.output_artifact),
+            certificate_bytes,
+        )
+        with self.assertRaises(ProtocolError):
+            VerifiedVerifyResult.from_artifact_bytes(
+                verify,
+                self.harness._verified(verify.result.output_artifact),
+                certificate_bytes + b"\n",
+            )
+
+        snapshot_root = self.harness.root / "repository-snapshot"
+        bundle_bytes = b"repository bundle"
+        metadata = {
+            "schema_version": REPOSITORY_SNAPSHOT_SCHEMA,
+            "repository": "example/robot",
+            "origin_url": "https://example.test/example/robot.git",
+            "base_ref": "main",
+            "base_oid": "1" * 40,
+            "branch_ref": "work/solidworks/robot/engineering",
+            "head_oid": None,
+            "bundle_sha256": hashlib.sha256(bundle_bytes).hexdigest(),
+        }
+        write_json(snapshot_root / REPOSITORY_SNAPSHOT_METADATA, metadata)
+        (snapshot_root / REPOSITORY_SNAPSHOT_FILE).write_bytes(bundle_bytes)
+        metadata_bytes = (snapshot_root / REPOSITORY_SNAPSHOT_METADATA).read_bytes()
+        snapshot_ref = self.harness.store.seal_tree(
+            snapshot_root,
+            kind=REPOSITORY_SNAPSHOT_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"tool": "repository-snapshot"}),
+        )
+        snapshot = VerifiedRepositorySnapshot.from_metadata_bytes(
+            self.harness._verified(snapshot_ref),
+            metadata_bytes,
+        )
+        with self.assertRaises(ProtocolError):
+            VerifiedRepositorySnapshot.from_metadata_bytes(
+                self.harness._verified(snapshot_ref),
+                metadata_bytes + b"\n",
+            )
+        publish_intent = VerifiedPublishIntent(
+            repository=snapshot,
+            commit=CommitSpec(
+                author_name="Publish Bot",
+                author_email="publish@example.test",
+                authored_at="2026-10-25T00:00:00+00:00",
+                committer_name="Publish Bot",
+                committer_email="publish@example.test",
+                committed_at="2026-10-25T00:00:00+00:00",
+                subject="feat(robot): publish URDF",
+                body="verified publication",
+            ),
+        )
+        publish = build_publish_command(
+            self.harness.spec,
+            verify_result,
+            publish_intent,
+        )
+        self.assertEqual(publish.stage, "publish")
+        self.assertEqual(publish.predecessor_decision_id, verify.decision.decision_id)
+        self.assertEqual(publish.expected_executor_sha256, self.harness.spec.executors.publish)
+        self.assertEqual(
+            set(publish.request),
+            {
+                "base_ref",
+                "branch_ref",
+                "capture_artifact_id",
+                "commit",
+                "expected_base_oid",
+                "expected_head_oid",
+                "generate_artifact_id",
+                "origin_url",
+                "output_contract",
+                "repository_slug",
+                "repository_snapshot_artifact_id",
+                "schema_version",
+                "verified_subject_sha256",
+                "verify_artifact_id",
+            },
+        )
+        self.assertEqual(publish.request["schema_version"], PUBLISH_REQUEST_SCHEMA)
+        self.assertEqual(publish.request["output_contract"], PUBLISH_OUTPUT_CONTRACT)
+        self.assertEqual(
+            publish.input_artifacts,
+            (
+                generate.result.output_artifact,
+                capture.result.output_artifact,
+                verify.result.output_artifact,
+                snapshot_ref,
+            ),
+        )
+        self.assertEqual(
+            validate_publish_command(
+                self.harness.spec,
+                verify_result,
+                publish_intent,
+                publish,
+            ),
+            publish,
+        )
+        self.assertEqual(
+            validate_stage_command(
+                self.harness.spec,
+                publish,
+                predecessor=verify,
+                verify_result=verify_result,
+                publish_intent=publish_intent,
+            ),
+            publish,
+        )
+        forged = AdmissionHarness.manual(
+            publish,
+            request={**_request(publish), "expected_base_oid": "2" * 40},
         )
         with self.assertRaises(ProtocolError) as raised:
-            build_publish_command(self.harness.spec, verify)
-        self.assertEqual(raised.exception.code, "admission.publish_contract_pending")
+            validate_publish_command(
+                self.harness.spec,
+                verify_result,
+                publish_intent,
+                forged,
+            )
+        self.assertIn("request.expected_base_oid", raised.exception.detail["fields"])
 
     def test_invalid_predecessor_fact_cannot_project_discover(self) -> None:
         predecessor = self.harness.freeze_result(self.command)
@@ -722,7 +944,7 @@ class AdmissionProjectionTests(unittest.TestCase):
                 decision=wrong,
             )
 
-    def test_unsupported_stage_is_explicit(self) -> None:
+    def test_publish_without_verified_certificate_and_intent_is_refused(self) -> None:
         publish = StageCommand.create(
             command_id="publish-command",
             run_id="run-1",
@@ -738,7 +960,7 @@ class AdmissionProjectionTests(unittest.TestCase):
         )
         with self.assertRaises(ProtocolError) as raised:
             validate_stage_command(self.harness.spec, publish)
-        self.assertEqual(raised.exception.code, "admission.stage_not_supported")
+        self.assertEqual(raised.exception.code, "admission.predecessor_required")
 
 
 if __name__ == "__main__":

@@ -25,12 +25,7 @@ from ...repository.publish import (
     materialize_repository_snapshot,
 )
 from ...runtime import tool_record
-from ...schemas import (
-    PUBLICATION_PLAN_SCHEMA,
-    PUBLICATION_RECEIPT_SCHEMA as PUBLISH_RECEIPT_SCHEMA,
-    PUBLISH_REQUEST_SCHEMA,
-    VERIFICATION_CERTIFICATE_SCHEMA,
-)
+from ...schemas import PUBLICATION_PLAN_SCHEMA, PUBLICATION_RECEIPT_SCHEMA, VERIFICATION_CERTIFICATE_SCHEMA
 from ...stages import CONTRACT
 from ..contracts import (
     ArtifactRef,
@@ -43,12 +38,16 @@ from ..contracts import (
 )
 from ..effects import EffectSettlement, EffectState, StageEffectPort
 from ..engine import StageWorkspace
+from ..publish_contract import (
+    PUBLISH_OUTPUT_CONTRACT,
+    PUBLISH_REQUEST_SCHEMA,
+    REPOSITORY_SNAPSHOT_KIND,
+)
 
-PUBLISH_OUTPUT_CONTRACT = "solidworks-to-urdf.publication-artifact/v1"
+PUBLISH_RECEIPT_SCHEMA = PUBLICATION_RECEIPT_SCHEMA
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 VERIFY_ARTIFACT_KIND = "stage_output:verify"
-REPOSITORY_SNAPSHOT_KIND = "repository_snapshot"
 GENERATE_RECEIPT = "reports/generate.json"
 VERIFY_CERTIFICATE = "verification-certificate.json"
 VERIFY_EXECUTION = "verification-execution.json"

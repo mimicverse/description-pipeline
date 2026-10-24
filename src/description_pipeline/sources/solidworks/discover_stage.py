@@ -12,17 +12,12 @@ from typing import Any
 
 from ...io import PipelineError, canonical, confined, digest, file_digest, read_data
 from ...interface_records import REQUEST_PURPOSES
-from ...schemas import (
-    ARTIFACT_MANIFEST_SCHEMA,
-    NATIVE_DISCOVER_REQUEST_SCHEMA,
-    NATIVE_OBSERVATION_SCHEMA,
-    NATIVE_SOURCE_SET_SCHEMA,
-)
+from ...schemas import ARTIFACT_MANIFEST_SCHEMA, NATIVE_OBSERVATION_SCHEMA, NATIVE_SOURCE_SET_SCHEMA
+from ...schemas import NATIVE_DISCOVER_REQUEST_SCHEMA as NATIVE_REQUEST_SCHEMA
 from .discovery import DISCOVERY_SCHEMA, DiscoverySettings, read_native_record
 from .revision import package_inventory
 from .selection import selection_bindings, validate_file_index
 
-NATIVE_REQUEST_SCHEMA = NATIVE_DISCOVER_REQUEST_SCHEMA
 OBSERVATION_MANIFEST = "observation.json"
 OBSERVATION_MEMBERS = frozenset({"request.json", "source.json", "selection.json", "record.json", "tool.json"})
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")

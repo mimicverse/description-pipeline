@@ -27,7 +27,6 @@ from description_pipeline.pipeline.stages.generate import (
     GENERATE_RECEIPT,
     GenerateHandler,
 )
-from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 from description_pipeline.pipeline.verify import (
     NoExternalEffects,
     CERTIFICATE_FILENAME,
@@ -39,6 +38,7 @@ from description_pipeline.pipeline.verify import (
     validate_verification_certificate,
 )
 from description_pipeline.runtime import tool_record
+from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 from description_pipeline.stages import CONTRACT_SHA256
 from tests.v1 import test_hermetic_six_stage as hermetic
 

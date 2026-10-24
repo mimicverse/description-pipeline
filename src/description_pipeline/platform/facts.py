@@ -18,7 +18,9 @@ from ..io import PipelineError, digest
 from ..pipeline.admission import (
     AdmissionSpec,
     VerifiedDiscoverResult,
+    VerifiedPublishIntent,
     VerifiedPredecessor,
+    VerifiedVerifyResult,
     validate_store_command,
 )
 from ..pipeline.contracts import (
@@ -42,7 +44,7 @@ from ..pipeline.effects import (
     project_effect_settlement,
     project_effect_state,
 )
-from ..schemas import DISPATCH_EFFECT_SCHEMA, RUN_ADMISSION_SCHEMA, STAGE_COMMAND_SCHEMA
+from ..schemas import AIRFLOW_DISPATCH_EFFECT_SCHEMA, RUN_ADMISSION_SCHEMA, STAGE_COMMAND_SCHEMA
 
 
 class FactStoreError(PipelineError):
@@ -308,7 +310,7 @@ class FactStore:
         command: DispatchCommand,
     ) -> EffectIntent:
         expected = {
-            "schema_version": DISPATCH_EFFECT_SCHEMA,
+            "schema_version": AIRFLOW_DISPATCH_EFFECT_SCHEMA,
             "conf_artifact_id": command.conf_artifact.artifact_id,
             "conf_set_sha256": command.conf_artifact.set_sha256,
             "dag_id": command.dag_id,
@@ -495,6 +497,8 @@ class FactStore:
         predecessor: VerifiedPredecessor,
         supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
         discover_result: VerifiedDiscoverResult | None = None,
+        verify_result: VerifiedVerifyResult | None = None,
+        publish_intent: VerifiedPublishIntent | None = None,
     ) -> StageCommand:
         """Validate and register one successor command after its predecessor decision."""
 
@@ -508,6 +512,10 @@ class FactStore:
             raise FactStoreError("Supporting predecessors must be verified immutable facts")
         if discover_result is not None and not isinstance(discover_result, VerifiedDiscoverResult):
             raise FactStoreError("A verified Discover result is required")
+        if verify_result is not None and not isinstance(verify_result, VerifiedVerifyResult):
+            raise FactStoreError("A verified Verify result is required")
+        if publish_intent is not None and not isinstance(publish_intent, VerifiedPublishIntent):
+            raise FactStoreError("A verified Publish intent is required")
         if not isinstance(command, StageCommand) or command.kind != "stage" or command.stage is None:
             raise FactStoreError("A successor stage command is required")
         try:
@@ -519,6 +527,8 @@ class FactStore:
                 predecessor=predecessor,
                 supporting_predecessors=supporting_predecessors,
                 discover_result=discover_result,
+                verify_result=verify_result,
+                publish_intent=publish_intent,
             )
         except ProtocolError as error:
             raise FactStoreError("The successor command fails typed semantic validation") from error

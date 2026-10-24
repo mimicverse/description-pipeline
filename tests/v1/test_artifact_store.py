@@ -11,7 +11,7 @@ from pathlib import Path
 from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline.io import digest
 from description_pipeline.pipeline import DispatchConf, StageResult
-from description_pipeline.schemas import DISPATCH_CONF_SCHEMA, STAGE_RESULT_SCHEMA
+from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA, STAGE_RESULT_SCHEMA
 
 
 class ArtifactStoreTests(unittest.TestCase):
@@ -104,7 +104,7 @@ class ArtifactStoreTests(unittest.TestCase):
 
     def test_dispatch_conf_is_a_separate_reference_only_artifact(self) -> None:
         conf = DispatchConf(
-            schema_version=DISPATCH_CONF_SCHEMA,
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id="run-1",
             freeze_command_id="command-freeze",
         )

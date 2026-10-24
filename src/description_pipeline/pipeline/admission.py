@@ -12,12 +12,12 @@ from typing import Any
 
 from ..interface_records import REQUEST_PURPOSES
 from ..io import PipelineError, artifact_path_parts, digest, parse_data
+from ..repository.publish import CommitSpec
 from ..schemas import (
     ADMISSION_SPEC_SCHEMA,
     ARTIFACT_MANIFEST_SCHEMA,
     DISCOVER_RESULT_SCHEMA,
     GENERATE_REQUEST_SCHEMA,
-    VERIFY_REQUEST_SCHEMA,
 )
 from .contracts import (
     ArtifactRef,
@@ -36,13 +36,28 @@ from .freeze import (
     RULESET_CATALOG_SCHEMA,
     RULESET_KIND,
 )
+from .publish_contract import (
+    PUBLISH_OUTPUT_CONTRACT,
+    PUBLISH_REQUEST_SCHEMA,
+    REPOSITORY_SNAPSHOT_FILE,
+    REPOSITORY_SNAPSHOT_KIND,
+    REPOSITORY_SNAPSHOT_METADATA,
+    REPOSITORY_SNAPSHOT_SCHEMA,
+)
+from .verify_contract import (
+    CERTIFICATE_FILENAME,
+    CERTIFICATE_SCHEMA,
+    EXECUTION_RECEIPT_FILENAME,
+    OUTPUT_CONTRACT as VERIFY_OUTPUT_CONTRACT,
+    REQUEST_SCHEMA as VERIFY_REQUEST_SCHEMA,
+)
 
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
 GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
-VERIFY_OUTPUT_CONTRACT = "solidworks-to-urdf.verification-artifact/v1"
-SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify")
+SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
+_OID40 = re.compile(r"\A[0-9a-f]{40}\Z")
 _ADMISSION_FIELDS = frozenset(
     {
         "contract_sha256",
@@ -50,7 +65,7 @@ _ADMISSION_FIELDS = frozenset(
         "executors",
         "from_stage",
         "main_assembly",
-        "native_tool_sha256",
+        "native_tool_source_sha256",
         "originals",
         "parent_run_id",
         "policy_sha256",
@@ -318,7 +333,7 @@ class AdmissionSpec:
     ruleset: VerifiedRuleset
     configuration: VerifiedArtifact
     executors: StageExecutors
-    native_tool_sha256: str
+    native_tool_source_sha256: str
     contract_sha256: str
     policy_sha256: str
     created_at: datetime
@@ -351,7 +366,7 @@ class AdmissionSpec:
             )
         if not isinstance(self.executors, StageExecutors):
             raise ProtocolError("admission.invalid", {"where": "executors"})
-        for field in ("native_tool_sha256", "contract_sha256", "policy_sha256"):
+        for field in ("native_tool_source_sha256", "contract_sha256", "policy_sha256"):
             _require_digest(getattr(self, field), "admission.invalid", field)
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise ProtocolError("admission.invalid", {"where": "created_at"})
@@ -369,7 +384,7 @@ class AdmissionSpec:
             "executors": self.executors.to_record(),
             "from_stage": self.from_stage,
             "main_assembly": self.main_assembly,
-            "native_tool_sha256": self.native_tool_sha256,
+            "native_tool_source_sha256": self.native_tool_source_sha256,
             "originals": self.originals.to_record(),
             "parent_run_id": self.parent_run_id,
             "policy_sha256": self.policy_sha256,
@@ -418,7 +433,7 @@ class AdmissionSpec:
             ruleset=ruleset,
             configuration=configuration,
             executors=StageExecutors.from_record(record["executors"]),
-            native_tool_sha256=record["native_tool_sha256"],
+            native_tool_source_sha256=record["native_tool_source_sha256"],
             contract_sha256=record["contract_sha256"],
             policy_sha256=record["policy_sha256"],
             created_at=datetime.fromisoformat(record["created_at"].replace("Z", "+00:00")),
@@ -527,7 +542,8 @@ class VerifiedDiscoverResult:
     upload_inventory_sha256: str
     main_assembly: str
     native_observation_sha256: str
-    native_tool_sha256: str
+    native_tool_source_sha256: str
+    native_tool_record_sha256: str
     source_set_artifact: ArtifactRef
     ruleset_artifact: ArtifactRef
     configuration_artifact: ArtifactRef
@@ -540,7 +556,8 @@ class VerifiedDiscoverResult:
             "selected_files_sha256",
             "upload_inventory_sha256",
             "native_observation_sha256",
-            "native_tool_sha256",
+            "native_tool_source_sha256",
+            "native_tool_record_sha256",
         ):
             _require_digest(getattr(self, field), "admission.discover_result_invalid", field)
         _require_text(self.main_assembly, "admission.discover_result_invalid", "main_assembly")
@@ -596,6 +613,12 @@ class VerifiedDiscoverResult:
         native_tool = record["native_tool"]
         if not isinstance(native_tool, Mapping) or not native_tool:
             raise ProtocolError("admission.discover_result_invalid", {"where": "native_tool"})
+        native_tool_source_sha256 = native_tool.get("source_sha256")
+        _require_digest(
+            native_tool_source_sha256,
+            "admission.discover_result_invalid",
+            "native_tool.source_sha256",
+        )
         return cls(
             predecessor=predecessor,
             prepared_sha256=record["prepared_sha256"],
@@ -603,11 +626,343 @@ class VerifiedDiscoverResult:
             upload_inventory_sha256=upload,
             main_assembly=main,
             native_observation_sha256=record["native_observation_sha256"],
-            native_tool_sha256=digest(dict(native_tool)),
+            native_tool_source_sha256=native_tool_source_sha256,
+            native_tool_record_sha256=digest(dict(native_tool)),
             source_set_artifact=ArtifactRef.from_record(record["source_set_artifact"]),
             ruleset_artifact=ArtifactRef.from_record(record["ruleset_artifact"]),
             configuration_artifact=ArtifactRef.from_record(record["configuration_artifact"]),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedVerifyResult:
+    """The sealed Verify certificate projection required by Publish."""
+
+    predecessor: VerifiedPredecessor
+    artifact: VerifiedArtifact
+    generate_artifact: ArtifactRef
+    capture_artifact: ArtifactRef
+    verified_subject_sha256: str
+    certificate_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.predecessor, VerifiedPredecessor) or self.predecessor.stage != "verify":
+            raise ProtocolError("admission.verify_result_invalid", {"where": "predecessor"})
+        if (
+            not isinstance(self.artifact, VerifiedArtifact)
+            or self.artifact.ref != self.predecessor.result.output_artifact
+            or set(self.artifact.inventory) != {CERTIFICATE_FILENAME, EXECUTION_RECEIPT_FILENAME}
+        ):
+            raise ProtocolError("admission.verify_result_invalid", {"where": "artifact"})
+        if (
+            not isinstance(self.generate_artifact, ArtifactRef)
+            or self.generate_artifact.kind != GENERATE_ARTIFACT_KIND
+            or self.generate_artifact.producer_stage != "generate"
+            or not isinstance(self.capture_artifact, ArtifactRef)
+            or self.capture_artifact.kind != CAPTURE_ARTIFACT_KIND
+            or self.capture_artifact.producer_stage != "capture"
+            or self.generate_artifact.artifact_id == self.capture_artifact.artifact_id
+        ):
+            raise ProtocolError("admission.verify_result_invalid", {"where": "artifact-pair"})
+        _require_digest(
+            self.verified_subject_sha256,
+            "admission.verify_result_invalid",
+            "verified_subject_sha256",
+        )
+        _require_digest(
+            self.certificate_sha256,
+            "admission.verify_result_invalid",
+            "certificate_sha256",
+        )
+        if self.artifact.inventory[CERTIFICATE_FILENAME] != self.certificate_sha256:
+            raise ProtocolError("admission.verify_result_invalid", {"where": "certificate_sha256"})
+        request = self.predecessor.command.request
+        if (
+            request.get("generate_artifact_id") != self.generate_artifact.artifact_id
+            or request.get("capture_artifact_id") != self.capture_artifact.artifact_id
+            or self.verified_subject_sha256 != self.generate_artifact.set_sha256
+            or self.predecessor.result.run_id != self.generate_artifact.producer_run_id
+            or self.predecessor.result.run_id != self.capture_artifact.producer_run_id
+        ):
+            raise ProtocolError("admission.verify_result_invalid", {"where": "lineage"})
+
+    @classmethod
+    def from_artifact_bytes(
+        cls,
+        predecessor: VerifiedPredecessor,
+        artifact: VerifiedArtifact,
+        certificate_bytes: bytes,
+    ) -> VerifiedVerifyResult:
+        if not isinstance(predecessor, VerifiedPredecessor) or predecessor.stage != "verify":
+            raise ProtocolError("admission.verify_result_invalid", {"where": "predecessor"})
+        if not isinstance(artifact, VerifiedArtifact):
+            raise ProtocolError("admission.verify_result_invalid", {"where": "artifact"})
+        if (
+            artifact.ref != predecessor.result.output_artifact
+            or set(artifact.inventory) != {CERTIFICATE_FILENAME, EXECUTION_RECEIPT_FILENAME}
+            or not isinstance(certificate_bytes, bytes)
+            or not certificate_bytes
+            or hashlib.sha256(certificate_bytes).hexdigest()
+            != artifact.inventory[CERTIFICATE_FILENAME]
+        ):
+            raise ProtocolError("admission.verify_result_invalid", {"where": "certificate-bytes"})
+        try:
+            certificate = parse_data(certificate_bytes, Path(CERTIFICATE_FILENAME))
+        except PipelineError as error:
+            raise ProtocolError("admission.verify_result_invalid", {"where": "certificate"}) from error
+        required = {
+            "actual_verifier",
+            "actual_verifier_sha256",
+            "capture_artifact",
+            "config_snapshot_sha256",
+            "contract_sha256",
+            "decision",
+            "generate_artifact",
+            "passed",
+            "policy_sha256",
+            "purpose",
+            "request",
+            "request_sha256",
+            "schema_version",
+            "subject_sha256",
+            "verification_key",
+        }
+        if not isinstance(certificate, Mapping) or not required <= set(certificate):
+            raise ProtocolError("admission.verify_result_invalid", {"where": "certificate"})
+        proof = {key: certificate[key] for key in certificate if key != "verification_key"}
+        if (
+            certificate.get("schema_version") != CERTIFICATE_SCHEMA
+            or certificate.get("decision") != "PASS"
+            or certificate.get("passed") is not True
+            or digest(proof) != certificate.get("verification_key")
+            or not isinstance(certificate.get("actual_verifier"), Mapping)
+            or digest(certificate["actual_verifier"]) != certificate.get("actual_verifier_sha256")
+            or certificate.get("actual_verifier_sha256") != predecessor.result.actual_executor_sha256
+            or certificate.get("actual_verifier_sha256") != predecessor.decision.actual_executor_sha256
+        ):
+            raise ProtocolError("admission.verify_result_invalid", {"where": "certificate-identity"})
+        try:
+            generate = ArtifactRef.from_record(certificate["generate_artifact"])
+            capture = ArtifactRef.from_record(certificate["capture_artifact"])
+        except (KeyError, TypeError, PipelineError) as error:
+            raise ProtocolError("admission.verify_result_invalid", {"where": "certificate-artifacts"}) from error
+        request = certificate["request"]
+        command = predecessor.command
+        if (
+            not isinstance(request, Mapping)
+            or digest(request) != certificate["request_sha256"]
+            or request.get("generate_artifact") != generate.to_record()
+            or request.get("capture_artifact") != capture.to_record()
+            or request.get("config_snapshot_sha256") != command.config_snapshot_sha256
+            or request.get("contract_sha256") != command.contract_sha256
+            or request.get("expected_verifier_sha256") != command.expected_executor_sha256
+            or request.get("output_contract") != VERIFY_OUTPUT_CONTRACT
+            or request.get("policy_sha256") != command.policy_sha256
+            or request.get("purpose") != command.request.get("purpose")
+            or request.get("schema_version") != VERIFY_REQUEST_SCHEMA
+            or command.request.get("generate_artifact_id") != generate.artifact_id
+            or command.request.get("capture_artifact_id") != capture.artifact_id
+            or certificate["contract_sha256"] != command.contract_sha256
+            or certificate["policy_sha256"] != command.policy_sha256
+            or certificate["config_snapshot_sha256"] != command.config_snapshot_sha256
+            or certificate["purpose"] != command.request.get("purpose")
+            or certificate["subject_sha256"] != generate.set_sha256
+        ):
+            raise ProtocolError("admission.verify_result_invalid", {"where": "certificate-lineage"})
+        return cls(
+            predecessor=predecessor,
+            artifact=artifact,
+            generate_artifact=generate,
+            capture_artifact=capture,
+            verified_subject_sha256=generate.set_sha256,
+            certificate_sha256=hashlib.sha256(certificate_bytes).hexdigest(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedRepositorySnapshot:
+    """One verified repository bundle and the exact refs it can materialize."""
+
+    artifact: VerifiedArtifact
+    repository: str
+    origin_url: str
+    base_ref: str
+    expected_base_oid: str
+    branch_ref: str
+    expected_head_oid: str | None
+    bundle_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.artifact, VerifiedArtifact)
+            or self.artifact.ref.kind != REPOSITORY_SNAPSHOT_KIND
+            or set(self.artifact.inventory) != {REPOSITORY_SNAPSHOT_FILE, REPOSITORY_SNAPSHOT_METADATA}
+        ):
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "artifact"})
+        _require_text(self.repository, "admission.publish_snapshot_invalid", "repository")
+        _require_text(self.origin_url, "admission.publish_snapshot_invalid", "origin_url")
+        if "/" not in self.repository:
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "repository"})
+        for field in ("base_ref", "branch_ref"):
+            value = _require_text(
+                getattr(self, field),
+                "admission.publish_snapshot_invalid",
+                field,
+            )
+            if value.startswith("-") or ".." in value or value.endswith(".lock"):
+                raise ProtocolError("admission.publish_snapshot_invalid", {"where": field})
+        if _OID40.fullmatch(self.expected_base_oid) is None:
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "expected_base_oid"})
+        if self.expected_head_oid is not None and _OID40.fullmatch(self.expected_head_oid) is None:
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "expected_head_oid"})
+        _require_digest(
+            self.bundle_sha256,
+            "admission.publish_snapshot_invalid",
+            "bundle_sha256",
+        )
+        if self.artifact.inventory[REPOSITORY_SNAPSHOT_FILE] != self.bundle_sha256:
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "bundle_sha256"})
+
+    @classmethod
+    def from_metadata_bytes(
+        cls,
+        artifact: VerifiedArtifact,
+        metadata_bytes: bytes,
+    ) -> VerifiedRepositorySnapshot:
+        if not isinstance(artifact, VerifiedArtifact):
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "artifact"})
+        if not isinstance(metadata_bytes, bytes) or not metadata_bytes:
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "metadata"})
+        expected_sha256 = artifact.inventory.get(REPOSITORY_SNAPSHOT_METADATA)
+        if expected_sha256 is None or hashlib.sha256(metadata_bytes).hexdigest() != expected_sha256:
+            raise ProtocolError(
+                "admission.publish_snapshot_invalid",
+                {"where": "metadata", "reason": "bytes-mismatch"},
+            )
+        try:
+            record = parse_data(metadata_bytes, Path(REPOSITORY_SNAPSHOT_METADATA))
+        except PipelineError as error:
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "metadata"}) from error
+        required = {
+            "schema_version",
+            "repository",
+            "origin_url",
+            "base_ref",
+            "base_oid",
+            "branch_ref",
+            "head_oid",
+            "bundle_sha256",
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record) != required
+            or record["schema_version"] != REPOSITORY_SNAPSHOT_SCHEMA
+        ):
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "metadata-fields"})
+        return cls(
+            artifact=artifact,
+            repository=record["repository"],
+            origin_url=record["origin_url"],
+            base_ref=record["base_ref"],
+            expected_base_oid=record["base_oid"],
+            branch_ref=record["branch_ref"],
+            expected_head_oid=record["head_oid"],
+            bundle_sha256=record["bundle_sha256"],
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "artifact": self.artifact.to_record(),
+            "base_ref": self.base_ref,
+            "branch_ref": self.branch_ref,
+            "bundle_sha256": self.bundle_sha256,
+            "expected_base_oid": self.expected_base_oid,
+            "expected_head_oid": self.expected_head_oid,
+            "origin_url": self.origin_url,
+            "repository": self.repository,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> VerifiedRepositorySnapshot:
+        required = {
+            "artifact",
+            "base_ref",
+            "branch_ref",
+            "bundle_sha256",
+            "expected_base_oid",
+            "expected_head_oid",
+            "origin_url",
+            "repository",
+        }
+        if not isinstance(record, Mapping) or set(record) != required:
+            raise ProtocolError("admission.publish_snapshot_invalid", {"where": "record"})
+        return cls(
+            artifact=_verified_from_record(record["artifact"]),
+            repository=record["repository"],
+            origin_url=record["origin_url"],
+            base_ref=record["base_ref"],
+            expected_base_oid=record["expected_base_oid"],
+            branch_ref=record["branch_ref"],
+            expected_head_oid=record["expected_head_oid"],
+            bundle_sha256=record["bundle_sha256"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPublishIntent:
+    """The immutable repository target and deterministic commit metadata."""
+
+    repository: VerifiedRepositorySnapshot
+    commit: CommitSpec
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.repository, VerifiedRepositorySnapshot) or not isinstance(self.commit, CommitSpec):
+            raise ProtocolError("admission.publish_intent_invalid", {"where": "components"})
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "commit": _commit_record(self.commit),
+            "repository": self.repository.to_record(),
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> VerifiedPublishIntent:
+        if not isinstance(record, Mapping) or set(record) != {"commit", "repository"}:
+            raise ProtocolError("admission.publish_intent_invalid", {"where": "record"})
+        commit = record["commit"]
+        commit_fields = {
+            "author_email",
+            "author_name",
+            "authored_at",
+            "body",
+            "committed_at",
+            "committer_email",
+            "committer_name",
+            "subject",
+        }
+        if not isinstance(commit, Mapping) or set(commit) != commit_fields:
+            raise ProtocolError("admission.publish_intent_invalid", {"where": "commit"})
+        try:
+            value = CommitSpec(**dict(commit))
+        except PipelineError as error:
+            raise ProtocolError("admission.publish_intent_invalid", {"where": "commit"}) from error
+        return cls(
+            repository=VerifiedRepositorySnapshot.from_record(record["repository"]),
+            commit=value,
+        )
+
+
+def _commit_record(commit: CommitSpec) -> dict[str, Any]:
+    return {
+        "author_email": commit.author_email,
+        "author_name": commit.author_name,
+        "authored_at": commit.authored_at,
+        "body": commit.body,
+        "committed_at": commit.committed_at,
+        "committer_email": commit.committer_email,
+        "committer_name": commit.committer_name,
+        "subject": commit.subject,
+    }
 
 
 def _base_command(
@@ -709,7 +1064,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         "ruleset_catalog_sha256": spec.ruleset.artifact.ref.set_sha256,
         "platform_config_sha256": spec.configuration.ref.set_sha256,
         "submission_identity": _submission_identity(spec),
-        "expected_native_tool_sha256": spec.native_tool_sha256,
+        "expected_native_tool_sha256": spec.native_tool_source_sha256,
     }
     return _base_command(
         spec,
@@ -756,7 +1111,7 @@ def build_capture_command(
         or discover_result.source_set_artifact != spec.originals.ref
         or discover_result.ruleset_artifact != spec.ruleset.artifact.ref
         or discover_result.configuration_artifact != spec.configuration.ref
-        or discover_result.native_tool_sha256 != spec.native_tool_sha256
+        or discover_result.native_tool_source_sha256 != spec.native_tool_source_sha256
     ):
         raise ProtocolError("admission.lineage_mismatch", {"stage": "capture"})
     effect_key = "native-capture:" + digest(
@@ -772,7 +1127,7 @@ def build_capture_command(
         "upload_sha256": discover_result.upload_inventory_sha256,
         "prepared_sha256": discover_result.prepared_sha256,
         "main_assembly": discover_result.main_assembly,
-        "native_tool_sha256": discover_result.native_tool_sha256,
+        "native_tool_sha256": discover_result.native_tool_source_sha256,
     }
     return _base_command(
         spec,
@@ -828,28 +1183,50 @@ def build_verify_command(
     )
 
 
-def build_publish_command(spec: AdmissionSpec, verify: VerifiedPredecessor) -> StageCommand:
-    """Reserve the static boundary until the Publish handler schema is fixed."""
+def build_publish_command(
+    spec: AdmissionSpec,
+    verify_result: VerifiedVerifyResult,
+    publish_intent: VerifiedPublishIntent,
+) -> StageCommand:
+    """Project Publish from one verified certificate and sealed repository target."""
 
-    _require_predecessor(verify, stage="verify", run_id=spec.run_id)
-    raise ProtocolError(
-        "admission.publish_contract_pending",
-        {
-            "required": [
-                "verify_output_artifact",
-                "generated_output_artifact",
-                "repository",
-                "base_ref",
-                "head_ref",
-                "expected_base_oid",
-                "expected_head_oid",
-                "candidate_commit",
-                "candidate_tree",
-                "title_digest",
-                "body_digest",
-                "expected_pr",
-            ]
-        },
+    if not isinstance(verify_result, VerifiedVerifyResult):
+        raise ProtocolError("admission.verify_result_invalid", {"stage": "publish"})
+    if not isinstance(publish_intent, VerifiedPublishIntent):
+        raise ProtocolError("admission.publish_intent_invalid", {"stage": "publish"})
+    verify = _require_predecessor(verify_result.predecessor, stage="verify", run_id=spec.run_id)
+    repository = publish_intent.repository
+    verified = verify_result.predecessor.result.output_artifact
+    input_artifacts = (
+        verify_result.generate_artifact,
+        verify_result.capture_artifact,
+        verified,
+        repository.artifact.ref,
+    )
+    if len({item.artifact_id for item in input_artifacts}) != len(input_artifacts):
+        raise ProtocolError("admission.publish_intent_invalid", {"where": "duplicate-artifact"})
+    request = {
+        "base_ref": repository.base_ref,
+        "branch_ref": repository.branch_ref,
+        "capture_artifact_id": verify_result.capture_artifact.artifact_id,
+        "commit": _commit_record(publish_intent.commit),
+        "expected_base_oid": repository.expected_base_oid,
+        "expected_head_oid": repository.expected_head_oid,
+        "generate_artifact_id": verify_result.generate_artifact.artifact_id,
+        "origin_url": repository.origin_url,
+        "output_contract": PUBLISH_OUTPUT_CONTRACT,
+        "repository_slug": repository.repository,
+        "repository_snapshot_artifact_id": repository.artifact.ref.artifact_id,
+        "schema_version": PUBLISH_REQUEST_SCHEMA,
+        "verified_subject_sha256": verify_result.verified_subject_sha256,
+        "verify_artifact_id": verified.artifact_id,
+    }
+    return _base_command(
+        spec,
+        stage="publish",
+        request=request,
+        input_artifacts=input_artifacts,
+        predecessor_decision_id=verify.decision.decision_id,
     )
 
 
@@ -935,6 +1312,18 @@ def validate_verify_command(
     return _validate(build_verify_command(spec, generate, capture), command)
 
 
+def validate_publish_command(
+    spec: AdmissionSpec,
+    verify_result: VerifiedVerifyResult,
+    publish_intent: VerifiedPublishIntent,
+    command: StageCommand,
+) -> StageCommand:
+    return _validate(
+        build_publish_command(spec, verify_result, publish_intent),
+        command,
+    )
+
+
 def validate_stage_command(
     spec: AdmissionSpec,
     command: StageCommand,
@@ -942,19 +1331,39 @@ def validate_stage_command(
     predecessor: VerifiedPredecessor | None = None,
     supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
     discover_result: VerifiedDiscoverResult | None = None,
+    verify_result: VerifiedVerifyResult | None = None,
+    publish_intent: VerifiedPublishIntent | None = None,
 ) -> StageCommand:
     """The pure Store transaction hook; unsupported stages are explicit."""
 
     if command.stage == "freeze":
-        if predecessor is not None or supporting_predecessors or discover_result is not None:
+        if (
+            predecessor is not None
+            or supporting_predecessors
+            or discover_result is not None
+            or verify_result is not None
+            or publish_intent is not None
+        ):
             raise ProtocolError("admission.predecessor_invalid", {"stage": "freeze"})
         return validate_freeze_command(spec, command)
     if command.stage == "discover":
-        if predecessor is None or supporting_predecessors or discover_result is not None:
+        if (
+            predecessor is None
+            or supporting_predecessors
+            or discover_result is not None
+            or verify_result is not None
+            or publish_intent is not None
+        ):
             raise ProtocolError("admission.predecessor_required", {"stage": "discover"})
         return validate_discover_command(spec, predecessor, command)
     if command.stage == "capture":
-        if predecessor is None or discover_result is None or len(supporting_predecessors) != 1:
+        if (
+            predecessor is None
+            or discover_result is None
+            or len(supporting_predecessors) != 1
+            or verify_result is not None
+            or publish_intent is not None
+        ):
             raise ProtocolError("admission.predecessor_required", {"stage": "capture"})
         return validate_capture_command(
             spec,
@@ -964,13 +1373,36 @@ def validate_stage_command(
             command,
         )
     if command.stage == "generate":
-        if predecessor is None or supporting_predecessors or discover_result is not None:
+        if (
+            predecessor is None
+            or supporting_predecessors
+            or discover_result is not None
+            or verify_result is not None
+            or publish_intent is not None
+        ):
             raise ProtocolError("admission.predecessor_required", {"stage": "generate"})
         return validate_generate_command(spec, predecessor, command)
     if command.stage == "verify":
-        if predecessor is None or len(supporting_predecessors) != 1 or discover_result is not None:
+        if (
+            predecessor is None
+            or len(supporting_predecessors) != 1
+            or discover_result is not None
+            or verify_result is not None
+            or publish_intent is not None
+        ):
             raise ProtocolError("admission.predecessor_required", {"stage": "verify"})
         return validate_verify_command(spec, predecessor, supporting_predecessors[0], command)
+    if command.stage == "publish":
+        if (
+            predecessor is None
+            or verify_result is None
+            or predecessor != verify_result.predecessor
+            or supporting_predecessors
+            or discover_result is not None
+            or publish_intent is None
+        ):
+            raise ProtocolError("admission.predecessor_required", {"stage": "publish"})
+        return validate_publish_command(spec, verify_result, publish_intent, command)
     raise ProtocolError("admission.stage_not_supported", {"stage": command.stage})
 
 
@@ -982,6 +1414,8 @@ def validate_store_command(
     predecessor: VerifiedPredecessor | None = None,
     supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
     discover_result: VerifiedDiscoverResult | None = None,
+    verify_result: VerifiedVerifyResult | None = None,
+    publish_intent: VerifiedPublishIntent | None = None,
 ) -> StageCommand:
     """Pure transaction hook for the common FactStore integration."""
 
@@ -992,6 +1426,8 @@ def validate_store_command(
         predecessor=predecessor,
         supporting_predecessors=supporting_predecessors,
         discover_result=discover_result,
+        verify_result=verify_result,
+        publish_intent=publish_intent,
     )
 
 
@@ -1010,7 +1446,10 @@ __all__ = [
     "VerifiedArtifact",
     "VerifiedDiscoverResult",
     "VerifiedPredecessor",
+    "VerifiedPublishIntent",
+    "VerifiedRepositorySnapshot",
     "VerifiedRuleset",
+    "VerifiedVerifyResult",
     "build_capture_command",
     "build_discover_command",
     "build_freeze_command",
@@ -1022,6 +1461,7 @@ __all__ = [
     "validate_discover_command",
     "validate_freeze_command",
     "validate_generate_command",
+    "validate_publish_command",
     "validate_run_admission",
     "validate_stage_command",
     "validate_store_command",

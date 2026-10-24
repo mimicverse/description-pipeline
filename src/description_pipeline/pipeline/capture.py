@@ -25,7 +25,6 @@ from ..io import (
     read_data,
     write_json,
 )
-from ..schemas import CAPTURE_EFFECT_FAILURE_SCHEMA, NATIVE_CAPTURE_EFFECT_SCHEMA
 from .discover import (
     ARTIFACT_MANIFEST_SCHEMA,
     CONFIGURATION_KIND,
@@ -38,6 +37,7 @@ from .discover import (
 from ..sources.solidworks.discovery import DISCOVERY_FILE, native_component_identity
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import selection_bindings
+from ..schemas import CAPTURE_EFFECT_FAILURE_SCHEMA, NATIVE_CAPTURE_EFFECT_SCHEMA
 from ..stages import stage_view
 from .contracts import (
     ArtifactRef,

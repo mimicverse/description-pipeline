@@ -17,8 +17,8 @@ from typing import Any, Literal
 
 from ..io import PipelineError, canonical, digest
 from ..schemas import (
+    AIRFLOW_DISPATCH_CONF_SCHEMA,
     DISPATCH_COMMAND_SCHEMA,
-    DISPATCH_CONF_SCHEMA,
     FAILURE_ENVELOPE_SCHEMA,
     RUN_ADMISSION_SCHEMA,
     STAGE_COMMAND_SCHEMA,
@@ -380,7 +380,7 @@ class DispatchConf:
     freeze_command_id: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != DISPATCH_CONF_SCHEMA:
+        if self.schema_version != AIRFLOW_DISPATCH_CONF_SCHEMA:
             raise ProtocolError("dispatch_conf.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.run_id, "dispatch_conf.invalid", "run_id")
         _require_identifier(self.freeze_command_id, "dispatch_conf.invalid", "freeze_command_id")

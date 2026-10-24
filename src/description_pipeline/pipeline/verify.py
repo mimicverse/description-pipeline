@@ -24,12 +24,7 @@ from ..interface_records import (
 from ..io import PipelineError, canonical, digest, file_digest, inventory, read_data, write_json
 from ..request_evidence import read_request_evidence
 from ..runtime import tool_record
-from ..schemas import (
-    GENERATE_RESULT_SCHEMA,
-    VERIFICATION_CERTIFICATE_SCHEMA,
-    VERIFICATION_EXECUTION_SCHEMA,
-    VERIFY_REQUEST_SCHEMA,
-)
+from ..schemas import GENERATE_RESULT_SCHEMA
 from ..stages import CONTRACT, CONTRACT_SHA256
 from ..verification.solidworks_urdf import (
     evaluate_bundle,
@@ -47,16 +42,17 @@ from .contracts import (
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
-
-REQUEST_SCHEMA = VERIFY_REQUEST_SCHEMA
-CERTIFICATE_SCHEMA = VERIFICATION_CERTIFICATE_SCHEMA
-RECEIPT_SCHEMA = VERIFICATION_EXECUTION_SCHEMA
-OUTPUT_CONTRACT = "solidworks-to-urdf.verification-artifact/v1"
-GENERATE_ARTIFACT_KIND = "stage_output:generate"
-CAPTURE_ARTIFACT_KIND = "stage_output:capture"
-GENERATE_RECEIPT = "reports/generate.json"
-CERTIFICATE_FILENAME = "verification-certificate.json"
-EXECUTION_RECEIPT_FILENAME = "verification-execution.json"
+from .verify_contract import (
+    CAPTURE_ARTIFACT_KIND,
+    CERTIFICATE_FILENAME,
+    CERTIFICATE_SCHEMA,
+    EXECUTION_RECEIPT_FILENAME,
+    GENERATE_ARTIFACT_KIND,
+    GENERATE_RECEIPT,
+    OUTPUT_CONTRACT,
+    RECEIPT_SCHEMA,
+    REQUEST_SCHEMA,
+)
 _PURPOSES = frozenset({PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW})
 _VOLATILE_DETAIL_KEYS = frozenset({"stderr", "stdout", "returncode", "traceback"})
 
