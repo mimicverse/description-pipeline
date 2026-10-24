@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline.io import PipelineError, canonical, digest, write_json
+from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.verification.solidworks_urdf import (
     _capture_preparation,
     _native_receipts_evidence,
@@ -748,7 +749,7 @@ def recovery_payload(
         for row in preparation["source_files_after"].values()
     }
     toolchain = {
-        "schema_version": "solidworks-to-urdf.tool/v1",
+        "schema_version": TOOL_SCHEMA,
         "pipeline_id": "solidworks-to-urdf",
         "version": "1.5.0",
         "source_sha256": "a" * 64,
