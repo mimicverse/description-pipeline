@@ -155,7 +155,7 @@ class StagedSelection:
             return False
         _refuse(
             self.state == "awaiting_files",
-            "selection_round_stale",
+            "selection_batch_stale",
             "Provisional staging is no longer accepting the upload batch",
         )
         with tempfile.TemporaryDirectory(prefix=".selection-upload-", dir=self.stage.parent) as temporary:

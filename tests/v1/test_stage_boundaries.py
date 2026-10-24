@@ -276,16 +276,6 @@ class StageBoundaryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PipelineError, "absent or empty"):
             solidworks.capture(self.package, user, backend=object(), run_id="b6a1f2c3-4d5e-6f70-8192-a3b4c5d6e7f8")
-        # The exact production chain: the Windows default runner calls capture().
-        from description_pipeline.orchestration import windows as windows_module
-
-        with self.assertRaisesRegex(PipelineError, "absent or empty"):
-            windows_module._default_runner(
-                self.package,
-                user,
-                backend=object(),
-                run_id="b6a1f2c3-4d5e-6f70-8192-a3b4c5d6e7f9",
-            )
         self.assertEqual("keep me\n", notes.read_text(encoding="utf-8"))
         self.assertEqual("keep me too\n", private.read_text(encoding="utf-8"))
         self.assertEqual("unrelated\n", readme.read_text(encoding="utf-8"))

@@ -1,4 +1,4 @@
-"""Locked selection contract: closure sealing and one-batch provisional transport."""
+"""Selection closure contract: sealing and one-batch provisional transport."""
 
 from __future__ import annotations
 

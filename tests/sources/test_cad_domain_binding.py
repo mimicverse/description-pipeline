@@ -15,7 +15,9 @@ from unittest.mock import patch
 
 from . import _paths  # noqa: F401
 from description_pipeline.io import write_json  # noqa: E402
-from description_pipeline.orchestration.windows import Jobs, read_config  # noqa: E402
+from description_pipeline.orchestration import windows  # noqa: E402
+from description_pipeline.orchestration.native_operation_runtime import DISCOVER_KIND  # noqa: E402
+from description_pipeline.schemas import TOOL_SCHEMA  # noqa: E402
 from description_pipeline.sources.solidworks import isolation  # noqa: E402
 from description_pipeline.sources.solidworks.errors import EnvironmentError_  # noqa: E402
 
@@ -151,27 +153,23 @@ class CadDomainBindingTests(unittest.TestCase):
             # No binding at all also refuses: the old per-user state default is gone.
             isolation._ownership_path()
 
-    def test_an_unbound_host_never_hands_jobs_a_domain_of_their_own(self) -> None:
-        # The old production fallback handed each endpoint-side Jobs its own
-        # state-root domain; with the fallback gone, an unbound host refuses.
+    def test_an_unbound_host_never_creates_a_state_root_domain(self) -> None:
         empty = self.root / "no-endpoint"
         empty.mkdir()
-        config_path = self._endpoint_config(self.root / "jobs-state", "job-config.json")
-        with patch.dict(os.environ, _clean_env(DESCRIPTION_ENDPOINT_ROOT=str(empty)), clear=True):
-            jobs = Jobs(read_config(config_path))
-            try:
-                with self.assertRaises(isolation.DomainUnbound):
-                    _ = jobs.cad_ownership_file
-            finally:
-                jobs.close()
+        with (
+            patch.dict(os.environ, _clean_env(DESCRIPTION_ENDPOINT_ROOT=str(empty)), clear=True),
+            self.assertRaises(isolation.DomainUnbound),
+        ):
+            windows._cad_ownership_file()
 
     def test_endpoint_and_standalone_default_share_one_domain(self) -> None:
-        # Endpoint side: a Jobs instance whose state root deliberately differs
-        # from the binding; standalone side: the default resolver in a child
+        # Endpoint side: an operation runtime whose state root deliberately differs
+        # from the CAD binding; standalone side: the default resolver in a child
         # process, exactly as a diagnostic or operator tool would resolve.
         self._endpoint_config(self.root / "endpoint-state")
         state = (self.root / "endpoint-state").resolve()
         (self.root / "packages").mkdir()
+        (self.root / "outputs").mkdir()
         token = self.root / "token"
         token.write_text("t" * 64, encoding="utf-8")
         config_path = self.root / "here.json"
@@ -187,11 +185,21 @@ class CadDomainBindingTests(unittest.TestCase):
         )
         env = _clean_env(DESCRIPTION_ENDPOINT_ROOT=str(self.root))
         with patch.dict(os.environ, env, clear=True):
-            config = read_config(config_path)
-            jobs = Jobs(config)
+            config = windows.read_config(config_path)
+            tool = {
+                "schema_version": TOOL_SCHEMA,
+                "pipeline_id": "cad-domain-test",
+                "source_sha256": "ab" * 32,
+            }
+            with patch.object(windows, "_native_tool_record", return_value=tool):
+                runtime = windows.build_runtime(config)
             try:
-                self.assertEqual(jobs.cad_ownership_file, state / "cad-ownership.json")
-                self.assertNotEqual(jobs.cad_ownership_file, Path(jobs.config["state_root"]) / "cad-ownership.json")
+                discover = runtime.executors[DISCOVER_KIND]
+                self.assertEqual(discover.cad_ownership_file, state / "cad-ownership.json")
+                self.assertNotEqual(
+                    discover.cad_ownership_file,
+                    config["state_root"] / "cad-ownership.json",
+                )
                 holder = isolation.domain_lease()
                 holder.acquire()
                 try:
@@ -199,7 +207,7 @@ class CadDomainBindingTests(unittest.TestCase):
                 finally:
                     holder.release()
             finally:
-                jobs.close()
+                runtime.close()
         self.assertFalse(refused["acquired"], refused)
         self.assertEqual(refused["code"], "cad_domain_leased")
         self.assertEqual(Path(refused["lease"]), Path(str(state / "cad-ownership.json") + ".lease"))

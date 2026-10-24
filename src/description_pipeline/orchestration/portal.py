@@ -1090,7 +1090,7 @@ def _automatic_summary(job: dict | None) -> dict:
         }
     if status == "failed":
         return {"state": "failed", "job_state": status, "checks": checks, "message": message}
-    if status in {"queued", "selecting", "running", "awaiting_definition", "native_complete"}:
+    if status in {"queued", "running", "native_complete"}:
         # native_complete ends the native half only: the portable half is still the
         # pipeline's remaining work, so the automatic view stays in progress instead of
         # surfacing a terminal verdict or a raw protocol message.
@@ -1103,7 +1103,7 @@ def _automatic_summary(job: dict | None) -> dict:
 
 
 _NATIVE_JOB_STATUSES = frozenset(
-    {"queued", "selecting", "running", "awaiting_definition", "passed", "native_complete", "failed"}
+    {"queued", "running", "passed", "native_complete", "failed"}
 )
 _RETRY_REFUSED_MESSAGES = {
     RECOVERY_UNKNOWN_PUBLICATION: (
@@ -1911,7 +1911,7 @@ class PortalApp:
             return "unconfirmed", "Cannot confirm native job state; retry later"
         if isinstance(job, dict):
             job_state = str(job.get("status") or "")
-            if job_state in {"queued", "selecting", "running", "awaiting_definition"}:
+            if job_state in {"queued", "running"}:
                 return "run_active", "The native job is still executing and can be deleted only after it ends"
             # native_complete is a definitive native state: the Windows half is done and only
             # the Linux portable half may still be running (checked above).
