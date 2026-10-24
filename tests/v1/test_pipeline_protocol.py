@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from description_pipeline.pipeline import (
     EffectIntent,
     EffectState,
     ExecutionClaim,
+    FailureEnvelope,
     RunAdmission,
     RunStatus,
     StageCandidate,
@@ -31,7 +33,11 @@ from description_pipeline.pipeline import (
     project_stage_status,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
-from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA, STAGE_RESULT_SCHEMA
+from description_pipeline.schemas import (
+    AIRFLOW_DISPATCH_CONF_SCHEMA,
+    FAILURE_ENVELOPE_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+)
 
 
 def artifact(name: str, *, stage="generate") -> ArtifactRef:
@@ -590,6 +596,78 @@ class StageEngineTests(unittest.TestCase):
         self.assertEqual(self.handler.executions, 1)
         self.assertEqual(self.handler.validations, 2)
         self.assertEqual(self.services.commit_calls, 2)
+
+    def test_cached_completed_decision_rechecks_the_current_effect_ledger(self) -> None:
+        execute_stage(
+            command_id=self.command.command_id,
+            handler=self.handler,
+            services=self.services,
+        )
+        self.services.effects["native-effect"] = EffectState.UNKNOWN
+        with self.assertRaises(ProtocolError) as raised:
+            execute_stage(
+                command_id=self.command.command_id,
+                handler=self.handler,
+                services=self.services,
+            )
+        self.assertEqual(raised.exception.code, "effect.unsettled")
+
+    def test_cached_decision_cannot_belong_to_another_command(self) -> None:
+        execute_stage(
+            command_id=self.command.command_id,
+            handler=self.handler,
+            services=self.services,
+        )
+        self.services.decision = replace(self.services.decision, command_id="foreign-command")
+        with self.assertRaises(ProtocolError) as raised:
+            execute_stage(
+                command_id=self.command.command_id,
+                handler=self.handler,
+                services=self.services,
+            )
+        self.assertEqual(raised.exception.code, "decision.command_mismatch")
+
+    def test_cached_failure_rejects_changed_or_unresolved_effect_states(self) -> None:
+        failure = FailureEnvelope(
+            schema_version=FAILURE_ENVELOPE_SCHEMA,
+            command_id=self.command.command_id,
+            run_id=self.command.run_id,
+            stage=self.command.stage,
+            request_digest=self.command.request_digest,
+            outcome="failed",
+            actual_executor_sha256=self.command.expected_executor_sha256,
+            reason_code="domain.failed",
+            error_type="StageFailure",
+            error_message="domain failed",
+            error_detail=None,
+            effect_states=(("native-effect", "prepared"),),
+            evidence_artifacts=(),
+            retained_locations=(),
+            unavailable_reason=None,
+            occurred_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        self.services.decision = StageDecision(
+            decision_id="failed-decision",
+            run_id=self.command.run_id,
+            stage=self.command.stage,
+            command_id=self.command.command_id,
+            result_record_artifact=None,
+            result_digest=None,
+            actual_executor_sha256=self.command.expected_executor_sha256,
+            outcome="failed",
+            original_producer_decision_id=None,
+            reason_code="domain.failed",
+            failure_envelope=failure,
+            decided_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        self.services.effects["native-effect"] = EffectState.UNKNOWN
+        with self.assertRaises(ProtocolError) as raised:
+            execute_stage(
+                command_id=self.command.command_id,
+                handler=self.handler,
+                services=self.services,
+            )
+        self.assertEqual(raised.exception.code, "effect.unsettled")
 
 
 if __name__ == "__main__":

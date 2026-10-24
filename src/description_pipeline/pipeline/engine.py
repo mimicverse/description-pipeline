@@ -175,6 +175,49 @@ def _validate_effect_settlement(services: StageServices, command: StageCommand, 
         )
 
 
+def _validate_decision_identity(command: StageCommand, decision) -> None:
+    if (
+        decision.command_id != command.command_id
+        or decision.run_id != command.run_id
+        or decision.stage != command.stage
+        or decision.actual_executor_sha256 != command.expected_executor_sha256
+        or decision.outcome not in {"completed", "failed", "cancelled"}
+    ):
+        raise ProtocolError("decision.command_mismatch", {"command_id": command.command_id})
+
+
+def _validate_cached_decision(
+    services: StageServices,
+    command: StageCommand,
+    decision,
+) -> None:
+    _validate_decision_identity(command, decision)
+    if decision.failure_envelope is not None:
+        failure = decision.failure_envelope
+        if (
+            failure.command_id != command.command_id
+            or failure.run_id != command.run_id
+            or failure.stage != command.stage
+            or failure.request_digest != command.request_digest
+            or failure.actual_executor_sha256 != decision.actual_executor_sha256
+            or failure.outcome != decision.outcome
+        ):
+            raise ProtocolError("failure.command_mismatch", {"command_id": command.command_id})
+        ledger = services.effect_states_for_command(command.command_id)
+        recorded = dict(failure.effect_states)
+        current = {effect_id: state.value for effect_id, state in ledger.items()}
+        if recorded != current or any(state in {"unknown", "conflict"} for state in current.values()):
+            raise ProtocolError(
+                "effect.unsettled",
+                {"command_id": command.command_id, "effect_states": sorted(current.items())},
+            )
+        return
+    result = services.load_result(decision)
+    _validate_result_identity(command, result)
+    _validate_effect_settlement(services, command, result)
+    services.verify_decision(decision, result)
+
+
 def execute_stage(
     *,
     command_id: str,
@@ -196,11 +239,10 @@ def execute_stage(
 
     confirmed = services.decision_for(command)
     if confirmed is not None:
+        _validate_cached_decision(services, command, confirmed)
         if confirmed.failure_envelope is not None:
             return confirmed.failure_envelope
         result = services.load_result(confirmed)
-        _validate_result_identity(command, result)
-        services.verify_decision(confirmed, result)
         return result
 
     claim = services.acquire_claim(command)

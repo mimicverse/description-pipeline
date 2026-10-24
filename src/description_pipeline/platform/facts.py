@@ -764,7 +764,12 @@ class FactStore:
         with self._transaction() as connection:
             cursor = connection.cursor()
             row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
-            return None if row is None else self._decision_from_row(cursor, row)
+            if row is None:
+                return None
+            decision = self._decision_from_row(cursor, row)
+            if decision.command_id != command.command_id:
+                raise FactConflict("The stage decision belongs to another command")
+            return decision
 
     def load_result(self, decision: StageDecision) -> StageResult:
         if decision.result_record_artifact is None:
