@@ -2667,9 +2667,9 @@ def _freeze_local(
         stage = "verify_sources"
         _capture_note(activity, "verify_sources")
         # Verify the live copy state and saved original bytes independently.
+        backend.verify_sources_unchanged()
         final_reader = getattr(backend, "verify_capture_documents_ready", None)
         final_document_state = final_reader() if callable(final_reader) else None
-        backend.verify_sources_unchanged()
         if final_document_state is not None:
             write_json(
                 staging / "raw" / "document_state_after_reads.json",
