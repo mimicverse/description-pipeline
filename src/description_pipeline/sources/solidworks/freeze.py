@@ -2437,9 +2437,15 @@ def _pristine_readout_window(
             top_level = assembly(document)
         except Exception:  # noqa: BLE001 - mirrors _mass_closure's optional whole-assembly reader
             top_level = None
+    state_reader = getattr(backend, "verify_capture_documents_ready", None)
+    document_state = state_reader() if callable(state_reader) else None
     _capture_note(activity, "window_close")
     closer()
-    return {"top_level": top_level, "record": record}
+    return {
+        "top_level": top_level,
+        "record": record,
+        "document_state_after_pristine_readout": document_state,
+    }
 
 
 def _freeze_local(
@@ -2661,7 +2667,14 @@ def _freeze_local(
         stage = "verify_sources"
         _capture_note(activity, "verify_sources")
         # Verify the live copy state and saved original bytes independently.
+        final_reader = getattr(backend, "verify_capture_documents_ready", None)
+        final_document_state = final_reader() if callable(final_reader) else None
         backend.verify_sources_unchanged()
+        if final_document_state is not None:
+            write_json(
+                staging / "raw" / "document_state_after_reads.json",
+                final_document_state,
+            )
         originals = _verify_originals_unchanged(closure)
         copied = _copy_inventory(staging / "source")
         if copied != closure["copy_files"]:
@@ -2697,6 +2710,11 @@ def _freeze_local(
             activity=activity,
             diagnostic_dir=diagnostic_dir,
         )
+        if window.get("document_state_after_pristine_readout") is not None:
+            write_json(
+                staging / "raw" / "document_state_after_pristine_readout.json",
+                window["document_state_after_pristine_readout"],
+            )
         if isinstance(mass_closure, dict) and mass_closure.get("status") == "recorded":
             if not isinstance(window["top_level"], dict):
                 raise BridgeError(

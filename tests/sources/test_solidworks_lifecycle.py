@@ -126,6 +126,19 @@ class SessionTests(unittest.TestCase):
             return doc
 
         backend._document_by_path = refresh
+        backend._capture_loaded_documents = Mock(
+            return_value=[
+                {
+                    "doc": doc,
+                    "identity": id(doc),
+                    "normalized_path": normalize_document_path(
+                        os.path.abspath(doc.GetPathName)
+                    ),
+                    "path": doc.GetPathName,
+                    "document_type": 2,
+                }
+            ]
+        )
         with patch(
             "description_pipeline.sources.solidworks.native._hash",
             return_value="a" * 64,
@@ -181,6 +194,19 @@ class SessionTests(unittest.TestCase):
             EnableAssemblyRebuild=False,
         )
         backend._document_by_path = Mock(return_value=doc)
+        backend._capture_loaded_documents = Mock(
+            return_value=[
+                {
+                    "doc": doc,
+                    "identity": id(doc),
+                    "normalized_path": normalize_document_path(
+                        os.path.abspath(doc.GetPathName)
+                    ),
+                    "path": doc.GetPathName,
+                    "document_type": 2,
+                }
+            ]
+        )
         with patch(
             "description_pipeline.sources.solidworks.native._hash",
             return_value="a" * 64,
