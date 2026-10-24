@@ -6125,6 +6125,7 @@ def source_definition(
     """
 
     import tempfile
+    from ...interface_records import record_archive_path
 
     package = Path(package)
     payload = read_data(package / discovery_name)
@@ -6138,9 +6139,10 @@ def source_definition(
             relative = str(entry.get("file") or "").replace("\\", "/")
             if not relative:
                 continue
+            package_file = record_archive_path(str(entry.get("package_file") or ""))
             target = confined(root, relative, exists=False)
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(confined(package, records_prefix + str(entry.get("package_file") or "")), target)
+            shutil.copyfile(confined(package, records_prefix + package_file), target)
         request_record, _request_digest = read_request_evidence(package / "input" / "request.json")
         settings = DiscoverySettings(
             record_roots=(root,),

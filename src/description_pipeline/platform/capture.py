@@ -11,10 +11,12 @@ file-side state is consulted.
 from __future__ import annotations
 
 from pathlib import Path
+import copy
 import hashlib
 import shutil
 import zipfile
 
+from ..interface_records import validate_source_record
 from ..io import PipelineError, digest, file_digest, read_data
 from ..sources.solidworks.selection import validate_file_index, verify_selection
 from ..orchestration.airflow_client import capture_archive_metadata, validate_run_id
@@ -23,9 +25,11 @@ from ..orchestration.stage_transfer import (
     CAPTURE_MANIFEST,
     MAX_MANIFEST_BYTES,
     admit_capture,
-    verify_transfer,
 )
-from .flow import RunPaths, _registered_request_sha256, recorded_events
+from ..native_transfer import verify_transfer
+from ..stages import canonical_freeze_timestamp, validate_freeze_events
+from . import flow
+from .flow import RunPaths, _registered_request_sha256
 from .store import PlatformStore
 
 
@@ -76,16 +80,87 @@ def _check_selected_capture(capture: Path, selection: dict) -> None:
             raise PipelineError(f"The captured source differs from the selected bytes: {name}")
 
 
-def _append_native_events(platform: PlatformStore, run_id: str, capture: Path) -> None:
-    """Mirror the sealed native stage receipts into the platform's live stream, once each."""
-    receipt = read_data(capture / "reports/native-stages.json")
-    remaining = _recorded_payloads(platform, run_id)
-    for event in (receipt or {}).get("events") or []:
-        if not isinstance(event, dict):
+def registered_freeze_events(platform: PlatformStore, run_id: str) -> list[dict]:
+    """Read the one registered Linux freeze block from platform rows."""
+
+    events = []
+    for row in flow.recorded_events(platform, run_id):
+        if (
+            not isinstance(row, dict)
+            or row.get("stage") != "freeze"
+            or row.get("kind") != "stage"
+        ):
             continue
-        if event in remaining:
+        payload = row.get("payload")
+        if payload == {"state": "completed"}:
+            continue
+        if (
+            not isinstance(payload, dict)
+            or payload.get("stage") != "freeze"
+        ):
+            raise PipelineError("A freeze-stage row is not a raw protocol event")
+        events.append({"at": canonical_freeze_timestamp(row.get("at")), **copy.deepcopy(payload)})
+    return validate_freeze_events(events)
+
+
+def _event_key(event: dict, *, stage=None, kind="stage", at=None) -> tuple:
+    """One event identity independent of whether its instant is a row or payload field."""
+
+    payload = copy.deepcopy(event)
+    timestamp = payload.pop("at", None)
+    if timestamp is None:
+        timestamp = at
+    return (
+        stage or payload.get("stage"),
+        kind,
+        canonical_freeze_timestamp(timestamp),
+        digest(payload),
+    )
+
+
+def _append_native_events(
+    platform: PlatformStore,
+    run_id: str,
+    capture: Path,
+    expected_freeze_events,
+) -> None:
+    """Validate the carried Freeze block once, then mirror only new native events."""
+
+    expected_freeze = validate_freeze_events(expected_freeze_events)
+    if registered_freeze_events(platform, run_id) != expected_freeze:
+        raise PipelineError("The native capture Freeze block differs from the registered platform facts")
+    receipt = read_data(capture / "reports/native-stages.json")
+    receipt_events = (receipt or {}).get("events") or []
+    if not isinstance(receipt_events, list):
+        raise PipelineError("The native stage receipt has no event list")
+    receipt_freeze = [
+        event
+        for event in receipt_events
+        if isinstance(event, dict) and event.get("stage") == "freeze"
+    ]
+    if validate_freeze_events(receipt_freeze) != expected_freeze:
+        raise PipelineError("The native stage receipt changed its carried Freeze block")
+    remaining = {
+        _event_key(
+            payload if isinstance(payload, dict) else {},
+            stage=row.get("stage"),
+            kind=row.get("kind"),
+            at=row.get("at"),
+        )
+        for row in flow.recorded_events(platform, run_id)
+        for payload in [row.get("payload") if isinstance(row, dict) else None]
+    }
+    receipt_keys = set()
+    for event in receipt_events:
+        if not isinstance(event, dict) or event.get("stage") == "freeze":
+            continue
+        key = _event_key(event)
+        if key in receipt_keys:
+            raise PipelineError("The native stage receipt repeats an event")
+        receipt_keys.add(key)
+        if key in remaining:
             # An earlier attempt already mirrored this event; recovery never duplicates it.
-            remaining.remove(event)
+            remaining.remove(key)
             continue
         platform.append_event(
             run_id,
@@ -95,27 +170,17 @@ def _append_native_events(platform: PlatformStore, run_id: str, capture: Path) -
         )
 
 
-def _recorded_payloads(platform: PlatformStore, run_id: str) -> list:
-    """Every recorded payload of one run, over the shared paging read facility."""
-    return [row.get("payload") if isinstance(row, dict) else None for row in recorded_events(platform, run_id)]
-
-
-def source_identity(capture: Path) -> tuple[str | None, str | None]:
+def source_identity(capture: Path) -> tuple[str, str | None]:
     """Hardware and revision of one admitted capture tree, read from its frozen source."""
     source_path = capture / "input/source.json"
     if not source_path.is_file():
-        return None, None
-    payload = read_data(source_path)
-    if not isinstance(payload, dict):
-        return None, None
-    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    hardware = identity.get("hardware_id")
+        raise PipelineError("The admitted capture carries no input/source.json identity")
+    payload = validate_source_record(read_data(source_path))
+    identity = payload["identity"]
+    metadata = payload["metadata"]
+    hardware = identity["hardware_id"]
     revision = metadata.get("revision")
-    return (
-        hardware if isinstance(hardware, str) and hardware else None,
-        revision if isinstance(revision, str) and revision else None,
-    )
+    return hardware, revision if isinstance(revision, str) and revision else None
 
 
 def import_native_capture(
@@ -124,13 +189,34 @@ def import_native_capture(
     """Download the sealed native capture and admit it into the attempt."""
     run_id = validate_run_id(run_id)
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    native_request = job.get("request") if isinstance(job.get("request"), dict) else {}
+    freeze_events = validate_freeze_events(native_request.get("freeze_events"))
+    if native_request.get("freeze_events_sha256") != digest(freeze_events):
+        raise PipelineError("The native capture Freeze block differs from its bound digest")
     native_tool = result.get("native_tool")
     if not isinstance(native_tool, dict) or not native_tool:
         raise PipelineError("The native job carries no tool record; the transfer cannot be verified")
     selection_binding = _capture_selection(job, run_id, native_tool)
     selection = selection_binding["selection"]
     handoff = selection["handoff_sha256"]
+    upload_sha256 = selection_binding["upload_sha256"]
     main_assembly = selection["main_assembly"]
+    prepared_dir = job.get("prepared_dir")
+    prepared_files = job.get("prepared_files")
+    if not isinstance(prepared_dir, str) or not prepared_dir:
+        raise PipelineError("The native job carries no platform prepared source root")
+    if (
+        not isinstance(prepared_files, dict)
+        or not prepared_files
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(checksum, str)
+            or not checksum
+            for name, checksum in prepared_files.items()
+        )
+    ):
+        raise PipelineError("The native job carries no platform prepared source inventory")
     archive = capture_archive_metadata(job)
     capture = paths.capture_dir
     admitted = (
@@ -161,11 +247,17 @@ def import_native_capture(
             shutil.copy2(sealed_request, frozen)
         if file_digest(frozen) != authority:
             raise PipelineError("The admitted capture is missing the registered frozen input/request.json")
-        summary = verify_transfer(capture, carried={"input/request.json": authority})
+        summary = verify_transfer(
+            capture,
+            carried={"input/request.json": authority},
+            expected_upload_sha256=upload_sha256,
+            native_prepared_dir=prepared_dir,
+            native_prepared_files=prepared_files,
+        )
         if not isinstance(summary, dict) or summary.get("handoff_sha256") != handoff:
             raise PipelineError("The admitted capture differs from its native manifest receipt")
         _check_selected_capture(capture, selection)
-        _append_native_events(platform, run_id, capture)
+        _append_native_events(platform, run_id, capture, freeze_events)
     else:
         paths.run_dir.mkdir(parents=True, exist_ok=True)
         archive_path = paths.run_dir / CAPTURE_ARCHIVE
@@ -189,11 +281,14 @@ def import_native_capture(
             capture,
             expected_run_id=run_id,
             expected_handoff_sha256=handoff,
+            expected_upload_sha256=upload_sha256,
             expected_main_assembly=main_assembly,
             expected_native_tool=native_tool,
+            expected_prepared_dir=prepared_dir,
+            expected_prepared_files=prepared_files,
         )
         _check_selected_capture(capture, selection)
-        _append_native_events(platform, run_id, capture)
+        _append_native_events(platform, run_id, capture, freeze_events)
     hardware, revision = source_identity(capture)
     return {
         "run_id": run_id,
@@ -202,5 +297,8 @@ def import_native_capture(
         "state": "capture_admitted",
         "hardware_id": hardware,
         "revision": revision,
+        "upload_sha256": upload_sha256,
+        "native_prepared_dir": prepared_dir,
+        "native_prepared_files": dict(prepared_files),
         **selection_binding,
     }

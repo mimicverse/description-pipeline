@@ -24,7 +24,12 @@ from description_pipeline.platform import flow
 from description_pipeline.platform import storage as platform_storage
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages, tool_record
-from description_pipeline.stages import CONFIRMED_STAGE_PASSED, CONTRACT, CONTRACT_SHA256
+from description_pipeline.stages import (
+    CONFIRMED_STAGE_PASSED,
+    CONTRACT,
+    CONTRACT_SHA256,
+    validate_freeze_events,
+)
 
 from .test_stage_transfer import MAIN_ASSEMBLY
 
@@ -46,6 +51,25 @@ def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
     )
     with zipfile.ZipFile(archive) as packed:
         manifest_sha256 = hashlib.sha256(packed.read("transfer-manifest.json")).hexdigest()
+        native_stages = json.loads(packed.read("reports/native-stages.json"))
+        collection = json.loads(packed.read("evidence/evidence/collection.json"))
+        binding = next(
+            event["check"]["details"]
+            for event in native_stages["events"]
+            if (event.get("check") or {}).get("id") == "discovery.binding"
+        )
+        prepared_files = {
+            name.removeprefix("input/"): checksum
+            for name, checksum in binding["files"].items()
+        }
+        prepared_dir = str(Path(collection["identity"]["assembly"]).parent)
+        freeze_events = validate_freeze_events(
+            [
+                event
+                for event in native_stages["events"]
+                if event.get("stage") == "freeze"
+            ]
+        )
     return {
         "status": "native_complete",
         "run_id": run_id,
@@ -53,11 +77,16 @@ def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
         "native_tool": tool,
         "handoff_sha256": HANDOFF,
         "package_files": dict(SELECTED),
+        "prepared_dir": prepared_dir,
+        "prepared_files": prepared_files,
         "request": {
             "run_id": run_id,
             "upload_files": dict(UPLOAD),
             "upload_sha256": digest(UPLOAD),
             "main_assembly": MAIN_ASSEMBLY,
+            "freeze_events": freeze_events,
+            "freeze_events_sha256": digest(freeze_events),
+            "freeze_receipt_sha256": "f" * 64,
         },
         "selection": {
             "state": "sealed",
@@ -128,10 +157,10 @@ class SplitAdmissionMixin:
             build_request_evidence(
                 purpose="engineering",
                 request_id="fixture-frozen-request",
-                target_hardware="nd_fixture",
+                target_hardware="fixture",
                 change_summary="fixture frozen original",
                 main_assembly=MAIN_ASSEMBLY,
-                handoff_digest=HANDOFF,
+                handoff_digest=digest(UPLOAD),
                 platform_config_digest="c" * 64,
             )
         )
@@ -206,6 +235,8 @@ class SplitAdmissionMixin:
         paths = self._paths(run_id)
         archive = Path(archive) if archive is not None else self.archive
         job = capture_job(run_id, archive, self.tool)
+        for event in job["request"]["freeze_events"]:
+            self.store.append_event(run_id, stage="freeze", kind="stage", payload=event)
         endpoint = FakeEndpoint(archive.read_bytes())
         result = platform_capture.import_native_capture(self.store, paths, run_id, job, endpoint)
         # The DAG materializes both mutable copies of the registered frozen request:
@@ -218,5 +249,14 @@ class SplitAdmissionMixin:
         snapshot = self.tmp / f"fixture-native-{run_id}"
         shutil.copytree(paths.capture_dir, snapshot)
         self._subject_layout(snapshot)
-        self._register_stage(run_id, "capture", snapshot, state="native_complete", native_tool=self.tool)
+        self._register_stage(
+            run_id,
+            "capture",
+            snapshot,
+            state="native_complete",
+            native_tool=self.tool,
+            upload_sha256=job["request"]["upload_sha256"],
+            native_prepared_dir=job["prepared_dir"],
+            native_prepared_files=job["prepared_files"],
+        )
         return result

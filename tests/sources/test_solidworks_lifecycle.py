@@ -86,6 +86,9 @@ class SessionTests(unittest.TestCase):
 
     def test_capture_rebuild_is_in_memory_and_failure_blocks_measurement(self):
         backend = SolidWorksBackend()
+        backend._sessions["copy"] = Mock(
+            closed=False, identity=Mock(return_value={"pid": 100, "state": "active"}),
+        )
         backend._capture_roots = [normalize_document_path("/snapshot/source")]
         extension = SimpleNamespace(
             NeedsRebuild2=1,
@@ -126,6 +129,19 @@ class SessionTests(unittest.TestCase):
             return doc
 
         backend._document_by_path = refresh
+        backend._capture_loaded_documents = Mock(
+            return_value=[
+                {
+                    "doc": doc,
+                    "identity": id(doc),
+                    "normalized_path": normalize_document_path(
+                        os.path.abspath(doc.GetPathName)
+                    ),
+                    "path": doc.GetPathName,
+                    "document_type": 2,
+                }
+            ]
+        )
         with patch(
             "description_pipeline.sources.solidworks.native._hash",
             return_value="a" * 64,
@@ -181,6 +197,19 @@ class SessionTests(unittest.TestCase):
             EnableAssemblyRebuild=False,
         )
         backend._document_by_path = Mock(return_value=doc)
+        backend._capture_loaded_documents = Mock(
+            return_value=[
+                {
+                    "doc": doc,
+                    "identity": id(doc),
+                    "normalized_path": normalize_document_path(
+                        os.path.abspath(doc.GetPathName)
+                    ),
+                    "path": doc.GetPathName,
+                    "document_type": 2,
+                }
+            ]
+        )
         with patch(
             "description_pipeline.sources.solidworks.native._hash",
             return_value="a" * 64,

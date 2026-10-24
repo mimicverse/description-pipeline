@@ -117,7 +117,7 @@ def _run_scenario(root: Path) -> dict:
             report["initial_dispatch"] = world.operation_bindings[
                 world.operations[f"portal-{DAG_RUN}/freeze:0"][0]
             ]
-            module._register_freeze_stage(
+            freeze_events, freeze_receipt = module._register_freeze_stage(
                 paths,
                 RUN,
                 request_id=REQUEST_ID,
@@ -129,7 +129,9 @@ def _run_scenario(root: Path) -> dict:
             report["calls"].append("DAG._register_freeze_stage")
             phase = "producer"
             with patch.object(producer, "capture_record", return_value=raw):
-                native = producer.build_fixture_capture(root / "producer", run_id=RUN, purpose="engineering")
+                native = producer.build_fixture_capture(
+                    root / "producer", run_id=RUN, purpose="engineering", prior_freeze_events=freeze_events
+                )
             assert inventory(native_root) == upload
             report["calls"].append("shared.build_fixture_capture: real freeze/discover/capture")
             phase = "import"
@@ -142,8 +144,13 @@ def _run_scenario(root: Path) -> dict:
                 "native_tool": native["native_tool"],
                 "handoff_sha256": native["handoff_sha256"],
                 "package_files": selection["files"],
+                "prepared_dir": native["prepared_dir"],
+                "prepared_files": native["prepared_files"],
                 "request": {
                     "run_id": RUN,
+                    "freeze_events": freeze_events,
+                    "freeze_events_sha256": digest(freeze_events),
+                    "freeze_receipt_sha256": freeze_receipt,
                     "upload_files": upload,
                     "upload_sha256": digest(upload),
                     "main_assembly": MAIN,
@@ -168,7 +175,16 @@ def _run_scenario(root: Path) -> dict:
             carry_request_evidence(paths.run_dir, paths.capture_dir)
             before = inventory(paths.capture_dir)
             phase = "native_registration"
-            module._register_native_stages(store, store_root, RUN, paths.capture_dir, paths.run_dir)
+            module._register_native_stages(
+                store,
+                store_root,
+                RUN,
+                paths.capture_dir,
+                paths.run_dir,
+                prepared_dir=native["prepared_dir"],
+                prepared_files=native["prepared_files"],
+                upload_sha256=digest(upload),
+            )
             report["calls"].append("DAG._register_native_stages")
             assert inventory(paths.capture_dir) == before
             phase = "generate"

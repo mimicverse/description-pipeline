@@ -15,13 +15,16 @@ from description_pipeline.stages import (
     HOST_IDS,
     STAGE_IDS,
     checked,
+    canonical_freeze_timestamp,
     compact_view,
     contract_markdown,
     record_check,
     require_complete,
     stage_view,
+    validate_freeze_events,
 )
 from description_pipeline.verification.solidworks_urdf import evaluate_bundle, require_qualified_report
+from tests.v1.freeze_event_support import freeze_events
 
 
 class StageTests(unittest.TestCase):
@@ -42,6 +45,29 @@ class StageTests(unittest.TestCase):
         view = stage_view()
         self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in view["stages"]}, expected)
         self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in compact_view(view)["stages"]}, expected)
+
+    def test_freeze_events_require_one_canonical_raw_block(self):
+        events = freeze_events()
+        self.assertEqual(validate_freeze_events(events), events)
+        self.assertEqual(canonical_freeze_timestamp("2026-10-24T14:39:24.893914+08:00"), "2026-10-24T06:39:24.893914Z")
+
+        invalids = []
+        duplicate = copy.deepcopy(events)
+        duplicate[1]["stage"] = "discover"
+        invalids.append(duplicate)
+        extra = copy.deepcopy(events)
+        extra[0]["seq"] = 1
+        invalids.append(extra)
+        two_completed = copy.deepcopy(events)
+        two_completed[1]["state"] = "completed"
+        invalids.append(two_completed)
+        naive = copy.deepcopy(events)
+        naive[0]["at"] = "2026-10-24T00:00:00.000000"
+        invalids.append(naive)
+        for invalid in invalids:
+            with self.subTest(events=invalid), self.assertRaises(PipelineError):
+                validate_freeze_events(invalid)
+
     def test_missing_results_and_green_events_cannot_pass_checks(self):
         for job in ({}, {"events": [{"stage": "capture", "state": "completed"}]}):
             view = stage_view(job)

@@ -19,7 +19,7 @@ from description_pipeline.sources.solidworks.evidence import (  # noqa: E402
 from description_pipeline.sources.solidworks.native import SolidWorksBackend  # noqa: E402
 
 
-def environment(*, session_role: str = "copy") -> dict:
+def environment(*, copy_pid: int = 100) -> dict:
     return {
         "captured_at": "2026-10-23T07:00:00Z",
         "platform": "Windows-11",
@@ -27,7 +27,7 @@ def environment(*, session_role: str = "copy") -> dict:
         "worker_version": "1.2.3",
         "toolchain": {
             "schema_version": TOOL_SCHEMA,
-            "pipeline_id": "description",
+            "pipeline_id": "solidworks-to-urdf",
             "version": "1.2.3",
             "source_sha256": "a" * 64,
             "release": {"package_files": {"worker.py": "b" * 64}},
@@ -42,7 +42,18 @@ def environment(*, session_role: str = "copy") -> dict:
         "solidworks": {
             "revision": "34.4.1",
             "input_mode": "saved_documents",
-            "sessions": {session_role: {"pid": 100, "state": "active", "lease": {"held": True}}},
+            "sessions": {
+                "source": {
+                    "pid": 80,
+                    "state": "closed",
+                    "lease": {"held": False, "holder_pid": None, "path": r"C:\state\cad.lease"},
+                },
+                "copy": {
+                    "pid": copy_pid,
+                    "state": "active",
+                    "lease": {"held": True, "holder_pid": 200, "path": r"C:\state\cad.lease"},
+                },
+            },
             "build": "2026.1",
             "license": 1,
             "visible": True,
@@ -51,7 +62,7 @@ def environment(*, session_role: str = "copy") -> dict:
 
 
 def runtime_environment() -> dict:
-    payload = environment()
+    payload = environment(copy_pid=110)
     payload["session_boundary"] = {
         "closure_top_level": r"C:\captures\robot.SLDASM",
         "configuration": "Default",
@@ -85,10 +96,11 @@ def runtime_environment() -> dict:
 
 
 class MetadataProvenanceTests(unittest.TestCase):
-    def warnings(self, runtime=None, rewrite=None) -> list[dict]:
+    def warnings(self, runtime=None, rewrite=None, expected_tool=None) -> list[dict]:
         return metadata_value_warnings(
             runtime or runtime_environment(),
-            rewrite or environment(session_role="source"),
+            rewrite or environment(),
+            expected_tool=expected_tool or environment()["toolchain"],
             runtime_sha256="c" * 64,
             rewrite_sha256="d" * 64,
             expected_configuration="Default",
@@ -128,7 +140,7 @@ class MetadataProvenanceTests(unittest.TestCase):
                 "GetCurrentLicenseType": "license getter failed",
             },
         )
-        rewrite = environment(session_role="source")
+        rewrite = environment()
         rewrite["solidworks"].update(
             build=None,
             license=None,
@@ -223,15 +235,57 @@ class MetadataProvenanceTests(unittest.TestCase):
         runtime["session_boundary"]["opened"]["warnings"] = 1
         self.assertTrue(self.objects(runtime=runtime))
 
-    def test_session_role_pointer_is_escaped(self) -> None:
-        objects = self.objects(runtime=runtime_environment(), rewrite=environment(session_role="source/copy"))
+    def test_unknown_or_mismatched_toolchain_is_rejected(self) -> None:
+        mutations = (
+            ("schema_version", "unknown-tool/v999"),
+            ("pipeline_id", "another-pipeline"),
+            ("version", "999.0.0"),
+            ("source_sha256", "f" * 64),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                runtime = runtime_environment()
+                runtime["toolchain"][key] = value
+                with self.assertRaises(PipelineError):
+                    self.warnings(runtime=runtime)
+
+        rewrite = environment()
+        rewrite["toolchain"]["runtime"]["packages"]["pywin32"] = "999"
+        with self.assertRaisesRegex(PipelineError, "runtime differs"):
+            self.warnings(rewrite=rewrite)
+
+    def test_fresh_session_boundary_is_revalidated(self) -> None:
+        runtime = runtime_environment()
+        runtime["session_boundary"]["retirement"]["role"] = "source"
+        with self.assertRaisesRegex(PipelineError, "retirement.role"):
+            self.warnings(runtime=runtime)
+
+        runtime = runtime_environment()
+        runtime["session_boundary"]["retirement"]["after"]["pid"] = 101
+        with self.assertRaisesRegex(PipelineError, "changed the retired process pid"):
+            self.warnings(runtime=runtime)
+
+        runtime = runtime_environment()
+        runtime["solidworks"]["sessions"]["copy"]["pid"] = 100
+        with self.assertRaisesRegex(PipelineError, "capture reused the retired rewrite process"):
+            self.warnings(runtime=runtime)
+
+        runtime = runtime_environment()
+        runtime["solidworks"]["sessions"]["source"]["state"] = "active"
+        runtime["solidworks"]["sessions"]["source"]["lease"]["held"] = True
+        with self.assertRaisesRegex(PipelineError, "source.*closed"):
+            self.warnings(runtime=runtime)
+
+    def test_session_process_fields_are_projected(self) -> None:
+        objects = self.objects(runtime=runtime_environment(), rewrite=environment())
         rewrite_fields = {
             field
             for row in objects
             if row["file"] == "evidence/evidence/rewrite-environment.json"
             for field in row["fields"]
         }
-        self.assertIn("/solidworks/sessions/source~1copy", rewrite_fields)
+        self.assertIn("/solidworks/sessions/source", rewrite_fields)
+        self.assertIn("/solidworks/sessions/copy", rewrite_fields)
 
 
 class NativeMetadataTests(unittest.TestCase):

@@ -174,6 +174,32 @@ class SequentialSessionTests(unittest.TestCase):
         finally:
             self.sessions[0].process.close.side_effect = None
 
+    def test_release_keeps_a_failed_session_for_the_same_owner_to_retry(self):
+        self.backend._app_for_path(self.source)
+        session = self.sessions[0]
+        close = session.process.close
+        original_close = close.side_effect
+        attempts = 0
+
+        def close_once_failed():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise EnvironmentError_("cad_process_cleanup_failed", "still running")
+            original_close()
+
+        session.process.close.side_effect = close_once_failed
+        with self.assertRaises(EnvironmentError_) as caught:
+            self.backend.release()
+        self.assertEqual(caught.exception.code, "cad_process_cleanup_failed")
+        self.assertIs(self.backend._sessions["source"], session)
+        self.assertIs(self.backend._owner_thread, threading.current_thread())
+
+        self.backend.release()
+        self.assertNotIn("source", self.backend._sessions)
+        self.assertIsNone(self.backend._owner_thread)
+        self.assertEqual(attempts, 2)
+
     def test_reference_rewrite_reads_saved_bytes_after_source_retirement(self):
         source = Path(self.source)
         source.parent.mkdir()

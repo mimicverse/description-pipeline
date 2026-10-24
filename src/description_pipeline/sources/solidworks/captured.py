@@ -28,7 +28,10 @@ def derive_scene(root: Path, manifest: dict) -> dict:
     payload = read_data(confined(delivery, "evidence/discovery.json"))
     main = str((payload.get("derivation") or {}).get("main_assembly") or "")
     config = source_definition(
-        delivery, discovery_name="evidence/discovery.json", cad_prefix="input/cad/", records_prefix="input/records/"
+        delivery,
+        discovery_name="evidence/discovery.json",
+        cad_prefix="input/cad/",
+        records_prefix="input/",
     )
     if not isinstance(raw, dict) or not isinstance(config, dict):
         raise PipelineError("Captured readings and source configuration must be objects")
@@ -85,12 +88,15 @@ def derive_scene(root: Path, manifest: dict) -> dict:
         REWRITE_ENVIRONMENT_EVIDENCE,
         "evidence/rewrite-environment.json",
     )
+    native_tool_path = confined(delivery, "reports/native-tool.json")
+    native_tool = read_data(native_tool_path)
     closure = read_data(confined(root, "raw/dependency_closure.json"))
     if not isinstance(closure, dict):
         raise PipelineError("Captured dependency closure must be an object")
     metadata_warnings = metadata_value_warnings(
         runtime,
         rewrite,
+        expected_tool=native_tool,
         runtime_sha256=runtime_sha256,
         rewrite_sha256=rewrite_sha256,
         expected_configuration=str(config.get("configuration") or ""),

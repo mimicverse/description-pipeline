@@ -72,6 +72,56 @@ def fixture_mass_payload(
 class AxisFixtureBackend(support.FixtureCadBackend):
     """Fixture backend that can resolve the authored joint axis selector."""
 
+    evidence_class = "cad"
+
+    def native_ready(self) -> dict:
+        return {
+            "role": "native",
+            "scope": "provided synthetic CAD backend for the capture regression suite",
+            "solidworks_executable": r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\SLDWORKS.exe",
+        }
+
+    def environment(self) -> dict:
+        environment = super().environment()
+        copy_session = environment["sessions"]["copy"]
+        if not hasattr(self, "_capture_source_pid"):
+            self._capture_source_pid = max(1, self.session_pid - 1)
+        environment["sessions"] = {
+            "source": {
+                "pid": self._capture_source_pid,
+                "state": "closed",
+            },
+            "copy": {
+                "pid": copy_session["pid"],
+                "state": copy_session["state"],
+            },
+        }
+        return environment
+
+    def retire_session(self, role: str = "copy") -> dict:
+        self.assert_role(role)
+        before = {
+            "pid": self.session_pid,
+            "state": "active",
+        }
+        self.retired_session_pids.append(self.session_pid)
+        self.open_documents.clear()
+        self.session_pid += 1
+        return {
+            "role": role,
+            "retired": True,
+            "before": before,
+            "after": {
+                "pid": before["pid"],
+                "state": "closed",
+            },
+        }
+
+    @staticmethod
+    def assert_role(role: str) -> None:
+        if role != "copy":
+            raise AssertionError(f"unexpected retired role: {role}")
+
     def collect_scene(self, doc_path, coordinate_systems, on_activity=None, require_material=True):
         self._capture_document = Path(doc_path).resolve()
         scene = super().collect_scene(
@@ -294,6 +344,10 @@ class SplitRoundtripTests(unittest.TestCase):
 
         with (
             patch.object(solidworks, "_native_tool_record", return_value=native_tool()),
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=native_tool(),
+            ),
             patch.object(steps, "inspect_prepared_input", side_effect=inspect_with_root),
         ):
             capture = solidworks.capture(

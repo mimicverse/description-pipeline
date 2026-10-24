@@ -21,6 +21,7 @@ from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
+from description_pipeline.stages import validate_freeze_events
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend
@@ -79,6 +80,35 @@ def native_twin() -> dict:
     }
 
 
+def fixture_backend(prepared_package: Path, main_assembly: str) -> AxisFixtureBackend:
+    """The one synthetic CAD backend for a real prepared package capture."""
+
+    return AxisFixtureBackend(
+        prepared_package / main_assembly,
+        [
+            {
+                "name": "base-1",
+                "transform": support.placement((0.0, 0.0, 0.0)),
+                # Off-axis COM: the product signal proves the convention at capture time.
+                "mass": fixture_mass_payload(0.192, (0.01, 0.02, 0.0)),
+            },
+            {
+                "name": "arm-1",
+                "transform": support.placement((0.0, 0.0, 0.1)),
+                "mass": fixture_mass_payload(
+                    0.105654866776462,
+                    (0.0, 0.0, 0.05),
+                ),
+            },
+        ],
+        dependencies=[prepared_package / "cad/base.SLDPRT", prepared_package / "cad/arm.SLDPRT"],
+        coordinate_systems={
+            "CS_base_link": support.placement((0.0, 0.0, 0.0)),
+            "CS_arm_link": support.placement((0.0, 0.0, 0.1)),
+        },
+    )
+
+
 def build_fixture_capture(
     root: Path,
     *,
@@ -86,6 +116,7 @@ def build_fixture_capture(
     main_assembly: str = "cad/robot.SLDASM",
     purpose: str = "engineering",
     runner=None,
+    prior_freeze_events=None,
 ) -> dict:
     """Run the real producer over the control fixture and return the sealed transfer."""
 
@@ -113,13 +144,16 @@ def build_fixture_capture(
     def record(event: dict) -> None:
         events.append({"at": datetime.now(UTC).isoformat(), **event})
 
-    steps.freeze_inputs(
-        handoff_dir,
-        handoff,
-        package_inventory(handoff_dir),
-        main_assembly=main_assembly,
-        on_event=record,
-    )
+    if prior_freeze_events is None:
+        steps.freeze_inputs(
+            handoff_dir,
+            handoff,
+            package_inventory(handoff_dir),
+            main_assembly=main_assembly,
+            on_event=record,
+        )
+    else:
+        events.extend(validate_freeze_events(prior_freeze_events))
     prepared_package, _target, prepared, prepared_files = steps.discover_structure(
         handoff_dir,
         root / "prepared",
@@ -132,39 +166,20 @@ def build_fixture_capture(
         preparer=lambda *args, **kwargs: prepare_native_package(*args, backend=FakeBackend(capture_record()), **kwargs),
         on_event=record,
     )
-    backend = AxisFixtureBackend(
-        prepared_package / main_assembly,
-        [
-            {
-                "name": "base-1",
-                "transform": support.placement((0.0, 0.0, 0.0)),
-                # Off-axis COM: the product signal proves the convention at capture time.
-                "mass": fixture_mass_payload(0.192, (0.01, 0.02, 0.0)),
-            },
-            {
-                "name": "arm-1",
-                "transform": support.placement((0.0, 0.0, 0.1)),
-                "mass": fixture_mass_payload(
-                    0.105654866776462,
-                    (0.0, 0.0, 0.05),
-                ),
-            },
-        ],
-        dependencies=[prepared_package / "cad/base.SLDPRT", prepared_package / "cad/arm.SLDPRT"],
-        coordinate_systems={
-            "CS_base_link": support.placement((0.0, 0.0, 0.0)),
-            "CS_arm_link": support.placement((0.0, 0.0, 0.1)),
-        },
-    )
+    backend = fixture_backend(prepared_package, main_assembly)
     tool = native_twin()
     capture_output = root / "capture-delivery"
-    with patch.object(solidworks, "_native_tool_record", return_value=tool):
+    with (
+        patch.object(solidworks, "_native_tool_record", return_value=tool),
+        patch("description_pipeline.runtime.tool_record", return_value=tool),
+    ):
         capture = capture_entry(
             prepared_package,
             capture_output,
             backend=backend,
             run_id=run_id,
             handoff_sha256=handoff,
+            upload_sha256=handoff,
             main_assembly=main_assembly,
             expected_inputs=prepared_files,
             prior_events=events,
@@ -190,6 +205,8 @@ def build_fixture_capture(
         "hardware_id": prepared.hardware_id,
         "revision": prepared.revision,
         "native_tool": tool,
+        "prepared_dir": str(prepared_package),
+        "prepared_files": dict(prepared_files),
         "archive": archive,
         "manifest": manifest,
         # The exact capture-archive receipt the Windows endpoint serves at its

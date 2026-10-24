@@ -143,7 +143,7 @@ class VerifierSelectionTests(unittest.TestCase):
             self.root,
             discovery_name="evidence/discovery.json",
             cad_prefix="input/cad/",
-            records_prefix="input/records/",
+            records_prefix="input/",
         )
         return native, scene, config
 

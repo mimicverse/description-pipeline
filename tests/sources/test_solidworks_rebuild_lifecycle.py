@@ -20,6 +20,7 @@ LEFT = r"C:\capture\prepared\left.SLDASM"
 RIGHT = r"C:\capture\prepared\right.SLDASM"
 CHILD = r"C:\capture\prepared\child.SLDASM"
 GRANDCHILD = r"C:\capture\prepared\grandchild.SLDASM"
+PART = r"C:\capture\prepared\part.SLDPRT"
 VIRTUAL_ASSEMBLY = "/tmp/swx1234/VC~~/robot/virtual_assembly.SLDASM"
 OUTSIDE_ASSEMBLY = r"C:\outside\foreign.SLDASM"
 OUTSIDE_PART = r"C:\outside\foreign.SLDPRT"
@@ -219,6 +220,8 @@ class _Backend(SolidWorksBackend):
         self._capture_roots = [CAPTURE_ROOT]
         self._refresh = refresh
         self.refresh_calls = []
+        self._extra_loaded_documents = []
+        self._current_document = None
         self._sessions = {"copy": _Session(session_pid)}
         if extra_sessions:
             self._sessions.update(extra_sessions)
@@ -232,11 +235,44 @@ class _Backend(SolidWorksBackend):
                 value = self._refresh[str(path)]
             except KeyError as error:
                 raise CadError("document_not_open", "missing test document") from error
-            return value.pop(0) if isinstance(value, list) else value
-        return self._refresh() if callable(self._refresh) else self._refresh
+            result = value.pop(0) if isinstance(value, list) else value
+        else:
+            result = self._refresh() if callable(self._refresh) else self._refresh
+        self._current_document = result
+        return result
 
     def _document_by_path(self, path):
         return self._document_handle_by_path(path)
+
+    def _capture_loaded_documents(self):
+        docs = {}
+        if isinstance(self._refresh, dict):
+            for path, value in self._refresh.items():
+                candidates = value if isinstance(value, list) else [value]
+                doc = candidates[0] if candidates else docs.get(path)
+                if isinstance(doc, _Doc):
+                    docs[normalize_document_path(os.path.abspath(path))] = doc
+        if isinstance(self._current_document, _Doc):
+            doc = self._current_document
+            docs[normalize_document_path(os.path.abspath(doc.GetPathName))] = doc
+        for doc in self._extra_loaded_documents:
+            docs[f"extra:{id(doc)}"] = doc
+        return [
+            {
+                "doc": doc,
+                "identity": id(doc),
+                "normalized_path": normalize_document_path(
+                    os.path.abspath(str(doc.GetPathName))
+                ),
+                "path": str(doc.GetPathName),
+                "document_type": doc.GetType(),
+            }
+            for _key, doc in sorted(docs.items())
+        ]
+
+    def _rebuild_capture_copy(self, doc, path):
+        self._current_document = doc
+        return super()._rebuild_capture_copy(doc, path)
 
     def _ensure_document(self, path):
         raise AssertionError("a missing document must never be reopened")
@@ -557,6 +593,26 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertIn("RuntimeError: rebuild native failure", caught.exception.detail["error"])
         self.assertEqual(backend.refresh_calls, [])
 
+    def test_mid_rebuild_failure_keeps_the_partial_native_journal(self):
+        child = _Doc(CHILD, needs_rebuild2=1, rebuild_result=False)
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend.collect_scene(PATH, [])
+        journal = caught.exception.detail["rebuild_journal"]
+        self.assertEqual(journal[0]["kind"], "initial")
+        self.assertEqual(
+            journal[0]["initial_pending"],
+            [normalize_document_path(os.path.abspath(CHILD))],
+        )
+        self.assertIn(
+            (CHILD, "cad_rebuild_failed"),
+            {(row.get("path"), row.get("error_code")) for row in journal[1:]},
+        )
+
     def test_native_refresh_exception_preserves_phase_and_error(self):
         backend = _Backend(RuntimeError("document lookup failed"))
         doc = _Doc(PATH, needs_rebuild2=1)
@@ -573,6 +629,28 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             caught.exception.detail["error"],
         )
         self.assertEqual(backend.refresh_calls, [PATH])
+
+    def test_successful_rebuild_keeps_its_result_when_refresh_or_after_state_fails(self):
+        for resolved, error_phase, error_code in (
+            (CadError("document_not_open", "gone"), "refresh", "document_not_open"),
+            (_UnreadablePathDoc(PATH), "after_state", "cad_document_identity"),
+        ):
+            with self.subTest(phase=error_phase):
+                doc = _Doc(PATH, needs_rebuild2=1)
+                backend = _Backend(resolved)
+                with patch(
+                    "description_pipeline.sources.solidworks.native._hash",
+                    return_value="f" * 64,
+                ), self.assertRaises(CadError) as caught:
+                    backend._rebuild_capture_copy(doc, PATH)
+                self.assertEqual(doc.rebuild_calls, 1)
+                self.assertEqual(caught.exception.code, error_code)
+                journal = backend._capture_rebuild_journal[-1]
+                self.assertIs(journal["result"], True)
+                self.assertEqual(journal["error_code"], error_code)
+                self.assertEqual(journal["error_phase"], error_phase)
+                self.assertTrue(journal["error"])
+                self.assertNotIn("state_after", journal)
 
     def test_rebuild_cannot_change_source_bytes(self):
         backend = _Backend(lambda: _Doc(PATH))
@@ -665,7 +743,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
                 _Component("clean-1", clean),
             ],
         )
-        backend = _Backend({PATH: top, LEFT: suppressed, RIGHT: clean})
+        backend = _Backend({PATH: top, RIGHT: clean})
         with patch(
             "description_pipeline.sources.solidworks.native._hash",
             return_value="e" * 64,
@@ -787,6 +865,125 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         )
         self.assertEqual([grandchild.rebuild_calls, child.rebuild_calls, top.rebuild_calls], [1, 1, 0])
 
+    def test_rebuild_does_not_expand_into_an_unrelated_sibling(self):
+        left = _Doc(LEFT, needs_rebuild2=1)
+        right = _Doc(RIGHT, needs_rebuild2=0)
+        top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("left-1", left), _Component("right-1", right)],
+        )
+        left._rebuild_callback = lambda: setattr(right, "needs_rebuild2", 1)
+        top._rebuild_callback = lambda: setattr(right, "needs_rebuild2", 0)
+        backend = _Backend({PATH: top, LEFT: left, RIGHT: right})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual([row["path"] for row in preparation["child_rebuilds"]], [LEFT])
+        self.assertEqual([left.rebuild_calls, right.rebuild_calls, top.rebuild_calls], [1, 0, 1])
+        self.assertEqual(preparation["needs_rebuild2_after"], 0)
+
+    def test_top_does_not_hide_an_unrelated_sibling_left_pending(self):
+        left = _Doc(LEFT, needs_rebuild2=1)
+        right = _Doc(RIGHT, needs_rebuild2=0)
+        top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("left-1", left), _Component("right-1", right)],
+        )
+        left._rebuild_callback = lambda: setattr(right, "needs_rebuild2", 1)
+        backend = _Backend({PATH: top, LEFT: left, RIGHT: right})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["path"], RIGHT)
+        self.assertEqual([left.rebuild_calls, right.rebuild_calls, top.rebuild_calls], [1, 0, 1])
+
+    def test_top_rebuild_clears_a_pending_part_dependency(self):
+        part = _Doc(PART, document_type=1, needs_rebuild2=1)
+        top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("part-1", part)],
+        )
+        top._rebuild_callback = lambda: setattr(part, "needs_rebuild2", 0)
+        backend = _Backend({PATH: top, PART: part})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="c" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(part.rebuild_calls, 0)
+        self.assertEqual([row["path"] for row in preparation["part_states_after"]], [PART])
+        self.assertEqual(preparation["part_states_after"][0]["state"]["needs_rebuild2_value"], 0)
+
+    def test_unbound_loaded_document_is_rejected(self):
+        top = _Doc(PATH)
+        extra = _Doc(PART, document_type=1)
+        backend = _Backend({PATH: top})
+        backend._extra_loaded_documents = [extra]
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="c" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_document_unbound")
+
+    def test_final_read_boundary_rechecks_all_loaded_documents(self):
+        part = _Doc(PART, document_type=1)
+        top = _Doc(PATH, children=[_Component("part-1", part)])
+        backend = _Backend({PATH: top, PART: part})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ):
+            backend._rebuild_capture_copy(top, PATH)
+        part.needs_rebuild2 = 1
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend.verify_capture_documents_ready()
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["path"], PART)
+
+    def test_final_read_boundary_uses_the_latest_top_read_only_state(self):
+        top = _Doc(PATH)
+        backend = _Backend({PATH: top})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ):
+            backend._rebuild_capture_copy(top, PATH)
+        top._read_only = False
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend.verify_capture_documents_ready()
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["path"], PATH)
+        self.assertIs(caught.exception.detail["state"]["read_only"], False)
+
+    def test_pending_part_dependency_cannot_pass_behind_a_clean_top(self):
+        part = _Doc(PART, document_type=1, needs_rebuild2=1)
+        top = _Doc(PATH, needs_rebuild2=0, children=[_Component("part-1", part)])
+        backend = _Backend({PATH: top, PART: part})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["path"], PART)
+        self.assertEqual(top.rebuild_calls, 0)
+        self.assertEqual(part.rebuild_calls, 0)
+
     def test_top_rebuild_uses_the_handle_refreshed_after_children(self):
         child = _Doc(CHILD, needs_rebuild2=1)
         stale_top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
@@ -845,6 +1042,46 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             preparation["source_files_before"],
         )
         self.assertEqual(source_hash.call_count, 2)
+
+    def test_shared_part_occurrences_keep_short_long_and_restore_parked(self):
+        class ConfiguredPart(_Doc):
+            def GetConfigurationNames(self):
+                return ["Parked", "Short", "Long"]
+
+            def GetConfigurationByName(self, name):
+                if name not in self.GetConfigurationNames():
+                    raise ValueError(f"unknown configuration: {name}")
+                return _Configuration(self, name, False)
+
+        part = ConfiguredPart(
+            PART,
+            configuration="Parked",
+            document_type=1,
+        )
+        top = _Doc(
+            PATH,
+            children=[
+                _Component("part-short", part, referenced_configuration="Short"),
+                _Component("part-long", part, referenced_configuration="Long"),
+            ],
+        )
+        backend = _Backend({PATH: top, PART: part})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(len(preparation["part_states_after"]), 1)
+        state = preparation["part_states_after"][0]["state"]
+        self.assertEqual(state["configuration"], "Parked")
+        self.assertEqual(
+            {
+                row["referenced_configuration"]
+                for row in preparation["topology_before"]
+                if row["instance"] in {"part-short", "part-long"}
+            },
+            {"Short", "Long"},
+        )
 
     def test_pending_virtual_assembly_rebuilds_as_the_owning_session_document(self):
         virtual = _Doc(VIRTUAL_ASSEMBLY, read_only=False, needs_rebuild2=1)
@@ -987,7 +1224,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             return_value="e" * 64,
         ), self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(top, PATH)
-        self.assertEqual(caught.exception.code, "cad_rebuild_topology_changed")
+        self.assertEqual(caught.exception.code, "cad_capture_document_unbound")
         self.assertEqual(added.rebuild_calls, 0)
 
     def test_topology_removal_during_rebuild_is_rejected(self):
@@ -1000,7 +1237,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             return_value="f" * 64,
         ), self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(top, PATH)
-        self.assertEqual(caught.exception.code, "cad_rebuild_topology_changed")
+        self.assertEqual(caught.exception.code, "cad_capture_document_unbound")
 
     def test_topology_rebinding_during_rebuild_is_rejected(self):
         child = _Doc(CHILD)
@@ -1016,7 +1253,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             return_value="a" * 64,
         ), self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(top, PATH)
-        self.assertEqual(caught.exception.code, "cad_rebuild_topology_changed")
+        self.assertEqual(caught.exception.code, "cad_capture_document_unbound")
 
 
 if __name__ == "__main__":

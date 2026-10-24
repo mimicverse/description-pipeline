@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -25,6 +27,7 @@ from description_pipeline.repository import urdf_pr
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.runtime import tool_record
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
+from description_pipeline.sources.solidworks.native import normalize_document_path
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.scene import combine_mass_properties
 from description_pipeline.stages import STAGE_IDS
@@ -43,6 +46,19 @@ OVERRIDES = {
     "OverrideCenterOfMass": False,
     "OverrideMomentsOfInertia": False,
 }
+
+
+def _native_tool() -> dict:
+    return {**native_tool(), "release": None}
+
+
+def _portable_tool() -> dict:
+    native = _native_tool()
+    return {
+        **tool_record("portable"),
+        "source_sha256": native["source_sha256"],
+        "release": None,
+    }
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -94,14 +110,53 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
     evidence_class = "cad"
 
     def environment(self) -> dict:
+        if not hasattr(self, "_hermetic_source_pid"):
+            self._hermetic_source_pid = max(1, self.session_pid - 1)
         return {
             "revision": "34.0.0",
             "input_mode": "saved_documents",
-            "sessions": {},
+            "sessions": {
+                "source": {
+                    "pid": self._hermetic_source_pid,
+                    "state": "closed",
+                },
+                "copy": {
+                    "pid": self.session_pid,
+                    "state": "active",
+                },
+            },
             "build": "hermetic-test",
             "license": 1,
             "visible": True,
         }
+
+    def retire_session(self, role: str = "copy") -> dict:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("retire_session")
+        self.assert_role(role)
+        before = {
+            "pid": self.session_pid,
+            "state": "active",
+        }
+        self.retired_session_pids.append(self.session_pid)
+        self.open_documents.clear()
+        self.session_pid += 1
+        return {
+            "role": role,
+            "retired": True,
+            "before": before,
+            "after": {
+                "pid": before["pid"],
+                "state": "closed",
+            },
+        }
+
+    @staticmethod
+    def assert_role(role: str) -> None:
+        if role != "copy":
+            raise AssertionError(f"unexpected retired role: {role}")
 
     def assembly_mass_properties(self, path: str) -> dict:
         entries = []
@@ -154,6 +209,264 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
             ],
             "errors": [],
             "reference": {"method": "IMassProperty2 (SelectedItems = component instance)"},
+        }
+
+    def collect_scene(self, doc_path, coordinate_systems, on_activity=None, require_material=True):
+        scene = super().collect_scene(
+            doc_path,
+            coordinate_systems,
+            on_activity=on_activity,
+            require_material=require_material,
+        )
+        self._capture_component_paths = [
+            (str(component.name), str(component.path))
+            for component in scene.components
+        ]
+        configuration = "Default"
+        state = {
+            "save_flag": False,
+            "needs_rebuild2_value": 0,
+            "read_only": True,
+            "configuration": configuration,
+            "configuration_needs_rebuild": False,
+            "path": str(doc_path),
+            "configurations": [
+                {
+                    "name": configuration,
+                    "needs_rebuild": False,
+                    "add_rebuild_save_mark": False,
+                }
+            ],
+            "controls": {
+                "enable_assembly_rebuild": False,
+                "lightweight_component_count": 0,
+            },
+        }
+        source_files = {}
+        for path in [doc_path, *(component.path for component in scene.components)]:
+            key = normalize_document_path(os.path.abspath(path))
+            source_files.setdefault(
+                key,
+                {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                },
+            )
+        topology = [
+            {
+                "instance": "top",
+                "depth": 0,
+                "document_path": str(doc_path),
+                "normalized_path": normalize_document_path(os.path.abspath(doc_path)),
+                "document_type": 2,
+                "referenced_configuration": configuration,
+                "suppression_state": None,
+                "storage_scope": "file",
+                "provenance_state": None,
+                "owner_document_path": None,
+                "owner_sha256": None,
+                "native_api_pid": None,
+            },
+            *[
+                {
+                    "instance": component.name,
+                    "depth": 1,
+                    "document_path": component.path,
+                    "normalized_path": normalize_document_path(os.path.abspath(component.path)),
+                    "document_type": 1,
+                    "referenced_configuration": configuration,
+                    "suppression_state": 2,
+                    "storage_scope": "file",
+                    "provenance_state": None,
+                    "owner_document_path": None,
+                    "owner_sha256": None,
+                    "native_api_pid": None,
+                }
+                for component in scene.components
+            ],
+        ]
+        topology.sort(
+            key=lambda row: tuple(
+                "" if row.get(name) is None else str(row.get(name))
+                for name in (
+                    "instance",
+                    "normalized_path",
+                    "document_type",
+                    "referenced_configuration",
+                    "depth",
+                    "suppression_state",
+                    "storage_scope",
+                    "provenance_state",
+                )
+            )
+        )
+        top_sha256 = source_files[normalize_document_path(os.path.abspath(doc_path))]["sha256"]
+        scene.notes["capture_preparation"] = {
+            "session": {"role": "copy", "identity": self.environment()["sessions"]["copy"], "temp_root": None},
+            "schema_version": "solidworks-to-urdf.capture-preparation/v1",
+            "used_api": "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
+            "scope": "collected_copy_in_memory",
+            "document": str(doc_path),
+            "configuration": configuration,
+            "read_only": True,
+            "saved_to_disk": False,
+            "rebuild_performed": False,
+            "component_count": len(scene.components),
+            "assembly_document_count": 1,
+            "child_rebuilds": [],
+            "top_rebuild": None,
+            "rebuild_calls": [
+                {
+                    "kind": "initial",
+                    "initial_pending": [],
+                    "rebuild_candidates": [],
+                }
+            ],
+            "needs_rebuild2_before": 0,
+            "needs_rebuild2_after": 0,
+            "configuration_needs_rebuild_before": False,
+            "configuration_needs_rebuild_after": False,
+            "source_sha256_before": top_sha256,
+            "source_sha256_after": top_sha256,
+            "save_flag_before": False,
+            "save_flag_after": False,
+            "state_before": dict(state),
+            "state_after_children": dict(state),
+            "state_after": dict(state),
+            "assembly_states_before": [
+                {
+                    "depth": 0,
+                    "path": str(doc_path),
+                    "instances": ["top"],
+                    "state": dict(state),
+                }
+            ],
+            "assembly_states_after": [
+                {
+                    "depth": 0,
+                    "path": str(doc_path),
+                    "instances": ["top"],
+                    "state": dict(state),
+                }
+            ],
+            "part_states_after": [
+                {
+                    "path": str(component.path),
+                    "instances": [component.name],
+                    "state": {
+                        "save_flag": False,
+                        "needs_rebuild2_value": 0,
+                        "read_only": False,
+                        "configuration": configuration,
+                        "configuration_needs_rebuild": False,
+                        "path": str(component.path),
+                        "configurations": [
+                            {
+                                "name": configuration,
+                                "needs_rebuild": False,
+                                "add_rebuild_save_mark": False,
+                            }
+                        ],
+                    },
+                }
+                for component in scene.components
+            ],
+            "source_files_before": source_files,
+            "source_files_after": dict(source_files),
+            "session_dependency_paths": [],
+            "topology_before": topology,
+            "topology_after": [dict(row) for row in topology],
+        }
+        return scene
+
+    def verify_capture_documents_ready(self) -> dict:
+        top_path = str(self._capture_document)
+        documents = [
+            {
+                "path": top_path,
+                "document_type": 2,
+                "state": {
+                    "save_flag": False,
+                    "needs_rebuild2_value": 0,
+                    "read_only": True,
+                    "configuration": "Default",
+                    "configuration_needs_rebuild": False,
+                    "path": top_path,
+                    "configurations": [
+                        {
+                            "name": "Default",
+                            "needs_rebuild": False,
+                            "add_rebuild_save_mark": False,
+                        }
+                    ],
+                    "controls": {
+                        "enable_assembly_rebuild": False,
+                        "lightweight_component_count": 0,
+                    },
+                },
+            },
+            *[
+                {
+                    "path": component_path,
+                    "document_type": 1,
+                    "state": {
+                        "save_flag": False,
+                        "needs_rebuild2_value": 0,
+                        "read_only": False,
+                        "configuration": "Default",
+                        "configuration_needs_rebuild": False,
+                        "path": component_path,
+                        "configurations": [
+                            {
+                                "name": "Default",
+                                "needs_rebuild": False,
+                                "add_rebuild_save_mark": False,
+                            }
+                        ],
+                    },
+                }
+                for _component_name, component_path in self._capture_component_paths
+            ],
+        ]
+        return {
+            "document_count": len(documents),
+            "session": {"role": "copy", "identity": self.environment()["sessions"]["copy"], "temp_root": None},
+            "parts": sum(item["document_type"] == 1 for item in documents),
+            "assemblies": sum(item["document_type"] == 2 for item in documents),
+            "documents": documents,
+            "topology": [
+                {
+                    "instance": "top",
+                    "depth": 0,
+                    "document_path": top_path,
+                    "normalized_path": normalize_document_path(os.path.abspath(top_path)),
+                    "document_type": 2,
+                    "referenced_configuration": "Default",
+                    "suppression_state": None,
+                    "storage_scope": "file",
+                    "provenance_state": None,
+                    "owner_document_path": None,
+                    "owner_sha256": None,
+                    "native_api_pid": None,
+                },
+                *[
+                    {
+                        "instance": component_name,
+                        "depth": 1,
+                        "document_path": component_path,
+                        "normalized_path": normalize_document_path(os.path.abspath(component_path)),
+                        "document_type": 1,
+                        "referenced_configuration": "Default",
+                        "suppression_state": 2,
+                        "storage_scope": "file",
+                        "provenance_state": None,
+                        "owner_document_path": None,
+                        "owner_sha256": None,
+                        "native_api_pid": None,
+                    }
+                    for component_name, component_path in self._capture_component_paths
+                ],
+            ],
         }
 
     def export_component_meshes(self, destinations: dict[str, str], on_activity=None) -> dict[str, dict]:
@@ -278,13 +591,15 @@ class HermeticSixStageTests(unittest.TestCase):
                 "CS_arm_link": support.placement((0.0, 0.0, 0.1)),
             },
         )
-        with patch.object(solidworks, "_native_tool_record", return_value=native_tool()):
+        native_identity = _native_tool()
+        with patch("description_pipeline.runtime.tool_record", return_value=native_identity):
             capture = solidworks.capture(
                 prepared,
                 self.root / "capture",
                 backend=backend,
                 run_id=RUN_ID,
                 handoff_sha256=handoff_digest,
+                upload_sha256=handoff_digest,
                 main_assembly=MAIN_ASSEMBLY,
                 expected_inputs=prepared_files,
                 prior_events=self.events,
@@ -388,27 +703,30 @@ class HermeticSixStageTests(unittest.TestCase):
         self.assertEqual(native["freeze"]["handoff_sha256"], native["capture"]["handoff_sha256"])
         self.assertEqual(native["freeze"]["handoff_sha256"], digest(package_inventory(self.handoff)))
 
-        generated = solidworks.generate(
-            capture,
-            self.root / "generate",
-            run_id=RUN_ID,
-            handoff_sha256=native["capture"]["handoff_sha256"],
-            prior_events=self.events,
-            on_event=self._record,
-        )
+        portable_identity = _portable_tool()
+        with patch.object(steps, "tool_record", return_value=portable_identity):
+            generated = solidworks.generate(
+                capture,
+                self.root / "generate",
+                run_id=RUN_ID,
+                handoff_sha256=native["capture"]["handoff_sha256"],
+                prior_events=self.events,
+                on_event=self._record,
+            )
         self.assertEqual(generated["state"], "generated", generated.get("error"))
         generated_subject = generated["subject_sha256"]
         self.assertEqual(read_delivery_manifest(self.root / "generate")["subject"]["digest"], generated_subject)
 
-        verified = solidworks.verify(
-            self.root / "generate",
-            self.root / "verify",
-            run_id=RUN_ID,
-            expected_subject=generated_subject,
-            handoff_sha256=native["capture"]["handoff_sha256"],
-            prior_events=self.events,
-            on_event=self._record,
-        )
+        with patch.object(steps, "tool_record", return_value=portable_identity):
+            verified = solidworks.verify(
+                self.root / "generate",
+                self.root / "verify",
+                run_id=RUN_ID,
+                expected_subject=generated_subject,
+                handoff_sha256=native["capture"]["handoff_sha256"],
+                prior_events=self.events,
+                on_event=self._record,
+            )
         self.assertEqual(verified["state"], "verified", verified.get("error"))
         self.assertIs(verified["passed"], True)
         self.assertEqual(verified["subject_sha256"], generated_subject)
@@ -432,6 +750,39 @@ class HermeticSixStageTests(unittest.TestCase):
         urdf = (self.root / "verify/urdf/robot.urdf").read_text(encoding="utf-8")
         self.assertIn("WARNING metadata.non_native", urdf)
         return original_handoff, native, verified
+
+    def test_published_subject_supports_self_contained_cli_check(self) -> None:
+        from description_pipeline.verification.solidworks_urdf import check_bundle
+
+        _original_handoff, _native, verified = self._generate_and_verify()
+        published = self.root / "self-contained"
+        for name in ("input", "evidence", "model", "urdf", "meshes"):
+            shutil.copytree(self.root / "verify" / name, published / name)
+        shutil.copy2(self.root / "verify/tool.json", published / "tool.json")
+        shutil.copy2(self.root / "verify/manifest.json", published / "manifest.json")
+        (published / "reports").mkdir()
+        shutil.copy2(
+            self.root / "verify/reports/quality.json",
+            published / "reports/quality.json",
+        )
+
+        report = check_bundle(published)
+        self.assertIs(report["passed"], True, report.get("checks"))
+        self.assertEqual(report["subject_sha256"], verified["subject_sha256"])
+
+        shutil.copy2(
+            self.root / "verify/reports/native-stages.json",
+            published / "reports/native-stages.json",
+        )
+        partial_receipts = check_bundle(published)
+        self.assertIs(partial_receipts["passed"], False)
+        (published / "reports/native-stages.json").unlink()
+
+        with_required_receipts = check_bundle(
+            published,
+            require_native_receipts=True,
+        )
+        self.assertIs(with_required_receipts["passed"], False)
 
     def _capture_with_environment_mutation(self, mutate) -> tuple[Path, dict]:
         from description_pipeline.sources.solidworks import freeze as freeze_module
@@ -599,16 +950,18 @@ class HermeticSixStageTests(unittest.TestCase):
                 on_event=self._record,
             )
 
-        self.assertEqual(failed["state"], "gh_failed_after_push")
+        self.assertEqual(failed["state"], "unresolved")
+        self.assertEqual(failed["error"], "github_failed_after_push")
         self.assertIs(failed["passed"], False)
-        self.assertEqual(failed["error"], "github_failed")
-        self.assertEqual(failed["error_code"], "github_failed")
-        self.assertEqual(failed["submission"]["error"], "github_failed")
+        self.assertEqual(failed["error"], "github_failed_after_push")
+        self.assertEqual(failed["reason"], "github_failed")
+        self.assertEqual(failed["error_code"], "github_failed_after_push")
+        self.assertEqual(failed["submission"]["error"], "github_failed_after_push")
         self.assertEqual(failed["subject_sha256"], subject)
         self.assertEqual(failed["quality"]["passed"], True)
         self._assert_failed_publish_evidence(failed, subject)
         boundary_failure = self._portable_publish_failure(failed)
-        self.assertEqual(getattr(boundary_failure, "code", None), "github_failed")
+        self.assertEqual(getattr(boundary_failure, "code", None), "github_failed_after_push")
         self.assertTrue(
             _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").strip(),
             "the local Git push completed before GitHub failed",

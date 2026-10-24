@@ -156,7 +156,13 @@ class ToolIdentityTests(unittest.TestCase):
             root = Path(directory)
             bundle = self._publishable_bundle(root)
             release = {"schema_version": "solidworks-to-urdf.release/v1", "version": __version__}
-            submission = {"state": "published", "url": "https://github.com/example/arm/pull/1", "subject": "a" * 64}
+            submission = {
+                "state": "published",
+                "url": "https://github.com/example/arm/pull/1",
+                "subject": "a" * 64,
+                "subject_sha256": "a" * 64,
+                "passed": True,
+            }
             with (
                 patch.object(steps, "tool_record", return_value={"release": release}),
                 patch(

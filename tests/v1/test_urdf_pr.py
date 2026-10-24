@@ -350,7 +350,7 @@ class PublishTests(unittest.TestCase):
                 )
             raise AssertionError(args)
 
-        def verifier(bundle: Path) -> dict:
+        def verifier(bundle: Path, **_kwargs) -> dict:
             from description_pipeline.io import read_data
             from description_pipeline.verification import solidworks_urdf as _verification
 
@@ -402,15 +402,29 @@ class PublishTests(unittest.TestCase):
     def test_pr_actual_head_must_equal_verified_pushed_commit(self):
         self.gh_mode = "stale_head"
         result = self.submit()
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["error"], "pr_identity_mismatch")
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "pr_identity_mismatch_after_push")
         self.assertEqual(self.fx.remote_head(), result["commit"])
         self.assertTrue(result["detail"]["observed"]["url"])
+
+    def test_invalid_github_json_after_creation_preserves_reconciliation_identity(self):
+        original = urdf_pr._gh
+
+        def exchange(repository, *args):
+            return "{" if args[:2] == ("pr", "view") else original(repository, *args)
+
+        with mock.patch.object(urdf_pr, "_gh", side_effect=exchange):
+            result = self.submit()
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["commit"], self.fx.remote_head())
+        self.assertTrue(self.prs)
+        self.assertTrue(result["url"])
 
     def test_failure_after_pr_creation_preserves_url_and_pushed_commit(self):
         self.gh_mode = "fail_view"
         result = self.submit()
-        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "github_failed_after_push")
         self.assertEqual(result["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(result["commit"], self.fx.remote_head())
 
@@ -746,7 +760,8 @@ class PublishTests(unittest.TestCase):
         first = self.submit()
         self.gh_mode = "fail_update"
         result = self.submit()
-        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "github_failed_after_push")
         self.assertEqual(result["url"], first["url"])
         self.assertEqual(result["commit"], self.fx.remote_head())
 
@@ -835,24 +850,35 @@ class PublishTests(unittest.TestCase):
         )
 
     def test_bad_verification_and_tamper_never_push(self) -> None:
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: lambda bundle: {"passed": False}):
+        with mock.patch.object(
+            urdf_pr,
+            "_load_verifier",
+            lambda: lambda bundle, **_kwargs: {"passed": False},
+        ):
             self.assertEqual(self.submit()["error"], "verification_failed")
         self.assertEqual(self.fx.remote_head(), "")
         with mock.patch.object(
-            urdf_pr, "_load_verifier", lambda: lambda bundle: {"passed": True, "subject_sha256": "0" * 64}
+            urdf_pr,
+            "_load_verifier",
+            lambda: lambda bundle, **_kwargs: {"passed": True, "subject_sha256": "0" * 64},
         ):
             self.assertEqual(self.submit()["error"], "verification_subject_mismatch")
         self.assertEqual(self.fx.remote_head(), "")
         good = {"passed": True, "subject_sha256": subject_digest(self.fx.bundle)}
         (self.fx.bundle / "reports/quality.json").write_text('{"passed": true}\n', encoding="utf-8")
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: lambda bundle: good):
+        with mock.patch.object(
+            urdf_pr,
+            "_load_verifier",
+            lambda: lambda bundle, **_kwargs: good,
+        ):
             self.assertEqual(self.submit()["error"], "stale_quality_report")
         self.assertEqual(self.fx.remote_head(), "")
 
     def test_gh_failure_after_push_keeps_pushed_receipt(self) -> None:
         self.gh_mode = "fail"
         result = self.submit()
-        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "github_failed_after_push")
         self.assertEqual(result["commit"], self.fx.remote_head())
         self.assertEqual(result["branch"], BRANCH)
         self.assertTrue(result["subject"])

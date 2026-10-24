@@ -223,8 +223,13 @@ def _stamp(root: Path, receipt: dict) -> None:
 
 def _check(root: Path) -> dict:
     from .verification.solidworks_urdf import check_bundle
+    from .native_transfer import load_native_receipts
 
-    return check_bundle(root)
+    return check_bundle(
+        root,
+        native_receipts=load_native_receipts(root),
+        require_native_receipts=True,
+    )
 
 
 def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
@@ -245,12 +250,38 @@ def _native_tool_record() -> dict:
     return tool_record(role="native")
 
 
-def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, main_assembly):
+def _finish_native_capture(
+    staging,
+    output,
+    receipt,
+    *,
+    run_id,
+    handoff_sha256,
+    upload_sha256,
+    main_assembly,
+):
     """Close a capture-only run: provenance reports, sealed transfer, native_complete."""
 
+    from .native_transfer import expected_native_check_details
+    upload_sha256 = upload_sha256 or handoff_sha256
     tool = _native_tool_record()
     write_json(staging / "reports/native-tool.json", tool)
     receipt.update(state="native_complete", passed=False, native_complete=True, native_tool=tool, stage="capture")
+    discovery = read_data(staging / "evidence/discovery.json")
+    native_files = discovery.get("native_files") if isinstance(discovery, dict) else None
+    if not isinstance(native_files, dict) or not native_files:
+        raise PipelineError("Native discovery has no file inventory")
+    expected_details = expected_native_check_details(
+        staging,
+        handoff_sha256=handoff_sha256,
+        main_assembly=main_assembly,
+        main_assembly_sha256=file_digest(staging / "input/cad" / main_assembly),
+        native_files=native_files,
+    )
+    for event in receipt["events"]:
+        check = event.get("check") if isinstance(event, dict) else None
+        if isinstance(check, dict) and check.get("id") in expected_details:
+            check["details"] = expected_details[check["id"]]
     _stamp(staging, receipt)
     # The native receipt must stay stable even when Linux rewrites reports/stages.json, and
     # it keeps the raw events (with timestamps) so the portable side can seed prior_events.
@@ -261,8 +292,15 @@ def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, 
 
     archive = staging / CAPTURE_ARCHIVE
     manifest = seal_capture(
-        staging, archive, run_id=run_id, handoff_sha256=handoff_sha256, main_assembly=main_assembly, native_tool=tool
+        staging,
+        archive,
+        run_id=run_id,
+        handoff_sha256=handoff_sha256,
+        upload_sha256=upload_sha256,
+        main_assembly=main_assembly,
+        native_tool=tool,
     )
+    receipt["upload_sha256"] = upload_sha256
     write_json(staging / CAPTURE_MANIFEST, manifest)
     receipt["capture_archive"] = {
         "name": CAPTURE_ARCHIVE,
@@ -294,6 +332,8 @@ def _failed_run(staging, output, receipt, event, error):
         with contextlib.suppress(Exception):
             event({"stage": phase, "state": "failed"})
     receipt.update(passed=False, state="failed", stage=phase, error=str(error))
+    if "native_complete" in receipt:
+        receipt["native_complete"] = False
     if hasattr(error, "code"):
         receipt["error_code"] = error.code
     detail = getattr(error, "detail", None) or getattr(error, "details", None)
@@ -324,6 +364,7 @@ def capture(
     prior_events=None,
     expected_inputs=None,
     handoff_sha256=None,
+    upload_sha256: str | None = None,
     main_assembly: str | None = None,
     resume: dict | None = None,
 ) -> dict:
@@ -370,6 +411,7 @@ def capture(
                 receipt,
                 run_id=receipt["run_id"],
                 handoff_sha256=handoff_sha256,
+                upload_sha256=upload_sha256,
                 main_assembly=main_assembly,
             )
         except Exception as error:
@@ -518,9 +560,9 @@ def publish(
             definition, input_report = _replay_seeded_inputs(staging)
             receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
             _require_subject(staging, expected_subject)
-            from .verification.solidworks_urdf import check_bundle, rebuilt_definition, require_qualified_report
+            from .verification.solidworks_urdf import rebuilt_definition, require_qualified_report
 
-            report = require_qualified_report(check_bundle(staging), rebuilt_definition(staging), root=staging)
+            report = require_qualified_report(_check(staging), rebuilt_definition(staging), root=staging)
             if expected_subject and report.get("subject_sha256") != expected_subject:
                 raise PipelineError("Verified report is bound to a different subject")
             receipt.update(
@@ -544,6 +586,9 @@ def publish(
                     receipt["error_code"] = error
                 if "detail" in submitted:
                     receipt["detail"] = submitted["detail"]
+                for key in ("reason", "commit", "url", "retry"):
+                    if key in submitted:
+                        receipt[key] = submitted[key]
             _stamp(output, receipt)
             return {**receipt, "output": str(output)}
         except Exception as error:

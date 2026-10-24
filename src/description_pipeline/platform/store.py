@@ -44,6 +44,7 @@ from ..stages import (
     STAGE_IDS,
     STAGE_STATES,
     TERMINAL_STAGE_STATES,
+    publication_succeeded,
 )
 from .storage import SEALED_URI_PREFIX, parse_sealed_uri, sealed_resolver_from_environment
 
@@ -2815,8 +2816,12 @@ class PlatformStore:
             raise PlatformStoreError("The native owner settlement names the discover operation and its task key")
         native_run = receipt.get("native_run_id")
         native_sha = receipt.get("native_receipt_sha256")
+        native_inputs = reconcile.get("native_receipt") if isinstance(reconcile, dict) else None
+        native_receipt_path = native_inputs.get("path") if isinstance(native_inputs, dict) else None
         if not _is_canonical_uuid(native_run) or not _is_sha256(native_sha):
             raise PlatformStoreError("The native owner settlement binds its endpoint job and receipt bytes")
+        if not isinstance(native_receipt_path, str) or not native_receipt_path:
+            raise PlatformStoreError("The native owner settlement binds its original receipt path")
         if native_sha not in _evidence_digests(reconcile.get("evidence")):
             raise PlatformStoreError("The native receipt digest is not bound by the settlement evidence")
 
@@ -2919,6 +2924,14 @@ class PlatformStore:
                 "map_index": bound_map,
                 "native_run_id": native_run,
                 "native_receipt_sha256": native_sha,
+                "native_receipt_path": native_receipt_path,
+                "native_stages_sha256": receipt.get("native_stages_sha256"),
+                "native_handoff_sha256": receipt.get("native_handoff_sha256"),
+                "capture_receipt_sha256": (
+                    digest(stages["capture"][2])
+                    if actual_stage == "capture" and isinstance(stages["capture"][2], dict)
+                    else None
+                ),
             },
         )
         reconcile_operation = reconcile.get("operation_id") if isinstance(reconcile, dict) else None
@@ -3378,6 +3391,11 @@ class PlatformStore:
         manifest = read_delivery_manifest(root)
         subject = manifest.get("subject") or {}
         stage = receipt.get("stage")
+        if (
+            receipt.get("subject_sha256") is not None
+            and subject.get("digest") != receipt.get("subject_sha256")
+        ):
+            raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         if completed and stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
             raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         records = subject.get("files") or []
@@ -3439,7 +3457,7 @@ class PlatformStore:
         # The prepared index must be complete: every staged input member except the
         # carried request and the index itself has to appear in its inventory.
         indexed = {path[len("input/") :] for path in stamped if path.startswith("input/")}
-        missing = sorted(indexed - set(files) - {"request.json", "handoff.json"})
+        missing = sorted(indexed - set(files) - {"request.json", "handoff.json", "source.json"})
         if missing:
             raise PlatformStoreError(f"The sealed input/handoff.json index is incomplete: {missing}")
         expected_handoff = digest(files)
@@ -3686,6 +3704,93 @@ class PlatformStore:
             }
             if {name: record["state"] for name, record in stages.items()} != expected:
                 raise PlatformStoreError("The native capture replay does not match its terminal stage projection")
+            discover_receipt = stages["discover"]["receipt"]
+            capture_receipt = stages["capture"]["receipt"]
+            capture_binding_matches = (
+                isinstance(binding, dict)
+                and _is_sha256(binding.get("native_stages_sha256"))
+                and _is_sha256(binding.get("native_handoff_sha256"))
+                and _is_sha256(binding.get("capture_receipt_sha256"))
+                and binding.get("native_stages_sha256")
+                == discover_receipt.get("native_stages_sha256")
+                and binding.get("native_handoff_sha256")
+                == discover_receipt.get("handoff_sha256")
+                and binding.get("capture_receipt_sha256") == digest(capture_receipt)
+                and binding.get("native_run_id") == native_run_id(owner_run)
+                and (
+                    capture_receipt.get("native_receipt_sha256") is None
+                    or capture_receipt.get("native_receipt_sha256")
+                    == binding.get("native_receipt_sha256")
+                )
+            )
+            if not capture_binding_matches:
+                raise PlatformStoreError("The native capture replay does not bind its stage receipt bytes")
+            native_receipt_path = binding.get("native_receipt_path")
+            native_receipt = load_native_failed_receipt(
+                native_receipt_path,
+                stage="discover",
+                native_run_id=binding.get("native_run_id"),
+                reported_stage="capture",
+            )
+            if (
+                native_receipt.sha256 != binding.get("native_receipt_sha256")
+                or native_receipt.native_stages_sha256
+                != binding.get("native_stages_sha256")
+                or native_receipt.native_handoff_sha256
+                != binding.get("native_handoff_sha256")
+            ):
+                raise PlatformStoreError("The native capture replay differs from its original receipt bytes")
+            for stage_name in ("freeze", "discover"):
+                record = stages[stage_name]
+                self._verify_checkpoint_scope(
+                    record["checkpoint_uri"],
+                    run_id=run_id,
+                    stage=stage_name,
+                    reused_from_run=record["reused_from_run"],
+                )
+                definition, sealed_root = self._verify_sealed(
+                    record["checkpoint_uri"],
+                    record["receipt"],
+                )
+                _sealed_receipt(
+                    record["receipt"],
+                    run_id=run_id,
+                    stage=stage_name,
+                    state="completed",
+                    checkpoint_uri=record["checkpoint_uri"],
+                    definition=definition,
+                    root=sealed_root,
+                )
+            capture_record = stages["capture"]
+            self._verify_checkpoint_scope(
+                capture_record["checkpoint_uri"],
+                run_id=run_id,
+                stage="capture",
+                reused_from_run=capture_record["reused_from_run"],
+            )
+            self._verify_sealed(
+                capture_record["checkpoint_uri"],
+                capture_record["receipt"],
+                completed=False,
+            )
+            _sealed_receipt(
+                capture_record["receipt"],
+                run_id=run_id,
+                stage="capture",
+                state="failed",
+                checkpoint_uri=capture_record["checkpoint_uri"],
+                definition=None,
+            )
+            self._verify_bound_discover_airflow(
+                cursor,
+                dag_id=owner_dag,
+                dag_run_id=owner_run,
+                binding=binding,
+            )
+            cursor.execute(_READ_RUN, (run_id,))
+            run_row = cursor.fetchone()
+            if run_row is None or run_row[0] != "failed":
+                raise PlatformStoreError("The native capture replay requires the terminal failed run")
             return {
                 "operation": {
                     "operation_id": operation_id,
@@ -4057,13 +4162,7 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
                 raise PlatformStoreError("The registered reports/quality.json member does not bind the sealed bytes")
     if stage == "publish":
         submission = receipt.get("submission")
-        if (
-            not isinstance(submission, dict)
-            or submission.get("passed") is not True
-            or submission.get("state") not in {"published", "updated", "noop"}
-            or not submission.get("url")
-            or submission.get("subject_sha256") not in (None, subject)
-        ):
+        if not publication_succeeded(submission, subject):
             raise PlatformStoreError("The sealed publication receipt has no confirmed submission")
 
 

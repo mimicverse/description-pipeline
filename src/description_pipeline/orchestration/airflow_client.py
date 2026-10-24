@@ -57,7 +57,7 @@ from ..interface_records import (
 )
 from ..schemas import CACHE_IMPORT_CONFIRMATION_SCHEMA, CONFIG_SNAPSHOT_SCHEMA
 from ..sources.solidworks.selection import validate_file_index
-from ..stages import STAGE_IDS
+from ..stages import STAGE_IDS, publication_succeeded, validate_freeze_events
 from .selection_client import prepare_staging_archive
 from .stage_transfer import CAPTURE_ARCHIVE, MAX_TRANSFER_BYTES
 
@@ -1053,12 +1053,16 @@ class WindowsEndpoint:
         run_id: str,
         upload_files: dict[str, str],
         main_assembly: str,
+        freeze_events: list[dict],
+        freeze_receipt_sha256: str,
         resume: dict | None = None,
     ) -> dict:
         """Start one staging job: a fresh full-folder stage, or a linked rerun inheriting a sealed parent."""
 
         validated = validate_file_index(upload_files)
         main = validate_main_assembly(main_assembly)
+        validated_freeze_events = validate_freeze_events(freeze_events)
+        freeze_receipt = validate_sha256(freeze_receipt_sha256)
         if main not in validated:
             raise EndpointProtocolError("the main assembly is not part of the upload index")
         payload = {
@@ -1066,6 +1070,9 @@ class WindowsEndpoint:
             "upload_files": dict(validated),
             "upload_sha256": digest(validated),
             "main_assembly": main,
+            "freeze_events": validated_freeze_events,
+            "freeze_events_sha256": digest(validated_freeze_events),
+            "freeze_receipt_sha256": freeze_receipt,
         }
         if resume is not None:
             payload["resume"] = validate_resume(resume, run_id=payload["run_id"])
@@ -1557,12 +1564,8 @@ def check_result(result: dict | None, *, expected_slug: str, expected_base: str)
         raise ResultNotPublishable("result.passed is not true")
     subject = result["subject_sha256"]
     submission = result.get("submission")
-    if not isinstance(submission, dict) or submission.get("passed") is not True:
+    if not publication_succeeded(submission, subject):
         raise ResultNotPublishable("result.submission is missing or not passed")
-    if submission.get("subject_sha256") != subject:
-        raise ResultNotPublishable("result.submission.subject_sha256 differs from the run subject")
-    if submission.get("state") not in SUBMISSION_STATES:
-        raise ResultNotPublishable(f"result.submission.state must be one of {sorted(SUBMISSION_STATES)}")
     if not isinstance(submission.get("base"), str) or not submission["base"].strip():
         raise ResultNotPublishable("result.submission.base is missing")
     if not isinstance(submission.get("commit"), str) or _COMMIT.fullmatch(submission["commit"]) is None:

@@ -832,7 +832,7 @@ class FreezeTests(unittest.TestCase):
         manifest = freeze(self.config, self.destination, backend=self.backend)
         _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
 
-        runtime = read_data(self.destination / "evidence/environment.json")
+        runtime = read_data(self.destination / "native-runtime.json")
         runtime["solidworks"].update(
             input_mode="saved_documents",
             build="fixture-build",

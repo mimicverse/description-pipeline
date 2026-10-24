@@ -8,6 +8,8 @@ discovery run.  No CAD, no Windows and no network beyond an ephemeral loopback s
 
 from __future__ import annotations
 
+from tests.v1.freeze_event_support import freeze_request_fields
+
 import copy
 import hashlib
 import json
@@ -194,6 +196,7 @@ class SelectionEndpointTests(unittest.TestCase):
 
     def request(self, run_id: str) -> dict:
         return {
+            **freeze_request_fields(),
             "run_id": run_id,
             "upload_files": self.upload_files,
             "upload_sha256": self.upload_sha,

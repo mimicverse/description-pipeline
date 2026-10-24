@@ -25,7 +25,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from description_pipeline.io import PipelineError, file_digest, write_json
+from description_pipeline.io import PipelineError, digest, file_digest, write_json
 from description_pipeline.orchestration.stage_transfer import seal_capture
 from description_pipeline.platform import capture as platform_capture
 from description_pipeline.platform import flow
@@ -35,6 +35,7 @@ from description_pipeline.platform.store import PlatformStore
 from .linux_split_support import (
     HANDOFF,
     MAIN_ASSEMBLY,
+    UPLOAD,
     FakeEndpoint,
     SplitAdmissionMixin,
     capture_job,
@@ -63,13 +64,21 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
             dispatch={"stage": "capture", "operation_key": f"{RUN}/capture:0", "params_digest": "a" * 64},
         )
         self.tool = native_tool()
-        source = capture_root(self.tmp, run_id=RUN, handoff=HANDOFF)
+        self.upload_sha256 = digest(UPLOAD)
+        source = capture_root(
+            self.tmp,
+            run_id=RUN,
+            handoff=HANDOFF,
+            upload=self.upload_sha256,
+            upload_files=UPLOAD,
+        )
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(
             source,
             self.archive,
             run_id=RUN,
             handoff_sha256=HANDOFF,
+            upload_sha256=self.upload_sha256,
             main_assembly=MAIN_ASSEMBLY,
             native_tool=self.tool,
         )
@@ -322,10 +331,17 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
         )
         negative_archive = self.tmp / "negative-evidence.zip"
         seal_capture(
-            capture_root(self.tmp / "negative-native", run_id=NEGATIVE, handoff=HANDOFF),
+            capture_root(
+                self.tmp / "negative-native",
+                run_id=NEGATIVE,
+                handoff=HANDOFF,
+                upload=self.upload_sha256,
+                upload_files=UPLOAD,
+            ),
             negative_archive,
             run_id=NEGATIVE,
             handoff_sha256=HANDOFF,
+            upload_sha256=self.upload_sha256,
             main_assembly=MAIN_ASSEMBLY,
             native_tool=self.tool,
         )
@@ -458,7 +474,7 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
         # and the caller-side sealing/registration in the DAG suite
         # (tests.v1.test_airflow_dag).
         verify_uri = f"store://sealed/{RUN}/verify"
-        self.store.sealed_path(verify_uri).mkdir(parents=True, exist_ok=True)
+        shutil.copytree(self.store.sealed_path(generate_uri), self.store.sealed_path(verify_uri))
         self.world.stages[(RUN, "verify")] = ("completed", {"state": "verified"}, verify_uri)
         published = {
             "state": "published",

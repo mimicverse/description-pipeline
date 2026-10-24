@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import tempfile
 import unittest
@@ -21,8 +22,8 @@ from .test_stage_entries import REPLAYED_INSPECTION, make_seed
 from .test_stage_transfer import capture_root as build_capture_root
 from .test_stage_transfer import native_tool as build_native_tool
 
-HANDOFF = "b" * 64
 MAIN = "robot.SLDASM"
+HANDOFF = digest({MAIN: hashlib.sha256(b"CAD-BYTES").hexdigest()})
 
 
 def stage_events(stage_id: str) -> list[dict]:
@@ -62,8 +63,18 @@ class StageBoundaryTests(unittest.TestCase):
         (self.package / "assembly.SLDASM").write_bytes(b"control")
         self.output = self.root / "delivery"
 
+    def _native_events(self, run_id: str) -> list[dict]:
+        event_fixture = build_capture_root(
+            self.root / f"event-fixture-{run_id}",
+            run_id=run_id,
+            handoff=HANDOFF,
+        )
+        return json.loads(
+            (event_fixture / "reports/native-stages.json").read_text(encoding="utf-8")
+        )["events"]
+
     @staticmethod
-    def _fake_capture(calls):
+    def _fake_capture(calls, *, run_id):
         def fake_capture(
             package,
             staging,
@@ -75,14 +86,23 @@ class StageBoundaryTests(unittest.TestCase):
             handoff_sha256=None,
         ):
             calls["capture"] += 1
-            fixture = build_capture_root(Path(staging).parent / "fixture", handoff=handoff_sha256)
+            fixture = build_capture_root(
+                Path(staging).parent / "fixture",
+                run_id=run_id,
+                handoff=handoff_sha256,
+            )
             shutil.copytree(fixture, Path(staging), dirs_exist_ok=True)
             # The shared fixture models a legacy captured tree; the native boundary
             # now seals raw evidence only and renders no report.
             for name in ("reports/structural-team.md", "reports/structural-team.json"):
                 (Path(staging) / name).unlink(missing_ok=True)
             if on_event is not None:
-                for event in stage_events("capture"):
+                fixture_events = json.loads(
+                    (Path(staging) / "reports/native-stages.json").read_text(encoding="utf-8")
+                )["events"]
+                for event in (
+                    item for item in fixture_events if item.get("stage") == "capture"
+                ):
                     on_event(event)
             if on_activity is not None:
                 on_activity({"phase": "capture", "action": "seal"})
@@ -93,10 +113,19 @@ class StageBoundaryTests(unittest.TestCase):
     def test_capture_forwards_activity_and_stops_at_the_seal(self) -> None:
         calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}
         records = []
+        run_id = "8d0c55c4-1cad-5aff-af5f-5cc0bfc5a977"
+        native_events = self._native_events(run_id)
 
         with (
             patch.object(solidworks, "_native_tool_record", return_value=build_native_tool()),
-            patch.object(steps, "capture_evidence", side_effect=self._fake_capture(calls)),
+            patch.object(
+                steps,
+                "capture_evidence",
+                side_effect=self._fake_capture(
+                    calls,
+                    run_id=run_id,
+                ),
+            ),
             patch.object(steps, "generate_model", side_effect=forbid(calls, "generate")),
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
             patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
@@ -105,10 +134,12 @@ class StageBoundaryTests(unittest.TestCase):
                 self.package,
                 self.output,
                 backend=object(),
-                run_id="8d0c55c4-1cad-5aff-af5f-5cc0bfc5a977",
+                run_id=run_id,
                 handoff_sha256=HANDOFF,
                 main_assembly=MAIN,
-                prior_events=[*stage_events("freeze"), *stage_events("discover")],
+                prior_events=[
+                    event for event in native_events if event.get("stage") in {"freeze", "discover"}
+                ],
                 on_activity=records.append,
             )
 
@@ -118,10 +149,19 @@ class StageBoundaryTests(unittest.TestCase):
 
     def test_capture_seals_transfer_and_stops(self) -> None:
         calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}
+        run_id = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
+        native_events = self._native_events(run_id)
 
         with (
             patch.object(solidworks, "_native_tool_record", return_value=build_native_tool()),
-            patch.object(steps, "capture_evidence", side_effect=self._fake_capture(calls)),
+            patch.object(
+                steps,
+                "capture_evidence",
+                side_effect=self._fake_capture(
+                    calls,
+                    run_id=run_id,
+                ),
+            ),
             patch.object(steps, "generate_model", side_effect=forbid(calls, "generate")),
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
             patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
@@ -130,14 +170,16 @@ class StageBoundaryTests(unittest.TestCase):
                 self.package,
                 self.output,
                 backend=object(),
-                run_id="7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865",
+                run_id=run_id,
                 handoff_sha256=HANDOFF,
                 main_assembly=MAIN,
-                prior_events=[*stage_events("freeze"), *stage_events("discover")],
+                prior_events=[
+                    event for event in native_events if event.get("stage") in {"freeze", "discover"}
+                ],
             )
         self.assertIs(result["native_complete"], True)
         self.assertIs(result["passed"], False)
-        self.assertEqual(result["state"], "native_complete")
+        self.assertEqual(result["state"], "native_complete", result.get("error"))
         self.assertEqual(result["execution_scope"], ["freeze", "discover", "capture"])
         archive = self.output / transfer.CAPTURE_ARCHIVE
         manifest = self.output / transfer.CAPTURE_MANIFEST
@@ -180,6 +222,7 @@ class StageBoundaryTests(unittest.TestCase):
             destination,
             expected_run_id=result["run_id"],
             expected_handoff_sha256=HANDOFF,
+            expected_upload_sha256=HANDOFF,
             expected_main_assembly=MAIN,
             expected_native_tool=build_native_tool(),
         )

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from description_pipeline.io import write_json
 from .endpoint_support import EndpointFixture
+from .freeze_event_support import freeze_request_fields
 
 
 class QueuedReplayRecoveryTests(EndpointFixture, unittest.TestCase):
@@ -30,6 +31,7 @@ class QueuedReplayRecoveryTests(EndpointFixture, unittest.TestCase):
         """Create one linked child without letting the live worker consume it."""
 
         request = {
+            **freeze_request_fields(parent["request"]),
             "run_id": str(uuid.uuid4()),
             "upload_files": parent["request"]["upload_files"],
             "upload_sha256": parent["request"]["upload_sha256"],

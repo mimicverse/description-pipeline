@@ -8,9 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from description_pipeline.io import PipelineError, file_digest
+from description_pipeline.io import PipelineError, digest, file_digest
 from description_pipeline.orchestration.stage_transfer import seal_capture
 from description_pipeline.platform import capture as platform_capture
+from description_pipeline.platform.capture import source_identity
 from description_pipeline.platform import flow
 from description_pipeline.platform.store import PlatformStore
 
@@ -53,16 +54,26 @@ class PlatformCaptureImportTests(unittest.TestCase):
             dispatch={"stage": "capture", "operation_key": f"{RUN}/capture:0", "params_digest": "a" * 64},
         )
         self.tool = native_tool()
-        source = capture_root(self.tmp, run_id=RUN, handoff=HANDOFF)
+        self.upload_sha256 = digest(UPLOAD)
+        source = capture_root(
+            self.tmp,
+            run_id=RUN,
+            handoff=HANDOFF,
+            upload=self.upload_sha256,
+            upload_files=UPLOAD,
+        )
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(
             source,
             self.archive,
             run_id=RUN,
             handoff_sha256=HANDOFF,
+            upload_sha256=self.upload_sha256,
             main_assembly=MAIN_ASSEMBLY,
             native_tool=self.tool,
         )
+        for event in capture_job(RUN, self.archive, self.tool)["request"]["freeze_events"]:
+            self.store.append_event(RUN, stage="freeze", kind="stage", payload=event)
 
     def _sealed(self, uri):
         return self.store_root / "sealed" / uri.removeprefix("store://sealed/")
@@ -81,6 +92,16 @@ class PlatformCaptureImportTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "declared receipt"):
             platform_capture.import_native_capture(self.store, self._paths(RUN), RUN, job, endpoint)
 
+    def test_capture_source_identity_never_degrades_to_missing(self) -> None:
+        missing = self.tmp / "missing-identity"
+        missing.mkdir()
+        with self.assertRaisesRegex(PipelineError, "source.json"):
+            source_identity(missing)
+        (missing / "input").mkdir()
+        (missing / "input/source.json").write_text("{}\n", encoding="utf-8")
+        with self.assertRaises(PipelineError):
+            source_identity(missing)
+
     def test_matching_bytes_admit_and_mirror_the_native_events(self) -> None:
         digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
         endpoint = FakeEndpoint(self.archive.read_bytes())
@@ -94,6 +115,12 @@ class PlatformCaptureImportTests(unittest.TestCase):
         self.assertTrue((self._paths(RUN).capture_dir / "transfer-manifest.json").is_file())
         recorded = [event for event in self.world.events if event[0] == RUN]
         self.assertTrue(recorded, "the sealed native events must mirror into the platform stream")
+        freeze_events = [event for event in recorded if event[3] == "freeze"]
+        self.assertEqual(
+            len(freeze_events),
+            len(job["request"]["freeze_events"]),
+            "import must reference the registered Freeze block instead of appending a duplicate",
+        )
 
     def test_changed_selection_refuses_before_downloading(self) -> None:
         mutations = (
@@ -119,7 +146,13 @@ class PlatformCaptureImportTests(unittest.TestCase):
 
         from description_pipeline.io import write_json
 
-        source = capture_root(self.tmp / "foreign-inventory", run_id=FRESH, handoff=HANDOFF)
+        source = capture_root(
+            self.tmp / "foreign-inventory",
+            run_id=FRESH,
+            handoff=HANDOFF,
+            upload=self.upload_sha256,
+            upload_files=UPLOAD,
+        )
         record_path = source / "evidence/discovery.json"
         record = json.loads(record_path.read_text())
         record["native_files"]["stray.SLDPRT"] = "0" * 64
@@ -129,18 +162,16 @@ class PlatformCaptureImportTests(unittest.TestCase):
         manifest["files"]["discovery.json"] = file_digest(record_path)
         write_json(manifest_path, manifest)
         archive = self.tmp / "foreign-inventory.zip"
-        seal_capture(
-            source,
-            archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        endpoint = FakeEndpoint(archive.read_bytes())
-        job = self._job(FRESH, archive, declared_sha256=file_digest(archive))
-        with self.assertRaisesRegex(PipelineError, "native inventory differs"):
-            platform_capture.import_native_capture(self.store, self._paths(FRESH), FRESH, job, endpoint)
+        with self.assertRaisesRegex(PipelineError, "Native discovery inventory"):
+            seal_capture(
+                source,
+                archive,
+                run_id=FRESH,
+                handoff_sha256=HANDOFF,
+                upload_sha256=self.upload_sha256,
+                main_assembly=MAIN_ASSEMBLY,
+                native_tool=self.tool,
+            )
 
     def test_a_manifest_receipt_mismatch_is_refused_and_leaves_no_tree(self) -> None:
         endpoint = FakeEndpoint(self.archive.read_bytes())

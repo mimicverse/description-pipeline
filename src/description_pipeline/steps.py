@@ -11,6 +11,8 @@ import hashlib
 import json
 import shutil
 import sys
+from .native_transfer import load_native_receipts
+
 from pathlib import Path
 
 from . import __version__
@@ -20,7 +22,7 @@ from .io import PipelineError, confined, digest, file_digest, inventory, read_da
 from .runtime import tool_record
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.revision import package_inventory
-from .stages import checked
+from .stages import checked, publication_succeeded
 
 
 def _state(emit, stage, state, **details):
@@ -285,7 +287,12 @@ def _archive_input(package: Path, staging: Path) -> None:
     ``input/records``.  Nothing is duplicated.
     """
 
-    from .sources.solidworks.discovery import DISCOVERY_FILE
+    from .sources.solidworks.discovery import (
+        DISCOVERY_FILE,
+        FINDINGS_FILE,
+        IDENTITY_FILE,
+    )
+    from .interface_records import record_archive_path
 
     payload = read_data(package / DISCOVERY_FILE)
     native_files = payload.get("native_files") if isinstance(payload.get("native_files"), dict) else {}
@@ -303,18 +310,33 @@ def _archive_input(package: Path, staging: Path) -> None:
     entries = list(payload.get("records") or [])
     if isinstance(payload.get("budget"), dict):
         entries.append(payload["budget"])
-    copied_records: set[str] = set()
+    copied_records: dict[str, tuple[str, str]] = {}
     for entry in entries:
-        package_file = str(entry.get("package_file") or "")
-        if not package_file or package_file in copied_records:
+        package_file = record_archive_path(str(entry.get("package_file") or ""))
+        casefolded = package_file.casefold()
+        source = confined(package, package_file)
+        checksum = file_digest(source)
+        existing = copied_records.get(casefolded)
+        if existing is not None:
+            if existing != (package_file, checksum):
+                raise PipelineError(f"Controlled record archive repeats a path: {package_file}")
             continue
-        copied_records.add(package_file)
-        target = confined(destination / "records", package_file, exists=False)
+        copied_records[casefolded] = (package_file, checksum)
+        target = confined(destination, package_file, exists=False)
+        if target.exists():
+            raise PipelineError(f"Controlled record archive would overwrite a file: {package_file}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(confined(package, package_file), target)
+        shutil.copyfile(source, target)
     source_path = package / "source.json"
     if source_path.is_file():
         shutil.copyfile(source_path, destination / "source.json")
+    sidecars = [DISCOVERY_FILE, FINDINGS_FILE]
+    if confined(package, IDENTITY_FILE, exists=False).is_file():
+        sidecars.append(IDENTITY_FILE)
+    for relative in sidecars:
+        target = confined(destination, relative, exists=False)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(confined(package, relative), target)
 
 
 def _rehome_evidence(staging: Path, package: Path) -> None:
@@ -786,7 +808,11 @@ def capture_evidence(
         definition = {"source": source, "plan": plan}
         prepared_files = package_inventory(package)
         _archive_input(package, staging)
-        report["package_files"] = dict(sorted(inventory(staging / "input").items()))
+        report["package_files"] = {
+            name: checksum
+            for name, checksum in sorted(inventory(staging / "input").items())
+            if name != "request.json"
+        }
         write_json(staging / "input/handoff.json", report)
         return definition, report, prepared_files
 
@@ -813,7 +839,13 @@ def capture_evidence(
             from .runtime import native_readiness
 
             return native_readiness()
-        return {"scope": "provided CAD backend; native qualification is recorded in the capture evidence"}
+        reader = getattr(backend, "native_ready", None)
+        if callable(reader):
+            return reader()
+        return {
+            "role": "native",
+            "scope": "provided CAD backend; native qualification is recorded in the capture evidence",
+        }
 
     checked(on_event, "capture", "input", "runtime.ready", ready)
     _require(package_inventory(package) == original_files, "Prepared inputs changed before native capture")
@@ -916,7 +948,12 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
         return {"subject_sha256": actual}
 
     checked(on_event, "verify", "input", "verification.subject", verify_subject)
-    report = evaluate_bundle(staging)
+    receipts = load_native_receipts(staging)
+    report = evaluate_bundle(
+        staging,
+        native_receipts=receipts,
+        require_native_receipts=True,
+    )
     write_json(staging / "reports/quality.json", report)
     checked(
         on_event,
@@ -930,7 +967,15 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
         "verify",
         "output",
         "verification.report_binding",
-        lambda: require_qualified_report(check_bundle(staging), rebuilt_definition(staging), root=staging),
+        lambda: require_qualified_report(
+            check_bundle(
+                staging,
+                native_receipts=receipts,
+                require_native_receipts=True,
+            ),
+            rebuilt_definition(staging),
+            root=staging,
+        ),
         describe=lambda value: {
             "passed": value.get("passed"),
             "subject_sha256": value.get("subject_sha256"),
@@ -972,12 +1017,16 @@ def publish_model(
         message=message,
         on_event=on_event,
     )
+    subject = result.get("subject")
     result = {
         **result,
         "pipeline_id": PIPELINE_ID,
-        "subject_sha256": result.get("subject"),
-        "passed": bool(result.get("url")) and result.get("state") in {"published", "updated", "noop"},
+        "subject_sha256": subject,
+        "passed": publication_succeeded(result, subject),
     }
 
-    _state(on_event, "publish", "completed" if result["passed"] else "failed", error=result.get("error"))
+    state = "completed" if result["passed"] else result.get("state", "failed")
+    if state not in {"completed", "failed", "unresolved"}:
+        state = "failed"
+    _state(on_event, "publish", state, error=result.get("error"))
     return result

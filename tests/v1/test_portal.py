@@ -1072,12 +1072,19 @@ class PortalTests(unittest.TestCase):
         entry["merged"] = merged
         hardware = job.get("hardware_id")
         if isinstance(hardware, str) and hardware:
+            from tests.v1.source_record_support import source_record
+
             # The registered capture tree carries the frozen source identity the
             # run page reads its hardware/revision from.
             capture = self.store.root / "sealed" / run_id / "capture" / "input"
             capture.mkdir(parents=True, exist_ok=True)
             (capture / "source.json").write_text(
-                json.dumps({"identity": {"hardware_id": hardware}, "metadata": {"revision": job.get("revision")}}),
+                json.dumps(source_record(
+                    hardware_id=hardware,
+                    handoff_digest="a" * 64,
+                    main_assembly=job.get("main_assembly") or "robot.SLDASM",
+                    revision=job.get("revision"),
+                )),
                 encoding="utf-8",
             )
 

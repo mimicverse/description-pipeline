@@ -58,7 +58,7 @@ from description_pipeline.interface_records import (
     validate_health,
 )
 from description_pipeline.schemas import CACHE_RELEASE_RECEIPT_SCHEMA, HEALTH_SCHEMA, RESOURCE_POLICY_SCHEMA
-from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, validate_freeze_events
 
 TOKEN = "scheduled-token"
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,10 +136,13 @@ def _mock_endpoint(
 ) -> tuple[ThreadingHTTPServer, dict]:
     """The one-workflow endpoint contract: full-folder staging, raw record, definition, capture."""
 
-    from description_pipeline.io import digest  # noqa: PLC0415 - the checkout arrives via --root
+    from description_pipeline import solidworks, steps
+    from description_pipeline.io import digest, confined
     from description_pipeline.orchestration import discovery_transfer  # noqa: PLC0415
     from description_pipeline.sources.solidworks.selection import seal_closure_selection  # noqa: PLC0415
     from tests.sources.selection_support import closure_evidence  # noqa: PLC0415
+    from tests.v1.split_capture_fixture import fixture_backend
+    from unittest.mock import patch
 
     main_assembly = fixture["main_assembly"]
     dependencies = sorted(name for name in upload_files if name != main_assembly)
@@ -154,7 +157,6 @@ def _mock_endpoint(
         "cache_receipts": {},
         "cache_releases": [],
     }
-    archive = Path(fixture["archive"]).read_bytes()
 
     def sealed_manifest() -> dict:
         """The closure the native endpoint seals server-side after the single full-folder upload."""
@@ -162,6 +164,14 @@ def _mock_endpoint(
         evidence = closure_evidence(
             upload_files, main_assembly, edges=edges, reader_sha256=reader_sha256, stage_root=stage_root
         )
+        recorded = (record.get("source_selection") or {}).get("closure") or {}
+        for name, document in evidence["documents"].items():
+            observations = {
+                edge["resolved"].replace("\\", "/"): edge["instance"]
+                for edge in ((recorded.get("documents") or {}).get(name) or {}).get("resolved_edges") or []
+            }
+            for edge in document["resolved_edges"]:
+                edge["instance"] = observations[edge["resolved"].replace("\\", "/")]
         return seal_closure_selection(upload_files, main_assembly, evidence, reader_sha256=reader_sha256)
 
     class Handler(BaseHTTPRequestHandler):
@@ -236,9 +246,29 @@ def _mock_endpoint(
                     "upload_sha256": digest(upload_files),
                     "main_assembly": main_assembly,
                 }
+                try:
+                    supplied_freeze = validate_freeze_events(payload.get("freeze_events"))
+                except Exception:
+                    self._send(409, {"error": "selection request freeze binding is invalid"})
+                    return
+                freeze_receipt = payload.get("freeze_receipt_sha256")
                 if (
-                    set(payload) - {"run_id", "upload_files", "upload_sha256", "main_assembly", "resume"}
+                    set(payload)
+                    - {
+                        "run_id",
+                        "upload_files",
+                        "upload_sha256",
+                        "main_assembly",
+                        "freeze_events",
+                        "freeze_events_sha256",
+                        "freeze_receipt_sha256",
+                        "resume",
+                    }
                     or {key: payload.get(key) for key in fresh} != fresh
+                    or payload.get("freeze_events_sha256") != digest(supplied_freeze)
+                    or not isinstance(freeze_receipt, str)
+                    or len(freeze_receipt) != 64
+                    or any(character not in "0123456789abcdef" for character in freeze_receipt)
                 ):
                     self._send(409, {"error": "selection request differs from the staged intake"})
                     return
@@ -329,6 +359,10 @@ def _mock_endpoint(
                     self._send(200, _view(job))
                     return
                 state["uploads"] += 1
+                for name, data in members.items():
+                    target = confined(Path(stage_root), name, exists=False)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
                 manifest = sealed_manifest()
                 sealed = discovery_transfer.seal_raw_record_bundle(
                     {**record, "source_selection": manifest},
@@ -353,7 +387,7 @@ def _mock_endpoint(
                 )
                 job["status"] = "awaiting_definition"
                 job["events"] = [
-                    *fixture["native_stages"]["events"],
+                    *job["request"]["freeze_events"],
                     {"stage": "job", "state": "awaiting_definition", "at": "t0"},
                 ]
                 self._send(200, _view(job))
@@ -363,16 +397,75 @@ def _mock_endpoint(
                 if not body or len(prepared) != 64 or any(item not in "0123456789abcdef" for item in prepared):
                     self._send(400, {"error": "definition binding is invalid"})
                     return
+                requested = {"sha256": hashlib.sha256(body).hexdigest(), "prepared_sha256": prepared}
+                if job.get("capture_request") is not None:
+                    self._send(200 if job["capture_request"] == requested else 409, _view(job))
+                    return
+                attempt = bundle_dir / ("attempt-" + uuid.uuid4().hex)
+                attempt.mkdir()
+                definition_archive = attempt / "capture-request.zip"
+                destination = attempt / "prepared"
+                try:
+                    definition_archive.write_bytes(body)
+                    shutil.copytree(stage_root, destination)
+                    prepared_package = discovery_transfer.stage_capture_request(
+                        definition_archive,
+                        destination,
+                        expected_run_id=run_id,
+                        expected_selection=job["selection"]["manifest"],
+                        expected_record={**record, "source_selection": job["selection"]["manifest"]},
+                        expected_native_tool=fixture["native_tool"],
+                        expected_prepared_sha256=prepared,
+                        expected_archive_sha256=requested["sha256"],
+                    )
+                    events = list(job["request"]["freeze_events"])
+
+                    def observed(event):
+                        events.append({"at": datetime.now(UTC).isoformat(), **event})
+
+                    package, _target, prepared_package, prepared_files = steps.discover_structure(
+                        Path(stage_root), destination, run_id,
+                        expected_digest=job["handoff_sha256"],
+                        expected_files=job["package_files"],
+                        main_assembly=main_assembly, configuration={}, targets={},
+                        prepared=prepared_package, on_event=observed,
+                    )
+                    capture_dir = attempt / "capture"
+                    with (
+                        patch.object(solidworks, "_native_tool_record", return_value=fixture["native_tool"]),
+                        patch("description_pipeline.runtime.tool_record", return_value=fixture["native_tool"]),
+                    ):
+                        result = solidworks.capture(
+                            package, capture_dir, backend=fixture_backend(package, main_assembly),
+                            run_id=run_id, main_assembly=main_assembly,
+                            expected_inputs=prepared_files, prior_events=events,
+                            handoff_sha256=job["handoff_sha256"],
+                            upload_sha256=job["request"]["upload_sha256"],
+                        )
+                    receipt = result.get("capture_archive")
+                    if (
+                        result.get("native_complete") is not True
+                        or result.get("state") != "native_complete"
+                        or not isinstance(receipt, dict)
+                    ):
+                        raise RuntimeError(f"Control fixture capture failed: {result.get('error')}")
+                    archive_bytes = (capture_dir / receipt["name"]).read_bytes()
+                    native_stages = json.loads((capture_dir / "reports/native-stages.json").read_text())
+                except Exception as error:
+                    shutil.rmtree(destination, ignore_errors=True)
+                    self._send(409, {"error": str(error)})
+                    return
                 state["definition_posts"].append({"prepared_sha256": prepared, "size": len(body)})
-                job["_artifacts"][fixture["receipt"]["name"]] = archive
+                job["_artifacts"][receipt["name"]] = archive_bytes
+                job.update(
+                    capture_request=requested,
+                    prepared_dir=str(package),
+                    prepared_files=dict(prepared_files),
+                )
                 job["status"] = "native_complete"
-                job["stages"] = fixture["native_stages"]
-                job["events"] = [*fixture["native_stages"]["events"]]
-                job["result"] = {
-                    "native_complete": True,
-                    "native_tool": fixture["native_tool"],
-                    "capture_archive": dict(fixture["receipt"]),
-                }
+                job["stages"] = native_stages
+                job["events"] = list(job["stages"]["events"])
+                job["result"] = result
                 job["error"] = None
                 self._send(200, _view(job))
                 return
@@ -1135,6 +1228,29 @@ def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict, 
     }
 
 
+def _wait_platform_sql_evidence(
+    platform_schema: str,
+    run_id: str,
+    projection: dict,
+    *,
+    request_id: str,
+    timeout_seconds: float = 30.0,
+) -> dict:
+    """Allow the post-DagRun failure callback to settle before asserting platform rows."""
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        evidence = _platform_sql_evidence(
+            platform_schema,
+            run_id,
+            projection,
+            request_id=request_id,
+        )
+        if evidence.get("ok") or time.monotonic() >= deadline:
+            return evidence
+        time.sleep(1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -1722,7 +1838,7 @@ def main() -> int:
                     problems.append(
                         "the preview and the quality document do not agree on one bound subject digest"
                     )
-            sql_evidence = _platform_sql_evidence(
+            sql_evidence = _wait_platform_sql_evidence(
                 args.platform_schema,
                 native_id,
                 projection,

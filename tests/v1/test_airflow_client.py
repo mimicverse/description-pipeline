@@ -39,6 +39,7 @@ from description_pipeline.orchestration.airflow_client import (
 from description_pipeline.sources.solidworks.handoff import HANDOFF_SCHEMA
 from description_pipeline.io import digest
 from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
+from .freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
 
 TOKEN = "test-token"
 RUN_ID = "b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
@@ -93,7 +94,14 @@ READER_SHA256 = "d" * 64
 
 
 def start_staging(endpoint, run_id: str = RUN_ID, **overrides) -> dict:
-    payload = {"run_id": run_id, "upload_files": SELECTION_FILES, "main_assembly": "assembly.SLDASM"}
+    prior = freeze_events()
+    payload = {
+        "run_id": run_id,
+        "upload_files": SELECTION_FILES,
+        "main_assembly": "assembly.SLDASM",
+        "freeze_events": prior,
+        "freeze_receipt_sha256": FREEZE_RECEIPT_SHA256,
+    }
     payload.update(overrides)
     return endpoint.start_staging_job(**payload)
 

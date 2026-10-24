@@ -8,6 +8,7 @@ side's battery, not claimed by these unit tests.
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import tempfile
@@ -42,13 +43,19 @@ from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.solidworks_urdf import required_checks
+from tests.v1.source_record_support import source_record
 
 NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
 CHECKPOINT = "store://sealed/run-r-1"
 NATIVE_STAGE_STATES = {"freeze": "frozen", "discover": "discovered", "capture": "native_complete"}
 
 
-def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
+def build_sealed_delivery(
+    root: Path,
+    *,
+    hardware_id: str = "nd",
+    revision: str | None = None,
+) -> tuple[str, list[dict], str, str]:
     """One real sealed delivery: manifest record-for-record plus its digests.
 
     The tree covers the declared evidence of all six stages, so the same
@@ -62,16 +69,26 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
         (root / name).mkdir(parents=True)
     (root / "input" / "records").mkdir()
     (root / "evidence" / "geometry").mkdir()
-    write_json(root / "input" / "source.json", {"source": "fixture"})
     write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
     (root / "input" / "cad" / "cad").mkdir(parents=True)
     (root / "input" / "cad" / "cad" / "robot.SLDASM").write_bytes(b"fixture-native")
+    native_inventory = {
+        "cad/robot.SLDASM": file_digest(root / "input" / "cad" / "cad" / "robot.SLDASM")
+    }
+    write_json(
+        root / "input" / "source.json",
+        source_record(
+            hardware_id=hardware_id,
+            handoff_digest=digest(native_inventory),
+            main_assembly="cad/robot.SLDASM",
+            revision=revision,
+        ),
+    )
     package_files = {
         "source.json": file_digest(root / "input" / "source.json"),
         "records/arm.json": file_digest(root / "input" / "records" / "arm.json"),
         "cad/cad/robot.SLDASM": file_digest(root / "input" / "cad" / "cad" / "robot.SLDASM"),
     }
-    native_inventory = {"cad/robot.SLDASM": package_files["cad/cad/robot.SLDASM"]}
     write_json(
         root / "input" / "handoff.json",
         {
@@ -86,6 +103,13 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
             "discovery": "fixture",
             "handoff_sha256": digest(native_inventory),
             "native_files": native_inventory,
+            "identity": {
+                "main_assembly": "cad/robot.SLDASM",
+                "delivery_configuration": "Default",
+                "hardware_id": hardware_id,
+                "revision": revision,
+            },
+            "records": [],
         },
     )
     write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
@@ -115,7 +139,7 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
         build_request_evidence(
             purpose="engineering",
             request_id="fixture-sealed-delivery",
-            target_hardware="nd",
+            target_hardware=hardware_id,
             change_summary="fixture",
             main_assembly="cad/robot.SLDASM",
             handoff_digest=digest(package_files),
@@ -3200,6 +3224,8 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
 
         discover_root = self.tmp / self.run_id / "discover"
         subject, artifacts, _upload, native_handoff = build_sealed_delivery(discover_root)
+        capture_root = self.tmp / self.run_id / "capture"
+        capture_subject, capture_artifacts, _capture_upload, _capture_handoff = build_sealed_delivery(capture_root)
         native_tool = read_data(discover_root / "reports" / "native-tool.json")
         native_stages = self._capture_stage_view()
         self.store.confirm_stage(
@@ -3234,7 +3260,10 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 "state": "failed",
                 "passed": False,
                 "error": "The sealed capture plan carries an unsafe selector document",
+                "subject_sha256": capture_subject,
+                "artifacts": capture_artifacts,
             },
+            checkpoint_uri=f"store://sealed/{self.run_id}/capture",
         )
         for stage in ("generate", "verify", "publish"):
             self.store.confirm_stage(run_id=self.run_id, stage=stage, state="blocked", receipt={})
@@ -3668,6 +3697,161 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 owner_operation_id=self.native_id,
             )
         self.assertEqual(self.world.snapshot_state(), before)
+
+    def test_state_first_recovery_revalidates_sealed_rows_receipts_and_airflow(self) -> None:
+        self._prepare_capture_failure()
+        reconcile = self._capture_reconcile()
+        self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
+
+        original_freeze = self.world.stages[(self.run_id, "freeze")]
+        self.world.stages[(self.run_id, "freeze")] = (
+            "completed",
+            {},
+            *original_freeze[2:],
+        )
+        with self.assertRaises((PlatformStoreError, PipelineError)):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.world.stages[(self.run_id, "freeze")] = original_freeze
+
+        original_capture = self.world.stages[(self.run_id, "capture")]
+        changed_capture = dict(original_capture[1])
+        changed_capture["passed"] = True
+        self.world.stages[(self.run_id, "capture")] = (
+            "failed",
+            changed_capture,
+            *original_capture[2:],
+        )
+        with self.assertRaises(PlatformStoreError):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.world.stages[(self.run_id, "capture")] = original_capture
+
+        for label, mutate in (
+            ("subject", lambda receipt: receipt.update(subject_sha256="f" * 64)),
+            ("error", lambda receipt: receipt.update(error="FORGED CAPTURE ERROR")),
+            ("native-receipt", lambda receipt: receipt.update(native_receipt_sha256="f" * 64)),
+        ):
+            with self.subTest(mutation=label):
+                changed_capture = copy.deepcopy(original_capture[1])
+                mutate(changed_capture)
+                self.world.stages[(self.run_id, "capture")] = (
+                    "failed",
+                    changed_capture,
+                    *original_capture[2:],
+                )
+                before = self.world.snapshot_state()
+                with self.assertRaises(PlatformStoreError):
+                    self.store.completed_native_capture_recovery(
+                        run_id=self.run_id,
+                        operation_key=reconcile["operation_key"],
+                        params_digest=reconcile["params_digest"],
+                        owner_operation_id=self.native_id,
+                    )
+                self.assertEqual(self.world.snapshot_state(), before)
+                self.world.stages[(self.run_id, "capture")] = original_capture
+
+        original_discover = self.world.stages[(self.run_id, "discover")]
+        changed_discover = copy.deepcopy(original_discover[1])
+        changed_discover["native_stages_sha256"] = "f" * 64
+        self.world.stages[(self.run_id, "discover")] = (
+            "completed",
+            changed_discover,
+            *original_discover[2:],
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "stage receipt bytes"):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.world.stages[(self.run_id, "discover")] = original_discover
+
+        self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "running"
+        with self.assertRaises(PlatformStoreError):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "failed"
+
+        for run_state in ("running", "queued", "succeeded", "unresolved"):
+            with self.subTest(run_state=run_state):
+                self.world.run_states[self.run_id] = run_state
+                before = self.world.snapshot_state()
+                with self.assertRaisesRegex(PlatformStoreError, "terminal failed run"):
+                    self.store.completed_native_capture_recovery(
+                        run_id=self.run_id,
+                        operation_key=reconcile["operation_key"],
+                        params_digest=reconcile["params_digest"],
+                        owner_operation_id=self.native_id,
+                    )
+                self.assertEqual(self.world.snapshot_state(), before)
+        self.world.run_states[self.run_id] = "failed"
+
+        original_receipt_bytes = self.log.read_bytes()
+        changed_receipt = json.loads(original_receipt_bytes)
+        changed_receipt["error"] = "FORGED NATIVE RECEIPT"
+        self._write_document(changed_receipt)
+        with self.assertRaisesRegex(PlatformStoreError, "original receipt bytes"):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.log.write_bytes(original_receipt_bytes)
+
+        discover_root = self.tmp / self.run_id / "discover"
+        backup = self.tmp / "discover-backup"
+        shutil.copytree(discover_root, backup)
+        shutil.rmtree(discover_root)
+        with self.assertRaises((PlatformStoreError, PipelineError)):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        shutil.copytree(backup, discover_root)
+
+    def test_state_first_recovery_refuses_foreign_checkpoint_scope(self) -> None:
+        self._prepare_capture_failure()
+        reconcile = self._capture_reconcile()
+        self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
+        foreign_run = "11111111-1111-4111-8111-111111111111"
+        for stage in ("freeze", "discover", "capture"):
+            with self.subTest(stage=stage):
+                original = self.world.stages[(self.run_id, stage)]
+                source = self.tmp / self.run_id / stage
+                foreign = self.tmp / foreign_run / stage
+                shutil.copytree(source, foreign)
+                self.world.stages[(self.run_id, stage)] = (
+                    original[0],
+                    original[1],
+                    f"store://sealed/{foreign_run}/{stage}",
+                    *original[3:],
+                )
+                with self.assertRaisesRegex(PlatformStoreError, "proven origin"):
+                    self.store.completed_native_capture_recovery(
+                        run_id=self.run_id,
+                        operation_key=reconcile["operation_key"],
+                        params_digest=reconcile["params_digest"],
+                        owner_operation_id=self.native_id,
+                    )
+                self.world.stages[(self.run_id, stage)] = original
+                shutil.rmtree(foreign)
 
     def test_capture_settlement_refuses_a_foreign_owner_binding(self) -> None:
         self._prepare_capture_failure()

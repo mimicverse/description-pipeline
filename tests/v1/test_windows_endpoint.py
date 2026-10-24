@@ -46,7 +46,7 @@ class _DelayedWorkerMutex:
 
 
 class EndpointTests(EndpointFixture, unittest.TestCase):
-    def test_selection_flow_reaches_a_sealed_capture_transfer(self):
+    def test_selection_flow_reaches_a_sealed_capture_transfer_with_linux_freeze_events(self):
         calls: list[dict] = []
 
         def runner(package, output, **kwargs):
@@ -66,7 +66,10 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual(calls[0]["main_assembly"], MAIN)
         self.assertEqual(set(finished["capture_archive"]), {"name", "sha256", "size", "manifest_sha256"})
-        self.assertNotIn("freeze", {event.get("stage") for event in finished["events"]})
+        self.assertEqual(
+            [event for event in finished["events"] if event.get("stage") == "freeze"],
+            request["freeze_events"],
+        )
         # The operator request binding stays exactly as submitted.
         self.assertEqual(request, finished["request"])
         self.assertEqual(MAIN, finished["main_assembly"])
@@ -118,9 +121,12 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         finished = self.await_terminal(jobs, request["run_id"])
         self.assertEqual("failed", finished["status"])
         self.assertEqual("discover", finished["events"][-1]["stage"])
-        self.assertNotIn("freeze", {event.get("stage") for event in finished["events"]})
+        self.assertEqual(
+            [event for event in finished["events"] if event.get("stage") == "freeze"],
+            request["freeze_events"],
+        )
 
-    def test_source_change_after_selection_fails_in_discover_without_a_windows_freeze_stage(self):
+    def test_source_change_after_selection_keeps_only_the_linux_freeze_block(self):
         from description_pipeline.orchestration.selection_transport import StagedSelection
 
         original = StagedSelection.seal_closure
@@ -138,7 +144,10 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual("failed", finished["status"])
         self.assertIn("Selected source digest changed after native closure resolution", finished["error"])
         self.assertEqual("discover", finished["events"][-1]["stage"])
-        self.assertNotIn("freeze", {event.get("stage") for event in finished["events"]})
+        self.assertEqual(
+            [event for event in finished["events"] if event.get("stage") == "freeze"],
+            request["freeze_events"],
+        )
 
     def test_blocking_native_reader_keeps_the_run_pollable(self):
         started, release = threading.Event(), threading.Event()

@@ -29,6 +29,7 @@ from description_pipeline.orchestration.discovery_transfer import (
 from description_pipeline.orchestration.windows import Jobs, read_config
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings
 from tests.sources.test_solidworks_discovery import record as native_record
+from .freeze_event_support import freeze_request_fields
 from .protocol_support import protocol_events
 
 #: The neutral discovery fixture's exact file set and byte layout.
@@ -144,6 +145,7 @@ class EndpointFixture:
             "upload_files": copy.deepcopy(self.upload_files),
             "upload_sha256": self.upload_sha,
             "main_assembly": MAIN,
+            **freeze_request_fields(),
             **extra,
         }
 

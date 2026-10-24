@@ -32,6 +32,7 @@ from description_pipeline.orchestration.selection_client import prepare_staging_
 from description_pipeline.orchestration.windows import RequestError, handler
 from description_pipeline.sources.solidworks.discovery import DISCOVERY_FILE, DiscoverySettings
 from .endpoint_support import MAIN, TOOL, EndpointFixture, source_bytes
+from .freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
 
 
 class DefinitionEndpointTests(EndpointFixture, unittest.TestCase):
@@ -236,7 +237,13 @@ class DefinitionClientLoopbackTests(EndpointFixture, unittest.TestCase):
             EndpointConfig(base_url=f"http://127.0.0.1:{server.server_port}", token=jobs.config["token"], timeout=5.0)
         )
         run_id = str(uuid.uuid4())
-        client.start_staging_job(run_id=run_id, upload_files=self.upload_files, main_assembly=MAIN)
+        client.start_staging_job(
+            run_id=run_id,
+            upload_files=self.upload_files,
+            main_assembly=MAIN,
+            freeze_events=freeze_events(),
+            freeze_receipt_sha256=FREEZE_RECEIPT_SHA256,
+        )
 
         source = Path(self.enterContext(TemporaryDirectory()))
         for name, payload in source_bytes().items():
