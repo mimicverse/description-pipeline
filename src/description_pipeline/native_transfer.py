@@ -127,8 +127,9 @@ def _capture_execution(value, *, run_id: str) -> dict:
         "claim_id",
         "command_id",
         "effect_id",
-        "executor_sha256",
         "fence",
+        "native_tool_sha256",
+        "owner_sha256",
         "run_id",
     }
     _require(
@@ -147,7 +148,8 @@ def _capture_execution(value, *, run_id: str) -> dict:
         "Capture execution lacks its command, claim or effect identity",
     )
     _require(type(value.get("fence")) is int and value["fence"] > 0, "Capture execution fence is invalid")
-    _require(_is_sha256(value.get("executor_sha256")), "Capture execution tool digest is invalid")
+    _require(_is_sha256(value.get("owner_sha256")), "Capture execution owner digest is invalid")
+    _require(_is_sha256(value.get("native_tool_sha256")), "Capture execution native tool digest is invalid")
     return dict(value)
 
 
@@ -1252,6 +1254,10 @@ def capture_manifest(
     if capture_only:
         manifest["upstream_artifacts"] = _capture_upstream(upstream_artifacts)
         manifest["execution"] = _capture_execution(execution, run_id=run_id)
+        _require(
+            manifest["execution"]["native_tool_sha256"] == manifest["native_tool_sha256"],
+            "Capture execution native tool differs from the transfer tool",
+        )
     verify_transfer(
         root,
         transfer_manifest=manifest,
@@ -1524,6 +1530,11 @@ def verify_transfer(
         manifest.get("native_tool_sha256") == digest(manifest.get("native_tool")),
         "Transfer manifest native tool digest differs from its record",
     )
+    if capture_only_scope:
+        _require(
+            execution["native_tool_sha256"] == manifest.get("native_tool_sha256"),
+            "Capture execution native tool differs from the transfer tool",
+        )
     _validate_native_tool(manifest.get("native_tool"))
     if receipt_native_tool is not None:
         _require(

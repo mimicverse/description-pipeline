@@ -44,6 +44,19 @@ def artifact(identifier: str, stage: str, run_id: str) -> ArtifactRef:
     )
 
 
+class _Effects:
+    def __init__(self) -> None:
+        self.authorized = []
+        self.observed = []
+
+    def authorize(self, **request):
+        self.authorized.append(request)
+        return request["effect_key"]
+
+    def observe(self, **observation):
+        self.observed.append(observation)
+
+
 class CaptureHandlerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="capture-handler-")
@@ -79,6 +92,7 @@ class CaptureHandlerTests(unittest.TestCase):
                 "effect_id": "effect-capture",
                 "handoff_sha256": self.fixture["handoff_sha256"],
                 "main_assembly": MAIN,
+                "native_tool_sha256": digest(self.fixture["native_tool"]),
                 "prepared_sha256": digest(self.fixture["prepared_files"]),
                 "upload_sha256": self.fixture["handoff_sha256"],
             },
@@ -117,17 +131,27 @@ class CaptureHandlerTests(unittest.TestCase):
             },
         )
 
-    def handler(self, *, native_operation=None, tool=None) -> CaptureHandler:
+    def handler(
+        self,
+        *,
+        native_operation=None,
+        tool=None,
+        effects: _Effects | None = None,
+    ) -> CaptureHandler:
+        effects = effects or _Effects()
         return CaptureHandler(
             backend_factory=lambda package: fixture_backend(package, MAIN),
             native_tool_factory=lambda: tool or self.fixture["native_tool"],
             native_operation=native_operation,
+            effect_authorizer=effects.authorize,
+            effect_observer=effects.observe,
         )
 
     def test_real_capture_seal_and_linux_admission_keep_producer_and_executor_separate(self) -> None:
         discovery_before = (self.package / "discovery/native-discovery.json").read_bytes()
+        effects = _Effects()
         with patch("description_pipeline.runtime.tool_record", return_value=self.fixture["native_tool"]):
-            execution = self.handler().execute(self.command, self.claim, self.workspace())
+            execution = self.handler(effects=effects).execute(self.command, self.claim, self.workspace())
 
         self.assertEqual(execution.outcome, "completed")
         admitted = Path(execution.candidate_root)
@@ -136,6 +160,10 @@ class CaptureHandlerTests(unittest.TestCase):
         self.assertEqual(manifest["run_id"], CHILD)
         self.assertEqual(manifest["native_stage_scope"], ["capture"])
         self.assertEqual(manifest["execution"]["effect_id"], "effect-capture")
+        self.assertNotEqual(
+            manifest["execution"]["owner_sha256"],
+            manifest["execution"]["native_tool_sha256"],
+        )
         self.assertEqual(
             {
                 row["producer_stage"]: row["producer_run_id"]
@@ -144,6 +172,14 @@ class CaptureHandlerTests(unittest.TestCase):
             {"discover": PARENT, "freeze": PARENT},
         )
         self.assertEqual((self.package / "discovery/native-discovery.json").read_bytes(), discovery_before)
+        authorization = effects.authorized[0]
+        self.assertEqual(authorization["effect_key"], "effect-capture")
+        self.assertEqual(authorization["outbound_digest"], digest(authorization["outbound"]))
+        self.assertEqual(
+            authorization["expected_state_digest"],
+            digest(authorization["expected_state"]),
+        )
+        self.assertEqual(effects.observed[0]["state_class"], "known")
 
     def test_producer_identity_is_rejected_before_native_operation(self) -> None:
         operation = Mock()
@@ -156,6 +192,57 @@ class CaptureHandlerTests(unittest.TestCase):
                 self.workspace(discover_run_id="a0000000-0000-4000-8000-000000000099"),
             )
         operation.assert_not_called()
+
+    def test_missing_effect_gateway_fails_before_native_operation(self) -> None:
+        operation = Mock()
+        handler = CaptureHandler(
+            backend_factory=lambda package: fixture_backend(package, MAIN),
+            native_tool_factory=lambda: self.fixture["native_tool"],
+            native_operation=operation,
+        )
+        with self.assertRaisesRegex(Exception, "effect_gateway_required"):
+            handler.execute(self.command, self.claim, self.workspace())
+        operation.assert_not_called()
+
+    def test_native_tool_mismatch_is_rejected_before_effect_or_native_operation(self) -> None:
+        operation = Mock()
+        authorizer = Mock()
+        command = self._command(
+            request={
+                **self.command.to_record()["request"],
+                "native_tool_sha256": "f" * 64,
+            }
+        )
+        handler = CaptureHandler(
+            backend_factory=lambda package: fixture_backend(package, MAIN),
+            native_tool_factory=lambda: self.fixture["native_tool"],
+            native_operation=operation,
+            effect_authorizer=authorizer,
+            effect_observer=Mock(),
+        )
+        with self.assertRaisesRegex(Exception, "native_tool_mismatch"):
+            handler.execute(command, self.claim, self.workspace())
+        operation.assert_not_called()
+        authorizer.assert_not_called()
+
+    def test_unsettled_prior_effect_is_queried_before_native_operation(self) -> None:
+        operation = Mock()
+        observer = Mock()
+
+        def unresolved(**request):
+            raise CaptureUnresolved("effect.unknown")
+
+        handler = CaptureHandler(
+            backend_factory=lambda package: fixture_backend(package, MAIN),
+            native_tool_factory=lambda: self.fixture["native_tool"],
+            native_operation=operation,
+            effect_authorizer=unresolved,
+            effect_observer=observer,
+        )
+        with self.assertRaisesRegex(CaptureUnresolved, "effect.unknown"):
+            handler.execute(self.command, self.claim, self.workspace())
+        operation.assert_not_called()
+        observer.assert_not_called()
 
     def test_plan_must_cover_the_complete_active_object_set_before_native_operation(self) -> None:
         package = self.root / "incomplete-plan"
@@ -190,6 +277,7 @@ class CaptureHandlerTests(unittest.TestCase):
         operation.assert_not_called()
 
     def test_unknown_native_effect_never_becomes_a_terminal_stage_result(self) -> None:
+        effects = _Effects()
         operation = Mock(
             return_value=NativeCaptureResult(
                 "unknown",
@@ -200,8 +288,14 @@ class CaptureHandlerTests(unittest.TestCase):
             )
         )
         with self.assertRaises(CaptureUnresolved):
-            self.handler(native_operation=operation).execute(self.command, self.claim, self.workspace())
+            self.handler(native_operation=operation, effects=effects).execute(
+                self.command,
+                self.claim,
+                self.workspace(),
+            )
         self.assertEqual(operation.call_count, 1)
+        self.assertEqual(effects.authorized[0]["effect_key"], "effect-capture")
+        self.assertEqual(effects.observed[0]["state_class"], "unobservable")
 
     def test_admission_rejects_tampered_upstream_identity_without_installing(self) -> None:
         workspace = self.workspace()
@@ -222,8 +316,9 @@ class CaptureHandlerTests(unittest.TestCase):
             "claim_id": self.claim.claim_id,
             "command_id": self.command.command_id,
             "effect_id": "effect-capture",
-            "executor_sha256": self.claim.owner_sha256,
             "fence": self.claim.fence,
+            "native_tool_sha256": digest(self.fixture["native_tool"]),
+            "owner_sha256": self.claim.owner_sha256,
             "run_id": self.command.run_id,
         }
         with self.assertRaisesRegex(Exception, "upstream"):

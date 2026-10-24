@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import shutil
 import tempfile
+import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from ..io import PipelineError, digest, read_data
+from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, writable_output
+from ..io import (
+    PipelineError,
+    acquire_process_lock,
+    digest,
+    file_digest,
+    inventory,
+    read_data,
+    write_json,
+)
 from ..sources.solidworks.discovery import DISCOVERY_FILE, native_component_identity
 from ..sources.solidworks.revision import package_inventory
+from ..stages import STAGE_IDS, stage_view
 from .contracts import ArtifactRef, ExecutionClaim, ProtocolError, StageCandidate, StageCommand, StageExecution
 from .engine import StageWorkspace
 
@@ -32,6 +47,7 @@ class CaptureRequest:
     prepared_sha256: str
     main_assembly: str
     effect_id: str
+    native_tool_sha256: str
 
     @classmethod
     def from_command(cls, command: StageCommand) -> CaptureRequest:
@@ -42,6 +58,7 @@ class CaptureRequest:
             "effect_id",
             "handoff_sha256",
             "main_assembly",
+            "native_tool_sha256",
             "prepared_sha256",
             "upload_sha256",
         }
@@ -53,7 +70,7 @@ class CaptureRequest:
         values = {key: request[key] for key in required}
         if not all(isinstance(value, str) and value and "\x00" not in value for value in values.values()):
             raise ProtocolError("capture.request_invalid", {"where": "text-fields"})
-        for key in ("handoff_sha256", "prepared_sha256", "upload_sha256"):
+        for key in ("handoff_sha256", "native_tool_sha256", "prepared_sha256", "upload_sha256"):
             value = values[key]
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ProtocolError("capture.request_invalid", {"where": key})
@@ -169,15 +186,27 @@ class NativeCaptureResult:
             raise ProtocolError("capture.native_reason", {"outcome": self.outcome})
 
 
-def _execution_record(command: StageCommand, claim: ExecutionClaim, request: CaptureRequest) -> dict[str, Any]:
+def _execution_record(
+    command: StageCommand,
+    claim: ExecutionClaim,
+    request: CaptureRequest,
+    native_tool: Mapping[str, Any],
+) -> dict[str, Any]:
     if claim.command_id != command.command_id or claim.owner_sha256 != command.expected_executor_sha256:
         raise ProtocolError("capture.claim_mismatch", {"command_id": command.command_id})
+    native_tool_sha256 = digest(native_tool)
+    if native_tool_sha256 != request.native_tool_sha256:
+        raise ProtocolError(
+            "capture.native_tool_mismatch",
+            {"expected": request.native_tool_sha256, "actual": native_tool_sha256},
+        )
     return {
         "claim_id": claim.claim_id,
         "command_id": command.command_id,
         "effect_id": request.effect_id,
-        "executor_sha256": claim.owner_sha256,
         "fence": claim.fence,
+        "native_tool_sha256": native_tool_sha256,
+        "owner_sha256": claim.owner_sha256,
         "run_id": command.run_id,
     }
 
@@ -198,7 +227,206 @@ def _native_tool_record() -> dict[str, Any]:
     return tool_record(role="native")
 
 
-def capture_native_transaction(
+@contextmanager
+def _capture_output_lock(output: Path):
+    """One attempt owns the destination lock for the complete native transaction."""
+
+    if output.is_symlink() or output.is_junction():
+        raise PipelineError("Output cannot be a symlink or junction")
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output.parent / f".{output.name}.description.lock"
+    try:
+        handle = acquire_process_lock(lock_path)
+    except OSError as error:
+        raise PipelineError(f"Another run owns {lock_path} or its ownership lock is unavailable") from error
+    try:
+        yield output
+    finally:
+        os.close(handle)
+
+
+def _capture_receipt(
+    run_id: str,
+    prior_events,
+    *,
+    resume: Mapping[str, Any] | None,
+    handoff_sha256: str,
+) -> dict[str, Any]:
+    """Create a native-only receipt; prior events are accepted only by the legacy adapter."""
+
+    events = [event for event in (prior_events or ()) if isinstance(event, dict)]
+    scope = [
+        stage
+        for stage in STAGE_IDS
+        if any(event.get("stage") == stage for event in events)
+    ] + ["capture"]
+    receipt = {
+        "schema_version": BUNDLE_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "run_id": run_id or str(uuid.uuid4()),
+        "handoff_sha256": handoff_sha256,
+        "state": "failed",
+        "events": events,
+        "execution_scope": scope,
+    }
+    if resume:
+        receipt["resume"] = {
+            "parent_run": resume.get("parent_run"),
+            "from_stage": resume.get("from_stage"),
+        }
+    return receipt
+
+
+def _capture_event_sink(receipt: dict[str, Any], on_event=None):
+    def event(item):
+        entry = {"at": datetime.now(UTC).isoformat(), **item}
+        receipt.setdefault("events", []).append(entry)
+        receipt["stage"] = item["stage"]
+        if on_event is not None:
+            on_event({**entry, "pipeline_id": PIPELINE_ID, "run_id": receipt["run_id"]})
+
+    return event
+
+
+def _install_capture_tree(staging: Path, target: Path) -> None:
+    if not writable_output(target):
+        raise PipelineError(f"Output must be absent or empty: {target}")
+    backup = Path(tempfile.mkdtemp(prefix=f".{target.name}-previous-", dir=target.parent))
+    backup.rmdir()
+    moved = False
+    try:
+        if target.exists():
+            os.replace(target, backup)
+            moved = True
+        os.replace(staging, target)
+    except BaseException:
+        if moved and not target.exists():
+            os.replace(backup, target)
+        raise
+    finally:
+        if backup.exists() and target.exists():
+            shutil.rmtree(backup)
+
+
+def _stamp_capture(root: Path, receipt: dict[str, Any]) -> None:
+    receipt["artifacts"] = inventory(root, exclude=("reports/stages.json",))
+    write_json(root / "reports/stages.json", stage_view(receipt))
+    receipt["stage_report"] = {
+        "path": "reports/stages.json",
+        "sha256": file_digest(root / "reports/stages.json"),
+    }
+
+
+def _keep_capture_diagnostic(staging: Path, output: Path, receipt: dict[str, Any]) -> Path:
+    _stamp_capture(staging, receipt)
+    failed = output.with_name(output.name + ".failed")
+    if not writable_output(failed):
+        failed = Path(tempfile.mkdtemp(prefix=output.name + ".failed-", dir=output.parent))
+        failed.rmdir()
+    _install_capture_tree(staging, failed)
+    return failed
+
+
+def _failed_capture(staging, output, receipt, event, error):
+    phase = receipt.get("stage", receipt["execution_scope"][0])
+    if not receipt.get("events") or receipt["events"][-1]["state"] != "failed":
+        with contextlib.suppress(Exception):
+            event({"stage": phase, "state": "failed"})
+    receipt.update(passed=False, state="failed", stage=phase, error=str(error))
+    receipt["native_complete"] = False
+    if hasattr(error, "code"):
+        receipt["error_code"] = error.code
+    detail = getattr(error, "detail", None) or getattr(error, "details", None)
+    if detail is not None:
+        receipt["detail"] = detail
+    has_staging = staging is not None and staging.exists()
+    root = staging if has_staging else output
+    quality_path = root / "reports/quality.json"
+    if quality_path.is_file():
+        receipt["quality"] = read_data(quality_path)
+        receipt["subject_sha256"] = receipt["quality"].get("subject_sha256")
+    if has_staging:
+        receipt["diagnostic_path"] = str(_keep_capture_diagnostic(staging, output, receipt))
+    else:
+        _stamp_capture(output, receipt)
+        receipt["diagnostic_path"] = str(output)
+    return receipt
+
+
+def _seal_native_capture_artifact(
+    staging: Path,
+    output: Path,
+    receipt: dict[str, Any],
+    *,
+    run_id: str,
+    handoff_sha256: str,
+    upload_sha256: str | None,
+    main_assembly: str,
+    upstream_artifacts=None,
+    execution=None,
+    native_tool: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seal the native artifact and atomically install the completed Capture tree."""
+
+    from ..native_transfer import expected_native_check_details
+    from ..orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
+
+    upload_sha256 = upload_sha256 or handoff_sha256
+    tool = native_tool or _native_tool_record()
+    write_json(staging / "reports/native-tool.json", tool)
+    receipt.update(
+        state="native_complete",
+        passed=False,
+        native_complete=True,
+        native_tool=tool,
+        stage="capture",
+    )
+    discovery = read_data(staging / "evidence/discovery.json")
+    native_files = discovery.get("native_files") if isinstance(discovery, dict) else None
+    if not isinstance(native_files, dict) or not native_files:
+        raise PipelineError("Native discovery has no file inventory")
+    expected_details = expected_native_check_details(
+        staging,
+        handoff_sha256=handoff_sha256,
+        main_assembly=main_assembly,
+        main_assembly_sha256=file_digest(staging / "input/cad" / main_assembly),
+        native_files=native_files,
+    )
+    for event in receipt["events"]:
+        check = event.get("check") if isinstance(event, dict) else None
+        if isinstance(check, dict) and check.get("id") in expected_details:
+            check["details"] = expected_details[check["id"]]
+    _stamp_capture(staging, receipt)
+    native_stages = read_data(staging / "reports/stages.json")
+    native_stages["events"] = list(receipt["events"])
+    write_json(staging / "reports/native-stages.json", native_stages)
+    archive = staging / CAPTURE_ARCHIVE
+    manifest = seal_capture(
+        staging,
+        archive,
+        run_id=run_id,
+        handoff_sha256=handoff_sha256,
+        upload_sha256=upload_sha256,
+        main_assembly=main_assembly,
+        native_tool=tool,
+        upstream_artifacts=upstream_artifacts,
+        execution=execution,
+    )
+    receipt["upload_sha256"] = upload_sha256
+    write_json(staging / CAPTURE_MANIFEST, manifest)
+    receipt["capture_archive"] = {
+        "name": CAPTURE_ARCHIVE,
+        "sha256": file_digest(archive),
+        "size": archive.stat().st_size,
+        "manifest_sha256": file_digest(staging / CAPTURE_MANIFEST),
+    }
+    _stamp_capture(staging, receipt)
+    _install_capture_tree(staging, output)
+    return {**receipt, "output": str(output)}
+
+
+def _capture_native_transaction(
     package: Path,
     output: Path,
     *,
@@ -214,7 +442,7 @@ def capture_native_transaction(
     resume: Mapping[str, Any] | None = None,
     upstream_artifacts: tuple[dict[str, Any], ...] | None = None,
     execution: Mapping[str, Any] | None = None,
-    native_tool: dict[str, Any] | None = None,
+    native_tool_factory: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run the real native Capture transaction and seal its artifact.
 
@@ -222,8 +450,6 @@ def capture_native_transaction(
     endpoint adapter used by the currently deployed integration.
     """
 
-    from .. import solidworks
-    from ..delivery import writable_output
     from ..steps import capture_evidence
 
     package = Path(package)
@@ -233,18 +459,17 @@ def capture_native_transaction(
     output = Path(output)
     if output.resolve().is_relative_to(package) or package.is_relative_to(output.resolve()):
         raise PipelineError("Input and output directories must be separate")
-    with solidworks.output_lock(output) as output:
+    with _capture_output_lock(output) as output:
         if not writable_output(output):
             raise PipelineError(f"Output must be absent or empty: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
-        receipt = solidworks._stage_receipt(
-            "capture",
+        receipt = _capture_receipt(
             run_id,
             prior_events,
             resume=dict(resume) if resume is not None else None,
             handoff_sha256=handoff_sha256,
         )
-        event = solidworks._event_sink(receipt, on_event)
+        event = _capture_event_sink(receipt, on_event)
         try:
             _, input_report = capture_evidence(
                 package,
@@ -256,7 +481,8 @@ def capture_native_transaction(
                 handoff_sha256=handoff_sha256,
             )
             receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
-            return solidworks._finish_native_capture(
+            tool = (native_tool_factory or _native_tool_record)()
+            return _seal_native_capture_artifact(
                 staging,
                 output,
                 receipt,
@@ -266,10 +492,10 @@ def capture_native_transaction(
                 main_assembly=main_assembly,
                 upstream_artifacts=upstream_artifacts,
                 execution=dict(execution) if execution is not None else None,
-                native_tool=native_tool,
+                native_tool=tool,
             )
         except Exception as error:
-            return solidworks._failed_run(staging, output, receipt, event, error)
+            return _failed_capture(staging, output, receipt, event, error)
         finally:
             if staging.exists():
                 shutil.rmtree(staging)
@@ -290,7 +516,7 @@ def _invoke_native_operation(
 ) -> NativeCaptureResult:
     """Call the production native reader, sealer and receipt writer."""
 
-    result = capture_native_transaction(
+    result = _capture_native_transaction(
         inputs.package,
         output,
         backend=backend,
@@ -302,7 +528,7 @@ def _invoke_native_operation(
         prior_events=(),
         upstream_artifacts=upstream_artifacts,
         execution=execution,
-        native_tool=native_tool,
+        native_tool_factory=lambda: native_tool,
     )
     if result.get("native_complete") is True:
         archive_receipt = result.get("capture_archive")
@@ -326,10 +552,14 @@ class CaptureHandler:
         native_operation: Callable[..., NativeCaptureResult] | None = None,
         admitter: Callable[..., dict[str, Any]] | None = None,
         native_tool_factory: Callable[[], dict[str, Any]] | None = None,
+        effect_authorizer: Callable[..., str] | None = None,
+        effect_observer: Callable[..., None] | None = None,
     ) -> None:
         self._backend_factory = backend_factory
         self._native_operation = native_operation or _invoke_native_operation
         self._native_tool_factory = native_tool_factory or _native_tool_record
+        self._effect_authorizer = effect_authorizer
+        self._effect_observer = effect_observer
         if admitter is None:
             from ..orchestration.stage_transfer import admit_capture
 
@@ -344,9 +574,38 @@ class CaptureHandler:
     ) -> StageExecution:
         request = CaptureRequest.from_command(command)
         inputs = CaptureInputs.resolve(command, workspace, request)
-        execution = _execution_record(command, claim, request)
         upstream = _upstream_records(inputs)
         tool = self._native_tool_factory()
+        execution = _execution_record(command, claim, request, tool)
+        if self._effect_authorizer is None or self._effect_observer is None:
+            raise ProtocolError(
+                "capture.effect_gateway_required",
+                {"command_id": command.command_id},
+            )
+        outbound = {
+            "command_id": command.command_id,
+            "execution": execution,
+            "objects": inputs.object_names,
+            "prepared_sha256": request.prepared_sha256,
+            "upstream_artifacts": upstream,
+        }
+        expected_state = {
+            "main_assembly": request.main_assembly,
+            "request_digest": command.request_digest,
+            "run_id": command.run_id,
+            "stage": "capture",
+        }
+        effect_id = self._effect_authorizer(
+            command=command,
+            claim=claim,
+            effect_key=request.effect_id,
+            outbound=outbound,
+            outbound_digest=digest(outbound),
+            expected_state=expected_state,
+            expected_state_digest=digest(expected_state),
+        )
+        if effect_id != request.effect_id:
+            raise ProtocolError("capture.effect_identity", {"effect_id": effect_id})
         backend = self._backend_factory(inputs.package) if self._backend_factory is not None else None
         output = workspace.root / "capture-native"
         native = self._native_operation(
@@ -363,10 +622,26 @@ class CaptureHandler:
         )
         required_effects = (request.effect_id,)
         if native.outcome == "unknown":
+            self._effect_observer(
+                command=command,
+                claim=claim,
+                effect_id=request.effect_id,
+                state_class="unobservable",
+                payload_artifact_id=None,
+                payload_digest=digest(native.receipt),
+            )
             raise CaptureUnresolved(native.reason_code or "capture.native_unknown")
         if native.outcome in {"failed", "cancelled"}:
             if native.output is None or not native.output.exists():
                 raise ProtocolError("capture.failure_evidence_missing", {"outcome": native.outcome})
+            self._effect_observer(
+                command=command,
+                claim=claim,
+                effect_id=request.effect_id,
+                state_class="absent",
+                payload_artifact_id=None,
+                payload_digest=digest(native.receipt),
+            )
             checks = digest(
                 {
                     "effect_id": request.effect_id,
@@ -384,6 +659,15 @@ class CaptureHandler:
             )
         if native.output is None or native.archive is None or not native.archive.is_file():
             raise ProtocolError("capture.native_artifact_missing", {"output": str(native.output)})
+        archive_digest = file_digest(native.archive)
+        self._effect_observer(
+            command=command,
+            claim=claim,
+            effect_id=request.effect_id,
+            state_class="known",
+            payload_artifact_id=f"{command.command_id}:native-artifact",
+            payload_digest=archive_digest,
+        )
 
         admitted = workspace.root / "capture-admitted"
         manifest = self._admitter(
