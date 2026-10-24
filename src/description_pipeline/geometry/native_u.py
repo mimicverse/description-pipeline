@@ -24,10 +24,11 @@ NATIVE_TOLERANT_EDGE_BOUNDARY_RULE = (
     "native-tolerant-edge-boundary-euclidean-v5"
 )
 NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE = (
-    "native-curve-topology-endpoint-set-v2"
+    "native-curve-topology-endpoint-set-v3"
 )
+NATIVE_CURVE_ENDPOINT_DIRECTION_RULE = "native-curve-endpoint-sense-v1"
 NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE = (
-    "native-open-edge-boundary-identity-v2"
+    "native-open-edge-boundary-identity-v3"
 )
 NATIVE_OPEN_EDGE_SCOPE_RULE = "native-open-edge-scope-binding-v1"
 NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
@@ -1570,6 +1571,8 @@ def native_curve_topology_endpoint_set_assignment(
         "actual_end_point_m": list(actual_end),
         "direct_error_m": direct_error,
         "swapped_error_m": swapped_error,
+        "direct_complete": direct_complete,
+        "swapped_complete": swapped_complete,
         "complete_match_count": matching_count,
         "canonical_result": canonical_result,
         "canonical_error_m": canonical_error,
@@ -1667,6 +1670,56 @@ def _gap_mapping_options(
         ),
         "matching_margin_m": margin,
         "unique": selected is not None,
+    }
+
+
+def _directed_endpoint_projection(
+    source_start,
+    source_end,
+    target_start,
+    target_end,
+    *,
+    result: str,
+    label: str,
+) -> dict:
+    """Check the endpoint identity selected by native curve direction.
+
+    ``ICurveParamData.Sense`` owns the curve-to-edge endpoint correspondence.
+    Distance is an independent projection gate and never selects endpoint
+    identity.  The selected orientation must also belong to the independently
+    recomputed unordered native endpoint set within the existing 50 micrometre
+    projection bound.
+    """
+
+    if result not in {"direct", "swapped"}:
+        raise ValueError(f"{label} direction is not direct or swapped")
+    assignment = native_curve_topology_endpoint_set_assignment(
+        source_start,
+        source_end,
+        target_start,
+        target_end,
+    )
+    if assignment["accepted"] is not True or assignment[f"{result}_complete"] is not True:
+        raise ValueError(
+            f"{label} native direction is outside the unordered endpoint-set "
+            "50 micrometre projection bound"
+        )
+    return {
+        "rule_version": NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE,
+        "identity_rule": NATIVE_CURVE_ENDPOINT_DIRECTION_RULE,
+        "metric": assignment["metric"],
+        "tolerance_m": assignment["tolerance_m"],
+        "identity_result": result,
+        "direct_error_m": assignment["direct_error_m"],
+        "swapped_error_m": assignment["swapped_error_m"],
+        "selected_error_m": (
+            assignment["direct_error_m"]
+            if result == "direct"
+            else assignment["swapped_error_m"]
+        ),
+        "direct_complete": assignment["direct_complete"],
+        "swapped_complete": assignment["swapped_complete"],
+        "accepted": True,
     }
 
 
@@ -1795,6 +1848,10 @@ def native_open_edge_boundary_identity(
     fin_end_point = tuple(_native_u(value) for value in fin_end_point)
     curve_start_point = tuple(_native_u(value) for value in curve_start_point)
     curve_end_point = tuple(_native_u(value) for value in curve_end_point)
+    if edge_start_point == edge_end_point or curve_start_point == curve_end_point:
+        raise ValueError(
+            "edge and curve endpoints must be geometrically distinct"
+        )
 
     def endpoint_name(result: str, source: str) -> str:
         if result == "direct":
@@ -1822,6 +1879,7 @@ def native_open_edge_boundary_identity(
             "fin endpoints must identify a full or segmented edge interval"
         )
 
+    curve_direction = "direct" if curve_sense else "swapped"
     curve_mapping = _gap_mapping_options(
         curve_start_point,
         curve_end_point,
@@ -1829,15 +1887,38 @@ def native_open_edge_boundary_identity(
         edge_end_point,
         gap,
     )
-    if not curve_mapping["unique"]:
-        raise ValueError("gap-bounded endpoint mapping is not unique")
+    curve_mapping.update(
+        {
+            "distance_identity_used": False,
+            "distance_selected_result": curve_mapping["selected_result"],
+            "distance_unique": curve_mapping["unique"],
+            "metric_scope": {
+                "distance_options": "euclidean",
+                "selected_projection": "max_abs_coordinate",
+            },
+            "identity_rule": NATIVE_CURVE_ENDPOINT_DIRECTION_RULE,
+            "identity_authority": "ICurveParamData.Sense",
+            "identity_sense": curve_sense,
+            "identity_result": curve_direction,
+            "selected_projection": _directed_endpoint_projection(
+                curve_start_point,
+                curve_end_point,
+                edge_start_point,
+                edge_end_point,
+                result=curve_direction,
+                label="curve endpoint",
+            ),
+        }
+    )
     curve_to_edge = {
-        "start": endpoint_name(curve_mapping["selected_result"], "start"),
-        "end": endpoint_name(curve_mapping["selected_result"], "end"),
+        "start": endpoint_name(curve_direction, "start"),
+        "end": endpoint_name(curve_direction, "end"),
     }
 
     fin_to_edge = {"start": None, "end": None}
     if full_edge:
+        if fin_start_point == fin_end_point:
+            raise ValueError("full-edge fin endpoints must be geometrically distinct")
         fin_mapping = _gap_mapping_options(
             fin_start_point,
             fin_end_point,
@@ -1845,18 +1926,31 @@ def native_open_edge_boundary_identity(
             edge_end_point,
             gap,
         )
-        if not fin_mapping["unique"]:
-            raise ValueError("gap-bounded fin endpoint mapping is not unique")
-        fin_to_edge = {
-            "start": endpoint_name(fin_mapping["selected_result"], "start"),
-            "end": endpoint_name(fin_mapping["selected_result"], "end"),
-        }
         for fin_endpoint, role in zip(("start", "end"), roles, strict=True):
             curve_endpoint = "start" if role == "u_min" else "end"
-            if fin_to_edge[fin_endpoint] != curve_to_edge[curve_endpoint]:
-                raise ValueError(
-                    "fin U boundary and gap mapping disagree on edge endpoint"
-                )
+            fin_to_edge[fin_endpoint] = curve_to_edge[curve_endpoint]
+        fin_direction = (
+            "direct"
+            if fin_to_edge == {"start": "start", "end": "end"}
+            else "swapped"
+        )
+        fin_mapping.update(
+            {
+                "distance_identity_used": False,
+                "distance_selected_result": fin_mapping["selected_result"],
+                "distance_unique": fin_mapping["unique"],
+                "metric_scope": {
+                    "distance_options": "euclidean",
+                    "identity": "none",
+                },
+                "identity_rule": "native-fin-u-boundary-role-v1",
+                "identity_authority": (
+                    "ICurveParamData.Sense+fin U boundary roles"
+                ),
+                "identity_sense": curve_sense,
+                "identity_result": fin_direction,
+            }
+        )
     else:
         boundary_index = 0 if roles[0] is not None else 1
         interior_index = 1 - boundary_index
@@ -1877,71 +1971,44 @@ def native_open_edge_boundary_identity(
         curve_endpoint = "start" if boundary_role == "u_min" else "end"
         edge_endpoint = curve_to_edge[curve_endpoint]
         fin_endpoint = "start" if boundary_index == 0 else "end"
-        fin_boundary_point = (
-            fin_start_point if boundary_index == 0 else fin_end_point
-        )
         curve_boundary_point = (
             curve_start_point if curve_endpoint == "start" else curve_end_point
         )
-        opposite_curve_point = (
-            curve_end_point if curve_endpoint == "start" else curve_start_point
-        )
-        boundary_to_curve_tolerance = math.nextafter(
-            native_curve_endpoint_operation_tolerance(
-                fin_boundary_point,
-                fin_boundary_point,
-                opposite_curve_point,
-            )
-            + gap,
-            math.inf,
-        )
-        boundary_to_curve_error = native_point_euclidean_error(
-            fin_boundary_point,
-            curve_boundary_point,
-        )
-        if boundary_to_curve_error > boundary_to_curve_tolerance:
-            raise ValueError(
-                "segmented fin boundary endpoint does not match its curve boundary"
-            )
-        target_point = (
-            edge_start_point if edge_endpoint == "start" else edge_end_point
-        )
         boundary_error = native_point_euclidean_error(
             curve_boundary_point,
-            target_point,
+            (
+                edge_start_point
+                if edge_endpoint == "start"
+                else edge_end_point
+            ),
         )
-        candidates = []
-        for candidate_name, candidate_point in (
-            ("start", edge_start_point),
-            ("end", edge_end_point),
-        ):
-            if native_point_within_euclidean_bound(
-                curve_boundary_point,
-                candidate_point,
-                gap,
-            ):
-                candidates.append(candidate_name)
-        if candidates != [edge_endpoint]:
-            raise ValueError(
-                "segmented fin boundary endpoint does not map uniquely to its edge endpoint"
-            )
         fin_to_edge[fin_endpoint] = edge_endpoint
         fin_mapping = {
+            "rule_version": NATIVE_CURVE_ENDPOINT_DIRECTION_RULE,
             "mode": "segmented",
             "metric": "euclidean",
+            "metric_scope": {
+                "boundary_error": "euclidean",
+                "identity": "none",
+            },
             "gap_m": gap,
+            "identity_rule": NATIVE_CURVE_ENDPOINT_DIRECTION_RULE,
+            "identity_authority": (
+                "ICurveParamData.Sense+fin U boundary role"
+            ),
+            "identity_sense": curve_sense,
+            "identity_result": (
+                "direct"
+                if fin_endpoint == edge_endpoint
+                else "swapped"
+            ),
             "boundary_endpoint": fin_endpoint,
             "boundary_role": boundary_role,
             "edge_endpoint": edge_endpoint,
             "boundary_error_m": boundary_error,
-            "fin_boundary_to_curve_error_m": boundary_to_curve_error,
-            "fin_boundary_to_curve_tolerance_m": (
-                boundary_to_curve_tolerance
-            ),
             "interior_endpoint": "end" if interior_index == 1 else "start",
             "interior_u": interior_u,
-            "complete_match_count": 1,
-            "unique": True,
+            "geometry_evidence_scope": "independent endpoint evidence",
         }
 
     two_gap = math.nextafter(2.0 * gap, math.inf)
@@ -2059,9 +2126,10 @@ def native_curve_domain_transform(
 ) -> dict:
     """Classify an edge U domain against underlying-curve periodicity.
 
-    ``Sense`` may orient the periodic parameter lift only. It never changes the
-    raw ``UMin``/``StartPoint`` and ``UMax``/``EndPoint`` correspondence or the
-    unordered curve/edge endpoint-set identity.
+    ``Sense`` declares whether the curve and edge share direction.  It also
+    orients the periodic parameter lift.  Raw ``UMin``/``StartPoint`` and
+    ``UMax``/``EndPoint`` remain the native parameter endpoints; the unordered
+    endpoint set is an independent coverage gate, not the direction authority.
     """
 
     curve_start = _native_u(underlying_start)

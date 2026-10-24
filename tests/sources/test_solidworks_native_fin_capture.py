@@ -1327,7 +1327,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             "face_indices": [0],
             "u_min": 0.0,
             "u_max": 1.0,
-            "curve_sense": False,
+            "curve_sense": True,
             "curve_type": 0,
             "is_tolerant": True,
             "tolerant_gap_m": 5e-7,
@@ -1449,7 +1449,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                         "parameter_success_parsed"
                     ],
                 ),
-                curve_sense=False,
+                curve_sense=True,
                 gap_m=5e-7,
                 body_type=1,
                 face_count=1,
@@ -2634,7 +2634,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertIsNotNone(identity)
         self.assertEqual(
             identity["rule_version"],
-            "native-open-edge-boundary-identity-v2",
+            "native-open-edge-boundary-identity-v3",
         )
         self.assertEqual(identity["identity_mode"], "full_edge")
         self.assertEqual(
@@ -2896,6 +2896,12 @@ class NativeFinCaptureTests(unittest.TestCase):
                 triangles,
                 expected_source_scope=body["scope"],
             )
+
+    def test_parser_rejects_native_sense_change(self):
+        def mutate(edge, _fin):
+            edge["curve_sense"] = not edge["curve_sense"]
+
+        self.assert_r3_open_mutation_rejected(mutate)
 
     def test_parser_rejects_duplicate_open_identity_endpoint_refs(self):
         def mutate(_edge, fin):
@@ -3270,7 +3276,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             curve_u_max=1.0,
             fin_endpoint_u=(0.0, 0.4),
             fin_endpoint_success=(True, True),
-            curve_sense=False,
+            curve_sense=True,
             gap_m=5e-7,
             body_type=1,
             face_count=1,
@@ -3296,15 +3302,20 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(mapping["boundary_role"], "u_min")
         self.assertEqual(mapping["edge_endpoint"], "start")
         self.assertEqual(mapping["boundary_error_m"], 0.0)
-        self.assertEqual(mapping["fin_boundary_to_curve_error_m"], 0.0)
-        self.assertGreaterEqual(
-            mapping["fin_boundary_to_curve_tolerance_m"],
-            mapping["gap_m"],
-        )
         self.assertEqual(mapping["interior_endpoint"], "end")
         self.assertEqual(mapping["interior_u"], 0.4)
-        self.assertEqual(mapping["complete_match_count"], 1)
-        self.assertIs(mapping["unique"], True)
+        self.assertEqual(mapping["identity_result"], "direct")
+        self.assertEqual(
+            mapping["metric_scope"],
+            {
+                "boundary_error": "euclidean",
+                "identity": "none",
+            },
+        )
+        self.assertEqual(
+            mapping["identity_authority"],
+            "ICurveParamData.Sense+fin U boundary role",
+        )
 
     def test_v5_open_boundary_identity_accepts_mixed_parameter_state(self):
         identity = native_open_edge_boundary_identity(
@@ -3329,7 +3340,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             curve_u_max=1.0,
             fin_endpoint_u=(0.0, 1.0),
             fin_endpoint_success=(True, False),
-            curve_sense=False,
+            curve_sense=True,
             gap_m=5e-7,
             body_type=1,
             face_count=1,
@@ -3343,6 +3354,142 @@ class NativeFinCaptureTests(unittest.TestCase):
             identity["selected_fin_to_edge"],
             {"start": "start", "end": "end"},
         )
+
+    def test_observed_short_tolerant_edge_uses_sense_for_identity(self):
+        component = "base_link3.0-1/EasyEDA PCB Model~Nz70-2"
+        identity = native_open_edge_boundary_identity(
+            component=component,
+            scope_binding=fixture_open_edge_scope_binding(
+                component=component,
+                body_index=22,
+            ),
+            edge_reference_sha256=(
+                "ec971ec7195547fc5274e19cc650e197260178f2b7bac0b3f7b0eae9a9564318"
+            ),
+            edge_endpoint_refs=(
+                "d6b8e95c3675222ea688d54654c71fae272a1b97db116c754b4ddc451d958a4a",
+                "3731f2dd655985a91a9ee87647c6526f3c6da959498a08c24a3cc7fedaa7223e",
+            ),
+            edge_start_point=(
+                0.035735061468122,
+                0.00474751461938471,
+                -0.050663097222461824,
+            ),
+            edge_end_point=(
+                0.035734561468122,
+                0.004722930915767165,
+                -0.05063176133840251,
+            ),
+            fin_id=91,
+            fin_vertex_ids=(116, 117),
+            fin_start_point=(
+                0.035735061468122,
+                0.004723420538913588,
+                -0.050637079486342836,
+            ),
+            fin_end_point=(
+                0.035735061468122,
+                0.004722920391463888,
+                -0.050631754578799676,
+            ),
+            curve_start_point=(
+                0.035735061468122,
+                0.004747514619706555,
+                -0.05066309722169634,
+            ),
+            curve_end_point=(
+                0.035735061468122,
+                0.004722934417487,
+                -0.050631779576576004,
+            ),
+            curve_u_min=0.0,
+            curve_u_max=1.0,
+            fin_endpoint_u=(0.8701478320701209, 1.0),
+            fin_endpoint_success=(True, True),
+            curve_sense=True,
+            gap_m=5e-7,
+            body_type=1,
+            face_count=1,
+            cofin_raw_id=-1,
+            edge_fin_ids=(13, 20, 35, 37, 41, 47, 80, 91, 94, 97, 112),
+            topology_set_accepted=True,
+        )
+
+        curve_mapping = identity["curve_to_edge_mapping"]
+        self.assertEqual(identity["identity_mode"], "segmented")
+        self.assertEqual(
+            identity["selected_curve_to_edge"],
+            {"start": "start", "end": "end"},
+        )
+        self.assertEqual(
+            identity["selected_fin_to_edge"],
+            {"start": None, "end": "end"},
+        )
+        self.assertEqual(
+            identity["fin_to_edge_mapping"]["identity_result"],
+            "direct",
+        )
+        self.assertIs(curve_mapping["distance_identity_used"], False)
+        self.assertEqual(curve_mapping["complete_match_count"], 0)
+        self.assertEqual(curve_mapping["identity_result"], "direct")
+        self.assertIs(curve_mapping["selected_projection"]["accepted"], True)
+        self.assertIs(curve_mapping["selected_projection"]["direct_complete"], True)
+        self.assertEqual(
+            curve_mapping["selected_projection"]["tolerance_m"],
+            NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+        )
+
+    def test_reverse_sense_with_negative_u_owns_directed_identity(self):
+        arguments = {
+            "component": "part-1",
+            "scope_binding": fixture_open_edge_scope_binding(),
+            "edge_reference_sha256": hashlib.sha256(
+                b"reverse-sense-edge"
+            ).hexdigest(),
+            "edge_endpoint_refs": (
+                hashlib.sha256(b"reverse-sense-start").hexdigest(),
+                hashlib.sha256(b"reverse-sense-end").hexdigest(),
+            ),
+            "edge_start_point": (1e-4, 0.0, 0.0),
+            "edge_end_point": (0.0, 0.0, 0.0),
+            "fin_id": 88,
+            "fin_vertex_ids": (116, 117),
+            "fin_start_point": (0.0, 0.0, 0.0),
+            "fin_end_point": (1e-4, 0.0, 0.0),
+            "curve_start_point": (0.0, 0.0, 0.0),
+            "curve_end_point": (1e-4, 0.0, 0.0),
+            "curve_u_min": -1.0,
+            "curve_u_max": 0.0,
+            "fin_endpoint_u": (-1.0, 0.0),
+            "fin_endpoint_success": (True, True),
+            "curve_sense": False,
+            "gap_m": 5e-7,
+            "body_type": 1,
+            "face_count": 1,
+            "cofin_raw_id": -1,
+            "edge_fin_ids": (88, 89),
+            "topology_set_accepted": True,
+        }
+        identity = native_open_edge_boundary_identity(**arguments)
+        self.assertEqual(
+            identity["selected_curve_to_edge"],
+            {"start": "end", "end": "start"},
+        )
+        self.assertEqual(
+            identity["selected_fin_to_edge"],
+            {"start": "end", "end": "start"},
+        )
+        self.assertEqual(
+            identity["curve_to_edge_mapping"]["identity_result"],
+            "swapped",
+        )
+
+        arguments["curve_sense"] = True
+        with self.assertRaisesRegex(
+            ValueError,
+            "50 micrometre projection bound",
+        ):
+            native_open_edge_boundary_identity(**arguments)
 
     def test_open_boundary_fallback_does_not_create_v5_identity(self):
         original_method = native_module._method
@@ -3589,41 +3736,46 @@ class NativeFinCaptureTests(unittest.TestCase):
                 expected_source_scope=missing_body["scope"],
             )
 
-    def test_open_boundary_identity_rejects_wrong_segment_boundary(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "boundary endpoint does not match its curve boundary",
-        ):
-            native_open_edge_boundary_identity(
-                component="part-1",
-                scope_binding=fixture_open_edge_scope_binding(),
-                edge_reference_sha256=hashlib.sha256(
-                    b"wrong-segment-boundary"
-                ).hexdigest(),
-                edge_endpoint_refs=(
-                    hashlib.sha256(b"wrong-segment-start").hexdigest(),
-                    hashlib.sha256(b"wrong-segment-end").hexdigest(),
-                ),
-                edge_start_point=(0.0, 0.0, 0.0),
-                edge_end_point=(1.0, 0.0, 0.0),
-                fin_id=88,
-                fin_vertex_ids=(116, 117),
-                fin_start_point=(1.0, 0.0, 0.0),
-                fin_end_point=(0.4, 0.0, 0.0),
-                curve_start_point=(0.0, 0.0, 0.0),
-                curve_end_point=(1.0, 0.0, 0.0),
-                curve_u_min=0.0,
-                curve_u_max=1.0,
-                fin_endpoint_u=(0.0, 0.4),
-                fin_endpoint_success=(True, True),
-                curve_sense=True,
-                gap_m=5e-7,
-                body_type=1,
-                face_count=1,
-                cofin_raw_id=-1,
-                edge_fin_ids=(88, 89),
-                topology_set_accepted=True,
-            )
+    def test_segmented_identity_does_not_infer_from_raw_fin_point(self):
+        identity = native_open_edge_boundary_identity(
+            component="part-1",
+            scope_binding=fixture_open_edge_scope_binding(),
+            edge_reference_sha256=hashlib.sha256(
+                b"raw-fin-point-edge"
+            ).hexdigest(),
+            edge_endpoint_refs=(
+                hashlib.sha256(b"raw-fin-start").hexdigest(),
+                hashlib.sha256(b"raw-fin-end").hexdigest(),
+            ),
+            edge_start_point=(0.0, 0.0, 0.0),
+            edge_end_point=(1.0, 0.0, 0.0),
+            fin_id=88,
+            fin_vertex_ids=(116, 117),
+            fin_start_point=(1.0, 0.0, 0.0),
+            fin_end_point=(0.4, 0.0, 0.0),
+            curve_start_point=(0.0, 0.0, 0.0),
+            curve_end_point=(1.0, 0.0, 0.0),
+            curve_u_min=0.0,
+            curve_u_max=1.0,
+            fin_endpoint_u=(0.0, 0.4),
+            fin_endpoint_success=(True, True),
+            curve_sense=True,
+            gap_m=5e-7,
+            body_type=1,
+            face_count=1,
+            cofin_raw_id=-1,
+            edge_fin_ids=(88, 89),
+            topology_set_accepted=True,
+        )
+
+        self.assertEqual(
+            identity["selected_fin_to_edge"],
+            {"start": "start", "end": None},
+        )
+        self.assertEqual(
+            identity["fin_to_edge_mapping"]["geometry_evidence_scope"],
+            "independent endpoint evidence",
+        )
 
     def test_open_boundary_identity_rejects_no_boundary_role(self):
         with self.assertRaisesRegex(
@@ -3664,7 +3816,7 @@ class NativeFinCaptureTests(unittest.TestCase):
     def test_two_complete_open_identity_mappings_fail_closed(self):
         with self.assertRaisesRegex(
             ValueError,
-            "not unique",
+            "geometrically distinct",
         ):
             native_open_edge_boundary_identity(
                 component="part-1",
@@ -3697,37 +3849,86 @@ class NativeFinCaptureTests(unittest.TestCase):
                 topology_set_accepted=True,
             )
 
-    def test_open_identity_gap_is_euclidean_not_coordinate_bound(self):
+    def test_open_identity_uses_native_sense_and_keeps_gap_as_diagnostic(self):
         gap = 5e-7
         delta = (0.8 * gap, 0.8 * gap, 0.0)
+        identity = native_open_edge_boundary_identity(
+            component="part-1",
+            scope_binding=fixture_open_edge_scope_binding(),
+            edge_reference_sha256=hashlib.sha256(
+                b"diagonal-edge"
+            ).hexdigest(),
+            edge_endpoint_refs=(
+                hashlib.sha256(b"diagonal-start").hexdigest(),
+                hashlib.sha256(b"diagonal-end").hexdigest(),
+            ),
+            edge_start_point=delta,
+            edge_end_point=(1e-6 + delta[0], delta[1], 0.0),
+            fin_id=329,
+            fin_vertex_ids=(116, 117),
+            fin_start_point=(0.0, 0.0, 0.0),
+            fin_end_point=(1e-6, 0.0, 0.0),
+            curve_start_point=(0.0, 0.0, 0.0),
+            curve_end_point=(1e-6, 0.0, 0.0),
+            curve_u_min=0.0,
+            curve_u_max=1.0,
+            fin_endpoint_u=(0.0, 1.0),
+            fin_endpoint_success=(True, True),
+            curve_sense=True,
+            gap_m=gap,
+            body_type=1,
+            face_count=1,
+            cofin_raw_id=-1,
+            edge_fin_ids=(329,),
+            topology_set_accepted=True,
+        )
+
+        mapping = identity["curve_to_edge_mapping"]
+        self.assertIs(mapping["distance_identity_used"], False)
+        self.assertEqual(mapping["complete_match_count"], 0)
+        self.assertEqual(
+            mapping["identity_authority"],
+            "ICurveParamData.Sense",
+        )
+        self.assertEqual(mapping["identity_result"], "direct")
+        self.assertEqual(
+            identity["selected_curve_to_edge"],
+            {"start": "start", "end": "end"},
+        )
+        self.assertIs(
+            mapping["selected_projection"]["accepted"],
+            True,
+        )
+
+    def test_open_identity_rejects_native_sense_outside_projection_bound(self):
         with self.assertRaisesRegex(
             ValueError,
-            "not unique",
+            "50 micrometre projection bound",
         ):
             native_open_edge_boundary_identity(
                 component="part-1",
                 scope_binding=fixture_open_edge_scope_binding(),
                 edge_reference_sha256=hashlib.sha256(
-                    b"diagonal-edge"
+                    b"sense-outside-bound-edge"
                 ).hexdigest(),
                 edge_endpoint_refs=(
-                    hashlib.sha256(b"diagonal-start").hexdigest(),
-                    hashlib.sha256(b"diagonal-end").hexdigest(),
+                    hashlib.sha256(b"sense-outside-start").hexdigest(),
+                    hashlib.sha256(b"sense-outside-end").hexdigest(),
                 ),
-                edge_start_point=delta,
-                edge_end_point=(1e-6 + delta[0], delta[1], 0.0),
+                edge_start_point=(1.0, 0.0, 0.0),
+                edge_end_point=(2.0, 0.0, 0.0),
                 fin_id=329,
                 fin_vertex_ids=(116, 117),
                 fin_start_point=(0.0, 0.0, 0.0),
-                fin_end_point=(1e-6, 0.0, 0.0),
+                fin_end_point=(1.0, 0.0, 0.0),
                 curve_start_point=(0.0, 0.0, 0.0),
-                curve_end_point=(1e-6, 0.0, 0.0),
+                curve_end_point=(1.0, 0.0, 0.0),
                 curve_u_min=0.0,
                 curve_u_max=1.0,
                 fin_endpoint_u=(0.0, 1.0),
                 fin_endpoint_success=(True, True),
                 curve_sense=True,
-                gap_m=gap,
+                gap_m=5e-7,
                 body_type=1,
                 face_count=1,
                 cofin_raw_id=-1,
