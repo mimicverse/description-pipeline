@@ -20,6 +20,7 @@ from description_pipeline.pipeline.stages import publish as publish_stage
 from description_pipeline.pipeline.stages.publish import (
     PublishGitReconciliationAdapter,
     PublishHandler,
+    PublishPullRequestReconciliationAdapter,
 )
 from description_pipeline.platform.facts import FactStore
 from description_pipeline.repository.publish import (
@@ -126,7 +127,8 @@ def _send(args) -> int:
         now=now,
     )
     command = facts.load_command(args.command_id)
-    handler = PublishHandler(artifacts, pull_requests=_FilePullRequests(Path(args.pr_state)))
+    pull_requests = _FilePullRequests(Path(args.pr_state))
+    handler = PublishHandler(artifacts, pull_requests=pull_requests)
     failure = None
     if args.mode == "send":
         failure = patch.object(
@@ -135,11 +137,25 @@ def _send(args) -> int:
             side_effect=_ProcessCrash("process stopped after git push"),
         )
         expected = _ProcessCrash
-    else:
+    elif args.mode == "send-absent":
         failure = patch.object(
             PublicationRepository,
             "push",
             side_effect=RuntimeError("process stopped before remote write"),
+        )
+        expected = publish_stage.PublishIncomplete
+    elif args.mode == "send-pr":
+        failure = patch.object(
+            publish_stage,
+            "_require_pr_match",
+            side_effect=_ProcessCrash("process stopped after pull-request write"),
+        )
+        expected = _ProcessCrash
+    else:
+        failure = patch.object(
+            pull_requests,
+            "create",
+            side_effect=RuntimeError("process stopped before pull-request write"),
         )
         expected = publish_stage.PublishIncomplete
     try:
@@ -161,10 +177,20 @@ def _resume(args) -> int:
         observer_tool_sha256=args.observer_tool_sha256,
         clock=lambda: now,
     )
+    pull_requests = _FilePullRequests(Path(args.pr_state))
+    pull_request_recovery = args.mode == "resume-pr"
     reconciled = reconciliation.reconcile(
         command_id=args.command_id,
-        effect_key=publish_stage.GIT_EFFECT_KEY,
-        adapter=PublishGitReconciliationAdapter(),
+        effect_key=(
+            publish_stage.PR_EFFECT_KEY
+            if pull_request_recovery
+            else publish_stage.GIT_EFFECT_KEY
+        ),
+        adapter=(
+            PublishPullRequestReconciliationAdapter(pull_requests)
+            if pull_request_recovery
+            else PublishGitReconciliationAdapter()
+        ),
     )
     if reconciled.settlement.state is not EffectState.SATISFIED:
         return 25
@@ -177,14 +203,25 @@ def _resume(args) -> int:
         now=now,
     )
     command = facts.load_command(args.command_id)
-    handler = PublishHandler(artifacts, pull_requests=_FilePullRequests(Path(args.pr_state)))
+    handler = PublishHandler(artifacts, pull_requests=pull_requests)
     execute_stage(command_id=command.command_id, handler=handler, services=services)
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("send", "send-absent", "resume"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "send",
+            "send-absent",
+            "send-pr",
+            "send-pr-absent",
+            "resume",
+            "resume-pr",
+        ),
+        required=True,
+    )
     parser.add_argument("--database-uri", required=True)
     parser.add_argument("--schema", required=True)
     parser.add_argument("--artifact-root", required=True)
@@ -196,7 +233,7 @@ def main() -> int:
     parser.add_argument("--pr-state", required=True)
     parser.add_argument("--observer-tool-sha256")
     args = parser.parse_args()
-    if args.mode in {"send", "send-absent"}:
+    if args.mode in {"send", "send-absent", "send-pr", "send-pr-absent"}:
         return _send(args)
     if args.observer_tool_sha256 is None:
         parser.error("--observer-tool-sha256 is required for resume")

@@ -256,6 +256,123 @@ class PublishRecoveryPostgresTests(unittest.TestCase):
         )
         self.assertFalse(self.pr_state.exists())
 
+    def test_two_process_restart_recovers_pr_effect_without_rewriting(self) -> None:
+        command = self._command("pr-positive")
+        common = self._common_args(command)
+        sent = self._run_child(
+            "--mode",
+            "send-pr",
+            *common,
+            "--owner-sha256",
+            digest({"process": "old-pr-publish-process"}),
+            "--now",
+            self.now.isoformat(),
+        )
+        self.assertEqual(sent.returncode, 23, sent.stderr)
+        git_settlement = self.facts.effect_settlement_for_key(
+            command.command_id,
+            publish_stage.GIT_EFFECT_KEY,
+        )
+        unknown = self.facts.effect_settlement_for_key(
+            command.command_id,
+            publish_stage.PR_EFFECT_KEY,
+        )
+        self.assertIs(git_settlement.state, EffectState.SATISFIED)
+        self.assertIs(unknown.state, EffectState.UNKNOWN)
+        self.assertIsNotNone(unknown.outbound_artifact)
+        self.artifacts.verify(unknown.outbound_artifact)
+        outbound = self.artifacts.materialize(
+            unknown.outbound_artifact,
+            self.fixture.root / "original-pr-outbound",
+        )
+        original_request_sha256 = file_digest(Path(outbound) / "request.json")
+        rows_before = json.loads(self.pr_state.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows_before), 1)
+
+        later = self.now + timedelta(minutes=10)
+        with self.assertRaisesRegex(FactConflict, "unresolved"):
+            self.facts.acquire_claim(
+                command.command_id,
+                claim_id="premature-pr-recovery-claim",
+                owner_sha256=digest({"process": "premature-pr-recovery"}),
+                executor_sha256=self.fixture.executor,
+                now=later,
+                expires_at=later + timedelta(minutes=5),
+            )
+        resumed = self._run_child(
+            "--mode",
+            "resume-pr",
+            *common,
+            "--owner-sha256",
+            digest({"process": "new-pr-publish-process"}),
+            "--now",
+            later.isoformat(),
+            "--observer-tool-sha256",
+            self.observer_tool,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        settlement = self.facts.effect_settlement_for_key(
+            command.command_id,
+            publish_stage.PR_EFFECT_KEY,
+        )
+        self.assertIs(settlement.state, EffectState.SATISFIED)
+        self.assertIsNotNone(settlement.payload_artifact)
+        payload = self.artifacts.materialize(
+            settlement.payload_artifact,
+            self.fixture.root / "reconciled-pr-payload",
+        )
+        self.assertEqual(
+            set(inventory(payload, exclude=("manifest.json",))),
+            {"observation.json", "request.json"},
+        )
+        self.assertEqual(file_digest(Path(payload) / "request.json"), original_request_sha256)
+        observation = json.loads((payload / "observation.json").read_text(encoding="utf-8"))
+        self.assertEqual(observation["action"], "reconciled")
+        self.assertEqual(observation["pull_request"], rows_before[0])
+        self.assertEqual(
+            json.loads(self.pr_state.read_text(encoding="utf-8")),
+            rows_before,
+        )
+
+    def test_two_process_pr_absence_stays_unknown_and_is_never_created(self) -> None:
+        command = self._command("pr-absent")
+        common = self._common_args(command)
+        sent = self._run_child(
+            "--mode",
+            "send-pr-absent",
+            *common,
+            "--owner-sha256",
+            digest({"process": "old-absent-pr-process"}),
+            "--now",
+            self.now.isoformat(),
+        )
+        self.assertEqual(sent.returncode, 23, sent.stderr)
+        unknown = self.facts.effect_settlement_for_key(
+            command.command_id,
+            publish_stage.PR_EFFECT_KEY,
+        )
+        self.assertIs(unknown.state, EffectState.UNKNOWN)
+        self.assertFalse(self.pr_state.exists())
+
+        resumed = self._run_child(
+            "--mode",
+            "resume-pr",
+            *common,
+            "--owner-sha256",
+            digest({"process": "new-absent-pr-process"}),
+            "--now",
+            (self.now + timedelta(minutes=10)).isoformat(),
+            "--observer-tool-sha256",
+            self.observer_tool,
+        )
+        self.assertEqual(resumed.returncode, 25, resumed.stderr)
+        settlement = self.facts.effect_settlement_for_key(
+            command.command_id,
+            publish_stage.PR_EFFECT_KEY,
+        )
+        self.assertIs(settlement.state, EffectState.UNKNOWN)
+        self.assertFalse(self.pr_state.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

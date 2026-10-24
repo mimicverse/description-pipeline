@@ -654,6 +654,22 @@ class PublishHandlerTests(unittest.TestCase):
             effects=effects or self.fixture.effects,
         )
 
+    def _pr_recovery_inputs(self):
+        first = self._run()
+        effect_id = self.fixture.effects.by_key[publish_stage.PR_EFFECT_KEY]
+        intent = self.fixture.effects.intents[effect_id]
+        settlement = self.fixture.effects.effect_settlement_for_key(
+            publish_stage.PR_EFFECT_KEY
+        )
+        self.assertIsNotNone(settlement)
+        self.assertIsNotNone(settlement.outbound_artifact)
+        outbound = self.fixture.store.materialize(
+            settlement.outbound_artifact,
+            self.fixture.root / "pr-recovery-outbound",
+        )
+        self.fixture.effects.force_unknown(publish_stage.PR_EFFECT_KEY)
+        return first, effect_id, intent, Path(outbound)
+
     def _command_with_target(self, *, base_ref: str, branch_ref: str) -> StageCommand:
         request = self.fixture.command.to_record()["request"]
         request.update({"base_ref": base_ref, "branch_ref": branch_ref})
@@ -1185,6 +1201,185 @@ else:
         after = (self.fixture.pr.observe_calls, self.fixture.pr.create_calls, self.fixture.pr.update_calls)
         self.assertEqual(first.checks_sha256, second.checks_sha256)
         self.assertEqual(before, after)
+
+    def test_pull_request_reconciliation_reuses_original_outbound_without_writes(self) -> None:
+        first, effect_id, intent, outbound = self._pr_recovery_inputs()
+        original = self.fixture.pr.rows[0]
+        before = (
+            self.fixture.pr.observe_calls,
+            self.fixture.pr.create_calls,
+            self.fixture.pr.update_calls,
+        )
+        workspace = self.fixture.root / "pr-reconcile-work"
+        workspace.mkdir()
+        evidence = publish_stage.PublishPullRequestReconciliationAdapter(
+            self.fixture.pr
+        ).observe(
+            command=self.fixture.command,
+            intent=intent,
+            outbound_root=outbound,
+            workspace_root=workspace,
+        )
+        after = (
+            self.fixture.pr.observe_calls,
+            self.fixture.pr.create_calls,
+            self.fixture.pr.update_calls,
+        )
+        self.assertEqual(after, (before[0] + 1, before[1], before[2]))
+        self.assertEqual((evidence.fact_type, evidence.state_class), ("reconciled", "known"))
+        self.assertIsNotNone(evidence.payload_root)
+        self.assertEqual(
+            set(inventory(evidence.payload_root, exclude=("manifest.json",))),
+            {"observation.json", "request.json"},
+        )
+        payload = read_data(evidence.payload_root / "observation.json")
+        self.assertEqual(payload["action"], "reconciled")
+        self.assertEqual(payload["pull_request"], original.to_record())
+
+        self.fixture.effects.record_observation(
+            effect_id,
+            source="test.pr.reconcile",
+            state_class="known",
+            observation_root=evidence.payload_root,
+        )
+        second_workspace = StageWorkspace(
+            root=self.fixture.root / "pr-reconcile-resume",
+            inputs=self.fixture.workspace.inputs,
+        )
+        second_claim = replace(
+            self.fixture.claim,
+            claim_id="publish-claim-pr-reconcile",
+            fence=2,
+            owner_sha256=digest({"process": "publish-pr-reconcile"}),
+        )
+        before_resume = (
+            self.fixture.pr.observe_calls,
+            self.fixture.pr.create_calls,
+            self.fixture.pr.update_calls,
+        )
+        with (
+            patch.object(PublishHandler, "_prepare", side_effect=AssertionError("must not rebuild")),
+            patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")),
+            patch.object(self.fixture.pr, "create", side_effect=AssertionError("must not create")),
+            patch.object(self.fixture.pr, "update", side_effect=AssertionError("must not update")),
+        ):
+            second = self._run(workspace=second_workspace, claim=second_claim)
+        self.assertEqual(first.checks_sha256, second.checks_sha256)
+        self.assertEqual(
+            (
+                self.fixture.pr.observe_calls,
+                self.fixture.pr.create_calls,
+                self.fixture.pr.update_calls,
+            ),
+            before_resume,
+        )
+
+    def test_pull_request_reconciliation_keeps_inexact_results_nonterminal(self) -> None:
+        _first, _effect_id, intent, outbound = self._pr_recovery_inputs()
+        original = self.fixture.pr.rows[0]
+        adapter = publish_stage.PublishPullRequestReconciliationAdapter(self.fixture.pr)
+
+        cases = (
+            ("absent", [], "absent"),
+            (
+                "conflict",
+                [replace(original, title="different title")],
+                "unobservable",
+            ),
+            (
+                "ambiguous",
+                [
+                    original,
+                    replace(
+                        original,
+                        number=2,
+                        url="https://example.test/example/robot/pull/2",
+                    ),
+                ],
+                "unobservable",
+            ),
+        )
+        for name, rows, expected_state in cases:
+            with self.subTest(name=name):
+                self.fixture.pr.rows = list(rows)
+                workspace = self.fixture.root / f"pr-reconcile-{name}"
+                workspace.mkdir()
+                evidence = adapter.observe(
+                    command=self.fixture.command,
+                    intent=intent,
+                    outbound_root=outbound,
+                    workspace_root=workspace,
+                )
+                self.assertEqual(
+                    (evidence.fact_type, evidence.state_class),
+                    ("observation", expected_state),
+                )
+                payload = read_data(evidence.payload_root / "observation.json")
+                self.assertEqual(payload["action"], expected_state)
+                self.assertEqual(payload["observed_pull_requests"], [row.to_record() for row in rows])
+        self.assertEqual(self.fixture.pr.create_calls, 1)
+        self.assertEqual(self.fixture.pr.update_calls, 0)
+
+    def test_pull_request_reconciliation_binds_the_frozen_existing_pr(self) -> None:
+        _first, _effect_id, intent, outbound = self._pr_recovery_inputs()
+        original = self.fixture.pr.rows[0]
+        request_path = outbound / "request.json"
+        request = read_data(request_path)
+        request["expected_pr"] = {
+            "number": original.number,
+            "url": original.url,
+            "head_oid": original.head_oid,
+        }
+        write_json(request_path, request)
+        expected_state = {
+            name: request[name]
+            for name in publish_stage._PR_EXPECTED_STATE_FIELDS
+        }
+        intent = replace(
+            intent,
+            expected_state=expected_state,
+            expected_state_digest=digest(expected_state),
+        )
+        adapter = publish_stage.PublishPullRequestReconciliationAdapter(self.fixture.pr)
+
+        workspace = self.fixture.root / "pr-reconcile-existing"
+        workspace.mkdir()
+        evidence = adapter.observe(
+            command=self.fixture.command,
+            intent=intent,
+            outbound_root=outbound,
+            workspace_root=workspace,
+        )
+        self.assertEqual((evidence.fact_type, evidence.state_class), ("reconciled", "known"))
+
+        self.fixture.pr.rows = [
+            replace(original, url="https://example.test/example/robot/pull/other")
+        ]
+        workspace = self.fixture.root / "pr-reconcile-existing-conflict"
+        workspace.mkdir()
+        evidence = adapter.observe(
+            command=self.fixture.command,
+            intent=intent,
+            outbound_root=outbound,
+            workspace_root=workspace,
+        )
+        self.assertEqual((evidence.fact_type, evidence.state_class), ("observation", "unobservable"))
+
+    def test_pull_request_reconciliation_rejects_tampered_outbound_before_query(self) -> None:
+        _first, _effect_id, intent, outbound = self._pr_recovery_inputs()
+        request_path = outbound / "request.json"
+        request = read_data(request_path)
+        request["body"] += "tampered"
+        write_json(request_path, request)
+        before = self.fixture.pr.observe_calls
+        with self.assertRaisesRegex(PipelineError, "pr_recovery_request"):
+            publish_stage.PublishPullRequestReconciliationAdapter(self.fixture.pr).observe(
+                command=self.fixture.command,
+                intent=intent,
+                outbound_root=outbound,
+                workspace_root=self.fixture.root / "pr-reconcile-tampered-work",
+            )
+        self.assertEqual(self.fixture.pr.observe_calls, before)
 
     def test_sealed_snapshot_replays_after_original_checkout_is_deleted(self) -> None:
         first = self._run()

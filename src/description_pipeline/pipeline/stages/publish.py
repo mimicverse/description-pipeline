@@ -85,6 +85,23 @@ _PUBLICATION_PLAN_FIELDS = frozenset(
         "verify_artifact",
     }
 )
+_PR_OUTBOUND_FIELDS = frozenset(
+    {
+        "base_ref",
+        "body",
+        "body_digest",
+        "candidate_commit",
+        "expected_pr",
+        "head_ref",
+        "repository",
+        "schema_version",
+        "subject_sha256",
+        "title",
+        "title_digest",
+    }
+)
+_PR_EXPECTED_STATE_FIELDS = _PR_OUTBOUND_FIELDS - {"body", "title"}
+_PR_TARGET_FIELDS = frozenset({"base_ref", "head_ref", "repository"})
 
 
 class PublishIncomplete(PipelineError):
@@ -941,20 +958,202 @@ def _require_pr_match(
     observation: PullRequestObservation,
     *,
     request: PublishDomainRequest,
-    candidate: PreparedCandidate | _PublishedCandidate,
+    candidate_commit: str,
     title: str,
     body: str,
 ) -> None:
-    if (
-        observation.number <= 0
-        or observation.state != "OPEN"
-        or observation.base_ref != request.base_ref
-        or observation.head_ref != request.branch_ref
-        or observation.head_oid != candidate.commit
-        or digest({"title": observation.title}) != digest({"title": title})
-        or digest({"body": observation.body}) != digest({"body": body})
+    if not _pr_matches(
+        observation,
+        request=request,
+        candidate_commit=candidate_commit,
+        title=title,
+        body=body,
     ):
         raise StageFailure("publish_pr_conflict", "Pull request does not exactly match the fixed intent")
+
+
+def _pr_matches(
+    observation: PullRequestObservation,
+    *,
+    request: PublishDomainRequest,
+    candidate_commit: str,
+    title: str,
+    body: str,
+) -> bool:
+    return (
+        type(observation.number) is int
+        and observation.number > 0
+        and isinstance(observation.url, str)
+        and bool(observation.url)
+        and observation.state == "OPEN"
+        and observation.base_ref == request.base_ref
+        and observation.head_ref == request.branch_ref
+        and isinstance(observation.head_oid, str)
+        and _HEX40.fullmatch(observation.head_oid) is not None
+        and observation.head_oid == candidate_commit
+        and isinstance(observation.title, str)
+        and isinstance(observation.body, str)
+        and digest({"title": observation.title}) == digest({"title": title})
+        and digest({"body": observation.body}) == digest({"body": body})
+    )
+
+
+def _read_sealed_pull_request_outbound_root(
+    *,
+    request: PublishDomainRequest,
+    intent: EffectIntent,
+    outbound_root: Path,
+) -> dict[str, Any]:
+    """Bind one PR-effect outbound to its immutable intent and Publish command."""
+
+    outbound_root = Path(outbound_root)
+    if set(inventory(outbound_root, exclude=("manifest.json",))) != {"request.json"}:
+        raise PublicationError("publish.pr_recovery_inventory", {"root": str(outbound_root)})
+
+    request_path = outbound_root / "request.json"
+    sealed_request = _require_object(read_data(request_path), "sealed pull-request effect request")
+    if request_path.read_bytes() != canonical(sealed_request) or set(sealed_request) != _PR_OUTBOUND_FIELDS:
+        raise PublicationError("publish.pr_recovery_request")
+
+    expected_state = {name: sealed_request[name] for name in _PR_EXPECTED_STATE_FIELDS}
+    if expected_state != dict(intent.expected_state):
+        raise PublicationError(
+            "publish.pr_recovery_expected_state",
+            {"effect_id": intent.effect_id},
+        )
+    target = {
+        "repository": sealed_request["repository"],
+        "base_ref": sealed_request["base_ref"],
+        "head_ref": sealed_request["head_ref"],
+    }
+    if set(intent.target) != _PR_TARGET_FIELDS or target != dict(intent.target):
+        raise PublicationError(
+            "publish.pr_recovery_target",
+            {"effect_id": intent.effect_id},
+        )
+    command_binding = {
+        "repository": request.repository_slug,
+        "base_ref": request.base_ref,
+        "head_ref": request.branch_ref,
+    }
+    if any(sealed_request[name] != value for name, value in command_binding.items()):
+        raise PublicationError("publish.pr_recovery_binding")
+
+    title = sealed_request["title"]
+    body = sealed_request["body"]
+    if (
+        not isinstance(title, str)
+        or not isinstance(body, str)
+        or sealed_request["title_digest"] != digest({"title": title})
+        or sealed_request["body_digest"] != digest({"body": body})
+    ):
+        raise PublicationError("publish.pr_recovery_request", {"reason": "value"})
+    return sealed_request
+
+
+def _expected_pr_matches(
+    observation: PullRequestObservation,
+    expected_pr: dict[str, Any] | None,
+) -> bool:
+    return expected_pr is None or (
+        observation.number == expected_pr["number"]
+        and observation.url == expected_pr["url"]
+        and observation.head_oid == expected_pr["head_oid"]
+    )
+
+
+class PublishPullRequestReconciliationAdapter:
+    """Read-only observer for one unresolved Publish pull-request effect."""
+
+    def __init__(self, pull_requests: PullRequestClient) -> None:
+        self.pull_requests = pull_requests
+
+    def observe(
+        self,
+        *,
+        command: StageCommand,
+        intent: EffectIntent,
+        outbound_root: Path,
+        workspace_root: Path,
+    ) -> EffectReconciliationEvidence:
+        if (
+            intent.command_id != command.command_id
+            or intent.effect_key != PR_EFFECT_KEY
+            or intent.effect_kind != "pr_upsert"
+        ):
+            raise PublicationError(
+                "publish.pr_recovery_effect",
+                {
+                    "effect_id": intent.effect_id,
+                    "effect_key": intent.effect_key,
+                    "effect_kind": intent.effect_kind,
+                },
+            )
+        request = _request_contract(command)
+        sealed = _read_sealed_pull_request_outbound_root(
+            request=request,
+            intent=intent,
+            outbound_root=outbound_root,
+        )
+        observations = tuple(
+            self.pull_requests.observe(
+                repository=sealed["repository"],
+                base_ref=sealed["base_ref"],
+                head_ref=sealed["head_ref"],
+                candidate_commit=sealed["candidate_commit"],
+            )
+        )
+        exact = (
+            len(observations) == 1
+            and _pr_matches(
+                observations[0],
+                request=request,
+                candidate_commit=sealed["candidate_commit"],
+                title=sealed["title"],
+                body=sealed["body"],
+            )
+            and _expected_pr_matches(observations[0], sealed["expected_pr"])
+        )
+        if exact:
+            pull_request = observations[0]
+            payload = {
+                "action": "reconciled",
+                "pull_request": pull_request.to_record(),
+            }
+            fact_type = "reconciled"
+            state_class = "known"
+            state = "known"
+            number = pull_request.number
+        else:
+            payload = {
+                "action": "absent" if not observations else "unobservable",
+                "expected_pr": sealed["expected_pr"],
+                "observed_pull_requests": [item.to_record() for item in observations],
+            }
+            fact_type = "observation"
+            state_class = "absent" if not observations else "unobservable"
+            state = state_class
+            number = None
+
+        payload_root = Path(workspace_root) / "publish-pr-evidence"
+        payload_root.mkdir()
+        write_json(payload_root / "observation.json", payload)
+        shutil.copyfile(Path(outbound_root) / "request.json", payload_root / "request.json")
+        return EffectReconciliationEvidence(
+            fact_type=fact_type,
+            state_class=state_class,
+            payload_root=payload_root,
+            metadata={
+                "effect_id": intent.effect_id,
+                "pull_request_number": number,
+                "repository": sealed["repository"],
+                "base_ref": sealed["base_ref"],
+                "head_ref": sealed["head_ref"],
+                "candidate_commit": sealed["candidate_commit"],
+                "subject_sha256": sealed["subject_sha256"],
+                "state": state,
+            },
+        )
 
 
 def _pr_effect(
@@ -979,7 +1178,7 @@ def _pr_effect(
         _require_pr_match(
             pull_request,
             request=request,
-            candidate=candidate,
+            candidate_commit=candidate.commit,
             title=title,
             body=body,
         )
@@ -995,7 +1194,7 @@ def _pr_effect(
             _require_pr_match(
                 observations[0],
                 request=request,
-                candidate=candidate,
+                candidate_commit=candidate.commit,
                 title=title,
                 body=body,
             )
@@ -1098,7 +1297,7 @@ def _pr_effect(
     _require_pr_match(
         observation,
         request=request,
-        candidate=candidate,
+        candidate_commit=candidate.commit,
         title=title,
         body=body,
     )
