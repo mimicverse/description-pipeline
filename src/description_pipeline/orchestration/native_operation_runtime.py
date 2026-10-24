@@ -2054,9 +2054,9 @@ class NativeOperationRuntime:
     def artifact_path(self, operation_id: str) -> tuple[Path, dict]:
         canonical_id = _operation_id(operation_id)
         view = self._project(canonical_id)
-        if view.state != "satisfied" or view.artifact is None:
+        if view.artifact is None or not view.resource_terminated:
             raise NativeOperationError(
-                "The native operation has no satisfied artifact",
+                "The native operation has no complete sealed artifact",
                 status=409,
                 code="native_artifact_unavailable",
             )

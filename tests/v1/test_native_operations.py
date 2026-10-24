@@ -1269,6 +1269,84 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                 workspace_root=workspace,
             )
 
+    def test_cancel_race_uses_complete_artifact_and_resource_release(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class GatedBackend(_CountingBackend):
+            def discover_native(self, frozen_source, settings, *, on_activity=None):
+                del frozen_source, settings, on_activity
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("gated backend was not released")
+                return copy.deepcopy(self.payload)
+
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = GatedBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        request = self.request("discover-operation-cancel-race")
+        workspace = self.root / "cancel-race"
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        client.create_operation(
+            _operation(
+                request.operation_id,
+                archive,
+                kind=DISCOVER_KIND,
+                request=request.to_record(),
+                output_contract=NATIVE_OBSERVATION_SCHEMA,
+            )
+        )
+        client.upload_input(request.operation_id, archive)
+        self.assertTrue(entered.wait(5))
+        cancelled = client.cancel_operation(request.operation_id)
+        self.assertEqual(cancelled.state, "unknown")
+        release.set()
+        settled = _wait_for(
+            lambda: (
+                current
+                if (
+                    current := client.get_operation(request.operation_id)
+                ).artifact
+                is not None
+                and current.resource_terminated
+                else None
+            )
+        )
+        self.assertEqual(settled.state, "unknown")
+        (workspace / "observer").mkdir()
+        command, intent, outbound = self.observer_fixture(
+            request.operation_id,
+            workspace / "observer",
+            archive=archive,
+        )
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError("observer must not create")
+        )
+        client.upload_input = mock.Mock(
+            side_effect=AssertionError("observer must not upload")
+        )
+        client.cancel_operation = mock.Mock(
+            side_effect=AssertionError("observer must not cancel")
+        )
+
+        evidence = NativeOperationEffectObserver(client).observe(
+            command=command,
+            intent=intent,
+            outbound_root=outbound,
+            workspace_root=workspace / "observer",
+        )
+
+        self.assertEqual(evidence.fact_type, "reconciled")
+        self.assertEqual(evidence.state_class, "known")
+        self.assertEqual(evidence.metadata["operation_state"], "unknown")
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
+        client.cancel_operation.assert_not_called()
+
     def test_missing_or_unreachable_operation_stays_an_observation(self) -> None:
         runtime = NativeOperationRuntime(
             state_root=self.root / "missing-state",

@@ -523,9 +523,9 @@ class NativeOperationClient:
     ) -> ArtifactDownload:
         view = self.get_operation(operation_id)
         artifact = view.artifact
-        if view.state != "satisfied" or artifact is None or not view.resource_terminated:
+        if artifact is None or not view.resource_terminated:
             raise NativeOperationClientError(
-                "native operation has no satisfied artifact",
+                "native operation has no complete sealed artifact",
                 status=409,
                 code="native_artifact_unavailable",
             )
@@ -967,7 +967,11 @@ class NativeOperationEffectObserver:
             request_sha256=request_sha256,
             native_tool_requirement_sha256=request.native_tool_record_sha256,
         )
-        if observed.state != "satisfied":
+        if observed.state != "satisfied" and not (
+            observed.state == "unknown"
+            and observed.artifact is not None
+            and observed.resource_terminated
+        ):
             return self._non_satisfied(
                 observed,
                 workspace_root=workspace_root,
@@ -1130,7 +1134,11 @@ class NativeOperationEffectObserver:
                 status=409,
                 code="native_operation_conflict",
             )
-        if observed.state != "satisfied":
+        if observed.state != "satisfied" and not (
+            observed.state == "unknown"
+            and observed.artifact is not None
+            and observed.resource_terminated
+        ):
             return self._non_satisfied(
                 observed,
                 workspace_root=workspace_root,
