@@ -75,6 +75,7 @@ from ..stages import (
     merge_activity,
     normalize_activity,
     stage_view,
+    validate_freeze_events,
 )
 from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
 from .selection_transport import StagedSelection
@@ -561,10 +562,18 @@ class Jobs:
         job["failure_diagnostics"] = {"path": "diagnostic.json", "sha256": digest}
 
     def validate(self, request):
-        expected = {"run_id", "upload_files", "upload_sha256", "main_assembly"}
+        expected = {
+            "run_id",
+            "upload_files",
+            "upload_sha256",
+            "main_assembly",
+            "freeze_events",
+            "freeze_events_sha256",
+            "freeze_receipt_sha256",
+        }
         _require(
             isinstance(request, dict) and set(request) in (expected, expected | {"resume"}),
-            "Expected run_id, upload_files, upload_sha256, main_assembly and optional resume",
+            "Expected run identity, prepared upload, freeze events, and optional resume",
         )
         _job_id(request["run_id"])
         _resume_spec(request)
@@ -573,6 +582,16 @@ class Jobs:
         )
         files = validate_file_index(request["upload_files"])
         _require(digest(files) == request["upload_sha256"], "Upload metadata differs from its bound identity")
+        freeze_events = validate_freeze_events(request["freeze_events"])
+        _require(
+            digest(freeze_events) == request["freeze_events_sha256"],
+            "Freeze events differ from their bound identity",
+        )
+        _require(
+            isinstance(request["freeze_receipt_sha256"], str)
+            and _SHA.fullmatch(request["freeze_receipt_sha256"]) is not None,
+            "Freeze receipt identity is missing",
+        )
         if request["main_assembly"] not in files:
             raise SelectionError(
                 "selection_main_invalid",
@@ -974,6 +993,7 @@ class Jobs:
                     raise RequestError("run_id is already bound to a different request", 409)
                 return self.snapshot(identifier), False
             files = self.validate(request)
+            freeze_events = validate_freeze_events(request["freeze_events"])
             spec = _resume_spec(request)
             tool = self._tool_identity()
             _require(
@@ -987,7 +1007,7 @@ class Jobs:
                 "request": copy.deepcopy(request),
                 "main_assembly": request["main_assembly"],
                 "status": "selecting",
-                "events": [],
+                "events": copy.deepcopy(freeze_events),
                 "result": None,
                 "error": None,
                 "native_tool": tool,
@@ -1017,7 +1037,14 @@ class Jobs:
                 _require(
                     all(
                         parent["request"].get(key) == request[key]
-                        for key in ("upload_files", "upload_sha256", "main_assembly")
+                        for key in (
+                            "upload_files",
+                            "upload_sha256",
+                            "main_assembly",
+                            "freeze_events",
+                            "freeze_events_sha256",
+                            "freeze_receipt_sha256",
+                        )
                     ),
                     "A linked attempt must retain its parent's exact upload and selected assembly",
                 )
@@ -1734,6 +1761,7 @@ class Jobs:
                     prior_events=list(job["events"]),
                     expected_inputs=job["prepared_files"],
                     handoff_sha256=job["handoff_sha256"],
+                    upload_sha256=job["request"]["upload_sha256"],
                     **resume_kwargs,
                 )
                 archive = result.get("capture_archive") if isinstance(result.get("capture_archive"), dict) else None

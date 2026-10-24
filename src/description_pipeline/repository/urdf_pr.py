@@ -165,6 +165,8 @@ def _unresolved(code: str, detail, *, commit: str, branch: str, subject: str, ba
         "commit": commit,
         "branch": branch,
         "subject": subject,
+        "subject_sha256": subject,
+        "passed": False,
         "base": base,
         "url": url,
         "retry": {
@@ -1262,6 +1264,8 @@ def submit_bundle(
             "url": url,
             "repository_slug": slug,
             "purpose": purpose,
+            "subject_sha256": subject,
+            "passed": True,
         }
         observed("publication.receipt", "passed", {**result, "subject_sha256": subject})
         return result
@@ -1283,6 +1287,8 @@ def submit_bundle(
             "commit": pushed,
             "branch": branch,
             "subject": subject,
+            "subject_sha256": subject,
+            "passed": False,
             "url": getattr(error, "pr_url", ""),
         }
     except subprocess.CalledProcessError as error:
@@ -1298,6 +1304,8 @@ def submit_bundle(
                 "commit": pushed,
                 "branch": branch,
                 "subject": subject,
+                "subject_sha256": subject,
+                "passed": False,
                 "base": base,
                 "retry": {"command": "gh pr list --head " + branch, "stderr": (error.stderr or "")[-300:]},
                 "url": getattr(error, "pr_url", ""),
@@ -1309,6 +1317,8 @@ def submit_bundle(
             "commit": pushed,
             "branch": branch,
             "subject": subject,
+            "subject_sha256": subject,
+            "passed": False,
         }
     except Exception as error:  # noqa: BLE001 - receipts must never crash the caller
         observed(phase, "failed", {"error": type(error).__name__, "detail": str(error)[:300]})
@@ -1319,6 +1329,8 @@ def submit_bundle(
             "commit": pushed,
             "branch": branch,
             "subject": subject,
+            "subject_sha256": subject,
+            "passed": False,
         }
     finally:
         if submission_root is not None:

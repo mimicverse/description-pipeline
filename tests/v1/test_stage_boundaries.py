@@ -222,6 +222,7 @@ class StageBoundaryTests(unittest.TestCase):
             destination,
             expected_run_id=result["run_id"],
             expected_handoff_sha256=HANDOFF,
+            expected_upload_sha256=HANDOFF,
             expected_main_assembly=MAIN,
             expected_native_tool=build_native_tool(),
         )

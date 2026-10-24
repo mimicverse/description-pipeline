@@ -9,7 +9,6 @@ bytes - no state file is business authority.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 import logging
 
@@ -19,9 +18,14 @@ from .. import solidworks
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, file_digest, read_data
 from ..orchestration.airflow_client import JOB_SCHEMA, validate_run_id
-from ..orchestration.stage_transfer import CAPTURE_MANIFEST, verify_transfer
+from ..orchestration.stage_transfer import CAPTURE_MANIFEST, TEAM_REPORTS, verify_transfer
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
-from ..stages import DELIVERY_STAGES, STAGE_IDS
+from ..stages import (
+    DELIVERY_STAGES,
+    STAGE_IDS,
+    canonical_freeze_timestamp,
+    publication_succeeded,
+)
 from .store import PlatformStore
 
 log = logging.getLogger(__name__)
@@ -160,10 +164,29 @@ def revalidate_capture(platform: PlatformStore, run_id: str, capture: Path, froz
         raise PipelineError("The admitted capture is missing the registered frozen input/request.json")
     if file_digest(carried) != authority:
         raise PipelineError("The carried input/request.json differs from the registered original")
-    summary = verify_transfer(capture, carried={"input/request.json": authority})
+    receipt = registered_capture(platform, run_id)
+    upload_sha256 = receipt.get("upload_sha256")
+    prepared_dir = receipt.get("native_prepared_dir")
+    prepared_files = receipt.get("native_prepared_files")
+    if (
+        not isinstance(upload_sha256, str)
+        or len(upload_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in upload_sha256)
+    ):
+        raise PipelineError("The recorded capture carries no full-upload digest")
+    if not isinstance(prepared_dir, str) or not prepared_dir:
+        raise PipelineError("The recorded capture carries no platform prepared source root")
+    if not isinstance(prepared_files, dict) or not prepared_files:
+        raise PipelineError("The recorded capture carries no platform prepared source inventory")
+    summary = verify_transfer(
+        capture,
+        carried={"input/request.json": authority},
+        expected_upload_sha256=upload_sha256,
+        native_prepared_dir=prepared_dir,
+        native_prepared_files=prepared_files,
+    )
     if not isinstance(summary, dict):
         raise PipelineError("The admitted capture carries no sealed transfer to revalidate")
-    receipt = registered_capture(platform, run_id)
     if summary.get("run_id") != receipt.get("run_id"):
         # The transfer belongs to the original native producer; a linked
         # attempt's materialized copy must still present that producer's own
@@ -303,6 +326,26 @@ def run_stage(
                 raise PipelineError("publish requires the configured model repository checkout")
             seed_owner = owner if boundary == stage else run_id
             seed = registered_checkpoint(platform, seed_owner, _SEED_STAGE[stage])
+            if stage in {"verify", "publish"}:
+                upload_sha256 = capture_receipt.get("upload_sha256")
+                prepared_dir = capture_receipt.get("native_prepared_dir")
+                prepared_files = capture_receipt.get("native_prepared_files")
+                if (
+                    not isinstance(upload_sha256, str)
+                    or not isinstance(prepared_dir, str)
+                    or not isinstance(prepared_files, dict)
+                ):
+                    raise PipelineError("The registered capture lacks its native source binding")
+                summary = verify_transfer(
+                    seed,
+                    regenerated=TEAM_REPORTS,
+                    carried={"input/request.json": _registered_request_sha256(platform, owner)},
+                    expected_upload_sha256=upload_sha256,
+                    native_prepared_dir=prepared_dir,
+                    native_prepared_files=prepared_files,
+                )
+                if not isinstance(summary, dict):
+                    raise PipelineError(f"{stage} seed carries no complete native receipt triplet")
             resume = None
             if owner != run_id:
                 resume = {"parent_run": owner, "from_stage": boundary or stage}
@@ -337,13 +380,12 @@ def run_stage(
 
 
 def _event_instant(value) -> str | None:
-    """The recorded instant as canonical second-resolution text; other shapes stay absent."""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, datetime):
-        stamped = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-        return stamped.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return None
+    """The recorded instant as canonical UTC text; malformed shapes stay absent."""
+
+    try:
+        return canonical_freeze_timestamp(value)
+    except PipelineError:
+        return None
 
 
 def registered_delivery_events(platform: PlatformStore, run_id: str) -> list[dict]:
@@ -386,7 +428,10 @@ def _registered_capture_identity(
     uri = row.get("checkpoint_uri")
     if row.get("state") != "completed" or not isinstance(uri, str) or not uri:
         return None, None
-    confirmed = platform.confirmed_stage(run_id, "capture")
+    try:
+        confirmed = platform.confirmed_stage(run_id, "capture")
+    except PipelineError:
+        return None, None
     if not isinstance(confirmed, dict):
         return None, None
     from .capture import source_identity
@@ -415,12 +460,7 @@ def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
     quality = receipt.get("quality") if isinstance(receipt.get("quality"), dict) else {}
     submission = receipt.get("submission") if isinstance(receipt.get("submission"), dict) else {}
     subject = receipt.get("subject_sha256")
-    submission_bound = (
-        submission.get("state") in {"published", "updated", "noop"}
-        and submission.get("passed") is True
-        and bool(submission.get("url"))
-        and submission.get("subject_sha256") == subject
-    )
+    submission_bound = publication_succeeded(submission, subject)
     state = record.get("state")
     result = {
         "pipeline_id": PIPELINE_ID,

@@ -126,7 +126,24 @@ def import_native_capture(
     selection_binding = _capture_selection(job, run_id, native_tool)
     selection = selection_binding["selection"]
     handoff = selection["handoff_sha256"]
+    upload_sha256 = selection_binding["upload_sha256"]
     main_assembly = selection["main_assembly"]
+    prepared_dir = job.get("prepared_dir")
+    prepared_files = job.get("prepared_files")
+    if not isinstance(prepared_dir, str) or not prepared_dir:
+        raise PipelineError("The native job carries no platform prepared source root")
+    if (
+        not isinstance(prepared_files, dict)
+        or not prepared_files
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(checksum, str)
+            or not checksum
+            for name, checksum in prepared_files.items()
+        )
+    ):
+        raise PipelineError("The native job carries no platform prepared source inventory")
     archive = capture_archive_metadata(job)
     capture = paths.capture_dir
     admitted = (
@@ -157,7 +174,13 @@ def import_native_capture(
             shutil.copy2(sealed_request, frozen)
         if file_digest(frozen) != authority:
             raise PipelineError("The admitted capture is missing the registered frozen input/request.json")
-        summary = verify_transfer(capture, carried={"input/request.json": authority})
+        summary = verify_transfer(
+            capture,
+            carried={"input/request.json": authority},
+            expected_upload_sha256=upload_sha256,
+            native_prepared_dir=prepared_dir,
+            native_prepared_files=prepared_files,
+        )
         if not isinstance(summary, dict) or summary.get("handoff_sha256") != handoff:
             raise PipelineError("The admitted capture differs from its native manifest receipt")
         _check_selected_capture(capture, selection)
@@ -185,8 +208,11 @@ def import_native_capture(
             capture,
             expected_run_id=run_id,
             expected_handoff_sha256=handoff,
+            expected_upload_sha256=upload_sha256,
             expected_main_assembly=main_assembly,
             expected_native_tool=native_tool,
+            expected_prepared_dir=prepared_dir,
+            expected_prepared_files=prepared_files,
         )
         _check_selected_capture(capture, selection)
         _append_native_events(platform, run_id, capture)
@@ -198,5 +224,8 @@ def import_native_capture(
         "state": "capture_admitted",
         "hardware_id": hardware,
         "revision": revision,
+        "upload_sha256": upload_sha256,
+        "native_prepared_dir": prepared_dir,
+        "native_prepared_files": dict(prepared_files),
         **selection_binding,
     }

@@ -24,6 +24,7 @@ from description_pipeline.interface_records import (
 from description_pipeline.orchestration.airflow_client import EndpointConfig, WindowsEndpoint, cache_release_request
 
 from tests.v1.split_capture_fixture import CONTROL_LIMITS, REQUIRED_CONTROL_GATES
+from .freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
 
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE = ROOT / "tools" / "scheduled_smoke.py"
@@ -232,6 +233,8 @@ class MockEndpointHealthTests(unittest.TestCase):
                     run_id=run_id,
                     upload_files={"cad/robot.SLDASM": "d" * 64},
                     main_assembly="cad/robot.SLDASM",
+                    freeze_events=freeze_events(),
+                    freeze_receipt_sha256=FREEZE_RECEIPT_SHA256,
                 )
                 self.assertEqual(state["jobs"][run_id]["handoff_sha256"], "e" * 64)
                 request = cache_release_request(

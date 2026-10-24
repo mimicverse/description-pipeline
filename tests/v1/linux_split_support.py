@@ -46,6 +46,18 @@ def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
     )
     with zipfile.ZipFile(archive) as packed:
         manifest_sha256 = hashlib.sha256(packed.read("transfer-manifest.json")).hexdigest()
+        native_stages = json.loads(packed.read("reports/native-stages.json"))
+        collection = json.loads(packed.read("evidence/evidence/collection.json"))
+        binding = next(
+            event["check"]["details"]
+            for event in native_stages["events"]
+            if (event.get("check") or {}).get("id") == "discovery.binding"
+        )
+        prepared_files = {
+            name.removeprefix("input/"): checksum
+            for name, checksum in binding["files"].items()
+        }
+        prepared_dir = str(Path(collection["identity"]["assembly"]).parent)
     return {
         "status": "native_complete",
         "run_id": run_id,
@@ -53,6 +65,8 @@ def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
         "native_tool": tool,
         "handoff_sha256": HANDOFF,
         "package_files": dict(SELECTED),
+        "prepared_dir": prepared_dir,
+        "prepared_files": prepared_files,
         "request": {
             "run_id": run_id,
             "upload_files": dict(UPLOAD),
@@ -131,7 +145,7 @@ class SplitAdmissionMixin:
                 target_hardware="fixture",
                 change_summary="fixture frozen original",
                 main_assembly=MAIN_ASSEMBLY,
-                handoff_digest=HANDOFF,
+                handoff_digest=digest(UPLOAD),
                 platform_config_digest="c" * 64,
             )
         )
@@ -218,5 +232,14 @@ class SplitAdmissionMixin:
         snapshot = self.tmp / f"fixture-native-{run_id}"
         shutil.copytree(paths.capture_dir, snapshot)
         self._subject_layout(snapshot)
-        self._register_stage(run_id, "capture", snapshot, state="native_complete", native_tool=self.tool)
+        self._register_stage(
+            run_id,
+            "capture",
+            snapshot,
+            state="native_complete",
+            native_tool=self.tool,
+            upload_sha256=job["request"]["upload_sha256"],
+            native_prepared_dir=job["prepared_dir"],
+            native_prepared_files=job["prepared_files"],
+        )
         return result

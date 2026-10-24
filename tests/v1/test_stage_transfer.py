@@ -23,6 +23,7 @@ from description_pipeline.io import PipelineError, canonical, digest, file_diges
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+from description_pipeline import steps
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.stages import stage_view as rendered_stage_view
 
@@ -109,6 +110,16 @@ def _capture_events(
         for name, checksum in inventory(root / "input").items()
         if name not in {"handoff.json", "request.json"}
     }
+    binding_files = {
+        f"input/{name}": checksum
+        for name, checksum in input_inventory.items()
+    }
+    prepared_files = dict(input_inventory)
+    capture_plan = root / "evidence/capture-plan.json"
+    if capture_plan.is_file():
+        plan_sha256 = file_digest(capture_plan)
+        binding_files["input/capture-plan.json"] = plan_sha256
+        prepared_files["capture-plan.json"] = plan_sha256
     evidence_inventory = {
         name: checksum
         for name, checksum in inventory(root / "evidence").items()
@@ -192,12 +203,9 @@ def _capture_events(
                 {
                     "base": "fixture",
                     "discovery_sha256": file_digest(native_discovery_path),
-                    "files": {
-                        f"input/{name}": checksum
-                        for name, checksum in input_inventory.items()
-                    },
+                    "files": binding_files,
                     "hardware_id": discovery_identity.get("hardware_id"),
-                    "prepared_sha256": digest(input_inventory),
+                    "prepared_sha256": digest(prepared_files),
                     "repository_slug": "example/fixture",
                     "revision": discovery_identity.get("revision"),
                 },
@@ -273,7 +281,14 @@ def _capture_events(
     ]
 
 
-def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, main: str = MAIN_ASSEMBLY) -> Path:
+def capture_root(
+    base: Path,
+    *,
+    run_id: str = RUN_ID,
+    handoff: str = HANDOFF,
+    upload: str = HANDOFF,
+    main: str = MAIN_ASSEMBLY,
+) -> Path:
     root = Path(base) / "capture"
     (root / "input" / "cad").mkdir(parents=True)
     (root / "input" / "cad" / main).write_bytes(MAIN_BYTES)
@@ -288,7 +303,7 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     }
     source_identity = {
         "configuration": "Default",
-        "handoff_digest": handoff,
+        "handoff_digest": upload,
         "hardware_id": "fixture",
         "kind": "source-revision",
         "main_assembly": main,
@@ -489,6 +504,7 @@ def seal(root: Path, archive: Path, **overrides) -> dict:
     arguments = {
         "run_id": RUN_ID,
         "handoff_sha256": HANDOFF,
+        "upload_sha256": HANDOFF,
         "main_assembly": MAIN_ASSEMBLY,
         "native_tool": native_tool(),
     }
@@ -500,6 +516,7 @@ def admit(archive: Path, destination: Path, **overrides) -> dict:
     arguments = {
         "expected_run_id": RUN_ID,
         "expected_handoff_sha256": HANDOFF,
+        "expected_upload_sha256": HANDOFF,
         "expected_main_assembly": MAIN_ASSEMBLY,
         "expected_native_tool": native_tool(),
     }
@@ -597,6 +614,23 @@ class StageTransferTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive) as archive:
             sealed = archive.read(transfer.CAPTURE_MANIFEST)
         self.assertEqual((destination / transfer.CAPTURE_MANIFEST).read_bytes(), sealed)
+
+    def test_full_upload_and_selected_native_handoff_are_bound_separately(self) -> None:
+        upload_sha256 = digest({**NATIVE_FILES, "excluded.SLDPRT": "e" * 64})
+        root = capture_root(self.base / "separate-upload", upload=upload_sha256)
+        archive = self.base / "separate-upload.zip"
+        manifest = seal(root, archive, upload_sha256=upload_sha256)
+        self.assertEqual(manifest["upload_sha256"], upload_sha256)
+        self.assertEqual(manifest["handoff_sha256"], HANDOFF)
+
+        destination = self.base / "separate-upload-admitted"
+        admit(archive, destination, expected_upload_sha256=upload_sha256)
+        summary = transfer.verify_transfer(
+            destination,
+            expected_upload_sha256=upload_sha256,
+        )
+        self.assertEqual(summary["upload_sha256"], upload_sha256)
+        self.assertEqual(summary["handoff_sha256"], HANDOFF)
 
     def test_regenerated_team_reports_are_tolerated_only_in_deliveries(self) -> None:
         manifest = seal(self.root, self.archive)
@@ -1173,6 +1207,7 @@ class StageTransferTests(unittest.TestCase):
                 capture,
                 archive,
                 handoff_sha256=handoff_sha256,
+                upload_sha256=handoff_sha256,
                 main_assembly=assembly.name,
             )
             self.assertIn("evidence/evidence/collection.json", manifest["files"])
@@ -1181,6 +1216,7 @@ class StageTransferTests(unittest.TestCase):
                 archive,
                 destination,
                 expected_handoff_sha256=handoff_sha256,
+                expected_upload_sha256=handoff_sha256,
                 expected_main_assembly=assembly.name,
             )
             self.assertTrue((destination / "evidence/manifest.json").is_file())
@@ -1409,6 +1445,36 @@ class StageTransferTests(unittest.TestCase):
         )
         with self.assertRaises(PipelineError):
             seal(record_bound, self.base / "record-source.zip")
+
+    def test_controlled_record_archive_path_is_canonical_and_never_overwrites(self) -> None:
+        self.assertEqual(transfer.record_archive_path("records/record.txt"), "records/record.txt")
+        for invalid in (
+            "cad/robot.SLDASM",
+            "../record.txt",
+            "records/../record.txt",
+            "records/records/record.txt",
+            "records\\record.txt",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(PipelineError):
+                transfer.record_archive_path(invalid)
+
+        package = self.base / "record-package"
+        (package / "discovery").mkdir(parents=True)
+        (package / "records").mkdir()
+        (package / "records" / "record.txt").write_text("record\n", encoding="utf-8")
+        write_json(
+            package / "discovery/native-discovery.json",
+            {
+                "native_files": {},
+                "records": [{"package_file": "records/record.txt"}],
+            },
+        )
+        write_json(package / "discovery/findings.json", {"findings": []})
+        staging = self.base / "record-staging"
+        (staging / "input/records").mkdir(parents=True)
+        (staging / "input/records/record.txt").write_text("existing\n", encoding="utf-8")
+        with self.assertRaisesRegex(PipelineError, "overwrite"):
+            steps._archive_input(package, staging)
 
     def test_input_valid_details_are_recomputed_from_archived_bytes(self) -> None:
         root = capture_root(self.base / "input-details")

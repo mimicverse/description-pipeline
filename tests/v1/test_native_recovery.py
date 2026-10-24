@@ -19,6 +19,7 @@ from description_pipeline.request_evidence import build_request_evidence, reques
 from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 from tests.sources.selection_support import sealed_selection
+from tests.v1.source_record_support import source_record
 
 RUN_ID = "cfa3e725-abc5-5b60-94ad-6ba838110408"
 MAIN = "assembly.SLDASM"
@@ -85,6 +86,14 @@ class NativeRecoveryTests(unittest.TestCase):
         self.handoff = digest(self.native_files)
         self.full_upload = {**self.native_files, "excluded.SLDPRT": "d" * 64}
         self.full_upload_sha = digest(self.full_upload)
+        write_json(
+            self.derived / "source.json",
+            source_record(
+                hardware_id="m3.0",
+                handoff_digest=self.full_upload_sha,
+                main_assembly=MAIN,
+            ),
+        )
         selection = sealed_selection(
             self.full_upload,
             MAIN,

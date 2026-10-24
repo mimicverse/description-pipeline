@@ -28,7 +28,10 @@ def derive_scene(root: Path, manifest: dict) -> dict:
     payload = read_data(confined(delivery, "evidence/discovery.json"))
     main = str((payload.get("derivation") or {}).get("main_assembly") or "")
     config = source_definition(
-        delivery, discovery_name="evidence/discovery.json", cad_prefix="input/cad/", records_prefix="input/records/"
+        delivery,
+        discovery_name="evidence/discovery.json",
+        cad_prefix="input/cad/",
+        records_prefix="input/",
     )
     if not isinstance(raw, dict) or not isinstance(config, dict):
         raise PipelineError("Captured readings and source configuration must be objects")

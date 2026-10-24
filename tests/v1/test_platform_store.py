@@ -43,13 +43,19 @@ from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.solidworks_urdf import required_checks
+from tests.v1.source_record_support import source_record
 
 NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
 CHECKPOINT = "store://sealed/run-r-1"
 NATIVE_STAGE_STATES = {"freeze": "frozen", "discover": "discovered", "capture": "native_complete"}
 
 
-def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
+def build_sealed_delivery(
+    root: Path,
+    *,
+    hardware_id: str = "nd",
+    revision: str | None = None,
+) -> tuple[str, list[dict], str, str]:
     """One real sealed delivery: manifest record-for-record plus its digests.
 
     The tree covers the declared evidence of all six stages, so the same
@@ -63,16 +69,26 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
         (root / name).mkdir(parents=True)
     (root / "input" / "records").mkdir()
     (root / "evidence" / "geometry").mkdir()
-    write_json(root / "input" / "source.json", {"source": "fixture"})
     write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
     (root / "input" / "cad" / "cad").mkdir(parents=True)
     (root / "input" / "cad" / "cad" / "robot.SLDASM").write_bytes(b"fixture-native")
+    native_inventory = {
+        "cad/robot.SLDASM": file_digest(root / "input" / "cad" / "cad" / "robot.SLDASM")
+    }
+    write_json(
+        root / "input" / "source.json",
+        source_record(
+            hardware_id=hardware_id,
+            handoff_digest=digest(native_inventory),
+            main_assembly="cad/robot.SLDASM",
+            revision=revision,
+        ),
+    )
     package_files = {
         "source.json": file_digest(root / "input" / "source.json"),
         "records/arm.json": file_digest(root / "input" / "records" / "arm.json"),
         "cad/cad/robot.SLDASM": file_digest(root / "input" / "cad" / "cad" / "robot.SLDASM"),
     }
-    native_inventory = {"cad/robot.SLDASM": package_files["cad/cad/robot.SLDASM"]}
     write_json(
         root / "input" / "handoff.json",
         {
@@ -87,6 +103,13 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
             "discovery": "fixture",
             "handoff_sha256": digest(native_inventory),
             "native_files": native_inventory,
+            "identity": {
+                "main_assembly": "cad/robot.SLDASM",
+                "delivery_configuration": "Default",
+                "hardware_id": hardware_id,
+                "revision": revision,
+            },
+            "records": [],
         },
     )
     write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
@@ -116,7 +139,7 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
         build_request_evidence(
             purpose="engineering",
             request_id="fixture-sealed-delivery",
-            target_hardware="nd",
+            target_hardware=hardware_id,
             change_summary="fixture",
             main_assembly="cad/robot.SLDASM",
             handoff_digest=digest(package_files),

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from description_pipeline.io import PipelineError, file_digest
+from description_pipeline.io import PipelineError, digest, file_digest
 from description_pipeline.orchestration.stage_transfer import seal_capture
 from description_pipeline.platform import capture as platform_capture
 from description_pipeline.platform.capture import source_identity
@@ -54,13 +54,20 @@ class PlatformCaptureImportTests(unittest.TestCase):
             dispatch={"stage": "capture", "operation_key": f"{RUN}/capture:0", "params_digest": "a" * 64},
         )
         self.tool = native_tool()
-        source = capture_root(self.tmp, run_id=RUN, handoff=HANDOFF)
+        self.upload_sha256 = digest(UPLOAD)
+        source = capture_root(
+            self.tmp,
+            run_id=RUN,
+            handoff=HANDOFF,
+            upload=self.upload_sha256,
+        )
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(
             source,
             self.archive,
             run_id=RUN,
             handoff_sha256=HANDOFF,
+            upload_sha256=self.upload_sha256,
             main_assembly=MAIN_ASSEMBLY,
             native_tool=self.tool,
         )
@@ -130,7 +137,12 @@ class PlatformCaptureImportTests(unittest.TestCase):
 
         from description_pipeline.io import write_json
 
-        source = capture_root(self.tmp / "foreign-inventory", run_id=FRESH, handoff=HANDOFF)
+        source = capture_root(
+            self.tmp / "foreign-inventory",
+            run_id=FRESH,
+            handoff=HANDOFF,
+            upload=self.upload_sha256,
+        )
         record_path = source / "evidence/discovery.json"
         record = json.loads(record_path.read_text())
         record["native_files"]["stray.SLDPRT"] = "0" * 64
@@ -146,6 +158,7 @@ class PlatformCaptureImportTests(unittest.TestCase):
                 archive,
                 run_id=FRESH,
                 handoff_sha256=HANDOFF,
+                upload_sha256=self.upload_sha256,
                 main_assembly=MAIN_ASSEMBLY,
                 native_tool=self.tool,
             )

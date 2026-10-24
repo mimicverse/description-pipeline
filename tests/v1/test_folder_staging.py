@@ -31,6 +31,7 @@ from description_pipeline.orchestration.airflow_client import (
 )
 from description_pipeline.orchestration.selection_client import prepare_staging_archive
 from description_pipeline.sources.solidworks.revision import package_inventory
+from .freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
 
 ROOT = Path(__file__).resolve().parents[2]
 DAG_PATH = ROOT / "deploy/airflow/dags/solidworks_to_urdf.py"
@@ -281,7 +282,14 @@ class FolderStagingTransportTests(unittest.TestCase):
         self.batch_dir = self.tmp / "staging"
 
     def _start(self, **overrides) -> dict:
-        payload = {"run_id": self.run_id, "upload_files": self.upload, "main_assembly": "总装.SLDASM"}
+        prior = freeze_events()
+        payload = {
+            "run_id": self.run_id,
+            "upload_files": self.upload,
+            "main_assembly": "总装.SLDASM",
+            "freeze_events": prior,
+            "freeze_receipt_sha256": FREEZE_RECEIPT_SHA256,
+        }
         payload.update(overrides)
         return self.endpoint.start_staging_job(**payload)
 
@@ -382,6 +390,8 @@ class FolderStagingTransportTests(unittest.TestCase):
             run_id=child,
             upload_files=self.upload,
             main_assembly="总装.SLDASM",
+            freeze_events=freeze_events(),
+            freeze_receipt_sha256=FREEZE_RECEIPT_SHA256,
             resume={"parent_run": self.run_id, "from_stage": "capture"},
         )
         self.assertEqual(response["selection"]["state"], "sealed")
@@ -401,6 +411,8 @@ class FolderStagingTransportTests(unittest.TestCase):
                 run_id="2b3faa2a-0000-4000-8000-000000000003",
                 upload_files=self.upload,
                 main_assembly="总装.SLDASM",
+                freeze_events=freeze_events(),
+                freeze_receipt_sha256=FREEZE_RECEIPT_SHA256,
                 resume={"parent_run": self.run_id, "from_stage": "capture"},
             )
         self.assertIn("different main assembly", str(caught.exception))
@@ -411,6 +423,8 @@ class FolderStagingTransportTests(unittest.TestCase):
                 run_id="2b3faa2a-0000-4000-8000-000000000004",
                 upload_files=self.upload,
                 main_assembly="总装.SLDASM",
+                freeze_events=freeze_events(),
+                freeze_receipt_sha256=FREEZE_RECEIPT_SHA256,
                 resume={"parent_run": self.run_id, "from_stage": "capture"},
             )
         self.assertIn("outside the upload index", str(caught.exception))

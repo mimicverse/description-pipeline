@@ -109,6 +109,44 @@ def _normalize_document_path(value) -> str:
     return ntpath.normpath(str(value or "").replace("/", "\\")).casefold()
 
 
+def _expected_prepared_assembly(prepared_dir: str, main_assembly: str) -> str:
+    root = str(prepared_dir or "").replace("/", "\\")
+    relative = str(main_assembly or "").replace("/", "\\")
+    _require(bool(root) and bool(relative), "Native prepared root and main assembly are required")
+    artifact_path_parts(main_assembly)
+    _require(
+        ".." not in root.split("\\") and ".." not in relative.split("\\"),
+        "Native prepared source path contains traversal",
+    )
+    expected = ntpath.normpath(ntpath.join(root, relative))
+    _require(
+        ntpath.isabs(root) and ntpath.isabs(expected),
+        "Native prepared root is not an absolute path",
+    )
+    return _normalize_document_path(expected)
+
+
+def record_archive_path(package_file: str) -> str:
+    """Validate the canonical embedded-record path used by every archive reader."""
+
+    _require(
+        isinstance(package_file, str)
+        and package_file == package_file.replace("\\", "/")
+        and "//" not in package_file,
+        "Controlled record path is not canonical POSIX text",
+    )
+    artifact_path_parts(package_file)
+    parts = package_file.split("/")
+    _require(
+        len(parts) == 2
+        and parts[0] == "records"
+        and bool(parts[1])
+        and parts[1] not in {".", ".."},
+        "Controlled record path must be records/<file>",
+    )
+    return package_file
+
+
 def _validate_native_tool(native_tool) -> None:
     """A native tool record must pin its release and the Windows-native runtime closure."""
 
@@ -365,6 +403,7 @@ def _validate_evidence(
     configuration: str,
     native_files: dict[str, str],
     native_tool: dict,
+    native_prepared_dir: str | None = None,
 ) -> dict:
     evidence = Path(root) / "evidence"
     manifest = verify_snapshot(evidence)
@@ -497,6 +536,18 @@ def _validate_evidence(
         and source_assembly.endswith(discovery_source_suffix),
         "Evidence source paths disagree or do not bind the selected main assembly",
     )
+    if native_prepared_dir is not None:
+        prepared_source = _expected_prepared_assembly(
+            native_prepared_dir,
+            main_assembly,
+        )
+        _require(
+            source_assembly
+            == source_document
+            == source_material
+            == prepared_source,
+            "Evidence source paths differ from the platform prepared source",
+        )
     _require(
         collected_source == closure_source
         and collected_source.endswith("\\" + _document_basename(main_assembly).casefold()),
@@ -660,6 +711,7 @@ def _validate_stage_details(
     main_assembly: str,
     main_assembly_sha256: str,
     native_files: dict[str, str],
+    native_prepared_files: dict[str, str] | None = None,
 ) -> None:
     checks = _stage_checks(view)
     expected = expected_native_check_details(
@@ -781,6 +833,22 @@ def _validate_stage_details(
         == digest({name.removeprefix("input/"): checksum for name, checksum in binding_files.items()}),
         "Discover discovery.binding prepared digest differs from its file inventory",
     )
+    if native_prepared_files is not None:
+        prepared_inventory = _casefold_inventory(
+            native_prepared_files,
+            "Platform prepared inventory",
+        )
+        _require(
+            {
+                name.removeprefix("input/").casefold(): checksum
+                for name, checksum in binding_files.items()
+            }
+            == {
+                key: value[1]
+                for key, value in prepared_inventory.items()
+            },
+            "Discover discovery.binding differs from the platform prepared inventory",
+        )
     _require(
         bound_paths == set(archived_inputs),
         "Discover discovery.binding differs from the complete prepared-to-archived inventory",
@@ -820,7 +888,7 @@ def _validate_stage_details(
 def _validate_source_identity(
     root: Path,
     *,
-    handoff_sha256: str,
+    upload_sha256: str,
     main_assembly: str,
     configuration: str,
 ) -> dict:
@@ -841,7 +909,7 @@ def _validate_source_identity(
         "Frozen handoff main assembly or configuration differs from the transfer",
     )
     _require(
-        identity.get("handoff_digest") == handoff_sha256
+        identity.get("handoff_digest") == upload_sha256
         and identity.get("main_assembly") == main_assembly
         and identity.get("configuration") == configuration
         and identity.get("hardware_id") == hardware
@@ -878,29 +946,51 @@ def _validate_source_identity(
     )
     for item in source_records:
         expected = by_reference[item["reference"]]
-        package_file = expected.get("package_file")
-        handoff_files = handoff.get("package_files")
         _require(
-            isinstance(package_file, str)
-            and package_file.startswith("records/")
-            and expected.get("source_sha256") == item["file_sha256"]
+            set(expected)
+            == {
+                "reference",
+                "file",
+                "key",
+                "package_file",
+                "sha256",
+                "source_sha256",
+                "anchor",
+            },
+            f"Native controlled record has unknown or missing fields: {item['reference']}",
+        )
+        package_file = record_archive_path(str(expected.get("package_file") or ""))
+        handoff_files = handoff.get("package_files")
+        source_sha256 = expected.get("source_sha256")
+        record_sha256 = expected.get("sha256")
+        source_file = expected.get("file")
+        record_key = expected.get("key")
+        anchor = expected.get("anchor")
+        _require(
+            _is_sha256(source_sha256)
+            and record_sha256 == source_sha256
+            and source_sha256 == item["file_sha256"]
+            and isinstance(source_file, str)
+            and bool(source_file)
+            and isinstance(record_key, str)
+            and (anchor is None or isinstance(anchor, str))
             and isinstance(handoff_files, dict),
             f"Controlled record path differs from the source record: {item['reference']}",
         )
-        artifact_path_parts(package_file)
+        artifact_path_parts(source_file)
         archived_record = next(
             (
                 name
                 for name, checksum in handoff_files.items()
-                if name.casefold() == ("records/" + package_file).casefold()
-                and checksum == item["file_sha256"]
+                if name.replace("\\", "/").casefold() == package_file.casefold()
+                and checksum == source_sha256
             ),
             None,
         )
         _require(
             archived_record is not None
             and file_digest(confined(root, "input/" + archived_record))
-            == item["file_sha256"],
+            == source_sha256,
             f"Controlled record bytes differ from the source record: {item['reference']}",
         )
     request_path = confined(root, "input/request.json", exists=False)
@@ -909,7 +999,7 @@ def _validate_source_identity(
         _require(
             request.get("main_assembly") == main_assembly
             and request.get("target_hardware") == hardware
-            and request.get("handoff_digest") == handoff_sha256,
+            and request.get("handoff_digest") == upload_sha256,
             "Frozen request differs from the source and handoff identity",
         )
     return source
@@ -1006,10 +1096,13 @@ def _validate_capture(
     *,
     run_id: str,
     handoff_sha256: str,
+    upload_sha256: str,
     main_assembly: str,
     native_tool,
     native_stages=None,
     native_tool_record=None,
+    native_prepared_dir: str | None = None,
+    native_prepared_files: dict[str, str] | None = None,
 ) -> dict:
     """Re-read a capture root (sealed or freshly extracted) against the transfer contract."""
 
@@ -1048,7 +1141,7 @@ def _validate_capture(
     _require(configuration, "Frozen handoff lacks its configuration")
     source = _validate_source_identity(
         root,
-        handoff_sha256=handoff_sha256,
+        upload_sha256=upload_sha256,
         main_assembly=main_assembly,
         configuration=configuration,
     )
@@ -1059,6 +1152,7 @@ def _validate_capture(
         configuration=configuration,
         native_files=native_files,
         native_tool=native_tool,
+        native_prepared_dir=native_prepared_dir,
     )
     _validate_stage_details(
         root,
@@ -1067,6 +1161,7 @@ def _validate_capture(
         main_assembly=main_assembly,
         main_assembly_sha256=main_assembly_sha256,
         native_files=native_files,
+        native_prepared_files=native_prepared_files,
     )
     return {
         "main_assembly_sha256": main_assembly_sha256,
@@ -1081,6 +1176,7 @@ def seal_capture(
     *,
     run_id: str,
     handoff_sha256: str,
+    upload_sha256: str,
     main_assembly: str,
     native_tool: dict,
 ) -> dict:
@@ -1090,6 +1186,7 @@ def seal_capture(
     archive = Path(archive)
     _require(isinstance(run_id, str) and run_id.strip(), "run_id must be a nonempty string")
     _require(_is_sha256(handoff_sha256), "handoff_sha256 must be a sha256 digest")
+    _require(_is_sha256(upload_sha256), "upload_sha256 must be a sha256 digest")
     _require(isinstance(main_assembly, str) and main_assembly.strip(), "main_assembly must be a relative file name")
     artifact_path_parts(main_assembly)
     _require(not archive.exists(), f"Transfer archive already exists: {archive}")
@@ -1119,6 +1216,7 @@ def seal_capture(
         root,
         run_id=run_id,
         handoff_sha256=handoff_sha256,
+        upload_sha256=upload_sha256,
         main_assembly=main_assembly,
         native_tool=native_tool,
     )
@@ -1126,6 +1224,7 @@ def seal_capture(
         "schema_version": TRANSFER_SCHEMA,
         "run_id": run_id,
         "handoff_sha256": handoff_sha256,
+        "upload_sha256": upload_sha256,
         "main_assembly": main_assembly,
         "main_assembly_sha256": validated["main_assembly_sha256"],
         "native_tool": native_tool,
@@ -1296,8 +1395,11 @@ def admit_capture(
     *,
     expected_run_id: str,
     expected_handoff_sha256: str,
+    expected_upload_sha256: str,
     expected_main_assembly: str,
     expected_native_tool: dict,
+    expected_prepared_dir: str | None = None,
+    expected_prepared_files: dict[str, str] | None = None,
 ) -> dict:
     """Admit one transferred capture: validate in private staging, then install atomically."""
 
@@ -1312,6 +1414,7 @@ def admit_capture(
         manifest = _extract(archive, staging)
         _require(manifest.get("run_id") == expected_run_id, "Transfer belongs to another run")
         _require(manifest.get("handoff_sha256") == expected_handoff_sha256, "Transfer binds another handoff")
+        _require(manifest.get("upload_sha256") == expected_upload_sha256, "Transfer binds another upload")
         _require(manifest.get("main_assembly") == expected_main_assembly, "Transfer binds another main assembly")
         _require(
             manifest.get("native_tool") == expected_native_tool,
@@ -1321,8 +1424,11 @@ def admit_capture(
             staging,
             run_id=expected_run_id,
             handoff_sha256=expected_handoff_sha256,
+            upload_sha256=expected_upload_sha256,
             main_assembly=expected_main_assembly,
             native_tool=expected_native_tool,
+            native_prepared_dir=expected_prepared_dir,
+            native_prepared_files=expected_prepared_files,
         )
         _require(
             manifest.get("main_assembly_sha256") == validated["main_assembly_sha256"],
@@ -1342,6 +1448,9 @@ def verify_transfer(
     regenerated: tuple[str, ...] = (),
     carried: dict[str, str] | None = None,
     native_receipts: dict | None = None,
+    expected_upload_sha256: str | None = None,
+    native_prepared_dir: str | None = None,
+    native_prepared_files: dict[str, str] | None = None,
 ) -> dict | None:
     """Revalidate transferred native provenance inside a delivery bundle.
 
@@ -1414,6 +1523,7 @@ def verify_transfer(
             "schema_version",
             "run_id",
             "handoff_sha256",
+            "upload_sha256",
             "main_assembly",
             "main_assembly_sha256",
             "native_tool",
@@ -1553,11 +1663,19 @@ def verify_transfer(
         )
     run_id = manifest.get("run_id")
     handoff = manifest.get("handoff_sha256")
+    upload = manifest.get("upload_sha256")
     main_assembly = manifest.get("main_assembly")
     _require(
-        isinstance(run_id, str) and run_id and _is_sha256(handoff) and isinstance(main_assembly, str) and main_assembly,
-        "Transfer manifest lacks its run, handoff or main assembly",
+        isinstance(run_id, str)
+        and run_id
+        and _is_sha256(handoff)
+        and _is_sha256(upload)
+        and isinstance(main_assembly, str)
+        and main_assembly,
+        "Transfer manifest lacks its run, handoff, upload or main assembly",
     )
+    if expected_upload_sha256 is not None:
+        _require(upload == expected_upload_sha256, "Transfer binds another upload")
     try:
         canonical_run_id = str(uuid.UUID(run_id))
     except (ValueError, AttributeError, TypeError) as error:
@@ -1567,10 +1685,13 @@ def verify_transfer(
         bundle,
         run_id=run_id,
         handoff_sha256=handoff,
+        upload_sha256=upload,
         main_assembly=main_assembly,
         native_tool=manifest.get("native_tool"),
         native_stages=receipt_stages,
         native_tool_record=receipt_native_tool,
+        native_prepared_dir=native_prepared_dir,
+        native_prepared_files=native_prepared_files,
     )
     _require(
         validated["main_assembly_sha256"] == manifest.get("main_assembly_sha256"),
@@ -1579,6 +1700,7 @@ def verify_transfer(
     return {
         "run_id": run_id,
         "handoff_sha256": handoff,
+        "upload_sha256": upload,
         "main_assembly": main_assembly,
         "files": len(files),
         "source_revision_id": validated["source_revision_id"],
@@ -1586,7 +1708,14 @@ def verify_transfer(
     }
 
 
-def validate_native_receipts(root: Path, receipts: dict) -> dict:
+def validate_native_receipts(
+    root: Path,
+    receipts: dict,
+    *,
+    expected_upload_sha256: str | None = None,
+    native_prepared_dir: str | None = None,
+    native_prepared_files: dict[str, str] | None = None,
+) -> dict:
     """Validate an in-memory native receipt triplet against one delivery root.
 
     This is the publisher path: native report files are intentionally absent
@@ -1624,6 +1753,9 @@ def validate_native_receipts(root: Path, receipts: dict) -> dict:
         regenerated=() if team_reports_present else TEAM_REPORTS,
         carried=carried,
         native_receipts=blobs,
+        expected_upload_sha256=expected_upload_sha256,
+        native_prepared_dir=native_prepared_dir,
+        native_prepared_files=native_prepared_files,
     )
     _require(isinstance(summary, dict), "Native receipts do not bind a transfer")
     return {

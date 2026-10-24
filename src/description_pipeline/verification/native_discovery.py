@@ -2792,8 +2792,10 @@ def _close(left, right, tolerance: float = 1e-9) -> bool:
 
 
 def _record_value(package: Path, entry: dict, key: str):
-    relative = str(entry.get("package_file") or "")
-    candidates = [package / relative, package / "input/records" / relative]
+    from ..orchestration.stage_transfer import record_archive_path
+
+    relative = record_archive_path(str(entry.get("package_file") or ""))
+    candidates = [package / relative, package / "input" / relative]
     target = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     _require(
         target.is_file(), "discovery.record", "embedded record file is missing", {"file": entry.get("package_file")}

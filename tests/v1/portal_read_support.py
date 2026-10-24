@@ -16,8 +16,8 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
-from description_pipeline.io import file_digest, read_data, write_json
+from description_pipeline.delivery import read_delivery_manifest
+from description_pipeline.io import read_data, write_json
 from description_pipeline.platform.storage import seal_stage_confirmation
 from description_pipeline.platform.store import PlatformStore
 from description_pipeline.verification import solidworks_urdf
@@ -118,17 +118,14 @@ class RegisteredPlatform:
         if capture.exists():
             shutil.rmtree(capture)
         capture.mkdir(parents=True)
-        _subject, _artifacts, _handoff_full, handoff_native = build_sealed_delivery(capture)
-        manifest = read_delivery_manifest(capture)
-        write_json(
-            capture / "input/source.json",
-            {"identity": {"hardware_id": hardware_id}, "metadata": {"revision": revision}},
+        _subject, _artifacts, _handoff_full, handoff_native = build_sealed_delivery(
+            capture,
+            hardware_id=hardware_id,
+            revision=revision,
         )
-        handoff = read_data(capture / "input/handoff.json")
-        handoff["package_files"]["source.json"] = file_digest(capture / "input/source.json")
-        write_json(capture / "input/handoff.json", handoff)
-        write_delivery_manifest(capture, contract=manifest["contract"], policy=manifest["policy"])
         manifest = read_delivery_manifest(capture)
+        handoff = read_data(capture / "input/handoff.json")
+        source = read_data(capture / "input/source.json")
         receipt = {
             "schema_version": "solidworks-to-urdf.bundle/v1",
             "pipeline_id": "solidworks-to-urdf",
@@ -137,8 +134,11 @@ class RegisteredPlatform:
             "state": "native_complete",
             "passed": False,
             "handoff_sha256": handoff_native,
+            "upload_sha256": source["identity"]["handoff_digest"],
             "artifacts": [dict(record) for record in manifest["subject"]["files"]],
             "native_tool": read_data(capture / "reports/native-tool.json"),
+            "native_prepared_dir": "C:\\fixture\\prepared",
+            "native_prepared_files": dict(handoff["package_files"]),
         }
         self.world.stages.pop((run_id, "capture"), None)
         self.store.confirm_stage(

@@ -168,6 +168,7 @@ def build_fixture_capture(
             backend=backend,
             run_id=run_id,
             handoff_sha256=handoff,
+            upload_sha256=handoff,
             main_assembly=main_assembly,
             expected_inputs=prepared_files,
             prior_events=events,
@@ -193,6 +194,8 @@ def build_fixture_capture(
         "hardware_id": prepared.hardware_id,
         "revision": prepared.revision,
         "native_tool": tool,
+        "prepared_dir": str(prepared_package),
+        "prepared_files": dict(prepared_files),
         "archive": archive,
         "manifest": manifest,
         # The exact capture-archive receipt the Windows endpoint serves at its

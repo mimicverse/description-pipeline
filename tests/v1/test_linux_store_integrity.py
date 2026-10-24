@@ -26,14 +26,14 @@ from pathlib import Path
 from unittest import mock
 
 from description_pipeline import solidworks
-from description_pipeline.io import PipelineError, file_digest, read_data, write_json
+from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST, seal_capture
 from description_pipeline.platform import capture as platform_capture
 from description_pipeline.platform import flow
 from description_pipeline.platform import storage as platform_storage
 from description_pipeline.platform.store import PlatformStore, PlatformStoreError
 
-from .linux_split_support import HANDOFF, SplitAdmissionMixin, capture_job, portable_record
+from .linux_split_support import HANDOFF, UPLOAD, SplitAdmissionMixin, capture_job, portable_record
 from .test_platform_store import FakeWorld
 from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
 
@@ -57,13 +57,20 @@ class LinuxStoreIntegrityTests(SplitAdmissionMixin, unittest.TestCase):
             dispatch={"stage": "capture", "operation_key": f"{RUN}/capture:0", "params_digest": "a" * 64},
         )
         self.tool = native_tool()
-        source = capture_root(self.tmp, run_id=RUN, handoff=HANDOFF)
+        self.upload_sha256 = digest(UPLOAD)
+        source = capture_root(
+            self.tmp,
+            run_id=RUN,
+            handoff=HANDOFF,
+            upload=self.upload_sha256,
+        )
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(
             source,
             self.archive,
             run_id=RUN,
             handoff_sha256=HANDOFF,
+            upload_sha256=self.upload_sha256,
             main_assembly=MAIN_ASSEMBLY,
             native_tool=self.tool,
         )

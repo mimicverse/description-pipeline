@@ -142,6 +142,8 @@ def _run_scenario(root: Path) -> dict:
                 "native_tool": native["native_tool"],
                 "handoff_sha256": native["handoff_sha256"],
                 "package_files": selection["files"],
+                "prepared_dir": native["prepared_dir"],
+                "prepared_files": native["prepared_files"],
                 "request": {
                     "run_id": RUN,
                     "upload_files": upload,
@@ -168,7 +170,16 @@ def _run_scenario(root: Path) -> dict:
             carry_request_evidence(paths.run_dir, paths.capture_dir)
             before = inventory(paths.capture_dir)
             phase = "native_registration"
-            module._register_native_stages(store, store_root, RUN, paths.capture_dir, paths.run_dir)
+            module._register_native_stages(
+                store,
+                store_root,
+                RUN,
+                paths.capture_dir,
+                paths.run_dir,
+                prepared_dir=native["prepared_dir"],
+                prepared_files=native["prepared_files"],
+                upload_sha256=digest(upload),
+            )
             report["calls"].append("DAG._register_native_stages")
             assert inventory(paths.capture_dir) == before
             phase = "generate"

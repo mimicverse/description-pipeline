@@ -44,6 +44,7 @@ from ..stages import (
     STAGE_IDS,
     STAGE_STATES,
     TERMINAL_STAGE_STATES,
+    publication_succeeded,
 )
 from .storage import SEALED_URI_PREFIX, parse_sealed_uri, sealed_resolver_from_environment
 
@@ -4161,13 +4162,7 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
                 raise PlatformStoreError("The registered reports/quality.json member does not bind the sealed bytes")
     if stage == "publish":
         submission = receipt.get("submission")
-        if (
-            not isinstance(submission, dict)
-            or submission.get("passed") is not True
-            or submission.get("state") not in {"published", "updated", "noop"}
-            or not submission.get("url")
-            or submission.get("subject_sha256") not in (None, subject)
-        ):
+        if not publication_succeeded(submission, subject):
             raise PlatformStoreError("The sealed publication receipt has no confirmed submission")
 
 

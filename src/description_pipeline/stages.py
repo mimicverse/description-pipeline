@@ -10,6 +10,7 @@ import copy
 import json
 import re
 import unicodedata
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .delivery import PIPELINE_ID
@@ -40,6 +41,101 @@ WINDOWS_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if "windo
 #: field so the set never depends on stage order (ORC-02).  Mixed Windows+Linux
 #: stages (discover, capture) are native-driven and stay out of this set.
 PORTABLE_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",))
+
+
+def canonical_freeze_timestamp(value) -> str:
+    """Normalize one timezone-aware platform instant to canonical UTC text."""
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise PipelineError("Native freeze event timestamp is invalid") from error
+    else:
+        raise PipelineError("Native freeze events require timestamps")
+    if parsed.tzinfo is None:
+        raise PipelineError("Native freeze event timestamps require a timezone")
+    return parsed.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def validate_freeze_events(events) -> list[dict]:
+    """Return the exact immutable Linux freeze block admitted into a native job."""
+
+    if not isinstance(events, list) or not events:
+        raise PipelineError("Native jobs require the recorded Linux freeze event block")
+    required_checks = {
+        "handoff.admission": "input",
+        "handoff.integrity": "output",
+    }
+    checks = {}
+    previous_at = None
+    normalized = []
+    for event in events:
+        if (
+            not isinstance(event, dict)
+            or event.get("stage") != "freeze"
+            or set(event) - {"at", "check", "stage", "state"}
+        ):
+            raise PipelineError("Native freeze events must contain only freeze-stage objects")
+        timestamp = canonical_freeze_timestamp(event.get("at"))
+        parsed_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if previous_at is not None and parsed_at < previous_at:
+            raise PipelineError("Native freeze event timestamps are not ordered UTC values")
+        previous_at = parsed_at
+        state = event.get("state")
+        if state not in {"running", "completed"}:
+            raise PipelineError("Native freeze events contain a non-successful state")
+        check = event.get("check")
+        if check is not None:
+            identifier = check.get("id") if isinstance(check, dict) else None
+            if (
+                not isinstance(identifier, str)
+                or identifier in checks
+                or not isinstance(check.get("boundary"), str)
+                or check.get("state") != "passed"
+                or not isinstance(check.get("details"), dict)
+            ):
+                raise PipelineError("Native freeze event checks are malformed")
+            checks[identifier] = check["boundary"]
+        item = copy.deepcopy(event)
+        item["at"] = timestamp
+        normalized.append(item)
+    if normalized[0].get("state") != "running":
+        raise PipelineError("Native freeze events do not start with running")
+    completed = [event for event in normalized if event.get("state") == "completed"]
+    if (
+        len(completed) != 1
+        or normalized[-1].get("state") != "completed"
+        or normalized[-1].get("check") is not None
+    ):
+        raise PipelineError("Native freeze events do not end with one completion")
+    if any(
+        event.get("state") != "running"
+        for event in normalized[1:-1]
+    ):
+        raise PipelineError("Native freeze events contain an event outside the running interval")
+    if checks != required_checks:
+        raise PipelineError("Native freeze events do not carry the required boundary checks")
+    return normalized
+
+
+def publication_succeeded(submission, subject) -> bool:
+    """The one success predicate shared by publication producers and readers."""
+
+    return (
+        isinstance(subject, str)
+        and len(subject) == 64
+        and all(character in "0123456789abcdef" for character in subject)
+        and isinstance(submission, dict)
+        and submission.get("passed") is True
+        and submission.get("state") in {"published", "updated", "noop"}
+        and isinstance(submission.get("url"), str)
+        and bool(submission["url"])
+        and submission.get("subject_sha256") == subject
+    )
+
 
 #: Portable stages after the native boundary that produce the delivery and its
 #: rendered reports.  A receipt renders a report only when its executed scope

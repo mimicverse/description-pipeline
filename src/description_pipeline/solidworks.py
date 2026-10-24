@@ -249,11 +249,20 @@ def _native_tool_record() -> dict:
     return tool_record(role="native")
 
 
-def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, main_assembly):
+def _finish_native_capture(
+    staging,
+    output,
+    receipt,
+    *,
+    run_id,
+    handoff_sha256,
+    upload_sha256,
+    main_assembly,
+):
     """Close a capture-only run: provenance reports, sealed transfer, native_complete."""
 
     from .orchestration.stage_transfer import expected_native_check_details
-
+    upload_sha256 = upload_sha256 or handoff_sha256
     tool = _native_tool_record()
     write_json(staging / "reports/native-tool.json", tool)
     receipt.update(state="native_complete", passed=False, native_complete=True, native_tool=tool, stage="capture")
@@ -282,8 +291,15 @@ def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, 
 
     archive = staging / CAPTURE_ARCHIVE
     manifest = seal_capture(
-        staging, archive, run_id=run_id, handoff_sha256=handoff_sha256, main_assembly=main_assembly, native_tool=tool
+        staging,
+        archive,
+        run_id=run_id,
+        handoff_sha256=handoff_sha256,
+        upload_sha256=upload_sha256,
+        main_assembly=main_assembly,
+        native_tool=tool,
     )
+    receipt["upload_sha256"] = upload_sha256
     write_json(staging / CAPTURE_MANIFEST, manifest)
     receipt["capture_archive"] = {
         "name": CAPTURE_ARCHIVE,
@@ -345,6 +361,7 @@ def capture(
     prior_events=None,
     expected_inputs=None,
     handoff_sha256=None,
+    upload_sha256: str | None = None,
     main_assembly: str | None = None,
     resume: dict | None = None,
 ) -> dict:
@@ -391,6 +408,7 @@ def capture(
                 receipt,
                 run_id=receipt["run_id"],
                 handoff_sha256=handoff_sha256,
+                upload_sha256=upload_sha256,
                 main_assembly=main_assembly,
             )
         except Exception as error:

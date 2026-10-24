@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.v1._airflow_env import pinned_airflow_home
+from tests.v1.freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
 
 from description_pipeline.io import digest, file_digest
 from description_pipeline.orchestration.airflow_client import EndpointConfig
@@ -26,6 +27,15 @@ DAG_DIR = ROOT / "deploy/airflow/dags"
 AIRFLOW_HOME = pinned_airflow_home()
 
 _MIGRATED = False
+
+
+def freeze_request_fields() -> dict:
+    events = freeze_events()
+    return {
+        "freeze_events": events,
+        "freeze_events_sha256": digest(events),
+        "freeze_receipt_sha256": FREEZE_RECEIPT_SHA256,
+    }
 
 
 def accepted_freeze_record(
@@ -91,6 +101,7 @@ class _OperationRecorder:
         self.registered: list[dict] = []
         self.claimed: list[dict] = []
         self.success_settlements: list[dict] = []
+        self.events: list[dict] = []
 
     def register_operation(self, **kwargs):
         self.registered.append(dict(kwargs))
@@ -109,14 +120,70 @@ class _OperationRecorder:
     def confirm_stage(self, **kwargs):
         return None
 
+    def append_event(self, run_id, *, stage, kind, payload=None):
+        self.events.append(
+            {
+                "seq": len(self.events) + 1,
+                "at": f"2026-10-24T00:00:0{len(self.events)}.000000Z",
+                "kind": kind,
+                "stage": stage,
+                "operation_id": None,
+                "payload": payload or {},
+            }
+        )
+
+    def run_events(self, run_id, *, after_seq=0, limit=200):
+        return [row for row in self.events if row["seq"] > after_seq][:limit]
+
 
 class _InitialDispatchBindingDouble:
+    def __init__(self):
+        self._recorded_events = []
+
     def run_record(self, run_id):
         return {"request_id": f"portal-{run_id}"}
 
     def bind_initial_dispatch(self, **payload):
         self.initial_dispatch = dict(payload)
         return SimpleNamespace(state="queued")
+
+    def append_event(self, run_id, *, stage, kind, payload=None):
+        self._recorded_events.append(
+            {
+                "seq": len(self._recorded_events) + 1,
+                "at": f"2026-10-24T00:00:0{len(self._recorded_events)}.000000Z",
+                "kind": kind,
+                "stage": stage,
+                "operation_id": None,
+                "payload": payload or {},
+            }
+        )
+
+    def run_events(self, run_id, *, after_seq=0, limit=200):
+        rows = list(self._recorded_events)
+        if not rows:
+            rows = [
+                {
+                    "seq": index,
+                    "at": f"2026-10-24T00:00:0{index - 1}.000000Z",
+                    "kind": "stage",
+                    "stage": "freeze",
+                    "operation_id": None,
+                    "payload": event,
+                }
+                for index, event in enumerate(freeze_events(), start=1)
+            ]
+            rows.append(
+                {
+                    "seq": len(rows) + 1,
+                    "at": "2026-10-24T00:00:04.000000Z",
+                    "kind": "stage",
+                    "stage": "freeze",
+                    "operation_id": None,
+                    "payload": {"state": "completed"},
+                }
+            )
+        return [row for row in rows if row["seq"] > after_seq][:limit]
 
 
 @unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
@@ -475,6 +542,9 @@ class DagTests(unittest.TestCase):
         job_request = {
             key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")
         }
+        for key in ("freeze_events", "freeze_events_sha256", "freeze_receipt_sha256"):
+            if key in request:
+                job_request[key] = request[key]
         if request.get("resume") is not None:
             job_request["resume"] = request["resume"]
         endpoint = SimpleNamespace(
@@ -482,6 +552,8 @@ class DagTests(unittest.TestCase):
                 "run_id": run_id,
                 "status": "native_complete",
                 "request": job_request,
+                "prepared_dir": "C:\\prepared",
+                "prepared_files": dict(request["upload_files"]),
             }
         )
         native_binding = {
@@ -545,6 +617,64 @@ class DagTests(unittest.TestCase):
         self.assertIn("package_file=", captured.output[0])
         self.assertNotIn("package_sha256=<unavailable>", captured.output[0])
 
+    def test_freeze_prior_binding_keeps_only_raw_seq_one_through_four(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        module = self._module()
+        base = freeze_events()
+        text_rows = []
+        datetime_rows = []
+        local_start = datetime(2026, 10, 24, 14, 0, tzinfo=timezone(timedelta(hours=8)))
+        for index, payload in enumerate(base):
+            row = {
+                "seq": index + 1,
+                "at": (local_start + timedelta(microseconds=index * 100_000)).isoformat(),
+                "kind": "stage",
+                "stage": "freeze",
+                "operation_id": None,
+                "payload": {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "at"
+                },
+            }
+            text_rows.append(row)
+            datetime_rows.append({**row, "at": datetime.fromisoformat(row["at"])})
+        text_rows.append(
+            {
+                "seq": 5,
+                "at": local_start + timedelta(microseconds=500_000),
+                "kind": "stage",
+                "stage": "freeze",
+                "operation_id": None,
+                "payload": {"state": "completed"},
+            }
+        )
+        datetime_rows.append(text_rows[-1])
+        platform = SimpleNamespace(confirmed_stage=lambda *_: {"sha256": "b" * 64})
+
+        with patch.object(module.flow, "recorded_events", return_value=text_rows):
+            text_events, text_receipt = module._prior_freeze_binding(platform, "run-1")
+        with patch.object(module.flow, "recorded_events", return_value=datetime_rows):
+            datetime_events, datetime_receipt = module._prior_freeze_binding(platform, "run-1")
+
+        self.assertEqual(text_events, datetime_events)
+        self.assertEqual(
+            [row["state"] for row in text_events],
+            ["running", "running", "running", "completed"],
+        )
+        self.assertTrue(all(set(row) <= {"at", "check", "stage", "state"} for row in text_events))
+        self.assertTrue(all(row["at"].endswith("Z") for row in text_events))
+        self.assertEqual(text_receipt, digest({"sha256": "b" * 64}))
+        self.assertEqual(datetime_receipt, text_receipt)
+
+        malformed = [dict(text_rows[0], payload={"state": "running"})]
+        with (
+            patch.object(module.flow, "recorded_events", return_value=malformed),
+            self.assertRaisesRegex(module.AirflowFailException, "not a raw protocol event"),
+        ):
+            module._prior_freeze_binding(platform, "run-1")
+
     def test_failure_stores_terminal_checks_before_raising_and_progress_logs_only_changes(self):
         from types import SimpleNamespace
         from airflow.sdk.exceptions import AirflowFailException
@@ -604,6 +734,7 @@ class DagTests(unittest.TestCase):
             "main_assembly": "assembly.SLDASM",
             "conn_id": "test",
             "platform_config_digest": "c" * 64,
+            **freeze_request_fields(),
         }
         endpoint = SimpleNamespace(get_job=lambda run_id: {"run_id": run_id, "status": "running"})
         original = AirflowFailException(
@@ -752,6 +883,7 @@ class DagTests(unittest.TestCase):
             "main_assembly": "assembly.SLDASM",
             "conn_id": "test",
             "platform_config_digest": "c" * 64,
+            **freeze_request_fields(),
         }
         matching = {
             "run_id": request["run_id"],
@@ -793,6 +925,7 @@ class DagTests(unittest.TestCase):
             "main_assembly": "assembly.SLDASM",
             "conn_id": "test",
             "platform_config_digest": "c" * 64,
+            **freeze_request_fields(),
         }
         job = {
             "run_id": request["run_id"],
@@ -802,7 +935,13 @@ class DagTests(unittest.TestCase):
                 "upload_files": upload,
                 "upload_sha256": request["upload_sha256"],
                 "main_assembly": request["main_assembly"],
+                **{
+                    key: request[key]
+                    for key in ("freeze_events", "freeze_events_sha256", "freeze_receipt_sha256")
+                },
             },
+            "prepared_dir": "C:\\prepared",
+            "prepared_files": dict(upload),
         }
         endpoint = SimpleNamespace(get_job=lambda run_id: job)
         with (
@@ -838,6 +977,7 @@ class DagTests(unittest.TestCase):
             "conn_id": "test",
             "platform_config_digest": "c" * 64,
             "intake_dir": str(intake),
+            **freeze_request_fields(),
         }
         job = {
             "run_id": request["run_id"],
@@ -847,7 +987,13 @@ class DagTests(unittest.TestCase):
                 "upload_files": upload,
                 "upload_sha256": request["upload_sha256"],
                 "main_assembly": request["main_assembly"],
+                **{
+                    key: request[key]
+                    for key in ("freeze_events", "freeze_events_sha256", "freeze_receipt_sha256")
+                },
             },
+            "prepared_dir": "C:\\prepared",
+            "prepared_files": dict(upload),
         }
         endpoint = SimpleNamespace(get_job=lambda run_id: job)
         binding = {
@@ -931,6 +1077,7 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "assembly.SLDASM",
                 "conn_id": "solidworks_windows",
                 "platform_config_digest": "c" * 64,
+                **freeze_request_fields(),
             }
             operations = _OperationRecorder()
             config = EndpointConfig(
@@ -968,6 +1115,7 @@ class DagTests(unittest.TestCase):
                     "upload_files": upload,
                     "upload_sha256": digest(upload),
                     "main_assembly": "assembly.SLDASM",
+                    **freeze_request_fields(),
                 },
             )
             self.assertEqual(job["hardware_id"], "m3.0")
@@ -1105,6 +1253,23 @@ class DagTests(unittest.TestCase):
         baseline_digest = "a" * 64
         started: list[str] = []
         confirmed: list[dict] = []
+        platform_events: list[dict] = []
+
+        def append_event(run_id, *, stage, kind, payload=None):
+            platform_events.append(
+                {
+                    "seq": len(platform_events) + 1,
+                    "at": f"2026-10-24T00:00:0{len(platform_events)}.000000Z",
+                    "kind": kind,
+                    "stage": stage,
+                    "operation_id": None,
+                    "payload": payload or {},
+                }
+            )
+
+        def run_events(_run_id, *, after_seq=0, limit=200):
+            return [row for row in platform_events if row["seq"] > after_seq][:limit]
+
         platform = SimpleNamespace(
             run_record=lambda value: {"request_id": request_id} if value == run_id else None,
             bind_initial_dispatch=lambda **payload: None,
@@ -1118,7 +1283,8 @@ class DagTests(unittest.TestCase):
             confirmed_stage=lambda *args, **kwargs: None,
             confirm_stage=lambda **payload: confirmed.append(payload),
             stage_records=lambda value: {},
-            append_event=lambda *args, **kwargs: None,
+            append_event=append_event,
+            run_events=run_events,
         )
         config = EndpointConfig(
             "http://127.0.0.1:1",
@@ -1256,6 +1422,7 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "3.0 总装1008.SLDASM",
                 "conn_id": "solidworks_windows",
                 "platform_config_digest": "c" * 64,
+                **freeze_request_fields(),
             }
             operations = _OperationRecorder()
             config = EndpointConfig(
@@ -1283,6 +1450,7 @@ class DagTests(unittest.TestCase):
                     "upload_files": upload,
                     "upload_sha256": digest(upload),
                     "main_assembly": "3.0 总装1008.SLDASM",
+                    **freeze_request_fields(),
                 },
             )
             self.assertEqual([call["kind"] for call in operations.registered], ["native"])
@@ -1443,6 +1611,8 @@ class DagTests(unittest.TestCase):
                 "upload_files": upload,
                 "main_assembly": "3.0 总装1008.SLDASM",
                 "resume": {"parent_run": parent_run_id, "from_stage": "capture"},
+                "freeze_events": request["freeze_events"],
+                "freeze_receipt_sha256": request["freeze_receipt_sha256"],
             },
         )
         with (
@@ -1599,7 +1769,7 @@ class DagTests(unittest.TestCase):
                 confirmed.append(kwargs)
 
             def append_event(self, run_id, *, stage, kind, payload=None):
-                return None
+                super().append_event(run_id, stage=stage, kind=kind, payload=payload)
 
         class Stub:
             def authorized_intake_dir(self, handoff_path):
@@ -1849,7 +2019,7 @@ class DagTests(unittest.TestCase):
                 confirmed.append(kwargs)
 
             def append_event(self, run_id, *, stage, kind, payload=None):
-                return None
+                super().append_event(run_id, stage=stage, kind=kind, payload=payload)
 
         class Stub:
             def authorized_intake_dir(self, handoff_path):
@@ -2051,7 +2221,7 @@ class DagTests(unittest.TestCase):
                 confirmed.append(kwargs)
 
             def append_event(self, run_id, *, stage, kind, payload=None):
-                return None
+                super().append_event(run_id, stage=stage, kind=kind, payload=payload)
 
         class Stub:
             def authorized_intake_dir(self, handoff_path):
@@ -2271,6 +2441,21 @@ class PlatformRegistrationTests(unittest.TestCase):
             self.sequence.append("claim")
             return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
 
+        def run_events(run_id, *, after_seq=0, limit=200):
+            rows = [
+                {
+                    "seq": index,
+                    "at": f"2026-10-24T00:00:0{index - 1}.000000Z",
+                    "kind": event["kind"],
+                    "stage": event["stage"],
+                    "operation_id": None,
+                    "payload": event["payload"],
+                }
+                for index, event in enumerate(self.live_events, start=1)
+                if event["run_id"] == run_id
+            ]
+            return [row for row in rows if row["seq"] > after_seq][:limit]
+
         platform = SimpleNamespace(
             confirm_stage=lambda **payload: self.calls.append(payload),
             confirmed_stage=lambda *args, **kwargs: None,
@@ -2280,6 +2465,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             append_event=lambda run_id, *, stage, kind, payload=None: self.live_events.append(
                 {"run_id": run_id, "stage": stage, "kind": kind, "payload": payload}
             ),
+            run_events=run_events,
             register_operation=register_operation,
             claim_operation=claim_operation,
         )
@@ -3077,7 +3263,18 @@ class PlatformRegistrationTests(unittest.TestCase):
         capture.mkdir(parents=True)
         build_sealed_delivery(capture)
         platform, store_root = self.module._platform_binding()
-        self.module._register_native_stages(platform, store_root, "run-1", capture, run_dir)
+        handoff = read_data(capture / "input" / "handoff.json")
+        prepared_files = handoff["package_files"]
+        self.module._register_native_stages(
+            platform,
+            store_root,
+            "run-1",
+            capture,
+            run_dir,
+            prepared_dir=str(capture / "input" / "cad"),
+            prepared_files=prepared_files,
+            upload_sha256=digest(prepared_files),
+        )
         self.assertEqual([call["stage"] for call in self.calls], ["discover", "capture"])
         self.assertEqual([call["state"] for call in self.calls], ["completed", "completed"])
         self.assertEqual([call["receipt"]["state"] for call in self.calls], ["discovered", "native_complete"])
@@ -3109,6 +3306,16 @@ class PlatformRegistrationTests(unittest.TestCase):
         handoff = digest(native_files)
         full_upload = {**native_files, "excluded.SLDPRT": "d" * 64}
         full_upload_sha = digest(full_upload)
+        from tests.v1.source_record_support import source_record
+
+        write_json(
+            derived / "source.json",
+            source_record(
+                hardware_id="m3.0",
+                handoff_digest=full_upload_sha,
+                main_assembly="assembly.SLDASM",
+            ),
+        )
         from tests.sources.selection_support import sealed_selection
 
         discovery = {
@@ -3399,6 +3606,23 @@ class PlatformRegistrationTests(unittest.TestCase):
 
             def append_event(self, run_id, *, stage, kind, payload=None):
                 events.append({"run_id": run_id, "stage": stage, "kind": kind, "payload": payload})
+
+            def run_events(self, run_id, *, after_seq=0, limit=200):
+                rows = []
+                for index, event in enumerate(events, start=1):
+                    if event["run_id"] != run_id:
+                        continue
+                    rows.append(
+                        {
+                            "seq": index,
+                            "at": f"2026-10-24T00:00:0{index - 1}.000000Z",
+                            "kind": event["kind"],
+                            "stage": event["stage"],
+                            "operation_id": None,
+                            "payload": event["payload"],
+                        }
+                    )
+                return [row for row in rows if row["seq"] > after_seq][:limit]
 
             def request_record(self, request_id):
                 return accepted_freeze_record(
@@ -4025,6 +4249,22 @@ class LinkedMaterializationTests(unittest.TestCase):
             receipt["tool"] = read_data(self.tree / "tool.json")
         if stage in {"discover", "capture"}:
             receipt["native_tool"] = read_data(self.tree / "reports" / "native-tool.json")
+        if stage == "capture":
+            view = read_data(self.tree / "reports/native-stages.json")
+            binding = next(
+                event["check"]["details"]
+                for event in view["events"]
+                if (event.get("check") or {}).get("id") == "discovery.binding"
+            )
+            collection = read_data(self.tree / "evidence/evidence/collection.json")
+            receipt.update(
+                upload_sha256=read_data(self.tree / "input/source.json")["identity"]["handoff_digest"],
+                native_prepared_dir=str(Path(collection["identity"]["assembly"]).parent),
+                native_prepared_files={
+                    name.removeprefix("input/"): checksum
+                    for name, checksum in binding["files"].items()
+                },
+            )
         self.module._seal_and_confirm(self.store, self.root, run_id, stage, self.tree, receipt, state="completed")
 
     def _producer(self, run_id: str, stage: str, seeds: list):
@@ -4083,7 +4323,21 @@ class LinkedMaterializationTests(unittest.TestCase):
         subject: str,
         repository: Path | None = None,
     ) -> dict:
-        tree = self.module.flow.RunPaths(self.root, run_id).stage_output(stage)
+        paths = self.module.flow.RunPaths(self.root, run_id)
+        tree = paths.stage_output(stage)
+        real_verify_transfer = self.module.flow.verify_transfer
+        verify_calls: list[Path] = []
+
+        def verify_seed(seed, **kwargs):
+            verify_calls.append(Path(seed))
+            if len(verify_calls) > 1:
+                gates.append(("native-transfer", str(seed)))
+                return {
+                    "run_id": run_id,
+                    "handoff_sha256": "b" * 64,
+                    "upload_sha256": "c" * 64,
+                }
+            return real_verify_transfer(seed, **kwargs)
 
         def identity(platform, owner):
             gates.append(("identity", owner))
@@ -4092,6 +4346,7 @@ class LinkedMaterializationTests(unittest.TestCase):
         with (
             patch.object(self.module, "_platform_binding", return_value=(self.store, self.root)),
             patch.object(self.module.flow, "portable_identity_gate", side_effect=identity),
+            patch.object(self.module.flow, "verify_transfer", side_effect=verify_seed),
             patch.object(self.module.flow.solidworks, stage, side_effect=self._producer(run_id, stage, seeds)),
         ):
             return self.module._portable_registered(
@@ -4135,7 +4390,8 @@ class LinkedMaterializationTests(unittest.TestCase):
         )
         self.assertEqual(receipt["state"], "verified")
         self.assertEqual(seeds, [("verify", self.root / "sealed" / self.PARENT / "generate")])
-        self.assertEqual({owner for _, owner in gates}, {self.PARENT})
+        self.assertEqual({owner for kind, owner in gates if kind == "identity"}, {self.PARENT})
+        self.assertEqual([kind for kind, _owner in gates].count("native-transfer"), 1)
         child_rows = self.store.stage_records(self.CHILD)
         for stage in ("freeze", "discover", "capture", "generate"):
             row, source = child_rows[stage], parent_rows[stage]
@@ -4162,7 +4418,7 @@ class LinkedMaterializationTests(unittest.TestCase):
         )
         self.assertEqual(receipt["state"], "verified")
         self.assertEqual(seeds, [("verify", self.root / "sealed" / self.PARENT / "generate")])
-        self.assertEqual({owner for _, owner in gates}, {self.CHILD})
+        self.assertEqual({owner for kind, owner in gates if kind == "identity"}, {self.CHILD})
         self.assertEqual(self.store.stage_records(self.GRANDCHILD)["generate"]["reused_from_run"], self.CHILD)
 
         seeds, gates = [], []
@@ -4177,7 +4433,7 @@ class LinkedMaterializationTests(unittest.TestCase):
         )
         self.assertEqual(receipt["state"], "published")
         self.assertEqual(seeds, [("publish", self.root / "sealed" / self.GRANDCHILD / "verify")])
-        self.assertEqual({owner for _, owner in gates}, {self.CHILD})
+        self.assertEqual({owner for kind, owner in gates if kind == "identity"}, {self.CHILD})
         self.assertEqual(self.store.stage_records(self.GRANDCHILD)["publish"]["state"], "completed")
 
     def test_a_confirmed_publication_replays_its_registered_receipt(self) -> None:

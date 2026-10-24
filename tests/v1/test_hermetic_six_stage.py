@@ -469,6 +469,7 @@ class HermeticSixStageTests(unittest.TestCase):
                 backend=backend,
                 run_id=RUN_ID,
                 handoff_sha256=handoff_digest,
+                upload_sha256=handoff_digest,
                 main_assembly=MAIN_ASSEMBLY,
                 expected_inputs=prepared_files,
                 prior_events=self.events,
