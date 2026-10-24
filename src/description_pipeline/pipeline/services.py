@@ -99,6 +99,9 @@ class CanonicalStageServices:
     def decision_for(self, command: StageCommand) -> StageDecision | None:
         return self.facts.decision_for(command)
 
+    def cancellation_for(self, command: StageCommand) -> StageCommand | None:
+        return self.facts.cancellation_for(command)
+
     def load_result(self, decision: StageDecision) -> StageResult:
         return self.facts.load_result(decision)
 

@@ -45,7 +45,7 @@ from description_pipeline.pipeline.contracts import (
     ProtocolError,
     StageCommand,
 )
-from description_pipeline.pipeline import discover as discover_module
+import description_pipeline.pipeline.discover as discover_module
 from description_pipeline.pipeline.freeze import (
     RULESET_CATALOG_SCHEMA,
     RulesetCatalog,

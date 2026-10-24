@@ -166,6 +166,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS command_dispatch_once
     ON :"platform_schema".command (run_id)
     WHERE kind = 'dispatch';
 
+CREATE UNIQUE INDEX IF NOT EXISTS command_cancel_target_once
+    ON :"platform_schema".command ((request->>'target_command_id'))
+    WHERE kind = 'cancel';
+
 CREATE TABLE IF NOT EXISTS :"platform_schema".command_input_artifact (
     command_id text NOT NULL REFERENCES :"platform_schema".command (command_id),
     artifact_id text NOT NULL REFERENCES :"platform_schema".artifact (artifact_id),

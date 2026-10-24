@@ -12,6 +12,7 @@ from typing import Protocol
 from ..io import canonical
 from ..schemas import UNHANDLED_STAGE_FAILURE_SCHEMA
 from .contracts import (
+    CancellationRequest,
     ExecutionClaim,
     FailureEnvelope,
     ProtocolError,
@@ -50,6 +51,8 @@ class StageServices(Protocol):
     def load_command(self, command_id: str) -> StageCommand: ...
 
     def decision_for(self, command: StageCommand) -> StageDecision | None: ...
+
+    def cancellation_for(self, command: StageCommand) -> StageCommand | None: ...
 
     def load_result(self, decision: StageDecision) -> StageResult: ...
 
@@ -221,6 +224,76 @@ def _confirmed_decision_record(
     return result
 
 
+def _execute_requested_cancellation(
+    command: StageCommand,
+    cancel_command: StageCommand,
+    services: StageServices,
+) -> FailureEnvelope:
+    request = CancellationRequest.from_command(cancel_command)
+    if request.target_command_id != command.command_id:
+        raise ProtocolError("cancel.target_mismatch", {"command_id": command.command_id})
+    before = services.effect_states_for_command(command.command_id)
+    if any(not effect_is_settled(state) for state in before.values()):
+        raise ProtocolError(
+            "cancel.effect_unresolved",
+            {
+                "command_id": command.command_id,
+                "effect_states": {effect_id: state.value for effect_id, state in sorted(before.items())},
+            },
+        )
+    claim = services.acquire_claim(command)
+    if claim.command_id != command.command_id:
+        raise ProtocolError("claim.command_mismatch", {"command_id": command.command_id})
+    candidate = services.candidate_for(command, claim)
+    workspace = services.materialize(command, claim, candidate=candidate)
+    after = services.effect_states_for_command(command.command_id)
+    if after != before:
+        raise ProtocolError(
+            "cancel.effect_changed",
+            {
+                "command_id": command.command_id,
+                "before": {effect_id: state.value for effect_id, state in sorted(before.items())},
+                "after": {effect_id: state.value for effect_id, state in sorted(after.items())},
+            },
+        )
+    failure = StageFailure(
+        request.reason_code,
+        request.reason,
+        outcome="cancelled",
+        error_type="StageCancelled",
+        detail={
+            "cancel_command_id": cancel_command.command_id,
+            "requested_by": request.requested_by,
+            "target_command_id": command.command_id,
+        },
+    )
+    return services.commit_failure(
+        command,
+        claim,
+        failure,
+        workspace_root=workspace.root,
+    )
+
+
+def execute_cancellation(
+    *,
+    command_id: str,
+    services: StageServices,
+) -> StageResult | FailureEnvelope:
+    """Return the existing decision or form one cancelled result for the original executor."""
+
+    command = services.load_command(command_id)
+    if command.kind != "stage" or command.stage is None:
+        raise ProtocolError("cancel.target_not_stage", {"command_id": command_id})
+    confirmed = services.decision_for(command)
+    if confirmed is not None:
+        return _confirmed_decision_record(services, command, confirmed)
+    cancel_command = services.cancellation_for(command)
+    if cancel_command is None:
+        raise ProtocolError("cancel.not_requested", {"command_id": command_id})
+    return _execute_requested_cancellation(command, cancel_command, services)
+
+
 def execute_stage(
     *,
     command_id: str,
@@ -243,6 +316,10 @@ def execute_stage(
     confirmed = services.decision_for(command)
     if confirmed is not None:
         return _confirmed_decision_record(services, command, confirmed)
+
+    cancel_command = services.cancellation_for(command)
+    if cancel_command is not None:
+        return _execute_requested_cancellation(command, cancel_command, services)
 
     claim = services.acquire_claim(command)
     if claim.command_id != command.command_id:

@@ -319,6 +319,93 @@ class DiagnosticReplayScope:
 
 
 @dataclass(frozen=True, slots=True)
+class CancellationRequest:
+    """One immutable request to cancel an existing stage command."""
+
+    schema_version: str
+    target_command_id: str
+    target_run_id: str
+    target_stage: StageId
+    target_request_digest: str
+    reason_code: str
+    reason: str
+    requested_by: str
+    requested_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "description-pipeline.cancel-request/v1":
+            raise ProtocolError("cancel.invalid", {"where": "schema_version"})
+        for field in ("target_command_id", "target_run_id", "reason_code", "reason", "requested_by"):
+            _require_text(getattr(self, field), "cancel.invalid", field)
+        _require_stage(self.target_stage, "cancel.invalid", "target_stage")
+        _require_digest(self.target_request_digest, "cancel.invalid", "target_request_digest")
+        if not isinstance(self.requested_at, datetime) or self.requested_at.tzinfo is None:
+            raise ProtocolError("cancel.invalid", {"where": "requested_at"})
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "reason_code": self.reason_code,
+            "requested_at": self.requested_at.isoformat(),
+            "requested_by": self.requested_by,
+            "schema_version": self.schema_version,
+            "target_command_id": self.target_command_id,
+            "target_request_digest": self.target_request_digest,
+            "target_run_id": self.target_run_id,
+            "target_stage": self.target_stage,
+        }
+
+    def logical_identity(self) -> dict[str, Any]:
+        """The retry identity of the request, excluding server receipt time."""
+
+        record = self.to_record()
+        record.pop("requested_at")
+        return record
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> CancellationRequest:
+        expected = {
+            "reason",
+            "reason_code",
+            "requested_at",
+            "requested_by",
+            "schema_version",
+            "target_command_id",
+            "target_request_digest",
+            "target_run_id",
+            "target_stage",
+        }
+        if not isinstance(record, Mapping) or set(record) != expected:
+            raise ProtocolError("cancel.invalid", {"where": "request"})
+        if not isinstance(record["requested_at"], str):
+            raise ProtocolError("cancel.invalid", {"where": "requested_at"})
+        try:
+            requested_at = datetime.fromisoformat(record["requested_at"].replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ProtocolError("cancel.invalid", {"where": "requested_at"}) from error
+        return cls(
+            schema_version=record["schema_version"],
+            target_command_id=record["target_command_id"],
+            target_run_id=record["target_run_id"],
+            target_stage=record["target_stage"],
+            target_request_digest=record["target_request_digest"],
+            reason_code=record["reason_code"],
+            reason=record["reason"],
+            requested_by=record["requested_by"],
+            requested_at=requested_at,
+        )
+
+    @classmethod
+    def from_command(cls, command: StageCommand) -> CancellationRequest:
+        if command.kind != "cancel" or command.stage is not None:
+            raise ProtocolError("cancel.invalid", {"where": "command"})
+        request = cls.from_record(command.request)
+        if request.target_run_id != command.run_id:
+            raise ProtocolError("cancel.invalid", {"where": "target_run_id"})
+        return request
+
+
+@dataclass(frozen=True, slots=True)
 class StageCommand:
     """The complete non-secret request that authorizes one stage execution."""
 
@@ -347,6 +434,8 @@ class StageCommand:
             raise ProtocolError("command.invalid", {"where": "kind", "value": self.kind})
         if self.kind == "stage" or self.stage is not None:
             _require_stage(self.stage, "command.invalid", "stage")
+        if self.kind == "cancel":
+            CancellationRequest.from_command(self)
         _require_text(self.idempotency_key, "command.invalid", "idempotency_key")
         object.__setattr__(self, "request", _freeze_mapping(self.request, "command.invalid", "request"))
         _require_digest(self.request_digest, "command.invalid", "request_digest")
@@ -446,6 +535,58 @@ class StageCommand:
             identity["diagnostic_scope"] = diagnostic_scope.to_record()
         request_digest = digest(identity)
         return cls(request_digest=request_digest, **values)
+
+    @classmethod
+    def create_cancel(
+        cls,
+        *,
+        command_id: str,
+        run_id: str,
+        idempotency_key: str,
+        request: CancellationRequest,
+        config_snapshot_sha256: str,
+        contract_sha256: str,
+        policy_sha256: str,
+        expected_executor_sha256: str,
+    ) -> StageCommand:
+        if not isinstance(request, CancellationRequest) or request.target_run_id != run_id:
+            raise ProtocolError("cancel.invalid", {"where": "request"})
+        request_record = request.to_record()
+        values = {
+            "schema_version": STAGE_COMMAND_SCHEMA,
+            "command_id": command_id,
+            "run_id": run_id,
+            "kind": "cancel",
+            "stage": None,
+            "idempotency_key": idempotency_key,
+            "request": request_record,
+            "input_artifacts": (),
+            "config_snapshot_sha256": config_snapshot_sha256,
+            "contract_sha256": contract_sha256,
+            "policy_sha256": policy_sha256,
+            "expected_executor_sha256": expected_executor_sha256,
+            "predecessor_decision_id": None,
+            "diagnostic_scope": None,
+        }
+        identity = {
+            key: values[key]
+            for key in (
+                "command_id",
+                "idempotency_key",
+                "kind",
+                "request",
+                "schema_version",
+                "stage",
+                "run_id",
+                "input_artifacts",
+                "config_snapshot_sha256",
+                "contract_sha256",
+                "policy_sha256",
+                "expected_executor_sha256",
+                "predecessor_decision_id",
+            )
+        }
+        return cls(request_digest=digest(identity), **values)
 
     def to_record(self) -> dict[str, Any]:
         return {

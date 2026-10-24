@@ -31,6 +31,7 @@ from ..pipeline.diagnostic import (
 )
 from ..pipeline.contracts import (
     ArtifactRef,
+    CancellationRequest,
     DispatchCommand,
     DispatchConf,
     ExecutionClaim,
@@ -774,6 +775,116 @@ class FactStore:
             raise FactConflict("The stage decision is bound to another command")
         return decision
 
+    def _cancel_command_cursor(
+        self,
+        cursor,
+        target_command_id: str,
+        *,
+        lock: bool = False,
+    ) -> StageCommand | None:
+        cursor.execute(
+            """
+            SELECT command_id
+            FROM command
+            WHERE kind = 'cancel'
+              AND request->>'target_command_id' = %s
+            ORDER BY command_id
+            """
+            + (" FOR UPDATE" if lock else ""),
+            (target_command_id,),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise FactConflict("A target command carries multiple cancellation requests")
+        command = self._load_command_cursor(cursor, rows[0][0])
+        if command is None:
+            raise FactStoreError("The cancellation command disappeared")
+        request = CancellationRequest.from_command(command)
+        if request.target_command_id != target_command_id:
+            raise FactConflict("The cancellation command names another target")
+        return command
+
+    def request_cancel(
+        self,
+        *,
+        target_command_id: str,
+        cancel_executor_sha256: str,
+        reason_code: str,
+        reason: str,
+        requested_by: str,
+        requested_at: datetime,
+    ) -> StageCommand | StageDecision:
+        """Record one immutable cancellation intent without writing a StageDecision."""
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT command_id FROM command WHERE command_id = %s FOR UPDATE",
+                (target_command_id,),
+            )
+            if cursor.fetchone() is None:
+                raise FactStoreError(f"The target command {target_command_id!r} is not registered")
+            target = self._load_command_cursor(cursor, target_command_id)
+            if target is None or target.kind != "stage" or target.stage is None:
+                raise FactStoreError("Only a stage command can be cancelled")
+            if target.diagnostic_scope is not None:
+                raise FactStoreError("Diagnostic commands do not accept production cancellation")
+            decision_row = self._decision_row(cursor, run_id=target.run_id, stage=target.stage)
+            if decision_row is not None:
+                decision = self._decision_from_row(cursor, decision_row)
+                if decision.command_id != target.command_id:
+                    raise FactConflict("The target stage decision belongs to another command")
+                return decision
+            request = CancellationRequest(
+                schema_version="description-pipeline.cancel-request/v1",
+                target_command_id=target.command_id,
+                target_run_id=target.run_id,
+                target_stage=target.stage,
+                target_request_digest=target.request_digest,
+                reason_code=reason_code,
+                reason=reason,
+                requested_by=requested_by,
+                requested_at=requested_at,
+            )
+            existing = self._cancel_command_cursor(
+                cursor,
+                target.command_id,
+                lock=True,
+            )
+            if existing is not None:
+                if (
+                    CancellationRequest.from_command(existing).logical_identity()
+                    != request.logical_identity()
+                    or existing.expected_executor_sha256 != cancel_executor_sha256
+                ):
+                    raise FactConflict("The target command already has a different cancellation request")
+                return existing
+            command = StageCommand.create_cancel(
+                command_id="cancel:" + digest(
+                    {
+                        "target_command_id": target.command_id,
+                        "target_request_digest": target.request_digest,
+                    }
+                ),
+                run_id=target.run_id,
+                idempotency_key=f"{target.run_id}/cancel/{target.command_id}",
+                request=request,
+                config_snapshot_sha256=target.config_snapshot_sha256,
+                contract_sha256=target.contract_sha256,
+                policy_sha256=target.policy_sha256,
+                expected_executor_sha256=cancel_executor_sha256,
+            )
+            self._insert_command_cursor(cursor, command)
+            return command
+
+    def cancellation_for(self, command: StageCommand) -> StageCommand | None:
+        if command.kind != "stage" or command.stage is None:
+            raise FactStoreError("Only a stage command can carry a cancellation request")
+        with self._transaction() as connection:
+            return self._cancel_command_cursor(connection.cursor(), command.command_id)
+
     def load_result(self, decision: StageDecision) -> StageResult:
         if decision.result_record_artifact is None:
             raise FactStoreError("A minimal failure envelope has no StageResult artifact")
@@ -1009,6 +1120,18 @@ class FactStore:
                 expected_command_id=expected_command_id,
             )
 
+    def effect_intent(
+        self,
+        effect_id: str,
+        *,
+        expected_command_id: str | None = None,
+    ) -> EffectIntent:
+        with self._transaction() as connection:
+            intent, _facts = self._effect_cursor(connection.cursor(), effect_id)
+        if expected_command_id is not None and intent.command_id != expected_command_id:
+            raise FactConflict("The effect names another command")
+        return intent
+
     def _effect_settlement_cursor(
         self,
         cursor,
@@ -1129,6 +1252,15 @@ class FactStore:
     ) -> EffectFact:
         stored = None
         if claim is not None:
+            if fact_type == "dispatch_authorized":
+                cursor.execute(
+                    "SELECT command_id FROM command WHERE command_id = %s FOR UPDATE",
+                    (claim.command_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise FactStoreError("The dispatch authorization command disappeared")
+                if self._cancel_command_cursor(cursor, claim.command_id, lock=True) is not None:
+                    raise FactConflict("Cancellation was requested before effect dispatch")
             cursor.execute(
                 """
                 SELECT command_id, fence, owner_sha256, executor_sha256, closed_at
@@ -1250,6 +1382,14 @@ class FactStore:
             raise FactStoreError("Effect dispatch time must be timezone-aware")
         with self._transaction() as connection:
             cursor = connection.cursor()
+            cursor.execute(
+                "SELECT command_id FROM command WHERE command_id = %s FOR UPDATE",
+                (claim.command_id,),
+            )
+            if cursor.fetchone() is None:
+                raise FactStoreError("The effect dispatch command disappeared")
+            if self._cancel_command_cursor(cursor, claim.command_id, lock=True) is not None:
+                raise FactConflict("Cancellation was requested before effect dispatch")
             self._verify_open_claim_cursor(cursor, claim)
             cursor.execute("SELECT command_id FROM effect_intent WHERE effect_id = %s FOR UPDATE", (effect_id,))
             row = cursor.fetchone()
@@ -1582,6 +1722,8 @@ class FactStore:
             cursor.execute("SELECT command_id FROM command WHERE command_id = %s FOR UPDATE", (command.command_id,))
             if cursor.fetchone() is None:
                 raise FactStoreError("The command disappeared before decision commit")
+            if self._cancel_command_cursor(cursor, command.command_id, lock=True) is not None:
+                raise FactConflict("Cancellation was requested; commit the cancelled result instead")
             existing_row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
             if existing_row is not None:
                 existing = self._decision_from_row(cursor, existing_row)
@@ -1714,6 +1856,11 @@ class FactStore:
             )
             if cursor.fetchone() is None:
                 raise FactStoreError("The command disappeared before failure commit")
+            if (
+                failure.outcome != "cancelled"
+                and self._cancel_command_cursor(cursor, command.command_id, lock=True) is not None
+            ):
+                raise FactConflict("Cancellation was requested; commit the cancelled result instead")
             existing_row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
             if existing_row is not None:
                 existing = self._decision_from_row(cursor, existing_row)
