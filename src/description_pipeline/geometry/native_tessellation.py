@@ -3072,15 +3072,6 @@ def _parse_itessellation_evidence(
                     fin["end_evidence"],
                 )
             )
-            uses_closest_fallback = any(
-                isinstance(evidence_value, dict)
-                and evidence_value["parameter_u_source"]
-                == "closest_point_fallback"
-                for evidence_value in (
-                    fin["start_evidence"],
-                    fin["end_evidence"],
-                )
-            )
             open_identity_candidate = (
                 body_key[0] == 1
                 and len(edge["face_indices"]) == 1
@@ -3096,18 +3087,6 @@ def _parse_itessellation_evidence(
                         + f": native tessellation v8 edge {reference} "
                         + "uses a tolerant gap without open-edge endpoint identity",
                     )
-            elif (
-                uses_closest_fallback
-                and open_identity_candidate
-                and not unique_topology_accepted
-            ):
-                _require(
-                    endpoint_set_mode,
-                    component
-                    + f": native tessellation v8 edge {reference} "
-                    + "uses fallback boundary evidence without open-edge endpoint identity",
-                )
-                requires_open_identity = True
             recomputed_open_identity = None
             open_identity_sha256 = None
             topology_accepted = unique_topology_accepted
@@ -3119,12 +3098,6 @@ def _parse_itessellation_evidence(
                     + f"fin {fin['fin_id']} carries unnecessary open-edge identity",
                 )
             elif requires_open_identity:
-                _require(
-                    endpoint_set_mode,
-                    component
-                    + f": native tessellation v8 edge {reference} "
-                    + "uses fallback boundary evidence without an open-edge endpoint identity",
-                )
                 try:
                     face_span = face_spans_by_key[
                         (*body_key, fin["face_index"])
@@ -3498,31 +3471,11 @@ def _parse_itessellation_evidence(
                     + f": native tessellation v8 edge {reference} "
                     + "topology endpoint assignment is not independently reproducible",
                 )
-                endpoint_set_mode = (
-                    assignment["direct_error_m"]
-                    <= assignment["tolerance_m"]
-                    and assignment["swapped_error_m"]
-                    <= assignment["tolerance_m"]
-                )
-                current_edge_unique_topology = (
-                    assignment["accepted"] is True
-                    and assignment["complete_match_count"] == 1
-                )
-                open_identity_accepted = endpoint_set_mode and any(
-                    evidence["fins"][fin_id]["open_edge_boundary_identity"]
-                    is not None
-                    for fin_id in actual
-                )
                 _require(
-                    current_edge_unique_topology
-                    or open_identity_accepted
-                    or (
-                        endpoint_set_mode
-                        and bool(collapsed_fin_span)
-                    ),
+                    assignment["accepted"],
                     component
                     + f": native tessellation v8 edge {reference} "
-                    + "topology endpoint set has no unique or open-edge proof",
+                    + "unordered endpoint set is incomplete",
                 )
             else:
                 _require(

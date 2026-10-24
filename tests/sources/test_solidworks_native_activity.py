@@ -14,6 +14,7 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from description_pipeline.sources.solidworks import native as native_module
 from description_pipeline.sources.solidworks.native import SolidWorksBackend
@@ -179,7 +180,7 @@ class ActivityEmissionTests(unittest.TestCase):
             objects = [item["current_object"] for item in reads if "current_object" in item]
             self.assertEqual(sorted(set(objects)), ["base-1", "base-2", "base-3"])
 
-    def test_large_interval_coalesces_component_events_but_keeps_boundaries(self) -> None:
+    def test_large_interval_emits_each_object_transition_and_final_count(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = native_module._ACTIVITY_MIN_INTERVAL_SECONDS
@@ -190,10 +191,51 @@ class ActivityEmissionTests(unittest.TestCase):
             finally:
                 native_module._ACTIVITY_MIN_INTERVAL_SECONDS = original
             reads = [item for item in records if item["action"] == "read_components"]
-            self.assertLessEqual(len(reads), 2)
-            self.assertGreaterEqual(len(reads), 1)
+            self.assertEqual(len(reads), 4)
+            self.assertEqual(
+                [item.get("current_object") for item in reads[:3]],
+                ["base-1", "base-2", "base-3"],
+            )
             self.assertEqual(reads[0]["completed"], 0)
             self.assertEqual(reads[-1]["completed"], 3)
+
+    def test_object_transition_is_emitted_before_repeat_interval(self) -> None:
+        records = []
+        emitter = native_module._ActivityEmitter(records.append)
+        with patch.object(
+            native_module.time,
+            "monotonic",
+            side_effect=[10.0, 10.1, 10.2],
+        ):
+            emitter.emit(
+                "mesh_export",
+                phase="capture",
+                current_object="object-a",
+                completed=2,
+                total=85,
+            )
+            emitter.emit(
+                "mesh_export",
+                phase="capture",
+                current_object="object-b",
+                completed=2,
+                total=85,
+            )
+            emitter.emit(
+                "mesh_export",
+                phase="capture",
+                current_object="object-b",
+                completed=2,
+                total=85,
+            )
+        emitter.refresh()
+
+        self.assertEqual(len(records), 3)
+        self.assertEqual(records[0]["current_object"], "object-a")
+        self.assertEqual(records[1]["current_object"], "object-b")
+        self.assertEqual(records[-1]["current_object"], "object-b")
+        self.assertEqual(records[-1]["completed"], 2)
+        self.assertEqual(records[-1]["total"], 85)
 
     def test_capture_emits_the_walk_and_per_instance_reads_with_names(self) -> None:
         with TemporaryDirectory() as tmp, _com_stubs():

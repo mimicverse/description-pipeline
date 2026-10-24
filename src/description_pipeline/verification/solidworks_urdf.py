@@ -601,7 +601,7 @@ def _native(root, manifest):
 def _capture_preparation(root, manifest):
     """Independently compare capture rebuild state with native discovery."""
 
-    schema = "solidworks-to-urdf.capture-preparation/v1"
+    schema = "solidworks-to-urdf.capture-preparation/v2"
     rebuild_api = (
         "IModelDocExtension.NeedsRebuild2/"
         "IConfiguration.NeedsRebuild/"
@@ -650,9 +650,17 @@ def _capture_preparation(root, manifest):
         "session_dependency_paths",
         "topology_before",
         "topology_after",
+        "loaded_documents_before",
+        "loaded_documents_after",
+        "session_recovery",
     }
     _require(set(preparation) == required, "Capture preparation fields are incomplete or unknown")
     _require(preparation["schema_version"] == schema, "Capture preparation schema changed")
+    session_recovery = preparation["session_recovery"]
+    _require(
+        session_recovery is None or isinstance(session_recovery, dict),
+        "Capture session recovery is malformed",
+    )
     environment = evidence.runtime(root)
     copy_identity = ((environment.get("solidworks") or {}).get("sessions") or {}).get("copy")
     _require(
@@ -662,6 +670,22 @@ def _capture_preparation(root, manifest):
         and copy_identity.get("state") == "active",
         "Capture environment has no active owned copy process",
     )
+    before_recovery_environment = None
+    if session_recovery is not None:
+        before_recovery_environment = read_data(
+            confined(
+                root,
+                "evidence/capture-environment-before-recovery.json",
+            )
+        )
+        _require(
+            isinstance(before_recovery_environment, dict)
+            and isinstance(
+                before_recovery_environment.get("solidworks"),
+                dict,
+            ),
+            "Capture pre-recovery environment is malformed",
+        )
 
     def session_evidence(value, label):
         _require(
@@ -736,6 +760,13 @@ def _capture_preparation(root, manifest):
         suffix = parts[positions[0] + 1 :]
         _require(bool(suffix), f"A session path has no path below {marker}")
         return "/".join(suffix)
+
+    def session_path_identity(value):
+        parts = [part.casefold() for part in re.split(r"[\\/]", str(value or "")) if part]
+        markers = [part for part in parts if part in {"ic~~", "vc~~"}]
+        _require(len(markers) == 1, "A session path lacks one session marker")
+        marker = markers[0]
+        return marker + "/" + session_path_suffix(value, marker)
 
     def copy_matches_document(copy_path, resolved):
         copy_parts = [item for item in document_key(copy_path).split("/") if item]
@@ -992,6 +1023,19 @@ def _capture_preparation(root, manifest):
         return rows
 
     def topology_semantic(rows):
+        def owner_identity(value):
+            if value is None:
+                return None
+            parts = [
+                part.casefold()
+                for part in re.split(r"[\\/]", str(value))
+                if part
+            ]
+            markers = [part for part in parts if part in {"ic~~", "vc~~"}]
+            if markers:
+                return session_path_identity(value)
+            return normalized_path(value)
+
         return sorted(
             [
                 {
@@ -1003,10 +1047,8 @@ def _capture_preparation(root, manifest):
                     "storage_scope": row["storage_scope"],
                     "provenance_state": row["provenance_state"],
                     "owner_sha256": row["owner_sha256"],
-                    "owner_document_path": (
-                        normalized_path(row["owner_document_path"])
-                        if row["owner_document_path"] is not None
-                        else None
+                    "owner_document_path": owner_identity(
+                        row["owner_document_path"]
                     ),
                     **(
                         {}
@@ -1018,6 +1060,103 @@ def _capture_preparation(root, manifest):
             ],
             key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
         )
+
+    def loaded_document_signature(value, label):
+        _require(
+            isinstance(value, dict)
+            and set(value)
+            == {"file_paths", "session_paths", "document_types"},
+            f"{label} is malformed",
+        )
+        file_paths = value["file_paths"]
+        session_paths = value["session_paths"]
+        document_types = value["document_types"]
+        _require(
+            isinstance(file_paths, list)
+            and file_paths == sorted(set(file_paths))
+            and all(isinstance(path, str) and path for path in file_paths),
+            f"{label} file paths are malformed",
+        )
+        _require(
+            isinstance(session_paths, list)
+            and session_paths == sorted(set(session_paths))
+            and all(
+                isinstance(path, str)
+                and path.split("/", 1)[0] in {"ic~~", "vc~~"}
+                and len(path.split("/")) >= 2
+                for path in session_paths
+            ),
+            f"{label} session paths are malformed",
+        )
+        _require(
+            isinstance(document_types, list)
+            and all(
+                isinstance(row, dict)
+                and set(row) == {"path", "document_type"}
+                and isinstance(row["path"], str)
+                and type(row["document_type"]) is int
+                and row["document_type"] in {1, 2}
+                for row in document_types
+            ),
+            f"{label} document types are malformed",
+        )
+        typed_paths = [row["path"] for row in document_types]
+        _require(
+            typed_paths == sorted(set(typed_paths))
+            and set(typed_paths) == set(file_paths) | set(session_paths),
+            f"{label} document types contradict the loaded paths",
+        )
+        return {
+            "file_paths": file_paths,
+            "session_paths": session_paths,
+            "document_types": document_types,
+        }
+
+    def validate_loaded_inventory(value, topology, sources, label):
+        inventory = loaded_document_signature(value, label)
+        _require(
+            set(inventory["file_paths"]) == set(sources),
+            f"{label} file documents differ from the source inventory",
+        )
+        topology_types = {}
+        for item in topology:
+            if item["storage_scope"] == "suppressed":
+                continue
+            identity = (
+                session_path_identity(item["document_path"])
+                if item["storage_scope"] == "session"
+                else normalized_path(item["document_path"])
+            )
+            prior = topology_types.setdefault(
+                identity,
+                item["document_type"],
+            )
+            _require(
+                prior == item["document_type"],
+                f"{label} has conflicting types for one document",
+            )
+        expected_sessions = sorted(
+            identity
+            for identity, document_type in topology_types.items()
+            if any(
+                item["storage_scope"] == "session"
+                and session_path_identity(item["document_path"]) == identity
+                for item in topology
+            )
+        )
+        _require(
+            inventory["session_paths"] == expected_sessions,
+            f"{label} session documents differ from the topology",
+        )
+        _require(
+            {
+                row["path"]: row["document_type"]
+                for row in inventory["document_types"]
+            }
+            == topology_types,
+            f"{label} document types differ from the topology",
+        )
+        return inventory
 
     before = state_row(preparation["state_before"], "capture state_before")
     after_children = state_row(preparation["state_after_children"], "capture state_after_children")
@@ -1329,6 +1468,22 @@ def _capture_preparation(root, manifest):
         set(session_dependencies) == {item["document_path"] for item in session_rows},
         "Session dependency inventory differs from topology",
     )
+    loaded_before = validate_loaded_inventory(
+        preparation["loaded_documents_before"],
+        topology_before,
+        before_sources,
+        "loaded_documents_before",
+    )
+    loaded_after = validate_loaded_inventory(
+        preparation["loaded_documents_after"],
+        topology_after,
+        after_sources,
+        "loaded_documents_after",
+    )
+    _require(
+        loaded_before == loaded_after,
+        "Capture rebuild changed the final loaded document inventory",
+    )
     top_sha256 = before_sources[top_key]["sha256"]
     _require(
         preparation["source_sha256_before"] == preparation["source_sha256_after"] == top_sha256,
@@ -1487,6 +1642,533 @@ def _capture_preparation(root, manifest):
             f"Part did not finish fully rebuilt: {group['path']}",
         )
 
+    if session_recovery is not None:
+        _require(
+            set(session_recovery)
+            == {
+                "schema_version",
+                "first_attempt",
+                "retirement",
+                "reopen",
+                "fresh_session",
+            }
+            and session_recovery["schema_version"]
+            == "solidworks-to-urdf.rebuild-session-recovery/v2",
+            "Capture session recovery fields are incomplete or unknown",
+        )
+
+        def recovery_identity(value, label, *, required_state):
+            _require(
+                isinstance(value, dict)
+                and set(value)
+                == {
+                    "pid",
+                    "state",
+                    "executable",
+                    "ownership",
+                    "lease",
+                },
+                f"{label} fields are incomplete or unknown",
+            )
+            _require(
+                type(value["pid"]) is int
+                and value["pid"] > 0
+                and value["state"] == required_state
+                and isinstance(value["executable"], str)
+                and bool(value["executable"])
+                and value["ownership"] == "windows_job",
+                f"{label} process identity is invalid",
+            )
+            lease = value["lease"]
+            _require(
+                isinstance(lease, dict)
+                and set(lease) == {"path", "held", "holder_pid"}
+                and isinstance(lease["path"], str)
+                and bool(lease["path"])
+                and type(lease["held"]) is bool
+                and (
+                    (
+                        required_state == "active"
+                        and lease["held"] is True
+                        and type(lease["holder_pid"]) is int
+                        and lease["holder_pid"] > 0
+                    )
+                    or (
+                        required_state == "closed"
+                        and lease["held"] is False
+                        and lease["holder_pid"] is None
+                    )
+                ),
+                f"{label} lease identity contradicts its process state",
+            )
+            return value
+
+        def attempt_session(value, label):
+            _require(
+                isinstance(value, dict)
+                and set(value) == {"role", "identity", "temp_root"},
+                f"{label} fields are incomplete or unknown",
+            )
+            identity = recovery_identity(
+                value["identity"],
+                f"{label} identity",
+                required_state="active",
+            )
+            _require(
+                value["role"] == "copy",
+                f"{label} is not an active owned copy process",
+            )
+            temp_root = value["temp_root"]
+            _require(
+                temp_root is None
+                or (
+                    isinstance(temp_root, str)
+                    and session_root_pid(temp_root) == identity["pid"]
+                ),
+                f"{label} temp root differs from its process",
+            )
+            return value
+
+        first_attempt = session_recovery["first_attempt"]
+        _require(
+            isinstance(first_attempt, dict)
+            and set(first_attempt)
+            == {
+                "session",
+                "rebuild_calls",
+                "source_files",
+                "topology",
+                "loaded_documents",
+            },
+            "Capture first-attempt evidence is malformed",
+        )
+        old_session = attempt_session(
+            first_attempt["session"],
+            "Capture first-attempt session",
+        )
+        before_sessions = (
+            (before_recovery_environment.get("solidworks") or {}).get("sessions")
+        )
+        _require(
+            isinstance(before_sessions, dict)
+            and set(before_sessions) == {"source", "copy"}
+            and before_sessions["copy"] == old_session["identity"]
+            and before_sessions["source"].get("state") == "closed",
+            "Capture pre-recovery environment does not bind the first attempt",
+        )
+        final_session = attempt_session(
+            session_recovery["fresh_session"],
+            "Capture fresh-session identity",
+        )
+        final_identity = recovery_identity(
+            prepared_session["identity"],
+            "Capture prepared-session identity",
+            required_state="active",
+        )
+        _require(
+            final_session == prepared_session
+            and final_identity == final_session["identity"]
+            and old_session["identity"]["pid"]
+            != final_session["identity"]["pid"],
+            "Capture fresh session is not independently owned",
+        )
+        _require(
+            old_session["identity"]["executable"]
+            == final_session["identity"]["executable"]
+            and old_session["identity"]["ownership"]
+            == final_session["identity"]["ownership"]
+            and old_session["identity"]["lease"]
+            == final_session["identity"]["lease"],
+            "Capture recovery changed the native executable or lease domain",
+        )
+        retirement = session_recovery["retirement"]
+        _require(
+            isinstance(retirement, dict)
+            and set(retirement)
+            == {"role", "retired", "before", "after"}
+            and retirement["role"] == "copy"
+            and retirement["retired"] is True
+            and retirement["before"] == old_session["identity"]
+            and recovery_identity(
+                retirement["after"],
+                "Capture retired-session identity",
+                required_state="closed",
+            )
+            == retirement["after"]
+            and retirement["after"]["pid"]
+            == old_session["identity"]["pid"]
+            and retirement["after"]["executable"]
+            == old_session["identity"]["executable"]
+            and retirement["after"]["ownership"]
+            == old_session["identity"]["ownership"]
+            and retirement["after"]["lease"]["path"]
+            == old_session["identity"]["lease"]["path"],
+            "Capture old session retirement is not proven",
+        )
+        reopened = session_recovery["reopen"]
+        _require(
+            isinstance(reopened, dict)
+            and set(reopened)
+            == {"opened", "path", "read_only", "errors", "warnings"}
+            and isinstance(reopened["opened"], str)
+            and bool(reopened["opened"])
+            and _same_native_path(reopened["path"], top_path)
+            and reopened["read_only"] is True
+            and type(reopened["errors"]) is int
+            and reopened["errors"] == 0,
+            "Capture recovery did not reopen the exact top read-only",
+        )
+        _require(
+            type(reopened["warnings"]) is int and reopened["warnings"] >= 0,
+            "Capture recovery reopen warnings are invalid",
+        )
+        _require(
+            isinstance(environment, dict)
+            and isinstance(before_recovery_environment, dict),
+            "Capture recovery environment evidence is malformed",
+        )
+        for field in ("platform", "python", "worker_version", "toolchain"):
+            _require(
+                before_recovery_environment.get(field) == environment.get(field),
+                f"Capture recovery changed native runtime field: {field}",
+            )
+        before_solidworks = before_recovery_environment["solidworks"]
+        final_solidworks = environment["solidworks"]
+        for field in (
+            "revision",
+            "input_mode",
+            "build",
+            "license",
+            "visible",
+            "unavailable",
+        ):
+            _require(
+                before_solidworks.get(field)
+                == final_solidworks.get(field),
+                f"Capture recovery changed SolidWorks field: {field}",
+            )
+        before_native_sessions = before_solidworks.get("sessions")
+        final_native_sessions = final_solidworks.get("sessions")
+        _require(
+            isinstance(before_native_sessions, dict)
+            and set(before_native_sessions) == {"source", "copy"}
+            and isinstance(final_native_sessions, dict)
+            and set(final_native_sessions) == {"source", "copy"}
+            and before_native_sessions["source"]
+            == final_native_sessions["source"]
+            and before_native_sessions["copy"]
+            == old_session["identity"]
+            and final_native_sessions["copy"]
+            == final_session["identity"],
+            "Capture recovery changed native session continuity",
+        )
+        first_topology = topology_rows(
+            first_attempt["topology"],
+            "Capture first-attempt topology",
+            old_session,
+        )
+        first_sources = source_map(
+            first_attempt["source_files"],
+            "Capture first-attempt source_files",
+        )
+        _require(
+            first_sources == before_sources,
+            "Capture first attempt and final recovery used different source bytes",
+        )
+        _require(
+            topology_semantic(first_topology)
+            == topology_semantic(topology_before),
+            "Capture first attempt and final recovery changed native topology",
+        )
+        first_loaded = validate_loaded_inventory(
+            first_attempt["loaded_documents"],
+            first_topology,
+            first_sources,
+            "Capture first-attempt loaded_documents",
+        )
+        _require(
+            first_loaded == loaded_before,
+            "Capture recovery loaded a different document inventory",
+        )
+
+        first_assembly_rows = {}
+        for item in first_topology:
+            if item["document_type"] != 2:
+                continue
+            identity = (
+                session_path_identity(item["document_path"])
+                if item["storage_scope"] == "session"
+                else normalized_path(item["document_path"])
+            )
+            group = first_assembly_rows.setdefault(
+                identity,
+                {
+                    "depth": item["depth"],
+                    "instances": [],
+                    "configurations": set(),
+                    "paths": set(),
+                },
+            )
+            group["depth"] = max(group["depth"], item["depth"])
+            group["instances"].append(item["instance"])
+            group["configurations"].add(item["referenced_configuration"])
+            group["paths"].add(item["document_path"])
+
+        def first_document_identity(path):
+            matches = {
+                (
+                    session_path_identity(item["document_path"])
+                    if item["storage_scope"] == "session"
+                    else normalized_path(item["document_path"])
+                )
+                for item in first_topology
+                if (
+                    session_path_identity(item["document_path"])
+                    == session_path_identity(path)
+                    if item["storage_scope"] == "session"
+                    else normalized_path(item["document_path"])
+                    == normalized_path(path)
+                )
+            }
+            _require(
+                len(matches) == 1,
+                "Capture first-attempt document identity is unknown or ambiguous",
+            )
+            return next(iter(matches))
+
+        first_by_instance = {
+            item["instance"]: item for item in first_topology
+        }
+        first_top_identity = first_document_identity(top_path)
+        first_parents_by_document = {}
+        for item in first_topology:
+            if (
+                item["instance"] == "top"
+                or item["storage_scope"] == "suppressed"
+                or item["document_type"] != 2
+            ):
+                continue
+            parent_instance = (
+                "top"
+                if item["depth"] == 1
+                else item["instance"].rsplit("/", 1)[0]
+            )
+            parent = first_by_instance.get(parent_instance)
+            _require(
+                parent is not None
+                and parent["document_type"] == 2
+                and parent["depth"] == item["depth"] - 1,
+                "Capture first-attempt assembly has no exact parent",
+            )
+            parent_identity = (
+                first_top_identity
+                if parent_instance == "top"
+                else first_document_identity(parent["document_path"])
+            )
+            first_parents_by_document.setdefault(
+                first_document_identity(item["document_path"]),
+                set(),
+            ).add(parent_identity)
+
+        first_journal = first_attempt["rebuild_calls"]
+        _require(
+            isinstance(first_journal, list)
+            and len(first_journal) >= 2
+            and isinstance(first_journal[0], dict)
+            and set(first_journal[0])
+            == {"kind", "initial_pending", "rebuild_candidates"}
+            and first_journal[0]["kind"] == "initial"
+            and isinstance(first_journal[0]["initial_pending"], list)
+            and first_journal[0]["initial_pending"]
+            == sorted(set(first_journal[0]["initial_pending"]))
+            and first_journal[0]["initial_pending"]
+            and first_journal[0]["rebuild_candidates"]
+            == sorted(set(first_journal[0]["rebuild_candidates"])),
+            "Capture first-attempt journal has no exact dirty closure",
+        )
+        first_pending = {
+            first_document_identity(path)
+            for path in first_journal[0]["initial_pending"]
+        }
+        _require(
+            first_top_identity not in first_pending,
+            "Capture first-attempt top cannot be an initial pending candidate",
+        )
+        first_candidates = {
+            first_document_identity(path)
+            for path in first_journal[0]["rebuild_candidates"]
+        }
+        expected_candidates = set(first_pending)
+        pending = list(first_pending)
+        while pending:
+            child = pending.pop()
+            for parent in first_parents_by_document.get(child, set()):
+                if (
+                    parent == first_top_identity
+                    or parent in expected_candidates
+                ):
+                    continue
+                expected_candidates.add(parent)
+                pending.append(parent)
+        _require(
+            first_pending <= set(first_assembly_rows)
+            and first_candidates == expected_candidates,
+            "Capture first-attempt candidates differ from the exact dirty ancestor closure",
+        )
+        sequence = 1
+        for identity in sorted(
+            first_candidates,
+            key=lambda key: (-first_assembly_rows[key]["depth"], key),
+        ):
+            _require(
+                sequence < len(first_journal) - 1,
+                "Capture first-attempt journal ended before its candidates",
+            )
+            candidate = first_journal[sequence]
+            group = first_assembly_rows[identity]
+            _require(
+                isinstance(candidate, dict)
+                and set(candidate)
+                == {
+                    "sequence",
+                    "kind",
+                    "path",
+                    "depth",
+                    "required_configurations",
+                    "state",
+                    "decision",
+                }
+                and candidate["sequence"] == sequence
+                and candidate["kind"] == "candidate"
+                and first_document_identity(candidate["path"]) == identity
+                and candidate["depth"] == group["depth"]
+                and candidate["required_configurations"]
+                == sorted(group["configurations"]),
+                "Capture first-attempt candidate journal differs from its graph",
+            )
+            state = state_row(
+                candidate["state"],
+                "Capture first-attempt candidate state",
+            )
+            _require(
+                first_document_identity(state["path"]) == identity
+                and state["configuration"]
+                in group["configurations"],
+                "Capture first-attempt candidate changed document identity",
+            )
+            sequence += 1
+            if state["needs_rebuild2_value"] in (1, 2):
+                _require(
+                    candidate["decision"] == "rebuild",
+                    "Capture first-attempt pending candidate was not rebuilt",
+                )
+                _require(
+                    sequence < len(first_journal) - 1,
+                    "Capture first-attempt journal ended before a child call",
+                )
+                call = first_journal[sequence]
+                _require(
+                    isinstance(call, dict)
+                    and set(call)
+                    == {
+                        "sequence",
+                        "kind",
+                        "phase",
+                        "path",
+                        "depth",
+                        "state_before",
+                        "result",
+                        "state_after",
+                        "elapsed_seconds",
+                    }
+                    and call["sequence"] == sequence
+                    and call["kind"] == "child"
+                    and call["phase"] == "child"
+                    and first_document_identity(call["path"]) == identity
+                    and call["depth"] == candidate["depth"]
+                    and call["state_before"] == candidate["state"]
+                    and call["result"] is True
+                    and type(call["elapsed_seconds"]) in (int, float)
+                    and call["elapsed_seconds"] >= 0,
+                    "Capture first-attempt child-call journal is malformed",
+                )
+                child_after = state_row(
+                    call["state_after"],
+                    "Capture first-attempt child state_after",
+                )
+                _require(
+                    first_document_identity(child_after["path"]) == identity
+                    and child_after["configuration"]
+                    == state["configuration"]
+                    and child_after["read_only"] == state["read_only"]
+                    and child_after["needs_rebuild2_value"] == 0
+                    and child_after["configuration_needs_rebuild"] is False,
+                    "Capture first-attempt child rebuild changed state or did not converge",
+                )
+                sequence += 1
+            else:
+                _require(
+                    candidate["decision"] == "skip_clean",
+                    "Capture first-attempt clean candidate was rebuilt",
+                )
+        _require(
+            sequence < len(first_journal),
+            "Capture first-attempt journal has no top failure",
+        )
+        failed_top = first_journal[sequence]
+        _require(
+            isinstance(failed_top, dict)
+            and set(failed_top)
+            == {
+                "sequence",
+                "kind",
+                "phase",
+                "path",
+                "depth",
+                "state_before",
+                "result",
+                "state_after",
+                "elapsed_seconds",
+                "error_code",
+                "error_message",
+            }
+            and failed_top["sequence"] == sequence
+            and failed_top["kind"] == "top"
+            and failed_top["phase"] == "top"
+            and _same_native_path(failed_top["path"], top_path)
+            and failed_top["depth"] == 0
+            and failed_top["result"] is True
+            and failed_top["error_code"] == "cad_rebuild_incomplete"
+            and failed_top["error_message"]
+            == "Assembly rebuild did not end in a fully rebuilt configuration"
+            and type(failed_top["elapsed_seconds"]) in (int, float)
+            and failed_top["elapsed_seconds"] >= 0,
+            "Capture first-attempt top failure is malformed",
+        )
+        before_top = state_row(
+            failed_top["state_before"],
+            "Capture first-attempt top state_before",
+        )
+        failed_state = state_row(
+            failed_top["state_after"],
+            "Capture first-attempt top state_after",
+        )
+        _require(
+            _same_native_path(before_top["path"], top_path)
+            and before_top["read_only"] is True
+            and before_top["configuration"] == configuration
+            and before_top["needs_rebuild2_value"] in (1, 2)
+            and _same_native_path(failed_state["path"], top_path)
+            and failed_state["configuration"] == configuration
+            and failed_state["read_only"] is True
+            and failed_state["needs_rebuild2_value"] in (1, 2)
+            and failed_state["configuration_needs_rebuild"] is False,
+            "Capture first-attempt top failure lacks the sticky state",
+        )
+        _require(
+            sequence + 1 == len(first_journal),
+            "Capture first-attempt journal has extra native calls",
+        )
     def engineering_state_signature(state):
         return {
             "configuration": state["configuration"],
@@ -1705,6 +2387,7 @@ def _capture_preparation(root, manifest):
             == {
                 "path",
                 "depth",
+                "phase",
                 "instances",
                 "elapsed_seconds",
                 "result",
@@ -1715,6 +2398,7 @@ def _capture_preparation(root, manifest):
             "Child rebuild evidence is malformed",
         )
         _require(item["result"] is True, "Child rebuild did not return true")
+        _require(item["phase"] == "child", "Child rebuild phase differs")
         _require(
             type(item["elapsed_seconds"]) in (int, float) and item["elapsed_seconds"] >= 0,
             "Child rebuild time is invalid",
@@ -1757,7 +2441,11 @@ def _capture_preparation(root, manifest):
     )
 
     top_rebuild = preparation["top_rebuild"]
-    rebuilt = bool(child_rebuilds or top_rebuild is not None)
+    rebuilt = bool(
+        session_recovery is not None
+        or child_rebuilds
+        or top_rebuild is not None
+    )
     _require(preparation["rebuild_performed"] is rebuilt, "rebuild_performed contradicts the invoked APIs")
     _require(
         preparation["used_api"] == (rebuild_api if rebuilt else no_rebuild_api),
@@ -1782,6 +2470,7 @@ def _capture_preparation(root, manifest):
             == {
                 "path",
                 "depth",
+                "phase",
                 "instances",
                 "elapsed_seconds",
                 "result",
@@ -1793,6 +2482,12 @@ def _capture_preparation(root, manifest):
         )
         _require(_same_native_path(top_rebuild["path"], top_path), "Top rebuild names another document")
         _require(top_rebuild["result"] is True, "Top rebuild did not return true")
+        expected_phase = (
+            "top_recovery"
+            if preparation["session_recovery"] is not None
+            else "top"
+        )
+        _require(top_rebuild["phase"] == expected_phase, "Top rebuild phase differs")
         _require(top_rebuild["depth"] == 0 and top_rebuild["instances"] == ["top"], "Top rebuild identity changed")
         _require(
             top_rebuild["state_before"] == after_children,
@@ -1806,32 +2501,33 @@ def _capture_preparation(root, manifest):
         raise PipelineError("Pending top state has no rebuild evidence")
 
     rebuild_calls = preparation["rebuild_calls"]
-    _require(
-        isinstance(rebuild_calls, list)
-        and len(rebuild_calls) == len(rebuild_candidates) + len(child_rebuilds) + int(top_rebuild is not None) + 1,
-        "Rebuild call journal differs from the recorded native calls",
-    )
-    initial_call = rebuild_calls[0]
-    _require(
-        isinstance(initial_call, dict)
-        and set(initial_call) == {"kind", "initial_pending", "rebuild_candidates"}
-        and initial_call["kind"] == "initial"
-        and initial_call["initial_pending"] == sorted(initial_pending)
-        and initial_call["rebuild_candidates"] == sorted(rebuild_candidates),
-        "Rebuild journal does not bind the initial dirty ancestor closure",
-    )
+    _require(isinstance(rebuild_calls, list) and bool(rebuild_calls), "Rebuild call journal is missing")
+
     def verify_call(call, recorded_call, sequence, kind):
         _require(
             isinstance(call, dict)
             and set(call)
-            == {"sequence", "kind", "path", "depth", "state_before", "result", "state_after"}
+            == {
+                "sequence",
+                "kind",
+                "phase",
+                "path",
+                "depth",
+                "state_before",
+                "result",
+                "state_after",
+                "elapsed_seconds",
+            }
             and call["sequence"] == sequence
             and call["kind"] == kind
+            and call["phase"] == recorded_call["phase"]
             and call["path"] == recorded_call["path"]
             and call["depth"] == recorded_call["depth"]
             and call["state_before"] == recorded_call["state_before"]
             and call["result"] is True
             and call["state_after"] == recorded_call["state_after"]
+            and call["elapsed_seconds"]
+            == recorded_call["elapsed_seconds"]
             and recorded_call["call_sequence"] == sequence,
             "Rebuild call journal differs from its recorded evidence",
         )
@@ -1842,58 +2538,173 @@ def _capture_preparation(root, manifest):
         _require(sequence < len(rebuild_calls), "Rebuild journal ended before its scheduled observation or call")
         return rebuild_calls[sequence]
 
-    sequence = 1
-    for key in sorted(rebuild_candidates, key=lambda key: (-before_rows[key]["depth"], key)):
-        candidate = journal_row(sequence)
-        row = before_rows[key]
+    if session_recovery is None:
         _require(
-            isinstance(candidate, dict)
-            and set(candidate)
-            == {"sequence", "kind", "path", "depth", "required_configurations", "state", "decision"}
-            and candidate["sequence"] == sequence
-            and candidate["kind"] == "candidate"
-            and _same_native_path(candidate["path"], row["path"])
-            and candidate["depth"] == row["depth"]
-            and candidate["required_configurations"] == sorted(groups[key]["configurations"]),
-            "Rebuild journal omits or reorders an initial dirty closure candidate",
+            len(rebuild_calls)
+            == len(rebuild_candidates)
+            + len(child_rebuilds)
+            + int(top_rebuild is not None)
+            + 1,
+            "Rebuild call journal differs from the recorded native calls",
         )
-        fresh = state_row(candidate["state"], "Rebuild candidate state")
+        initial_call = rebuild_calls[0]
         _require(
-            _same_native_path(fresh["path"], row["path"])
-            and fresh["configuration"] == row["state"]["configuration"],
-            "Rebuild candidate changed its document or configuration",
+            isinstance(initial_call, dict)
+            and set(initial_call)
+            == {"kind", "initial_pending", "rebuild_candidates"}
+            and initial_call["kind"] == "initial"
+            and initial_call["initial_pending"] == sorted(initial_pending)
+            and initial_call["rebuild_candidates"]
+            == sorted(rebuild_candidates),
+            "Rebuild journal does not bind the initial dirty ancestor closure",
         )
-        _require(
-            groups[key]["configurations"] <= {item["name"] for item in fresh["configurations"]},
-            "Rebuild candidate omits a required configuration",
-        )
-        sequence += 1
-        if fresh["needs_rebuild2_value"] in (1, 2):
+        sequence = 1
+        for key in sorted(
+            rebuild_candidates,
+            key=lambda key: (-before_rows[key]["depth"], key),
+        ):
+            candidate = journal_row(sequence)
+            row = before_rows[key]
             _require(
-                candidate["decision"] == "rebuild"
-                and key in child_calls
-                and child_calls[key]["state_before"] == fresh,
-                "A pending candidate has no recorded child-first rebuild",
+                isinstance(candidate, dict)
+                and set(candidate)
+                == {
+                    "sequence",
+                    "kind",
+                    "path",
+                    "depth",
+                    "required_configurations",
+                    "state",
+                    "decision",
+                }
+                and candidate["sequence"] == sequence
+                and candidate["kind"] == "candidate"
+                and _same_native_path(candidate["path"], row["path"])
+                and candidate["depth"] == row["depth"]
+                and candidate["required_configurations"]
+                == sorted(groups[key]["configurations"]),
+                "Rebuild journal omits or reorders an initial dirty closure candidate",
             )
-            verify_call(journal_row(sequence), child_calls.pop(key), sequence, "child")
+            fresh = state_row(candidate["state"], "Rebuild candidate state")
+            _require(
+                _same_native_path(fresh["path"], row["path"])
+                and fresh["configuration"]
+                == row["state"]["configuration"],
+                "Rebuild candidate changed its document or configuration",
+            )
+            _require(
+                groups[key]["configurations"]
+                <= {item["name"] for item in fresh["configurations"]},
+                "Rebuild candidate omits a required configuration",
+            )
             sequence += 1
-        else:
-            _require(
-                candidate["decision"] == "skip_clean"
-                and key not in child_calls
-                and fresh["configuration_needs_rebuild"] is False
-                and all(
-                    item["needs_rebuild"] is False
-                    for item in fresh["configurations"]
-                    if item["name"] in groups[key]["configurations"]
-                ),
-                "A skipped rebuild candidate was not observed clean",
+            if fresh["needs_rebuild2_value"] in (1, 2):
+                _require(
+                    candidate["decision"] == "rebuild"
+                    and key in child_calls
+                    and child_calls[key]["state_before"] == fresh,
+                    "A pending candidate has no recorded child-first rebuild",
+                )
+                verify_call(
+                    journal_row(sequence),
+                    child_calls.pop(key),
+                    sequence,
+                    "child",
+                )
+                sequence += 1
+            else:
+                _require(
+                    candidate["decision"] == "skip_clean"
+                    and key not in child_calls
+                    and fresh["configuration_needs_rebuild"] is False
+                    and all(
+                        item["needs_rebuild"] is False
+                        for item in fresh["configurations"]
+                        if item["name"] in groups[key]["configurations"]
+                    ),
+                    "A skipped rebuild candidate was not observed clean",
+                )
+        _require(
+            not child_calls,
+            "Child rebuild has no corresponding candidate observation",
+        )
+        if top_rebuild is not None:
+            verify_call(
+                journal_row(sequence),
+                top_rebuild,
+                sequence,
+                "top",
             )
-    _require(not child_calls, "Child rebuild has no corresponding candidate observation")
-    if top_rebuild is not None:
-        verify_call(journal_row(sequence), top_rebuild, sequence, "top")
-        sequence += 1
-    _require(sequence == len(rebuild_calls), "Rebuild journal contains an unscheduled native call")
+            sequence += 1
+    else:
+        _require(
+            child_rebuilds == [],
+            "A recovered final attempt performed child rebuilds",
+        )
+        _require(
+            len(rebuild_calls)
+            == 1 + len(rebuild_candidates) + int(top_rebuild is not None),
+            "Recovery journal differs from its deferred top-only attempt",
+        )
+        initial_call = rebuild_calls[0]
+        _require(
+            isinstance(initial_call, dict)
+            and set(initial_call)
+            == {"kind", "initial_pending", "rebuild_candidates"}
+            and initial_call["kind"] == "recovery_initial"
+            and initial_call["initial_pending"] == sorted(initial_pending)
+            and initial_call["rebuild_candidates"]
+            == sorted(rebuild_candidates),
+            "Recovery journal does not bind the fresh session graph",
+        )
+        sequence = 1
+        for key in sorted(
+            rebuild_candidates,
+            key=lambda key: (-before_rows[key]["depth"], key),
+        ):
+            candidate = journal_row(sequence)
+            row = before_rows[key]
+            _require(
+                isinstance(candidate, dict)
+                and set(candidate)
+                == {
+                    "sequence",
+                    "kind",
+                    "path",
+                    "depth",
+                    "required_configurations",
+                    "state",
+                    "decision",
+                }
+                and candidate["sequence"] == sequence
+                and candidate["kind"] == "candidate"
+                and _same_native_path(candidate["path"], row["path"])
+                and candidate["depth"] == row["depth"]
+                and candidate["required_configurations"]
+                == sorted(groups[key]["configurations"])
+                and candidate["decision"] == "recovery_defer_to_top",
+                "Recovery journal does not defer a fresh pending candidate",
+            )
+            state = state_row(candidate["state"], "Recovery candidate state")
+            _require(
+                _same_native_path(state["path"], row["path"])
+                and state["configuration"]
+                == row["state"]["configuration"],
+                "Recovery candidate changed its document or configuration",
+            )
+            sequence += 1
+        if top_rebuild is not None:
+            verify_call(
+                journal_row(sequence),
+                top_rebuild,
+                sequence,
+                "top_recovery",
+            )
+            sequence += 1
+    _require(
+        sequence == len(rebuild_calls),
+        "Rebuild journal contains an unscheduled native call",
+    )
 
     return {
         "schema_version": schema,
