@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import re
 import shutil
 import tempfile
 import unittest
@@ -15,6 +14,7 @@ from unittest.mock import patch
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.geometry.native_u import native_tolerant_edge_value_warning
 from description_pipeline.io import PipelineError, digest, inventory, read_data, write_json
+from description_pipeline.model import EngineeringModel, emit
 from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
     ProtocolError,
@@ -33,6 +33,7 @@ from description_pipeline.pipeline.stages.generate import (
     GenerateHandler,
 )
 from description_pipeline.sources.solidworks.generation_warnings import generation_value_warnings
+from description_pipeline.sources.solidworks.naming import visual_name
 from description_pipeline.sources.snapshot import write_manifest
 
 from tests.sources import test_solidworks_mass_authority as authority_fixtures
@@ -392,7 +393,7 @@ class GenerateVerifyClosureTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.view_index = 0
 
-    def _evaluate(self, generate_ref=None) -> dict:
+    def _evaluate_details(self, generate_ref=None) -> tuple[dict, object]:
         from description_pipeline.interface_records import check_policy_digest
         from description_pipeline.pipeline.verify import _evaluation_view, _verify_artifact_tree
         from description_pipeline.stages import CONTRACT_SHA256
@@ -418,34 +419,50 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             contract_sha256=CONTRACT_SHA256,
             policy_sha256=check_policy_digest(),
         )
-        return evaluate_bundle(root)
+        return evaluate_bundle(root), generate
 
-    def _reseal(self, name: str, mutation) -> object:
-        from description_pipeline.io import file_digest
+    def _evaluate(self, generate_ref=None) -> dict:
+        return self._evaluate_details(generate_ref)[0]
 
+    def _reseal_with_emitter(self, name: str, mutation) -> tuple[object, EngineeringModel, dict]:
+        from description_pipeline.sources.snapshot import verify_snapshot
+        from description_pipeline.sources.solidworks.captured import derive_engineering_input
+
+        original_model = read_data(self.fixture.generate_source / "model/robot.json")
         source = self.fixture.root / f"mutated-generate-{name}"
-        shutil.copytree(self.fixture.generate_source, source)
-        urdf = source / "urdf/robot.urdf"
-        model_path = source / "model/robot.json"
-        before_model = model_path.read_bytes()
-        before_urdf = urdf.read_bytes()
-        mutation(model_path=model_path, urdf=urdf)
-        receipt_path = source / GENERATE_RECEIPT
-        receipt = read_data(receipt_path)
-        if model_path.read_bytes() != before_model:
-            model = read_data(model_path)
-            receipt["model_sha256"] = file_digest(model_path)
-            receipt["semantic_identity"] = model.get("semantic_identity")
-        if urdf.read_bytes() != before_urdf:
-            receipt["urdf_sha256"] = file_digest(urdf)
-        write_json(receipt_path, receipt)
-        return self.fixture.store.seal_tree(
+        source.mkdir()
+        payload = copy.deepcopy(original_model)
+        mutation(payload)
+        manifest = verify_snapshot(self.fixture.capture_root / "evidence")
+        payload["semantic_identity"] = derive_engineering_input(
+            self.fixture.capture_root / "evidence",
+            manifest,
+        )["semantic_identity"]
+        model = EngineeringModel.from_dict(payload)
+        emission = emit(
+            model,
+            evidence_root=self.fixture.capture_root / "evidence",
+            destination=source,
+        )
+        shutil.copyfile(self.fixture.generate_source / "tool.json", source / "tool.json")
+        receipt = read_data(self.fixture.generate_source / GENERATE_RECEIPT)
+        receipt.update(
+            {
+                "semantic_identity": model.to_dict()["semantic_identity"],
+                "model_sha256": emission.model_sha256,
+                "urdf_sha256": emission.urdf_sha256,
+                "mesh_files": list(emission.mesh_files),
+            }
+        )
+        write_json(source / GENERATE_RECEIPT, receipt)
+        reference = self.fixture.store.seal_tree(
             source,
             kind="stage_output:generate",
             producer_run_id=self.fixture.generator_command.run_id,
             producer_stage="generate",
             producer_tool_sha256=self.fixture.generate_executor,
         )
+        return reference, model, receipt
 
     def test_generate_pair_closes_to_independent_verify_with_per_field_warnings(self) -> None:
         report = self._evaluate()
@@ -465,86 +482,129 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             self.assertTrue(all(item.get("object") for item in by_code[code]["objects"]))
             self.assertTrue(all(item.get("fields") or item.get("field") for item in by_code[code]["objects"]))
 
-    def test_resealed_generate_semantic_mutations_are_rejected(self) -> None:
+    def test_producer_consistent_semantic_mutations_fail_independent_source_gates(self) -> None:
+        def warning_objects(model: dict, code: str) -> list[dict]:
+            warning = next(item for item in model["provenance"]["value_warnings"] if item["code"] == code)
+            return warning["objects"]
+
+        def material_color(model: dict) -> None:
+            visual = model["links"][0]["visuals"][0]
+            visual["rgba"] = [1.0, 0.0, 0.0, 1.0]
+            for code in ("display.material_fallback", "display.constant"):
+                for row in warning_objects(model, code):
+                    if row["object"] == visual["name"]:
+                        row["actual"]["rgba"] = [1.0, 0.0, 0.0, 1.0]
+
+        def mass_inertia(model: dict) -> None:
+            inertial = model["links"][0]["inertial"]
+            inertial["mass"] *= 1.5
+            inertial["inertia"][0] *= 2.0
+
+        def joint_axis(model: dict) -> None:
+            joint = model["joints"][0]
+            joint["axis"] = [1.0, 0.0, 0.0]
+            joint["provenance"]["axis.delivered_local_axis"] = [1.0, 0.0, 0.0]
+            for row in warning_objects(model, "direction.semantics_unresolved"):
+                if row["object"] == joint["name"]:
+                    row["actual"] = [1.0, 0.0, 0.0]
+
+        def object_binding(model: dict) -> None:
+            visual = model["links"][0]["visuals"][0]
+            previous = visual["name"]
+            native_component = "base-1"
+            current = visual_name(native_component, link="arm_link")
+            visual["provenance"]["native_component"] = native_component
+            visual["name"] = current
+            for code in (
+                "naming.derived_visual",
+                "naming.content_addressed_mesh",
+                "display.material_fallback",
+                "display.constant",
+            ):
+                for row in warning_objects(model, code):
+                    if row["object"] != previous:
+                        continue
+                    row["object"] = current
+                    if code == "naming.derived_visual":
+                        row["original"] = native_component
+                        row["actual"] = current
+
+        def missing_warning(model: dict) -> None:
+            model["provenance"]["value_warnings"] = [
+                item
+                for item in model["provenance"]["value_warnings"]
+                if item["code"] != "display.material_fallback"
+            ]
+
         cases = (
             (
                 "material-color",
-                lambda model_path, urdf: urdf.write_text(
-                    re.sub(
-                        r'rgba="[^"]+"',
-                        'rgba="1 0 0 1"',
-                        urdf.read_text(encoding="utf-8"),
-                        count=1,
-                    ),
-                    encoding="utf-8",
-                ),
-                "urdf.syntax_names",
+                material_color,
+                {"provenance.value_warnings"},
+            ),
+            (
+                "mass-inertia",
+                mass_inertia,
+                {
+                    "physics.mass_closure_equality",
+                    "physics.independent",
+                    "physics.expected_mass",
+                },
+            ),
+            (
+                "joint-axis",
+                joint_axis,
+                {"joints.shoulder_pitch_joint"},
             ),
             (
                 "object-binding",
-                lambda model_path, urdf: urdf.write_text(
-                    re.sub(
-                        r'visual name="[^"]+"',
-                        'visual name="foreign_visual"',
-                        urdf.read_text(encoding="utf-8"),
-                        count=1,
-                    ),
-                    encoding="utf-8",
-                ),
-                "urdf.syntax_names",
-            ),
-            (
-                "inertia",
-                lambda model_path, urdf: urdf.write_text(
-                    re.sub(
-                        r'ixx="[^"]+"',
-                        'ixx="9.0"',
-                        urdf.read_text(encoding="utf-8"),
-                        count=1,
-                    ),
-                    encoding="utf-8",
-                ),
-                "inertia.arm_link",
-            ),
-            (
-                "axis-transform",
-                lambda model_path, urdf: urdf.write_text(
-                    re.sub(
-                        r'<axis xyz="[^"]+"',
-                        '<axis xyz="0 1 0"',
-                        urdf.read_text(encoding="utf-8"),
-                        count=1,
-                    ),
-                    encoding="utf-8",
-                ),
-                "urdf.syntax_names",
+                object_binding,
+                {"provenance.value_warnings"},
             ),
             (
                 "missing-warning",
-                lambda model_path, urdf: write_json(
-                    model_path,
-                    {
-                        **read_data(model_path),
-                        "provenance": {
-                            **read_data(model_path)["provenance"],
-                            "value_warnings": [
-                                item
-                                for item in read_data(model_path)["provenance"]["value_warnings"]
-                                if item["code"] != "display.material_fallback"
-                            ],
-                        },
-                    },
-                ),
-                "provenance.value_warnings",
+                missing_warning,
+                {"provenance.value_warnings"},
             ),
         )
-        for name, mutation, expected_gate in cases:
+        capture_before = digest(inventory(self.fixture.capture_root))
+        original_model = EngineeringModel.from_dict(
+            read_data(self.fixture.generate_source / "model/robot.json")
+        )
+        for name, mutation, expected_failures in cases:
             with self.subTest(name=name):
-                reference = self._reseal(name, mutation)
-                report = self._evaluate(reference)
+                reference, model, receipt = self._reseal_with_emitter(name, mutation)
+                report, generate = self._evaluate_details(reference)
+                checks = {item["id"]: item for item in report["checks"]}
                 self.assertIs(report["passed"], False)
-                failed = {check["id"] for check in report["checks"] if check["passed"] is not True}
-                self.assertIn(expected_gate, failed)
+                self.assertIs(checks["model.schema"]["passed"], True)
+                self.assertIs(checks["urdf.syntax_names"]["passed"], True)
+                if name == "mass-inertia":
+                    self.assertIs(checks["inertia.arm_link"]["passed"], True)
+                for identifier in expected_failures:
+                    self.assertIs(checks[identifier]["passed"], False)
+                self.assertEqual(
+                    {
+                        item["id"]
+                        for item in report["checks"]
+                        if item["passed"] is not True
+                    },
+                    expected_failures,
+                )
+                self.assertEqual(
+                    model.to_dict()["semantic_identity"],
+                    original_model.to_dict()["semantic_identity"],
+                )
+                self.assertNotEqual(model.semantic_sha256, original_model.semantic_sha256)
+                self.assertNotEqual(reference.artifact_id, self.fixture.generate_ref.artifact_id)
+                self.assertNotEqual(reference.set_sha256, self.fixture.generate_ref.set_sha256)
+                members = {item["path"]: item["sha256"] for item in generate.manifest["members"]}
+                self.assertEqual(members["model/robot.json"], receipt["model_sha256"])
+                self.assertEqual(members["urdf/robot.urdf"], receipt["urdf_sha256"])
+                if name == "missing-warning":
+                    urdf = (generate.root / "urdf/robot.urdf").read_text(encoding="utf-8")
+                    self.assertNotIn("WARNING display.material_fallback:", urdf)
+                self.assertEqual(digest(inventory(self.fixture.capture_root)), capture_before)
 
 
 if __name__ == "__main__":
