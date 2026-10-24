@@ -26,6 +26,8 @@ from .admission import (
 )
 from .contracts import (
     ArtifactRef,
+    DispatchCommand,
+    DispatchConf,
     ExecutionClaim,
     FailureEnvelope,
     RunAdmission,
@@ -50,6 +52,7 @@ from .effects import (
     project_effect_settlement,
     project_effect_state,
 )
+from .dispatch import DispatchAdapter, DispatchObservation, DispatchResult, TechnicalDispatchService
 from .engine import StageHandler, StageServices, StageWorkspace, execute_stage
 from .discover import DiscoverDomainAdapter, DiscoverHandler
 from .capture import CaptureHandler
@@ -62,6 +65,11 @@ __all__ = [
     "CaptureHandler",
     "DiscoverDomainAdapter",
     "DiscoverHandler",
+    "DispatchAdapter",
+    "DispatchCommand",
+    "DispatchConf",
+    "DispatchObservation",
+    "DispatchResult",
     "EffectFact",
     "EffectIntent",
     "EffectSettlement",
@@ -84,6 +92,7 @@ __all__ = [
     "StageServices",
     "StageStatus",
     "StageWorkspace",
+    "TechnicalDispatchService",
     "VerifiedArtifact",
     "VerifiedDiscoverResult",
     "VerifiedPredecessor",

@@ -116,20 +116,40 @@ the original domain failure.
 - `tests/v1/test_runtime_candidate_postgres.py`: throwaway PostgreSQL concurrency and
   composition proof.
 
-## Deferred Portal dispatch decision
+## 技术派发的持久化边界
 
-Portal admission and Airflow dispatch must not consume the Freeze stage execution claim. The
-candidate direction is a separate technical dispatch command linked in the same admission
-transaction to the immutable RunAdmission and Freeze command. It reuses command, claim and
-effect facts but creates neither a seventh business stage nor a StageDecision.
+Portal 的 Airflow 派发使用独立的 `DispatchCommand`，与 run、Freeze command、固定的
+`dag_id`/`dag_run_id`、幂等键和派发执行器身份绑定。`DispatchConf` 只保存 `run_id` 与
+`freeze_command_id`，作为独立的 `airflow_dispatch_conf` artifact 封存；凭据留在受控
+adapter 中，不进入 conf、command、数据库或本模块工作区。
 
-Its complete non-secret target/payload and outbound artifact must be durable with admission.
-A lost trigger response is reconciled through the original dispatch effect; neither a new DAG
-run identity nor a retry is inferred from timeout, scratch state or XCom. This model remains a
-follow-up integration item and is not implemented in the current P0/port batch.
+`FactStore.admit_run` 在一个短事务内写入 `RunAdmission`、Freeze `StageCommand`、dispatch
+command、conf artifact 和唯一的 `airflow_dispatch` `EffectIntent`。schema 同时保证每个 run
+最多有一个 dispatch command。dispatch 复用 command、execution claim 和 effect 事实，
+没有第七个业务阶段，也不创建 `StageDecision`。
 
-Admission semantic binding also remains open. The current `FactStore.admit_run` verifies only
-run/stage shape and does not yet prove that the Freeze command is the deterministic projection
-of the admission principal, request id, purpose, target, originals, rules and configuration.
-The Freeze/Discover typed `AdmissionSpec` and pure command builder/validator are pending shared
-integration. No `admission semantic binding closed` claim is made by this candidate.
+`TechnicalDispatchService` 只有在 effect 为 `prepared` 时取得 dispatch command 自己的
+claim。它不复用 Freeze claim。触发器响应、异常和后续观察都写入同一 effect journal。
+已满足的 effect 不访问外部服务；丢响应或后续不可观察时只查询原
+`dag_id`/`dag_run_id`，不会重新 trigger、换 run id 或读取 XCom 推断结果。
+
+`tests/v1/test_runtime_candidate_postgres.py` 使用监听 `127.0.0.1` 的本地 Airflow stub，
+覆盖 admission 原子绑定、伪造 Freeze command、错误 conf/原件绑定、独立 claim、丢响应观察
+与 unknown replay 零重发。该 stub 不连接真实 Airflow。
+
+## Admission 与后续命令绑定
+
+`AdmissionSpec` 是 principal、purpose、request、target、originals、rules、configuration
+和命令身份的唯一纯事实。`build_freeze_command`、`build_run_admission` 及
+`FactStore.admit_run` 共同验证 Freeze command 是该 spec 的确定性投影；错绑原件、规则、
+配置或管理字段会在任何数据库写入前拒绝。
+
+Freeze 完成后，`FactStore.create_command` 同时要求持久化 `RunAdmission` 和已验证的
+`VerifiedPredecessor`。它在 run 锁内重新核对 admission、Freeze command、decision、
+StageResult artifact 和业务输出 artifact，再由同一 spec 重建并验证 Discover command。
+该路径不会接受调用方自报的 principal、purpose、source 或 configuration 字段；不支持
+AdmissionSpec 投影的阶段在写入前明确拒绝。
+
+本候选只完成共享运行时与 PostgreSQL 组合验证。Portal/handler 的最终接线由主架构
+统一组合；本轮未连接真实 Airflow、Portal、现场、Windows 或 CAD，也不构成任何部署或
+Capture 阶段通过声明。

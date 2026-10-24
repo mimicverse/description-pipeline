@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -9,7 +10,7 @@ from pathlib import Path
 
 from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline.io import digest
-from description_pipeline.pipeline import StageResult
+from description_pipeline.pipeline import DispatchConf, StageResult
 
 
 class ArtifactStoreTests(unittest.TestCase):
@@ -99,6 +100,23 @@ class ArtifactStoreTests(unittest.TestCase):
         result_path.write_text("{}", encoding="utf-8")
         with self.assertRaises(ArtifactStoreError):
             self.store.read_result(sealed)
+
+    def test_dispatch_conf_is_a_separate_reference_only_artifact(self) -> None:
+        conf = DispatchConf(
+            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            run_id="run-1",
+            freeze_command_id="command-freeze",
+        )
+        artifact = self.store.seal_dispatch_conf(
+            conf,
+            producer_run_id="run-1",
+            producer_tool_sha256=self.tool,
+        )
+        self.assertEqual(artifact.kind, "airflow_dispatch_conf")
+        self.assertIsNone(artifact.producer_stage)
+        self.assertEqual(self.store.read_dispatch_conf(artifact), conf)
+        records = json.loads((self.store.objects / artifact.artifact_id / "conf.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(records), {"schema_version", "run_id", "freeze_command_id"})
 
 
 if __name__ == "__main__":
