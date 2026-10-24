@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -17,32 +18,22 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
-from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.interface_records import check_policy_digest
-from description_pipeline.io import canonical, digest, inventory, write_json
+from description_pipeline.interface_records import config_snapshot_digest
+from description_pipeline.io import digest, read_data, write_json
 from description_pipeline.orchestration.discover_protocol import (
     ArchiveDiscoverAdapter,
 )
-from description_pipeline.pipeline.admission import (
-    AdmissionSpec,
-    StageExecutors,
-    ADMISSION_SPEC_SCHEMA,
-    NATIVE_TOOL_REQUIREMENT_KIND,
-    VerifiedArtifact,
-    VerifiedPublishIntent,
-    VerifiedRepositorySnapshot,
-    VerifiedRuleset,
-)
+from description_pipeline.pipeline.admission import AdmissionSpec
 from description_pipeline.pipeline.application import StageApplication
 from description_pipeline.pipeline.capture import CaptureHandler
 from description_pipeline.pipeline.discover import DiscoverHandler
 from description_pipeline.pipeline.freeze import (
-    CONFIGURATION_KIND,
     FreezeHandler,
-    ORIGINALS_KIND,
-    RULESET_KIND,
-    RulesetCatalog,
-    RulesetRoot,
+)
+from description_pipeline.pipeline.ingestion import (
+    ProductionAdmissionRequest,
+    ReceivedUploadReceipt,
+    load_production_admission,
 )
 from description_pipeline.pipeline.services import (
     CanonicalStageServices,
@@ -52,7 +43,11 @@ from description_pipeline.pipeline.stages.generate import GenerateHandler
 from description_pipeline.pipeline.stages.publish import PublishHandler
 from description_pipeline.pipeline.verify import VerifyHandler
 from description_pipeline.platform.facts import FactStore
-from description_pipeline.repository.publish import CommitSpec
+from description_pipeline.schemas import (
+    CONFIG_SNAPSHOT_SCHEMA,
+    PLATFORM_CONFIG_SCHEMA,
+)
+from description_pipeline.sources.solidworks.handoff import describe_handoff
 from description_pipeline.stages import CONTRACT_SHA256
 
 from tests.sources import support
@@ -91,17 +86,6 @@ RECORDS = {
         "drive": {"effort": 6.0, "velocity": 2.0},
     },
 }
-
-
-def _verified(
-    artifacts: ArtifactStore,
-    ref,
-) -> VerifiedArtifact:
-    return VerifiedArtifact.from_store_record(
-        ref,
-        artifacts.verify(ref),
-    )
-
 
 def _qualified_backend(package: Path) -> QualifiedFixtureBackend:
     components = [
@@ -196,11 +180,23 @@ class RealSixStageChainTests(unittest.TestCase):
             "package_files": {
                 "description_pipeline/runtime.py": "c" * 64,
             },
+            "contract": {
+                "schema_version": "fixture-contract/v1",
+                "digest": CONTRACT_SHA256,
+            },
+            "support": {
+                "python": "3.12",
+                "targets": ["linux", "windows"],
+            },
         }
         self.portable["release"] = copy.deepcopy(release)
         self.native["release"] = copy.deepcopy(release)
+        self.portable["source_sha256"] = release["source_sha256"]
+        self.native["source_sha256"] = release["source_sha256"]
 
-        self.source_root = self.root / "source"
+        self.handoff_root = self.root / "handoff"
+        self.upload_root = self.handoff_root / "run-produced"
+        self.source_root = self.upload_root / "CAD"
         for relative, payload in {
             MAIN_ASSEMBLY: b"placeholder cad/robot.SLDASM\n",
             "cad/base.SLDPRT": b"placeholder cad/base.SLDPRT\n",
@@ -211,71 +207,11 @@ class RealSixStageChainTests(unittest.TestCase):
             target = self.source_root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(payload)
-        self.originals_ref = self.store.seal_tree(
-            self.source_root,
-            kind=ORIGINALS_KIND,
-            producer_run_id=None,
-            producer_stage=None,
-            producer_tool_sha256=digest({"producer": ORIGINALS_KIND}),
-        )
 
         self.rules_root = self.root / "rules"
         logical_root = self.rules_root / "root-000"
         for relative, payload in RECORDS.items():
             write_json(logical_root / relative, payload)
-        root_record = RulesetRoot(
-            path="root-000",
-            members=inventory(logical_root),
-        )
-        catalog = RulesetCatalog(
-            version="records-"
-            + digest([root_record.to_record()]),
-            roots=(root_record,),
-            records={
-                f"root-000/{relative}": checksum
-                for relative, checksum in root_record.members.items()
-            },
-        )
-        write_json(
-            self.rules_root / "catalog.json",
-            catalog.to_record(),
-        )
-        self.ruleset_ref = self.store.seal_tree(
-            self.rules_root,
-            kind=RULESET_KIND,
-            producer_run_id=None,
-            producer_stage=None,
-            producer_tool_sha256=digest({"producer": RULESET_KIND}),
-        )
-
-        self.configuration_root = self.root / "configuration"
-        write_json(
-            self.configuration_root / "config.json",
-            {"snapshot": "real-six-stage"},
-        )
-        self.configuration_ref = self.store.seal_tree(
-            self.configuration_root,
-            kind=CONFIGURATION_KIND,
-            producer_run_id=None,
-            producer_stage=None,
-            producer_tool_sha256=digest(
-                {"producer": CONFIGURATION_KIND}
-            ),
-        )
-        self.native_root = self.root / "native-requirement"
-        self.native_root.mkdir()
-        (self.native_root / "tool.json").write_bytes(
-            canonical(self.native)
-        )
-        self.native_ref = self.store.seal_tree(
-            self.native_root,
-            kind=NATIVE_TOOL_REQUIREMENT_KIND,
-            producer_run_id=None,
-            producer_stage=None,
-            producer_tool_sha256=digest(
-                {"producer": NATIVE_TOOL_REQUIREMENT_KIND}
-            ),
-        )
 
         self.facts = FactStore(self._connect, self.store)
         self.services = CanonicalStageServices(
@@ -297,62 +233,118 @@ class RealSixStageChainTests(unittest.TestCase):
             options=f"-c search_path={self.schema},public",
         )
 
-    def _spec(self) -> AdmissionSpec:
-        snapshot = _verified(self.store, self.publish.snapshot_ref)
-        metadata = canonical(self.publish.snapshot.to_record())
-        repository = VerifiedRepositorySnapshot.from_metadata_bytes(
-            snapshot,
-            metadata,
+    def _production_request(self) -> ProductionAdmissionRequest:
+        identity = describe_handoff(self.source_root)
+        receipt = ReceivedUploadReceipt(
+            folder="CAD",
+            files=len(identity["files"]),
+            bytes=sum(
+                (self.source_root / name).stat().st_size
+                for name in identity["files"]
+            ),
+            handoff_sha256=identity["handoff_sha256"],
+            main_assembly=MAIN_ASSEMBLY,
+            target_hardware="nd_fixture",
+            change_summary="Exercise production intake through six real handlers",
+            purpose="engineering",
         )
-        commit_record = dict(
-            self.publish.command.request["commit"]
-        )
-        ruleset = VerifiedRuleset.from_catalog_bytes(
-            _verified(self.store, self.ruleset_ref),
-            (self.rules_root / "catalog.json").read_bytes(),
-        )
-        executors = StageExecutors(
-            freeze=self.portable["source_sha256"],
-            discover=self.portable["source_sha256"],
-            capture=self.portable["source_sha256"],
-            generate=self.portable["source_sha256"],
-            verify=self.portable["source_sha256"],
-            publish=self.portable["source_sha256"],
-        )
-        return AdmissionSpec(
-            schema_version=ADMISSION_SPEC_SCHEMA,
+        return ProductionAdmissionRequest(
             run_id=RUN_ID,
             request_id="real-six-stage-request",
-            parent_run_id=None,
-            from_stage=None,
-            principal="fixture:real-six-stage",
+            upload_dir=self.upload_root,
+            receipt=receipt,
+            main_assembly=MAIN_ASSEMBLY,
             target_hardware="nd_fixture",
             purpose="engineering",
-            change_summary="Exercise the real six-stage application chain",
-            main_assembly=MAIN_ASSEMBLY,
-            originals=_verified(self.store, self.originals_ref),
-            ruleset=ruleset,
-            configuration=_verified(
-                self.store,
-                self.configuration_ref,
-            ),
-            executors=executors,
-            dispatch_executor_sha256=self.portable["source_sha256"],
-            native_tool_source_sha256=self.native["source_sha256"],
-            native_tool_record_sha256=digest(self.native),
-            native_tool_requirement=_verified(
-                self.store,
-                self.native_ref,
-            ),
-            contract_sha256=CONTRACT_SHA256,
-            policy_sha256=check_policy_digest(),
-            platform_config_sha256=self.configuration_ref.set_sha256,
-            publish_intent=VerifiedPublishIntent(
-                repository=repository,
-                commit=CommitSpec(**commit_record),
-            ),
-            created_at=datetime(2026, 10, 25, tzinfo=UTC),
+            change_summary=receipt.change_summary,
+            principal="cli:tenant:ou_chain",
         )
+
+    def _platform_snapshot(self) -> Path:
+        token = self.root / "endpoint-token"
+        secret = self.root / "feishu-secret"
+        certificate = self.root / "operator-certificate.pem"
+        private_key = self.root / "operator-private-key.pem"
+        dsn = self.root / "database-dsn"
+        for path, content in (
+            (token, "t" * 64),
+            (secret, "s" * 64),
+            (certificate, "certificate"),
+            (private_key, "key"),
+            (dsn, "postgresql://fixture"),
+        ):
+            path.write_text(content, encoding="utf-8")
+        paths = {}
+        for name in ("state", "workspace-root", "release-root"):
+            path = self.root / name
+            path.mkdir(exist_ok=True)
+            paths[name] = path
+        derived_runs = paths["state"] / "runs"
+        derived_runs.mkdir()
+        repository = paths["workspace-root"] / "robot"
+        if not repository.exists():
+            shutil.copytree(self.publish.repo, repository)
+        snapshot = {
+            "schema_version": CONFIG_SNAPSHOT_SCHEMA,
+            "install_id": "real-six-stage",
+            "generated_at": "2026-10-25T00:00:00Z",
+            "resolved": {
+                "schema_version": PLATFORM_CONFIG_SCHEMA,
+                "operator": {
+                    "origin": "https://operator.example.test",
+                    "certificate_file": str(certificate),
+                    "private_key_file": str(private_key),
+                },
+                "storage": {
+                    "state_root": str(paths["state"]),
+                    "handoff_root": str(self.handoff_root),
+                    "artifact_root": str(self.store.root),
+                    "workspace_root": str(paths["workspace-root"]),
+                    "release_root": str(paths["release-root"]),
+                },
+                "database": {"dsn_file": str(dsn)},
+                "windows": {
+                    "ssh_host": "windows-fixture",
+                    "endpoint_port": 8765,
+                    "token_file": str(token),
+                    "tunnel_loopback_port": 18765,
+                    "instance": {
+                        "task_name": "description-native",
+                        "package_root": "C:/payloads/packages",
+                        "output_root": "C:/payloads/outputs",
+                        "state_root": "C:/payloads/state",
+                    },
+                },
+                "auth": {
+                    "feishu_secret_file": str(secret),
+                    "tenant_keys": ["tenant"],
+                    "admin_open_ids": [],
+                },
+                "targets": {
+                    "nd_fixture": {
+                        "repository_slug": "mimicverse/robot",
+                        "base": "main",
+                    }
+                },
+                "specifications": {
+                    "record_roots": [str(self.rules_root / "root-000")]
+                },
+                "retention": {"unreferenced_evidence_days": None},
+                "derived": {
+                    "store_root": str(derived_runs),
+                    "repositories": {
+                        "mimicverse/robot": str(repository),
+                    },
+                    "discovery": {
+                        "record_roots": [str(self.rules_root / "root-000")]
+                    },
+                },
+            },
+            "sources": {"platform_json_sha256": "a" * 64},
+        }
+        path = self.root / "config-snapshot.json"
+        write_json(path, snapshot)
+        return path
 
     def _application(self) -> StageApplication:
         self.pull_requests = _PullRequests()
@@ -397,35 +389,57 @@ class RealSixStageChainTests(unittest.TestCase):
             clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
         )
 
-    def test_real_stage_handlers_complete_one_admitted_run(self) -> None:
+    def test_production_intake_completes_the_real_six_stage_chain(self) -> None:
         application = self._application()
-        admitted = application.admit(self._spec())
-        self.assertEqual(
-            admitted.dispatch_command.expected_executor_sha256,
-            admitted.admission.request["dispatch_executor_sha256"],
-        )
+        factory_work = self.root / "factory-work"
+        factory_work.mkdir()
+        request = self._production_request()
+        platform_snapshot = self._platform_snapshot()
         with (
             patch(
                 "description_pipeline.runtime.tool_record",
-                return_value=self.native,
+                return_value=copy.deepcopy(self.native),
             ),
             patch(
                 "description_pipeline.pipeline.stages.generate.tool_record",
-                return_value=self.portable,
+                return_value=copy.deepcopy(self.portable),
             ),
             patch(
                 "description_pipeline.pipeline.stages.publish.tool_record",
-                return_value=self.portable,
+                return_value=copy.deepcopy(self.portable),
             ),
         ):
+            admitted = load_production_admission(
+                application,
+                request,
+                artifacts=self.store,
+                platform_snapshot=platform_snapshot,
+                native_tool_provider=lambda: copy.deepcopy(self.native),
+                work_root=factory_work,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+                portable_tool_provider=lambda: copy.deepcopy(self.portable),
+            )
+            spec = AdmissionSpec.from_record(admitted.admission.request)
+            self.assertEqual(
+                application.load_admission_outcome(RUN_ID),
+                admitted,
+            )
+            self.assertEqual(
+                spec.originals.inventory_sha256,
+                request.receipt.handoff_sha256,
+            )
+            self.assertEqual(
+                spec.platform_config_sha256,
+                config_snapshot_digest(read_data(platform_snapshot)),
+            )
             outcome = application.execute_run(RUN_ID)
 
-        self.assertEqual(outcome.outcome, "completed")
+        self.assertEqual(outcome.outcome, "completed", repr(outcome))
         self.assertEqual(outcome.stage, "publish")
         self.assertEqual(len(self.pull_requests.rows), 1)
         self.assertEqual(
             self.pull_requests.rows[0].head_ref,
-            self.publish.snapshot.branch_ref,
+            spec.publish_intent.repository.branch_ref,
         )
         with (
             self._connect() as connection,
