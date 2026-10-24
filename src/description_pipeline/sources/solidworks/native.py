@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 import ntpath
 import os
@@ -5471,6 +5472,133 @@ class SolidWorksBackend(CadBackend):
             "topology": sorted(topology, key=_capture_topology_sort_key),
         }
 
+    @staticmethod
+    def _capture_graph_top_row(graph):
+        normalized_top = graph["normalized_top"]
+        return next(
+            row
+            for row in graph["assemblies"]
+            if row["normalized_path"] == normalized_top
+        )
+
+    def _capture_bind_graph(self, graph, path):
+        self._capture_expected_documents = {
+            row["normalized_path"] for row in graph["loaded_documents"]
+        }
+        self._capture_top_document = path
+        self._capture_topology = self._capture_semantic_topology(
+            graph["topology"]
+        )
+        self._capture_required_configurations = (
+            self._capture_required_configuration_map(graph["topology"])
+        )
+
+    @staticmethod
+    def _capture_session_path_signature(path):
+        text = str(path or "")
+        root = session_temp_root(text)
+        marker = "ic~~"
+        if root is None:
+            root = embedded_virtual_component_root(text)
+            marker = "vc~~"
+        if root is None or session_root_pid(root) is None:
+            raise ValueError("a session path has no controlled owned root")
+        module = posixpath if text.startswith("/") else ntpath
+        normalized = module.normcase(module.normpath(text))
+        normalized_root = module.normcase(module.normpath(root))
+        relative = module.relpath(normalized, normalized_root)
+        parts = re.split(r"[\\/]", relative)
+        if (
+            not parts
+            or parts[0].casefold() != marker
+            or any(part in {"", ".", ".."} for part in parts)
+            or module.isabs(relative)
+        ):
+            raise ValueError("a session path escapes its controlled owned root")
+        return "/".join(part.casefold() for part in parts)
+
+    @classmethod
+    def _capture_stable_topology(cls, rows):
+        stable = []
+        for row in rows:
+            item = {
+                "instance": row["instance"],
+                "depth": row["depth"],
+                "document_type": row["document_type"],
+                "referenced_configuration": row["referenced_configuration"],
+                "suppression_state": row["suppression_state"],
+                "storage_scope": row["storage_scope"],
+                "provenance_state": row["provenance_state"],
+                "owner_sha256": row["owner_sha256"],
+            }
+            if row["storage_scope"] == "session":
+                item["session_path"] = cls._capture_session_path_signature(
+                    row["document_path"]
+                )
+                if row["owner_document_path"] is not None:
+                    item["owner_identity"] = cls._capture_session_path_signature(
+                        row["owner_document_path"]
+                    )
+            else:
+                item["normalized_path"] = row["normalized_path"]
+                if row["owner_document_path"] is not None:
+                    item["owner_identity"] = normalize_document_path(
+                        os.path.abspath(row["owner_document_path"])
+                    )
+            stable.append(item)
+        return sorted(
+            stable,
+            key=lambda row: json.dumps(
+                row,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    @classmethod
+    def _capture_session_file_signatures(cls, paths):
+        return sorted(cls._capture_session_path_signature(path) for path in paths)
+
+    @classmethod
+    def _capture_loaded_document_signature(cls, graph):
+        files = []
+        sessions = []
+        document_types = []
+        for row in graph["loaded_documents"]:
+            path = row["path"]
+            if session_artifact_path(path):
+                sessions.append(cls._capture_session_path_signature(path))
+            else:
+                files.append(normalize_document_path(os.path.abspath(path)))
+            document_types.append(
+                {
+                    "path": (
+                        cls._capture_session_path_signature(path)
+                        if session_artifact_path(path)
+                        else normalize_document_path(os.path.abspath(path))
+                    ),
+                    "document_type": row["document_type"],
+                }
+            )
+        if (
+            len(files) != len(set(files))
+            or len(sessions) != len(set(sessions))
+            or set(files) != set(graph["source_files"])
+            or sorted(sessions)
+            != cls._capture_session_file_signatures(graph["session_files"])
+        ):
+            raise ValueError(
+                "loaded documents do not match the source and session inventories"
+            )
+        return {
+            "file_paths": sorted(files),
+            "session_paths": sorted(sessions),
+            "document_types": sorted(
+                document_types,
+                key=lambda row: (row["path"], row["document_type"]),
+            ),
+        }
+
     def _rebuild_capture_document(self, row, *, phase, document=None):
         """Rebuild one pending assembly once and require an immediate clean state."""
 
@@ -5479,7 +5607,8 @@ class SolidWorksBackend(CadBackend):
         sequence = len(self._capture_rebuild_journal)
         journal = {
             "sequence": sequence,
-            "kind": "top" if phase == "top" else "child",
+            "kind": phase if phase in {"top", "top_recovery"} else "child",
+            "phase": phase,
             "path": path,
             "depth": row["depth"],
             "state_before": copy.deepcopy(before),
@@ -5487,6 +5616,7 @@ class SolidWorksBackend(CadBackend):
         self._capture_rebuild_journal.append(journal)
         detail_phase = "child" if phase == "child" else "rebuild"
         call_phase = "resolve_handle"
+        elapsed = None
         try:
             dependency_doc = document or self._document_handle_by_path(path)
             extension = _member(dependency_doc, "Extension")
@@ -5498,8 +5628,10 @@ class SolidWorksBackend(CadBackend):
             journal.update(
                 {
                     "error_code": "cad_rebuild_failed",
+                    "error_message": "Assembly rebuild raised a native error",
                     "error_phase": call_phase,
                     "error": f"{type(error).__name__}: {error}"[:300],
+                    "elapsed_seconds": elapsed,
                 }
             )
             raise CadError(
@@ -5512,11 +5644,18 @@ class SolidWorksBackend(CadBackend):
                     "error": f"{type(error).__name__}: {error}"[:300],
                     "state": before,
                     "state_before": before,
+                    "elapsed_seconds": elapsed,
                 },
             ) from error
-        journal["result"] = result
+        journal.update({"result": result, "elapsed_seconds": elapsed})
         if result is not True:
-            journal.update({"result": result, "error_code": "cad_rebuild_failed"})
+            journal.update(
+                {
+                    "result": result,
+                    "error_code": "cad_rebuild_failed",
+                    "error_message": "Assembly did not rebuild successfully",
+                }
+            )
             raise CadError(
                 "cad_rebuild_failed",
                 "Assembly did not rebuild successfully",
@@ -5527,6 +5666,7 @@ class SolidWorksBackend(CadBackend):
                     "result": result,
                     "state": before,
                     "state_before": before,
+                    "elapsed_seconds": elapsed,
                 },
             )
         try:
@@ -5536,15 +5676,27 @@ class SolidWorksBackend(CadBackend):
                 else self._document_handle_by_path(path)
             )
         except CadError as error:
-            journal.update({"error_code": error.code, "error_phase": "refresh", "error": str(error)[:300]})
+            journal.update(
+                {
+                    "error_code": error.code,
+                    "error_message": error.message,
+                    "error_phase": "refresh",
+                    "error": str(error)[:300],
+                    "elapsed_seconds": elapsed,
+                }
+            )
             raise
         except Exception as error:  # noqa: BLE001 - refresh failure keeps stable evidence
             journal.update(
                 {
                     "result": result,
                     "error_code": "cad_capture_refresh_failed",
+                    "error_message": (
+                        "Rebuilt capture document could not be resolved"
+                    ),
                     "error_phase": "refresh",
                     "error": f"{type(error).__name__}: {error}"[:300],
+                    "elapsed_seconds": elapsed,
                 }
             )
             raise CadError(
@@ -5555,12 +5707,21 @@ class SolidWorksBackend(CadBackend):
                     "phase": "refresh",
                     "error": f"{type(error).__name__}: {error}"[:300],
                     "state_before": before,
+                    "elapsed_seconds": elapsed,
                 },
             ) from error
         try:
             _, after = self._capture_rebuild_state(path, document=refreshed, phase="after")
         except CadError as error:
-            journal.update({"error_code": error.code, "error_phase": "after_state", "error": str(error)[:300]})
+            journal.update(
+                {
+                    "error_code": error.code,
+                    "error_message": error.message,
+                    "error_phase": "after_state",
+                    "error": str(error)[:300],
+                    "elapsed_seconds": elapsed,
+                }
+            )
             raise
         if after.get("configuration") != before.get("configuration"):
             journal.update(
@@ -5568,6 +5729,10 @@ class SolidWorksBackend(CadBackend):
                     "result": result,
                     "state_after": copy.deepcopy(after),
                     "error_code": "cad_configuration_mismatch",
+                    "error_message": (
+                        "Assembly rebuild changed the active configuration"
+                    ),
+                    "elapsed_seconds": elapsed,
                 }
             )
             raise CadError(
@@ -5579,6 +5744,7 @@ class SolidWorksBackend(CadBackend):
                     "phase": detail_phase,
                     "before": before,
                     "after": after,
+                    "elapsed_seconds": elapsed,
                 },
             )
         if after.get("needs_rebuild2_value") != 0 or after.get("configuration_needs_rebuild") is not False:
@@ -5587,6 +5753,11 @@ class SolidWorksBackend(CadBackend):
                     "result": result,
                     "state_after": copy.deepcopy(after),
                     "error_code": "cad_rebuild_incomplete",
+                    "error_message": (
+                        "Assembly rebuild did not end in a fully rebuilt "
+                        "configuration"
+                    ),
+                    "elapsed_seconds": elapsed,
                 }
             )
             raise CadError(
@@ -5600,11 +5771,19 @@ class SolidWorksBackend(CadBackend):
                     "state_after": after,
                     "rebuild_result": result,
                     "state": after,
+                    "elapsed_seconds": elapsed,
                 },
             )
-        journal.update({"result": result, "state_after": copy.deepcopy(after)})
+        journal.update(
+            {
+                "result": result,
+                "state_after": copy.deepcopy(after),
+                "elapsed_seconds": elapsed,
+            }
+        )
         row["call_sequence"] = sequence
         return refreshed, after, {
+            "phase": phase,
             "path": path,
             "depth": row["depth"],
             "instances": list(row["instances"]),
@@ -5614,6 +5793,218 @@ class SolidWorksBackend(CadBackend):
             "state_before": before,
             "state_after": after,
         }
+
+    @staticmethod
+    def _capture_session_pid(identity, label):
+        if (
+            not isinstance(identity, dict)
+            or identity.get("state") != "active"
+            or type(identity.get("pid")) is not int
+            or identity["pid"] <= 0
+        ):
+            raise ValueError(f"{label} has no active owned process identity")
+        return identity["pid"]
+
+    def _capture_recover_top_rebuild(
+        self,
+        *,
+        graph,
+        path,
+        state_after_children,
+        child_rebuilds,
+        failure,
+    ):
+        """Retry one sticky top rebuild in a proven fresh owned session."""
+
+        detail = failure.detail if isinstance(failure.detail, dict) else {}
+        top = self._capture_graph_top_row(graph)
+        failed_state = detail.get("state_after")
+        recoverable = (
+            failure.code == "cad_rebuild_incomplete"
+            and detail.get("phase") == "rebuild"
+            and detail.get("depth") == 0
+            and detail.get("rebuild_result") is True
+            and isinstance(detail.get("path"), str)
+            and normalize_document_path(os.path.abspath(detail["path"]))
+            == graph["normalized_top"]
+            and isinstance(failed_state, dict)
+            and failed_state.get("needs_rebuild2_value") in (1, 2)
+            and failed_state.get("configuration_needs_rebuild") is False
+            and bool(child_rebuilds)
+        )
+        if not recoverable:
+            raise failure
+
+        first_journal = copy.deepcopy(self._capture_rebuild_journal)
+        old_session = self._capture_session_evidence(path)
+        old_pid = self._capture_session_pid(
+            old_session["identity"],
+            "retired capture session",
+        )
+        first_attempt = {
+            "session": old_session,
+            "rebuild_calls": first_journal,
+            "source_files": copy.deepcopy(graph["source_files"]),
+            "topology": copy.deepcopy(graph["topology"]),
+            "loaded_documents": self._capture_loaded_document_signature(graph),
+        }
+
+        recovery = {
+            "schema_version": (
+                "solidworks-to-urdf.rebuild-session-recovery/v2"
+            ),
+            "first_attempt": first_attempt,
+            "retirement": None,
+            "reopen": None,
+            "fresh_session": None,
+        }
+
+        try:
+            retirement = self.retire_session("copy")
+            recovery["retirement"] = retirement
+            before = retirement.get("before") if isinstance(retirement, dict) else None
+            after = retirement.get("after") if isinstance(retirement, dict) else None
+            if (
+                retirement.get("retired") is not True
+                or retirement.get("role") != "copy"
+                or before != old_session["identity"]
+                or not isinstance(after, dict)
+                or after.get("state") != "closed"
+                or after.get("pid") != old_pid
+            ):
+                raise ValueError(
+                    "the prior owned capture process is not proven retired"
+                )
+
+            opened = self.open_document(path)
+            recovery["reopen"] = copy.deepcopy(opened)
+            fresh_session = self._capture_session_evidence(path)
+            recovery["fresh_session"] = fresh_session
+            fresh_pid = self._capture_session_pid(
+                fresh_session["identity"],
+                "fresh capture session",
+            )
+            if fresh_pid == old_pid:
+                raise ValueError(
+                    "the fresh capture session reused the retired process"
+                )
+            fresh_document = self._document_handle_by_path(path)
+            fresh_graph = self._capture_rebuild_graph(fresh_document, path)
+            fresh_top = self._capture_graph_top_row(fresh_graph)
+            fresh_state = fresh_top["initial_state"]
+            source_unchanged = fresh_graph["source_files"] == graph["source_files"]
+            topology_unchanged = (
+                self._capture_stable_topology(fresh_graph["topology"])
+                == self._capture_stable_topology(graph["topology"])
+            )
+            session_files_unchanged = (
+                self._capture_session_file_signatures(
+                    fresh_graph["session_files"]
+                )
+                == self._capture_session_file_signatures(
+                    graph["session_files"]
+                )
+            )
+            loaded_documents_unchanged = (
+                self._capture_loaded_document_signature(fresh_graph)
+                == self._capture_loaded_document_signature(graph)
+            )
+            configuration_unchanged = (
+                fresh_state.get("configuration")
+                == top["initial_state"].get("configuration")
+            )
+            if (
+                fresh_state.get("read_only") is not True
+                or not source_unchanged
+                or not topology_unchanged
+                or not session_files_unchanged
+                or not loaded_documents_unchanged
+                or not configuration_unchanged
+                or fresh_graph["component_count"] != graph["component_count"]
+            ):
+                raise ValueError(
+                    "the fresh capture session changed source, topology, "
+                    "configuration, or read-only state"
+                )
+
+            self._capture_bind_graph(fresh_graph, path)
+            self._capture_rebuild_journal = [
+                {
+                    "kind": "recovery_initial",
+                    "initial_pending": list(
+                        fresh_graph["initial_pending_children"]
+                    ),
+                    "rebuild_candidates": list(
+                        fresh_graph["rebuild_candidates"]
+                    ),
+                }
+            ]
+            fresh_by_key = {
+                row["normalized_path"]: row
+                for row in fresh_graph["assemblies"]
+            }
+            for key in sorted(fresh_graph["rebuild_candidates"]):
+                row = fresh_by_key[key]
+                self._capture_rebuild_journal.append(
+                    {
+                        "sequence": len(self._capture_rebuild_journal),
+                        "kind": "candidate",
+                        "path": row["path"],
+                        "depth": row["depth"],
+                        "required_configurations": list(
+                            self._capture_required_configurations[key]
+                        ),
+                        "state": copy.deepcopy(row["initial_state"]),
+                        "decision": "recovery_defer_to_top",
+                    }
+                )
+
+            fresh_top_row = {
+                **fresh_top,
+                "state_before": copy.deepcopy(fresh_state),
+            }
+            fresh_top_rebuild = None
+            if fresh_state.get("needs_rebuild2_value") in (1, 2):
+                fresh_document, _, fresh_top_rebuild = (
+                    self._rebuild_capture_document(
+                        fresh_top_row,
+                        phase="top_recovery",
+                        document=fresh_document,
+                    )
+                )
+            elif (
+                fresh_state.get("needs_rebuild2_value") == 0
+                and fresh_state.get("configuration_needs_rebuild") is False
+            ):
+                fresh_document = self._document_by_path(path)
+            else:
+                raise ValueError(
+                    "the fresh capture session has an invalid top rebuild state"
+                )
+        except CadError as error:
+            error_detail = (
+                copy.deepcopy(error.detail)
+                if isinstance(error.detail, dict)
+                else {}
+            )
+            if isinstance(error.detail, dict):
+                error.detail = {
+                    **error_detail,
+                    "session_recovery": recovery,
+                }
+            raise
+        except Exception as error:  # noqa: BLE001 - recovery must stay fail-closed
+            raise CadError(
+                "cad_rebuild_recovery_failed",
+                "The bounded fresh-session rebuild recovery failed",
+                {
+                    "path": path,
+                    "error": f"{type(error).__name__}: {error}"[:500],
+                    "session_recovery": recovery,
+                },
+            ) from error
+
+        return fresh_document, fresh_graph, recovery, fresh_top_rebuild
 
     def _rebuild_capture_copy(self, doc, path):
         self._capture_rebuild_journal = []
@@ -5625,22 +6016,9 @@ class SolidWorksBackend(CadBackend):
                 "rebuild_candidates": list(graph["rebuild_candidates"]),
             }
         )
-        self._capture_expected_documents = {
-            row["normalized_path"] for row in graph["loaded_documents"]
-        }
-        self._capture_top_document = path
-        self._capture_topology = self._capture_semantic_topology(
-            graph["topology"]
-        )
-        self._capture_required_configurations = self._capture_required_configuration_map(
-            graph["topology"]
-        )
+        self._capture_bind_graph(graph, path)
         assemblies = graph["assemblies"]
-        top = next(
-            row
-            for row in assemblies
-            if normalize_document_path(os.path.abspath(row["path"])) == graph["normalized_top"]
-        )
+        top = self._capture_graph_top_row(graph)
         document = top["initial_state"]["path"]
         configuration = top["initial_state"]["configuration"]
         state_before = top["initial_state"]
@@ -5697,12 +6075,38 @@ class SolidWorksBackend(CadBackend):
             )
         top_row = {**top, "state_before": state_after_children}
         top_rebuild = None
+        recovery = None
         if top_row["state_before"]["needs_rebuild2_value"] in (1, 2):
-            doc, _top_final_state, top_rebuild = self._rebuild_capture_document(
-                top_row,
-                phase="top",
-                document=doc,
-            )
+            try:
+                doc, _top_final_state, top_rebuild = (
+                    self._rebuild_capture_document(
+                        top_row,
+                        phase="top",
+                        document=doc,
+                    )
+                )
+            except CadError as error:
+                doc, graph, recovery, top_rebuild = (
+                    self._capture_recover_top_rebuild(
+                        graph=graph,
+                        path=path,
+                        state_after_children=state_after_children,
+                        child_rebuilds=child_rebuilds,
+                        failure=error,
+                    )
+                )
+                assemblies = graph["assemblies"]
+                top = self._capture_graph_top_row(graph)
+                document = top["initial_state"]["path"]
+                configuration = top["initial_state"]["configuration"]
+                state_before = copy.deepcopy(top["initial_state"])
+                source_sha256_before = graph["source_files"][
+                    graph["normalized_top"]
+                ]["sha256"]
+                child_rebuilds = []
+                state_after_children = copy.deepcopy(
+                    top["initial_state"]
+                )
         else:
             doc, _top_final_state = self._capture_rebuild_state(
                 path,
@@ -5719,7 +6123,37 @@ class SolidWorksBackend(CadBackend):
             final_graph["loaded_documents"],
             phase="after_rebuild",
         )
-        if final_graph["topology"] != graph["topology"]:
+        try:
+            expected_loaded_documents = (
+                self._capture_loaded_document_signature(graph)
+            )
+            final_loaded_documents = self._capture_loaded_document_signature(
+                final_graph
+            )
+        except ValueError as error:
+            raise CadError(
+                "cad_rebuild_topology_changed",
+                "Capture rebuild changed a loaded document identity",
+                {"path": path, "error": str(error)[:300]},
+            ) from error
+        if final_loaded_documents != expected_loaded_documents:
+            raise CadError(
+                "cad_rebuild_topology_changed",
+                "Capture rebuild changed the loaded document set",
+                {
+                    "path": path,
+                    "before": expected_loaded_documents,
+                    "after": final_loaded_documents,
+                },
+            )
+        final_topology = final_graph["topology"]
+        expected_topology = graph["topology"]
+        if recovery is not None:
+            final_topology = self._capture_stable_topology(final_topology)
+            expected_topology = self._capture_stable_topology(
+                expected_topology
+            )
+        if final_topology != expected_topology:
             raise CadError(
                 "cad_rebuild_topology_changed",
                 "Capture rebuild changed the active dependency topology",
@@ -5739,7 +6173,16 @@ class SolidWorksBackend(CadBackend):
                     "after": final_graph["source_files"],
                 },
             )
-        if final_graph["session_files"] != graph["session_files"]:
+        final_session_files = final_graph["session_files"]
+        expected_session_files = graph["session_files"]
+        if recovery is not None:
+            final_session_files = self._capture_session_file_signatures(
+                final_session_files
+            )
+            expected_session_files = self._capture_session_file_signatures(
+                expected_session_files
+            )
+        if final_session_files != expected_session_files:
             raise CadError(
                 "cad_rebuild_topology_changed",
                 "Capture rebuild changed the session dependency set",
@@ -5831,9 +6274,13 @@ class SolidWorksBackend(CadBackend):
         source_files_after = final_graph["source_files"]
         source_sha256_after = source_files_after[graph["normalized_top"]]["sha256"]
 
-        rebuilt = bool(child_rebuilds or top_rebuild is not None)
+        rebuilt = bool(
+            recovery is not None
+            or child_rebuilds
+            or top_rebuild is not None
+        )
         return doc, {
-            "schema_version": "solidworks-to-urdf.capture-preparation/v1",
+            "schema_version": "solidworks-to-urdf.capture-preparation/v2",
             "used_api": (
                 "IModelDocExtension.NeedsRebuild2/"
                 "IConfiguration.NeedsRebuild/"
@@ -5880,6 +6327,13 @@ class SolidWorksBackend(CadBackend):
             "session_dependency_paths": graph["session_files"],
             "topology_before": graph["topology"],
             "topology_after": final_graph["topology"],
+            "loaded_documents_before": self._capture_loaded_document_signature(
+                graph
+            ),
+            "loaded_documents_after": self._capture_loaded_document_signature(
+                final_graph
+            ),
+            "session_recovery": copy.deepcopy(recovery),
         }
 
     def _leaf_mass_failure(self, name, occurrence, referenced, error, extra=None):
@@ -5913,10 +6367,6 @@ class SolidWorksBackend(CadBackend):
     def collect_scene(self, doc_path, coordinate_systems, on_activity=None, require_material=True):
         activity = _ActivityEmitter(on_activity)
         source_root = Path(doc_path).resolve().parent
-        try:
-            native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
-        except Exception:  # noqa: BLE001 - unresolved PID keeps source scope incomplete
-            native_api_pid = None
 
         def note(action: str, **fields) -> None:
             activity.emit(action, phase="capture", **fields)
@@ -5932,6 +6382,10 @@ class SolidWorksBackend(CadBackend):
             detail.setdefault("rebuild_journal", copy.deepcopy(self._capture_rebuild_journal))
             error.detail = detail
             raise
+        try:
+            native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
+        except Exception:  # noqa: BLE001 - unresolved PID keeps source scope incomplete
+            native_api_pid = None
         self._record_save_flag(doc, doc_path)
         self._components = set()
         self._source_components = {}
