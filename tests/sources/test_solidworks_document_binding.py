@@ -773,7 +773,7 @@ class ReturnViewRegistryTests(unittest.TestCase):
         # read afterwards goes through _component_document (declared sites:
         # collect_scene traversal and inspect_copy).
         self.assertEqual(len(raw_sites), 3, raw_sites)
-        self.assertEqual(source.count("_component_document("), 3, "definition + two acquisition sites")
+        self.assertEqual(source.count("_component_document("), 4, "definition + three acquisition sites")
 
 
 if __name__ == "__main__":
