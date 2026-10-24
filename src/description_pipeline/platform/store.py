@@ -2815,8 +2815,12 @@ class PlatformStore:
             raise PlatformStoreError("The native owner settlement names the discover operation and its task key")
         native_run = receipt.get("native_run_id")
         native_sha = receipt.get("native_receipt_sha256")
+        native_inputs = reconcile.get("native_receipt") if isinstance(reconcile, dict) else None
+        native_receipt_path = native_inputs.get("path") if isinstance(native_inputs, dict) else None
         if not _is_canonical_uuid(native_run) or not _is_sha256(native_sha):
             raise PlatformStoreError("The native owner settlement binds its endpoint job and receipt bytes")
+        if not isinstance(native_receipt_path, str) or not native_receipt_path:
+            raise PlatformStoreError("The native owner settlement binds its original receipt path")
         if native_sha not in _evidence_digests(reconcile.get("evidence")):
             raise PlatformStoreError("The native receipt digest is not bound by the settlement evidence")
 
@@ -2919,6 +2923,7 @@ class PlatformStore:
                 "map_index": bound_map,
                 "native_run_id": native_run,
                 "native_receipt_sha256": native_sha,
+                "native_receipt_path": native_receipt_path,
                 "native_stages_sha256": receipt.get("native_stages_sha256"),
                 "native_handoff_sha256": receipt.get("native_handoff_sha256"),
                 "capture_receipt_sha256": (
@@ -3719,6 +3724,21 @@ class PlatformStore:
             )
             if not capture_binding_matches:
                 raise PlatformStoreError("The native capture replay does not bind its stage receipt bytes")
+            native_receipt_path = binding.get("native_receipt_path")
+            native_receipt = load_native_failed_receipt(
+                native_receipt_path,
+                stage="discover",
+                native_run_id=binding.get("native_run_id"),
+                reported_stage="capture",
+            )
+            if (
+                native_receipt.sha256 != binding.get("native_receipt_sha256")
+                or native_receipt.native_stages_sha256
+                != binding.get("native_stages_sha256")
+                or native_receipt.native_handoff_sha256
+                != binding.get("native_handoff_sha256")
+            ):
+                raise PlatformStoreError("The native capture replay differs from its original receipt bytes")
             for stage_name in ("freeze", "discover"):
                 record = stages[stage_name]
                 self._verify_checkpoint_scope(
@@ -3766,6 +3786,10 @@ class PlatformStore:
                 dag_run_id=owner_run,
                 binding=binding,
             )
+            cursor.execute(_READ_RUN, (run_id,))
+            run_row = cursor.fetchone()
+            if run_row is None or run_row[0] != "failed":
+                raise PlatformStoreError("The native capture replay requires the terminal failed run")
             return {
                 "operation": {
                     "operation_id": operation_id,

@@ -475,9 +475,26 @@ def _validate_evidence(
     collected_source = _normalize_document_path(collected_document)
     closure_source = _normalize_document_path(raw_closure.get("top_level"))
     expected_source_suffix = "\\" + _normalize_document_path(main_assembly)
+    discovery_record = read_data(confined(evidence, "discovery.json"))
+    discovery_identity = (
+        discovery_record.get("identity")
+        if isinstance(discovery_record, dict)
+        else None
+    )
+    discovery_main = (
+        discovery_identity.get("main_assembly")
+        if isinstance(discovery_identity, dict)
+        else None
+    )
+    _require(
+        isinstance(discovery_main, str) and bool(discovery_main),
+        "Evidence discovery record names no unique source assembly",
+    )
+    discovery_source_suffix = "\\" + _normalize_document_path(discovery_main)
     _require(
         source_assembly == source_document == source_material
-        and source_assembly.endswith(expected_source_suffix),
+        and source_assembly.endswith(expected_source_suffix)
+        and source_assembly.endswith(discovery_source_suffix),
         "Evidence source paths disagree or do not bind the selected main assembly",
     )
     _require(
@@ -720,14 +737,12 @@ def _validate_stage_details(
     archived_inputs = {
         f"input/{name}": checksum
         for name, checksum in inventory(Path(root) / "input").items()
+        if name not in {"handoff.json", "request.json"}
     }
     capture_plan = confined(root, "evidence/capture-plan.json", exists=False)
     if capture_plan.is_file():
         archived_inputs["evidence/capture-plan.json"] = file_digest(capture_plan)
-    archived_by_name = {}
-    for path, checksum in archived_inputs.items():
-        key = (_document_basename(path).casefold(), checksum)
-        archived_by_name.setdefault(key, []).append(path)
+    bound_paths = set()
     for relative, checksum in binding_files.items():
         _require(
             isinstance(relative, str)
@@ -735,29 +750,41 @@ def _validate_stage_details(
             and _is_sha256(checksum),
             f"Discover discovery.binding has a malformed row: {relative!r}",
         )
-        key = (_document_basename(relative).casefold(), checksum)
-        candidates = archived_by_name.get(key, [])
+        prepared_name = relative.removeprefix("input/")
+        artifact_path_parts(prepared_name)
+        candidates = []
+        if relative in archived_inputs:
+            candidates.append(relative)
+        if prepared_name == "capture-plan.json":
+            candidates.append("evidence/capture-plan.json")
+        first = prepared_name.split("/", 1)[0]
+        if "/" in prepared_name and first in {"cad", "records"}:
+            candidates.append(f"input/{first}/{prepared_name}")
+        candidates = sorted(
+            {
+                path
+                for path in candidates
+                if path in archived_inputs
+            }
+        )
         _require(
             len(candidates) == 1,
-            f"Discover discovery.binding file is absent or ambiguous: {relative}",
+            f"Discover discovery.binding path is absent or ambiguous: {relative}",
         )
+        resolved = candidates[0]
+        _require(
+            archived_inputs[resolved] == checksum,
+            f"Discover discovery.binding file differs from the archive: {relative}",
+        )
+        bound_paths.add(resolved)
     _require(
         binding.get("prepared_sha256")
         == digest({name.removeprefix("input/"): checksum for name, checksum in binding_files.items()}),
         "Discover discovery.binding prepared digest differs from its file inventory",
     )
-    handoff_files = read_data(confined(root, "input/handoff.json")).get("package_files")
     _require(
-        isinstance(handoff_files, dict)
-        and all(
-            (
-                _document_basename(name).casefold(),
-                checksum,
-            )
-            in archived_by_name
-            for name, checksum in handoff_files.items()
-        ),
-        "Discover discovery.binding omits an archived package file",
+        bound_paths == set(archived_inputs),
+        "Discover discovery.binding differs from the complete prepared-to-archived inventory",
     )
     _require(
         binding.get("discovery_sha256") == file_digest(native_discovery_path)
@@ -853,21 +880,27 @@ def _validate_source_identity(
     for item in source_records:
         expected = by_reference[item["reference"]]
         package_file = expected.get("package_file")
+        handoff_files = handoff.get("package_files")
         _require(
             isinstance(package_file, str)
-            and bool(package_file)
+            and package_file.startswith("records/")
             and expected.get("source_sha256") == item["file_sha256"]
-            and len(
-                package_candidates := [
-                    name
-                    for name, checksum in (handoff.get("package_files") or {}).items()
-                    if _document_basename(name).casefold()
-                    == _document_basename(package_file).casefold()
-                    and checksum == item["file_sha256"]
-                ]
-            )
-            == 1
-            and file_digest(confined(root, "input/" + package_candidates[0]))
+            and isinstance(handoff_files, dict),
+            f"Controlled record path differs from the source record: {item['reference']}",
+        )
+        artifact_path_parts(package_file)
+        archived_record = next(
+            (
+                name
+                for name, checksum in handoff_files.items()
+                if name.casefold() == ("records/" + package_file).casefold()
+                and checksum == item["file_sha256"]
+            ),
+            None,
+        )
+        _require(
+            archived_record is not None
+            and file_digest(confined(root, "input/" + archived_record))
             == item["file_sha256"],
             f"Controlled record bytes differ from the source record: {item['reference']}",
         )

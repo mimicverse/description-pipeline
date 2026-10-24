@@ -3763,6 +3763,33 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
             )
         self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "failed"
 
+        for run_state in ("running", "queued", "succeeded", "unresolved"):
+            with self.subTest(run_state=run_state):
+                self.world.run_states[self.run_id] = run_state
+                before = self.world.snapshot_state()
+                with self.assertRaisesRegex(PlatformStoreError, "terminal failed run"):
+                    self.store.completed_native_capture_recovery(
+                        run_id=self.run_id,
+                        operation_key=reconcile["operation_key"],
+                        params_digest=reconcile["params_digest"],
+                        owner_operation_id=self.native_id,
+                    )
+                self.assertEqual(self.world.snapshot_state(), before)
+        self.world.run_states[self.run_id] = "failed"
+
+        original_receipt_bytes = self.log.read_bytes()
+        changed_receipt = json.loads(original_receipt_bytes)
+        changed_receipt["error"] = "FORGED NATIVE RECEIPT"
+        self._write_document(changed_receipt)
+        with self.assertRaisesRegex(PlatformStoreError, "original receipt bytes"):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.log.write_bytes(original_receipt_bytes)
+
         discover_root = self.tmp / self.run_id / "discover"
         backup = self.tmp / "discover-backup"
         shutil.copytree(discover_root, backup)

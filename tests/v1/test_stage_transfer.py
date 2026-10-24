@@ -1378,8 +1378,8 @@ class StageTransferTests(unittest.TestCase):
         source = read_data(source_path)
         source["identity"]["records"] = [
             {
-                "reference": "records/missing.json#value",
-                "file_sha256": "0" * 64,
+                "reference": "records/forged.json#value",
+                "file_sha256": NATIVE_FILES[MAIN_ASSEMBLY],
             }
         ]
         source["source_revision_id"] = digest(source["identity"])
@@ -1388,9 +1388,9 @@ class StageTransferTests(unittest.TestCase):
         discovery = read_data(discovery_path)
         discovery["records"] = [
             {
-                "reference": "records/missing.json#value",
-                "package_file": "records/missing.txt",
-                "source_sha256": "0" * 64,
+                "reference": "records/forged.json#value",
+                "package_file": f"records/forged/{MAIN_ASSEMBLY}",
+                "source_sha256": NATIVE_FILES[MAIN_ASSEMBLY],
             }
         ]
         write_json(discovery_path, discovery)
@@ -1465,6 +1465,35 @@ class StageTransferTests(unittest.TestCase):
                 )
                 with self.assertRaises(PipelineError):
                     seal(root, self.base / f"details-{label.replace('.', '-')}.zip")
+
+    def test_discovery_binding_is_a_complete_prepared_to_archived_mapping(self) -> None:
+        relative = f"input/cad/{MAIN_ASSEMBLY}"
+        for label in ("omitted", "foreign-path"):
+            with self.subTest(case=label):
+                root = capture_root(self.base / f"binding-{label}")
+                view = read_data(root / "reports/native-stages.json")
+                event = next(
+                    event
+                    for event in view["events"]
+                    if (event.get("check") or {}).get("id") == "discovery.binding"
+                )
+                files = dict(event["check"]["details"]["files"])
+                checksum = files.pop(relative)
+                if label == "foreign-path":
+                    files[f"input/foreign/{MAIN_ASSEMBLY}"] = checksum
+                event["check"]["details"]["files"] = files
+                event["check"]["details"]["prepared_sha256"] = digest(
+                    {
+                        name.removeprefix("input/"): value
+                        for name, value in files.items()
+                    }
+                )
+                write_json(
+                    root / "reports/native-stages.json",
+                    stage_view(run_id=RUN_ID, handoff=HANDOFF, events=view["events"]),
+                )
+                with self.assertRaises(PipelineError):
+                    seal(root, self.base / f"binding-{label}.zip")
 
     def test_receipt_rows_cannot_diverge_from_raw_events(self) -> None:
         root = capture_root(self.base / "row-details")
