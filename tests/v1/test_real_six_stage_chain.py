@@ -53,7 +53,6 @@ from description_pipeline.pipeline.stages.publish import PublishHandler
 from description_pipeline.pipeline.verify import VerifyHandler
 from description_pipeline.platform.facts import FactStore
 from description_pipeline.repository.publish import CommitSpec
-from description_pipeline.runtime import scoped_executor_sha256
 from description_pipeline.stages import CONTRACT_SHA256
 
 from tests.sources import support
@@ -338,10 +337,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 self.configuration_ref,
             ),
             executors=executors,
-            dispatch_executor_sha256=scoped_executor_sha256(
-                self.portable,
-                "airflow_dispatch",
-            ),
+            dispatch_executor_sha256=self.portable["source_sha256"],
             native_tool_source_sha256=self.native["source_sha256"],
             native_tool_record_sha256=digest(self.native),
             native_tool_requirement=_verified(

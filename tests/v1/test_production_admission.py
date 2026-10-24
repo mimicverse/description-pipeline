@@ -659,7 +659,7 @@ class ProductionAdmissionTests(unittest.TestCase):
         )
         self.assertEqual(spec.native_tool_source_sha256, self.native_tool["source_sha256"])
         self.assertEqual(spec.native_tool_record_sha256, digest(self.native_tool))
-        self.assertNotEqual(
+        self.assertEqual(
             spec.dispatch_executor_sha256,
             spec.executors.freeze,
         )

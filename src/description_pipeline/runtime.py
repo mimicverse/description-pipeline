@@ -124,16 +124,6 @@ def tool_record(role: str | None = None) -> dict:
     }
 
 
-def scoped_executor_sha256(record: dict, scope: str) -> str:
-    """Bind one runtime record to a non-stage executor responsibility."""
-
-    if not isinstance(record, dict) or not record:
-        raise PipelineError("An executor tool record must be a nonempty object")
-    if not isinstance(scope, str) or not scope or "\x00" in scope:
-        raise PipelineError("An executor scope must be a nonempty string")
-    return digest({"scope": scope, "tool": record})
-
-
 def runtime_packages(role: str | None = None) -> dict:
     """Record runtime dependency closure, excluding unrelated developer tools."""
     from packaging.requirements import Requirement

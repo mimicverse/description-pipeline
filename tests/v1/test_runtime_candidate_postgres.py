@@ -832,7 +832,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertNotEqual(claim_rows[0][0], claim_rows[0][1])
         self.assertTrue(claim_rows[0][2])
 
-    def test_transport_identity_is_independent_from_stage_executors(self) -> None:
+    def test_transport_identity_is_explicitly_bound_by_its_own_field(self) -> None:
         admission, freeze_command = self._new_admission("same-transport")
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
@@ -860,13 +860,13 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             dispatch,
             artifact,
         )
-        self.assertNotEqual(
-            stored_freeze.expected_executor_sha256,
-            stored_dispatch.expected_executor_sha256,
-        )
         self.assertEqual(
             stored_dispatch.expected_executor_sha256,
             admission.request["dispatch_executor_sha256"],
+        )
+        self.assertEqual(
+            stored_dispatch.expected_executor_sha256,
+            self.dispatch_executor,
         )
         self.assertNotEqual(stored_freeze.command_id, stored_dispatch.command_id)
 

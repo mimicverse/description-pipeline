@@ -29,7 +29,7 @@ from ..repository.publish import (
     seal_repository_snapshot,
 )
 from ..repository.review_branch import review_branch
-from ..runtime import scoped_executor_sha256, tool_record
+from ..runtime import tool_record
 from ..schemas import NATIVE_TOOL_REQUIREMENT_KIND, TOOL_SCHEMA
 from ..sources.solidworks.handoff import describe_handoff
 from ..stages import CONTRACT_SHA256
@@ -666,10 +666,7 @@ class ProductionAdmissionFactory:
             verify=source,
             publish=source,
         )
-        dispatch = scoped_executor_sha256(
-            portable,
-            "airflow_dispatch",
-        )
+        dispatch = source
         return executors, source, dispatch, portable
 
     def _native_requirement(
