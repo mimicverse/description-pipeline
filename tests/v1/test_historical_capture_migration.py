@@ -373,11 +373,35 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
         ):
             self._migrate()
 
+    def test_plan_identity_drift_is_refused_before_sealing(self) -> None:
+        path = self.prepared / "capture-plan.json"
+        plan = read_data(path)
+        plan["identity"] = {
+            "hardware_id": "other-hardware",
+            "revision": None,
+        }
+        write_json(path, plan)
+        with self.assertRaisesRegex(
+            HISTORICAL.HistoricalMigrationError,
+            "identity_mismatch",
+        ):
+            self._migrate()
+
     def test_prepared_drift_is_refused_before_sealing(self) -> None:
         (self.prepared / "part.SLDPRT").write_bytes(b"changed after plan\n")
         with self.assertRaisesRegex(
             HISTORICAL.HistoricalMigrationError,
             "plan_prepared_mismatch",
+        ):
+            self._migrate()
+
+    def test_missing_native_producer_evidence_is_refused(self) -> None:
+        record = read_data(self.native_record)
+        record.pop("source_selection")
+        write_json(self.native_record, record)
+        with self.assertRaisesRegex(
+            HISTORICAL.HistoricalMigrationError,
+            "producer_binding",
         ):
             self._migrate()
 
