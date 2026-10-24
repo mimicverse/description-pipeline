@@ -81,6 +81,83 @@ class RepositorySnapshot:
     head_oid: str | None
     bundle_sha256: str
 
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.repository, str)
+            or "/" not in self.repository
+            or self.repository.startswith("/")
+            or self.repository.endswith("/")
+        ):
+            raise PublicationError("publish.snapshot_repository")
+        if not isinstance(self.origin_url, str) or not self.origin_url or "\x00" in self.origin_url:
+            raise PublicationError("publish.snapshot_origin")
+        for name in ("base_ref", "branch_ref"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or not value
+                or value.startswith("-")
+                or ".." in value
+                or value.endswith(".lock")
+            ):
+                raise PublicationError("publish.snapshot_ref", {"field": name})
+        if _OID.fullmatch(self.base_oid) is None:
+            raise PublicationError("publish.snapshot_base")
+        if self.head_oid is not None and _OID.fullmatch(self.head_oid) is None:
+            raise PublicationError("publish.snapshot_head")
+        if _HEX64.fullmatch(self.bundle_sha256) is None:
+            raise PublicationError("publish.snapshot_bundle_sha256")
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "schema_version": REPOSITORY_SNAPSHOT_SCHEMA,
+            "repository": self.repository,
+            "origin_url": self.origin_url,
+            "base_ref": self.base_ref,
+            "base_oid": self.base_oid,
+            "branch_ref": self.branch_ref,
+            "head_oid": self.head_oid,
+            "bundle_sha256": self.bundle_sha256,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> RepositorySnapshot:
+        expected = {
+            "schema_version",
+            "repository",
+            "origin_url",
+            "base_ref",
+            "base_oid",
+            "branch_ref",
+            "head_oid",
+            "bundle_sha256",
+        }
+        if not isinstance(record, Mapping) or set(record) != expected:
+            raise PublicationError("publish.snapshot_shape")
+        if record["schema_version"] != REPOSITORY_SNAPSHOT_SCHEMA:
+            raise PublicationError("publish.snapshot_schema")
+        return cls(
+            repository=record["repository"],
+            origin_url=record["origin_url"],
+            base_ref=record["base_ref"],
+            base_oid=record["base_oid"],
+            branch_ref=record["branch_ref"],
+            head_oid=record["head_oid"],
+            bundle_sha256=record["bundle_sha256"],
+        )
+
+
+def read_repository_snapshot(source: Path) -> RepositorySnapshot:
+    """Read and verify one sealed repository metadata record and Git bundle."""
+
+    source = Path(source)
+    snapshot = RepositorySnapshot.from_record(read_data(source / REPOSITORY_SNAPSHOT_METADATA))
+    bundle = source / REPOSITORY_SNAPSHOT_FILE
+    if not bundle.is_file() or bundle.is_symlink():
+        raise PublicationError("publish.snapshot_bundle")
+    if hashlib.sha256(bundle.read_bytes()).hexdigest() != snapshot.bundle_sha256:
+        raise PublicationError("publish.snapshot_bundle")
+    return snapshot
 
 def seal_repository_snapshot(
     repository: Path,
