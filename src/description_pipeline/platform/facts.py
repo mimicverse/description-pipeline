@@ -425,6 +425,14 @@ class FactStore(AdmissionControlStore):
                     admission.created_at,
                 ),
             )
+            for artifact in (
+                spec.originals.ref,
+                spec.ruleset.artifact.ref,
+                spec.configuration.ref,
+                spec.native_tool_requirement.ref,
+                spec.publish_intent.repository.artifact.ref,
+            ):
+                self._insert_artifact(cursor, artifact)
             self._insert_command_cursor(cursor, command)
             self._insert_dispatch_command_cursor(
                 cursor,

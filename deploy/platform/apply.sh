@@ -10,6 +10,7 @@
 # Usage:
 #   apply.sh [--bootstrap | --airflow-grants] --psql PATH --database DB
 #            [--platform-schema NAME] [--airflow-schema NAME]
+#            [--legacy-archive-receipt PATH]
 #            [--socket DIR | --host HOST] [--port PORT] [--user USER]
 #
 # Default mode runs as platform_migrate, which owns only the platform schema; --bootstrap is
@@ -26,12 +27,14 @@ PLATFORM_SCHEMA="platform"
 AIRFLOW_SCHEMA="airflow"
 BOOTSTRAP=0
 AIRFLOW_GRANTS=0
+LEGACY_ARCHIVE_SHA256=""
 CONNECTION=()
 
 usage() {
   echo "usage: apply.sh [--bootstrap | --airflow-grants] --psql PATH --database DB" >&2
   echo "                [--platform-schema NAME]" >&2
   echo "                [--airflow-schema NAME]" >&2
+  echo "                [--legacy-archive-receipt PATH]" >&2
   echo "                [--socket DIR | --host HOST] [--port PORT] [--user USER]" >&2
   exit 2
 }
@@ -44,6 +47,12 @@ while [ "$#" -gt 0 ]; do
     --database) DATABASE="${2:?}"; shift 2 ;;
     --platform-schema) PLATFORM_SCHEMA="${2:?}"; shift 2 ;;
     --airflow-schema) AIRFLOW_SCHEMA="${2:?}"; shift 2 ;;
+    --legacy-archive-receipt)
+      LEGACY_ARCHIVE_RECEIPT="${2:?}"
+      [ -f "$LEGACY_ARCHIVE_RECEIPT" ] || { echo "legacy archive receipt is not a file" >&2; exit 2; }
+      LEGACY_ARCHIVE_SHA256="$(sha256sum "$LEGACY_ARCHIVE_RECEIPT" | cut -d ' ' -f 1)"
+      shift 2
+      ;;
     --socket) CONNECTION+=(-h "${2:?}"); shift 2 ;;
     --host) CONNECTION+=(-h "${2:?}"); shift 2 ;;
     --port) CONNECTION+=(-p "${2:?}"); shift 2 ;;
@@ -53,13 +62,16 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$DATABASE" ] || usage
 if [ "$BOOTSTRAP" = "1" ] && [ "$AIRFLOW_GRANTS" = "1" ]; then usage; fi
+if [ "$BOOTSTRAP" = "1" ] && [ -n "$LEGACY_ARCHIVE_SHA256" ]; then usage; fi
 
 run() {
   local file="$1"
   echo "platform apply: $(basename "$file")" >&2
   "$PSQL" "${CONNECTION[@]}" -d "$DATABASE" -v ON_ERROR_STOP=1 \
     -v platform_schema="$PLATFORM_SCHEMA" -v airflow_schema="$AIRFLOW_SCHEMA" \
-    -v platform_database="$DATABASE" -f "$file" >&2
+    -v platform_database="$DATABASE" \
+    -c "SELECT set_config('description.legacy_archive_sha256', '$LEGACY_ARCHIVE_SHA256', false)" \
+    -f "$file" >&2
 }
 
 if [ "$BOOTSTRAP" = "1" ]; then

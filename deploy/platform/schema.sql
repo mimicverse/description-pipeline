@@ -261,11 +261,30 @@ BEGIN
 END $$;
 
 -- One-way legacy cutover. The maintenance operator must archive and verify the old
--- tables before applying this file. The legacy business rows are never copied into
--- a second runtime authority.
+-- relations, views and ACLs, then provide the receipt digest through apply.sh. A
+-- target that still carries any legacy relation is refused without that receipt.
+-- DROP intentionally omits CASCADE: any remaining dependency aborts the migration
+-- instead of being silently removed.
+DO $$
+BEGIN
+    IF to_regclass('request') IS NOT NULL
+       OR to_regclass('run') IS NOT NULL
+       OR to_regclass('stage') IS NOT NULL
+       OR to_regclass('operation') IS NOT NULL
+       OR to_regclass('run_event') IS NOT NULL THEN
+        IF COALESCE(
+            current_setting('description.legacy_archive_sha256', true),
+            ''
+        ) !~ '^[0-9a-f]{64}$' THEN
+            RAISE EXCEPTION
+                'legacy_lifecycle_archive_receipt_required';
+        END IF;
+    END IF;
+END $$;
+
 DROP VIEW IF EXISTS :"platform_schema".lifecycle_projection;
-DROP TABLE IF EXISTS :"platform_schema".run_event CASCADE;
-DROP TABLE IF EXISTS :"platform_schema".operation CASCADE;
-DROP TABLE IF EXISTS :"platform_schema".stage CASCADE;
-DROP TABLE IF EXISTS :"platform_schema".run CASCADE;
-DROP TABLE IF EXISTS :"platform_schema".request CASCADE;
+DROP TABLE IF EXISTS :"platform_schema".run_event;
+DROP TABLE IF EXISTS :"platform_schema".operation;
+DROP TABLE IF EXISTS :"platform_schema".stage;
+DROP TABLE IF EXISTS :"platform_schema".run;
+DROP TABLE IF EXISTS :"platform_schema".request;

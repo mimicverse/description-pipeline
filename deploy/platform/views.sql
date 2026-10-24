@@ -37,7 +37,8 @@ effective_effects AS (
             ) THEN 'definitely_failed'
             WHEN COALESCE(bool_or(f.fact_type = 'dispatch_authorized'), false) THEN 'unknown'
             ELSE 'prepared'
-        END AS state
+        END AS state,
+        max(COALESCE(f.observed_at, i.created_at)) AS updated_at
     FROM :"platform_schema".effect_intent i
     JOIN :"platform_schema".command c ON c.command_id = i.command_id
     LEFT JOIN :"platform_schema".effect_fact f ON f.effect_id = i.effect_id
@@ -64,75 +65,141 @@ effect_projection AS (
           AND c.kind = 'stage'
 ),
 stage_projection AS (
+    WITH stage_facts AS (
+        SELECT
+            rows.run_id,
+            rows.stage,
+            rows.position,
+            rows.created_at,
+            command.command_id,
+            decision.outcome,
+            decision.decided_at,
+            COALESCE(claim.open_claim, false) AS open_claim,
+            claim.updated_at AS claim_updated_at,
+            COALESCE(cancel.requested, false) AS cancel_requested,
+            cancel.requested_at,
+            COALESCE(effects.has_unresolved, false) AS has_unresolved,
+            COALESCE(predecessors.has_failed, false) AS has_failed_predecessor,
+            COALESCE(predecessors.has_unresolved, false) AS has_unresolved_predecessor,
+            predecessors.updated_at AS predecessor_updated_at
+        FROM (
+            SELECT
+                a.run_id,
+                a.created_at,
+                stage_rows.stage,
+                stage_rows.position
+            FROM :"platform_schema".run_admission a
+            CROSS JOIN (
+                VALUES
+                    ('freeze', 0),
+                    ('discover', 1),
+                    ('capture', 2),
+                    ('generate', 3),
+                    ('verify', 4),
+                    ('publish', 5)
+            ) AS stage_rows(stage, position)
+        ) AS rows
+        LEFT JOIN :"platform_schema".command command
+               ON command.run_id = rows.run_id
+              AND command.kind = 'stage'
+              AND command.stage = rows.stage
+        LEFT JOIN :"platform_schema".stage_decision decision
+               ON decision.command_id = command.command_id
+        LEFT JOIN LATERAL (
+            SELECT
+                count(*) > 0 AS open_claim,
+                max(c.last_seen_at) AS updated_at
+            FROM :"platform_schema".execution_claim c
+            WHERE c.command_id = command.command_id
+              AND c.closed_at IS NULL
+        ) AS claim ON true
+        LEFT JOIN LATERAL (
+            SELECT
+                count(*) > 0 AS requested,
+                max(cancel_command.created_at) AS requested_at
+            FROM :"platform_schema".command cancel_command
+            WHERE cancel_command.kind = 'cancel'
+              AND cancel_command.request->>'target_command_id' = command.command_id
+        ) AS cancel ON true
+        LEFT JOIN LATERAL (
+            SELECT
+                bool_or(
+                    e.state IN ('unknown', 'conflict')
+                    OR (
+                        decision.outcome = 'completed'
+                        AND e.state <> 'satisfied'
+                    )
+                ) AS has_unresolved
+            FROM effective_effects e
+            JOIN :"platform_schema".effect_intent own_intent
+              ON own_intent.effect_id = e.effect_id
+            WHERE own_intent.command_id = command.command_id
+        ) AS effects ON true
+        LEFT JOIN LATERAL (
+            SELECT
+                bool_or(prior_decision.outcome IN ('failed', 'cancelled')) AS has_failed,
+                bool_or(COALESCE(prior_effect.has_unresolved, false)) AS has_unresolved,
+                max(COALESCE(prior_decision.decided_at, prior_effect.updated_at)) AS updated_at
+            FROM (
+                VALUES
+                    ('freeze', 0),
+                    ('discover', 1),
+                    ('capture', 2),
+                    ('generate', 3),
+                    ('verify', 4),
+                    ('publish', 5)
+            ) AS prior_stage(stage, position)
+            LEFT JOIN :"platform_schema".command prior_command
+                   ON prior_command.run_id = rows.run_id
+                  AND prior_command.kind = 'stage'
+                  AND prior_command.stage = prior_stage.stage
+            LEFT JOIN :"platform_schema".stage_decision prior_decision
+                   ON prior_decision.command_id = prior_command.command_id
+            LEFT JOIN LATERAL (
+                SELECT bool_or(prior_effect_row.state IN ('unknown', 'conflict')) AS has_unresolved,
+                       max(prior_effect_row.updated_at) AS updated_at
+                FROM effective_effects prior_effect_row
+                JOIN :"platform_schema".effect_intent prior_intent
+                  ON prior_intent.effect_id = prior_effect_row.effect_id
+                WHERE prior_intent.command_id = prior_command.command_id
+            ) AS prior_effect ON true
+            WHERE prior_stage.position < rows.position
+        ) AS predecessors ON true
+    )
     SELECT
         rows.run_id,
         rows.stage,
         CASE
-            WHEN COALESCE(effects.has_unknown, false) THEN 'unresolved'
-            WHEN decision.outcome IS NOT NULL THEN decision.outcome
-            WHEN COALESCE(claim.open_claim, false) THEN 'running'
-            WHEN COALESCE(cancel.requested, false) THEN 'cancellation_requested'
+            WHEN rows.has_unresolved THEN 'unresolved'
+            WHEN rows.outcome IS NOT NULL THEN rows.outcome
+            WHEN rows.open_claim THEN 'running'
+            WHEN rows.cancel_requested THEN 'cancellation_requested'
+            WHEN rows.command_id IS NULL AND rows.has_failed_predecessor THEN 'blocked'
+            WHEN rows.command_id IS NULL THEN 'not_run'
             ELSE 'waiting'
         END AS state,
         CASE
-            WHEN COALESCE(effects.has_unknown, false) THEN 'unresolved'
-            WHEN decision.outcome IN ('completed', 'failed', 'cancelled') THEN 'terminal'
-            WHEN COALESCE(claim.open_claim, false) THEN 'in_flight'
-            WHEN COALESCE(cancel.requested, false) THEN 'unresolved'
+            WHEN rows.has_unresolved THEN 'unresolved'
+            WHEN rows.outcome IN ('completed', 'failed', 'cancelled') THEN 'terminal'
+            WHEN rows.open_claim THEN 'in_flight'
+            WHEN rows.cancel_requested THEN 'unresolved'
+            WHEN rows.command_id IS NULL AND rows.has_failed_predecessor THEN 'terminal'
+            WHEN rows.command_id IS NULL AND rows.has_unresolved_predecessor THEN 'unknown'
+            WHEN rows.command_id IS NULL THEN 'terminal'
             ELSE 'unknown'
         END AS bucket,
         COALESCE(
-            decision.decided_at,
-            claim.updated_at,
-            cancel.requested_at,
+            rows.decided_at,
+            rows.claim_updated_at,
+            rows.requested_at,
+            CASE
+                WHEN rows.command_id IS NULL
+                 AND rows.has_failed_predecessor
+                THEN rows.predecessor_updated_at
+            END,
             rows.created_at
         ) AS updated_at
-    FROM (
-        SELECT
-            a.run_id,
-            a.created_at,
-            stage_rows.stage
-        FROM :"platform_schema".run_admission a
-        CROSS JOIN (
-            VALUES
-                ('freeze', 0),
-                ('discover', 1),
-                ('capture', 2),
-                ('generate', 3),
-                ('verify', 4),
-                ('publish', 5)
-        ) AS stage_rows(stage, position)
-    ) AS rows
-    LEFT JOIN :"platform_schema".command command
-           ON command.run_id = rows.run_id
-          AND command.kind = 'stage'
-          AND command.stage = rows.stage
-    LEFT JOIN :"platform_schema".stage_decision decision
-           ON decision.command_id = command.command_id
-    LEFT JOIN LATERAL (
-        SELECT
-            count(*) > 0 AS open_claim,
-            max(c.last_seen_at) AS updated_at
-        FROM :"platform_schema".execution_claim c
-        WHERE c.command_id = command.command_id
-          AND c.closed_at IS NULL
-    ) AS claim ON true
-    LEFT JOIN LATERAL (
-        SELECT
-            count(*) > 0 AS requested,
-            max(cancel_command.created_at) AS requested_at
-        FROM :"platform_schema".command cancel_command
-        WHERE cancel_command.kind = 'cancel'
-          AND cancel_command.request->>'target_command_id' = command.command_id
-    ) AS cancel ON true
-    LEFT JOIN LATERAL (
-        SELECT
-            bool_or(e.state IN ('unknown', 'conflict')) AS has_unknown
-        FROM effective_effects e
-        JOIN :"platform_schema".effect_intent own_intent
-          ON own_intent.effect_id = e.effect_id
-        WHERE own_intent.command_id = command.command_id
-    ) AS effects ON true
+    FROM stage_facts AS rows
 ),
 run_projection AS (
     SELECT
@@ -142,7 +209,9 @@ run_projection AS (
             WHEN bool_or(s.state = 'running') THEN 'running'
             WHEN bool_or(s.state = 'failed') THEN 'failed'
             WHEN bool_or(s.state = 'cancelled') THEN 'cancelled'
-            WHEN bool_and(s.state = 'completed') THEN 'succeeded'
+            WHEN bool_and(s.state IN ('completed', 'not_run', 'blocked'))
+             AND bool_or(s.state = 'completed')
+            THEN 'succeeded'
             ELSE 'waiting'
         END AS state,
         CASE
@@ -150,7 +219,9 @@ run_projection AS (
             WHEN bool_or(s.state = 'running') THEN 'in_flight'
             WHEN bool_or(s.state = 'failed') THEN 'terminal'
             WHEN bool_or(s.state = 'cancelled') THEN 'terminal'
-            WHEN bool_and(s.state = 'completed') THEN 'terminal'
+            WHEN bool_and(s.state IN ('completed', 'not_run', 'blocked'))
+             AND bool_or(s.state = 'completed')
+            THEN 'terminal'
             ELSE 'unknown'
         END AS bucket,
         max(s.updated_at) AS updated_at
