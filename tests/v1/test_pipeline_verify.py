@@ -16,7 +16,9 @@ from description_pipeline.io import PipelineError, digest, file_digest, read_dat
 from description_pipeline.pipeline import verify as pipeline_verify
 from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
+    StageCandidate,
     StageCommand,
+    StageResult,
 )
 from description_pipeline.pipeline.engine import StageWorkspace
 from description_pipeline.pipeline.stages.generate import (
@@ -26,6 +28,7 @@ from description_pipeline.pipeline.stages.generate import (
     GenerateHandler,
 )
 from description_pipeline.pipeline.verify import (
+    NoExternalEffects,
     CERTIFICATE_FILENAME,
     EXECUTION_RECEIPT_FILENAME,
     OUTPUT_CONTRACT,
@@ -83,7 +86,11 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         ):
             generated = GenerateHandler(self.store).execute(
                 self.generator_command,
-                self._claim(self.generator_command, owner=self.generate_executor),
+                self._claim(
+                    self.generator_command,
+                    owner=digest({"process": "generate"}),
+                    executor=self.generate_executor,
+                ),
                 StageWorkspace(
                     root=self.root / "generate-attempt",
                     inputs={self.capture_ref.artifact_id: self.capture_root},
@@ -100,12 +107,19 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.generate_root = self.store.materialize(self.generate_ref, self.root / "generate")
 
     @staticmethod
-    def _claim(command: StageCommand, *, owner: str, fence: int = 1) -> ExecutionClaim:
+    def _claim(
+        command: StageCommand,
+        *,
+        owner: str,
+        executor: str,
+        fence: int = 1,
+    ) -> ExecutionClaim:
         return ExecutionClaim(
             claim_id=f"claim-{command.command_id}-{fence}",
             command_id=command.command_id,
             fence=fence,
             owner_sha256=owner,
+            executor_sha256=executor,
             lane_key=None,
             expires_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(hours=1),
         )
@@ -136,7 +150,11 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             expected_executor_sha256=verifier_sha256,
             predecessor_decision_id="generate-decision",
         )
-        claim = self._claim(command, owner=verifier_sha256)
+        claim = self._claim(
+            command,
+            owner=digest({"process": "verify"}),
+            executor=verifier_sha256,
+        )
         self.verify_attempt += 1
         if generate_ref == self.generate_ref:
             generate_root = self.generate_root
@@ -167,7 +185,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             execution = VerifyHandler(
                 identity_provider=hermetic._portable_tool,
                 clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
-            ).execute(command, claim, workspace)
+            ).execute(command, claim, workspace, effects=NoExternalEffects())
         output = Path(execution.candidate_root)
         return (
             command,
@@ -176,6 +194,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             read_data(output / EXECUTION_RECEIPT_FILENAME),
             (output / CERTIFICATE_FILENAME).read_bytes(),
             command.input_artifacts[0],
+            claim,
         )
 
     def _seal_mutated_generate(self, name: str, mutate) -> object:
@@ -200,7 +219,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         first_execution, first_certificate, first_receipt = first[1], first[2], first[3]
         second_certificate, second_receipt = second[2], second[3]
         self.assertEqual(first_execution.outcome, "completed")
-        self.assertEqual(first_execution.required_effect_ids, ())
+        self.assertFalse(hasattr(first_execution, "required_effect_ids"))
+        self.assertEqual(first_certificate["actual_verifier_sha256"], first[6].executor_sha256)
+        self.assertNotEqual(first_certificate["actual_verifier_sha256"], first[6].owner_sha256)
         self.assertEqual(first_certificate, second_certificate)
         self.assertEqual(first[4], second[4])
         self.assertNotEqual(first_receipt["execution_id"], second_receipt["execution_id"])
@@ -213,8 +234,42 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertFalse((self.generate_root / "input").exists())
         self.assertFalse((self.generate_root / "evidence").exists())
 
+    def test_validate_candidate_only_checks_runtime_identity(self) -> None:
+        command, execution, certificate, _receipt, _bytes, _generate_ref, claim = self._run_verify()
+        output_ref = self.store.seal_tree(
+            execution.candidate_root,
+            kind="stage_output:verify",
+            producer_run_id=command.run_id,
+            producer_stage="verify",
+            producer_tool_sha256=claim.executor_sha256,
+        )
+        result = StageResult(
+            schema_version="description-pipeline.stage-result/v1",
+            command_id=command.command_id,
+            run_id=command.run_id,
+            stage="verify",
+            request_digest=command.request_digest,
+            outcome="completed",
+            output_artifact=output_ref,
+            actual_executor_sha256=claim.executor_sha256,
+            checks_sha256=digest(certificate),
+        )
+        candidate = StageCandidate(result=result)
+        with patch.object(
+            pipeline_verify,
+            "evaluate_bundle",
+            side_effect=AssertionError("candidate validation must not replay mechanics"),
+        ):
+            validated = VerifyHandler(identity_provider=hermetic._portable_tool).validate_candidate(
+                command,
+                claim,
+                candidate,
+                effects=NoExternalEffects(),
+            )
+        self.assertIs(validated, candidate)
+
     def test_certificate_consumer_rechecks_pair_without_mechanical_replay(self) -> None:
-        command, execution, certificate, _receipt, _bytes, generate_ref = self._run_verify()
+        command, execution, certificate, _receipt, _bytes, generate_ref, _claim = self._run_verify()
         with (
             patch.object(pipeline_verify, "evaluate_bundle", side_effect=AssertionError("mechanical replay")),
             patch.object(
@@ -258,6 +313,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 command,
                 claim,
                 workspace,
+                effects=NoExternalEffects(),
             )
 
     def test_original_xml_mutations_fail_and_certificate_is_deterministic(self) -> None:
@@ -278,7 +334,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             ("material-wrong-color", material_wrong_color),
         ):
             generate_ref = self._seal_mutated_generate(name, mutate)
-            _command, execution, certificate, _receipt, _bytes, _ref = self._run_verify(generate_ref)
+            _command, execution, certificate, _receipt, _bytes, _ref, _claim = self._run_verify(generate_ref)
             self.assertEqual(execution.outcome, "failed")
             self.assertEqual(certificate["decision"], "FAIL")
             failed = {row["id"] for row in certificate["checks"] if row["passed"] is not True}
@@ -294,7 +350,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertNotEqual(first[3]["execution_id"], second[3]["execution_id"])
 
     def test_consumer_rejects_closure_mutation_and_tampered_certificate(self) -> None:
-        command, execution, certificate, _receipt, _bytes, generate_ref = self._run_verify()
+        command, execution, certificate, _receipt, _bytes, generate_ref, _claim = self._run_verify()
         changed = self.root / "generate-changed"
         shutil.copytree(self.generate_root, changed)
         urdf = changed / "urdf/robot.urdf"
@@ -324,7 +380,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         write_json(certificate_path, certificate)
 
     def test_explicit_replay_executes_handler_and_matches_saved_certificate(self) -> None:
-        command, _execution, certificate, _receipt, _bytes, generate_ref = self._run_verify()
+        command, _execution, certificate, _receipt, _bytes, generate_ref, _claim = self._run_verify()
         with patch.object(
             pipeline_verify,
             "evaluate_bundle",

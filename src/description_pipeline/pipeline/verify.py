@@ -38,6 +38,7 @@ from .contracts import (
     StageCommand,
     StageExecution,
 )
+from .effects import StageEffectPort
 from .engine import StageWorkspace
 
 REQUEST_SCHEMA = "description-pipeline.verify-request/v1"
@@ -147,6 +148,16 @@ class VerificationResult:
     @property
     def passed(self) -> bool:
         return self.certificate["decision"] == "PASS"
+
+
+class NoExternalEffects:
+    """Explicit effect port for isolated Verify replay; any use is a defect."""
+
+    def __getattr__(self, name: str):
+        def forbidden(**_kwargs):
+            raise ProtocolError("verify.external_effect_forbidden", {"method": name})
+
+        return forbidden
 
 
 @dataclass(frozen=True, slots=True)
@@ -595,12 +606,15 @@ class VerifyHandler:
         command: StageCommand,
         claim: ExecutionClaim,
         workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
     ) -> StageExecution:
+        del effects
         if claim.command_id != command.command_id:
             raise ProtocolError("verify.claim_mismatch", {"command_id": command.command_id})
         request, roots = self.request_from_command(command, workspace)
-        if claim.owner_sha256 != request.expected_verifier_sha256:
-            raise ProtocolError("verify.executor_mismatch", {"claim_owner": claim.owner_sha256})
+        if claim.executor_sha256 != request.expected_verifier_sha256:
+            raise ProtocolError("verify.executor_mismatch", {"claim_executor": claim.executor_sha256})
         result = self.evaluate(
             request,
             generate_root=roots[request.generate_artifact.artifact_id],
@@ -622,7 +636,10 @@ class VerifyHandler:
         command: StageCommand,
         claim: ExecutionClaim,
         candidate: StageCandidate,
+        *,
+        effects: StageEffectPort,
     ) -> StageCandidate:
+        del effects
         result = candidate.result
         if (
             command.stage != "verify"
@@ -631,7 +648,7 @@ class VerifyHandler:
             or result.run_id != command.run_id
             or result.stage != "verify"
             or result.request_digest != command.request_digest
-            or result.actual_executor_sha256 != claim.owner_sha256
+            or result.actual_executor_sha256 != claim.executor_sha256
         ):
             raise ProtocolError("verify.candidate_identity_mismatch", {"command_id": command.command_id})
         return candidate
@@ -864,7 +881,8 @@ def replay_verification(
         claim_id="verification-replay",
         command_id=command.command_id,
         fence=1,
-        owner_sha256=digest(verifier),
+        owner_sha256=digest({"process": "verification-replay"}),
+        executor_sha256=digest(verifier),
         lane_key=None,
         expires_at=datetime(2099, 1, 1, tzinfo=UTC),
     )
@@ -883,6 +901,7 @@ def replay_verification(
                     capture_artifact.artifact_id: Path(capture_root),
                 },
             ),
+            effects=NoExternalEffects(),
         )
         certificate = read_data(Path(result.candidate_root) / CERTIFICATE_FILENAME)
     return certificate
