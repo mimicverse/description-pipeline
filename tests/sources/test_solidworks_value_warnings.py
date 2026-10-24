@@ -26,6 +26,7 @@ from description_pipeline.geometry.native_u import (
     NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
     NATIVE_TOLERANT_EDGE_WARNING_REASON,
+    NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
     native_curve_topology_endpoint_set_assignment,
     native_tolerant_edge_value_warning,
 )
@@ -58,6 +59,7 @@ def native_tolerant_warning() -> dict:
         "fin_id": 329,
         "fin_endpoint": "end",
         "parameter_boundary": "u_max",
+        "u_parameter_rule": NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
         "point_roundtrip_rule": NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
         "evaluate_rule_version": "native-curve-endpoint-float32-operation-v4",
         "evaluate_metric": NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,

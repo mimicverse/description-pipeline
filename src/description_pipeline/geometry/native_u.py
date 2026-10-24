@@ -10,8 +10,7 @@ import struct
 from fractions import Fraction
 
 NATIVE_U_IDENTITY_RULE = "native-u-identity-128ulp-v1"
-NATIVE_U_POINT_PARAMETER_RULE = "native-u-point-parameter-authoritative-v2"
-NATIVE_U_CLOSEST_FALLBACK_RULE = "native-u-closest-point-fallback-v1"
+NATIVE_U_CLOSEST_POINT_PARAMETER_RULE = "native-u-closest-point-parameter-v1"
 NATIVE_U_IDENTITY_ULPS = 128
 NATIVE_U_COVERAGE_COVERED = "covered"
 NATIVE_U_COVERAGE_UNCOVERED = "uncovered"
@@ -51,6 +50,8 @@ NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION = (
     "native_declared_tolerant_edge;euclidean_projected_endpoint_bound"
 )
 NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS = (
+    "u_parameter_rule",
+    "closest_point_on_raw[3]",
     "point_tolerance_m",
     "point_error_m",
     "point_roundtrip_rule",
@@ -64,9 +65,8 @@ NATIVE_TOLERANT_EDGE_GAP_WARNING = (
     "cad_native_tolerant_edge_boundary_projection"
 )
 NATIVE_TOLERANT_EDGE_WARNING_MESSAGE = (
-    "Native tolerant-edge boundary projection used a source-bound unordered "
-    "endpoint-set authority and, where needed, an independently replayed "
-    "open-edge identity."
+    "Native tolerant-edge boundary projection used the closest-point U, the "
+    "native curve direction, and an independently replayed open-edge identity."
 )
 NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS = frozenset(
     {
@@ -77,6 +77,7 @@ NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS = frozenset(
         "fin_id",
         "fin_endpoint",
         "parameter_boundary",
+        "u_parameter_rule",
         "point_roundtrip_rule",
         "evaluate_rule_version",
         "evaluate_metric",
@@ -406,6 +407,8 @@ def native_tolerant_edge_warning_is_valid(item: object) -> bool:
         and detail["fin_id"] >= 0
         and detail["fin_endpoint"] in {"start", "end"}
         and detail["parameter_boundary"] in {"u_min", "u_max"}
+        and detail["u_parameter_rule"]
+        == NATIVE_U_CLOSEST_POINT_PARAMETER_RULE
         and detail["point_roundtrip_rule"]
         == NATIVE_TOLERANT_EDGE_BOUNDARY_RULE
         and detail["evaluate_rule_version"]
@@ -792,33 +795,6 @@ def native_fin_interval(
         (direct[1], upper_value),
         (lower_value, direct[0]),
     ]
-
-
-def native_boolean_success(value: object) -> bool | None:
-    """Normalize a COM boolean-like 0/1 result without accepting other values."""
-
-    if type(value) is bool:
-        return value
-    if type(value) in (int, float) and value in (0, 1):
-        return bool(value)
-    return None
-
-
-def native_get_parameter_success(value: object) -> bool | None:
-    """Parse GetParameter's flag or packed double-long status strictly."""
-
-    boolean = native_boolean_success(value)
-    if boolean is not None:
-        return boolean
-    if type(value) is not float or not math.isfinite(value):
-        return None
-    bits = struct.unpack("<Q", struct.pack("<d", value))[0]
-    low32 = bits & 0xFFFFFFFF
-    if value == 0.0:
-        return False
-    if low32 == 1:
-        return True
-    return None
 
 
 def native_evaluate2_evidence(raw: list | tuple) -> dict | None:
@@ -1740,7 +1716,6 @@ def native_open_edge_boundary_identity(
     curve_u_min: float,
     curve_u_max: float,
     fin_endpoint_u: tuple[float, float],
-    fin_endpoint_success: tuple[bool, bool],
     curve_sense: bool,
     gap_m: float,
     body_type: int,
@@ -1803,14 +1778,6 @@ def native_open_edge_boundary_identity(
         raise ValueError("open-edge identity requires a one-face sheet boundary fin")
     if type(curve_sense) is not bool:
         raise ValueError("curve sense must be a strict boolean")
-    if (
-        not isinstance(fin_endpoint_success, tuple)
-        or len(fin_endpoint_success) != 2
-        or any(type(value) is not bool for value in fin_endpoint_success)
-    ):
-        raise ValueError("fin endpoint U availability must be strict booleans")
-    # ``False`` is the already validated closest-point fallback.  The caller
-    # retains that raw status and independently recomputes the fallback rule.
     if (
         not isinstance(fin_endpoint_u, tuple)
         or len(fin_endpoint_u) != 2

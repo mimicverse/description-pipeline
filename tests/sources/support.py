@@ -20,8 +20,8 @@ from description_pipeline.geometry.native_u import (
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+    NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
     NATIVE_U_IDENTITY_RULE,
-    NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_domain_transform,
     native_curve_endpoint_operation_tolerance,
@@ -330,9 +330,7 @@ def _u_evidence(
     )
     return {
         "u": u_parameter,
-        "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
-        "parameter_u_source": "get_parameter",
-        "fallback_reason": None,
+        "u_parameter_rule": NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
         "rule_version": NATIVE_U_IDENTITY_RULE,
         "point_roundtrip_rule": point_roundtrip_rule,
         "projection_rule": NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
@@ -348,13 +346,7 @@ def _u_evidence(
         "source_evaluate_error_m": evaluate_error,
         "closest_evaluate_error_m": closest_evaluate_error,
         "tolerant_edge_evidence": tolerant_edge_evidence,
-        "closest_point_on_raw": [*projected_point, u_parameter, 0.0],
-        "parameter_input_point_m": list(projected_point),
-        "parameter_raw": [u_parameter, True],
-        "parameter_success_raw": True,
-        "parameter_success_raw_type": "bool",
-        "parameter_success_bit": 1,
-        "parameter_success_parsed": True,
+        "closest_point_on_raw": [*projected_point, u_parameter],
         "evaluate_payload": payload,
         "evaluate_packed_status": packed_status,
         "open_edge_identity_sha256": open_edge_identity_sha256,
@@ -1082,14 +1074,6 @@ def native_tessellation_fixture(
                         fin["start_u"],
                         fin["end_u"],
                     ),
-                    fin_endpoint_success=(
-                        fin["start_evidence"][
-                            "parameter_success_parsed"
-                        ],
-                        fin["end_evidence"][
-                            "parameter_success_parsed"
-                        ],
-                    ),
                     curve_sense=curve_sense,
                     gap_m=edge["tolerant_gap_m"],
                     body_type=body_type,
@@ -1315,7 +1299,6 @@ def native_tessellation_fixture(
                 "unique_observations": u_observations,
                 "cache_hits": 0,
                 "get_closest_point_on_calls": u_observations,
-                "get_parameter_calls": u_observations,
                 "evaluate2_calls": u_observations,
             },
             "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),

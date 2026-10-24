@@ -1054,7 +1054,6 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         ):
             evidence["u"] = value
             evidence["closest_point_on_raw"][3] = value
-            evidence["parameter_raw"][0] = value
 
     def test_open_edge_accepts_one_boundary_fin_and_summarizes_it(self):
         tessellation, triangles = self.boundary_fixture()

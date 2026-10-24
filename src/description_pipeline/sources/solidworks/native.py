@@ -42,16 +42,14 @@ from ...geometry.native_u import (
     NATIVE_TOPOLOGY_IDENTITY_DERIVED,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
-    NATIVE_U_CLOSEST_FALLBACK_RULE,
+    NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
     NATIVE_U_IDENTITY_RULE,
-    NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
     native_fin_interval,
-    native_get_parameter_success,
     native_open_edge_boundary_identity,
     native_open_edge_scope_binding,
     native_point_euclidean_error,
@@ -8272,16 +8270,23 @@ class SolidWorksBackend(CadBackend):
             )
             if (
                 len(closest) != 5
-                or any(type(value) not in (int, float) for value in closest)
-                or not all(math.isfinite(float(value)) for value in closest)
+                or any(
+                    type(value) not in (int, float)
+                    for value in closest[:4]
+                )
+                or not all(
+                    math.isfinite(float(value))
+                    for value in closest[:4]
+                )
             ):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
-                    "GetClosestPointOn returned malformed parameter evidence",
+                    "GetClosestPointOn returned malformed point/U evidence",
                     {**base, "fin_id": fin_id, "endpoint": endpoint},
                 )
             closest_point = _binary64_xyz(closest[0:3])
             closest_u = float(closest[3])
+            closest_evidence = [*closest_point, closest_u]
 
             def point_error(left, right):
                 return max(
@@ -8298,85 +8303,51 @@ class SolidWorksBackend(CadBackend):
                         **base,
                         "fin_id": fin_id,
                         "endpoint": endpoint,
+                        "edge_reference_sha256": edge_reference_sha256,
+                        "source_point_m": list(point),
+                        "closest_point_on_raw": [
+                            *closest_point,
+                            closest_u,
+                        ],
+                        "closest_point_m": list(closest_point),
+                        "u": closest_u,
+                        "curve_u_min": domain["u_min"],
+                        "curve_u_max": domain["u_max"],
+                        "curve_sense": domain["sense"],
+                        "projection_tolerance_m": (
+                            NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+                        ),
                         "projection_error_m": projection_error,
                     },
                 )
+            endpoint_u = closest_u
+            u_parameter_rule = NATIVE_U_CLOSEST_POINT_PARAMETER_RULE
             if not native_u_in_closed_interval(
-                closest_u,
+                endpoint_u,
                 domain["u_min"],
                 domain["u_max"],
             ):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
-                    "GetClosestPointOn does not bind a finite in-domain endpoint U",
+                    "GetClosestPointOn endpoint U is outside the edge domain",
                     {
                         **base,
                         "fin_id": fin_id,
                         "endpoint": endpoint,
-                        "u": closest_u,
-                    },
-                )
-            parameter = call(
-                "IEdge.GetParameter",
-                lambda edge=edge, closest_point=closest_point: _as_list(
-                    _method(edge, "GetParameter", *closest_point)
-                ),
-                fin_id=fin_id,
-                endpoint=endpoint,
-            )
-            if (
-                len(parameter) != 2
-                or type(parameter[0]) not in (int, float)
-                or not math.isfinite(float(parameter[0]))
-            ):
-                raise CadError(
-                    "cad_native_tessellation_unreadable",
-                    "GetParameter did not return a successful finite endpoint U",
-                    {**base, "fin_id": fin_id, "endpoint": endpoint},
-                )
-            parameter_success = native_get_parameter_success(parameter[1])
-            if parameter_success is None:
-                raise CadError(
-                    "cad_native_tessellation_unreadable",
-                    "GetParameter success is not strict bool, numeric 0/1, "
-                    "or packed low32 exactly 1",
-                    {
-                        **base,
-                        "fin_id": fin_id,
-                        "endpoint": endpoint,
-                        "parameter_success_raw": repr(parameter[1])[:80],
-                    },
-                )
-            if parameter_success:
-                parameter_u = float(parameter[0])
-                u_parameter_rule = NATIVE_U_POINT_PARAMETER_RULE
-                parameter_u_source = "get_parameter"
-                fallback_reason = None
-            else:
-                parameter_u = closest_u
-                u_parameter_rule = NATIVE_U_CLOSEST_FALLBACK_RULE
-                parameter_u_source = "closest_point_fallback"
-                fallback_reason = "get_parameter_false"
-            if not native_u_in_closed_interval(
-                parameter_u,
-                domain["u_min"],
-                domain["u_max"],
-            ):
-                raise CadError(
-                    "cad_native_tessellation_unreadable",
-                    "GetParameter endpoint U is outside the edge domain",
-                    {
-                        **base,
-                        "fin_id": fin_id,
-                        "endpoint": endpoint,
-                        "parameter_u": parameter_u,
-                        "closest_u": closest_u,
+                        "edge_reference_sha256": edge_reference_sha256,
+                        "curve_u_min": domain["u_min"],
+                        "curve_u_max": domain["u_max"],
+                        "curve_sense": domain["sense"],
+                        "source_point_m": list(point),
+                        "closest_point_on_raw": closest_evidence,
+                        "closest_point_m": list(closest_point),
+                        "u": endpoint_u,
                     },
                 )
             evaluated_raw = call(
                 "IEdge.Evaluate2",
-                lambda edge=edge, parameter_u=parameter_u: _as_list(
-                    _method(edge, "Evaluate2", parameter_u, 1)
+                lambda edge=edge, endpoint_u=endpoint_u: _as_list(
+                    _method(edge, "Evaluate2", endpoint_u, 1)
                 ),
                 fin_id=fin_id,
                 endpoint=endpoint,
@@ -8386,13 +8357,34 @@ class SolidWorksBackend(CadBackend):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
                     "Evaluate2 shape or point payload is invalid",
-                    {**base, "fin_id": fin_id, "endpoint": endpoint},
+                    {
+                        **base,
+                        "fin_id": fin_id,
+                        "endpoint": endpoint,
+                        "edge_reference_sha256": edge_reference_sha256,
+                        "source_point_m": list(point),
+                        "closest_point_on_raw": closest_evidence,
+                        "u": endpoint_u,
+                        "evaluate2_raw": list(evaluated_raw),
+                    },
                 )
             if not evaluate_evidence["packed_status"]["parsed_success"]:
                 raise CadError(
                     "cad_native_tessellation_unreadable",
                     "Evaluate2 packed success bit is zero",
-                    {**base, "fin_id": fin_id, "endpoint": endpoint},
+                    {
+                        **base,
+                        "fin_id": fin_id,
+                        "endpoint": endpoint,
+                        "edge_reference_sha256": edge_reference_sha256,
+                        "source_point_m": list(point),
+                        "closest_point_on_raw": closest_evidence,
+                        "u": endpoint_u,
+                        "evaluate2_raw": list(evaluated_raw),
+                        "evaluate_packed_status": evaluate_evidence[
+                            "packed_status"
+                        ],
+                    },
                 )
             evaluated_point = _binary64_xyz(
                 evaluate_evidence["payload"][:3]
@@ -8408,15 +8400,7 @@ class SolidWorksBackend(CadBackend):
             tolerant_gap_m = (
                 edge_tolerance["gap_m"] if tolerance_available else 0.0
             )
-            if parameter_success is False:
-                point_tolerance = (
-                    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-                )
-                point_roundtrip_rule = (
-                    NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
-                )
-                boundary_name = None
-            elif native_u_equal(parameter_u, domain["u_min"]):
+            if native_u_equal(endpoint_u, domain["u_min"]):
                 curve_endpoint = domain["start_point_m"]
                 opposite_endpoint = domain["end_point_m"]
                 tolerant_edge_boundary = native_tolerant_edge_boundary(
@@ -8432,7 +8416,7 @@ class SolidWorksBackend(CadBackend):
                     "point_tolerance_m"
                 ]
                 boundary_name = "u_min"
-            elif native_u_equal(parameter_u, domain["u_max"]):
+            elif native_u_equal(endpoint_u, domain["u_max"]):
                 curve_endpoint = domain["end_point_m"]
                 opposite_endpoint = domain["start_point_m"]
                 tolerant_edge_boundary = native_tolerant_edge_boundary(
@@ -8505,6 +8489,21 @@ class SolidWorksBackend(CadBackend):
                         **base,
                         "fin_id": fin_id,
                         "endpoint": endpoint,
+                        "edge_reference_sha256": edge_reference_sha256,
+                        "source_point_m": list(point),
+                        "closest_point_on_raw": closest_evidence,
+                        "closest_point_m": list(closest_point),
+                        "u": endpoint_u,
+                        "curve_u_min": domain["u_min"],
+                        "curve_u_max": domain["u_max"],
+                        "curve_sense": domain["sense"],
+                        "curve_start_point_m": domain["start_point_m"],
+                        "curve_end_point_m": domain["end_point_m"],
+                        "evaluate2_raw": list(evaluated_raw),
+                        "evaluate_payload": evaluate_evidence["payload"],
+                        "evaluate_packed_status": evaluate_evidence[
+                            "packed_status"
+                        ],
                         "closest_point_error_m": projection_error,
                         "projection_error_m": projection_error,
                         "evaluate_point_error_m": official_evaluate_error,
@@ -8515,26 +8514,9 @@ class SolidWorksBackend(CadBackend):
                         "tolerant_edge_evidence": tolerant_edge_evidence,
                     },
                 )
-            if (
-                parameter_success is False
-                and source_evaluate_error
-                > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-            ):
-                raise CadError(
-                    "cad_native_tessellation_unreadable",
-                    "closest-point fallback does not close within 50 micrometres",
-                    {
-                        **base,
-                        "fin_id": fin_id,
-                        "endpoint": endpoint,
-                        "source_evaluate_error_m": source_evaluate_error,
-                    },
-                )
             return {
-                "u": parameter_u,
+                "u": endpoint_u,
                 "u_parameter_rule": u_parameter_rule,
-                "parameter_u_source": parameter_u_source,
-                "fallback_reason": fallback_reason,
                 "rule_version": NATIVE_U_IDENTITY_RULE,
                 "point_roundtrip_rule": point_roundtrip_rule,
                 "projection_rule": NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
@@ -8550,13 +8532,7 @@ class SolidWorksBackend(CadBackend):
                 "source_evaluate_error_m": source_evaluate_error,
                 "closest_evaluate_error_m": closest_evaluate_error,
                 "tolerant_edge_evidence": tolerant_edge_evidence,
-                "closest_point_on_raw": list(closest),
-                "parameter_input_point_m": list(closest_point),
-                "parameter_raw": list(parameter),
-                "parameter_success_raw": parameter[1],
-                "parameter_success_raw_type": type(parameter[1]).__name__,
-                "parameter_success_bit": 1 if parameter_success else 0,
-                "parameter_success_parsed": parameter_success,
+                "closest_point_on_raw": closest_evidence,
                 "evaluate_payload": evaluate_evidence["payload"],
                 "evaluate_packed_status": evaluate_evidence[
                     "packed_status"
@@ -8931,10 +8907,6 @@ class SolidWorksBackend(CadBackend):
                                 start_evidence["u"],
                                 end_evidence["u"],
                             ),
-                            fin_endpoint_success=(
-                                start_evidence["parameter_success_parsed"],
-                                end_evidence["parameter_success_parsed"],
-                            ),
                             curve_sense=domain["sense"],
                             gap_m=edge_tolerance["gap_m"],
                             body_type=body_type,
@@ -9004,14 +8976,6 @@ class SolidWorksBackend(CadBackend):
                                     ],
                                     vertex_points_binary64[
                                         row["vertex_ids"][1]
-                                    ],
-                                ],
-                                "fin_endpoint_success": [
-                                    start_evidence[
-                                        "parameter_success_parsed"
-                                    ],
-                                    end_evidence[
-                                        "parameter_success_parsed"
                                     ],
                                 ],
                                 "tolerant_endpoints": [
@@ -9218,7 +9182,6 @@ class SolidWorksBackend(CadBackend):
                 "unique_observations": len(u_observation_cache),
                 "cache_hits": u_cache_hits,
                 "get_closest_point_on_calls": len(u_observation_cache),
-                "get_parameter_calls": len(u_observation_cache),
                 "evaluate2_calls": len(u_observation_cache),
             },
             "reference_alias_audit": dict(registry.alias_audit()),
@@ -9645,7 +9608,6 @@ class SolidWorksBackend(CadBackend):
                 "unique_observations": 0,
                 "cache_hits": 0,
                 "get_closest_point_on_calls": 0,
-                "get_parameter_calls": 0,
                 "evaluate2_calls": 0,
             },
         }
@@ -10265,7 +10227,6 @@ class SolidWorksBackend(CadBackend):
                     "unique_observations": 0,
                     "cache_hits": 0,
                     "get_closest_point_on_calls": 0,
-                    "get_parameter_calls": 0,
                     "evaluate2_calls": 0,
                 },
             },

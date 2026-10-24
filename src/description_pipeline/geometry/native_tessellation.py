@@ -36,15 +36,13 @@ from .native_u import (
     NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
     NATIVE_TOLERANT_EDGE_WARNING_REASON,
-    NATIVE_U_CLOSEST_FALLBACK_RULE,
+    NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
     NATIVE_U_IDENTITY_RULE,
-    NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_fin_interval,
-    native_get_parameter_success,
     native_open_edge_boundary_identity,
     native_open_edge_scope_binding,
     native_point_error,
@@ -606,13 +604,11 @@ def _valid_u_evidence(
     topology_accepted: object,
     open_edge_identity_sha256: object,
 ) -> bool:
-    """Validate one retained GetClosestPointOn/GetParameter/Evaluate2 proof."""
+    """Validate one retained GetClosestPointOn/Evaluate2 proof."""
 
     if not isinstance(value, dict) or set(value) != {
         "u",
         "u_parameter_rule",
-        "parameter_u_source",
-        "fallback_reason",
         "rule_version",
         "point_roundtrip_rule",
         "projection_rule",
@@ -627,12 +623,6 @@ def _valid_u_evidence(
         "closest_evaluate_error_m",
         "tolerant_edge_evidence",
         "closest_point_on_raw",
-        "parameter_input_point_m",
-        "parameter_raw",
-        "parameter_success_raw",
-        "parameter_success_raw_type",
-        "parameter_success_bit",
-        "parameter_success_parsed",
         "evaluate_payload",
         "evaluate_packed_status",
         "open_edge_identity_sha256",
@@ -640,7 +630,6 @@ def _valid_u_evidence(
     }:
         return False
     closest = value["closest_point_on_raw"]
-    parameter = value["parameter_raw"]
     evaluated = value["evaluate_payload"]
     numeric = (int, float)
     if (
@@ -651,7 +640,7 @@ def _valid_u_evidence(
             for item in endpoint_point
         )
         or not isinstance(closest, list)
-        or len(closest) != 5
+        or len(closest) != 4
         or not all(
             type(item) in numeric and math.isfinite(float(item))
             for item in closest
@@ -667,12 +656,6 @@ def _valid_u_evidence(
         or not all(
             type(item) in numeric and math.isfinite(float(item))
             for item in value["source_point_m"]
-        )
-        or not isinstance(value["parameter_input_point_m"], list)
-        or len(value["parameter_input_point_m"]) != 3
-        or not all(
-            type(item) in numeric and math.isfinite(float(item))
-            for item in value["parameter_input_point_m"]
         )
         or not isinstance(curve_start, (list, tuple))
         or len(curve_start) != 3
@@ -710,38 +693,34 @@ def _valid_u_evidence(
     ):
         return False
     closest_point = tuple(closest[:3])
+    closest_parameter = closest[3]
     evaluated_point = tuple(evaluated[:3])
     expected_point = tuple(float(item) for item in endpoint_point)
     source_point = tuple(value["source_point_m"])
     projection_error = native_point_error(source_point, closest_point)
     if (
         source_point != expected_point
-        or tuple(value["parameter_input_point_m"]) != closest_point
+        or value["u_parameter_rule"]
+        != NATIVE_U_CLOSEST_POINT_PARAMETER_RULE
         or value["projection_rule"]
         != NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
         or value["projection_tolerance_m"]
         != NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
         or projection_error > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+        or not native_u_equal(value["u"], closest_parameter)
+        or not native_u_equal(u_parameter, closest_parameter)
     ):
         return False
-    parameter_success = native_get_parameter_success(
-        parameter[1]
-    ) if isinstance(parameter, list) and len(parameter) == 2 else None
     tolerant_edge_evidence = None
     tolerant_edge_metrics = None
     boundary_selected = False
     boundary_point_error = None
-    if parameter_success is False:
-        computed_tolerance = (
-            NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-        )
-        point_roundtrip_rule = NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
-    elif native_u_equal(value["u"], domain_lower) or native_u_equal(
-        value["u"],
+    if native_u_equal(closest_parameter, domain_lower) or native_u_equal(
+        closest_parameter,
         domain_upper,
     ):
         boundary_selected = True
-        if native_u_equal(value["u"], domain_lower):
+        if native_u_equal(closest_parameter, domain_lower):
             boundary_name = "u_min"
             curve_endpoint = curve_start
             opposite_curve_endpoint = curve_end
@@ -764,9 +743,7 @@ def _valid_u_evidence(
                 return False
             if tolerant_edge_metrics["accepted"] is not True:
                 return False
-            computed_tolerance = tolerant_edge_metrics[
-                "point_tolerance_m"
-            ]
+            computed_tolerance = tolerant_edge_metrics["point_tolerance_m"]
             boundary_point_error = tolerant_edge_metrics[
                 "evaluate_point_error_m"
             ]
@@ -821,11 +798,8 @@ def _valid_u_evidence(
         evaluated_point,
     )
     computed_point_error = (
-        boundary_point_error
-        if boundary_selected
-        else evaluate_error
+        boundary_point_error if boundary_selected else evaluate_error
     )
-    computed_evaluate_error = computed_point_error
     finite_values = (
         value["u"],
         value["point_tolerance_m"],
@@ -835,25 +809,8 @@ def _valid_u_evidence(
         value["source_evaluate_error_m"],
         value["closest_evaluate_error_m"],
     )
-    fallback = parameter_success is False
-    expected_u_rule = (
-        NATIVE_U_CLOSEST_FALLBACK_RULE
-        if fallback
-        else NATIVE_U_POINT_PARAMETER_RULE
-    )
-    expected_u_source = (
-        "closest_point_fallback"
-        if fallback
-        else "get_parameter"
-    )
-    expected_fallback_reason = "get_parameter_false" if fallback else None
-    expected_success_bit = 0 if fallback else 1
-    authoritative_u = closest[3] if fallback else parameter[0]
     return (
         value["rule_version"] == NATIVE_U_IDENTITY_RULE
-        and value["u_parameter_rule"] == expected_u_rule
-        and value["parameter_u_source"] == expected_u_source
-        and value["fallback_reason"] == expected_fallback_reason
         and value["point_roundtrip_rule"] == point_roundtrip_rule
         and all(
             type(item) in numeric and math.isfinite(float(item))
@@ -864,7 +821,7 @@ def _valid_u_evidence(
         and value["point_error_m"] == computed_point_error
         and value["projection_error_m"] == projection_error
         and value["closest_point_error_m"] == projection_error
-        and value["evaluate_point_error_m"] == computed_evaluate_error
+        and value["evaluate_point_error_m"] == computed_point_error
         and value["evaluate_point_error_m"] <= computed_tolerance
         and value["source_evaluate_error_m"] == source_evaluate_error
         and value["closest_evaluate_error_m"] == closest_evaluate_error
@@ -874,31 +831,10 @@ def _valid_u_evidence(
             or max(evaluate_error, closest_evaluate_error)
             <= computed_tolerance
         )
-        and native_u_equal(value["u"], u_parameter)
-        and isinstance(parameter, list)
-        and len(parameter) == 2
-        and type(parameter[0]) in numeric
-        and math.isfinite(float(parameter[0]))
-        and parameter_success is not None
         and native_u_in_closed_interval(
-            closest[3],
+            closest_parameter,
             domain_lower,
             domain_upper,
-        )
-        and value["parameter_success_raw"] == parameter[1]
-        and value["parameter_success_raw_type"] == type(parameter[1]).__name__
-        and value["parameter_success_bit"] == expected_success_bit
-        and value["parameter_success_parsed"] is (not fallback)
-        and native_u_equal(authoritative_u, value["u"])
-        and native_u_in_closed_interval(
-            authoritative_u,
-            domain_lower,
-            domain_upper,
-        )
-        and (
-            not fallback
-            or source_evaluate_error
-            <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
         )
         and _valid_evaluate2_packed_status(
             value["evaluate_packed_status"]
@@ -2069,13 +2005,11 @@ def _parse_itessellation_evidence(
             "unique_observations",
             "cache_hits",
             "get_closest_point_on_calls",
-            "get_parameter_calls",
             "evaluate2_calls",
         }
         and all(_integer(item) and item >= 0 for item in stats.values())
         and stats["get_closest_point_on_calls"]
         == stats["unique_observations"]
-        and stats["get_parameter_calls"] == stats["unique_observations"]
         and stats["evaluate2_calls"] == stats["unique_observations"],
         component + ": native U observation statistics are inconsistent",
     )
@@ -3196,14 +3130,6 @@ def _parse_itessellation_evidence(
                             fin["start_u"],
                             fin["end_u"],
                         ),
-                        fin_endpoint_success=(
-                            fin["start_evidence"][
-                                "parameter_success_parsed"
-                            ],
-                            fin["end_evidence"][
-                                "parameter_success_parsed"
-                            ],
-                        ),
                         curve_sense=edge["curve_sense"],
                         gap_m=edge["edge_tolerance"]["gap_m"],
                         body_type=body_key[0],
@@ -3299,6 +3225,9 @@ def _parse_itessellation_evidence(
                             "parameter_boundary": tolerant[
                                 "parameter_boundary"
                             ],
+                            "u_parameter_rule": fin[
+                                f"{endpoint_name}_evidence"
+                            ]["u_parameter_rule"],
                             "point_roundtrip_rule": tolerant[
                                 "point_roundtrip_rule"
                             ],

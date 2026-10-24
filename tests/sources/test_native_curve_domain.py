@@ -300,7 +300,6 @@ class NativeCurveDomainTests(unittest.TestCase):
                     evidence["closest_point_on_raw"][:3] = common_point
                     evidence["evaluate_payload"][:3] = common_point
                     evidence["source_point_m"] = list(common_point)
-                    evidence["parameter_input_point_m"] = list(common_point)
                     evidence["projection_error_m"] = 0.0
                     evidence["source_evaluate_error_m"] = 0.0
                     evidence["point_tolerance_m"] = (
@@ -476,7 +475,6 @@ class NativeCurveDomainTests(unittest.TestCase):
                 evidence["closest_point_on_raw"][:3] = former_end
                 evidence["evaluate_payload"][:3] = former_end
                 evidence["source_point_m"] = list(former_end)
-                evidence["parameter_input_point_m"] = list(former_end)
                 evidence["projection_error_m"] = 0.0
                 evidence["source_evaluate_error_m"] = 0.0
                 evidence["point_tolerance_m"] = (
