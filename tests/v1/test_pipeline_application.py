@@ -19,6 +19,7 @@ from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.pipeline.admission import build_run_admission
 from description_pipeline.pipeline.application import (
     STAGES,
+    AirflowTaskBinding,
     ApplicationError,
     ApplicationPortMissing,
     StageApplication,
@@ -37,6 +38,7 @@ from description_pipeline.pipeline.contracts import (
 )
 from description_pipeline.pipeline.engine import StageWorkspace
 from description_pipeline.pipeline.reconciliation import EffectReconciliationService
+from description_pipeline.pipeline.services import ClaimPolicy
 from description_pipeline.pipeline.verify import NoExternalEffects
 from description_pipeline.orchestration.native_operation_client import (
     NativeOperationEffectObserver,
@@ -181,6 +183,12 @@ class _MemoryBackend:
             return self.commands[command_id]
         except KeyError as error:
             raise PipelineError(f"unknown command: {command_id}") from error
+
+    def load_dispatch_command(self, command_id: str):
+        try:
+            return self.dispatch_commands[command_id]
+        except KeyError as error:
+            raise PipelineError(f"unknown dispatch command: {command_id}") from error
 
     def create_command(
         self,
@@ -408,6 +416,30 @@ class StageApplicationTests(unittest.TestCase):
         ):
             self.application.load_verified_freeze_origins("run-1")
 
+    def test_airflow_binding_must_match_the_admitted_dispatch_and_stage(self):
+        admitted = self.application.admit(self.harness.spec)
+        self.backend.claim_policy = ClaimPolicy(
+            owner_sha256="a" * 64,
+            executor_sha256=self.harness.spec.executors.freeze,
+            lease=timedelta(minutes=5),
+            dag_id=admitted.dispatch_command.dag_id,
+            dag_run_id="another-run",
+            task_id="freeze",
+            map_index=-1,
+        )
+        with self.assertRaisesRegex(ApplicationError, "admitted dispatch"):
+            self.application.run_stage(self.harness.spec.run_id, "freeze")
+        self.assertEqual(self.freeze.executions, 0)
+
+        self.backend.claim_policy = replace(
+            self.backend.claim_policy,
+            dag_run_id=admitted.dispatch_command.dag_run_id,
+            task_id="discover",
+        )
+        with self.assertRaisesRegex(ApplicationError, "requested stage"):
+            self.application.run_stage(self.harness.spec.run_id, "freeze")
+        self.assertEqual(self.freeze.executions, 0)
+
     def test_execute_run_resumes_after_a_completed_prefix(self):
         self.application.admit(self.harness.spec)
         freeze = self.application.run_stage("run-1", "freeze")
@@ -569,6 +601,51 @@ class StageApplicationTests(unittest.TestCase):
             NativeOperationEffectObserver,
         )
         self.assertEqual(application.missing_capabilities()["reconciliation"], [])
+
+    def test_environment_composition_carries_the_explicit_airflow_task_binding(self):
+        executor = "a" * 64
+        token = self.root / "bound-endpoint.token"
+        token.write_text("t" * 40, encoding="utf-8")
+        token.chmod(0o600)
+        environment = {
+            "PLATFORM_ARTIFACT_ROOT": str(self.root / "bound-cas"),
+            "PLATFORM_SERVICE_DSN": "postgresql://unused/unused",
+            "PIPELINE_WORK_ROOT": str(self.root / "bound-work"),
+            "SOLIDWORKS_ENDPOINT_URL": "http://127.0.0.1:18765",
+            "ENDPOINT_TOKEN_FILE": str(token),
+        }
+        binding = AirflowTaskBinding(
+            dag_id="solidworks_to_urdf",
+            dag_run_id="portal-bound-run",
+            task_id="freeze",
+            map_index=-1,
+        )
+        with patch(
+            "description_pipeline.pipeline.application.tool_record",
+            return_value={"source_sha256": executor},
+        ):
+            application = application_from_environment(
+                environment,
+                airflow_task_binding=binding,
+            )
+        policy = application.services.claim_policy
+        self.assertEqual(policy.dag_id, binding.dag_id)
+        self.assertEqual(policy.dag_run_id, binding.dag_run_id)
+        self.assertEqual(policy.task_id, binding.task_id)
+        self.assertEqual(policy.map_index, binding.map_index)
+
+    def test_airflow_task_binding_rejects_an_invalid_map_index(self):
+        for value in (None, -2, 0.0, True):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ApplicationError,
+                "map_index",
+            ):
+                AirflowTaskBinding(
+                    dag_id="solidworks_to_urdf",
+                    dag_run_id="portal-bound-run",
+                    task_id="freeze",
+                    map_index=value,
+                )
 
 
 if __name__ == "__main__":

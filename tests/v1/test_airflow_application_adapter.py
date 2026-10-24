@@ -51,6 +51,9 @@ class AirflowApplicationAdapterTests(unittest.TestCase):
         self.assertIn("run_id = conf.get", source)
         self.assertIn("application.run_stage(_run_id(context), stage)", source)
         self.assertEqual(source.count("_run_stage("), 7)
+        self.assertIn("airflow_task_binding=binding", source)
+        self.assertIn('task_id != stage', source)
+        self.assertIn('map_index = getattr(task_instance, "map_index", None)', source)
 
 
 if __name__ == "__main__":

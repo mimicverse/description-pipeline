@@ -9,6 +9,7 @@ from airflow.sdk import Param, dag, task
 from airflow.sdk.exceptions import AirflowFailException
 
 from description_pipeline.pipeline.application import (
+    AirflowTaskBinding,
     ApplicationError,
     StageApplication,
     application_from_environment,
@@ -28,15 +29,33 @@ def _run_id(context) -> str:
     return run_id
 
 
-def _application() -> StageApplication:
+def _application(binding: AirflowTaskBinding) -> StageApplication:
     try:
-        return application_from_environment()
+        return application_from_environment(airflow_task_binding=binding)
     except ApplicationError as error:
         raise AirflowFailException(f"{error.code}: {error}") from error
 
 
 def _run_stage(stage: StageId, context) -> dict:
-    application = _application()
+    dag_run = context.get("dag_run")
+    task_instance = context.get("ti")
+    dag_run_id = getattr(dag_run, "run_id", None)
+    task_id = getattr(task_instance, "task_id", None)
+    map_index = getattr(task_instance, "map_index", None)
+    if task_id != stage:
+        raise AirflowFailException(
+            f"Airflow task_id {task_id!r} differs from the requested stage {stage!r}"
+        )
+    try:
+        binding = AirflowTaskBinding(
+            dag_id=DAG_ID,
+            dag_run_id=dag_run_id,
+            task_id=task_id,
+            map_index=map_index,
+        )
+    except ApplicationError as error:
+        raise AirflowFailException(f"{error.code}: {error}") from error
+    application = _application(binding)
     try:
         result = application.run_stage(_run_id(context), stage)
     except ApplicationError as error:

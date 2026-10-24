@@ -96,6 +96,30 @@ class ApplicationPortMissing(ApplicationError):
     """The production composition lacks a required stage capability."""
 
 
+@dataclass(frozen=True, slots=True)
+class AirflowTaskBinding:
+    """The exact Airflow task currently executing one stage command."""
+
+    dag_id: str
+    dag_run_id: str
+    task_id: str
+    map_index: int
+
+    def __post_init__(self) -> None:
+        for name in ("dag_id", "dag_run_id", "task_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or "\x00" in value:
+                raise ApplicationError(
+                    "application.airflow_binding_invalid",
+                    f"Airflow task binding has an invalid {name}",
+                )
+        if type(self.map_index) is not int or self.map_index < -1:
+            raise ApplicationError(
+                "application.airflow_binding_invalid",
+                "Airflow map_index must be -1 for an unmapped task or a non-negative index",
+            )
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -883,6 +907,7 @@ class StageApplication:
 
         if stage not in STAGES:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {stage!r}")
+        self._validate_airflow_task_binding(run_id, stage)
         spec, admission = self._load_spec(run_id)
         self._require_handler(stage)
         if spec.from_stage not in {None, "freeze"}:
@@ -956,6 +981,59 @@ class StageApplication:
             return self.execute_registered_command(stored.command_id)
         raise ApplicationError("application.stage_plan_invalid", "The stage plan ended without a target")
 
+    def _validate_airflow_task_binding(self, run_id: str, stage: StageId) -> None:
+        """Reject a context binding that differs from the admitted dispatch identity."""
+
+        policy = getattr(self.services, "claim_policy", None)
+        if not isinstance(policy, ClaimPolicy):
+            return
+        values = (policy.dag_id, policy.dag_run_id, policy.task_id, policy.map_index)
+        if all(value is None for value in values):
+            return
+        if any(value is None for value in values):
+            raise ApplicationError(
+                "application.airflow_binding_incomplete",
+                "Airflow claims require dag_id, dag_run_id, task_id and map_index together",
+            )
+        binding = AirflowTaskBinding(
+            dag_id=policy.dag_id,
+            dag_run_id=policy.dag_run_id,
+            task_id=policy.task_id,
+            map_index=policy.map_index,
+        )
+        outcome = self.load_admission_outcome(run_id)
+        if outcome is None:
+            raise ApplicationError(
+                "application.airflow_binding_run_missing",
+                "Airflow task binding names an unadmitted run",
+                detail={"run_id": run_id},
+            )
+        dispatch = outcome.dispatch_command
+        if binding.task_id != stage:
+            raise ApplicationError(
+                "application.airflow_binding_stage_mismatch",
+                "Airflow task_id differs from the requested stage",
+                detail={"task_id": binding.task_id, "stage": stage},
+            )
+        if (
+            binding.dag_id != dispatch.dag_id
+            or binding.dag_run_id != dispatch.dag_run_id
+        ):
+            raise ApplicationError(
+                "application.airflow_binding_dispatch_mismatch",
+                "Airflow task binding differs from the admitted dispatch",
+                detail={
+                    "bound": {
+                        "dag_id": binding.dag_id,
+                        "dag_run_id": binding.dag_run_id,
+                    },
+                    "admitted": {
+                        "dag_id": dispatch.dag_id,
+                        "dag_run_id": dispatch.dag_run_id,
+                    },
+                },
+            )
+
     def execute_run(self, run_id: str, *, through: StageId = "publish") -> ApplicationOutcome:
         """Run stages one at a time from one admission; no downstream work is hidden in a handler."""
 
@@ -1019,6 +1097,7 @@ def application_from_environment(
     builders: Mapping[StageId, CommandBuilder] | None = None,
     native_operation_client: NativeOperationClient | None = None,
     reconciliation_adapter: EffectReconciliationAdapter | None = None,
+    airflow_task_binding: AirflowTaskBinding | None = None,
     clock: Callable[[], datetime] = _utc_now,
 ) -> StageApplication:
     """Compose implemented handlers; missing runtime capabilities remain explicit."""
@@ -1032,6 +1111,25 @@ def application_from_environment(
     executor_sha256 = _portable_executor_sha256()
     owner_sha256 = digest({"process": str(uuid.uuid4()), "pid": os.getpid()})
     lease_seconds = float(source.get("PIPELINE_CLAIM_LEASE_SECONDS", "3600"))
+    if airflow_task_binding is None:
+        claim_binding = {
+            "dag_id": None,
+            "dag_run_id": None,
+            "task_id": None,
+            "map_index": None,
+        }
+    elif isinstance(airflow_task_binding, AirflowTaskBinding):
+        claim_binding = {
+            "dag_id": airflow_task_binding.dag_id,
+            "dag_run_id": airflow_task_binding.dag_run_id,
+            "task_id": airflow_task_binding.task_id,
+            "map_index": airflow_task_binding.map_index,
+        }
+    else:
+        raise ApplicationError(
+            "application.airflow_binding_invalid",
+            "airflow_task_binding must be an AirflowTaskBinding",
+        )
     services = CanonicalStageServices(
         facts=facts,
         artifacts=artifacts,
@@ -1040,6 +1138,7 @@ def application_from_environment(
             owner_sha256=owner_sha256,
             executor_sha256=executor_sha256,
             lease=timedelta(seconds=lease_seconds),
+            **claim_binding,
         ),
         clock=clock,
     )
