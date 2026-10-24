@@ -47,7 +47,7 @@ from description_pipeline.pipeline.services import (
     CanonicalStageServices,
     ClaimPolicy,
 )
-from description_pipeline.platform.facts import FactStore
+from description_pipeline.platform.facts import FactStore, RunControlStore
 from tests.sources.selection_support import sealed_selection
 from tests.v1.test_native_operations import _Server
 
@@ -542,6 +542,20 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
             outcome.reason_code,
             "historical_capture.offline_boundary",
         )
+        self.assertEqual(
+            RunControlStore(connect).get_admitted_run(spec.run_id).state,
+            "failed",
+        )
+        with (
+            connect() as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT outcome FROM stage_decision "
+                "WHERE run_id = %s AND stage = 'capture'",
+                (spec.run_id,),
+            )
+            self.assertEqual(cursor.fetchall(), [("failed",)])
         request = observed["request"]
         self.assertEqual(
             len(request["package_files"]),
