@@ -1868,6 +1868,10 @@ def _capture_preparation(root, manifest):
             first_document_identity(path)
             for path in first_journal[0]["initial_pending"]
         }
+        _require(
+            first_top_identity not in first_pending,
+            "Capture first-attempt top cannot be an initial pending candidate",
+        )
         first_candidates = {
             first_document_identity(path)
             for path in first_journal[0]["rebuild_candidates"]

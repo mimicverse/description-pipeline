@@ -1255,6 +1255,26 @@ class CapturePreparationTests(unittest.TestCase):
                 "exact dirty ancestor closure",
             ),
             (
+                "top_initial_pending",
+                lambda journal: (
+                    journal[0].update(
+                        initial_pending=sorted(
+                            [
+                                *journal[0]["initial_pending"],
+                                journal[3]["path"],
+                            ]
+                        ),
+                        rebuild_candidates=sorted(
+                            [
+                                *journal[0]["rebuild_candidates"],
+                                journal[3]["path"],
+                            ]
+                        ),
+                    )
+                ),
+                "top cannot be an initial pending candidate",
+            ),
+            (
                 "pending_decision",
                 lambda journal: journal[1].update(decision="skip_clean"),
                 "pending candidate was not rebuilt",
