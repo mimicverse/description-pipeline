@@ -62,9 +62,9 @@ def verify_snapshot(root: Path) -> dict:
 def load_scene(root: Path) -> dict:
     manifest = verify_snapshot(root)
     if manifest["kind"] == "solidworks":
-        from .solidworks.captured import derive_scene
+        from .solidworks.captured import derive_engineering_input
 
-        return derive_scene(root, manifest)
+        return derive_engineering_input(root, manifest)
     scene = read_data(confined(root, manifest["scene"]))
     if not isinstance(scene, dict):
         raise PipelineError("Source scene must be an object")

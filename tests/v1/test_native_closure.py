@@ -9,7 +9,7 @@ call is recorded by a ``sys.meta_path`` finder with its importing file/line.
 
 The finder sees absolute module names (relative imports included) and
 importlib-driven imports; a positive self-control at the start proves it: a real
-``from .model import Robot`` executed with a src-path frame and a dynamic
+``from .model import EngineeringModel`` executed with a src-path frame and a dynamic
 ``importlib.import_module`` canary must both be recorded, the first attributed
 to ``src/``.  During the real run only test-scaffolding origins are allowed; an
 import originating in ``src/description_pipeline`` fails the proof.
@@ -99,7 +99,7 @@ phase["name"] = "canary"
 evict_forbidden()
 canary_file = str(src_root / "description_pipeline" / "probe_canary.py")
 exec(
-    compile("from .model import Robot\n", canary_file, "exec"),
+    compile("from .model import EngineeringModel\n", canary_file, "exec"),
     {"__package__": "description_pipeline", "__name__": "description_pipeline.probe_canary"},
 )
 evict_forbidden()

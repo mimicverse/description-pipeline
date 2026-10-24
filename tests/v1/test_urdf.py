@@ -11,8 +11,8 @@ from xml.etree import ElementTree as ET
 
 from description_pipeline.backends.urdf import MESH_PART_TRIANGLE_LIMIT, generate_urdf
 from description_pipeline.io import PipelineError, file_digest, read_data
-from description_pipeline.model import Robot
-from description_pipeline.sources.solidworks.naming import material_name, mesh_path
+from description_pipeline.model import EngineeringModel
+from description_pipeline.sources.solidworks.naming import material_name, mesh_path, visual_name
 from description_pipeline.verification.solidworks_urdf import _xml
 
 
@@ -36,9 +36,13 @@ def _mesh_scene(filename: str) -> dict:
     """Fixture scene with base_link's first visual and collision repointed."""
     source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
     scene = read_data(source / "scene.json")
+    scene["name"] = "fixture_arm"
     base = next(link for link in scene["links"] if link["name"] == "base_link")
     for role in ("visuals", "collisions"):
         base[role][0]["filename"] = filename
+        base[role][0]["name"] = visual_name(filename, link=base["name"])
+        if role == "visuals":
+            base[role][0]["material"] = material_name(filename, link=base["name"])
     return scene
 
 
@@ -65,9 +69,10 @@ class UrdfNumericContractTests(unittest.TestCase):
         joint["xyz"] = [0.1, math.pi, 1e-12]
         joint["rpy"] = [-0.0, 2.5, 0.0]
         joint["limits"] = {"lower": 0.1, "upper": math.pi, "effort": 1e-12, "velocity": 2.5}
-        robot = Robot.from_dict(scene)
+        scene["name"] = "numeric_contract"
+        model = EngineeringModel.from_dict(scene)
         with tempfile.TemporaryDirectory() as temp:
-            output = generate_urdf(robot, source, Path(temp), name="numeric_contract")
+            output = generate_urdf(model, source, Path(temp))
             node = next(row for row in ET.parse(output).getroot().findall("joint") if row.get("name") == joint["name"])
             xyz = node.find("origin").attrib["xyz"].split()
             rpy = node.find("origin").attrib["rpy"].split()
@@ -88,8 +93,9 @@ class UrdfWriterTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         scene = read_data(source / "scene.json")
         frame = scene["frames"][0]
+        scene["name"] = "frame_name"
         with tempfile.TemporaryDirectory() as temp:
-            output = generate_urdf(Robot.from_dict(scene), source, Path(temp), name="frame_name")
+            output = generate_urdf(EngineeringModel.from_dict(scene), source, Path(temp))
             document = ET.parse(output).getroot()
         node = next(
             joint
@@ -107,12 +113,12 @@ class UrdfWriterTests(unittest.TestCase):
         duplicate.update({"id": "tool_2", "name": "tool_"})
         duplicate["provenance"]["joint_name_rule"]["child"] = "tool_"
         scene["frames"].append(duplicate)
-        robot = Robot.from_dict(scene)
+        model = EngineeringModel.from_dict(scene)
         with (
             tempfile.TemporaryDirectory() as temp,
             self.assertRaisesRegex(PipelineError, "Frame fixed joint name collides"),
         ):
-            generate_urdf(robot, source, Path(temp), name="frame_collision")
+            generate_urdf(model, source, Path(temp))
 
     def test_authored_joint_cannot_reserve_the_derived_frame_joint_name(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
@@ -133,23 +139,24 @@ class UrdfWriterTests(unittest.TestCase):
             }
         )
         with self.assertRaisesRegex(PipelineError, "collide"):
-            Robot.from_dict(scene)
+            EngineeringModel.from_dict(scene)
 
     def test_broken_joint_reference_is_rejected_before_writing(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         scene = read_data(source / "scene.json")
         scene["joints"][0]["child"] = "missing_link"
         with self.assertRaisesRegex(PipelineError, "Unknown joint endpoint"):
-            Robot.from_dict(scene)
+            EngineeringModel.from_dict(scene)
 
     def test_diagnostic_urdf_preserves_declared_zero_limits(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         scene = read_data(source / "scene.json")
         joint = next(row for row in scene["joints"] if row["type"] == "revolute")
         joint["limits"] = {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0}
-        robot = Robot.from_dict(scene)
+        scene["name"] = "diagnostic_arm"
+        model = EngineeringModel.from_dict(scene)
         with tempfile.TemporaryDirectory() as temp:
-            output = generate_urdf(robot, source, Path(temp), name="diagnostic_arm")
+            output = generate_urdf(model, source, Path(temp))
             node = next(row for row in ET.parse(output).getroot().findall("joint") if row.get("name") == joint["name"])
             self.assertEqual(
                 {key: float(value) for key, value in node.find("limit").attrib.items()},
@@ -173,9 +180,10 @@ class UrdfWriterTests(unittest.TestCase):
                 "objects": [{"object": joint["name"], "field": "limits"}],
             }
         )
-        robot = Robot.from_dict(scene)
+        scene["name"] = "default_policy_arm"
+        model = EngineeringModel.from_dict(scene)
         with tempfile.TemporaryDirectory() as temp:
-            output = generate_urdf(robot, source, Path(temp), name="default_policy_arm")
+            output = generate_urdf(model, source, Path(temp))
             parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
             document = ET.fromstring(output.read_bytes(), parser=parser)
         node = next(row for row in document.findall("joint") if row.get("name") == joint["name"])
@@ -199,7 +207,8 @@ class UrdfWriterTests(unittest.TestCase):
                         for name in ("joint:left", "joint:right--special")],
         }]
         with tempfile.TemporaryDirectory() as temp:
-            output = generate_urdf(Robot.from_dict(scene), source, Path(temp), name="warning_test")
+            scene["name"] = "warning_test"
+            output = generate_urdf(EngineeringModel.from_dict(scene), source, Path(temp))
             parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
             document = ET.fromstring(output.read_bytes(), parser=parser)
         comments = [child.text or "" for child in document if child.tag is ET.Comment]
@@ -218,12 +227,13 @@ class UrdfWriterTests(unittest.TestCase):
             "objects": [{"object": name, "field": "limits", "hardware_qualified": False}
                         for name in ("joint:left", "joint:right")],
         }]
-        robot = Robot.from_dict(scene)
+        scene["name"] = "warning_test"
+        model = EngineeringModel.from_dict(scene)
         with tempfile.TemporaryDirectory() as temp:
-            output = generate_urdf(robot, source, Path(temp), name="warning_test")
+            output = generate_urdf(model, source, Path(temp))
             original = output.read_bytes()
             definition = {"source": {"robot_name": "warning_test"}}
-            _xml(Path(temp), definition, robot.to_dict())
+            _xml(Path(temp), definition, model.to_dict())
             for old, new in (
                 (b'"object": "joint:left"', b'"object": "joint:wrong"'),
                 (b'"field": "limits"', b'"field": "mass"'),
@@ -232,23 +242,25 @@ class UrdfWriterTests(unittest.TestCase):
                 with self.subTest(change=new):
                     output.write_bytes(original.replace(old, new, 1))
                     with self.assertRaisesRegex(PipelineError, "value-provenance warnings differ"):
-                        _xml(Path(temp), definition, robot.to_dict())
+                        _xml(Path(temp), definition, model.to_dict())
             start = original.index(b"<!--")
             end = original.index(b"-->", start) + 3
             output.write_bytes(original[:start] + original[end:])
             with self.assertRaisesRegex(PipelineError, "value-provenance warnings differ"):
-                _xml(Path(temp), definition, robot.to_dict())
+                _xml(Path(temp), definition, model.to_dict())
 
     def test_mesh_delivery_is_self_contained_and_deterministic(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
-        robot = Robot.from_dict(read_data(source / "scene.json"))
-        original = robot.to_dict()
+        scene = read_data(source / "scene.json")
+        scene["name"] = "fixture_arm"
+        model = EngineeringModel.from_dict(scene)
+        original = model.to_dict()
         with tempfile.TemporaryDirectory() as temp:
             first, second = Path(temp) / "first", Path(temp) / "second"
             first.mkdir()
             second.mkdir()
-            output = generate_urdf(robot, source, first, name="fixture_arm")
-            other = generate_urdf(robot, source, second, name="fixture_arm")
+            output = generate_urdf(model, source, first)
+            other = generate_urdf(model, source, second)
             self.assertEqual(output.read_bytes(), other.read_bytes())
             document = ET.parse(output).getroot()
             self.assertEqual(document.get("name"), "fixture_arm")
@@ -259,7 +271,7 @@ class UrdfWriterTests(unittest.TestCase):
                 self.assertTrue(path.is_relative_to(first))
                 self.assertTrue(path.is_file())
                 self.assertEqual(file_digest(path), file_digest(second / path.relative_to(first)))
-            self.assertEqual(robot.to_dict(), original)
+            self.assertEqual(model.to_dict(), original)
             self.assertNotIn(b"\r\n", output.read_bytes())
 
     def test_mesh_at_part_limit_keeps_the_single_delivery_name(self):
@@ -267,9 +279,9 @@ class UrdfWriterTests(unittest.TestCase):
             root = Path(temp)
             original = _binary_stl(MESH_PART_TRIANGLE_LIMIT)
             source = _staged_source(root, original)
-            robot = Robot.from_dict(_mesh_scene("geometry/big.stl"))
+            model = EngineeringModel.from_dict(_mesh_scene("geometry/big.stl"))
             destination = root / "delivery"
-            output = generate_urdf(robot, source, destination, name="fixture_arm")
+            output = generate_urdf(model, source, destination)
             node = next(link for link in ET.parse(output).getroot().findall("link") if link.get("name") == "base_link")
             expected = "../" + mesh_path(file_digest(source / "geometry/big.stl"), namespace="fixture_arm")
             self.assertEqual(
@@ -287,11 +299,11 @@ class UrdfWriterTests(unittest.TestCase):
             source = _staged_source(root, original)
             source_file = source / "geometry/big.stl"
             before = file_digest(source_file)
-            robot = Robot.from_dict(_mesh_scene("geometry/big.stl"))
-            canonical = robot.to_dict()
+            model = EngineeringModel.from_dict(_mesh_scene("geometry/big.stl"))
+            canonical = model.to_dict()
             first, second = root / "first", root / "second"
-            output = generate_urdf(robot, source, first, name="fixture_arm")
-            generate_urdf(robot, source, second, name="fixture_arm")
+            output = generate_urdf(model, source, first)
+            generate_urdf(model, source, second)
             links = {link.get("name"): link for link in ET.parse(output).getroot().findall("link")}
             base = links["base_link"]
             visuals = base.findall("visual")
@@ -327,7 +339,7 @@ class UrdfWriterTests(unittest.TestCase):
                 self.assertEqual(_floats(collision.find("geometry/mesh").get("scale")), [1.0, 1.0, 1.0])
                 self.assertIsNone(collision.find("material"))
             self.assertEqual(file_digest(source_file), before)
-            self.assertEqual(robot.to_dict(), canonical)
+            self.assertEqual(model.to_dict(), canonical)
             self.assertEqual((first / "urdf/robot.urdf").read_bytes(), (second / "urdf/robot.urdf").read_bytes())
 
     def test_non_binary_stl_mesh_is_rejected(self):
@@ -343,9 +355,7 @@ class UrdfWriterTests(unittest.TestCase):
                 destination = root / "delivery"
                 destination.mkdir()
                 with self.assertRaises(PipelineError) as caught:
-                    generate_urdf(
-                        Robot.from_dict(_mesh_scene("geometry/bad.stl")), source, destination, name="fixture_arm"
-                    )
+                    generate_urdf(EngineeringModel.from_dict(_mesh_scene("geometry/bad.stl")), source, destination)
                 self.assertIn("binary STL", str(caught.exception))
 
     def test_primitive_visuals_keep_their_geometry_elements(self):
@@ -379,7 +389,8 @@ class UrdfWriterTests(unittest.TestCase):
             },
         ]
         with tempfile.TemporaryDirectory() as temp:
-            output = generate_urdf(Robot.from_dict(scene), source, Path(temp), name="fixture_arm")
+            scene["name"] = "fixture_arm"
+            output = generate_urdf(EngineeringModel.from_dict(scene), source, Path(temp))
             node = next(link for link in ET.parse(output).getroot().findall("link") if link.get("name") == "base_link")
             visuals = node.findall("visual")
             self.assertEqual(len(visuals), 3)

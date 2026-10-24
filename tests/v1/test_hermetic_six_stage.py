@@ -804,6 +804,32 @@ class HermeticSixStageTests(unittest.TestCase):
         )
         self.assertIs(with_required_receipts["passed"], False)
 
+    def test_verify_rereads_the_subject_and_native_receipts_before_success(self) -> None:
+        from description_pipeline.verification import solidworks_urdf as quality
+
+        _original_handoff, native, _verified = self._generate_and_verify()
+        seed = self.root / "generate"
+        expected_subject = read_delivery_manifest(seed)["subject"]["digest"]
+        original_check = quality.check_bundle
+
+        def check_then_append_to_tool(*args, **kwargs):
+            report = original_check(*args, **kwargs)
+            tool = Path(args[0]) / "tool.json"
+            tool.write_bytes(tool.read_bytes() + b"\n")
+            return report
+
+        with patch.object(quality, "check_bundle", side_effect=check_then_append_to_tool):
+            receipt = solidworks.verify(
+                seed,
+                self.root / "verify-race",
+                run_id=RUN_ID,
+                expected_subject=expected_subject,
+                handoff_sha256=native["capture"]["handoff_sha256"],
+                prior_events=self.events,
+            )
+        self.assertEqual(receipt["state"], "failed", receipt)
+        self.assertIn("changed after the final report was replayed", receipt["error"])
+
     def _capture_with_environment_mutation(self, mutate) -> tuple[Path, dict]:
         from description_pipeline.sources.solidworks import freeze as freeze_module
 

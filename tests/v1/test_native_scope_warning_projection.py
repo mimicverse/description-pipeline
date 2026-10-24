@@ -35,7 +35,7 @@ from description_pipeline.geometry.native_u import (
     native_tolerant_edge_warning_details_match,
 )
 from description_pipeline.io import PipelineError, canonical_json_value, write_json
-from description_pipeline.model import Robot
+from description_pipeline.model import EngineeringModel
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.portal import (
     PortalError,
@@ -386,13 +386,13 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         scene = json.loads(
             (source / "scene.json").read_text(encoding="utf-8")
         )
+        scene["name"] = "native_warning"
         scene["provenance"]["value_warnings"] = [value_warning]
         with tempfile.TemporaryDirectory() as directory:
             output = generate_urdf(
-                Robot.from_dict(scene),
+                EngineeringModel.from_dict(scene),
                 source,
                 Path(directory),
-                name="native_warning",
             )
             parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
             document = ET.fromstring(output.read_bytes(), parser=parser)

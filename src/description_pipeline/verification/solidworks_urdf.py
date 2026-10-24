@@ -3129,51 +3129,9 @@ def _tool(root, native_receipts=None):
 
 
 def _xml(root, definition, model):
-    path = confined(root, "urdf/robot.urdf")
-    payload = path.read_bytes()
-    _require(
-        b"<!DOCTYPE" not in payload.upper() and b"<!ENTITY" not in payload.upper(), "XML declarations are forbidden"
-    )
-    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
-    document = ET.fromstring(payload, parser=parser)
-    robot_name = (definition.get("source") or {}).get("robot_name")
-    _require(isinstance(robot_name, str) and bool(robot_name), "The input definition carries no robot label")
-    _require(document.tag == "robot" and document.get("name") == robot_name, "Wrong URDF robot identity")
-    expected_comments = []
-    for item in (model.get("provenance") or {}).get("value_warnings") or []:
-        if not isinstance(item, dict) or not item.get("code"):
-            continue
-        objects = item.get("objects")
-        for subject in objects if isinstance(objects, list) and objects else [{}]:
-            detail = {"message": item.get("message", ""), "provenance": subject}
-            payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
-            code = str(item["code"]).replace("--", "- -")
-            expected_comments.append(f"WARNING {code}: {payload} See reports/quality.json.")
-    comments = [child for child in document if child.tag is ET.Comment]
-    _require(
-        [child.text for child in comments] == expected_comments,
-        "URDF value-provenance warnings differ from the model",
-    )
-    _require(
-        {child.tag for child in document if child.tag is not ET.Comment} <= {"link", "joint"},
-        "Unexpected top-level URDF extension",
-    )
-    links = document.findall("link")
-    joints = document.findall("joint")
-    link_names = [element.get("name", "") for element in links]
-    joint_names = [element.get("name", "") for element in joints]
-    _require(
-        len(set(link_names)) == len(link_names) and len(set(joint_names)) == len(joint_names), "Duplicate URDF name"
-    )
-    _require(all(_NAME.fullmatch(name) for name in link_names + joint_names), "URDF names must be snake_case")
-    expected_links = {link["name"] for link in model["links"]} | {frame["name"] for frame in model["frames"]}
-    expected_joints = {joint["name"] for joint in model["joints"]} | {
-        fixed_joint_name(str(frame["parent"]), str(frame["name"])) for frame in model["frames"]
-    }
-    _require(
-        set(link_names) == expected_links and set(joint_names) == expected_joints,
-        "URDF entity set differs from canonical model",
-    )
+    from .actual_urdf import read_and_validate_actual_urdf
+
+    document, _details = read_and_validate_actual_urdf(root, definition, model)
     return document
 
 
@@ -4267,9 +4225,9 @@ def _portable_details(value, root):
 
 
 def _model(root):
-    from ..model import Robot
+    from ..model import EngineeringModel
 
-    return Robot.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
+    return EngineeringModel.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
 
 
 #: The sealed records each qualification fact's conclusion is read from

@@ -44,6 +44,8 @@ def seal_capture(
     upload_sha256: str,
     main_assembly: str,
     native_tool: dict,
+    upstream_artifacts=None,
+    execution=None,
 ) -> dict:
     """Seal a completed Windows capture into one closed, self-describing archive."""
 
@@ -57,6 +59,8 @@ def seal_capture(
         upload_sha256=upload_sha256,
         main_assembly=main_assembly,
         native_tool=native_tool,
+        upstream_artifacts=upstream_artifacts,
+        execution=execution,
     )
     files = manifest["files"]
     archive.parent.mkdir(parents=True, exist_ok=True)
@@ -175,6 +179,8 @@ def admit_capture(
     expected_native_tool: dict,
     expected_prepared_dir: str | None = None,
     expected_prepared_files: dict[str, str] | None = None,
+    expected_upstream_artifacts=None,
+    expected_execution=None,
 ) -> dict:
     """Admit one transferred capture: validate in private staging, then install atomically."""
 
@@ -197,6 +203,8 @@ def admit_capture(
             native_prepared_dir=expected_prepared_dir,
             native_prepared_files=expected_prepared_files,
             capture_only=True,
+            expected_upstream_artifacts=expected_upstream_artifacts,
+            expected_execution=expected_execution,
         )
         manifest = read_data(staging / CAPTURE_MANIFEST)
         os.replace(staging, destination)
