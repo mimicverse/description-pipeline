@@ -28,6 +28,7 @@ from description_pipeline.pipeline.admission import AdmissionSpec
 from description_pipeline.pipeline.application import StageApplication
 from description_pipeline.pipeline.capture import CaptureHandler
 from description_pipeline.pipeline.discover import DiscoverHandler
+from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.freeze import (
     FreezeHandler,
 )
@@ -42,8 +43,14 @@ from description_pipeline.pipeline.services import (
     CanonicalStageServices,
     ClaimPolicy,
 )
+from description_pipeline.pipeline.reconciliation import EffectReconciliationService
 from description_pipeline.pipeline.stages.generate import GenerateHandler
-from description_pipeline.pipeline.stages.publish import PublishHandler
+from description_pipeline.pipeline.stages.publish import (
+    PR_EFFECT_KEY,
+    PublishHandler,
+    PublishIncomplete,
+    PublishPullRequestReconciliationAdapter,
+)
 from description_pipeline.pipeline.verify import VerifyHandler
 from description_pipeline.platform.facts import FactStore
 from description_pipeline.schemas import (
@@ -126,6 +133,25 @@ def _qualified_backend(package: Path) -> QualifiedFixtureBackend:
             "CS_arm_link": support.placement((0.0, 0.0, 0.1)),
         },
     )
+
+
+class _UnknownPullRequests(_PullRequests):
+    """Lose the create response on the first observation without losing the row."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hide_next_observe = False
+
+    def create(self, **kwargs):
+        super().create(**kwargs)
+        self.hide_next_observe = True
+        raise RuntimeError("controlled pull-request response loss")
+
+    def observe(self, **kwargs):
+        if self.hide_next_observe:
+            self.hide_next_observe = False
+            return ()
+        return super().observe(**kwargs)
 
 
 @unittest.skipUnless(
@@ -220,18 +246,25 @@ class RealSixStageChainTests(unittest.TestCase):
         self.facts = FactStore(self._connect, self.store)
         self._bind_services()
 
-    def _bind_services(self) -> None:
+    def _bind_services(
+        self,
+        *,
+        owner: str = "real-six-stage",
+        now: datetime | None = None,
+        work_suffix: str = "",
+    ) -> None:
+        current = datetime(2026, 10, 25, tzinfo=UTC) if now is None else now
         self.services = CanonicalStageServices(
             facts=self.facts,
             artifacts=self.store,
-            work_root=self.root / "engine-work",
+            work_root=self.root / f"engine-work{work_suffix}",
             claim_policy=ClaimPolicy(
-                owner_sha256=digest({"owner": "real-six-stage"}),
+                owner_sha256=digest({"owner": owner}),
                 executor_sha256=self.portable["source_sha256"],
                 lease=timedelta(minutes=10),
                 claim_id_factory=lambda: "chain-claim-" + uuid.uuid4().hex,
             ),
-            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+            clock=lambda: current,
         )
 
     def _connect(self):
@@ -408,8 +441,16 @@ class RealSixStageChainTests(unittest.TestCase):
                 text=True,
             )
 
-    def _application(self) -> StageApplication:
-        self.pull_requests = _PullRequests()
+    def _application(
+        self,
+        *,
+        pull_requests=None,
+        reconciler=None,
+        reconciliation_adapter=None,
+        clock: datetime | None = None,
+    ) -> StageApplication:
+        self.pull_requests = pull_requests or _PullRequests()
+        current = datetime(2026, 10, 25, tzinfo=UTC) if clock is None else clock
         discover = DiscoverHandler(
             ArchiveDiscoverAdapter(
                 artifacts=self.store,
@@ -448,7 +489,9 @@ class RealSixStageChainTests(unittest.TestCase):
                 ),
             },
             builders={},
-            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+            clock=lambda: current,
+            reconciler=reconciler,
+            reconciliation_adapter=reconciliation_adapter,
         )
 
     def test_production_intake_completes_the_real_six_stage_chain(self) -> None:
@@ -753,6 +796,140 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("verify", "failed"),
             ],
         )
+
+    def test_real_chain_reconciles_unknown_publish_effect_after_restart(self) -> None:
+        pull_requests = _UnknownPullRequests()
+        application = self._application(pull_requests=pull_requests)
+        factory_work = self.root / "unknown-factory-work"
+        factory_work.mkdir()
+        with (
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=copy.deepcopy(self.native),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.generate.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.publish.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+        ):
+            load_production_admission(
+                application,
+                self._production_request(),
+                artifacts=self.store,
+                platform_snapshot=self._platform_snapshot(),
+                native_tool_provider=lambda: copy.deepcopy(self.native),
+                work_root=factory_work,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+                portable_tool_provider=lambda: copy.deepcopy(self.portable),
+            )
+            with self.assertRaisesRegex(PublishIncomplete, "publish.pr_unknown"):
+                application.execute_run(RUN_ID)
+
+        self.assertEqual(pull_requests.create_calls, 1)
+        self.assertEqual(len(pull_requests.rows), 1)
+        command = self.facts.load_stage_command(RUN_ID, "publish")
+        unknown = self.facts.effect_settlement_for_key(
+            command.command_id,
+            PR_EFFECT_KEY,
+        )
+        self.assertIsNotNone(unknown)
+        self.assertIs(unknown.state, EffectState.UNKNOWN)
+        with (
+            self._connect() as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT stage, outcome FROM stage_decision "
+                "WHERE run_id = %s "
+                "ORDER BY array_position("
+                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                " stage)",
+                (RUN_ID,),
+            )
+            self.assertEqual(
+                cursor.fetchall(),
+                [
+                    ("freeze", "completed"),
+                    ("discover", "completed"),
+                    ("capture", "completed"),
+                    ("generate", "completed"),
+                    ("verify", "completed"),
+                ],
+            )
+
+        later = datetime(2026, 10, 25, 0, 15, tzinfo=UTC)
+        self._bind_services(
+            owner="real-six-stage-restart",
+            now=later,
+            work_suffix="-restart",
+        )
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.store,
+            work_root=self.root / "restart-reconciliation",
+            observer_tool_sha256=digest({"tool": "publish-read-observer"}),
+            clock=lambda: later,
+        )
+        restarted = self._application(
+            pull_requests=pull_requests,
+            reconciler=reconciler,
+            reconciliation_adapter=PublishPullRequestReconciliationAdapter(
+                pull_requests
+            ),
+            clock=later,
+        )
+        reconciled = restarted.reconcile_effect(
+            command_id=command.command_id,
+            effect_key=PR_EFFECT_KEY,
+        )
+        self.assertIs(reconciled.settlement.state, EffectState.SATISFIED)
+        with (
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=copy.deepcopy(self.native),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.generate.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.publish.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+        ):
+            outcome = restarted.execute_run(RUN_ID)
+
+        self.assertEqual(outcome.outcome, "completed", repr(outcome))
+        self.assertEqual(outcome.stage, "publish")
+        self.assertEqual(pull_requests.create_calls, 1)
+        self.assertEqual(len(pull_requests.rows), 1)
+        with (
+            self._connect() as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT stage, outcome FROM stage_decision "
+                "WHERE run_id = %s "
+                "ORDER BY array_position("
+                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                " stage)",
+                (RUN_ID,),
+            )
+            self.assertEqual(
+                cursor.fetchall(),
+                [
+                    ("freeze", "completed"),
+                    ("discover", "completed"),
+                    ("capture", "completed"),
+                    ("generate", "completed"),
+                    ("verify", "completed"),
+                    ("publish", "completed"),
+                ],
+            )
 
 if __name__ == "__main__":
     unittest.main()
