@@ -3446,8 +3446,30 @@ class SolidWorksBackend(CadBackend):
                 "a session artifact has no canonical controlled temporary root",
                 {"path": str(path), "role": role},
             )
-        session_pid = session.identity().get("pid")
-        if type(session_pid) is int and session_pid > 0 and session_root_pid(artifact_root) != session_pid:
+        try:
+            session_identity = session.identity()
+        except Exception as error:  # noqa: BLE001 - unreadable ownership must fail before mutation
+            raise CadError(
+                "cad_materialization_session_mismatch",
+                "the owning CAD session identity could not be read",
+                {
+                    "path": str(path),
+                    "role": role,
+                    "error": f"{type(error).__name__}: {error}"[:300],
+                },
+            ) from error
+        session_pid = session_identity.get("pid") if isinstance(session_identity, dict) else None
+        if type(session_pid) is not int or session_pid <= 0:
+            raise CadError(
+                "cad_materialization_session_mismatch",
+                "the owning CAD session has no valid process id",
+                {
+                    "path": str(path),
+                    "role": role,
+                    "session_pid": session_pid,
+                },
+            )
+        if session_root_pid(artifact_root) != session_pid:
             raise CadError(
                 "cad_materialization_session_mismatch",
                 "a session artifact root does not match the owning process id",

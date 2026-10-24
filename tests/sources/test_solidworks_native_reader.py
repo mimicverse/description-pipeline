@@ -554,7 +554,11 @@ class _Session:
         return None
 
     def identity(self):
-        return {"reader": "portable-mock"}
+        return {
+            "pid": 21040,
+            "reader": "portable-mock",
+            "state": "closed" if self.closed else "active",
+        }
 
 
 class _CaptureBackend(SolidWorksBackend):

@@ -201,12 +201,16 @@ class _Doc:
 
 
 class _Session:
-    def __init__(self, pid, *, state="active"):
+    def __init__(self, pid, *, state="active", include_pid=True):
         self._pid = pid
         self.closed = state == "closed"
+        self._include_pid = include_pid
 
     def identity(self):
-        return {"pid": self._pid, "state": "closed" if self.closed else "active"}
+        identity = {"state": "closed" if self.closed else "active"}
+        if self._include_pid:
+            identity["pid"] = self._pid
+        return identity
 
 
 class _Backend(SolidWorksBackend):
@@ -913,6 +917,41 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "cad_materialization_session_ambiguous")
         self.assertEqual(virtual.rebuild_calls, 0)
         self.assertEqual(top.rebuild_calls, 0)
+
+    def test_virtual_assembly_with_invalid_session_pid_blocks_before_rebuild(self):
+        cases = (
+            ("missing", None, False),
+            ("null", None, True),
+            ("zero", 0, True),
+            ("text", "1234", True),
+        )
+        for label, pid, include_pid in cases:
+            with self.subTest(label=label):
+                virtual = _Doc(VIRTUAL_ASSEMBLY, needs_rebuild2=1)
+                top = _Doc(
+                    PATH,
+                    children=[
+                        _Component(
+                            "virtual-1",
+                            virtual,
+                            is_virtual=True,
+                        )
+                    ],
+                )
+                backend = _Backend(
+                    {PATH: top, VIRTUAL_ASSEMBLY: virtual},
+                )
+                backend._sessions = {
+                    "copy": _Session(pid, include_pid=include_pid),
+                }
+                with patch(
+                    "description_pipeline.sources.solidworks.native._hash",
+                    return_value="f" * 64,
+                ), self.assertRaises(CadError) as caught:
+                    backend._rebuild_capture_copy(top, PATH)
+                self.assertEqual(caught.exception.code, "cad_materialization_session_mismatch")
+                self.assertEqual(virtual.rebuild_calls, 0)
+                self.assertEqual(top.rebuild_calls, 0)
 
     def test_file_backed_dependency_outside_the_copy_is_rejected(self):
         for path, document_type in (
