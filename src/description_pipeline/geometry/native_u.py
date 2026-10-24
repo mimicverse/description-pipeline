@@ -1753,9 +1753,11 @@ def native_open_edge_boundary_identity(
     if (
         not isinstance(fin_endpoint_success, tuple)
         or len(fin_endpoint_success) != 2
-        or any(type(value) is not bool or value is not True for value in fin_endpoint_success)
+        or any(type(value) is not bool for value in fin_endpoint_success)
     ):
-        raise ValueError("both fin endpoints require successful GetParameter")
+        raise ValueError("fin endpoint U availability must be strict booleans")
+    # ``False`` is the already validated closest-point fallback.  The caller
+    # retains that raw status and independently recomputes the fallback rule.
     if (
         not isinstance(fin_endpoint_u, tuple)
         or len(fin_endpoint_u) != 2

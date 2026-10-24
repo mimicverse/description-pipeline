@@ -3200,6 +3200,44 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(mapping["complete_match_count"], 1)
         self.assertIs(mapping["unique"], True)
 
+    def test_open_boundary_identity_accepts_validated_closest_fallback(self):
+        identity = native_open_edge_boundary_identity(
+            component="part-1",
+            scope_binding=fixture_open_edge_scope_binding(),
+            edge_reference_sha256=hashlib.sha256(
+                b"fallback-edge"
+            ).hexdigest(),
+            edge_endpoint_refs=(
+                hashlib.sha256(b"fallback-start").hexdigest(),
+                hashlib.sha256(b"fallback-end").hexdigest(),
+            ),
+            edge_start_point=(0.0, 0.0, 0.0),
+            edge_end_point=(1.0, 0.0, 0.0),
+            fin_id=88,
+            fin_vertex_ids=(116, 117),
+            fin_start_point=(0.0, 0.0, 0.0),
+            fin_end_point=(1.0, 0.0, 0.0),
+            curve_start_point=(0.0, 0.0, 0.0),
+            curve_end_point=(1.0, 0.0, 0.0),
+            curve_u_min=0.0,
+            curve_u_max=1.0,
+            fin_endpoint_u=(0.0, 1.0),
+            fin_endpoint_success=(True, False),
+            curve_sense=False,
+            gap_m=5e-7,
+            body_type=1,
+            face_count=1,
+            cofin_raw_id=-1,
+            edge_fin_ids=(88, 89),
+            topology_set_accepted=True,
+        )
+
+        self.assertEqual(identity["identity_mode"], "full_edge")
+        self.assertEqual(
+            identity["selected_fin_to_edge"],
+            {"start": "start", "end": "end"},
+        )
+
     def test_open_boundary_identity_rejects_wrong_segment_boundary(self):
         with self.assertRaisesRegex(
             ValueError,
