@@ -1208,6 +1208,74 @@ class CapturePreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "extra native calls"):
             self.validate(value)
 
+    def test_recovery_consumer_rejects_first_attempt_journal_state_drift(self) -> None:
+        cases = (
+            (
+                "missing_candidate",
+                lambda journal: journal[0].update(rebuild_candidates=[]),
+                "exact dirty ancestor closure",
+            ),
+            (
+                "extra_candidate",
+                lambda journal: journal[0].update(
+                    rebuild_candidates=sorted(
+                        [
+                            *journal[0]["rebuild_candidates"],
+                            journal[3]["path"],
+                        ]
+                    )
+                ),
+                "exact dirty ancestor closure",
+            ),
+            (
+                "pending_decision",
+                lambda journal: journal[1].update(decision="skip_clean"),
+                "pending candidate was not rebuilt",
+            ),
+            (
+                "child_read_only",
+                lambda journal: journal[2]["state_after"].update(
+                    read_only=False
+                ),
+                "child rebuild changed state",
+            ),
+            (
+                "child_configuration",
+                lambda journal: (
+                    journal[2]["state_after"].update(configuration="Other"),
+                    journal[2]["state_after"]["configurations"].append(
+                        {
+                            "name": "Other",
+                            "needs_rebuild": False,
+                            "add_rebuild_save_mark": False,
+                        }
+                    ),
+                ),
+                "child rebuild changed state",
+            ),
+            (
+                "failed_top_before_identity",
+                lambda journal: journal[3]["state_before"].update(path=PART),
+                "top failure lacks the sticky state",
+            ),
+            (
+                "failed_top_before_pending",
+                lambda journal: journal[3]["state_before"].update(
+                    needs_rebuild2_value=0
+                ),
+                "top failure lacks the sticky state",
+            ),
+        )
+        for label, mutate, pattern in cases:
+            with self.subTest(case=label):
+                value = recovery_payload()
+                journal = self.preparation(value)["session_recovery"][
+                    "first_attempt"
+                ]["rebuild_calls"]
+                mutate(journal)
+                with self.assertRaisesRegex(PipelineError, pattern):
+                    self.validate(value)
+
     def test_recovery_consumer_rejects_an_unclean_retirement(self) -> None:
         value = recovery_payload()
         recovery = self.preparation(value)["session_recovery"]

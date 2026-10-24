@@ -1814,6 +1814,40 @@ def _capture_preparation(root, manifest):
             )
             return next(iter(matches))
 
+        first_by_instance = {
+            item["instance"]: item for item in first_topology
+        }
+        first_top_identity = first_document_identity(top_path)
+        first_parents_by_document = {}
+        for item in first_topology:
+            if (
+                item["instance"] == "top"
+                or item["storage_scope"] == "suppressed"
+                or item["document_type"] != 2
+            ):
+                continue
+            parent_instance = (
+                "top"
+                if item["depth"] == 1
+                else item["instance"].rsplit("/", 1)[0]
+            )
+            parent = first_by_instance.get(parent_instance)
+            _require(
+                parent is not None
+                and parent["document_type"] == 2
+                and parent["depth"] == item["depth"] - 1,
+                "Capture first-attempt assembly has no exact parent",
+            )
+            parent_identity = (
+                first_top_identity
+                if parent_instance == "top"
+                else first_document_identity(parent["document_path"])
+            )
+            first_parents_by_document.setdefault(
+                first_document_identity(item["document_path"]),
+                set(),
+            ).add(parent_identity)
+
         first_journal = first_attempt["rebuild_calls"]
         _require(
             isinstance(first_journal, list)
@@ -1838,10 +1872,22 @@ def _capture_preparation(root, manifest):
             first_document_identity(path)
             for path in first_journal[0]["rebuild_candidates"]
         }
+        expected_candidates = set(first_pending)
+        pending = list(first_pending)
+        while pending:
+            child = pending.pop()
+            for parent in first_parents_by_document.get(child, set()):
+                if (
+                    parent == first_top_identity
+                    or parent in expected_candidates
+                ):
+                    continue
+                expected_candidates.add(parent)
+                pending.append(parent)
         _require(
-            first_pending <= first_candidates
-            and first_candidates <= set(first_assembly_rows),
-            "Capture first-attempt journal lies outside its assembly graph",
+            first_pending <= set(first_assembly_rows)
+            and first_candidates == expected_candidates,
+            "Capture first-attempt candidates differ from the exact dirty ancestor closure",
         )
         sequence = 1
         for identity in sorted(
@@ -1887,6 +1933,10 @@ def _capture_preparation(root, manifest):
             sequence += 1
             if state["needs_rebuild2_value"] in (1, 2):
                 _require(
+                    candidate["decision"] == "rebuild",
+                    "Capture first-attempt pending candidate was not rebuilt",
+                )
+                _require(
                     sequence < len(first_journal) - 1,
                     "Capture first-attempt journal ended before a child call",
                 )
@@ -1922,9 +1972,12 @@ def _capture_preparation(root, manifest):
                 )
                 _require(
                     first_document_identity(child_after["path"]) == identity
+                    and child_after["configuration"]
+                    == state["configuration"]
+                    and child_after["read_only"] == state["read_only"]
                     and child_after["needs_rebuild2_value"] == 0
                     and child_after["configuration_needs_rebuild"] is False,
-                    "Capture first-attempt child rebuild did not converge",
+                    "Capture first-attempt child rebuild changed state or did not converge",
                 )
                 sequence += 1
             else:
@@ -1975,7 +2028,12 @@ def _capture_preparation(root, manifest):
             "Capture first-attempt top state_after",
         )
         _require(
-            before_top["configuration"] == configuration
+            _same_native_path(before_top["path"], top_path)
+            and before_top["read_only"] is True
+            and before_top["configuration"] == configuration
+            and before_top["needs_rebuild2_value"] in (1, 2)
+            and before_top["configuration_needs_rebuild"] is False
+            and _same_native_path(failed_state["path"], top_path)
             and failed_state["configuration"] == configuration
             and failed_state["read_only"] is True
             and failed_state["needs_rebuild2_value"] in (1, 2)
