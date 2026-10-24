@@ -1181,6 +1181,24 @@ def _capture_document_identity(doc, path, phase, state=None):
     return document, configuration
 
 
+def _capture_topology_sort_key(row):
+    """Stable ordering for exact before/after capture topology comparison."""
+
+    return tuple(
+        "" if row.get(key) is None else str(row.get(key))
+        for key in (
+            "instance",
+            "normalized_path",
+            "document_type",
+            "referenced_configuration",
+            "depth",
+            "suppression_state",
+            "storage_scope",
+            "provenance_state",
+        )
+    )
+
+
 def _discovery_document_state(doc):
     """Observe saved/rebuild status; never refresh or rewrite engineering data."""
 
@@ -4755,11 +4773,12 @@ class SolidWorksBackend(CadBackend):
         return doc, state
 
     def _capture_rebuild_graph(self, doc, path):
-        """Return unique file-backed assembly documents in child-to-parent order."""
+        """Return unique assembly documents, dependencies, and exact live topology."""
 
         normalized_top = normalize_document_path(os.path.abspath(path))
         if not any(normalized_top.startswith(root + "\\") for root in self._capture_roots):
             raise CadError("cad_rebuild_scope", "Only a collected capture copy may be rebuilt")
+        source_root = Path(path).resolve().parent
         _top_doc, top_state = self._capture_rebuild_state(path, document=doc, phase="before")
         try:
             _manager, top_configuration = _active_configuration_view(doc)
@@ -4784,6 +4803,19 @@ class SolidWorksBackend(CadBackend):
         }
         source_files = {normalized_top: {"path": path, "sha256": self._capture_source_digest(path)}}
         session_files = []
+        topology = [
+            {
+                "instance": "top",
+                "depth": 0,
+                "document_path": path,
+                "normalized_path": normalized_top,
+                "document_type": 2,
+                "referenced_configuration": top_configuration_name,
+                "suppression_state": None,
+                "storage_scope": "file",
+                "provenance_state": None,
+            }
+        ]
         component_count = 0
         stack = [(item, 1) for item in reversed(_as_list(_method(root, "GetChildren")))]
         while stack:
@@ -4798,7 +4830,21 @@ class SolidWorksBackend(CadBackend):
             try:
                 component = _component(raw)
                 state = _component_state(component)
+                name = str(_member(component, "Name2") or "")
                 if state == COMPONENT_SUPPRESSED:
+                    topology.append(
+                        {
+                            "instance": name,
+                            "depth": depth,
+                            "document_path": None,
+                            "normalized_path": None,
+                            "document_type": None,
+                            "referenced_configuration": None,
+                            "suppression_state": state,
+                            "storage_scope": "suppressed",
+                            "provenance_state": None,
+                        }
+                    )
                     continue
                 if state not in {2, 3}:
                     raise CadError(
@@ -4827,23 +4873,52 @@ class SolidWorksBackend(CadBackend):
                         "Capture dependency has no supported native document type",
                         {"path": document_path, "document_type": document_type},
                     )
-                name = str(_member(component, "Name2") or "")
                 referenced = str(_member(component, "ReferencedConfiguration") or "")
                 normalized = normalize_document_path(os.path.abspath(document_path))
                 in_capture = any(normalized.startswith(root_path + "\\") for root_path in self._capture_roots)
+                provenance_state = None
                 if in_capture:
+                    storage_scope = "file"
                     source_files.setdefault(
                         normalized,
                         {"path": document_path, "sha256": self._capture_source_digest(document_path)},
                     )
-                elif document_type == 2:
-                    raise CadError(
-                        "cad_rebuild_scope",
-                        "Capture dependency assembly lies outside the collected copy",
-                        {"path": document_path, "instance": name},
-                    )
                 else:
+                    source_document = _component_source_document(
+                        component,
+                        source_root,
+                        native_path=document_path,
+                    )
+                    provenance = source_document.get("source_provenance") or {}
+                    provenance_state = provenance.get("state")
+                    if provenance_state not in {
+                        "cached_materialization",
+                        "embedded_virtual_component",
+                    }:
+                        raise CadError(
+                            "cad_rebuild_scope",
+                            "Capture dependency is neither a collected file nor a proven session document",
+                            {
+                                "path": document_path,
+                                "instance": name,
+                                "source_provenance": provenance,
+                            },
+                        )
+                    storage_scope = "session"
                     session_files.append(document_path)
+                topology.append(
+                    {
+                        "instance": name,
+                        "depth": depth,
+                        "document_path": document_path,
+                        "normalized_path": normalized,
+                        "document_type": document_type,
+                        "referenced_configuration": referenced,
+                        "suppression_state": state,
+                        "storage_scope": storage_scope,
+                        "provenance_state": provenance_state,
+                    }
+                )
                 if document_type == 2:
                     row = assemblies.setdefault(
                         normalized,
@@ -4909,6 +4984,7 @@ class SolidWorksBackend(CadBackend):
             "normalized_top": normalized_top,
             "session_files": sorted(set(session_files)),
             "source_files": source_files,
+            "topology": sorted(topology, key=_capture_topology_sort_key),
         }
 
     def _rebuild_capture_document(self, row, *, phase, document=None):
@@ -5063,12 +5139,56 @@ class SolidWorksBackend(CadBackend):
                 phase="after_children",
             )
 
+        final_graph = self._capture_rebuild_graph(doc, path)
+        if final_graph["topology"] != graph["topology"]:
+            raise CadError(
+                "cad_rebuild_topology_changed",
+                "Capture rebuild changed the active dependency topology",
+                {
+                    "path": path,
+                    "before": graph["topology"],
+                    "after": final_graph["topology"],
+                },
+            )
+        if final_graph["source_files"] != graph["source_files"]:
+            raise CadError(
+                "cad_capture_source_changed",
+                "Capture preparation changed collected source bytes",
+                {
+                    "path": path,
+                    "before": graph["source_files"],
+                    "after": final_graph["source_files"],
+                },
+            )
+        if final_graph["session_files"] != graph["session_files"]:
+            raise CadError(
+                "cad_rebuild_topology_changed",
+                "Capture rebuild changed the session dependency set",
+                {
+                    "path": path,
+                    "before": graph["session_files"],
+                    "after": final_graph["session_files"],
+                },
+            )
+
+        final_assemblies = final_graph["assemblies"]
+        final_by_key = {
+            normalize_document_path(os.path.abspath(row["path"])): row
+            for row in final_assemblies
+        }
+        final_top = final_by_key[graph["normalized_top"]]
+        top_final_state = final_top["initial_state"]
         final_states = []
         for row in assemblies:
-            if row is top:
-                state = top_final_state
-            else:
-                _, state = self._capture_rebuild_state(row["path"], phase="final")
+            key = normalize_document_path(os.path.abspath(row["path"]))
+            final_row = final_by_key.get(key)
+            if final_row is None:
+                raise CadError(
+                    "cad_rebuild_topology_changed",
+                    "Capture rebuild removed an assembly document",
+                    {"path": row["path"], "normalized_path": key},
+                )
+            state = final_row["initial_state"]
             expected_configuration = row["initial_state"]["configuration"]
             if state.get("configuration") != expected_configuration:
                 raise CadError(
@@ -5092,9 +5212,9 @@ class SolidWorksBackend(CadBackend):
                 )
             final_states.append(
                 {
-                    "depth": row["depth"],
-                    "path": row["path"],
-                    "instances": list(row["instances"]),
+                    "depth": final_row["depth"],
+                    "path": final_row["path"],
+                    "instances": list(final_row["instances"]),
                     "state": state,
                 }
             )
@@ -5106,22 +5226,7 @@ class SolidWorksBackend(CadBackend):
                 "Capture preparation did not end in a read-only top assembly",
                 {"path": path, "state": top_state},
             )
-        source_files_after = {}
-        for normalized, row in sorted(graph["source_files"].items()):
-            source_files_after[normalized] = {
-                "path": row["path"],
-                "sha256": self._capture_source_digest(row["path"]),
-            }
-        if source_files_after != graph["source_files"]:
-            raise CadError(
-                "cad_capture_source_changed",
-                "Capture preparation changed collected source bytes",
-                {
-                    "path": path,
-                    "before": graph["source_files"],
-                    "after": source_files_after,
-                },
-            )
+        source_files_after = final_graph["source_files"]
         source_sha256_after = source_files_after[graph["normalized_top"]]["sha256"]
 
         rebuilt = bool(child_rebuilds or top_rebuild is not None)
@@ -5140,7 +5245,7 @@ class SolidWorksBackend(CadBackend):
             "saved_to_disk": False,
             "rebuild_performed": rebuilt,
             "component_count": graph["component_count"],
-            "assembly_document_count": len(assemblies),
+            "assembly_document_count": len(final_assemblies),
             "child_rebuilds": child_rebuilds,
             "top_rebuild": top_rebuild,
             "needs_rebuild2_before": state_before.get("needs_rebuild2_value"),
@@ -5166,6 +5271,8 @@ class SolidWorksBackend(CadBackend):
             "source_files_before": graph["source_files"],
             "source_files_after": source_files_after,
             "session_dependency_paths": graph["session_files"],
+            "topology_before": graph["topology"],
+            "topology_after": final_graph["topology"],
         }
 
     def _leaf_mass_failure(self, name, occurrence, referenced, error, extra=None):

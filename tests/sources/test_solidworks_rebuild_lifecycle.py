@@ -20,6 +20,9 @@ LEFT = r"C:\capture\prepared\left.SLDASM"
 RIGHT = r"C:\capture\prepared\right.SLDASM"
 CHILD = r"C:\capture\prepared\child.SLDASM"
 GRANDCHILD = r"C:\capture\prepared\grandchild.SLDASM"
+VIRTUAL_ASSEMBLY = "/tmp/swx1234/VC~~/robot/virtual_assembly.SLDASM"
+OUTSIDE_ASSEMBLY = r"C:\outside\foreign.SLDASM"
+OUTSIDE_PART = r"C:\outside\foreign.SLDPRT"
 CAPTURE_ROOT = normalize_document_path(os.path.abspath(PATH)).rsplit("\\", 2)[0]
 
 
@@ -49,7 +52,17 @@ class _RootComponent:
 
 
 class _Component:
-    def __init__(self, name, document, *, suppression_state=2, children=(), referenced_configuration=None):
+    def __init__(
+        self,
+        name,
+        document,
+        *,
+        suppression_state=2,
+        children=(),
+        referenced_configuration=None,
+        is_virtual=False,
+        imported_path=None,
+    ):
         self.Name2 = name
         self.ReferencedConfiguration = (
             document._configuration
@@ -59,6 +72,8 @@ class _Component:
         self._document = document
         self._suppression_state = suppression_state
         self._children = list(children) if children else list(document._children)
+        self.IsVirtual = is_virtual
+        self._imported_path = imported_path
 
     def GetModelDoc2(self):
         return self._document
@@ -68,6 +83,9 @@ class _Component:
 
     def GetSuppression2(self):
         return self._suppression_state
+
+    def GetImportedPath(self):
+        return self._imported_path
 
 
 class _Extension:
@@ -766,6 +784,137 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertIs(returned, final_top)
         self.assertEqual([stale_top.rebuild_calls, refreshed_top.rebuild_calls, final_top.rebuild_calls], [0, 1, 0])
         self.assertEqual(preparation["needs_rebuild2_after"], 0)
+
+    def test_non_read_only_child_assembly_is_not_reopened_or_mutated(self):
+        child = _Doc(CHILD, read_only=False, needs_rebuild2=1)
+        top = _Doc(PATH, read_only=True, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(child.rebuild_calls, 1)
+        self.assertIs(preparation["state_after"]["read_only"], True)
+        child_state = next(
+            row["state"]
+            for row in preparation["assembly_states_after"]
+            if row["path"] == CHILD
+        )
+        self.assertIs(child_state["read_only"], False)
+
+    def test_clean_virtual_assembly_is_a_session_document_not_a_source_file(self):
+        virtual = _Doc(VIRTUAL_ASSEMBLY, read_only=False)
+        top = _Doc(
+            PATH,
+            children=[
+                _Component(
+                    "virtual-1",
+                    virtual,
+                    is_virtual=True,
+                )
+            ],
+        )
+        backend = _Backend({PATH: top, VIRTUAL_ASSEMBLY: virtual})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ) as source_hash:
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(preparation["assembly_document_count"], 2)
+        self.assertEqual(preparation["session_dependency_paths"], [VIRTUAL_ASSEMBLY])
+        self.assertNotIn(
+            normalize_document_path(os.path.abspath(VIRTUAL_ASSEMBLY)),
+            preparation["source_files_before"],
+        )
+        self.assertEqual(source_hash.call_count, 2)
+
+    def test_pending_virtual_assembly_rebuilds_as_the_owning_session_document(self):
+        virtual = _Doc(VIRTUAL_ASSEMBLY, read_only=False, needs_rebuild2=1)
+        top = _Doc(
+            PATH,
+            children=[
+                _Component(
+                    "virtual-1",
+                    virtual,
+                    is_virtual=True,
+                )
+            ],
+        )
+        backend = _Backend({PATH: top, VIRTUAL_ASSEMBLY: virtual})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="c" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual([row["path"] for row in preparation["child_rebuilds"]], [VIRTUAL_ASSEMBLY])
+        self.assertEqual(virtual.rebuild_calls, 1)
+        self.assertEqual(top.rebuild_calls, 0)
+
+    def test_file_backed_dependency_outside_the_copy_is_rejected(self):
+        for path, document_type in (
+            (OUTSIDE_ASSEMBLY, 2),
+            (OUTSIDE_PART, 1),
+        ):
+            with self.subTest(path=path):
+                outside = _Doc(path, document_type=document_type)
+                top = _Doc(PATH, children=[_Component("outside-1", outside)])
+                backend = _Backend({PATH: top, path: outside})
+                with patch(
+                    "description_pipeline.sources.solidworks.native._hash",
+                    return_value="d" * 64,
+                ), self.assertRaises(CadError) as caught:
+                    backend._rebuild_capture_copy(top, PATH)
+                self.assertEqual(caught.exception.code, "cad_rebuild_scope")
+                self.assertEqual(
+                    caught.exception.detail["source_provenance"]["native_document_path"],
+                    path,
+                )
+                self.assertEqual(top.rebuild_calls, 0)
+
+    def test_topology_addition_during_rebuild_is_rejected(self):
+        child = _Doc(CHILD)
+        added = _Doc(OTHER, needs_rebuild2=1)
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        top._rebuild_callback = lambda: top._root._children.append(
+            _Component("added-1", added)
+        )
+        backend = _Backend({PATH: top, CHILD: child, OTHER: added})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="e" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_topology_changed")
+        self.assertEqual(added.rebuild_calls, 0)
+
+    def test_topology_removal_during_rebuild_is_rejected(self):
+        child = _Doc(CHILD)
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        top._rebuild_callback = lambda: top._root._children.clear()
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_topology_changed")
+
+    def test_topology_rebinding_during_rebuild_is_rejected(self):
+        child = _Doc(CHILD)
+        replacement = _Doc(OTHER)
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        top._rebuild_callback = lambda: top._root._children.__setitem__(
+            0,
+            _Component("child-1", replacement),
+        )
+        backend = _Backend({PATH: top, CHILD: child, OTHER: replacement})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_topology_changed")
 
 
 if __name__ == "__main__":
