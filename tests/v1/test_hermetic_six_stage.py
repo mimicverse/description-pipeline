@@ -30,7 +30,6 @@ from description_pipeline.sources.solidworks.discovery import prepare_native_pac
 from description_pipeline.sources.solidworks.native import normalize_document_path
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.scene import combine_mass_properties
-from description_pipeline.stages import STAGE_IDS
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend
@@ -39,15 +38,12 @@ from tests.v1.test_stage_transfer import native_tool
 
 RUN_ID = "3f2c1f7a-9d4e-4d0a-9f11-2b6c5a7e8d90"
 MAIN_ASSEMBLY = "cad/robot.SLDASM"
-REVIEW_BRANCH = "work/solidworks/nd_fixture/engineering"
 BASE_BRANCH = "feature/nd_fixture"
 OVERRIDES = {
     "OverrideMass": False,
     "OverrideCenterOfMass": False,
     "OverrideMomentsOfInertia": False,
 }
-# Retained only inside skipped legacy publication tests.
-urdf_pr = None
 
 
 def _native_tool() -> dict:
@@ -664,52 +660,6 @@ class HermeticSixStageTests(unittest.TestCase):
         _git("config", "user.name", "Hermetic Test", cwd=repository)
         return repository
 
-    def _github(self, repository: Path, *args: str) -> str:
-        if args[:2] == ("pr", "list"):
-            return "[]"
-        if args[:2] == ("pr", "create"):
-            return "https://github.com/example/nd_fixture/pull/1"
-        if args[:2] == ("pr", "view"):
-            head = _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").split()[0]
-            return json.dumps(
-                {
-                    "url": "https://github.com/example/nd_fixture/pull/1",
-                    "state": "OPEN",
-                    "baseRefName": BASE_BRANCH,
-                    "headRefName": REVIEW_BRANCH,
-                    "headRefOid": head,
-                    "isCrossRepository": False,
-                }
-            )
-        raise AssertionError(f"unexpected GitHub command: {args}")
-
-    def _github_failure(self, repository: Path, *args: str) -> str:
-        if args[:2] == ("pr", "list"):
-            return "[]"
-        if args[:2] == ("pr", "create"):
-            raise subprocess.CalledProcessError(1, ["gh", *args], stderr="GitHub submission unavailable")
-        raise AssertionError(f"unexpected GitHub command: {args}")
-
-    def _assert_failed_publish_evidence(self, failed: dict, subject: str) -> Path:
-        output = Path(failed["output"])
-        self.assertEqual(read_delivery_manifest(output)["subject"]["digest"], subject)
-        for relative in (
-            "transfer-manifest.json",
-            "reports/native-tool.json",
-            "reports/native-stages.json",
-            "reports/stages.json",
-            "reports/structural-team.json",
-            "reports/structural-team.md",
-            "reports/quality.json",
-        ):
-            self.assertTrue((output / relative).is_file(), relative)
-        self.assertEqual(failed["stage_report"]["path"], "reports/stages.json")
-        self.assertEqual(
-            failed["stage_report"]["sha256"],
-            hashlib.sha256((output / "reports/stages.json").read_bytes()).hexdigest(),
-        )
-        return output
-
     def _generate_and_verify(self) -> tuple[dict, dict, dict]:
         original_handoff = _tree_bytes(self.handoff)
         capture, native = self._prepare_and_capture()
@@ -881,182 +831,6 @@ class HermeticSixStageTests(unittest.TestCase):
             mutate,
             "OpenDoc6 reported a failed or invalid open",
         )
-
-    @unittest.skip("legacy publisher removed")
-    def test_frozen_evidence_passes_real_generate_verify_and_local_git_publish(self) -> None:
-        original_handoff, native, verified = self._generate_and_verify()
-        generated_subject = verified["subject_sha256"]
-        verified_bytes = _tree_bytes(self.root / "verify")
-
-        release = {"schema_version": "solidworks-to-urdf.release/v1", "version": solidworks.__version__}
-        tool = {**tool_record("portable"), "release": release}
-        with (
-            patch.object(steps, "tool_record", return_value=tool),
-            patch.object(urdf_pr, "_origin_slug", return_value="example/nd_fixture"),
-            patch.object(urdf_pr, "_gh", side_effect=self._github),
-        ):
-            published = solidworks.publish(
-                self.root / "verify",
-                self.root / "publish",
-                run_id=RUN_ID,
-                expected_subject=generated_subject,
-                repository=self._repository(),
-                base=BASE_BRANCH,
-                handoff_sha256=native["capture"]["handoff_sha256"],
-                prior_events=self.events,
-                on_event=self._record,
-            )
-
-        self.assertEqual(published["state"], "published", published.get("error"))
-        self.assertIs(published["passed"], True)
-        self.assertEqual(published["subject_sha256"], generated_subject)
-        self.assertEqual(published["submission"]["subject"], generated_subject)
-        self.assertNotIn("error", published)
-        self.assertNotIn("error_code", published)
-        self.assertNotIn("detail", published)
-        self.assertEqual(read_delivery_manifest(self.root / "publish")["subject"]["digest"], generated_subject)
-        self.assertEqual(
-            _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").split()[0],
-            published["submission"]["commit"],
-        )
-        for relative in (
-            "transfer-manifest.json",
-            "reports/native-tool.json",
-            "reports/native-stages.json",
-            "reports/stages.json",
-            "reports/structural-team.json",
-            "reports/structural-team.md",
-            "reports/quality.json",
-        ):
-            self.assertTrue((self.root / "publish" / relative).is_file(), relative)
-        committed = set(
-            _git("ls-tree", "-r", "--name-only", published["submission"]["commit"], cwd=self.root / "repository")
-            .strip()
-            .splitlines()
-        )
-        self.assertIn("reports/quality.json", committed)
-        self.assertFalse(
-            {
-                "transfer-manifest.json",
-                "reports/native-tool.json",
-                "reports/native-stages.json",
-                "reports/stages.json",
-                "reports/structural-team.json",
-                "reports/structural-team.md",
-            }
-            & committed
-        )
-        after_handoff = _tree_bytes(self.handoff)
-        self.assertEqual(after_handoff, original_handoff)
-        self.assertEqual(_tree_bytes(self.root / "verify"), verified_bytes)
-        self.assertEqual({event["stage"] for event in self.events}, set(STAGE_IDS))
-        handoff_subjects = {
-            event["check"]["details"]["handoff_sha256"]
-            for event in self.events
-            if isinstance(event.get("check"), dict)
-            and isinstance(event["check"].get("details"), dict)
-            and event["check"]["details"].get("handoff_sha256")
-        }
-        self.assertEqual(handoff_subjects, {native["capture"]["handoff_sha256"]})
-        stage_subjects = {
-            event["check"]["details"]["subject_sha256"]
-            for event in self.events
-            if isinstance(event.get("check"), dict)
-            and isinstance(event["check"].get("details"), dict)
-            and event["check"]["details"].get("subject_sha256")
-        }
-        self.assertEqual(stage_subjects, {generated_subject})
-
-    @unittest.skip("legacy publisher removed")
-    def test_failed_github_submission_preserves_the_verified_delivery(self) -> None:
-        _original_handoff, native, verified = self._generate_and_verify()
-        subject = verified["subject_sha256"]
-        verified_bytes = _tree_bytes(self.root / "verify")
-        release = {"schema_version": "solidworks-to-urdf.release/v1", "version": solidworks.__version__}
-        tool = {**tool_record("portable"), "release": release}
-        with (
-            patch.object(steps, "tool_record", return_value=tool),
-            patch.object(urdf_pr, "_origin_slug", return_value="example/nd_fixture"),
-            patch.object(urdf_pr, "_gh", side_effect=self._github_failure),
-        ):
-            failed = solidworks.publish(
-                self.root / "verify",
-                self.root / "publish",
-                run_id=RUN_ID,
-                expected_subject=subject,
-                repository=self._repository(),
-                base=BASE_BRANCH,
-                handoff_sha256=native["capture"]["handoff_sha256"],
-                prior_events=self.events,
-                on_event=self._record,
-            )
-
-        self.assertEqual(failed["state"], "unresolved")
-        self.assertEqual(failed["error"], "github_failed_after_push")
-        self.assertIs(failed["passed"], False)
-        self.assertEqual(failed["error"], "github_failed_after_push")
-        self.assertEqual(failed["reason"], "github_failed")
-        self.assertEqual(failed["error_code"], "github_failed_after_push")
-        self.assertEqual(failed["submission"]["error"], "github_failed_after_push")
-        self.assertEqual(failed["subject_sha256"], subject)
-        self.assertEqual(failed["quality"]["passed"], True)
-        self._assert_failed_publish_evidence(failed, subject)
-        self.assertTrue(
-            _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").strip(),
-            "the local Git push completed before GitHub failed",
-        )
-        self.assertEqual(_tree_bytes(self.root / "verify"), verified_bytes)
-
-    @unittest.skip("legacy publisher removed")
-    def test_failed_git_submission_preserves_the_verified_delivery(self) -> None:
-        _original_handoff, native, verified = self._generate_and_verify()
-        subject = verified["subject_sha256"]
-        verified_bytes = _tree_bytes(self.root / "verify")
-        repository = self._repository()
-        real_git = urdf_pr._git
-        stderr = "pre-push submission rejected"
-
-        def git_with_failed_push(target, *args: str, **kwargs):
-            if args[:1] == ("push",):
-                raise subprocess.CalledProcessError(128, ["git", *args], stderr=stderr)
-            return real_git(target, *args, **kwargs)
-
-        release = {"schema_version": "solidworks-to-urdf.release/v1", "version": solidworks.__version__}
-        tool = {**tool_record("portable"), "release": release}
-        with (
-            patch.object(steps, "tool_record", return_value=tool),
-            patch.object(urdf_pr, "_origin_slug", return_value="example/nd_fixture"),
-            patch.object(urdf_pr, "_gh", side_effect=self._github),
-            patch.object(urdf_pr, "_git", side_effect=git_with_failed_push),
-        ):
-            failed = solidworks.publish(
-                self.root / "verify",
-                self.root / "publish",
-                run_id=RUN_ID,
-                expected_subject=subject,
-                repository=repository,
-                base=BASE_BRANCH,
-                handoff_sha256=native["capture"]["handoff_sha256"],
-                prior_events=self.events,
-                on_event=self._record,
-            )
-
-        self.assertEqual(failed["state"], "failed")
-        self.assertIs(failed["passed"], False)
-        self.assertEqual(failed["error"], "git_failed")
-        self.assertEqual(failed["error_code"], "git_failed")
-        self.assertEqual(failed["detail"], stderr)
-        self.assertEqual(failed["submission"]["error"], "git_failed")
-        self.assertEqual(failed["submission"]["detail"], stderr)
-        self.assertEqual(failed["subject_sha256"], subject)
-        self.assertEqual(failed["quality"]["passed"], True)
-        self._assert_failed_publish_evidence(failed, subject)
-        self.assertEqual(
-            _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").strip(),
-            "",
-        )
-        self.assertEqual(_tree_bytes(self.root / "verify"), verified_bytes)
-
 
 if __name__ == "__main__":
     unittest.main()
