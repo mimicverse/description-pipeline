@@ -689,5 +689,70 @@ class RealSixStageChainTests(unittest.TestCase):
             ],
         )
 
+    def test_real_chain_records_a_failure_and_stops_downstream_stages(self) -> None:
+        write_json(
+            self.rules_root / "root-000" / "budget.json",
+            {
+                "robot": {
+                    "expected_mass_kg": [0.9, 1.0],
+                    "expected_extent_m": [0.35, 0.5],
+                }
+            },
+        )
+        application = self._application()
+        factory_work = self.root / "failure-factory-work"
+        factory_work.mkdir()
+        with (
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=copy.deepcopy(self.native),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.generate.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.publish.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+        ):
+            load_production_admission(
+                application,
+                self._production_request(),
+                artifacts=self.store,
+                platform_snapshot=self._platform_snapshot(),
+                native_tool_provider=lambda: copy.deepcopy(self.native),
+                work_root=factory_work,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+                portable_tool_provider=lambda: copy.deepcopy(self.portable),
+            )
+            outcome = application.execute_run(RUN_ID)
+
+        self.assertEqual(outcome.outcome, "failed")
+        self.assertEqual(outcome.stage, "verify")
+        with (
+            self._connect() as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT stage, outcome FROM stage_decision "
+                "WHERE run_id = %s "
+                "ORDER BY array_position("
+                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                " stage)",
+                (RUN_ID,),
+            )
+            stages = cursor.fetchall()
+        self.assertEqual(
+            stages,
+            [
+                ("freeze", "completed"),
+                ("discover", "completed"),
+                ("capture", "completed"),
+                ("generate", "completed"),
+                ("verify", "failed"),
+            ],
+        )
+
 if __name__ == "__main__":
     unittest.main()
