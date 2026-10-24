@@ -28,6 +28,7 @@ jobs:
           cache-dependency-path: |
             requirements/build-py312.lock
             requirements/linux-py312.lock
+            requirements/test-py312.lock
       - name: The pinned CPython identity must be present
         run: |
           python - <<'PY'
@@ -78,10 +79,61 @@ jobs:
           python -m venv "$AIRFLOW_VENV"
           "$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
             -r deploy/airflow/requirements.lock
+          "$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
+            -r requirements/test-py312.lock
           "$AIRFLOW_VENV/bin/python" -m pip install --no-deps -e .
+      - name: The PostgreSQL integration tests must be runnable
+        run: |
+          "$AIRFLOW_VENV/bin/python" -B - <<'PY'
+          import importlib.metadata
+          import tempfile
+          from pathlib import Path
+
+          import pgserver
+          import psycopg2
+
+          expected = {
+              "pgserver": "0.1.4",
+              "psycopg2-binary": "2.9.13",
+          }
+          observed = {
+              name: importlib.metadata.version(name)
+              for name in expected
+          }
+          if observed != expected:
+              raise SystemExit(
+                  f"CI PostgreSQL test dependency identity drift: {observed}"
+              )
+
+          with tempfile.TemporaryDirectory(prefix="ci-postgres-probe-") as directory:
+              server = pgserver.get_server(
+                  Path(directory) / "pgdata",
+                  cleanup_mode="delete",
+              )
+              try:
+                  with (
+                      psycopg2.connect(server.get_uri()) as connection,
+                      connection.cursor() as cursor,
+                  ):
+                      cursor.execute("CREATE TEMP TABLE probe (value integer NOT NULL)")
+                      cursor.execute("INSERT INTO probe (value) VALUES (%s)", (17,))
+                      cursor.execute("SELECT value FROM probe")
+                      value = cursor.fetchone()[0]
+                  if value != 17:
+                      raise AssertionError(f"PostgreSQL transaction probe returned {value!r}")
+              finally:
+                  server.cleanup()
+          print(f"PostgreSQL test dependencies: {observed}")
+          PY
       - name: Regression suite
         run: |
-          "$AIRFLOW_VENV/bin/python" -B -m unittest discover -s tests -t .
+          set -o pipefail
+          "$AIRFLOW_VENV/bin/python" -B -m unittest discover -s tests -t . 2>&1 \
+            | tee "$RUNNER_TEMP/regression.log"
+          if grep -Fq "pgserver/psycopg2 are not installed" "$RUNNER_TEMP/regression.log"; then
+            echo "PostgreSQL tests were skipped despite the locked CI dependencies" >&2
+            exit 1
+          fi
       - name: The Windows settle semantics (offline pwsh matrix)
         run: pwsh -NoProfile -File tests/deploy/test_instance_lifecycle.ps1
 
