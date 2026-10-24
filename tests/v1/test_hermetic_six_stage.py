@@ -218,6 +218,10 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
             on_activity=on_activity,
             require_material=require_material,
         )
+        self._capture_component_paths = [
+            (str(component.name), str(component.path))
+            for component in scene.components
+        ]
         configuration = "Default"
         state = {
             "save_flag": False,
@@ -331,6 +335,28 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
                     "state": dict(state),
                 }
             ],
+            "part_states_after": [
+                {
+                    "path": str(component.path),
+                    "instances": [component.name],
+                    "state": {
+                        "save_flag": False,
+                        "needs_rebuild2_value": 0,
+                        "read_only": False,
+                        "configuration": configuration,
+                        "configuration_needs_rebuild": False,
+                        "path": str(component.path),
+                        "configurations": [
+                            {
+                                "name": configuration,
+                                "needs_rebuild": False,
+                                "add_rebuild_save_mark": False,
+                            }
+                        ],
+                    },
+                }
+                for component in scene.components
+            ],
             "source_files_before": source_files,
             "source_files_after": dict(source_files),
             "session_dependency_paths": [],
@@ -338,6 +364,62 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
             "topology_after": [dict(row) for row in topology],
         }
         return scene
+
+    def verify_capture_documents_ready(self) -> dict:
+        top_path = str(self._capture_document)
+        documents = [
+            {
+                "path": top_path,
+                "document_type": 2,
+                "state": {
+                    "save_flag": False,
+                    "needs_rebuild2_value": 0,
+                    "read_only": True,
+                    "configuration": "Default",
+                    "configuration_needs_rebuild": False,
+                    "path": top_path,
+                    "configurations": [
+                        {
+                            "name": "Default",
+                            "needs_rebuild": False,
+                            "add_rebuild_save_mark": False,
+                        }
+                    ],
+                    "controls": {
+                        "enable_assembly_rebuild": False,
+                        "lightweight_component_count": 0,
+                    },
+                },
+            },
+            *[
+                {
+                    "path": component_path,
+                    "document_type": 1,
+                    "state": {
+                        "save_flag": False,
+                        "needs_rebuild2_value": 0,
+                        "read_only": False,
+                        "configuration": "Default",
+                        "configuration_needs_rebuild": False,
+                        "path": component_path,
+                        "configurations": [
+                            {
+                                "name": "Default",
+                                "needs_rebuild": False,
+                                "add_rebuild_save_mark": False,
+                            }
+                        ],
+                    },
+                }
+                for _component_name, component_path in self._capture_component_paths
+            ],
+        ]
+        return {
+            "document_count": len(documents),
+            "parts": sum(item["document_type"] == 1 for item in documents),
+            "assemblies": sum(item["document_type"] == 2 for item in documents),
+            "documents": documents,
+        }
 
     def export_component_meshes(self, destinations: dict[str, str], on_activity=None) -> dict[str, dict]:
         entries = {}

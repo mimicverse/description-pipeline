@@ -639,6 +639,7 @@ def _capture_preparation(root, manifest):
         "state_after",
         "assembly_states_before",
         "assembly_states_after",
+        "part_states_after",
         "source_files_before",
         "source_files_after",
         "session_dependency_paths",
@@ -740,7 +741,7 @@ def _capture_preparation(root, manifest):
     _require(preparation["read_only"] is True, "Capture preparation did not prove top-level read-only state")
     _require(preparation["saved_to_disk"] is False, "Capture preparation claims a source save")
 
-    def state_row(value, label):
+    def state_row(value, label, *, controls_required=True):
         _require(isinstance(value, dict), f"{label} is not an object")
         required_state = {
             "save_flag",
@@ -750,8 +751,9 @@ def _capture_preparation(root, manifest):
             "configuration_needs_rebuild",
             "path",
             "configurations",
-            "controls",
         }
+        if controls_required:
+            required_state.add("controls")
         _require(set(value) == required_state, f"{label} fields are incomplete or unknown")
         _require(type(value["save_flag"]) is bool, f"{label} save flag is not boolean")
         _require(
@@ -781,6 +783,9 @@ def _capture_preparation(root, manifest):
             names.append(item["name"])
         _require(len(names) == len(set(names)), f"{label} repeats a configuration")
         _require(value["configuration"] in names, f"{label} active configuration is absent")
+        if not controls_required:
+            return value
+
         controls = value["controls"]
         _require(isinstance(controls, dict), f"{label} rebuild controls are malformed")
         allowed_controls = {
@@ -1281,6 +1286,161 @@ def _capture_preparation(root, manifest):
             f"Assembly did not finish fully rebuilt: {item['path']}",
         )
 
+    part_groups = {}
+    for item in topology_before:
+        if item["document_type"] != 1:
+            continue
+        key = normalized_path(item["document_path"])
+        group = part_groups.setdefault(
+            key,
+            {
+                "path": item["document_path"],
+                "instances": [],
+                "configurations": set(),
+            },
+        )
+        group["instances"].append(item["instance"])
+        group["configurations"].add(item["referenced_configuration"])
+    part_rows = {}
+    part_states = preparation["part_states_after"]
+    _require(isinstance(part_states, list), "part_states_after is missing")
+    for item in part_states:
+        _require(
+            isinstance(item, dict) and set(item) == {"path", "instances", "state"},
+            "part_states_after row is malformed",
+        )
+        _require(isinstance(item["path"], str) and bool(item["path"]), "part_states_after path is invalid")
+        _require(
+            isinstance(item["instances"], list)
+            and bool(item["instances"])
+            and all(isinstance(name, str) and bool(name) for name in item["instances"])
+            and len(item["instances"]) == len(set(item["instances"])),
+            "part_states_after instances are invalid",
+        )
+        key = normalized_path(item["path"])
+        _require(key not in part_rows, "part_states_after repeats a document")
+        part_rows[key] = item
+        state_row(item["state"], "part_states_after state", controls_required=False)
+        _require(
+            _same_native_path(item["state"]["path"], item["path"]),
+            "part_states_after state names another document",
+        )
+    _require(set(part_rows) == set(part_groups), "Part final-state set differs from exact topology")
+    for key, group in part_groups.items():
+        _require(
+            len(group["configurations"]) == 1,
+            f"A part document has conflicting referenced configurations: {group['path']}",
+        )
+        row = part_rows[key]
+        _require(
+            sorted(row["instances"]) == sorted(group["instances"]),
+            f"Part final instances differ: {group['path']}",
+        )
+        state = row["state"]
+        _require(
+            state["configuration"] == next(iter(group["configurations"])),
+            f"Part final configuration differs: {group['path']}",
+        )
+        _require(
+            state["needs_rebuild2_value"] == 0
+            and state["configuration_needs_rebuild"] is False
+            and all(item["needs_rebuild"] is False for item in state["configurations"]),
+            f"Part did not finish fully rebuilt: {group['path']}",
+        )
+
+    active_documents = {}
+    for item in topology_before:
+        if item["storage_scope"] == "suppressed":
+            continue
+        key = normalized_path(item["document_path"])
+        document_type = item["document_type"]
+        _require(
+            key not in active_documents or active_documents[key] == document_type,
+            f"An active document has conflicting native types: {item['document_path']}",
+        )
+        active_documents[key] = document_type
+
+    def document_snapshot(relative: str, label: str):
+        payload = read_data(confined(root, "evidence/raw/" + relative))
+        _require(
+            isinstance(payload, dict)
+            and set(payload) == {"document_count", "parts", "assemblies", "documents"},
+            f"{label} fields are incomplete or unknown",
+        )
+        documents = payload["documents"]
+        _require(isinstance(documents, list) and bool(documents), f"{label} has no loaded documents")
+        _require(type(payload["document_count"]) is int and payload["document_count"] == len(documents), (
+            f"{label} document count differs from its rows"
+        ))
+        rows = {}
+        states = {}
+        for item in documents:
+            _require(
+                isinstance(item, dict) and set(item) == {"path", "document_type", "state"},
+                f"{label} document row is malformed",
+            )
+            _require(isinstance(item["path"], str) and bool(item["path"]), f"{label} document path is invalid")
+            _require(
+                type(item["document_type"]) is int and item["document_type"] in {1, 2},
+                f"{label} document type is invalid",
+            )
+            key = normalized_path(item["path"])
+            _require(key not in rows, f"{label} repeats a loaded document")
+            rows[key] = item
+            state = state_row(
+                item["state"],
+                f"{label} document state",
+                controls_required=item["document_type"] == 2,
+            )
+            _require(
+                _same_native_path(state["path"], item["path"]),
+                f"{label} state names another document",
+            )
+            _require(
+                state["needs_rebuild2_value"] == 0
+                and state["configuration_needs_rebuild"] is False
+                and all(configuration["needs_rebuild"] is False for configuration in state["configurations"]),
+                f"{label} left a loaded document pending: {item['path']}",
+            )
+            expected_type = active_documents.get(key)
+            _require(expected_type == item["document_type"], f"{label} loaded an unbound document: {item['path']}")
+            states[key] = (item["document_type"], state)
+        _require(set(rows) == set(active_documents), f"{label} loaded-document set differs from native topology")
+        expected_by_type = Counter(active_documents.values())
+        _require(
+            type(payload["assemblies"]) is int
+            and type(payload["parts"]) is int
+            and payload["assemblies"] == expected_by_type[2]
+            and payload["parts"] == expected_by_type[1],
+            f"{label} part and assembly counts differ from native topology",
+        )
+        for key, (document_type, state) in states.items():
+            expected = next(
+                item
+                for item in topology_before
+                if item["storage_scope"] != "suppressed"
+                and normalized_path(item["document_path"]) == key
+            )
+            _require(
+                state["configuration"] == expected["referenced_configuration"],
+                f"{label} loaded another configuration: {state['path']}",
+            )
+            if key == top_key:
+                _require(state["read_only"] is True, f"{label} top assembly is not read-only")
+            if document_type == 1:
+                _require("controls" not in state, f"{label} part carries assembly controls")
+        return states
+
+    after_reads_states = document_snapshot("document_state_after_reads.json", "document_state_after_reads")
+    after_pristine_states = document_snapshot(
+        "document_state_after_pristine_readout.json",
+        "document_state_after_pristine_readout",
+    )
+    _require(
+        after_reads_states == after_pristine_states,
+        "Capture final document states changed across the pristine read window",
+    )
+
     child_rebuilds = preparation["child_rebuilds"]
     _require(isinstance(child_rebuilds, list), "child_rebuilds is not a list")
     child_paths = set()
@@ -1377,6 +1537,8 @@ def _capture_preparation(root, manifest):
         "source_sha256": top_sha256,
         "component_count": len(not_top),
         "assembly_document_count": len(groups),
+        "part_document_count": len(part_rows),
+        "final_document_count": len(after_reads_states),
         "session_document_count": len(session_rows),
     }
 

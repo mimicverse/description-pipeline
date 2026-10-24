@@ -104,6 +104,40 @@ def _sort_topology(rows: list[dict]) -> list[dict]:
     )
 
 
+def _document_state_snapshots(preparation: dict) -> dict[str, dict]:
+    states = {}
+    for item in preparation["assembly_states_after"]:
+        states[_normalized(item["path"])] = (item["path"], 2, item["state"])
+    for item in preparation["part_states_after"]:
+        states[_normalized(item["path"])] = (item["path"], 1, item["state"])
+    documents = []
+    for row in preparation["topology_after"]:
+        if row["storage_scope"] == "suppressed":
+            continue
+        document = states.pop(_normalized(row["document_path"]), None)
+        if document is not None:
+            documents.append(
+                {
+                    "path": document[0],
+                    "document_type": document[1],
+                    "state": copy.deepcopy(document[2]),
+                }
+            )
+    if states:
+        raise AssertionError(f"document state fixture has unbound rows: {sorted(states)}")
+    documents = sorted(documents, key=lambda item: _normalized(item["path"]))
+    snapshot = {
+        "document_count": len(documents),
+        "parts": sum(item["document_type"] == 1 for item in documents),
+        "assemblies": sum(item["document_type"] == 2 for item in documents),
+        "documents": documents,
+    }
+    return {
+        "document_state_after_reads.json": copy.deepcopy(snapshot),
+        "document_state_after_pristine_readout.json": copy.deepcopy(snapshot),
+    }
+
+
 def payload(*, virtual_reuse: bool = False) -> dict:
     state = _state(TOP)
     if virtual_reuse:
@@ -311,12 +345,37 @@ def payload(*, virtual_reuse: bool = False) -> dict:
                 "state": copy.deepcopy(state),
             }
         ],
+        "part_states_after": [],
         "source_files_before": copy.deepcopy(source_files),
         "source_files_after": copy.deepcopy(source_files),
         "session_dependency_paths": session_paths,
         "topology_before": copy.deepcopy(topology),
         "topology_after": copy.deepcopy(topology),
     }
+    if virtual_reuse:
+        preparation["part_states_after"] = [
+            {
+                "path": VIRTUAL,
+                "instances": ["virtual-1", "virtual-2"],
+                "state": {
+                    key: value
+                    for key, value in _state(VIRTUAL).items()
+                    if key != "controls"
+                },
+            }
+        ]
+    elif any(item["document_type"] == 1 for item in topology):
+        preparation["part_states_after"] = [
+            {
+                "path": PART,
+                "instances": ["arm-1", "arm-2"],
+                "state": {
+                    key: value
+                    for key, value in _state(PART).items()
+                    if key != "controls"
+                },
+            }
+        ]
     return {
         "scene": {
             "document": TOP,
@@ -339,6 +398,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
                 },
             }
         },
+        "document_states": _document_state_snapshots(preparation),
         "manifest": {"identity": {"configuration": "Default"}},
     }
 
@@ -386,6 +446,7 @@ def dynamic_child_payload() -> dict:
             "state": copy.deepcopy(child_state),
         }
     )
+    preparation["part_states_after"] = []
     fresh_before = copy.deepcopy(child_state)
     fresh_before["needs_rebuild2_value"] = 1
     preparation["child_rebuilds"] = [
@@ -404,6 +465,7 @@ def dynamic_child_payload() -> dict:
     source_files.pop(_normalized(PART))
     source_files[child_key] = {"path": CHILD_ASSEMBLY, "sha256": "b" * 64}
     preparation["source_files_after"] = copy.deepcopy(source_files)
+    value["document_states"] = _document_state_snapshots(preparation)
     raw = value["discovery"]["raw"]
     raw["components"] = [
         {
@@ -453,6 +515,12 @@ def dynamic_child_payload() -> dict:
 
 class CapturePreparationTests(unittest.TestCase):
     def validate(self, value: dict) -> dict:
+        def raw_document(path):
+            name = Path(path).name
+            if name not in value["document_states"]:
+                raise PipelineError(f"Missing raw document snapshot: {name}")
+            return copy.deepcopy(value["document_states"][name])
+
         with (
             patch(
                 "description_pipeline.verification.solidworks_urdf.evidence.scene",
@@ -465,6 +533,14 @@ class CapturePreparationTests(unittest.TestCase):
             patch(
                 "description_pipeline.verification.solidworks_urdf.evidence.discovery",
                 return_value=value["discovery"],
+            ),
+            patch(
+                "description_pipeline.verification.solidworks_urdf.confined",
+                side_effect=lambda root, relative, **_kwargs: Path(root) / relative,
+            ),
+            patch(
+                "description_pipeline.verification.solidworks_urdf.read_data",
+                side_effect=raw_document,
             ),
         ):
             return _capture_preparation(Path("/delivery"), value["manifest"])
@@ -487,6 +563,152 @@ class CapturePreparationTests(unittest.TestCase):
         result = self.validate(payload(virtual_reuse=True))
         self.assertEqual(result["component_count"], 2)
         self.assertEqual(result["session_document_count"], 2)
+
+    def test_final_document_snapshots_bind_every_loaded_object_and_terminal_state(self) -> None:
+        value = payload()
+        self.validate(value)
+
+        pending = copy.deepcopy(value)
+        next(
+            item
+            for item in pending["document_states"]["document_state_after_reads.json"]["documents"]
+            if item["document_type"] == 1
+        )["state"]["needs_rebuild2_value"] = 1
+        with self.assertRaisesRegex(PipelineError, "left a loaded document pending"):
+            self.validate(pending)
+
+        missing = copy.deepcopy(value)
+        missing["document_states"]["document_state_after_reads.json"]["documents"].pop()
+        with self.assertRaisesRegex(PipelineError, "document count|loaded-document set"):
+            self.validate(missing)
+
+        foreign = copy.deepcopy(value)
+        foreign["document_states"]["document_state_after_reads.json"]["documents"][0][
+            "path"
+        ] = r"C:\other\foreign.SLDPRT"
+        with self.assertRaisesRegex(
+            PipelineError,
+            "state names another document|unbound document|loaded-document set",
+        ):
+            self.validate(foreign)
+
+        changed = copy.deepcopy(value)
+        changed["document_states"]["document_state_after_pristine_readout.json"]["documents"][0][
+            "state"
+        ]["configuration"] = "Other"
+        with self.assertRaisesRegex(PipelineError, "configuration|changed across"):
+            self.validate(changed)
+
+        absent = copy.deepcopy(value)
+        absent["document_states"].pop("document_state_after_pristine_readout.json")
+        with self.assertRaisesRegex(PipelineError, "Missing raw document snapshot"):
+            self.validate(absent)
+
+    def test_actual_rebuild_producer_feeds_the_independent_final_state_consumer(self) -> None:
+        from description_pipeline.sources.solidworks import native
+        from tests.sources.test_solidworks_rebuild_lifecycle import _Backend, _Component, _Doc
+
+        top_path = r"C:\capture\prepared\robot.SLDASM"
+        part_path = r"C:\capture\prepared\part.SLDPRT"
+        part = _Doc(part_path, document_type=1)
+        top = _Doc(
+            top_path,
+            configuration="默认",
+            children=[_Component("part-1", part)],
+        )
+        backend = _Backend({top_path: top, part_path: part})
+        with patch.object(native, "_hash", return_value="a" * 64):
+            _, preparation = backend._rebuild_capture_copy(top, top_path)
+            documents = backend.verify_capture_documents_ready()
+        for name in ("topology_before", "topology_after"):
+            for row in preparation[name]:
+                if row.get("document_path"):
+                    row["normalized_path"] = _normalized(row["document_path"])
+        for name in ("source_files_before", "source_files_after"):
+            preparation[name] = {
+                _normalized(row["path"]): row
+                for row in preparation[name].values()
+            }
+        source_files = copy.deepcopy(preparation["source_files_after"])
+        source_hashes = {
+            _normalized(row["path"]): row["sha256"]
+            for row in source_files.values()
+        }
+        topology = copy.deepcopy(preparation["topology_after"])
+        value = {
+            "scene": {
+                "document": top_path,
+                "source_root": ntpath.dirname(top_path),
+                "notes": {"capture_preparation": preparation},
+            },
+            "closure": {
+                "top_level": top_path,
+                "configuration": "默认",
+                "copy_files": {
+                    "source/robot.SLDASM": source_hashes[_normalized(top_path)],
+                    "source/part.SLDPRT": source_hashes[_normalized(part_path)],
+                },
+                "mapping": [
+                    {
+                        "instance": "top_level",
+                        "source": r"C:\stage\cad\robot.SLDASM",
+                        "copy": "source/robot.SLDASM",
+                        "source_sha256": source_hashes[_normalized(top_path)],
+                        "copy_sha256": source_hashes[_normalized(top_path)],
+                    },
+                    {
+                        "instance": "part-1",
+                        "source": r"C:\stage\cad\part.SLDPRT",
+                        "copy": "source/part.SLDPRT",
+                        "source_sha256": source_hashes[_normalized(part_path)],
+                        "copy_sha256": source_hashes[_normalized(part_path)],
+                    },
+                ],
+            },
+            "discovery": {
+                "raw": {
+                    "identity": {"main_assembly": "cad/robot.SLDASM"},
+                    "components": [
+                        {
+                            "instance_id": "part-1",
+                            "document": r"cad\part.SLDPRT",
+                            "configuration": "默认",
+                            "suppressed": False,
+                            "suppression_state": 2,
+                        }
+                    ],
+                    "source_selection": {
+                        "main_assembly": "cad/robot.SLDASM",
+                        "closure": {
+                            "documents": {
+                                "cad/robot.SLDASM": {
+                                    "resolved_edges": [
+                                        {
+                                            "instance": "part-1",
+                                            "resolved": r"cad\part.SLDPRT",
+                                            "configuration": "默认",
+                                            "suppression_state": 2,
+                                        }
+                                    ]
+                                },
+                                "cad/part.SLDPRT": {"resolved_edges": []},
+                            },
+                            "virtual_components": [],
+                            "imports": [],
+                            "suppressed": [],
+                        },
+                    },
+                }
+            },
+            "document_states": {
+                "document_state_after_reads.json": documents,
+                "document_state_after_pristine_readout.json": copy.deepcopy(documents),
+            },
+            "manifest": {"identity": {"configuration": "默认"}},
+        }
+        self.assertEqual({row["instance"] for row in topology}, {"top", "part-1"})
+        result = self.validate(value)
+        self.assertEqual(result["final_document_count"], 2)
 
     def test_authored_suppressed_occurrence_is_preserved_and_bounded(self) -> None:
         def suppressed_row() -> dict:
