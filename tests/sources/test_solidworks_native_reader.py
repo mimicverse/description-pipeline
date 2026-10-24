@@ -521,7 +521,21 @@ class _App:
         return 1
 
     def GetDocuments(self):
-        return list(self._docs.values())
+        documents = list(self._docs.values())
+        seen = {id(document) for document in documents}
+        stack = [
+            component
+            for document in documents
+            for component in document._children
+        ]
+        while stack:
+            component = stack.pop()
+            document = component.GetModelDoc2()
+            if document is not None and id(document) not in seen:
+                seen.add(id(document))
+                documents.append(document)
+            stack.extend(component.GetChildren())
+        return documents
 
     def OpenDoc6(self, path, _kind, _options, _configuration, errors, warnings):
         key = os.path.normcase(os.path.abspath(str(path)))
