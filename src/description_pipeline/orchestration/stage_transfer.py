@@ -579,10 +579,9 @@ def expected_native_check_details(
             f"Frozen package file is absent from archived input or changed: {name}",
         )
     derived_inputs = {
-        name
-        for name in input_casefold
-        if name == "capture-plan.json" or name.startswith("discovery/")
-    }
+        "discovery/native-discovery.json",
+        "discovery/findings.json",
+    } & set(input_casefold)
     _require(
         set(input_casefold) == set(package_casefold) | derived_inputs,
         "Archived input contains an unbound non-package file",

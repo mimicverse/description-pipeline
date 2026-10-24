@@ -1495,6 +1495,22 @@ class StageTransferTests(unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     seal(root, self.base / f"binding-{label}.zip")
 
+    def test_unknown_discovery_input_is_not_a_derived_file(self) -> None:
+        root = capture_root(self.base / "unknown-discovery-input")
+        write_json(root / "input/discovery/evil.txt", {"forged": True})
+        events = _capture_events(
+            root,
+            handoff=HANDOFF,
+            main=MAIN_ASSEMBLY,
+            native_files=NATIVE_FILES,
+        )
+        write_json(
+            root / "reports/native-stages.json",
+            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
+        )
+        with self.assertRaisesRegex(PipelineError, "unbound non-package file"):
+            seal(root, self.base / "unknown-discovery-input.zip")
+
     def test_receipt_rows_cannot_diverge_from_raw_events(self) -> None:
         root = capture_root(self.base / "row-details")
         view = read_data(root / "reports/native-stages.json")
