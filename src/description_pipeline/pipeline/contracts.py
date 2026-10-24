@@ -406,6 +406,45 @@ class StageResult:
             "stage": self.stage,
         }
 
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> StageResult:
+        if not isinstance(record, Mapping):
+            raise ProtocolError("result.invalid", {"reason": "not-an-object"})
+        expected = {
+            "actual_executor_sha256",
+            "checks_sha256",
+            "command_id",
+            "outcome",
+            "reason_code",
+            "request_digest",
+            "required_effect_ids",
+            "result_artifact",
+            "run_id",
+            "schema_version",
+            "stage",
+        }
+        if set(record) != expected:
+            raise ProtocolError(
+                "result.invalid",
+                {"missing": sorted(expected - set(record)), "unknown": sorted(set(record) - expected)},
+            )
+        required_effects = record["required_effect_ids"]
+        if not isinstance(required_effects, list):
+            raise ProtocolError("result.invalid", {"where": "required_effect_ids"})
+        return cls(
+            schema_version=record["schema_version"],
+            command_id=record["command_id"],
+            run_id=record["run_id"],
+            stage=record["stage"],
+            request_digest=record["request_digest"],
+            outcome=record["outcome"],
+            result_artifact=ArtifactRef.from_record(record["result_artifact"]),
+            actual_executor_sha256=record["actual_executor_sha256"],
+            checks_sha256=record["checks_sha256"],
+            required_effect_ids=tuple(required_effects),
+            reason_code=record["reason_code"],
+        )
+
     @property
     def digest(self) -> str:
         return digest(self.to_record())
