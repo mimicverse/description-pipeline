@@ -389,6 +389,7 @@ class DiscoverHandler:
                     observation.root,
                     request=native_request,
                     artifact_ref=effect_artifact,
+                    resources_settled=observation.resources_settled,
                 )
             except NativeDiscoverRefusal as refusal:
                 raise StageFailure(
@@ -506,7 +507,7 @@ class DiscoverHandler:
                 outcome="completed",
                 candidate_root=str(output),
                 checks_sha256=digest(checks),
-                resources_settled=True,
+                resources_settled=observation.resources_settled,
             )
         except NativeDiscoverRefusal as refusal:
             raise StageFailure(refusal.code, refusal.message) from refusal
@@ -679,7 +680,7 @@ class DiscoverHandler:
             raise ProtocolError("discover.candidate_mismatch", {"command_id": command.command_id})
         if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
             raise ProtocolError("discover.claim_mismatch", {"command_id": command.command_id})
-        if result.actual_executor_sha256 != command.expected_executor_sha256:
+        if result.actual_executor_sha256 != claim.executor_sha256:
             raise ProtocolError("discover.executor_mismatch", {"command_id": command.command_id})
         if result.outcome in {"failed", "cancelled"} and not (
             isinstance(result.reason_code, str) and result.reason_code.startswith("discover.")

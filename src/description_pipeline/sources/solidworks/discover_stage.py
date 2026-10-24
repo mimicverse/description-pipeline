@@ -155,6 +155,14 @@ class NativeObservation:
     record: Mapping[str, Any]
     selection: Mapping[str, Any]
     native_tool: Mapping[str, Any]
+    resources_settled: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.resources_settled) is not bool:
+            raise NativeDiscoverRefusal(
+                "discover.observation_invalid",
+                "Native observation resource settlement must be Boolean",
+            )
 
     @property
     def observation_sha256(self) -> str:
@@ -251,7 +259,11 @@ def observe_native_record(
         "files": {item["path"]: item["sha256"] for item in members},
     }
     _write_canonical(output / OBSERVATION_MANIFEST, manifest)
-    return admit_native_observation(output, request=request)
+    return admit_native_observation(
+        output,
+        request=request,
+        resources_settled=True,
+    )
 
 
 def admit_native_observation(
@@ -259,6 +271,7 @@ def admit_native_observation(
     *,
     request: NativeDiscoverRequest,
     artifact_ref=None,
+    resources_settled: bool = False,
 ) -> NativeObservation:
     """Recompute and admit one Windows-sealed native observation."""
 
@@ -415,6 +428,7 @@ def admit_native_observation(
         record=MappingProxyType(copy.deepcopy(record)),
         selection=MappingProxyType(copy.deepcopy(selection)),
         native_tool=MappingProxyType(copy.deepcopy(tool)),
+        resources_settled=resources_settled,
     )
 
 

@@ -95,9 +95,10 @@ def _artifact(kind: str, root: Path, *, run_id: str | None = None, stage: str | 
 
 
 class ClosureReader:
-    def __init__(self, *, transform=None, refusal=None) -> None:
+    def __init__(self, *, transform=None, refusal=None, reader_sha256=TOOL_SHA256) -> None:
         self.transform = transform
         self.refusal = refusal
+        self.reader_sha256 = reader_sha256
         self.calls = 0
 
     def observe(self, stage, main_assembly, upload_files):
@@ -108,7 +109,7 @@ class ClosureReader:
             upload_files,
             main_assembly,
             edges=SELECTED_EDGES,
-            reader_sha256=TOOL_SHA256,
+            reader_sha256=self.reader_sha256,
             stage_root=str(stage),
         )
         if self.transform is not None:
@@ -425,11 +426,11 @@ class DiscoverHarness:
         claim = self.claim(command, fence=fence)
         return claim, self.effects.bind(command, claim, self.workspace())
 
-    def port(self, *, reader=None, backend=None) -> ArchiveDiscoverAdapter:
+    def port(self, *, reader=None, backend=None, native_tool=None) -> ArchiveDiscoverAdapter:
         backend = backend or CountingBackend(copy.deepcopy(self.record))
         return ArchiveDiscoverAdapter(
             artifacts=self.store,
-            native_tool=NATIVE_TOOL,
+            native_tool=native_tool or NATIVE_TOOL,
             selection_reader_factory=lambda: reader or ClosureReader(),
             backend_factory=lambda _root, _files: backend,
         )

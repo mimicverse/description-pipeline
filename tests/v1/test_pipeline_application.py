@@ -9,6 +9,7 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from description_pipeline import cli
 from description_pipeline.artifacts import ArtifactStore
@@ -18,7 +19,9 @@ from description_pipeline.pipeline.application import (
     ApplicationError,
     ApplicationPortMissing,
     StageApplication,
+    application_from_environment,
 )
+from description_pipeline.pipeline.capture import CaptureHandler
 from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
     StageCandidate,
@@ -310,6 +313,22 @@ class StageApplicationTests(unittest.TestCase):
                 application_factory=lambda: self.application,
             )
         self.assertEqual(code, 0)
+
+    def test_environment_composition_uses_the_portable_source_identity(self):
+        executor = "a" * 64
+        environment = {
+            "PLATFORM_ARTIFACT_ROOT": str(self.root / "factory-cas"),
+            "PLATFORM_SERVICE_DSN": "postgresql://unused/unused",
+            "PIPELINE_WORK_ROOT": str(self.root / "factory-work"),
+        }
+        with patch(
+            "description_pipeline.pipeline.application.tool_record",
+            return_value={"source_sha256": executor},
+        ):
+            application = application_from_environment(environment)
+        self.assertEqual(application.services.claim_policy.executor_sha256, executor)
+        self.assertIsInstance(application.handlers["capture"], CaptureHandler)
+        self.assertNotIn("publish", application.handlers)
 
 
 if __name__ == "__main__":

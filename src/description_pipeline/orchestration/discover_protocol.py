@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..build.archive import ZIP_EPOCH
-from ..io import PipelineError, artifact_path_parts, confined, file_digest, read_data
+from ..io import PipelineError, artifact_path_parts, confined, digest, file_digest, read_data
 from ..sources.solidworks.discover_stage import (
     OBSERVATION_MANIFEST,
     NativeDiscoverRefusal,
@@ -19,6 +19,7 @@ from ..sources.solidworks.discover_stage import (
     observe_native_record,
 )
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
+from ..sources.solidworks.revision import package_inventory
 from .selection_transport import StagedSelection
 
 if TYPE_CHECKING:
@@ -36,13 +37,35 @@ def seal_source_archive(source_root: Path, files: Mapping[str, str], destination
     root = Path(source_root)
     destination = Path(destination)
     expected = dict(files)
-    for name in expected:
-        if not confined(root, name).is_file():
-            raise NativeDiscoverRefusal(
-                "discover.source_set_changed",
-                "The full SourceSet differs from the registered discover request",
-                {"path": name},
-            )
+    actual = package_inventory(root)
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            manifest = read_data(manifest_path)
+        except (PipelineError, OSError, ValueError):
+            manifest = None
+        if (
+            isinstance(manifest, dict)
+            and manifest.get("schema_version") == "description-pipeline.artifact-manifest/v1"
+            and isinstance(manifest.get("members"), list)
+        ):
+            members = manifest["members"]
+            member_files = {
+                str(item.get("path")): str(item.get("sha256"))
+                for item in members
+                if isinstance(item, dict)
+            }
+            if (
+                len(member_files) == len(members)
+                and digest({"members": members}) == manifest.get("set_sha256")
+                and {name: value for name, value in actual.items() if name != "manifest.json"} == member_files
+            ):
+                actual.pop("manifest.json", None)
+    if actual != expected:
+        raise NativeDiscoverRefusal(
+            "discover.source_set_changed",
+            "The full SourceSet differs from the registered discover request",
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     try:
@@ -154,7 +177,11 @@ def admit_observation_bundle(
                 with source.open(item) as input_stream, target.open("xb") as output_stream:
                     while block := input_stream.read(_READ_CHUNK):
                         output_stream.write(block)
-            return admit_native_observation(destination, request=request)
+            return admit_native_observation(
+                destination,
+                request=request,
+                resources_settled=True,
+            )
     except BaseException:
         if destination.exists():
             import shutil
@@ -315,7 +342,12 @@ class ArchiveDiscoverAdapter:
         destination: Path,
     ) -> NativeObservation:
         root = self.artifacts.materialize(artifact, destination)
-        return admit_native_observation(root, request=request, artifact_ref=artifact)
+        return admit_native_observation(
+            root,
+            request=request,
+            artifact_ref=artifact,
+            resources_settled=True,
+        )
 
 
 __all__ = [

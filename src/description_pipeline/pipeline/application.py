@@ -33,6 +33,7 @@ from .admission import (
     validate_run_admission,
     validate_stage_command,
 )
+from .capture import CaptureHandler
 from .contracts import (
     FailureEnvelope,
     RunAdmission,
@@ -78,6 +79,21 @@ def _plain(value: Any) -> Any:
         return {key: _plain(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_plain(item) for item in value]
+    return value
+
+
+def _portable_executor_sha256() -> str:
+    record = tool_record(role="portable")
+    value = record.get("source_sha256")
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ApplicationError(
+            "application.executor_invalid",
+            "Portable runtime record carries no source identity",
+        )
     return value
 
 
@@ -523,7 +539,7 @@ def application_from_environment(
     work_root = source.get("PIPELINE_WORK_ROOT")
     if not work_root:
         raise ApplicationError("application.work_root_missing", "PIPELINE_WORK_ROOT is not configured")
-    executor_sha256 = digest(tool_record(role="portable"))
+    executor_sha256 = _portable_executor_sha256()
     owner_sha256 = digest({"process": str(uuid.uuid4()), "pid": os.getpid()})
     lease_seconds = float(source.get("PIPELINE_CLAIM_LEASE_SECONDS", "3600"))
     services = CanonicalStageServices(
@@ -538,6 +554,7 @@ def application_from_environment(
         clock=clock,
     )
     installed: dict[StageId, StageHandler] = {
+        "capture": CaptureHandler(artifact_store=artifacts),
         "freeze": FreezeHandler(),
         "generate": GenerateHandler(artifacts),
         "verify": VerifyHandler(),
