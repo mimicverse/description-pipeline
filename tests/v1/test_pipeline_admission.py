@@ -67,6 +67,7 @@ from description_pipeline.pipeline.publish_contract import (
 )
 from description_pipeline.repository.publish import CommitSpec
 from description_pipeline.schemas import (
+    TOOL_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
     VERIFY_REQUEST_SCHEMA,
 )
@@ -119,10 +120,18 @@ class AdmissionHarness:
         self.originals = self._verified(self.originals_ref)
         self.ruleset = self._verified(self.ruleset_ref)
         self.configuration = self._verified(self.configuration_ref)
+        self.native_tool = {
+            "schema_version": TOOL_SCHEMA,
+            "pipeline_id": "test",
+            "source_sha256": digest({"executor": "native-source"}),
+            "release": None,
+            "runtime": {"role": "native"},
+        }
         self.verified_ruleset = VerifiedRuleset.from_catalog_bytes(
             self.ruleset,
             (root / "rules/catalog.json").read_bytes(),
         )
+        self.publish_intent = self._publish_intent()
         self.spec = AdmissionSpec(
             schema_version=ADMISSION_SPEC_SCHEMA,
             run_id="run-1",
@@ -145,10 +154,60 @@ class AdmissionHarness:
                 verify=digest({"executor": "verify"}),
                 publish=digest({"executor": "publish"}),
             ),
-            native_tool_source_sha256=digest({"executor": "native-source"}),
+            native_tool_source_sha256=self.native_tool["source_sha256"],
+            native_tool_record_sha256=digest(self.native_tool),
+            native_tool=self.native_tool,
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": 1}),
+            platform_config_sha256=digest({"platform-config": 1}),
+            publish_intent=self.publish_intent,
             created_at=datetime(2026, 10, 25, 9, 30, tzinfo=UTC),
+        )
+
+    def _publish_intent(self) -> VerifiedPublishIntent:
+        repository_root = self.root / "repository-snapshot"
+        bundle = b"fixture git bundle"
+        metadata = {
+            "schema_version": REPOSITORY_SNAPSHOT_SCHEMA,
+            "repository": "mimicverse/robot",
+            "origin_url": "https://github.com/mimicverse/robot",
+            "base_ref": "main",
+            "base_oid": "1" * 40,
+            "branch_ref": "work/description/m3.0/run-1",
+            "head_oid": None,
+            "bundle_sha256": hashlib.sha256(bundle).hexdigest(),
+        }
+        for name, payload in (
+            (REPOSITORY_SNAPSHOT_FILE, bundle),
+            (REPOSITORY_SNAPSHOT_METADATA, canonical(metadata)),
+        ):
+            target = repository_root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        ref = self.store.seal_tree(
+            repository_root,
+            kind=REPOSITORY_SNAPSHOT_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"producer": REPOSITORY_SNAPSHOT_KIND}),
+        )
+        verified = self._verified(ref)
+        repository = VerifiedRepositorySnapshot.from_metadata_bytes(
+            verified,
+            canonical(metadata),
+        )
+        return VerifiedPublishIntent(
+            repository=repository,
+            commit=CommitSpec(
+                author_name="Release Service",
+                author_email="release@example.com",
+                authored_at="2026-10-25T09:30:00+00:00",
+                committer_name="Release Service",
+                committer_email="release@example.com",
+                committed_at="2026-10-25T09:30:00+00:00",
+                subject="feat(m3.0): publish URDF delivery",
+                body="Admitted revision",
+            ),
         )
 
     def _seal_source(self, kind: str, root: Path, files: dict[str, bytes]) -> ArtifactRef:
@@ -455,10 +514,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {
-                "executor": "native",
-                "source_sha256": self.harness.spec.native_tool_source_sha256,
-            },
+            "native_tool": self.harness.native_tool,
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
@@ -510,7 +566,8 @@ class AdmissionProjectionTests(unittest.TestCase):
                 "effect_key",
                 "handoff_sha256",
                 "main_assembly",
-                "native_tool_sha256",
+                "native_tool_source_sha256",
+                "native_tool_record_sha256",
                 "prepared_sha256",
                 "upload_sha256",
             },
@@ -525,12 +582,16 @@ class AdmissionProjectionTests(unittest.TestCase):
         )
         self.assertEqual(capture_command.request["prepared_sha256"], discover_result.prepared_sha256)
         self.assertEqual(
-            capture_command.request["native_tool_sha256"],
+            capture_command.request["native_tool_source_sha256"],
             discover_result.native_tool_source_sha256,
+        )
+        self.assertEqual(
+            capture_command.request["native_tool_record_sha256"],
+            discover_result.native_tool_record_sha256,
         )
         self.assertNotEqual(
             capture_command.expected_executor_sha256,
-            capture_command.request["native_tool_sha256"],
+            capture_command.request["native_tool_source_sha256"],
         )
         self.assertEqual(
             generate_command.request,
@@ -644,8 +705,8 @@ class AdmissionProjectionTests(unittest.TestCase):
         wrong_native_record = {
             **discover_payload,
             "native_tool": {
-                "executor": "different-native",
-                "source_sha256": digest({"executor": "different-native"}),
+                **self.harness.native_tool,
+                "runtime": {"role": "different-native"},
             },
         }
         wrong_native_result = VerifiedDiscoverResult.from_record(discover, wrong_native_record)
@@ -659,7 +720,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             capture_command,
             request={
                 **_request(capture_command),
-                "native_tool_sha256": digest({"executor": "wrong-native-requirement"}),
+                "native_tool_record_sha256": "0" * 64,
             },
         )
         with self.assertRaises(ProtocolError):
@@ -706,10 +767,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {
-                "executor": "native",
-                "source_sha256": self.harness.spec.native_tool_source_sha256,
-            },
+            "native_tool": self.harness.native_tool,
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
@@ -742,10 +800,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {
-                "executor": "native",
-                "source_sha256": self.harness.spec.native_tool_source_sha256,
-            },
+            "native_tool": self.harness.native_tool,
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
@@ -758,7 +813,7 @@ class AdmissionProjectionTests(unittest.TestCase):
         verify_command = build_verify_command(self.harness.spec, generate, capture)
         verify_request = {
             "capture_artifact": capture.result.output_artifact.to_record(),
-            "config_snapshot_sha256": self.harness.configuration_ref.set_sha256,
+            "config_snapshot_sha256": self.harness.spec.platform_config_sha256,
             "contract_sha256": self.harness.spec.contract_sha256,
             "expected_verifier_sha256": self.harness.spec.executors.verify,
             "generate_artifact": generate.result.output_artifact.to_record(),
@@ -771,7 +826,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "actual_verifier": {"executor": "verify"},
             "actual_verifier_sha256": self.harness.spec.executors.verify,
             "capture_artifact": capture.result.output_artifact.to_record(),
-            "config_snapshot_sha256": self.harness.configuration_ref.set_sha256,
+            "config_snapshot_sha256": self.harness.spec.platform_config_sha256,
             "contract_sha256": self.harness.spec.contract_sha256,
             "decision": "PASS",
             "generate_artifact": generate.result.output_artifact.to_record(),
@@ -806,50 +861,14 @@ class AdmissionProjectionTests(unittest.TestCase):
                 certificate_bytes + b"\n",
             )
 
-        snapshot_root = self.harness.root / "repository-snapshot"
-        bundle_bytes = b"repository bundle"
-        metadata = {
-            "schema_version": REPOSITORY_SNAPSHOT_SCHEMA,
-            "repository": "example/robot",
-            "origin_url": "https://example.test/example/robot.git",
-            "base_ref": "main",
-            "base_oid": "1" * 40,
-            "branch_ref": "work/solidworks/robot/engineering",
-            "head_oid": None,
-            "bundle_sha256": hashlib.sha256(bundle_bytes).hexdigest(),
-        }
-        write_json(snapshot_root / REPOSITORY_SNAPSHOT_METADATA, metadata)
-        (snapshot_root / REPOSITORY_SNAPSHOT_FILE).write_bytes(bundle_bytes)
-        metadata_bytes = (snapshot_root / REPOSITORY_SNAPSHOT_METADATA).read_bytes()
-        snapshot_ref = self.harness.store.seal_tree(
-            snapshot_root,
-            kind=REPOSITORY_SNAPSHOT_KIND,
-            producer_run_id=None,
-            producer_stage=None,
-            producer_tool_sha256=digest({"tool": "repository-snapshot"}),
-        )
-        snapshot = VerifiedRepositorySnapshot.from_metadata_bytes(
-            self.harness._verified(snapshot_ref),
-            metadata_bytes,
-        )
+        snapshot = self.harness.publish_intent.repository
+        snapshot_ref = snapshot.artifact.ref
         with self.assertRaises(ProtocolError):
             VerifiedRepositorySnapshot.from_metadata_bytes(
-                self.harness._verified(snapshot_ref),
-                metadata_bytes + b"\n",
+                snapshot.artifact,
+                b"{}\n",
             )
-        publish_intent = VerifiedPublishIntent(
-            repository=snapshot,
-            commit=CommitSpec(
-                author_name="Publish Bot",
-                author_email="publish@example.test",
-                authored_at="2026-10-25T00:00:00+00:00",
-                committer_name="Publish Bot",
-                committer_email="publish@example.test",
-                committed_at="2026-10-25T00:00:00+00:00",
-                subject="feat(robot): publish URDF",
-                body="verified publication",
-            ),
-        )
+        publish_intent = self.harness.publish_intent
         publish = build_publish_command(
             self.harness.spec,
             verify_result,
@@ -952,7 +971,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             idempotency_key="run-1/publish",
             request={},
             input_artifacts=(),
-            config_snapshot_sha256=self.harness.configuration_ref.set_sha256,
+            config_snapshot_sha256=self.harness.spec.platform_config_sha256,
             contract_sha256=self.harness.spec.contract_sha256,
             policy_sha256=self.harness.spec.policy_sha256,
             expected_executor_sha256=self.harness.spec.executors.publish,

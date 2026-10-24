@@ -18,6 +18,7 @@ from ..schemas import (
     ARTIFACT_MANIFEST_SCHEMA,
     DISCOVER_RESULT_SCHEMA,
     GENERATE_REQUEST_SCHEMA,
+    TOOL_SCHEMA,
 )
 from .contracts import (
     ArtifactRef,
@@ -66,10 +67,14 @@ _ADMISSION_FIELDS = frozenset(
         "from_stage",
         "main_assembly",
         "native_tool_source_sha256",
+        "native_tool_record_sha256",
+        "native_tool",
         "originals",
         "parent_run_id",
         "policy_sha256",
+        "platform_config_sha256",
         "principal",
+        "publish_intent",
         "purpose",
         "request_id",
         "ruleset",
@@ -99,6 +104,14 @@ def _require_safe_multiline(value: object, code: str, where: str) -> str:
     if not text.strip() or any((ord(char) < 32 and char != "\n") or ord(char) == 127 for char in text):
         raise ProtocolError(code, {"where": where})
     return text
+
+
+def _plain_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_value(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,8 +347,12 @@ class AdmissionSpec:
     configuration: VerifiedArtifact
     executors: StageExecutors
     native_tool_source_sha256: str
+    native_tool_record_sha256: str
+    native_tool: Mapping[str, Any]
     contract_sha256: str
     policy_sha256: str
+    platform_config_sha256: str
+    publish_intent: VerifiedPublishIntent
     created_at: datetime
 
     def __post_init__(self) -> None:
@@ -366,8 +383,29 @@ class AdmissionSpec:
             )
         if not isinstance(self.executors, StageExecutors):
             raise ProtocolError("admission.invalid", {"where": "executors"})
-        for field in ("native_tool_source_sha256", "contract_sha256", "policy_sha256"):
+        for field in (
+            "native_tool_source_sha256",
+            "native_tool_record_sha256",
+            "contract_sha256",
+            "policy_sha256",
+            "platform_config_sha256",
+        ):
             _require_digest(getattr(self, field), "admission.invalid", field)
+        native_tool = _plain_value(self.native_tool)
+        if not isinstance(native_tool, dict):
+            raise ProtocolError("admission.invalid", {"where": "native_tool"})
+        if (
+            native_tool.get("schema_version") != TOOL_SCHEMA
+            or native_tool.get("source_sha256") != self.native_tool_source_sha256
+            or digest(native_tool) != self.native_tool_record_sha256
+        ):
+            raise ProtocolError(
+                "admission.invalid",
+                {"where": "native_tool", "reason": "identity-mismatch"},
+            )
+        object.__setattr__(self, "native_tool", native_tool)
+        if not isinstance(self.publish_intent, VerifiedPublishIntent):
+            raise ProtocolError("admission.invalid", {"where": "publish_intent"})
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise ProtocolError("admission.invalid", {"where": "created_at"})
 
@@ -385,10 +423,14 @@ class AdmissionSpec:
             "from_stage": self.from_stage,
             "main_assembly": self.main_assembly,
             "native_tool_source_sha256": self.native_tool_source_sha256,
+            "native_tool_record_sha256": self.native_tool_record_sha256,
+            "native_tool": _plain_value(self.native_tool),
             "originals": self.originals.to_record(),
             "parent_run_id": self.parent_run_id,
             "policy_sha256": self.policy_sha256,
+            "platform_config_sha256": self.platform_config_sha256,
             "principal": self.principal,
+            "publish_intent": self.publish_intent.to_record(),
             "purpose": self.purpose,
             "request_id": self.request_id,
             "ruleset": self.ruleset.to_record(),
@@ -434,8 +476,12 @@ class AdmissionSpec:
             configuration=configuration,
             executors=StageExecutors.from_record(record["executors"]),
             native_tool_source_sha256=record["native_tool_source_sha256"],
+            native_tool_record_sha256=record["native_tool_record_sha256"],
+            native_tool=record["native_tool"],
             contract_sha256=record["contract_sha256"],
             policy_sha256=record["policy_sha256"],
+            platform_config_sha256=record["platform_config_sha256"],
+            publish_intent=VerifiedPublishIntent.from_record(record["publish_intent"]),
             created_at=datetime.fromisoformat(record["created_at"].replace("Z", "+00:00")),
         )
         if value.admission_sha256 != record["admission_sha256"]:
@@ -989,7 +1035,7 @@ def _base_command(
         idempotency_key=f"{spec.run_id}/{stage}",
         request=request,
         input_artifacts=input_artifacts,
-        config_snapshot_sha256=spec.configuration.ref.set_sha256,
+        config_snapshot_sha256=spec.platform_config_sha256,
         contract_sha256=spec.contract_sha256,
         policy_sha256=spec.policy_sha256,
         expected_executor_sha256=spec.executors.for_stage(stage),
@@ -1018,7 +1064,7 @@ def build_freeze_command(spec: AdmissionSpec) -> StageCommand:
         "configuration_artifact_id": spec.configuration.ref.artifact_id,
         "upload_inventory_sha256": spec.originals.inventory_sha256,
         "ruleset_catalog_sha256": spec.ruleset.artifact.ref.set_sha256,
-        "platform_config_sha256": spec.configuration.ref.set_sha256,
+        "platform_config_sha256": spec.platform_config_sha256,
     }
     return _base_command(
         spec,
@@ -1064,7 +1110,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         "purpose": spec.purpose,
         "ruleset_version": spec.ruleset.version,
         "ruleset_catalog_sha256": spec.ruleset.artifact.ref.set_sha256,
-        "platform_config_sha256": spec.configuration.ref.set_sha256,
+        "platform_config_sha256": spec.platform_config_sha256,
         "submission_identity": _submission_identity(spec),
         "expected_native_tool_sha256": spec.native_tool_source_sha256,
     }
@@ -1114,6 +1160,8 @@ def build_capture_command(
         or discover_result.ruleset_artifact != spec.ruleset.artifact.ref
         or discover_result.configuration_artifact != spec.configuration.ref
         or discover_result.native_tool_source_sha256 != spec.native_tool_source_sha256
+        or discover_result.native_tool_record_sha256
+        != spec.native_tool_record_sha256
     ):
         raise ProtocolError("admission.lineage_mismatch", {"stage": "capture"})
     effect_key = "native-capture:" + digest(
@@ -1129,7 +1177,8 @@ def build_capture_command(
         "upload_sha256": discover_result.upload_inventory_sha256,
         "prepared_sha256": discover_result.prepared_sha256,
         "main_assembly": discover_result.main_assembly,
-        "native_tool_sha256": discover_result.native_tool_source_sha256,
+        "native_tool_source_sha256": discover_result.native_tool_source_sha256,
+        "native_tool_record_sha256": discover_result.native_tool_record_sha256,
     }
     return _base_command(
         spec,
@@ -1196,6 +1245,8 @@ def build_publish_command(
         raise ProtocolError("admission.verify_result_invalid", {"stage": "publish"})
     if not isinstance(publish_intent, VerifiedPublishIntent):
         raise ProtocolError("admission.publish_intent_invalid", {"stage": "publish"})
+    if publish_intent != spec.publish_intent:
+        raise ProtocolError("admission.publish_intent_invalid", {"where": "admission-binding"})
     verify = _require_predecessor(verify_result.predecessor, stage="verify", run_id=spec.run_id)
     repository = publish_intent.repository
     verified = verify_result.predecessor.result.output_artifact

@@ -449,7 +449,8 @@ class CaptureHandlerTests(unittest.TestCase):
                 "effect_key": "capture-native",
                 "handoff_sha256": self.handoff_sha256,
                 "main_assembly": MAIN,
-                "native_tool_sha256": self.expected_native_tool_sha256,
+                "native_tool_source_sha256": self.expected_native_tool_sha256,
+                "native_tool_record_sha256": self.native_tool_sha256,
                 "prepared_sha256": digest(self.prepared_files),
                 "upload_sha256": self.upload_sha256,
             },
@@ -612,7 +613,7 @@ class CaptureHandlerTests(unittest.TestCase):
         operation = Mock()
         request = {
             **self.command.to_record()["request"],
-            "native_tool_sha256": "d" * 64,
+            "native_tool_record_sha256": "d" * 64,
         }
         command = self._command(request=request)
         claim = self._claim(command, "claim-native-rebind", fence=1)
@@ -622,6 +623,27 @@ class CaptureHandlerTests(unittest.TestCase):
                 command,
                 claim,
                 self.workspace(name="workspace-native-rebind"),
+                effects=effects,
+            )
+        operation.assert_not_called()
+        self.assertFalse(
+            any(intent.command_id == command.command_id for intent in self.effect_ledger.intents.values())
+        )
+
+    def test_capture_cannot_rebind_the_discover_native_source(self) -> None:
+        operation = Mock()
+        request = {
+            **self.command.to_record()["request"],
+            "native_tool_source_sha256": "d" * 64,
+        }
+        command = self._command(request=request)
+        claim = self._claim(command, "claim-native-source-rebind", fence=1)
+        effects = self.effects(command, claim)
+        with self.assertRaisesRegex(Exception, "native_requirement_binding"):
+            self.handler(native_operation=operation).execute(
+                command,
+                claim,
+                self.workspace(name="workspace-native-source-rebind"),
                 effects=effects,
             )
         operation.assert_not_called()

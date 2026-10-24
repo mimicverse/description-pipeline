@@ -513,10 +513,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "source_set_artifact": self.admission_harness.originals_ref.to_record(),
             "ruleset_artifact": self.admission_harness.ruleset_ref.to_record(),
             "configuration_artifact": self.admission_harness.configuration_ref.to_record(),
-            "native_tool": {
-                "executor": "native",
-                "source_sha256": self.admission_harness.spec.native_tool_source_sha256,
-            },
+            "native_tool": self.admission_harness.native_tool,
             "passed": True,
         }
 
@@ -672,7 +669,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         self.assertNotEqual(
             capture_command.expected_executor_sha256,
-            capture_command.request["native_tool_sha256"],
+            capture_command.request["native_tool_source_sha256"],
         )
         self.facts.create_command(
             capture_command,

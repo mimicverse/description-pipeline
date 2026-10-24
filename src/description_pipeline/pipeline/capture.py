@@ -105,7 +105,8 @@ def _artifact_files(root: Path, artifact: ArtifactRef, *, role: str) -> dict[str
 class CaptureRequest:
     """The Capture-specific part of one immutable StageCommand request."""
 
-    native_tool_sha256: str
+    native_tool_source_sha256: str
+    native_tool_record_sha256: str
     handoff_sha256: str
     upload_sha256: str
     prepared_sha256: str
@@ -121,7 +122,8 @@ class CaptureRequest:
             "effect_key",
             "handoff_sha256",
             "main_assembly",
-            "native_tool_sha256",
+            "native_tool_source_sha256",
+            "native_tool_record_sha256",
             "prepared_sha256",
             "upload_sha256",
         }
@@ -135,7 +137,8 @@ class CaptureRequest:
             raise ProtocolError("capture.request_invalid", {"where": "text-fields"})
         for key in (
             "handoff_sha256",
-            "native_tool_sha256",
+            "native_tool_source_sha256",
+            "native_tool_record_sha256",
             "prepared_sha256",
             "upload_sha256",
         ):
@@ -239,13 +242,19 @@ class CaptureInputs:
             raise ProtocolError("capture.discover_result_identity", {"where": "result.json"})
         native_tool = discover_result.get("native_tool")
         if (
-            discover_request.get("expected_native_tool_sha256") != request.native_tool_sha256
+            discover_request.get("expected_native_tool_sha256")
+            != request.native_tool_source_sha256
             or not isinstance(native_tool, dict)
-            or native_tool.get("source_sha256") != request.native_tool_sha256
+            or native_tool.get("source_sha256")
+            != request.native_tool_source_sha256
+            or digest(native_tool) != request.native_tool_record_sha256
         ):
             raise ProtocolError(
                 "capture.native_requirement_binding",
-                {"expected": request.native_tool_sha256},
+                {
+                    "source": request.native_tool_source_sha256,
+                    "record": request.native_tool_record_sha256,
+                },
             )
         if (
             discover_request.get("freeze_artifact_id") != freeze.artifact_id
@@ -403,11 +412,15 @@ def _execution_record(
 ) -> dict[str, Any]:
     if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
         raise ProtocolError("capture.claim_mismatch", {"command_id": command.command_id})
-    if native_tool.get("source_sha256") != request.native_tool_sha256:
+    if (
+        native_tool.get("source_sha256") != request.native_tool_source_sha256
+        or digest(native_tool) != request.native_tool_record_sha256
+    ):
         raise ProtocolError(
             "capture.native_tool_mismatch",
             {
-                "expected": request.native_tool_sha256,
+                "expected_source": request.native_tool_source_sha256,
+                "expected_record": request.native_tool_record_sha256,
                 "actual": native_tool.get("source_sha256"),
             },
         )
@@ -872,7 +885,8 @@ class CaptureHandler:
             execution_record.get("command_id") != command.command_id
             or execution_record.get("run_id") != command.run_id
             or execution_record.get("executor_sha256") != claim.executor_sha256
-            or tool.get("source_sha256") != request.native_tool_sha256
+            or tool.get("source_sha256") != request.native_tool_source_sha256
+            or digest(tool) != request.native_tool_record_sha256
             or execution_record.get("native_tool_sha256") != digest(tool)
         ):
             raise ProtocolError("capture.effect_identity", {"effect_key": request.effect_key})
