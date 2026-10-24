@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, writable_output
 from ..io import (
@@ -39,7 +39,11 @@ from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import selection_bindings
 from ..stages import stage_view
 from .contracts import ArtifactRef, ExecutionClaim, ProtocolError, StageCandidate, StageCommand, StageExecution
+from .effects import EffectSettlement, EffectState, StageEffectPort
 from .engine import StageWorkspace
+
+if TYPE_CHECKING:
+    from ..artifacts import ArtifactStore
 
 
 NativeOutcome = Literal["completed", "failed", "cancelled", "unknown"]
@@ -96,8 +100,7 @@ class CaptureRequest:
     upload_sha256: str
     prepared_sha256: str
     main_assembly: str
-    effect_id: str
-    native_tool_sha256: str
+    effect_key: str
 
     @classmethod
     def from_command(cls, command: StageCommand) -> CaptureRequest:
@@ -105,10 +108,9 @@ class CaptureRequest:
             raise ProtocolError("capture.command_stage", {"stage": command.stage})
         request = command.request
         required = {
-            "effect_id",
+            "effect_key",
             "handoff_sha256",
             "main_assembly",
-            "native_tool_sha256",
             "prepared_sha256",
             "upload_sha256",
         }
@@ -120,7 +122,7 @@ class CaptureRequest:
         values = {key: request[key] for key in required}
         if not all(isinstance(value, str) and value and "\x00" not in value for value in values.values()):
             raise ProtocolError("capture.request_invalid", {"where": "text-fields"})
-        for key in ("handoff_sha256", "native_tool_sha256", "prepared_sha256", "upload_sha256"):
+        for key in ("handoff_sha256", "prepared_sha256", "upload_sha256"):
             value = values[key]
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ProtocolError("capture.request_invalid", {"where": key})
@@ -366,20 +368,20 @@ def _execution_record(
     request: CaptureRequest,
     native_tool: Mapping[str, Any],
 ) -> dict[str, Any]:
-    if claim.command_id != command.command_id or claim.owner_sha256 != command.expected_executor_sha256:
+    if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
         raise ProtocolError("capture.claim_mismatch", {"command_id": command.command_id})
     native_tool_sha256 = digest(native_tool)
-    if native_tool_sha256 != request.native_tool_sha256:
+    if native_tool_sha256 != claim.executor_sha256:
         raise ProtocolError(
             "capture.native_tool_mismatch",
-            {"expected": request.native_tool_sha256, "actual": native_tool_sha256},
+            {"expected": claim.executor_sha256, "actual": native_tool_sha256},
         )
     return {
         "claim_id": claim.claim_id,
         "command_id": command.command_id,
-        "effect_id": request.effect_id,
+        "effect_key": request.effect_key,
+        "executor_sha256": native_tool_sha256,
         "fence": claim.fence,
-        "native_tool_sha256": native_tool_sha256,
         "owner_sha256": claim.owner_sha256,
         "run_id": command.run_id,
     }
@@ -720,64 +722,215 @@ class CaptureHandler:
     def __init__(
         self,
         *,
+        artifact_store: ArtifactStore | None = None,
         backend_factory: Callable[[Path], object] | None = None,
         native_operation: Callable[..., NativeCaptureResult] | None = None,
         admitter: Callable[..., dict[str, Any]] | None = None,
         native_tool_factory: Callable[[], dict[str, Any]] | None = None,
-        effect_authorizer: Callable[..., str] | None = None,
-        effect_observer: Callable[..., None] | None = None,
     ) -> None:
+        self._artifact_store = artifact_store
         self._backend_factory = backend_factory
         self._native_operation = native_operation or _invoke_native_operation
         self._native_tool_factory = native_tool_factory or _native_tool_record
-        self._effect_authorizer = effect_authorizer
-        self._effect_observer = effect_observer
         if admitter is None:
             from ..orchestration.stage_transfer import admit_capture
 
             admitter = admit_capture
         self._admitter = admitter
 
+    def _effect_state(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        request: CaptureRequest,
+        inputs: CaptureInputs,
+        tool: Mapping[str, Any],
+        effects: StageEffectPort,
+    ) -> tuple[str, EffectSettlement | None]:
+        existing = effects.effect_settlement_for_key(request.effect_key)
+        if existing is not None:
+            if existing.state == EffectState.SATISFIED:
+                return existing.effect_id, existing
+            if existing.state in {EffectState.UNKNOWN, EffectState.CONFLICT}:
+                raise CaptureUnresolved(f"capture.effect_{existing.state.value}")
+            if existing.state == EffectState.DEFINITELY_FAILED:
+                return existing.effect_id, existing
+            if existing.state != EffectState.PREPARED:
+                raise ProtocolError("capture.effect_state", {"state": existing.state.value})
+            effects.authorize_dispatch(existing.effect_id, source="capture-handler")
+            return existing.effect_id, existing
+
+        execution = _execution_record(command, claim, request, tool)
+        outbound_root = workspace.root / "capture-effect-outbound"
+        # This method is completed by execute below; keeping the intent shape in
+        # one local record prevents target and expected state from diverging.
+        outbound = {
+            "command_id": command.command_id,
+            "execution": execution,
+            "main_assembly": request.main_assembly,
+            "object_set_sha256": digest(list(inputs.object_names)),
+            "objects": list(inputs.object_names),
+            "prepared_sha256": request.prepared_sha256,
+            "request_digest": command.request_digest,
+            "run_id": command.run_id,
+            "upstream_artifacts": list(_upstream_records(inputs)),
+        }
+        expected_state = {
+            "command_id": command.command_id,
+            "effect_key": request.effect_key,
+            "main_assembly": request.main_assembly,
+            "object_set_sha256": digest(list(inputs.object_names)),
+            "prepared_sha256": request.prepared_sha256,
+            "request_digest": command.request_digest,
+            "schema_version": "description-pipeline.native-capture-effect/v1",
+        }
+        outbound_root.mkdir(parents=True, exist_ok=False)
+        write_json(outbound_root / "outbound.json", outbound)
+        intent = effects.prepare_effect(
+            effect_key=request.effect_key,
+            effect_kind="native_operation",
+            target={
+                "command_id": command.command_id,
+                "host": "windows",
+                "run_id": command.run_id,
+                "stage": "capture",
+            },
+            expected_state=expected_state,
+            outbound_root=outbound_root,
+        )
+        effects.authorize_dispatch(intent.effect_id, source="capture-handler")
+        return intent.effect_id, None
+
+    def _admit_effect_payload(
+        self,
+        *,
+        payload_root: Path,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        request: CaptureRequest,
+        inputs: CaptureInputs,
+    ) -> StageExecution:
+        execution_record = read_data(payload_root / "execution.json")
+        tool = read_data(payload_root / "native-tool.json")
+        archive = payload_root / "native-evidence.zip"
+        if not isinstance(execution_record, dict) or not isinstance(tool, dict) or not archive.is_file():
+            raise ProtocolError("capture.effect_payload", {"effect_key": request.effect_key})
+        if (
+            execution_record.get("command_id") != command.command_id
+            or execution_record.get("run_id") != command.run_id
+            or execution_record.get("executor_sha256") != claim.executor_sha256
+            or digest(tool) != claim.executor_sha256
+        ):
+            raise ProtocolError("capture.effect_executor", {"effect_key": request.effect_key})
+        admitted = payload_root / "admitted"
+        manifest = self._admitter(
+            archive,
+            admitted,
+            expected_run_id=command.run_id,
+            expected_handoff_sha256=request.handoff_sha256,
+            expected_upload_sha256=request.upload_sha256,
+            expected_main_assembly=request.main_assembly,
+            expected_native_tool=tool,
+            expected_prepared_dir=None,
+            expected_prepared_files=dict(inputs.prepared_files),
+            expected_upstream_artifacts=_upstream_records(inputs),
+            expected_execution=execution_record,
+        )
+        checks = digest(
+            {
+                "effect_key": request.effect_key,
+                "manifest": manifest,
+                "object_set_sha256": digest(list(inputs.object_names)),
+                "upstream_artifacts": _upstream_records(inputs),
+            }
+        )
+        return StageExecution(
+            outcome="completed",
+            candidate_root=str(admitted),
+            checks_sha256=checks,
+        )
+
+    def _reuse_satisfied_effect(
+        self,
+        *,
+        settlement: EffectSettlement,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        request: CaptureRequest,
+        inputs: CaptureInputs,
+    ) -> StageExecution:
+        if self._artifact_store is None or settlement.payload_artifact is None:
+            raise ProtocolError("capture.effect_payload_unavailable", {"effect_key": request.effect_key})
+        payload_root = self._artifact_store.materialize(
+            settlement.payload_artifact,
+            workspace.root / "satisfied-effect-payload",
+        )
+        return self._admit_effect_payload(
+            payload_root=payload_root,
+            command=command,
+            claim=claim,
+            request=request,
+            inputs=inputs,
+        )
+
+    @staticmethod
+    def _effect_failure_root(
+        workspace: StageWorkspace,
+        settlement: EffectSettlement,
+        reason_code: str,
+    ) -> Path:
+        root = workspace.root / "capture-effect-failure"
+        root.mkdir(parents=True, exist_ok=False)
+        payload = {
+            "effect_id": settlement.effect_id,
+            "reason_code": reason_code,
+            "schema_version": "description-pipeline.capture-effect-failure/v1",
+            "state": settlement.state.value,
+        }
+        write_json(root / "failure.json", payload)
+        return root
+
     def execute(
         self,
         command: StageCommand,
         claim: ExecutionClaim,
         workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
     ) -> StageExecution:
         request = CaptureRequest.from_command(command)
         inputs = CaptureInputs.resolve(command, workspace, request)
         upstream = _upstream_records(inputs)
         tool = self._native_tool_factory()
         execution = _execution_record(command, claim, request, tool)
-        if self._effect_authorizer is None or self._effect_observer is None:
-            raise ProtocolError(
-                "capture.effect_gateway_required",
-                {"command_id": command.command_id},
-            )
-        outbound = {
-            "command_id": command.command_id,
-            "execution": execution,
-            "objects": inputs.object_names,
-            "prepared_sha256": request.prepared_sha256,
-            "upstream_artifacts": upstream,
-        }
-        expected_state = {
-            "main_assembly": request.main_assembly,
-            "request_digest": command.request_digest,
-            "run_id": command.run_id,
-            "stage": "capture",
-        }
-        effect_id = self._effect_authorizer(
-            command=command,
-            claim=claim,
-            effect_key=request.effect_id,
-            outbound=outbound,
-            outbound_digest=digest(outbound),
-            expected_state=expected_state,
-            expected_state_digest=digest(expected_state),
+        effect_id, settlement = self._effect_state(
+            command,
+            claim,
+            workspace,
+            request,
+            inputs,
+            tool,
+            effects,
         )
-        if effect_id != request.effect_id:
-            raise ProtocolError("capture.effect_identity", {"effect_id": effect_id})
+        if settlement is not None and settlement.state == EffectState.SATISFIED:
+            return self._reuse_satisfied_effect(
+                settlement=settlement,
+                command=command,
+                claim=claim,
+                workspace=workspace,
+                request=request,
+                inputs=inputs,
+            )
+        if settlement is not None and settlement.state == EffectState.DEFINITELY_FAILED:
+            root = self._effect_failure_root(workspace, settlement, "capture.effect_definitely_failed")
+            return StageExecution(
+                outcome="failed",
+                candidate_root=str(root),
+                checks_sha256=digest(read_data(root / "failure.json")),
+                reason_code="capture.effect_definitely_failed",
+            )
         backend = self._backend_factory(inputs.package) if self._backend_factory is not None else None
         output = workspace.root / "capture-native"
         native = self._native_operation(
@@ -792,31 +945,31 @@ class CaptureHandler:
             execution=execution,
             native_tool=tool,
         )
-        required_effects = (request.effect_id,)
         if native.outcome == "unknown":
-            self._effect_observer(
-                command=command,
-                claim=claim,
-                effect_id=request.effect_id,
+            timeout_root = workspace.root / "capture-effect-unknown"
+            timeout_root.mkdir(parents=True, exist_ok=False)
+            write_json(timeout_root / "native-result.json", dict(native.receipt))
+            effects.record_timeout(effect_id, source="capture-handler", detail_root=timeout_root)
+            effects.record_observation(
+                effect_id,
+                source="capture-handler",
                 state_class="unobservable",
-                payload_artifact_id=None,
-                payload_digest=digest(native.receipt),
+                observation_root=timeout_root,
             )
             raise CaptureUnresolved(native.reason_code or "capture.native_unknown")
         if native.outcome in {"failed", "cancelled"}:
             if native.output is None or not native.output.exists():
                 raise ProtocolError("capture.failure_evidence_missing", {"outcome": native.outcome})
-            self._effect_observer(
-                command=command,
-                claim=claim,
-                effect_id=request.effect_id,
+            effects.record_response(effect_id, source="capture-handler", response_root=native.output)
+            effects.reconcile_effect(
+                effect_id,
+                source="capture-handler",
                 state_class="absent",
-                payload_artifact_id=None,
-                payload_digest=digest(native.receipt),
+                evidence_root=native.output,
             )
             checks = digest(
                 {
-                    "effect_id": request.effect_id,
+                    "effect_id": effect_id,
                     "objects": inputs.object_names,
                     "outcome": native.outcome,
                     "reason_code": native.reason_code,
@@ -826,49 +979,28 @@ class CaptureHandler:
                 outcome=native.outcome,
                 candidate_root=str(native.output),
                 checks_sha256=checks,
-                required_effect_ids=required_effects,
                 reason_code=native.reason_code,
             )
         if native.output is None or native.archive is None or not native.archive.is_file():
             raise ProtocolError("capture.native_artifact_missing", {"output": str(native.output)})
-        archive_digest = file_digest(native.archive)
-        self._effect_observer(
+        effect_payload = workspace.root / "capture-effect-payload"
+        effect_payload.mkdir(parents=True, exist_ok=False)
+        shutil.copyfile(native.archive, effect_payload / "native-evidence.zip")
+        write_json(effect_payload / "execution.json", execution)
+        write_json(effect_payload / "native-tool.json", tool)
+        effects.record_response(effect_id, source="capture-handler", response_root=effect_payload)
+        effects.record_observation(
+            effect_id,
+            source="capture-handler",
+            state_class="known",
+            observation_root=effect_payload,
+        )
+        return self._admit_effect_payload(
+            payload_root=effect_payload,
             command=command,
             claim=claim,
-            effect_id=request.effect_id,
-            state_class="known",
-            payload_artifact_id=f"{command.command_id}:native-artifact",
-            payload_digest=archive_digest,
-        )
-
-        admitted = workspace.root / "capture-admitted"
-        manifest = self._admitter(
-            native.archive,
-            admitted,
-            expected_run_id=command.run_id,
-            expected_handoff_sha256=request.handoff_sha256,
-            expected_upload_sha256=request.upload_sha256,
-            expected_main_assembly=request.main_assembly,
-            expected_native_tool=tool,
-            expected_prepared_dir=str(inputs.package),
-            expected_prepared_files=dict(inputs.prepared_files),
-            expected_upstream_artifacts=upstream,
-            expected_execution=execution,
-        )
-        checks = digest(
-            {
-                "effect_id": request.effect_id,
-                "execution": execution,
-                "manifest": manifest,
-                "objects": inputs.object_names,
-                "upstream_artifacts": upstream,
-            }
-        )
-        return StageExecution(
-            outcome="completed",
-            candidate_root=str(admitted),
-            checks_sha256=checks,
-            required_effect_ids=required_effects,
+            request=request,
+            inputs=inputs,
         )
 
     def validate_candidate(
@@ -876,6 +1008,8 @@ class CaptureHandler:
         command: StageCommand,
         claim: ExecutionClaim,
         candidate: StageCandidate,
+        *,
+        effects: StageEffectPort,
     ) -> StageCandidate:
         request = CaptureRequest.from_command(command)
         result = candidate.result
@@ -884,12 +1018,18 @@ class CaptureHandler:
             or result.run_id != command.run_id
             or result.stage != "capture"
             or result.request_digest != command.request_digest
-            or result.actual_executor_sha256 != claim.owner_sha256
+            or result.actual_executor_sha256 != claim.executor_sha256
         ):
             raise ProtocolError("capture.candidate_identity", {"command_id": command.command_id})
-        if request.effect_id not in result.required_effect_ids:
-            raise ProtocolError("capture.effect_missing", {"effect_id": request.effect_id})
-        artifact = result.result_artifact
+        settlement = effects.effect_settlement_for_key(request.effect_key)
+        expected_state = (
+            EffectState.SATISFIED
+            if result.outcome == "completed"
+            else EffectState.DEFINITELY_FAILED
+        )
+        if settlement is None or settlement.state != expected_state:
+            raise ProtocolError("capture.candidate_effect", {"effect_key": request.effect_key})
+        artifact = result.output_artifact
         if (
             artifact.producer_run_id != command.run_id
             or artifact.producer_stage != "capture"

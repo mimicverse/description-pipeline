@@ -31,6 +31,7 @@ from .contracts import (
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
+from .effects import StageEffectPort
 
 FREEZE_REQUEST_SCHEMA = "description-pipeline.freeze-request/v1"
 FREEZE_CHECKS_SCHEMA = "description-pipeline.freeze-checks/v1"
@@ -423,7 +424,7 @@ class FreezeHandler:
             raise ProtocolError("freeze.candidate_mismatch", {"command_id": command.command_id})
         if claim.command_id != command.command_id:
             raise ProtocolError("freeze.claim_mismatch", {"command_id": command.command_id})
-        if result.actual_executor_sha256 != command.expected_executor_sha256:
+        if result.actual_executor_sha256 != claim.executor_sha256:
             raise ProtocolError("freeze.executor_mismatch", {"command_id": command.command_id})
         if result.outcome in {"failed", "cancelled"} and not (
             isinstance(result.reason_code, str) and result.reason_code.startswith(_TERMINAL_REASON_PREFIX)

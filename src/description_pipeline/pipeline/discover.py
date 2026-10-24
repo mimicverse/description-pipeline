@@ -37,6 +37,7 @@ from .contracts import (
 )
 from .effects import EffectState, StageEffectPort
 from .engine import StageWorkspace
+from .effects import StageEffectPort
 
 DISCOVER_REQUEST_SCHEMA = "description-pipeline.discover-request/v1"
 DISCOVER_RESULT_SCHEMA = "description-pipeline.discover-result/v1"
@@ -678,7 +679,7 @@ class DiscoverHandler:
             raise ProtocolError("discover.candidate_mismatch", {"command_id": command.command_id})
         if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
             raise ProtocolError("discover.claim_mismatch", {"command_id": command.command_id})
-        if result.actual_executor_sha256 != command.expected_executor_sha256:
+        if result.actual_executor_sha256 != claim.executor_sha256:
             raise ProtocolError("discover.executor_mismatch", {"command_id": command.command_id})
         if result.outcome in {"failed", "cancelled"} and not (
             isinstance(result.reason_code, str) and result.reason_code.startswith("discover.")
