@@ -15,7 +15,6 @@ from typing import Any, Protocol
 
 from ..artifacts import ArtifactStore
 from ..io import PipelineError, digest, read_data
-from ..orchestration.discover_protocol import ArchiveDiscoverAdapter
 from ..platform.facts import FactStore
 from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
@@ -36,7 +35,6 @@ from .admission import (
     validate_run_admission,
     validate_stage_command,
 )
-from .capture import CaptureHandler
 from .contracts import (
     ArtifactRef,
     DispatchCommand,
@@ -609,6 +607,8 @@ class StageApplication:
                 predecessors[current_stage] = predecessor
                 if current_stage == "discover":
                     discover_result = self._verified_discover_result(predecessor)
+                if current_stage == stage:
+                    return self.execute_registered_command(stored.command_id)
                 continue
             if current_stage != stage:
                 raise ApplicationError(
@@ -701,13 +701,6 @@ def application_from_environment(
         clock=clock,
     )
     installed: dict[StageId, StageHandler] = {
-        "capture": CaptureHandler(artifact_store=artifacts),
-        "discover": DiscoverHandler(
-            ArchiveDiscoverAdapter(
-                artifacts=artifacts,
-                native_tool=tool_record(role="native"),
-            )
-        ),
         "freeze": FreezeHandler(),
         "generate": GenerateHandler(artifacts),
         "publish": PublishHandler(artifacts),

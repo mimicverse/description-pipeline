@@ -23,8 +23,6 @@ from description_pipeline.pipeline.application import (
     StageApplication,
     application_from_environment,
 )
-from description_pipeline.pipeline.capture import CaptureHandler
-from description_pipeline.pipeline.discover import DiscoverHandler
 from description_pipeline.pipeline.stages.publish import PublishHandler
 from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
@@ -304,6 +302,7 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(self.freeze.executions, 1)
         again = self.application.execute_registered_command(admitted.freeze_command.command_id)
         self.assertEqual(again, freeze)
+        self.assertEqual(self.application.run_stage("run-1", "freeze"), freeze)
         self.assertEqual(self.freeze.executions, 1)
 
         discover = self.application.run_stage("run-1", "discover")
@@ -314,6 +313,16 @@ class StageApplicationTests(unittest.TestCase):
             admitted.freeze_command.command_id,
             discover.command_id,
         })
+
+    def test_execute_run_resumes_after_a_completed_prefix(self):
+        self.application.admit(self.harness.spec)
+        freeze = self.application.run_stage("run-1", "freeze")
+        outcome = self.application.execute_run("run-1", through="discover")
+        self.assertEqual(outcome.outcome, "completed")
+        self.assertEqual(outcome.stage, "discover")
+        self.assertEqual(freeze.stage, "freeze")
+        self.assertEqual(self.freeze.executions, 1)
+        self.assertEqual(self.discover.executions, 1)
 
     def test_run_reports_exact_missing_capability_without_fallback(self):
         self.application.admit(self.harness.spec)
@@ -415,8 +424,8 @@ class StageApplicationTests(unittest.TestCase):
         ):
             application = application_from_environment(environment)
         self.assertEqual(application.services.claim_policy.executor_sha256, executor)
-        self.assertIsInstance(application.handlers["capture"], CaptureHandler)
-        self.assertIsInstance(application.handlers["discover"], DiscoverHandler)
+        self.assertNotIn("capture", application.handlers)
+        self.assertNotIn("discover", application.handlers)
         self.assertIsInstance(application.handlers["publish"], PublishHandler)
 
 
