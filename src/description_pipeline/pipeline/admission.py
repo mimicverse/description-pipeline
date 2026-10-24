@@ -350,11 +350,6 @@ class AdmissionSpec:
             raise ProtocolError("admission.invalid", {"where": "executors"})
         for field in ("native_tool_sha256", "contract_sha256", "policy_sha256"):
             _require_digest(getattr(self, field), "admission.invalid", field)
-        if self.executors.capture != self.native_tool_sha256:
-            raise ProtocolError(
-                "admission.invalid",
-                {"where": "executors.capture", "reason": "native-tool-mismatch"},
-            )
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise ProtocolError("admission.invalid", {"where": "created_at"})
 
@@ -529,6 +524,7 @@ class VerifiedDiscoverResult:
     upload_inventory_sha256: str
     main_assembly: str
     native_observation_sha256: str
+    native_tool_sha256: str
     source_set_artifact: ArtifactRef
     ruleset_artifact: ArtifactRef
     configuration_artifact: ArtifactRef
@@ -541,6 +537,7 @@ class VerifiedDiscoverResult:
             "selected_files_sha256",
             "upload_inventory_sha256",
             "native_observation_sha256",
+            "native_tool_sha256",
         ):
             _require_digest(getattr(self, field), "admission.discover_result_invalid", field)
         _require_text(self.main_assembly, "admission.discover_result_invalid", "main_assembly")
@@ -568,6 +565,7 @@ class VerifiedDiscoverResult:
             "source_set_artifact",
             "ruleset_artifact",
             "configuration_artifact",
+            "native_tool",
         }
         if not isinstance(record, Mapping) or not required <= set(record):
             raise ProtocolError("admission.discover_result_invalid", {"where": "record"})
@@ -592,6 +590,9 @@ class VerifiedDiscoverResult:
             raise ProtocolError("admission.discover_result_invalid", {"where": "selection.handoff_sha256"})
         _require_digest(upload, "admission.discover_result_invalid", "selection.upload_sha256")
         _require_text(main, "admission.discover_result_invalid", "selection.main_assembly")
+        native_tool = record["native_tool"]
+        if not isinstance(native_tool, Mapping) or not native_tool:
+            raise ProtocolError("admission.discover_result_invalid", {"where": "native_tool"})
         return cls(
             predecessor=predecessor,
             prepared_sha256=record["prepared_sha256"],
@@ -599,6 +600,7 @@ class VerifiedDiscoverResult:
             upload_inventory_sha256=upload,
             main_assembly=main,
             native_observation_sha256=record["native_observation_sha256"],
+            native_tool_sha256=digest(dict(native_tool)),
             source_set_artifact=ArtifactRef.from_record(record["source_set_artifact"]),
             ruleset_artifact=ArtifactRef.from_record(record["ruleset_artifact"]),
             configuration_artifact=ArtifactRef.from_record(record["configuration_artifact"]),
@@ -751,6 +753,7 @@ def build_capture_command(
         or discover_result.source_set_artifact != spec.originals.ref
         or discover_result.ruleset_artifact != spec.ruleset.artifact.ref
         or discover_result.configuration_artifact != spec.configuration.ref
+        or discover_result.native_tool_sha256 != spec.native_tool_sha256
     ):
         raise ProtocolError("admission.lineage_mismatch", {"stage": "capture"})
     effect_key = "native-capture:" + digest(
@@ -766,6 +769,7 @@ def build_capture_command(
         "upload_sha256": discover_result.upload_inventory_sha256,
         "prepared_sha256": discover_result.prepared_sha256,
         "main_assembly": discover_result.main_assembly,
+        "native_tool_sha256": discover_result.native_tool_sha256,
     }
     return _base_command(
         spec,
