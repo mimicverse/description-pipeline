@@ -2032,7 +2032,6 @@ def _capture_preparation(root, manifest):
             and before_top["read_only"] is True
             and before_top["configuration"] == configuration
             and before_top["needs_rebuild2_value"] in (1, 2)
-            and before_top["configuration_needs_rebuild"] is False
             and _same_native_path(failed_state["path"], top_path)
             and failed_state["configuration"] == configuration
             and failed_state["read_only"] is True

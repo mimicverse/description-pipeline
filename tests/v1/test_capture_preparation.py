@@ -619,7 +619,10 @@ def dynamic_child_payload() -> dict:
     return value
 
 
-def recovery_payload() -> dict:
+def recovery_payload(
+    *,
+    before_configuration_needs_rebuild: bool = False,
+) -> dict:
     """A real native recovery preparation consumed by the independent verifier."""
 
     from description_pipeline.sources.solidworks import native
@@ -634,10 +637,17 @@ def recovery_payload() -> dict:
     old_child = _Doc(child_path, needs_rebuild2=1)
     old_top = _Doc(
         top_path,
+        configuration_needs_rebuild=before_configuration_needs_rebuild,
         needs_rebuild2=1,
         rebuild_clears=False,
         children=[_Component("child-1", old_child)],
     )
+    if before_configuration_needs_rebuild:
+        old_top._rebuild_callback = lambda: setattr(
+            old_top,
+            "_configuration_needs_rebuild",
+            False,
+        )
     fresh_child = _Doc(child_path, needs_rebuild2=1)
     fresh_top = _Doc(
         top_path,
@@ -1149,6 +1159,23 @@ class CapturePreparationTests(unittest.TestCase):
         self.assertEqual(result["needs_rebuild2_after"], 0)
         self.assertEqual(result["final_document_count"], 2)
         self.assertEqual(result["assembly_document_count"], 2)
+
+    def test_recovery_accepts_top_rebuild_that_clears_configuration_pending(self) -> None:
+        value = recovery_payload(
+            before_configuration_needs_rebuild=True
+        )
+        recovery = self.preparation(value)["session_recovery"]
+        failed_top = recovery["first_attempt"]["rebuild_calls"][-1]
+        self.assertIs(
+            failed_top["state_before"]["configuration_needs_rebuild"],
+            True,
+        )
+        self.assertIs(
+            failed_top["state_after"]["configuration_needs_rebuild"],
+            False,
+        )
+        result = self.validate(value)
+        self.assertEqual(result["needs_rebuild2_after"], 0)
 
     def test_recovery_consumer_rejects_a_missing_first_attempt(self) -> None:
         value = recovery_payload()
