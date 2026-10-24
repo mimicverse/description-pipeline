@@ -12,7 +12,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.geometry.native_u import native_tolerant_edge_value_warning
 from description_pipeline.io import PipelineError, digest, inventory, read_data, write_json
 from description_pipeline.model import EngineeringModel, emit
 from description_pipeline.pipeline.contracts import (
@@ -32,13 +31,11 @@ from description_pipeline.pipeline.stages.generate import (
     GENERATE_REQUEST_SCHEMA,
     GenerateHandler,
 )
-from description_pipeline.sources.solidworks.generation_warnings import generation_value_warnings
 from description_pipeline.sources.solidworks.naming import visual_name
 from description_pipeline.sources.snapshot import write_manifest
 
 from tests.sources import test_solidworks_mass_authority as authority_fixtures
 from description_pipeline.pipeline.stages import generate as generate_stage
-from tests.v1 import test_native_scope_warning_projection as warning_fixtures
 
 
 class GenerateHandlerTests(unittest.TestCase):
@@ -119,10 +116,6 @@ class GenerateHandlerTests(unittest.TestCase):
             patch(
                 "description_pipeline.sources.solidworks.scene.load_scene",
                 side_effect=AssertionError("transitional load_scene must not run"),
-            ),
-            patch(
-                "description_pipeline.verification.native_mesh_observations.native_geometry_value_warnings",
-                side_effect=AssertionError("verification helper must not produce model warnings"),
             ),
         ):
             first = self.handler.execute(self.command, first_claim, first_workspace, effects=object())
@@ -287,118 +280,6 @@ class GenerateHandlerTests(unittest.TestCase):
                 effects=object(),
             )
         self.assertFalse((workspace.root / "output").exists())
-
-
-class ProductionWarningTests(unittest.TestCase):
-    def test_production_projection_reads_native_records_independently(self) -> None:
-        source = warning_fixtures.tolerant_warning()
-        scope = source["source_scope"]
-        tolerant = {
-            key: copy.deepcopy(source[key])
-            for key in (
-                "parameter_boundary",
-                "point_roundtrip_rule",
-                "evaluate_rule_version",
-                "evaluate_metric",
-                "evaluate_point_error_m",
-                "point_tolerance_m",
-                "projection_metric",
-                "projection_to_curve_l2_error_m",
-                "eligible_gap_m",
-                "gap_used",
-                "composed_projection_tolerance_m",
-            )
-        }
-        geometry = [
-            {
-                "component": "part-1",
-                "tessellation": {
-                    "native_edges": [
-                        {
-                            "body_type": 1,
-                            "body_index": 0,
-                            "edge_reference_sha256": source["edge_reference_sha256"],
-                            "edge_tolerance": {"out_variant_type": source["edge_tolerance_out_variant_type"]},
-                            "topology_endpoint_assignment": source["topology_endpoint_set"],
-                        }
-                    ],
-                    "itessellation": {
-                        "bodies": [
-                            {
-                                "body_type": 1,
-                                "body_index": 0,
-                                "fins": [
-                                    {
-                                        "classification": "native_edge",
-                                        "fin_id": source["fin_id"],
-                                        "edge_reference_sha256": source["edge_reference_sha256"],
-                                        "start_evidence": {"tolerant_edge_evidence": None},
-                                        "end_evidence": {"tolerant_edge_evidence": tolerant},
-                                        "open_edge_boundary_identity": {
-                                            "identity_chain_sha256": source[
-                                                "open_edge_boundary_identity_sha256"
-                                            ]
-                                        },
-                                    }
-                                ],
-                            }
-                        ]
-                    },
-                },
-            }
-        ]
-        with tempfile.TemporaryDirectory(prefix="generate-warning-") as temporary:
-            root = Path(temporary)
-            write_json(root / "evidence/raw/geometry.json", geometry)
-            write_json(root / "evidence/raw/source_scopes.json", {"part-1": scope})
-            actual = generation_value_warnings(root)
-        expected = native_tolerant_edge_value_warning([source])
-        self.assertEqual(actual, expected)
-        self.assertEqual(actual[0]["objects"][0]["fin_endpoint"], "end")
-        self.assertEqual(
-            actual[0]["objects"][0]["topology_endpoint_set"],
-            source["topology_endpoint_set"],
-        )
-
-    def test_fallback_without_v5_identity_does_not_mint_a_warning(self) -> None:
-        source = warning_fixtures.tolerant_warning()
-        geometry = [
-            {
-                "component": "part-1",
-                "tessellation": {
-                    "native_edges": [],
-                    "itessellation": {
-                        "bodies": [
-                            {
-                                "body_type": 1,
-                                "body_index": 0,
-                                "fins": [
-                                    {
-                                        "classification": "native_edge",
-                                        "fin_id": source["fin_id"],
-                                        "edge_reference_sha256": source["edge_reference_sha256"],
-                                        "start_evidence": {
-                                            "tolerant_edge_evidence": None,
-                                            "topology_endpoint_set_accepted": False,
-                                        },
-                                        "end_evidence": {
-                                            "tolerant_edge_evidence": None,
-                                            "topology_endpoint_set_accepted": False,
-                                        },
-                                        "open_edge_boundary_identity": None,
-                                    }
-                                ],
-                            }
-                        ]
-                    },
-                },
-            }
-        ]
-        with tempfile.TemporaryDirectory(prefix="generate-fallback-warning-") as temporary:
-            root = Path(temporary)
-            write_json(root / "evidence/raw/geometry.json", geometry)
-            write_json(root / "evidence/raw/source_scopes.json", {"part-1": source["source_scope"]})
-            self.assertEqual(generation_value_warnings(root), [])
 
 
 class GenerateVerifyClosureTests(unittest.TestCase):

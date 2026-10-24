@@ -14,7 +14,6 @@ from ...runtime import tool_record
 from ...schemas import ENGINEERING_MODEL_SCHEMA, GENERATE_REQUEST_SCHEMA, GENERATE_RESULT_SCHEMA, TOOL_SCHEMA
 from ...sources.snapshot import verify_snapshot
 from ...sources.solidworks.captured import derive_engineering_input
-from ...sources.solidworks.generation_warnings import generation_value_warnings
 from ..contracts import (
     ArtifactRef,
     ExecutionClaim,
@@ -75,8 +74,7 @@ def _compile_capture(capture: _CaptureInput) -> EngineeringModel:
     evidence_root = capture.root / "evidence"
     manifest = verify_snapshot(evidence_root)
     model_input = derive_engineering_input(evidence_root, manifest)
-    warnings = generation_value_warnings(capture.root)
-    return compile(model_input, native_warnings=warnings)
+    return compile(model_input)
 
 
 def _actual_tool(command: StageCommand, claim: ExecutionClaim) -> tuple[dict, str]:
