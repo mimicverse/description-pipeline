@@ -4765,7 +4765,14 @@ class SolidWorksBackend(CadBackend):
                 {"path": path, "error": str(error)},
             ) from error
 
-    def _capture_rebuild_state(self, path, *, document=None, phase="rebuild_state"):
+    def _capture_rebuild_state(
+        self,
+        path,
+        *,
+        document=None,
+        phase="rebuild_state",
+        include_assembly_controls=True,
+    ):
         """Read one loaded dependency's complete rebuild state without changing it."""
 
         doc = document or self._document_handle_by_path(path)
@@ -4773,7 +4780,8 @@ class SolidWorksBackend(CadBackend):
         state = _discovery_document_state(doc)
         state["path"] = document
         state["configurations"] = _configuration_rebuild_rows(doc)
-        state["controls"] = _assembly_rebuild_controls(doc)
+        if include_assembly_controls:
+            state["controls"] = _assembly_rebuild_controls(doc)
         if type(state.get("needs_rebuild2_value")) is not int or state["needs_rebuild2_value"] not in (0, 1, 2):
             raise CadError(
                 "cad_rebuild_state_unreadable",
@@ -4818,11 +4826,14 @@ class SolidWorksBackend(CadBackend):
         assemblies = {
             normalized_top: {
                 "depth": 0,
+                "normalized_path": normalized_top,
                 "path": path,
+                "parents": set(),
                 "referenced_configurations": {top_configuration_name},
                 "instances": ["top"],
             }
         }
+        part_documents = {}
         source_files = {normalized_top: {"path": path, "sha256": self._capture_source_digest(path)}}
         session_files = []
         topology = [
@@ -4839,9 +4850,12 @@ class SolidWorksBackend(CadBackend):
             }
         ]
         component_count = 0
-        stack = [(item, 1) for item in reversed(_as_list(_method(root, "GetChildren")))]
+        stack = [
+            (item, 1, normalized_top)
+            for item in reversed(_as_list(_method(root, "GetChildren")))
+        ]
         while stack:
-            raw, depth = stack.pop()
+            raw, depth, parent_assembly = stack.pop()
             component_count += 1
             if component_count > 500 or depth > 40:
                 raise CadError(
@@ -4952,17 +4966,35 @@ class SolidWorksBackend(CadBackend):
                         normalized,
                         {
                             "depth": depth,
+                            "normalized_path": normalized,
                             "path": document_path,
+                            "parents": set(),
                             "referenced_configurations": set(),
                             "instances": [],
                         },
                     )
                     row["depth"] = max(int(row["depth"]), depth)
+                    row["parents"].add(parent_assembly)
                     if referenced:
                         row["referenced_configurations"].add(referenced)
                     if name:
                         row["instances"].append(name)
-                stack.extend((child, depth + 1) for child in reversed(_as_list(_method(component, "GetChildren"))))
+                elif document_type == 1:
+                    row = part_documents.setdefault(
+                        normalized,
+                        {
+                            "doc": model,
+                            "path": document_path,
+                            "instances": [],
+                        },
+                    )
+                    if name:
+                        row["instances"].append(name)
+                child_parent = normalized if document_type == 2 else parent_assembly
+                stack.extend(
+                    (child, depth + 1, child_parent)
+                    for child in reversed(_as_list(_method(component, "GetChildren")))
+                )
             except CadError:
                 raise
             except Exception as error:  # noqa: BLE001 - fail before any rebuild mutation
@@ -5006,10 +5038,46 @@ class SolidWorksBackend(CadBackend):
             )
             states.append(row)
         states.sort(key=lambda item: (-int(item["depth"]), normalize_document_path(item["path"])))
+        part_states = []
+        for normalized, row in part_documents.items():
+            _part_doc, state = self._capture_rebuild_state(
+                row["path"],
+                document=row["doc"],
+                phase="before",
+                include_assembly_controls=False,
+            )
+            part_states.append(
+                {
+                    "normalized_path": normalized,
+                    "path": row["path"],
+                    "instances": sorted(row["instances"]),
+                    "initial_state": state,
+                }
+            )
+        part_states.sort(key=lambda item: item["normalized_path"])
+        by_path = {row["normalized_path"]: row for row in states}
+        initial_pending_children = {
+            row["normalized_path"]
+            for row in states
+            if row["normalized_path"] != normalized_top
+            and row["initial_state"].get("needs_rebuild2_value") in (1, 2)
+        }
+        rebuild_candidates = set(initial_pending_children)
+        pending = list(initial_pending_children)
+        while pending:
+            child = pending.pop()
+            for parent in by_path[child]["parents"]:
+                if parent == normalized_top or parent in rebuild_candidates:
+                    continue
+                rebuild_candidates.add(parent)
+                pending.append(parent)
         return {
             "assemblies": states,
             "component_count": component_count,
+            "initial_pending_children": sorted(initial_pending_children),
             "normalized_top": normalized_top,
+            "part_documents": part_states,
+            "rebuild_candidates": sorted(rebuild_candidates),
             "session_files": sorted(set(session_files)),
             "source_files": source_files,
             "topology": sorted(topology, key=_capture_topology_sort_key),
@@ -5129,8 +5197,14 @@ class SolidWorksBackend(CadBackend):
         source_sha256_before = graph["source_files"][graph["normalized_top"]]["sha256"]
 
         child_rebuilds = []
+        rebuild_candidates = set(graph["rebuild_candidates"])
         for row in assemblies:
             if row is top:
+                continue
+            if row["normalized_path"] not in rebuild_candidates:
+                # A sibling rebuild can dirty unrelated top-level assemblies.
+                # Those are not descendants of the initially dirty closure and
+                # must be cleared by the top rebuild instead of cascading.
                 continue
             child_doc, state_before_child = self._capture_rebuild_state(row["path"], phase="before_child")
             row["state_before"] = state_before_child
@@ -5246,6 +5320,30 @@ class SolidWorksBackend(CadBackend):
                     "state": state,
                 }
             )
+        final_part_states = []
+        for part in final_graph["part_documents"]:
+            _part_doc, state = self._capture_rebuild_state(
+                part["path"],
+                phase="final_part",
+                include_assembly_controls=False,
+            )
+            if (
+                state.get("needs_rebuild2_value") != 0
+                or state.get("configuration_needs_rebuild") is not False
+                or any(item["needs_rebuild"] is not False for item in state["configurations"])
+            ):
+                raise CadError(
+                    "cad_rebuild_incomplete",
+                    "Capture preparation left a part dependency pending",
+                    {"path": part["path"], "state": state},
+                )
+            final_part_states.append(
+                {
+                    "path": part["path"],
+                    "instances": list(part["instances"]),
+                    "state": state,
+                }
+            )
 
         top_state = top_final_state
         if top_state.get("read_only") is not True:
@@ -5298,6 +5396,7 @@ class SolidWorksBackend(CadBackend):
                 for row in sorted(assemblies, key=lambda item: int(item["depth"]))
             ],
             "assembly_states_after": final_states,
+            "part_states_after": final_part_states,
             "source_files_before": graph["source_files"],
             "source_files_after": source_files_after,
             "session_dependency_paths": graph["session_files"],
