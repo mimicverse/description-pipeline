@@ -192,24 +192,47 @@ class ProductionAdmissionTests(unittest.TestCase):
             principal="cli:tenant:ou_worker",
             from_stage="freeze",
         )
-        package_files = {
+        portable_package_files = {
+            "description_pipeline/portable.py": digest(
+                {"release-file": "portable"}
+            ),
+        }
+        native_package_files = {
             "description_pipeline/runtime.py": digest({"release-file": "runtime"}),
         }
-        self.release_identity = {
+        self.release_common = {
             "schema_version": "solidworks-to-urdf.release/v1",
             "pipeline_id": PIPELINE_ID,
             "version": __version__,
             "source_commit": "a" * 40,
             "source_tree": "b" * 40,
-            "source_sha256": digest(package_files),
-            "package_files": package_files,
+            "contract": {
+                "schema_version": "fixture-contract/v1",
+                "digest": "c" * 64,
+            },
+            "support": {
+                "python": "3.12",
+                "targets": ["linux", "windows"],
+            },
+        }
+        portable_source = digest(portable_package_files)
+        native_source = digest(native_package_files)
+        self.portable_release = {
+            **self.release_common,
+            "source_sha256": portable_source,
+            "package_files": portable_package_files,
+        }
+        self.native_release = {
+            **self.release_common,
+            "source_sha256": native_source,
+            "package_files": native_package_files,
         }
         self.portable_tool = {
             "schema_version": TOOL_SCHEMA,
             "pipeline_id": PIPELINE_ID,
             "version": __version__,
-            "source_sha256": digest({"portable": "installed"}),
-            "release": copy.deepcopy(self.release_identity),
+            "source_sha256": portable_source,
+            "release": copy.deepcopy(self.portable_release),
             "runtime": {
                 "role": "portable",
                 "system": "Linux",
@@ -220,8 +243,8 @@ class ProductionAdmissionTests(unittest.TestCase):
             "schema_version": TOOL_SCHEMA,
             "pipeline_id": PIPELINE_ID,
             "version": __version__,
-            "source_sha256": digest({"native": "observed"}),
-            "release": copy.deepcopy(self.release_identity),
+            "source_sha256": native_source,
+            "release": copy.deepcopy(self.native_release),
             "runtime": {
                 "role": "native",
                 "system": "Windows",
@@ -1036,7 +1059,7 @@ class ProductionAdmissionTests(unittest.TestCase):
         self.native_tool = {
             **self.native_tool,
             "release": {
-                **self.release_identity,
+                **self.native_tool["release"],
                 "source_commit": "f" * 40,
             },
         }
@@ -1046,6 +1069,42 @@ class ProductionAdmissionTests(unittest.TestCase):
     def test_formal_dual_end_release_identity_is_required_and_exact(self) -> None:
         work = self.root / "release-work"
         work.mkdir()
+        prepared = self._factory(work_root=work).prepare(self.request)
+        self.assertNotEqual(
+            prepared.spec.native_tool_source_sha256,
+            self.portable_tool["source_sha256"],
+        )
+        self.assertNotEqual(
+            self.native_tool["release"]["package_files"],
+            self.portable_tool["release"]["package_files"],
+        )
+        self.assertEqual(
+            {
+                key: self.native_tool["release"][key]
+                for key in (
+                    "schema_version",
+                    "pipeline_id",
+                    "version",
+                    "source_commit",
+                    "source_tree",
+                    "contract",
+                    "support",
+                )
+            },
+            {
+                key: self.portable_tool["release"][key]
+                for key in (
+                    "schema_version",
+                    "pipeline_id",
+                    "version",
+                    "source_commit",
+                    "source_tree",
+                    "contract",
+                    "support",
+                )
+            },
+        )
+
         portable = copy.deepcopy(self.portable_tool)
         native = copy.deepcopy(self.native_tool)
         self.portable_tool = {**portable, "release": None}
@@ -1085,9 +1144,9 @@ class ProductionAdmissionTests(unittest.TestCase):
             with self.subTest(field=field):
                 portable = copy.deepcopy(self.portable_tool)
                 native = copy.deepcopy(self.native_tool)
-                portable["release"] = copy.deepcopy(self.release_identity)
+                portable["release"] = copy.deepcopy(self.portable_release)
                 portable["version"] = __version__
-                native["release"] = copy.deepcopy(self.release_identity)
+                native["release"] = copy.deepcopy(self.native_release)
                 native["version"] = __version__
                 mutate_portable(portable)
                 mutate_native(native)
@@ -1102,6 +1161,56 @@ class ProductionAdmissionTests(unittest.TestCase):
                 self.assertIn(
                     field,
                     mismatch.exception.detail["fields"],
+                )
+
+        self_binding_cases = [
+            (
+                "portable-release-source",
+                "portable",
+                lambda tool: tool["release"].update(
+                    source_sha256="d" * 64
+                ),
+            ),
+            (
+                "native-release-source",
+                "native",
+                lambda tool: tool["release"].update(
+                    source_sha256="e" * 64
+                ),
+            ),
+            (
+                "portable-package-digest",
+                "portable",
+                lambda tool: tool["release"]["package_files"].update(
+                    {"description_pipeline/portable.py": "f" * 64}
+                ),
+            ),
+            (
+                "native-package-digest",
+                "native",
+                lambda tool: tool["release"]["package_files"].update(
+                    {"description_pipeline/runtime.py": "0" * 64}
+                ),
+            ),
+        ]
+        for name, role, mutate in self_binding_cases:
+            with self.subTest(case=name):
+                portable = copy.deepcopy(self.portable_tool)
+                native = copy.deepcopy(self.native_tool)
+                portable["release"] = copy.deepcopy(self.portable_release)
+                native["release"] = copy.deepcopy(self.native_release)
+                mutate(portable if role == "portable" else native)
+                self.portable_tool = portable
+                self.native_tool = native
+                with self.assertRaises(ProtocolError) as invalid:
+                    self._factory(work_root=work).prepare(self.request)
+                self.assertEqual(
+                    invalid.exception.code,
+                    "admission_ingestion.release_invalid",
+                )
+                self.assertEqual(
+                    invalid.exception.detail["role"],
+                    role,
                 )
 
     def test_missing_publication_actor_configuration_is_refused(self) -> None:

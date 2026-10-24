@@ -57,6 +57,15 @@ _TARGET = re.compile(r"\A[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 _REF = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _RELEASE_SCHEMA = "solidworks-to-urdf.release/v1"
+_COMMON_RELEASE_FIELDS = (
+    "schema_version",
+    "pipeline_id",
+    "version",
+    "source_commit",
+    "source_tree",
+    "contract",
+    "support",
+)
 _RECEIPT_FIELDS = frozenset(
     {
         "folder",
@@ -148,6 +157,8 @@ def _formal_release(
         "source_tree",
         "source_sha256",
         "package_files",
+        "contract",
+        "support",
     }
     if not required.issubset(record):
         raise ProtocolError(
@@ -170,7 +181,10 @@ def _formal_release(
             "admission_ingestion.release_invalid",
             {"role": role, "where": "identity"},
         )
-    _sha256(record["source_sha256"], f"{role}.release.source_sha256")
+    release_source_sha256 = _sha256(
+        record["source_sha256"],
+        f"{role}.release.source_sha256",
+    )
     package_files = record["package_files"]
     if (
         not isinstance(package_files, Mapping)
@@ -186,6 +200,14 @@ def _formal_release(
         raise ProtocolError(
             "admission_ingestion.release_invalid",
             {"role": role, "where": "package_files"},
+        )
+    if (
+        digest(dict(package_files)) != release_source_sha256
+        or tool.get("source_sha256") != release_source_sha256
+    ):
+        raise ProtocolError(
+            "admission_ingestion.release_invalid",
+            {"role": role, "where": "source-package-binding"},
         )
     runtime = tool.get("runtime")
     expected_system = "Windows" if role == "native" else "Linux"
@@ -683,14 +705,22 @@ class ProductionAdmissionFactory:
         source = _sha256(tool.get("source_sha256"), "native_tool.source_sha256")
         native_release = _formal_release(tool, role="native")
         portable_release = _formal_release(portable_tool, role="portable")
-        if native_release != portable_release:
+        native_identity = {
+            field: native_release[field]
+            for field in _COMMON_RELEASE_FIELDS
+        }
+        portable_identity = {
+            field: portable_release[field]
+            for field in _COMMON_RELEASE_FIELDS
+        }
+        if native_identity != portable_identity:
             raise ProtocolError(
                 "admission_ingestion.release_mismatch",
                 {
                     "fields": sorted(
                         key
-                        for key in set(native_release) | set(portable_release)
-                        if native_release.get(key) != portable_release.get(key)
+                        for key in _COMMON_RELEASE_FIELDS
+                        if native_identity[key] != portable_identity[key]
                     )
                 },
             )
