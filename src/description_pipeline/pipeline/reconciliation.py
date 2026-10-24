@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from ..io import canonical, write_json
+from ..schemas import (
+    EFFECT_RECONCILIATION_FAILURE_SCHEMA,
+    EFFECT_RECONCILIATION_SCHEMA,
+)
 from .contracts import ArtifactRef, ProtocolError, StageCommand
 from .effects import EffectFact, EffectIntent, EffectSettlement, EffectState
 
@@ -201,7 +205,7 @@ class EffectReconciliationService:
             write_json(
                 metadata_root / "metadata.json",
                 {
-                    "schema_version": "description-pipeline.effect-reconciliation/v1",
+                    "schema_version": EFFECT_RECONCILIATION_SCHEMA,
                     "command_id": command.command_id,
                     "effect_id": intent.effect_id,
                     "effect_key": intent.effect_key,
@@ -260,7 +264,7 @@ class EffectReconciliationService:
             write_json(
                 workspace / "reconciliation-failure.json",
                 {
-                    "schema_version": "description-pipeline.effect-reconciliation-failure/v1",
+                    "schema_version": EFFECT_RECONCILIATION_FAILURE_SCHEMA,
                     "error_type": type(error).__name__,
                     "error_message": str(error)[:4096],
                     "workspace": str(workspace),

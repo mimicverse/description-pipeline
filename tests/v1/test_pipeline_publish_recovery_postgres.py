@@ -28,6 +28,7 @@ from description_pipeline.pipeline import (
 )
 from description_pipeline.pipeline.stages import publish as publish_stage
 from description_pipeline.platform.facts import FactConflict, FactStore
+from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA
 
 from tests.v1.test_pipeline_publish import PublishFixture
 
@@ -82,7 +83,7 @@ class PublishRecoveryPostgresTests(unittest.TestCase):
             for item in self.fixture.command.input_artifacts
         )
         spec = DiagnosticAdmissionSpec(
-            schema_version="description-pipeline.diagnostic-admission-spec/v1",
+            schema_version=DIAGNOSTIC_ADMISSION_SCHEMA,
             run_id=f"publish-recovery-{suffix}",
             request_id=f"publish-recovery-request-{suffix}",
             target_stage="publish",

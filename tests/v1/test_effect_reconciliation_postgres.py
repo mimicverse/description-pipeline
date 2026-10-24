@@ -36,6 +36,7 @@ from description_pipeline.pipeline import (
 from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.platform.facts import FactConflict, FactStore
+from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / "schema.sql"
@@ -216,7 +217,7 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
             producer_tool_sha256=digest({"tool": "historical"}),
         )
         spec = DiagnosticAdmissionSpec(
-            schema_version="description-pipeline.diagnostic-admission-spec/v1",
+            schema_version=DIAGNOSTIC_ADMISSION_SCHEMA,
             run_id=f"effect-run-{suffix}",
             request_id=f"effect-request-{suffix}",
             target_stage="capture",

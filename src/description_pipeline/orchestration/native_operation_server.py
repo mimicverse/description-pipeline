@@ -13,10 +13,12 @@ from urllib.parse import quote, unquote, urlsplit
 
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, canonical, digest, parse_data
+from ..schemas import (
+    NATIVE_OPERATION_HEALTH_SCHEMA as HEALTH_SCHEMA,
+    NATIVE_TOOL_IDENTITY_SCHEMA,
+)
 from .native_operation_runtime import NativeOperationError, NativeOperationRuntime
 
-HEALTH_SCHEMA = "description-pipeline.native-operation-health/v1"
-NATIVE_TOOL_IDENTITY_SCHEMA = "description-pipeline.native-tool-identity/v1"
 MAX_JSON_BYTES = 8 * 1024**2
 MAX_ARCHIVE_BYTES = 16 * 1024**3
 

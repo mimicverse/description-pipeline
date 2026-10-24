@@ -29,6 +29,7 @@ from description_pipeline.pipeline.services import CanonicalStageServices, Claim
 from description_pipeline.pipeline.stages.generate import GenerateHandler
 from description_pipeline.pipeline.stages.publish import PublishHandler
 from description_pipeline.platform.diagnostic import DiagnosticRuntimeConfig, open_diagnostic_stores
+from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA
 from description_pipeline.stages import STAGE_IDS
 
 from tests.v1 import test_generate_handler as generate_fixtures
@@ -150,7 +151,7 @@ class GeneratePublishDiagnosticPostgresTests(unittest.TestCase):
 
     def _spec(self, *, source_command, imported_inputs, expected_executor: str):
         return DiagnosticAdmissionSpec(
-            schema_version="description-pipeline.diagnostic-admission-spec/v1",
+            schema_version=DIAGNOSTIC_ADMISSION_SCHEMA,
             run_id="diagnostic-" + source_command.stage,
             request_id="diagnostic-request-" + source_command.stage,
             target_stage=source_command.stage,

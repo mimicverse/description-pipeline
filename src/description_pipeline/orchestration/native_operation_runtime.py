@@ -20,6 +20,11 @@ from typing import Protocol
 from ..io import acquire_process_lock, canonical, digest, file_digest
 from ..native_transfer import CAPTURE_TRANSFER_SCHEMA, MAX_TRANSFER_BYTES
 from ..pipeline.contracts import ArtifactRef, ProtocolError
+from ..schemas import (
+    NATIVE_CAPTURE_OPERATION_SCHEMA as CAPTURE_OPERATION_SCHEMA,
+    NATIVE_OPERATION_REQUEST_SCHEMA as OPERATION_SCHEMA,
+    NATIVE_OPERATION_VIEW_SCHEMA as OPERATION_VIEW_SCHEMA,
+)
 from ..sources.solidworks.discover_stage import (
     NATIVE_OBSERVATION_SCHEMA,
     NativeDiscoverRefusal,
@@ -31,9 +36,6 @@ from .discover_protocol import run_windows_discover, seal_observation_bundle
 from .selection_transport import StagedSelection
 from .stage_transfer import CAPTURE_ARCHIVE
 
-OPERATION_SCHEMA = "description-pipeline.native-operation-request/v1"
-OPERATION_VIEW_SCHEMA = "description-pipeline.native-operation-view/v1"
-CAPTURE_OPERATION_SCHEMA = "description-pipeline.native-capture-operation/v1"
 DISCOVER_KIND = "discover"
 CAPTURE_KIND = "capture"
 _KINDS = frozenset({DISCOVER_KIND, CAPTURE_KIND})
