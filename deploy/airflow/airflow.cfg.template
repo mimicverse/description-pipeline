@@ -24,3 +24,10 @@ namespace_levels = http.access=WARNING
 expose_config = False
 [api_auth]
 jwt_secret = @JWT_SECRET@
+
+[triggerer]
+# Bound the number of simultaneous async effect observers independently from worker and
+# physical CAD capacity.
+capacity = 64
+job_heartbeat_sec = 5.0
+triggerer_health_check_threshold = 30.0

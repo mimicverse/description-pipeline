@@ -57,6 +57,7 @@ class UnitInventoryTests(unittest.TestCase):
                 "description-solidworks-tunnel",
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
                 "description-operator-proxy",
                 "description-portal",

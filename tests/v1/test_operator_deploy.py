@@ -448,6 +448,7 @@ def status_env(tmp: Path, config_home: Path) -> dict[str, str]:
         "description-solidworks-tunnel",
         "description-airflow-dag-processor",
         "description-airflow-scheduler",
+        "description-airflow-triggerer",
         "description-airflow-api-server",
         "description-portal",
         "description-operator-proxy",
@@ -2688,6 +2689,7 @@ class LifecycleTests(unittest.TestCase):
                     "description-airflow-api-server.service",
                     "description-airflow-dag-processor.service",
                     "description-airflow-scheduler.service",
+                    "description-airflow-triggerer.service",
                     "description-operator-proxy.service",
                     "description-portal.service",
                     "description-postgres.service",
@@ -3201,6 +3203,7 @@ class LifecycleTests(unittest.TestCase):
             for unit in (
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
             ):
                 content = (target / f"{unit}.service").read_text(encoding="utf-8")
@@ -3425,6 +3428,7 @@ class InstallOrderingTests(unittest.TestCase):
             "  description-solidworks-tunnel\n"
             "  description-airflow-dag-processor\n"
             "  description-airflow-scheduler\n"
+            "  description-airflow-triggerer\n"
             "  description-airflow-api-server\n"
             ")\n"
             'stop_runtime() {\n'
@@ -3455,7 +3459,7 @@ class InstallOrderingTests(unittest.TestCase):
             '    mkdir -p "$target"\n'
             '    echo "services_render venv=$AIRFLOW_VENV derived=$OPERATOR_DERIVED_ENV" >> "$ORDER_LOG"\n'
             '    for unit in description-airflow-dag-processor description-airflow-scheduler '
-            'description-airflow-api-server; do\n'
+            'description-airflow-triggerer description-airflow-api-server; do\n'
             '      printf "[Service]\\nEnvironmentFile=%s\\nExecStart=%s/bin/airflow fixture\\n" '
             '"$OPERATOR_DERIVED_ENV" "$AIRFLOW_VENV" > "$target/$unit.service"\n'
             '    done\n'
@@ -4115,6 +4119,7 @@ class InstallOrderingTests(unittest.TestCase):
                     "description-solidworks-tunnel",
                     "description-airflow-dag-processor",
                     "description-airflow-scheduler",
+                    "description-airflow-triggerer",
                     "description-airflow-api-server",
                     "description-portal",
                     "description-operator-proxy",
@@ -5222,6 +5227,7 @@ class InstallOrderingTests(unittest.TestCase):
             for unit in (
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
                 "description-portal",
                 "description-operator-proxy",
@@ -5598,6 +5604,7 @@ class InstallOrderingTests(unittest.TestCase):
             for unit in (
                 "description-airflow-dag-processor.service",
                 "description-airflow-scheduler.service",
+                "description-airflow-triggerer.service",
                 "description-airflow-api-server.service",
             ):
                 text = (unit_dir / unit).read_text(encoding="utf-8")
@@ -5623,7 +5630,7 @@ class InstallOrderingTests(unittest.TestCase):
             for pidfile in (Path(tmp) / "unit-state").glob("description-airflow-*.pid"):
                 pid = int(pidfile.read_text(encoding="utf-8").strip())
                 live_maps.append(Path(f"/proc/{pid}/maps").read_text(encoding="utf-8"))
-            self.assertEqual(len(live_maps), 3)
+            self.assertEqual(len(live_maps), 4)
             self.assertTrue(all(restored_venv in document for document in live_maps))
             self.assertTrue(all(candidate_venv not in document for document in live_maps))
             final_receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
@@ -6110,6 +6117,7 @@ class InstallOrderingTests(unittest.TestCase):
                 "description-solidworks-tunnel",
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
                 "description-portal",
                 "description-operator-proxy",
@@ -6128,6 +6136,7 @@ class InstallOrderingTests(unittest.TestCase):
                     "description-solidworks-tunnel": "inactive",
                     "description-airflow-dag-processor": "inactive",
                     "description-airflow-scheduler": "inactive",
+                    "description-airflow-triggerer": "inactive",
                     "description-airflow-api-server": "inactive",
                     "description-portal": "inactive",
                     "description-operator-proxy": "inactive",
@@ -6513,6 +6522,7 @@ class InstallOrderingTests(unittest.TestCase):
             for unit in (
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
             ):
                 self.assertTrue(any(unit in line for line in stopped), (unit, lines))
@@ -8263,6 +8273,10 @@ class NativePoolTests(unittest.TestCase):
         text = HEALTH.read_text(encoding="utf-8")
         self.assertIn("windows_native", text)
         self.assertIn("native pool windows_native is missing or its capacity is not 1", text)
+        self.assertIn('"$AIRFLOW_VENV/bin/airflow" version', text)
+        self.assertIn('"$AIRFLOW_VENV/bin/airflow" jobs check', text)
+        self.assertIn("--job-type TriggererJob --local --limit 1", text)
+        self.assertIn('conf.getint("triggerer", "capacity") == 64', text)
 
     def test_script_help_runs_without_airflow(self) -> None:
         result = run([sys.executable, str(self.SCRIPT), "--help"], {})

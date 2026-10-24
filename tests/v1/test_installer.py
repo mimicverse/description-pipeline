@@ -62,6 +62,10 @@ class RenderConfigTest(unittest.TestCase):
             self.assertIn(f"dags_folder = {DEPLOY / 'dags'}", text)
             self.assertIn("auth_manager = description_pipeline.orchestration.feishu_auth.FeishuAuthManager", text)
             self.assertNotIn("simple_auth_manager_users", text)
+            self.assertIn("[triggerer]", text)
+            self.assertIn("capacity = 64", text)
+            self.assertIn("job_heartbeat_sec = 5.0", text)
+            self.assertIn("triggerer_health_check_threshold = 30.0", text)
             first_keys = re.findall(r"^(?:fernet_key|jwt_secret) = (\S+)$", text, re.M)
             self.assertEqual(len(first_keys), 2)
             # Rerun with a different socket: secrets must survive byte-for-byte.
@@ -138,6 +142,7 @@ class ServicesRenderTest(unittest.TestCase):
                     "description-airflow-api-server.service",
                     "description-airflow-dag-processor.service",
                     "description-airflow-scheduler.service",
+                    "description-airflow-triggerer.service",
                     "description-postgres.service",
                     "unrelated.service",
                 ],
@@ -153,6 +158,10 @@ class ServicesRenderTest(unittest.TestCase):
             self.assertIn(f"Environment=AIRFLOW_HOME={Path(tmp) / 'home'}", scheduler)
             self.assertIn("UMask=0077", scheduler)
             self.assertNotIn("@", scheduler)
+            triggerer = (target / "description-airflow-triggerer.service").read_text(encoding="utf-8")
+            self.assertIn("ExecStart=" + str(Path(tmp) / "venv") + "/bin/airflow triggerer", triggerer)
+            self.assertIn("UMask=0077", triggerer)
+            self.assertNotIn("@", triggerer)
             api_server = (target / "description-airflow-api-server.service").read_text(encoding="utf-8")
             self.assertIn("api-server --host 127.0.0.1 --port 8791", api_server)
             self.assertIn(f"EnvironmentFile=-{Path(tmp) / 'home' / 'feishu.env'}", api_server)
@@ -174,7 +183,7 @@ class ServicesRenderTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             names = sorted(path.name for path in (config_home / "systemd" / "user").glob("*.service"))
-            self.assertEqual(len(names), 3)
+            self.assertEqual(len(names), 4)
             self.assertNotIn("description-postgres.service", names)
 
     def test_tunnel_is_optional_and_rejects_command_text(self) -> None:
@@ -257,6 +266,7 @@ class InstallGuardsTest(unittest.TestCase):
                 '  "db migrate") ;;\n'
                 '  "dags unpause solidworks_to_urdf") echo false > "$ADMISSION" ;;\n'
                 '  "version") echo 3.3.2 ;;\n'
+                '  "triggerer --help") ;;\n'
                 "  *) exit 1 ;;\n"
                 "esac\n"
             )
@@ -278,7 +288,7 @@ class InstallGuardsTest(unittest.TestCase):
             # and before the runtime identity takes over (the same entry the CI step runs).
             self.assertEqual(
                 calls.read_text().splitlines(),
-                ["doctor", "db migrate", "feishu_state_init", "version"] * 2,
+                ["doctor", "version", "triggerer --help", "db migrate", "feishu_state_init"] * 2,
             )
             calls.write_text("")
             rejected = self._install(
@@ -317,7 +327,8 @@ class InstallGuardsTest(unittest.TestCase):
             airflow = bindir / "airflow"
             airflow.write_text(
                 '#!/bin/bash\n'
-                'case "$*" in version) echo 3.3.2 ;; *) echo "airflow $*" >> "$CALLS" ;; esac\n'
+                'case "$*" in version) echo 3.3.2 ;; "triggerer --help") ;; '
+                '*) echo "airflow $*" >> "$CALLS" ;; esac\n'
                 'exit 0\n'
             )
             airflow.chmod(0o755)
@@ -422,6 +433,9 @@ class LockAndScriptsTest(unittest.TestCase):
         installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
         self.assertIn("--require-hashes --only-binary=:all:", installer)
         self.assertIn("-m pip check", installer)
+        self.assertIn('INSTALLED_AIRFLOW_VERSION="$("$AIRFLOW_VENV/bin/airflow" version', installer)
+        self.assertIn('[ "$INSTALLED_AIRFLOW_VERSION" = "3.3.2" ]', installer)
+        self.assertIn('"$AIRFLOW_VENV/bin/airflow" triggerer --help', installer)
         self.assertNotIn("pip install --upgrade", installer)
         self.assertNotIn("sed -e", installer)
 
