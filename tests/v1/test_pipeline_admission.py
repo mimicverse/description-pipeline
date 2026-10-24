@@ -169,7 +169,7 @@ class AdmissionHarness:
             run_id=command.run_id if run_id is None else run_id,
             stage=command.stage if stage is None else stage,
             idempotency_key=command.idempotency_key,
-            request=_request(command) if request is None else request,
+            request=_request(command) if request is None else _plain(request),
             input_artifacts=command.input_artifacts if input_artifacts is None else input_artifacts,
             config_snapshot_sha256=(
                 command.config_snapshot_sha256 if config_snapshot_sha256 is None else config_snapshot_sha256
@@ -265,6 +265,10 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(restored, self.harness.spec)
         self.assertEqual(restored.admission_sha256, self.harness.spec.admission_sha256)
         self.assertEqual(build_freeze_command(restored), self.command)
+
+    def test_run_admission_frozen_request_rebuilds_the_same_spec(self) -> None:
+        restored = AdmissionSpec.from_record(build_run_admission(self.harness.spec).request)
+        self.assertEqual(restored, self.harness.spec)
 
     def test_wrong_administrative_fields_are_each_rejected(self) -> None:
         cases = {
@@ -425,6 +429,22 @@ class AdmissionProjectionTests(unittest.TestCase):
         generate = self.harness.predecessor("generate", generate_command, {"stage": "generate"})
         verify_command = build_verify_command(self.harness.spec, generate, capture)
 
+        self.assertEqual(
+            {
+                command.stage: command.expected_executor_sha256
+                for command in (
+                    self.command,
+                    discover_command,
+                    capture_command,
+                    generate_command,
+                    verify_command,
+                )
+            },
+            {
+                stage: self.harness.spec.executors.for_stage(stage)
+                for stage in ("freeze", "discover", "capture", "generate", "verify")
+            },
+        )
         self.assertEqual(capture_command.stage, "capture")
         self.assertEqual(
             set(capture_command.request),
@@ -507,6 +527,37 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(
             validate_stage_command(
                 self.harness.spec,
+                verify_command,
+                predecessor=generate,
+                supporting_predecessors=(capture,),
+            ),
+            verify_command,
+        )
+        admission = build_run_admission(self.harness.spec)
+        self.assertEqual(
+            validate_store_command(
+                self.harness.spec,
+                admission,
+                capture_command,
+                predecessor=discover,
+                supporting_predecessors=(freeze,),
+                discover_result=discover_result,
+            ),
+            capture_command,
+        )
+        self.assertEqual(
+            validate_store_command(
+                self.harness.spec,
+                admission,
+                generate_command,
+                predecessor=capture,
+            ),
+            generate_command,
+        )
+        self.assertEqual(
+            validate_store_command(
+                self.harness.spec,
+                admission,
                 verify_command,
                 predecessor=generate,
                 supporting_predecessors=(capture,),

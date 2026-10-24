@@ -15,7 +15,12 @@ from datetime import datetime
 from typing import Protocol
 
 from ..io import PipelineError, digest
-from ..pipeline.admission import AdmissionSpec, VerifiedPredecessor, validate_store_command
+from ..pipeline.admission import (
+    AdmissionSpec,
+    VerifiedDiscoverResult,
+    VerifiedPredecessor,
+    validate_store_command,
+)
 from ..pipeline.contracts import (
     ArtifactRef,
     DispatchCommand,
@@ -49,6 +54,8 @@ class FactConflict(FactStoreError):
 
 class StageResultReader(Protocol):
     """Read and independently validate one sealed StageResult artifact."""
+
+    def verify(self, artifact: ArtifactRef) -> Mapping[str, object]: ...
 
     def read_result(self, artifact: ArtifactRef) -> StageResult: ...
 
@@ -485,6 +492,8 @@ class FactStore:
         *,
         admission: RunAdmission,
         predecessor: VerifiedPredecessor,
+        supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
+        discover_result: VerifiedDiscoverResult | None = None,
     ) -> StageCommand:
         """Validate and register one successor command after its predecessor decision."""
 
@@ -492,18 +501,37 @@ class FactStore:
             raise FactStoreError("A canonical RunAdmission is required")
         if not isinstance(predecessor, VerifiedPredecessor):
             raise FactStoreError("A verified committed predecessor is required")
+        if not isinstance(supporting_predecessors, tuple) or not all(
+            isinstance(item, VerifiedPredecessor) for item in supporting_predecessors
+        ):
+            raise FactStoreError("Supporting predecessors must be verified immutable facts")
+        if discover_result is not None and not isinstance(discover_result, VerifiedDiscoverResult):
+            raise FactStoreError("A verified Discover result is required")
         if not isinstance(command, StageCommand) or command.kind != "stage" or command.stage is None:
             raise FactStoreError("A successor stage command is required")
         try:
             spec = AdmissionSpec.from_record(admission.request)
-            validate_store_command(spec, admission, command, predecessor=predecessor)
+            validate_store_command(
+                spec,
+                admission,
+                command,
+                predecessor=predecessor,
+                supporting_predecessors=supporting_predecessors,
+                discover_result=discover_result,
+            )
         except ProtocolError as error:
             raise FactStoreError("The successor command fails typed semantic validation") from error
-        if predecessor.decision.result_record_artifact is None:  # pragma: no cover - verified fact
-            raise FactStoreError("The predecessor has no StageResult record")
-        sealed_result = self._result_reader.read_result(predecessor.decision.result_record_artifact)
-        if sealed_result != predecessor.result:
-            raise FactStoreError("The sealed predecessor StageResult differs from its verified fact")
+        predecessors = (predecessor, *supporting_predecessors)
+        artifact_verifier = getattr(self._result_reader, "verify", None)
+        if not callable(artifact_verifier):
+            raise FactStoreError("The configured artifact reader cannot verify predecessor outputs")
+        for verified in predecessors:
+            if verified.decision.result_record_artifact is None:  # pragma: no cover - verified fact
+                raise FactStoreError("A predecessor has no StageResult record")
+            artifact_verifier(verified.result.output_artifact)
+            sealed_result = self._result_reader.read_result(verified.decision.result_record_artifact)
+            if sealed_result != verified.result:
+                raise FactStoreError("A sealed predecessor StageResult differs from its verified fact")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute("SELECT run_id FROM run_admission WHERE run_id = %s FOR UPDATE", (command.run_id,))
@@ -512,29 +540,16 @@ class FactStore:
             stored_admission = self._load_admission_cursor(cursor, command.run_id)
             if stored_admission != admission:
                 raise FactConflict("The supplied admission differs from the registered admission")
-            stored_predecessor_command = self._load_command_cursor(
-                cursor,
-                predecessor.command.command_id,
-            )
-            if stored_predecessor_command != predecessor.command:
-                raise FactConflict("The predecessor command differs from its registered command")
-            decision_row = self._decision_row(
-                cursor,
-                run_id=command.run_id,
-                stage=predecessor.stage,
-            )
-            if decision_row is None:
-                raise FactStoreError("The command predecessor is not a completed decision of this run")
-            stored_decision = self._decision_from_row(cursor, decision_row)
-            if stored_decision != predecessor.decision:
-                raise FactConflict("The predecessor decision differs from its verified fact")
-            if (
-                self._artifact_cursor(cursor, predecessor.result.output_artifact.artifact_id)
-                != predecessor.result.output_artifact
-                or self._artifact_cursor(cursor, predecessor.decision.result_record_artifact.artifact_id)
-                != predecessor.decision.result_record_artifact
-            ):
-                raise FactConflict("The predecessor artifacts differ from their verified facts")
+            for verified in predecessors:
+                self._verify_registered_predecessor_cursor(cursor, verified)
+            if discover_result is not None:
+                for artifact in (
+                    discover_result.source_set_artifact,
+                    discover_result.ruleset_artifact,
+                    discover_result.configuration_artifact,
+                ):
+                    if self._artifact_cursor(cursor, artifact.artifact_id) != artifact:
+                        raise FactConflict("A Discover result artifact differs from its registered fact")
             existing = self._load_command_cursor(cursor, command.command_id)
             if existing is not None:
                 if existing != command:
@@ -542,6 +557,30 @@ class FactStore:
                 return existing
             self._insert_command_cursor(cursor, command)
             return command
+
+    def _verify_registered_predecessor_cursor(self, cursor, predecessor: VerifiedPredecessor) -> None:
+        stored_command = self._load_command_cursor(cursor, predecessor.command.command_id)
+        if stored_command != predecessor.command:
+            raise FactConflict("A predecessor command differs from its registered command")
+        decision_row = self._decision_row(
+            cursor,
+            run_id=predecessor.command.run_id,
+            stage=predecessor.stage,
+        )
+        if decision_row is None:
+            raise FactStoreError("A predecessor is not a completed decision of this run")
+        stored_decision = self._decision_from_row(cursor, decision_row)
+        if stored_decision != predecessor.decision:
+            raise FactConflict("A predecessor decision differs from its verified fact")
+        if predecessor.decision.result_record_artifact is None:  # pragma: no cover - verified fact
+            raise FactStoreError("A predecessor has no StageResult record")
+        if (
+            self._artifact_cursor(cursor, predecessor.result.output_artifact.artifact_id)
+            != predecessor.result.output_artifact
+            or self._artifact_cursor(cursor, predecessor.decision.result_record_artifact.artifact_id)
+            != predecessor.decision.result_record_artifact
+        ):
+            raise FactConflict("Predecessor artifacts differ from their verified facts")
 
     def _decision_row(self, cursor, *, run_id: str, stage: str):
         cursor.execute(

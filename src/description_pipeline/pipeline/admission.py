@@ -430,7 +430,7 @@ def _verified_from_record(record: object) -> VerifiedArtifact:
         raise ProtocolError("artifact.invalid", {"where": "verified_record"})
     ref = ArtifactRef.from_record(record["artifact"])
     raw_members = record["members"]
-    if not isinstance(raw_members, list):
+    if not isinstance(raw_members, (list, tuple)):
         raise ProtocolError("artifact.invalid", {"where": "members"})
     members = tuple(
         ArtifactMember(path=item.get("path"), bytes=item.get("bytes"), sha256=item.get("sha256"))

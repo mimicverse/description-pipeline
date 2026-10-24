@@ -28,21 +28,26 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
-from description_pipeline.io import digest
+from description_pipeline.io import digest, read_data
 from description_pipeline.pipeline import (
     DispatchCommand,
     DispatchConf,
     DispatchObservation,
     EffectState,
     ExecutionClaim,
+    StageCommand,
     StageExecution,
     StageFailure,
     StageResult,
     TechnicalDispatchService,
+    VerifiedDiscoverResult,
     VerifiedPredecessor,
+    build_capture_command,
     build_discover_command,
     build_freeze_command,
+    build_generate_command,
     build_run_admission,
+    build_verify_command,
     execute_stage,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
@@ -305,7 +310,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
 
         self.admission_harness = AdmissionHarness(Path(self.directory.name) / "admission")
         self.now = self.admission_harness.spec.created_at
-        self.executor = self.admission_harness.spec.expected_executor_sha256
+        self.executor = self.admission_harness.spec.executors.freeze
         self.owner = digest({"process": str(uuid.uuid4())})
         self.artifacts = self.admission_harness.store
         self.facts = FactStore(self._connect, self.artifacts)
@@ -429,6 +434,65 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         return dispatch, artifact
 
+    def _predecessor_for(self, command: StageCommand) -> VerifiedPredecessor:
+        stored = self.facts.load_command(command.command_id)
+        decision = self.facts.decision_for(stored)
+        self.assertIsNotNone(decision)
+        result = self.facts.load_result(decision)
+        return VerifiedPredecessor(
+            stage=stored.stage,
+            command=stored,
+            result=result,
+            decision=decision,
+        )
+
+    def _persist_predecessor_decision(self, predecessor: VerifiedPredecessor) -> None:
+        self.facts.register_artifact(predecessor.result.output_artifact)
+        self.facts.register_artifact(predecessor.decision.result_record_artifact)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO stage_decision (
+                    decision_id, run_id, stage, command_id, outcome, result_record_artifact_id,
+                    result_digest, actual_executor_sha256, original_producer_decision_id,
+                    reason_code, failure_envelope, failure_digest, decided_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, NULL, NULL, %s)
+                """,
+                (
+                    predecessor.decision.decision_id,
+                    predecessor.decision.run_id,
+                    predecessor.decision.stage,
+                    predecessor.decision.command_id,
+                    predecessor.decision.outcome,
+                    predecessor.decision.result_record_artifact.artifact_id,
+                    predecessor.decision.result_digest,
+                    predecessor.decision.actual_executor_sha256,
+                    predecessor.decision.decided_at,
+                ),
+            )
+
+    def _discover_payload(self, command: StageCommand) -> dict[str, object]:
+        files = {"cad/robot.SLDASM": self.admission_harness.originals.inventory["cad/robot.SLDASM"]}
+        return {
+            "schema_version": "description-pipeline.discover-result/v1",
+            "command_id": command.command_id,
+            "run_id": self.admission_harness.spec.run_id,
+            "request_digest": command.request_digest,
+            "selection": {
+                "files": files,
+                "handoff_sha256": digest(files),
+                "upload_sha256": self.admission_harness.originals.inventory_sha256,
+                "main_assembly": self.admission_harness.spec.main_assembly,
+            },
+            "prepared_sha256": digest({"prepared": 1}),
+            "native_observation_sha256": digest({"observation": 1}),
+            "source_set_artifact": self.admission_harness.originals_ref.to_record(),
+            "ruleset_artifact": self.admission_harness.ruleset_ref.to_record(),
+            "configuration_artifact": self.admission_harness.configuration_ref.to_record(),
+            "native_tool": {"executor": "native"},
+            "passed": True,
+        }
+
     def test_admission_binds_run_freeze_dispatch_conf_and_effect_atomically(self) -> None:
         replay = self.facts.admit_run(
             self.admission,
@@ -546,6 +610,93 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             (self.admission.run_id,),
         )
         self.assertEqual(rows[0][0], 1)
+
+    def test_store_persists_the_five_supported_projection_stages_in_order(self) -> None:
+        self._execute(_EffectHandler())
+        freeze = self._predecessor_for(self.command)
+
+        discover_command = build_discover_command(self.admission_harness.spec, freeze)
+        self.facts.create_command(
+            discover_command,
+            admission=self.admission,
+            predecessor=freeze,
+        )
+        discover = self.admission_harness.predecessor(
+            "discover",
+            discover_command,
+            self._discover_payload(discover_command),
+        )
+        self._persist_predecessor_decision(discover)
+        self.artifacts.verify(discover.result.output_artifact)
+        discover_result = VerifiedDiscoverResult.from_record(
+            discover,
+            read_data(
+                self.artifacts.objects
+                / discover.result.output_artifact.artifact_id
+                / "result.json"
+            ),
+        )
+
+        capture_command = build_capture_command(
+            self.admission_harness.spec,
+            freeze,
+            discover,
+            discover_result,
+        )
+        self.assertNotEqual(
+            capture_command.expected_executor_sha256,
+            capture_command.request["native_tool_sha256"],
+        )
+        self.facts.create_command(
+            capture_command,
+            admission=self.admission,
+            predecessor=discover,
+            supporting_predecessors=(freeze,),
+            discover_result=discover_result,
+        )
+        capture = self.admission_harness.predecessor(
+            "capture",
+            capture_command,
+            {"stage": "capture"},
+        )
+        self._persist_predecessor_decision(capture)
+
+        generate_command = build_generate_command(self.admission_harness.spec, capture)
+        self.facts.create_command(
+            generate_command,
+            admission=self.admission,
+            predecessor=capture,
+        )
+        generate = self.admission_harness.predecessor(
+            "generate",
+            generate_command,
+            {"stage": "generate"},
+        )
+        self._persist_predecessor_decision(generate)
+
+        verify_command = build_verify_command(
+            self.admission_harness.spec,
+            generate,
+            capture,
+        )
+        self.facts.create_command(
+            verify_command,
+            admission=self.admission,
+            predecessor=generate,
+            supporting_predecessors=(capture,),
+        )
+        rows = self._query(
+            "SELECT stage FROM command WHERE run_id = %s AND kind = 'stage' ORDER BY stage",
+            (self.admission.run_id,),
+        )
+        self.assertEqual(
+            [row[0] for row in rows],
+            ["capture", "discover", "freeze", "generate", "verify"],
+        )
+        self.assertEqual(
+            self.facts.load_command(verify_command.command_id),
+            verify_command,
+        )
 
     def test_technical_dispatch_uses_its_own_claim_and_creates_no_stage_decision(self) -> None:
         result = self.dispatch_service.dispatch(self.dispatch_command.command_id)

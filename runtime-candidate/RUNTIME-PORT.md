@@ -139,16 +139,27 @@ claim。它不复用 Freeze claim。触发器响应、异常和后续观察都�
 
 ## Admission 与后续命令绑定
 
-`AdmissionSpec` 是 principal、purpose、request、target、originals、rules、configuration
-和命令身份的唯一纯事实。`build_freeze_command`、`build_run_admission` 及
+`AdmissionSpec` 是 principal、purpose、request、target、originals、rules、configuration、
+六个 stage executor 身份和命令身份的唯一纯事实。每个 builder 只从
+`StageExecutors.for_stage(stage)` 取得自己的 executor；Windows native closure 由独立的
+`native_tool_sha256` 表达，Linux Capture executor 与它不要求相同。
+
+`build_freeze_command`、`build_run_admission` 及
 `FactStore.admit_run` 共同验证 Freeze command 是该 spec 的确定性投影；错绑原件、规则、
 配置或管理字段会在任何数据库写入前拒绝。
 
-Freeze 完成后，`FactStore.create_command` 同时要求持久化 `RunAdmission` 和已验证的
-`VerifiedPredecessor`。它在 run 锁内重新核对 admission、Freeze command、decision、
-StageResult artifact 和业务输出 artifact，再由同一 spec 重建并验证 Discover command。
-该路径不会接受调用方自报的 principal、purpose、source 或 configuration 字段；不支持
-AdmissionSpec 投影的阶段在写入前明确拒绝。
+Freeze 完成后，`FactStore.create_command` 同时要求持久化 `RunAdmission`、已验证的
+immediate `VerifiedPredecessor`、按阶段所需的 supporting predecessors，以及 Capture
+需要的 `VerifiedDiscoverResult`。它在 run 锁内逐个核对所有 predecessor command、
+decision、StageResult artifact 和业务输出 artifact，再由同一 spec 重建并验证目标命令。
+
+当前纯 builder/validator 覆盖 Freeze、Discover、Capture、Generate 和 Verify。Capture
+从已验证 Discover 结果读取 prepared/handoff/upload/native 身份；Generate 只接受 Capture；
+Verify 同时核对 Generate 和 Capture lineage。Publish 继续以
+`admission.publish_contract_pending` 明确拒绝，不创建 stub 或冒称六阶段完成。
+
+该路径不会接受调用方自报的 principal、purpose、source、configuration 或 executor
+字段；任一前驱或 support 事实与已注册事实不同，都在 command 写入前拒绝。
 
 本候选只完成共享运行时与 PostgreSQL 组合验证。Portal/handler 的最终接线由主架构
 统一组合；本轮未连接真实 Airflow、Portal、现场、Windows 或 CAD，也不构成任何部署或
