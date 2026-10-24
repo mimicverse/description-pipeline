@@ -17,6 +17,7 @@ from .contracts import (
 )
 from .effects import EffectFact, EffectIntent, EffectState, project_effect_state
 from .engine import StageHandler, StageServices, StageWorkspace, execute_stage
+from .freeze import FreezeHandler, FreezeRefusal
 
 __all__ = [
     "ArtifactRef",
@@ -24,6 +25,8 @@ __all__ = [
     "EffectIntent",
     "EffectState",
     "ExecutionClaim",
+    "FreezeHandler",
+    "FreezeRefusal",
     "RunAdmission",
     "RunStatus",
     "StageCandidate",
