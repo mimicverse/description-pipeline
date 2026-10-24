@@ -43,12 +43,14 @@ from .effects import (
 )
 from .engine import StageHandler, StageServices, StageWorkspace, execute_stage
 from .discover import DiscoverDomainAdapter, DiscoverHandler
+from .capture import CaptureHandler
 from .freeze import FreezeHandler, FreezeRefusal
 
 __all__ = [
     "AdmissionSpec",
     "ArtifactMember",
     "ArtifactRef",
+    "CaptureHandler",
     "DiscoverDomainAdapter",
     "DiscoverHandler",
     "EffectFact",

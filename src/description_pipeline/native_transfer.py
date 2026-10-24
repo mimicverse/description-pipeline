@@ -31,15 +31,18 @@ from .io import (
 from .request_evidence import read_request_evidence
 from .runtime import RUNTIME_VERSIONS, required_packages
 from .schemas import TOOL_SCHEMA, NATIVE_DISCOVERY_SCHEMA
+from .pipeline.contracts import ArtifactRef
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.handoff import MAX_HANDOFF_BYTES, MAX_HANDOFF_FILES
 from .sources.solidworks.revision import package_inventory
 from .stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA, stage_view
 
 TRANSFER_SCHEMA = "solidworks-to-urdf.transfer/v1"
+CAPTURE_TRANSFER_SCHEMA = "solidworks-to-urdf.capture-transfer/v2"
 
 
 NATIVE_STAGE_SCOPE = ("freeze", "discover", "capture")
+NATIVE_CAPTURE_SCOPE = ("capture",)
 
 
 MAX_TRANSFER_FILES = MAX_HANDOFF_FILES
@@ -92,6 +95,60 @@ def _allowed_payload(name: str) -> bool:
 
 def _is_sha256(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _capture_upstream(value) -> list[dict]:
+    """Validate the exact Freeze/Discover producer references of one Capture."""
+
+    _require(
+        isinstance(value, (list, tuple)) and len(value) == 2,
+        "Capture upstream artifacts must contain exactly Freeze and Discover",
+    )
+    refs = [ArtifactRef.from_record(row) for row in value]
+    by_stage = {ref.producer_stage: ref for ref in refs}
+    _require(
+        len(by_stage) == 2 and set(by_stage) == {"freeze", "discover"},
+        "Capture upstream artifacts must contain one Freeze and one Discover producer",
+    )
+    _require(
+        all(ref.producer_run_id for ref in refs),
+        "Capture upstream artifacts must retain their producer run identities",
+    )
+    return [
+        ref.to_record()
+        for ref in sorted(refs, key=lambda item: (str(item.producer_stage), item.artifact_id))
+    ]
+
+
+def _capture_execution(value, *, run_id: str) -> dict:
+    """Validate the executor identity carried beside upstream producer identity."""
+
+    required = {
+        "claim_id",
+        "command_id",
+        "effect_id",
+        "executor_sha256",
+        "fence",
+        "run_id",
+    }
+    _require(
+        isinstance(value, dict) and set(value) == required,
+        "Capture execution fields are incomplete or unknown",
+    )
+    _require(
+        value.get("run_id") == run_id,
+        "Capture execution run differs from the transfer executor",
+    )
+    _require(
+        all(
+            isinstance(value.get(name), str) and bool(value[name])
+            for name in ("claim_id", "command_id", "effect_id")
+        ),
+        "Capture execution lacks its command, claim or effect identity",
+    )
+    _require(type(value.get("fence")) is int and value["fence"] > 0, "Capture execution fence is invalid")
+    _require(_is_sha256(value.get("executor_sha256")), "Capture execution tool digest is invalid")
+    return dict(value)
 
 
 def _document_basename(value) -> str:
@@ -159,7 +216,13 @@ def _validate_native_tool(native_tool) -> None:
         )
 
 
-def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
+def _validate_stage_receipts(
+    view,
+    *,
+    run_id: str,
+    handoff_sha256: str,
+    execution_scope: tuple[str, ...] = NATIVE_STAGE_SCOPE,
+) -> None:
     _require(isinstance(view, dict), "Stage receipts must be an object")
     _require(view.get("schema_version") == VIEW_SCHEMA, "Stage receipts use another schema")
     _require(view.get("pipeline_id") == PIPELINE_ID, "Stage receipts belong to another pipeline")
@@ -170,8 +233,10 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
     _require(view.get("run_id") == run_id, "Stage receipts belong to another run")
     _require(view.get("handoff_sha256") == handoff_sha256, "Stage receipts bind another handoff")
     _require(
-        tuple(view.get("execution_scope") or ()) == NATIVE_STAGE_SCOPE,
-        "Stage receipts must declare the native execution scope freeze/discover/capture",
+        tuple(view.get("execution_scope") or ()) == execution_scope,
+        "Stage receipts must declare the native execution scope freeze/discover/capture"
+        if execution_scope == NATIVE_STAGE_SCOPE
+        else f"Stage receipts must declare the execution scope {execution_scope!r}",
     )
     stages = view.get("stages")
     _require(
@@ -182,7 +247,7 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
         "Stage receipts must list the six engineering stages once in contract order",
     )
     by_id = {stage["id"]: stage for stage in stages}
-    for stage_id in NATIVE_STAGE_SCOPE:
+    for stage_id in execution_scope:
         definition = _STAGE_DEFINITIONS[stage_id]
         stage = by_id[stage_id]
         received_input = stage.get("input_qc")
@@ -213,7 +278,7 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
             f"Native stage {stage_id} receipts are incomplete",
         )
     for stage_id in STAGE_IDS:
-        if stage_id in NATIVE_STAGE_SCOPE:
+        if stage_id in execution_scope:
             continue
         stage = by_id[stage_id]
         _require(stage.get("in_scope") is False, f"Non-native stage {stage_id} is declared in the native scope")
@@ -231,8 +296,10 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
     for event in events:
         _require(isinstance(event, dict), "A native protocol event must be an object")
         _require(
-            event.get("stage") in NATIVE_STAGE_SCOPE,
-            "Native stage receipts must contain only the first three stages' events",
+            event.get("stage") in execution_scope,
+            "Native stage receipts must contain only the first three stages' events"
+            if execution_scope == NATIVE_STAGE_SCOPE
+            else "Native stage receipts contain an event from an out-of-scope stage",
         )
         timestamp = event.get("at")
         _require(isinstance(timestamp, str) and timestamp, "A native protocol event lacks its timestamp")
@@ -261,7 +328,7 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
             stage_blocks.append((event["stage"], []))
         stage_blocks[-1][1].append(event)
     _require(
-        tuple(stage_id for stage_id, _block in stage_blocks) == NATIVE_STAGE_SCOPE,
+        tuple(stage_id for stage_id, _block in stage_blocks) == execution_scope,
         "Native protocol stage blocks are reordered, missing or interleaved",
     )
     for stage_id, block in stage_blocks:
@@ -290,25 +357,25 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
             {
                 "run_id": run_id,
                 "request": {"handoff_sha256": handoff_sha256},
-                "result": {"execution_scope": list(NATIVE_STAGE_SCOPE)},
+                "result": {"execution_scope": list(execution_scope)},
                 "events": events,
             }
         )
     except Exception as error:  # noqa: BLE001 - a receipt that cannot be rebuilt is not evidence
         raise PipelineError(f"Native stage receipts cannot be rebuilt from their events: {error}") from error
     _require(
-        _receipt_projection(recomputed) == _receipt_projection(view),
+        _receipt_projection(recomputed, execution_scope) == _receipt_projection(view, execution_scope),
         "Native stage receipts differ from the stage view rebuilt from their own events",
     )
 
 
-def _receipt_projection(view) -> dict:
+def _receipt_projection(view, execution_scope: tuple[str, ...] = NATIVE_STAGE_SCOPE) -> dict:
     """The native rows and boundary-check states a receipt must actually prove."""
 
     stages = view.get("stages")
     by_id = {stage.get("id"): stage for stage in stages or [] if isinstance(stage, dict)}
     projection = {}
-    for stage_id in NATIVE_STAGE_SCOPE:
+    for stage_id in execution_scope:
         stage = by_id.get(stage_id) or {}
         checks = {}
         for boundary in ("input", "output"):
@@ -639,6 +706,7 @@ def _validate_stage_details(
     main_assembly_sha256: str,
     native_files: dict[str, str],
     native_prepared_files: dict[str, str] | None = None,
+    capture_only: bool = False,
 ) -> None:
     checks = _stage_checks(view)
     expected = expected_native_check_details(
@@ -648,25 +716,41 @@ def _validate_stage_details(
         main_assembly_sha256=main_assembly_sha256,
         native_files=native_files,
     )
-    _require(
-        set(expected) <= set(checks),
-        f"Native stage receipts lack required details: {sorted(set(expected) - set(checks))}",
+    required_identifiers = (
+        {"input.valid", "capture.integrity", "capture.input_stability", "runtime.ready"}
+        if capture_only
+        else set(expected)
+        | {
+            "handoff.admission",
+            "discovery.definition",
+            "discovery.binding",
+            "runtime.ready",
+        }
     )
-    extra_required = {
-        "handoff.admission",
-        "discovery.definition",
-        "discovery.binding",
-        "runtime.ready",
-    }
     _require(
-        extra_required <= set(checks),
-        f"Native stage receipts lack required details: {sorted(extra_required - set(checks))}",
+        required_identifiers <= set(checks),
+        f"Native stage receipts lack required details: {sorted(required_identifiers - set(checks))}",
     )
     for identifier, details in expected.items():
+        if capture_only and identifier not in required_identifiers:
+            continue
         _require(
             checks[identifier].get("details") == details,
             f"Native stage detail differs from its captured bytes: {identifier}",
         )
+
+    if capture_only:
+        runtime_ready = checks["runtime.ready"].get("details")
+        _require(
+            isinstance(runtime_ready, dict)
+            and runtime_ready.get("role") == "native"
+            and isinstance(runtime_ready.get("scope"), str)
+            and bool(runtime_ready["scope"])
+            and isinstance(runtime_ready.get("solidworks_executable"), str)
+            and _document_basename(runtime_ready["solidworks_executable"]).casefold() == "sldworks.exe",
+            "Capture runtime.ready does not bind the native SolidWorks executable",
+        )
+        return
 
     admission = checks["handoff.admission"].get("details")
     _require(
@@ -958,7 +1042,7 @@ def _validate_source_identity(
 def _validate_native_discovery(
     root: Path,
     *,
-    run_id: str,
+    producer_run_id: str,
     main_assembly: str,
     handoff_sha256: str,
     actual_inputs: dict[str, str],
@@ -981,8 +1065,8 @@ def _validate_native_discovery(
     except (ValueError, AttributeError, TypeError) as error:
         raise PipelineError("Native discovery run_id is not a UUID") from error
     _require(
-        recorded_run_id == canonical_discovery_run == run_id,
-        "Native discovery record belongs to another run",
+        recorded_run_id == canonical_discovery_run == producer_run_id,
+        "Native discovery record belongs to another producer run",
     )
     identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
     recorded = identity.get("main_assembly")
@@ -1044,6 +1128,8 @@ def _validate_capture(
     native_tool_record=None,
     native_prepared_dir: str | None = None,
     native_prepared_files: dict[str, str] | None = None,
+    execution_scope: tuple[str, ...] = NATIVE_STAGE_SCOPE,
+    discovery_producer_run_id: str | None = None,
 ) -> dict:
     """Re-read a capture root (sealed or freshly extracted) against the transfer contract."""
 
@@ -1057,12 +1143,13 @@ def _validate_capture(
         view,
         run_id=run_id,
         handoff_sha256=handoff_sha256,
+        execution_scope=execution_scope,
     )
     handoff = read_data(confined(root, "input/handoff.json"))
     actual_inputs, input_main, main_assembly_sha256 = _validate_input(root, handoff, main_assembly)
     native_files, native_sha256 = _validate_native_discovery(
         root,
-        run_id=run_id,
+        producer_run_id=discovery_producer_run_id or run_id,
         main_assembly=main_assembly,
         handoff_sha256=handoff_sha256,
         actual_inputs=actual_inputs,
@@ -1101,6 +1188,7 @@ def _validate_capture(
         main_assembly_sha256=main_assembly_sha256,
         native_files=native_files,
         native_prepared_files=native_prepared_files,
+        capture_only=execution_scope == NATIVE_CAPTURE_SCOPE,
     )
     return {
         "main_assembly_sha256": main_assembly_sha256,
@@ -1112,6 +1200,7 @@ def _validate_capture(
 def capture_manifest(
     root: Path, *, run_id: str, handoff_sha256: str, upload_sha256: str,
     main_assembly: str, native_tool: dict,
+    upstream_artifacts=None, execution=None,
 ) -> dict:
     """Build and validate one closed native payload with the shared verifier."""
 
@@ -1141,8 +1230,13 @@ def capture_manifest(
         "Capture lacks the evidence snapshot",
     )
 
+    capture_only = upstream_artifacts is not None or execution is not None
+    _require(
+        (upstream_artifacts is None) == (execution is None),
+        "Capture upstream artifacts and execution identity must be supplied together",
+    )
     manifest = {
-        "schema_version": TRANSFER_SCHEMA,
+        "schema_version": CAPTURE_TRANSFER_SCHEMA if capture_only else TRANSFER_SCHEMA,
         "run_id": run_id,
         "handoff_sha256": handoff_sha256,
         "upload_sha256": upload_sha256,
@@ -1153,9 +1247,18 @@ def capture_manifest(
         "files": files,
         "file_count": len(files),
         "total_bytes": total_bytes,
-        "native_stage_scope": list(NATIVE_STAGE_SCOPE),
+        "native_stage_scope": list(NATIVE_CAPTURE_SCOPE if capture_only else NATIVE_STAGE_SCOPE),
     }
-    verify_transfer(root, transfer_manifest=manifest, capture_only=True)
+    if capture_only:
+        manifest["upstream_artifacts"] = _capture_upstream(upstream_artifacts)
+        manifest["execution"] = _capture_execution(execution, run_id=run_id)
+    verify_transfer(
+        root,
+        transfer_manifest=manifest,
+        capture_only=True,
+        expected_upstream_artifacts=manifest.get("upstream_artifacts"),
+        expected_execution=manifest.get("execution"),
+    )
     return manifest
 
 
@@ -1174,6 +1277,8 @@ def verify_transfer(
     expected_upload_sha256: str | None = None,
     native_prepared_dir: str | None = None,
     native_prepared_files: dict[str, str] | None = None,
+    expected_upstream_artifacts=None,
+    expected_execution=None,
 ) -> dict | None:
     """Revalidate transferred native provenance inside a delivery bundle.
 
@@ -1247,25 +1352,57 @@ def verify_transfer(
     skip = derived | set(carried_bindings)
     manifest = receipt_manifest if receipt_manifest is not None else read_data(confined(bundle, CAPTURE_MANIFEST))
     _require(isinstance(manifest, dict), "Transfer manifest must be an object")
+    manifest_schema = manifest.get("schema_version")
+    capture_only_scope = manifest_schema == CAPTURE_TRANSFER_SCHEMA
+    execution_scope = NATIVE_CAPTURE_SCOPE if capture_only_scope else NATIVE_STAGE_SCOPE
+    expected_fields = {
+        "schema_version",
+        "run_id",
+        "handoff_sha256",
+        "upload_sha256",
+        "main_assembly",
+        "main_assembly_sha256",
+        "native_tool",
+        "native_tool_sha256",
+        "files",
+        "file_count",
+        "total_bytes",
+        "native_stage_scope",
+    }
+    if capture_only_scope:
+        expected_fields.update({"upstream_artifacts", "execution"})
     _require(
-        set(manifest)
-        == {
-            "schema_version",
-            "run_id",
-            "handoff_sha256",
-            "upload_sha256",
-            "main_assembly",
-            "main_assembly_sha256",
-            "native_tool",
-            "native_tool_sha256",
-            "files",
-            "file_count",
-            "total_bytes",
-            "native_stage_scope",
-        },
+        set(manifest) == expected_fields,
         "Transfer manifest fields are incomplete or unknown",
     )
-    _require(manifest.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
+    _require(
+        manifest_schema in {TRANSFER_SCHEMA, CAPTURE_TRANSFER_SCHEMA},
+        "Transfer manifest uses an unknown schema",
+    )
+    upstream_artifacts = None
+    execution = None
+    if capture_only_scope:
+        upstream_artifacts = _capture_upstream(manifest.get("upstream_artifacts"))
+        execution = _capture_execution(manifest.get("execution"), run_id=str(manifest.get("run_id") or ""))
+        if expected_upstream_artifacts is not None:
+            _require(
+                upstream_artifacts == _capture_upstream(expected_upstream_artifacts),
+                "Capture transfer binds different upstream artifacts",
+            )
+        else:
+            raise PipelineError("Capture transfer requires expected upstream artifacts")
+        if expected_execution is not None:
+            _require(
+                execution == _capture_execution(expected_execution, run_id=str(manifest.get("run_id") or "")),
+                "Capture transfer binds another execution identity",
+            )
+        else:
+            raise PipelineError("Capture transfer requires the expected execution identity")
+    else:
+        _require(
+            expected_upstream_artifacts is None and expected_execution is None,
+            "Legacy native transfer cannot carry capture-only expectations",
+        )
     files = manifest.get("files")
     _require(isinstance(files, dict) and files, "Transfer manifest declares no files")
     if capture_only:
@@ -1284,7 +1421,7 @@ def verify_transfer(
         f"Transfer manifest omits required capture reports: {sorted(set(_REQUIRED_REPORTS) - set(files))}",
     )
     _require(
-        manifest.get("native_stage_scope") == list(NATIVE_STAGE_SCOPE),
+        manifest.get("native_stage_scope") == list(execution_scope),
         "Transfer manifest declares another native stage scope",
     )
     _require(
@@ -1437,6 +1574,15 @@ def verify_transfer(
         native_tool_record=receipt_native_tool,
         native_prepared_dir=native_prepared_dir,
         native_prepared_files=native_prepared_files,
+        execution_scope=execution_scope,
+        discovery_producer_run_id=next(
+            (
+                ref["producer_run_id"]
+                for ref in upstream_artifacts or ()
+                if ref.get("producer_stage") == "discover"
+            ),
+            None,
+        ),
     )
     _require(
         validated["main_assembly_sha256"] == manifest.get("main_assembly_sha256"),

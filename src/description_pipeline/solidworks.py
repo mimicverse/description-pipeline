@@ -259,12 +259,15 @@ def _finish_native_capture(
     handoff_sha256,
     upload_sha256,
     main_assembly,
+    upstream_artifacts=None,
+    execution=None,
+    native_tool=None,
 ):
     """Close a capture-only run: provenance reports, sealed transfer, native_complete."""
 
     from .native_transfer import expected_native_check_details
     upload_sha256 = upload_sha256 or handoff_sha256
-    tool = _native_tool_record()
+    tool = native_tool or _native_tool_record()
     write_json(staging / "reports/native-tool.json", tool)
     receipt.update(state="native_complete", passed=False, native_complete=True, native_tool=tool, stage="capture")
     discovery = read_data(staging / "evidence/discovery.json")
@@ -299,6 +302,8 @@ def _finish_native_capture(
         upload_sha256=upload_sha256,
         main_assembly=main_assembly,
         native_tool=tool,
+        upstream_artifacts=upstream_artifacts,
+        execution=execution,
     )
     receipt["upload_sha256"] = upload_sha256
     write_json(staging / CAPTURE_MANIFEST, manifest)
@@ -367,58 +372,31 @@ def capture(
     upload_sha256: str | None = None,
     main_assembly: str | None = None,
     resume: dict | None = None,
+    upstream_artifacts=None,
+    execution=None,
+    native_tool=None,
 ) -> dict:
-    """The native boundary entry: freeze, discover and capture one prepared package.
+    """Compatibility adapter retained only until the common engine is wired."""
 
-    The stage seals the native transfer archive and closes at ``native_complete``
-    (never ``passed``): generation, independent verification and publication are
-    separate portable stages on Linux.  ``backend`` is an internal
-    dependency-injection seam for native regressions; the endpoint always uses
-    the native SolidWorks backend.  ``on_activity`` optionally observes
-    best-effort capture progress for the live-activity view; progress can never
-    change a run.
-    """
+    from .pipeline.capture import capture_native_transaction
 
-    package = Path(package)
-    if package.is_symlink() or package.is_junction():
-        raise PipelineError("The input package cannot be a symlink or junction")
-    package = package.resolve()
-    output = Path(output)
-    if output.resolve().is_relative_to(package) or package.is_relative_to(output.resolve()):
-        raise PipelineError("Input and output directories must be separate")
-    with output_lock(output) as output:
-        if not writable_output(output):
-            raise PipelineError(f"Output must be absent or empty: {output}")
-        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
-        receipt = _stage_receipt("capture", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
-        event = _event_sink(receipt, on_event)
-        try:
-            from .steps import capture_evidence
-
-            _, input_report = capture_evidence(
-                package,
-                staging,
-                backend=backend,
-                on_event=event,
-                on_activity=on_activity,
-                expected_inputs=expected_inputs,
-                handoff_sha256=handoff_sha256,
-            )
-            receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
-            return _finish_native_capture(
-                staging,
-                output,
-                receipt,
-                run_id=receipt["run_id"],
-                handoff_sha256=handoff_sha256,
-                upload_sha256=upload_sha256,
-                main_assembly=main_assembly,
-            )
-        except Exception as error:
-            return _failed_run(staging, output, receipt, event, error)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging)
+    return capture_native_transaction(
+        package,
+        output,
+        backend=backend,
+        run_id=run_id,
+        on_event=on_event,
+        on_activity=on_activity,
+        prior_events=prior_events,
+        expected_inputs=expected_inputs,
+        handoff_sha256=handoff_sha256,
+        upload_sha256=upload_sha256,
+        main_assembly=main_assembly,
+        resume=resume,
+        upstream_artifacts=upstream_artifacts,
+        execution=execution,
+        native_tool=native_tool,
+    )
 
 
 def generate(
