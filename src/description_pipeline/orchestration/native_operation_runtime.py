@@ -1124,6 +1124,7 @@ class NativeOperationRuntime:
                 "SELECT operation_id FROM native_resource_lease WHERE singleton=1"
             ).fetchone()
             if current is not None:
+                self._resource_waiters.add(operation_id)
                 return False
             acquired_at = self._now()
             connection.execute(
@@ -1272,6 +1273,15 @@ class NativeOperationRuntime:
         )
         return artifact
 
+    def _remove_workspace_after_satisfied(
+        self,
+        operation_id: str,
+        workspace: Path,
+    ) -> None:
+        view = self._project(operation_id)
+        if view.state == "satisfied" and view.resource_terminated:
+            shutil.rmtree(workspace, ignore_errors=True)
+
     def _execute(self, operation_id: str) -> None:
         _row, intent = self._intent(operation_id)
         events = self._events(operation_id)
@@ -1368,111 +1378,107 @@ class NativeOperationRuntime:
             owner_sha256=owner_sha256,
         ):
             shutil.rmtree(workspace, ignore_errors=True)
-            with self._lock:
-                self._resource_waiters.add(operation_id)
             return
         try:
-            try:
-                result = executor(
-                    dict(intent.request),
-                    self._input_path(
-                        operation_id,
-                        intent.input_archive_sha256,
-                    ),
-                    workspace,
-                    native_tool,
-                )
-            except NativeOperationFailure as failure:
-                self._settle(
+            result = executor(
+                dict(intent.request),
+                self._input_path(
                     operation_id,
-                    "failed",
-                    {
-                        "code": failure.code,
-                        "message": str(failure),
-                        "detail": failure.detail,
-                    },
-                    release_resource=failure.resource_terminated,
-                    release_reason="native_definite_failure",
-                )
-                return
-            except NativeOperationUnresolved as error:
-                self._settle(
-                    operation_id,
-                    "unknown",
-                    {
-                        "code": error.code,
-                        "message": str(error),
-                        "detail": error.detail,
-                    },
-                    release_resource=error.resource_terminated,
-                    release_reason="native_unresolved_cleanup",
-                )
-                return
-            except Exception as error:
-                self._settle(
-                    operation_id,
-                    "unknown",
-                    {
-                        "code": "native_operation_exception",
-                        "message": f"{type(error).__name__}: {error}",
-                    },
-                )
-                return
-            if result.output_contract != intent.output_contract:
-                settlement_payload = {
-                    "code": "native_output_contract_mismatch",
-                    "message": "Native executor returned a different output contract",
-                    "actual": result.output_contract,
-                }
-                if result.resource_terminated:
-                    self._settle(
-                        operation_id,
-                        "unknown",
-                        settlement_payload,
-                        release_resource=True,
-                        release_reason="native_output_contract_mismatch",
-                    )
-                else:
-                    self._settle(operation_id, "unknown", settlement_payload)
-                return
-            try:
-                artifact = self._install_artifact(operation_id, result)
-            except Exception as error:
-                settlement_payload = {
-                    "code": "native_artifact_seal_failed",
+                    intent.input_archive_sha256,
+                ),
+                workspace,
+                native_tool,
+            )
+        except NativeOperationFailure as failure:
+            self._settle(
+                operation_id,
+                "failed",
+                {
+                    "code": failure.code,
+                    "message": str(failure),
+                    "detail": failure.detail,
+                },
+                release_resource=failure.resource_terminated,
+                release_reason="native_definite_failure",
+            )
+            return
+        except NativeOperationUnresolved as error:
+            self._settle(
+                operation_id,
+                "unknown",
+                {
+                    "code": error.code,
+                    "message": str(error),
+                    "detail": error.detail,
+                },
+                release_resource=error.resource_terminated,
+                release_reason="native_unresolved_cleanup",
+            )
+            return
+        except Exception as error:
+            self._settle(
+                operation_id,
+                "unknown",
+                {
+                    "code": "native_operation_exception",
                     "message": f"{type(error).__name__}: {error}",
-                }
-                if result.resource_terminated:
-                    self._settle(
-                        operation_id,
-                        "unknown",
-                        settlement_payload,
-                        release_resource=True,
-                        release_reason="native_artifact_seal_failed",
-                    )
-                else:
-                    self._settle(operation_id, "unknown", settlement_payload)
-                return
+                },
+            )
+            return
+        if result.output_contract != intent.output_contract:
+            settlement_payload = {
+                "code": "native_output_contract_mismatch",
+                "message": "Native executor returned a different output contract",
+                "actual": result.output_contract,
+            }
             if result.resource_terminated:
                 self._settle(
                     operation_id,
-                    "satisfied",
-                    {"artifact_sha256": artifact.sha256},
+                    "unknown",
+                    settlement_payload,
                     release_resource=True,
-                    release_reason="native_terminal",
+                    release_reason="native_output_contract_mismatch",
                 )
             else:
+                self._settle(operation_id, "unknown", settlement_payload)
+            return
+        try:
+            artifact = self._install_artifact(operation_id, result)
+        except Exception as error:
+            settlement_payload = {
+                "code": "native_artifact_seal_failed",
+                "message": f"{type(error).__name__}: {error}",
+            }
+            if result.resource_terminated:
                 self._settle(
                     operation_id,
                     "unknown",
-                    {
-                        "code": "native_resource_not_terminated",
-                        "message": "Native executor did not prove resource termination",
-                        "artifact_sha256": artifact.sha256,
-                    },
+                    settlement_payload,
+                    release_resource=True,
+                    release_reason="native_artifact_seal_failed",
                 )
-        finally:
-            shutil.rmtree(workspace, ignore_errors=True)
+            else:
+                self._settle(operation_id, "unknown", settlement_payload)
+            return
+        if result.resource_terminated:
+            self._settle(
+                operation_id,
+                "satisfied",
+                {"artifact_sha256": artifact.sha256},
+                release_resource=True,
+                release_reason="native_terminal",
+            )
+            self._remove_workspace_after_satisfied(operation_id, workspace)
+        else:
+            self._settle(
+                operation_id,
+                "unknown",
+                {
+                    "code": "native_resource_not_terminated",
+                    "message": "Native executor did not prove resource termination",
+                    "artifact_sha256": artifact.sha256,
+                },
+            )
 
     def _work(self) -> None:
         while True:

@@ -25,6 +25,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     CAPTURE_KIND,
     DISCOVER_KIND,
     DiscoverOperationExecutor,
+    NativeOperationFailure,
     NativeOperationResult,
     NativeOperationRuntime,
     build_operation_record,
@@ -144,6 +145,16 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(finished.state, "satisfied")
         self.assertTrue(finished.resource_terminated)
         self.assertEqual(self.calls, 1)
+        claim_id = next(
+            event["payload"]["claim_id"]
+            for event in runtime._events("operation-roundtrip")
+            if event["type"] == "claimed"
+        )
+        _wait_for(
+            lambda: not (
+                runtime.workspace_root / "operation-roundtrip" / claim_id
+            ).exists()
+        )
 
         repeated = client.create_operation(envelope)
         self.assertEqual(repeated, finished)
@@ -373,6 +384,89 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(failed.failure.code, "native_tool_mismatch")
         self.assertTrue(failed.resource_terminated)
         self.assertEqual(self.calls, 0)
+
+    def test_definite_native_failure_preserves_workspace_bytes(self) -> None:
+        def failing_executor(request, source_archive, workspace, native_tool):
+            del request, source_archive, native_tool
+            evidence = Path(workspace) / "partial-native.bin"
+            evidence.write_bytes(b"unsealed failure evidence")
+            raise NativeOperationFailure(
+                "capture.native_failed",
+                "native capture failed after writing evidence",
+                resource_terminated=True,
+            )
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: failing_executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        client.create_operation(_operation("operation-failed-evidence", self.archive))
+        client.upload_input("operation-failed-evidence", self.archive)
+        failed = client.wait_for_terminal("operation-failed-evidence")
+        self.assertEqual(failed.state, "failed")
+        claim_id = next(
+            event["payload"]["claim_id"]
+            for event in runtime._events("operation-failed-evidence")
+            if event["type"] == "claimed"
+        )
+        evidence = (
+            runtime.workspace_root
+            / "operation-failed-evidence"
+            / claim_id
+            / "partial-native.bin"
+        )
+        self.assertEqual(evidence.read_bytes(), b"unsealed failure evidence")
+
+    def test_artifact_seal_failure_preserves_unsealed_workspace(self) -> None:
+        def returning(request, source_archive, workspace, native_tool):
+            del request, source_archive, native_tool
+            (Path(workspace) / "unsealed.bin").write_bytes(b"must survive")
+            artifact = Path(workspace) / "result.zip"
+            artifact.write_bytes(b"candidate artifact")
+            return NativeOperationResult(
+                artifact_path=artifact,
+                artifact_name="result.zip",
+                output_contract=OUTPUT_CONTRACT,
+                resource_terminated=True,
+            )
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: returning},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        with mock.patch.object(
+            runtime,
+            "_install_artifact",
+            side_effect=RuntimeError("forced seal failure"),
+        ):
+            client.create_operation(_operation("operation-seal-failure", self.archive))
+            client.upload_input("operation-seal-failure", self.archive)
+            failed = client.wait_for_terminal("operation-seal-failure")
+        self.assertEqual(failed.state, "unknown")
+        self.assertTrue(failed.resource_terminated)
+        self.assertEqual(failed.failure.code, "native_artifact_seal_failed")
+        claim_id = next(
+            event["payload"]["claim_id"]
+            for event in runtime._events("operation-seal-failure")
+            if event["type"] == "claimed"
+        )
+        evidence = (
+            runtime.workspace_root
+            / "operation-seal-failure"
+            / claim_id
+            / "unsealed.bin"
+        )
+        self.assertEqual(evidence.read_bytes(), b"must survive")
 
     def test_missing_capture_executor_fails_without_loading_a_legacy_runner(self) -> None:
         runtime = NativeOperationRuntime(
