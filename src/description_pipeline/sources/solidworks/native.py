@@ -2888,8 +2888,9 @@ class _ActivityEmitter:
     pairs, are never fabricated, and stay monotonic per (phase, action);
     totals may grow while the walk discovers sub-assembly scope but never
     shrink below ``completed``.  The collector owns timestamps and sequencing.
-    Operation transitions always pass; only repeats of the current action are
-    throttled.  A missing or failing callback can never affect the capture.
+    Operation or object transitions always pass; only repeats of the same
+    phase/action/current-object observation are throttled.  A missing or
+    failing callback can never affect the capture.
 
     ``freeze`` reuses one emitter for a whole capture: its own stage notes go
     through :meth:`emit`, the backend capture methods receive :meth:`publish`
@@ -2952,7 +2953,16 @@ class _ActivityEmitter:
             now = time.monotonic()
             if (phase, action) == self._last_action:
                 previous_at = self._last_emitted.get((phase, action))
-                if previous_at is not None and now - previous_at < _ACTIVITY_MIN_INTERVAL_SECONDS:
+                previous_object = (
+                    self._last_record.get("current_object")
+                    if isinstance(self._last_record, dict)
+                    else None
+                )
+                if (
+                    previous_at is not None
+                    and now - previous_at < _ACTIVITY_MIN_INTERVAL_SECONDS
+                    and previous_object == current_object
+                ):
                     return
             self._last_emitted[(phase, action)] = now
         try:
@@ -8790,10 +8800,6 @@ class SolidWorksBackend(CadBackend):
                     evidence["tolerant_edge_evidence"] is not None
                     for evidence in endpoint_evidence
                 )
-                uses_closest_fallback = any(
-                    evidence["parameter_u_source"] == "closest_point_fallback"
-                    for evidence in endpoint_evidence
-                )
                 row["open_edge_boundary_identity"] = None
                 requires_open_identity = False
                 if uses_tolerant_gap and not unique_topology_accepted:
@@ -8801,26 +8807,6 @@ class SolidWorksBackend(CadBackend):
                         raise CadError(
                             "cad_native_tessellation_unreadable",
                             "tolerant gap use requires an open-edge endpoint identity",
-                            {
-                                **base,
-                                "edge_index": edge_row["index"],
-                                "fin_id": fin_id,
-                                "direct_error_m": direct_error,
-                                "swapped_error_m": swapped_error,
-                                "face_count": incidence,
-                                "cofin_raw_id": cofin_id,
-                            },
-                        )
-                    requires_open_identity = True
-                elif (
-                    uses_closest_fallback
-                    and open_identity_candidate
-                    and not unique_topology_accepted
-                ):
-                    if not endpoint_set_mode:
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "ambiguous closest-point fallback requires an open-edge endpoint identity",
                             {
                                 **base,
                                 "edge_index": edge_row["index"],
