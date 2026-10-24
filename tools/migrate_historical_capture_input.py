@@ -866,7 +866,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--artifact-store", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--tool-record", type=Path)
-    parser.add_argument("--current-native-tool", type=Path)
+    parser.add_argument("--current-native-tool", type=Path, required=True)
     parser.add_argument("--expected-run-id")
     parser.add_argument("--expected-prepared-sha256")
     parser.add_argument("--diagnostic-created-at", required=True)
@@ -878,11 +878,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         tool = read_data(args.tool_record) if args.tool_record is not None else None
-        current_native_tool = (
-            read_data(args.current_native_tool)
-            if args.current_native_tool is not None
-            else None
-        )
+        current_native_tool = read_data(args.current_native_tool)
         receipt = migrate_historical_capture_input(
             MigrationInputs(
                 prepared=args.prepared,
