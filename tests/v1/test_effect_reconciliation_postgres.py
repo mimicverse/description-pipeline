@@ -31,7 +31,6 @@ from description_pipeline.pipeline.reconciliation import (
     EffectReconciliationFailure,
     EffectReconciliationService,
 )
-from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.platform.facts import FactConflict, FactStore
@@ -124,6 +123,20 @@ class _AbsentAdapter:
             state_class="absent",
             payload_root=payload,
             metadata={"effect_id": intent.effect_id, "present": False},
+        )
+
+
+class _KnownAdapter:
+    def observe(self, *, command, intent, outbound_root, workspace_root):
+        del command, outbound_root
+        payload = workspace_root / "known-reconciliation"
+        payload.mkdir()
+        (payload / "observation.json").write_text('{"present":true}\n', encoding="utf-8")
+        return EffectReconciliationEvidence(
+            fact_type="reconciled",
+            state_class="known",
+            payload_root=payload,
+            metadata={"effect_id": intent.effect_id, "present": True},
         )
 
 
@@ -513,7 +526,7 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
             ),
             clock=lambda: later + timedelta(minutes=3),
         )
-        with self.assertRaisesRegex(ProtocolError, "effect.unsettled"):
+        with self.assertRaisesRegex(FactConflict, "non-satisfied effect"):
             execute_stage(
                 command_id=command.command_id,
                 handler=_ForbiddenHandler(),
@@ -525,6 +538,81 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
                 (command.command_id,),
             ),
             [("completed",)],
+        )
+
+    def test_conflict_absorbs_late_fence_evidence_until_verified_reconciliation(self) -> None:
+        command, _services, workspace, effects, intent = self._authorize_unknown_effect("conflict-resolution")
+        observation = workspace.root / "pre-conflict-observation"
+        observation.mkdir()
+        (observation / "observation.json").write_text('{"present":true}\n', encoding="utf-8")
+        effects.record_observation(
+            intent.effect_id,
+            source="first-fence",
+            state_class="known",
+            observation_root=observation,
+        )
+        self.facts.append_effect_fact(
+            effect_id=intent.effect_id,
+            claim=None,
+            fact_type="conflict",
+            source="independent-conflict",
+            state_class=None,
+            payload_artifact=None,
+            payload_digest=digest({"conflict": command.command_id}),
+            observed_at=self.now + timedelta(minutes=1),
+            fact_id="conflict-" + command.command_id,
+            expected_command_id=command.command_id,
+        )
+        response = workspace.root / "late-response"
+        response.mkdir()
+        (response / "response.json").write_text('{"late":true}\n', encoding="utf-8")
+        effects.record_response(
+            intent.effect_id,
+            source="late-fence",
+            response_root=response,
+        )
+        late_observation = workspace.root / "late-observation"
+        late_observation.mkdir()
+        (late_observation / "observation.json").write_text('{"present":true}\n', encoding="utf-8")
+        effects.record_observation(
+            intent.effect_id,
+            source="late-observation",
+            state_class="known",
+            observation_root=late_observation,
+        )
+        self.assertEqual(
+            self.facts.effect_settlement_for_key(command.command_id, "native").state,
+            EffectState.CONFLICT,
+        )
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=self.work_root / "conflict-resolution",
+            observer_tool_sha256=self.observer_tool,
+            clock=lambda: self.now + timedelta(minutes=2),
+        )
+        resolved = reconciler.reconcile(
+            command_id=command.command_id,
+            effect_key="native",
+            adapter=_KnownAdapter(),
+        )
+        self.assertEqual(resolved.settlement.state, EffectState.SATISFIED)
+        self.assertIsNotNone(resolved.fact)
+        self.assertEqual(resolved.fact.fact_type, "reconciled")
+        self.assertIsNotNone(resolved.fact.metadata_artifact_id)
+        self.assertEqual(
+            self._query(
+                "SELECT fact_type FROM effect_fact WHERE effect_id = %s ORDER BY seq",
+                (intent.effect_id,),
+            ),
+            [
+                ("dispatch_authorized",),
+                ("observation",),
+                ("conflict",),
+                ("response",),
+                ("observation",),
+                ("reconciled",),
+            ],
         )
 
     def test_observation_absence_and_expired_lease_do_not_settle_until_reconciled(self) -> None:

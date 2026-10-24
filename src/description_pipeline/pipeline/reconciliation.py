@@ -147,7 +147,6 @@ class EffectReconciliationService:
         if settlement.state in {
             EffectState.SATISFIED,
             EffectState.DEFINITELY_FAILED,
-            EffectState.CONFLICT,
         }:
             return EffectReconciliationResult(
                 command_id=command_id,
@@ -156,7 +155,7 @@ class EffectReconciliationService:
                 fact=None,
                 settlement=settlement,
             )
-        if settlement.state is not EffectState.UNKNOWN:
+        if settlement.state not in {EffectState.UNKNOWN, EffectState.CONFLICT}:
             raise ProtocolError(
                 "reconciliation.not_required",
                 {"state": settlement.state.value, "effect_id": intent.effect_id},
@@ -179,6 +178,18 @@ class EffectReconciliationService:
             )
             if not isinstance(evidence, EffectReconciliationEvidence):
                 raise ProtocolError("reconciliation.invalid", {"where": "adapter-result"})
+            if settlement.state is EffectState.CONFLICT and (
+                evidence.fact_type != "reconciled"
+                or evidence.state_class not in {"known", "absent"}
+            ):
+                raise ProtocolError(
+                    "reconciliation.conflict_unresolved",
+                    {
+                        "effect_id": intent.effect_id,
+                        "fact_type": evidence.fact_type,
+                        "state_class": evidence.state_class,
+                    },
+                )
             observed_at = self._now()
             if evidence.payload_artifact is not None:
                 self.artifacts.verify(evidence.payload_artifact)

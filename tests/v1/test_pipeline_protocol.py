@@ -141,6 +141,38 @@ class EffectProjectionTests(unittest.TestCase):
         )
         self.assertEqual(project_effect_state(self.intent, facts), EffectState.CONFLICT)
 
+    def test_late_fence_evidence_cannot_downgrade_conflict(self) -> None:
+        facts = (
+            self.fact(1, "dispatch_authorized"),
+            self.fact(2, "observation", state_class="known"),
+            self.fact(3, "conflict"),
+            self.fact(4, "response"),
+            self.fact(5, "observation", state_class="known"),
+        )
+        self.assertEqual(project_effect_state(self.intent, facts), EffectState.CONFLICT)
+
+    def test_conflict_is_absorbing_until_evidence_backed_reconciliation(self) -> None:
+        absorbing = (
+            self.fact(1, "dispatch_authorized"),
+            self.fact(2, "conflict"),
+            self.fact(3, "dispatch_authorized"),
+            self.fact(4, "observation", state_class="known"),
+        )
+        self.assertEqual(project_effect_state(self.intent, absorbing), EffectState.CONFLICT)
+        unresolved = (
+            *absorbing,
+            self.fact(5, "reconciled", state_class="known"),
+        )
+        self.assertEqual(project_effect_state(self.intent, unresolved), EffectState.CONFLICT)
+        resolved = (
+            *absorbing,
+            replace(
+                self.fact(5, "reconciled", state_class="known"),
+                metadata_artifact_id="reconciliation-metadata",
+            ),
+        )
+        self.assertEqual(project_effect_state(self.intent, resolved), EffectState.SATISFIED)
+
     def test_new_dispatch_after_known_is_unknown(self) -> None:
         facts = (
             self.fact(1, "observation", state_class="known"),

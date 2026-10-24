@@ -370,6 +370,27 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
     decisive: EffectFact | None = None
     terminal = False
     for fact in ordered:
+        if state is EffectState.CONFLICT:
+            if fact.fact_type == "conflict":
+                decisive = fact
+                continue
+            if (
+                fact.fact_type == "reconciled"
+                and fact.metadata_artifact_id is not None
+                and fact.state_class in {"known", "absent"}
+            ):
+                state = (
+                    EffectState.SATISFIED
+                    if fact.state_class == "known"
+                    else EffectState.DEFINITELY_FAILED
+                )
+                decisive = fact
+                terminal = True
+                continue
+            # Once a contradiction is recorded, an ordinary observation or
+            # late send fact remains audit evidence. Only an exact reconciliation
+            # carrying its independent metadata closure can establish a new state.
+            continue
         if fact.fact_type == "dispatch_authorized":
             # Every later send attempt is potentially in flight until a newer
             # exact observation or reconciliation settles it.

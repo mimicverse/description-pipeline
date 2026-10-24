@@ -44,6 +44,7 @@ from ..pipeline.contracts import (
     StageDecision,
     StageQualification,
     StageResult,
+    STAGES,
     qualify_stage,
     require_formal_qualification,
 )
@@ -787,6 +788,12 @@ class FactStore(AdmissionControlStore):
             stored_command,
             result=predecessor.result,
         )
+        self._verify_completed_command_effects_cursor(
+            cursor,
+            stored_command,
+            decision=stored_decision,
+        )
+        self._verify_completed_predecessor_chain_cursor(cursor, stored_command)
 
     def _decision_row(self, cursor, *, run_id: str, stage: str):
         cursor.execute(
@@ -841,13 +848,106 @@ class FactStore(AdmissionControlStore):
             raise FactStoreError("Only a stage command has a stage decision")
         with self._transaction() as connection:
             cursor = connection.cursor()
+            stored_command = self._load_command_cursor(cursor, command.command_id)
+            if stored_command != command:
+                raise FactConflict("The stage command differs from its registered command")
             row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
             if row is None:
                 return None
             decision = self._decision_from_row(cursor, row)
+            if decision.outcome == "completed":
+                self._verify_completed_command_effects_cursor(cursor, command, decision=decision)
+                self._verify_completed_predecessor_chain_cursor(cursor, command)
         if decision.command_id != command.command_id:
             raise FactConflict("The stage decision is bound to another command")
         return decision
+
+    def _decision_by_id_cursor(self, cursor, decision_id: str):
+        cursor.execute(
+            """
+            SELECT decision_id, run_id, stage, command_id, outcome, result_record_artifact_id,
+                   result_digest, actual_executor_sha256, original_producer_decision_id,
+                   reason_code, decided_at, failure_envelope, failure_digest
+            FROM stage_decision
+            WHERE decision_id = %s
+            """,
+            (decision_id,),
+        )
+        return cursor.fetchone()
+
+    def _completed_predecessor_chain_cursor(self, cursor, command: StageCommand) -> list[StageCommand]:
+        """Resolve the immutable upstream command chain from leaf to root."""
+
+        if command.kind != "stage" or command.stage is None:
+            return []
+        chain = []
+        current = command
+        seen = set()
+        while current.predecessor_decision_id is not None:
+            chain_key = (current.run_id, current.predecessor_decision_id)
+            if chain_key in seen or len(seen) >= len(STAGES):
+                raise FactConflict("The command predecessor chain is cyclic or too deep")
+            seen.add(chain_key)
+            decision_row = self._decision_by_id_cursor(cursor, current.predecessor_decision_id)
+            if decision_row is None:
+                raise FactConflict("The command predecessor decision is missing")
+            decision = self._decision_from_row(cursor, decision_row)
+            predecessor = self._load_command_cursor(cursor, decision.command_id)
+            if predecessor is None or predecessor.kind != "stage" or predecessor.stage is None:
+                raise FactConflict("The predecessor decision has no canonical stage command")
+            if (
+                decision.outcome != "completed"
+                or predecessor.run_id != command.run_id
+                or STAGES.index(predecessor.stage) >= STAGES.index(current.stage)
+            ):
+                raise FactConflict("The predecessor decision is not an earlier completed stage of this run")
+            chain.append(predecessor)
+            current = predecessor
+        return chain
+
+    def _verify_completed_command_effects_cursor(
+        self,
+        cursor,
+        command: StageCommand,
+        *,
+        decision: StageDecision | None = None,
+    ) -> StageResult:
+        if command.kind != "stage" or command.stage is None:
+            raise FactConflict("Only a canonical stage command can carry a completed decision")
+        if decision is None:
+            row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
+            if row is None:
+                raise FactConflict("A completed predecessor decision is missing")
+            decision = self._decision_from_row(cursor, row)
+        if (
+            decision.command_id != command.command_id
+            or decision.run_id != command.run_id
+            or decision.stage != command.stage
+            or decision.outcome != "completed"
+            or decision.result_record_artifact is None
+        ):
+            raise FactConflict("The command is not bound to its completed stage decision")
+        result = self._result_reader.read_result(decision.result_record_artifact)
+        if (
+            result.command_id != command.command_id
+            or result.run_id != command.run_id
+            or result.stage != command.stage
+            or result.outcome != "completed"
+            or result.actual_executor_sha256 != command.expected_executor_sha256
+            or result.digest != decision.result_digest
+        ):
+            raise FactConflict("The completed StageResult differs from its command and decision")
+        states = self._effect_states_for_command_cursor(cursor, command.command_id, lock=True)
+        if set(result.required_effect_ids) != set(states):
+            raise FactConflict("The completed StageResult effect ids differ from the current effect ledger")
+        if any(state is not EffectState.SATISFIED for state in states.values()):
+            raise FactConflict("The completed stage predecessor now has a non-satisfied effect")
+        return result
+
+    def _verify_completed_predecessor_chain_cursor(self, cursor, command: StageCommand) -> None:
+        chain = self._completed_predecessor_chain_cursor(cursor, command)
+        for predecessor in reversed(chain):
+            self._verify_completed_command_effects_cursor(cursor, predecessor)
 
     def _cancel_command_cursor(
         self,
@@ -975,6 +1075,10 @@ class FactStore(AdmissionControlStore):
 
     def qualification_for(self, decision: StageDecision) -> StageQualification:
         command = self.load_command(decision.command_id)
+        if decision.outcome == "completed":
+            current = self.decision_for(command)
+            if current != decision:
+                raise FactConflict("The completed decision no longer qualifies under the current effect ledger")
         admission = self.load_admission(decision.run_id)
         if admission is None:
             raise FactStoreError("The decision run has no admission")
@@ -1015,7 +1119,7 @@ class FactStore(AdmissionControlStore):
             cursor = connection.cursor()
             cursor.execute(
                 """
-                SELECT command_id, run_id, stage, expected_executor_sha256
+                SELECT command_id, run_id, stage, expected_executor_sha256, predecessor_decision_id
                 FROM command
                 WHERE command_id = %s
                 FOR UPDATE
@@ -1025,6 +1129,11 @@ class FactStore(AdmissionControlStore):
             command = cursor.fetchone()
             if command is None:
                 raise FactStoreError(f"The command {command_id!r} is not registered")
+            if command[4] is not None:
+                stored_command = self._load_command_cursor(cursor, command_id)
+                if stored_command is None:  # pragma: no cover - locked row
+                    raise FactStoreError("The locked command disappeared")
+                self._verify_completed_predecessor_chain_cursor(cursor, stored_command)
             if command[3] != executor_sha256:
                 raise FactConflict("The claim executor identity differs from the command expectation")
             if command[2] is not None and self._decision_row(cursor, run_id=command[1], stage=command[2]) is not None:
@@ -1384,14 +1493,24 @@ class FactStore(AdmissionControlStore):
         if fact_type in {"observation", "reconciled"}:
             intent, facts = self._effect_cursor(cursor, effect_id, lock=True)
             state = project_effect_state(intent, facts)
+            conflict_resolution = (
+                state is EffectState.CONFLICT
+                and fact_type == "reconciled"
+                and state_class in {"known", "absent"}
+                and metadata_artifact is not None
+                and metadata_artifact.kind == "effect_reconciliation_metadata"
+            )
+            conflict_audit = state is EffectState.CONFLICT and fact_type == "observation"
             if state in {
                 EffectState.SATISFIED,
                 EffectState.DEFINITELY_FAILED,
                 EffectState.CONFLICT,
-            }:
+            } and not conflict_resolution and not conflict_audit:
                 raise FactConflict(
                     "An observation or reconciliation cannot reinterpret a terminal effect"
                 )
+        if metadata_artifact is not None and metadata_artifact.kind != "effect_reconciliation_metadata":
+            raise FactStoreError("The effect metadata artifact has the wrong kind")
         if payload_artifact is not None:
             self._insert_artifact(cursor, payload_artifact)
         if metadata_artifact is not None:
@@ -1450,18 +1569,31 @@ class FactStore(AdmissionControlStore):
         fact_id: str,
         expected_command_id: str | None = None,
     ) -> EffectFact:
-        """Persist the only permission that may precede the external call."""
+        """Persist the only permission that may precede the external call.
+
+        Locking and validating the completed ancestor effect ledgers in this
+        transaction is the external-send linearization point. A later conflict
+        remains immutable evidence and invalidates subsequent qualifications,
+        but it cannot rewrite an authorization or an already reported effect.
+        """
 
         if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
             raise FactStoreError("Effect dispatch time must be timezone-aware")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(
-                "SELECT command_id FROM command WHERE command_id = %s FOR UPDATE",
+                "SELECT command_id, run_id, stage, predecessor_decision_id "
+                "FROM command WHERE command_id = %s FOR UPDATE",
                 (claim.command_id,),
             )
-            if cursor.fetchone() is None:
+            stored = cursor.fetchone()
+            if stored is None:
                 raise FactStoreError("The effect dispatch command disappeared")
+            if stored[3] is not None:
+                stored_command = self._load_command_cursor(cursor, claim.command_id)
+                if stored_command is None:  # pragma: no cover - locked row
+                    raise FactStoreError("The effect dispatch command disappeared")
+                self._verify_completed_predecessor_chain_cursor(cursor, stored_command)
             if self._cancel_command_cursor(cursor, claim.command_id, lock=True) is not None:
                 raise FactConflict("Cancellation was requested before effect dispatch")
             self._verify_open_claim_cursor(cursor, claim)
@@ -1671,13 +1803,23 @@ class FactStore(AdmissionControlStore):
 
         if fact_type not in {"observation", "reconciled"}:
             raise FactStoreError("A reconciliation fact must be observation or reconciled")
+        if metadata_artifact.kind != "effect_reconciliation_metadata":
+            raise FactStoreError("The reconciliation metadata artifact has the wrong kind")
+        verifier = getattr(self._result_reader, "verify", None)
+        if not callable(verifier):
+            raise FactStoreError("The configured artifact reader cannot verify reconciliation evidence")
+        verifier(payload_artifact)
+        verifier(metadata_artifact)
         with self._transaction() as connection:
             cursor = connection.cursor()
             intent, facts = self._effect_cursor(cursor, effect_id, lock=True)
             if intent.command_id != expected_command_id:
                 raise FactConflict("The reconciliation effect names another command")
             state = project_effect_state(intent, facts)
-            if state is not EffectState.UNKNOWN:
+            if state is EffectState.CONFLICT:
+                if fact_type != "reconciled" or state_class not in {"known", "absent"}:
+                    raise FactConflict("A conflict requires exact known or absent reconciliation evidence")
+            elif state is not EffectState.UNKNOWN:
                 raise FactConflict(f"The effect is {state.value}; read-only reconciliation is not applicable")
             return self._append_effect_fact_cursor(
                 cursor,
@@ -1815,6 +1957,11 @@ class FactStore(AdmissionControlStore):
             cursor.execute("SELECT command_id FROM command WHERE command_id = %s FOR UPDATE", (command.command_id,))
             if cursor.fetchone() is None:
                 raise FactStoreError("The command disappeared before decision commit")
+            stored_command = self._load_command_cursor(cursor, command.command_id)
+            if stored_command != command:
+                raise FactConflict("The decision command differs from its registered command")
+            if candidate.result.outcome == "completed":
+                self._verify_completed_predecessor_chain_cursor(cursor, command)
             if self._cancel_command_cursor(cursor, command.command_id, lock=True) is not None:
                 raise FactConflict("Cancellation was requested; commit the cancelled result instead")
             existing_row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)

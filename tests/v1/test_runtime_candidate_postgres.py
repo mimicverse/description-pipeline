@@ -8,8 +8,10 @@ throwaway cluster and never contacts an existing platform or Airflow service.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -80,6 +82,97 @@ from tests.v1.test_pipeline_admission import AdmissionHarness
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / "schema.sql"
+
+
+def _hold_conflict_until_authorization_attempt(
+    uri: str,
+    schema: str,
+    effect_id: str,
+    command_id: str,
+    ready,
+    release,
+) -> None:
+    import psycopg2
+
+    connection = psycopg2.connect(
+        uri,
+        options=f"-c search_path={schema},public",
+    )
+    try:
+        with connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT effect_id FROM effect_intent WHERE effect_id = %s FOR UPDATE",
+                (effect_id,),
+            )
+            if cursor.fetchone() is None:
+                raise AssertionError("conflict target effect is missing")
+            cursor.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM effect_fact WHERE effect_id = %s",
+                (effect_id,),
+            )
+            seq = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                INSERT INTO effect_fact (
+                    fact_id, effect_id, seq, claim_id, fence, fact_type,
+                    source, state_class, payload_artifact_id, payload_digest,
+                    metadata_artifact_id, observed_at
+                ) VALUES (
+                    %s, %s, %s, NULL, NULL, 'conflict',
+                    'race-conflict', NULL, NULL, %s, NULL, now()
+                )
+                """,
+                (
+                    f"race-conflict-{effect_id}",
+                    effect_id,
+                    seq,
+                    "a" * 64,
+                ),
+            )
+            ready.set()
+            if not release.wait(20):
+                raise TimeoutError("authorization race release timed out")
+    finally:
+        connection.close()
+
+
+def _attempt_authorization_blocked_by_conflict(
+    uri: str,
+    schema: str,
+    artifact_root: str,
+    claim,
+    effect_id: str,
+    attempting,
+    result,
+) -> None:
+    import psycopg2
+
+    from description_pipeline.artifacts import ArtifactStore
+    from description_pipeline.platform.facts import FactConflict, FactStore
+
+    def connect():
+        return psycopg2.connect(
+            uri,
+            options=f"-c search_path={schema},public",
+        )
+
+    facts = FactStore(connect, ArtifactStore(artifact_root))
+    attempting.set()
+    try:
+        facts.authorize_effect_dispatch(
+            effect_id=effect_id,
+            claim=claim,
+            source="race-authorization",
+            payload_digest="b" * 64,
+            observed_at=claim.expires_at - timedelta(seconds=1),
+            fact_id=f"race-authorization-{effect_id}",
+        )
+    except FactConflict as error:
+        result.put(("conflict", str(error)))
+    except Exception as error:
+        result.put(("error", f"{type(error).__name__}: {error}"))
+    else:
+        result.put(("authorized", ""))
 
 
 class _EffectHandler:
@@ -496,6 +589,131 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 ),
             )
 
+    def _seed_synthetic_completed_stage(
+        self,
+        stage: str,
+        *,
+        predecessor_decision_id: str,
+        with_decision: bool = True,
+    ) -> StageCommand:
+        spec = self.admission_harness.spec
+        executor = spec.executors.for_stage(stage)
+        command = StageCommand.create(
+            command_id=f"lineage-{stage}-" + str(uuid.uuid4()),
+            run_id=self.admission.run_id,
+            stage=stage,
+            idempotency_key=f"{self.admission.run_id}/lineage/{stage}/" + str(uuid.uuid4()),
+            request={"stage": stage},
+            input_artifacts=(),
+            config_snapshot_sha256=spec.platform_config_sha256,
+            contract_sha256=spec.contract_sha256,
+            policy_sha256=spec.policy_sha256,
+            expected_executor_sha256=executor,
+            predecessor_decision_id=predecessor_decision_id,
+        )
+        if not with_decision:
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO command (
+                        command_id, run_id, kind, stage, idempotency_key, request,
+                        request_digest, config_snapshot_sha256, contract_sha256,
+                        policy_sha256, expected_executor_sha256, predecessor_decision_id
+                    ) VALUES (
+                        %s, %s, 'stage', %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        command.command_id,
+                        command.run_id,
+                        command.stage,
+                        command.idempotency_key,
+                        json.dumps(dict(command.request)),
+                        command.request_digest,
+                        command.config_snapshot_sha256,
+                        command.contract_sha256,
+                        command.policy_sha256,
+                        command.expected_executor_sha256,
+                        command.predecessor_decision_id,
+                    ),
+                )
+            return command
+        with tempfile.TemporaryDirectory(prefix=f"lineage-{stage}-") as directory:
+            output_root = Path(directory)
+            (output_root / "result.json").write_text(
+                json.dumps({"stage": stage}) + "\n",
+                encoding="utf-8",
+            )
+            output = self.artifacts.seal_tree(
+                output_root,
+                kind=f"stage_output:{stage}",
+                producer_run_id=self.admission.run_id,
+                producer_stage=stage,
+                producer_tool_sha256=executor,
+            )
+        result = StageResult(
+            schema_version=STAGE_RESULT_SCHEMA,
+            command_id=command.command_id,
+            run_id=self.admission.run_id,
+            stage=stage,
+            request_digest=command.request_digest,
+            outcome="completed",
+            output_artifact=output,
+            actual_executor_sha256=executor,
+            checks_sha256=digest({"checks": stage}),
+            resources_settled=True,
+        )
+        result_record = self.artifacts.seal_stage_result(result)
+        self.facts.register_artifact(output)
+        self.facts.register_artifact(result_record)
+        decision_id = f"lineage-decision-{stage}-" + str(uuid.uuid4())
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO command (
+                    command_id, run_id, kind, stage, idempotency_key, request,
+                    request_digest, config_snapshot_sha256, contract_sha256,
+                    policy_sha256, expected_executor_sha256, predecessor_decision_id
+                ) VALUES (
+                    %s, %s, 'stage', %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    command.command_id,
+                    command.run_id,
+                    command.stage,
+                    command.idempotency_key,
+                    json.dumps(dict(command.request)),
+                    command.request_digest,
+                    command.config_snapshot_sha256,
+                    command.contract_sha256,
+                    command.policy_sha256,
+                    command.expected_executor_sha256,
+                    command.predecessor_decision_id,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO stage_decision (
+                    decision_id, run_id, stage, command_id, outcome,
+                    result_record_artifact_id, result_digest,
+                    actual_executor_sha256, reason_code, failure_envelope,
+                    failure_digest, decided_at
+                ) VALUES (%s, %s, %s, %s, 'completed', %s, %s, %s, NULL, NULL, NULL, %s)
+                """,
+                (
+                    decision_id,
+                    self.admission.run_id,
+                    stage,
+                    command.command_id,
+                    result_record.artifact_id,
+                    result.digest,
+                    executor,
+                    self.now,
+                ),
+            )
+        return command
+
     def _discover_payload(self, command: StageCommand) -> dict[str, object]:
         files = {"cad/robot.SLDASM": self.admission_harness.originals.inventory["cad/robot.SLDASM"]}
         return {
@@ -635,6 +853,245 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             (self.admission.run_id,),
         )
         self.assertEqual(rows[0][0], 1)
+
+    def test_upstream_conflict_invalidates_registered_downstream_authorization(self) -> None:
+        self._execute(_EffectHandler())
+        freeze = self._predecessor_for(self.command)
+        discover_command = build_discover_command(self.admission_harness.spec, freeze)
+        self.facts.create_command(
+            discover_command,
+            admission=self.admission,
+            predecessor=freeze,
+        )
+        services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "discover-work",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": "discover-forward"}),
+                executor_sha256=self.admission_harness.spec.executors.discover,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now,
+        )
+        claim = services.acquire_claim(discover_command)
+        workspace = services.materialize(discover_command, claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(discover_command, claim, workspace)
+        outbound = workspace.root / "outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"operation":"discover"}\n', encoding="utf-8")
+        discover_effect = effects.prepare_effect(
+            effect_key="native",
+            effect_kind="native_operation",
+            target={"endpoint": "native-discover"},
+            expected_state={"state": "complete"},
+            outbound_root=outbound,
+        )
+        freeze_effect_id = self.facts.effect_ids_for_command(self.command.command_id)[0]
+        self.facts.append_effect_fact(
+            effect_id=freeze_effect_id,
+            claim=None,
+            fact_type="conflict",
+            source="reconciliation",
+            state_class=None,
+            payload_artifact=None,
+            payload_digest=digest({"conflict": "freeze"}),
+            observed_at=self.now + timedelta(seconds=1),
+            fact_id="conflict-freeze-after-discover",
+            expected_command_id=self.command.command_id,
+        )
+        self.assertEqual(
+            self.facts.effect_state(freeze_effect_id),
+            EffectState.CONFLICT,
+        )
+        with self.assertRaisesRegex(FactConflict, "non-satisfied"):
+            self.facts.decision_for(self.command)
+        with self.assertRaisesRegex(FactConflict, "predecessor"):
+            self.facts.create_command(
+                discover_command,
+                admission=self.admission,
+                predecessor=freeze,
+            )
+        with self.assertRaisesRegex(FactConflict, "predecessor"):
+            effects.authorize_dispatch(discover_effect.effect_id, source="discover-executor")
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact "
+                "WHERE effect_id = %s AND fact_type = 'dispatch_authorized'",
+                (discover_effect.effect_id,),
+            ),
+            [(0,)],
+        )
+
+    def test_publish_authorization_rechecks_every_completed_ancestor_effect(self) -> None:
+        self._execute(_EffectHandler())
+        freeze = self._predecessor_for(self.command)
+        predecessor_decision = freeze.decision
+        for stage in ("discover", "capture", "generate", "verify"):
+            command = self._seed_synthetic_completed_stage(
+                stage,
+                predecessor_decision_id=predecessor_decision.decision_id,
+            )
+            decision = self.facts.decision_for(command)
+            self.assertIsNotNone(decision)
+            predecessor_decision = decision
+        publish_command = self._seed_synthetic_completed_stage(
+            "publish",
+            predecessor_decision_id=predecessor_decision.decision_id,
+            with_decision=False,
+        )
+        services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "publish-work",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": "publish-forward"}),
+                executor_sha256=self.admission_harness.spec.executors.publish,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now,
+        )
+        claim = services.acquire_claim(publish_command)
+        workspace = services.materialize(publish_command, claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(publish_command, claim, workspace)
+        outbound = workspace.root / "outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"operation":"publish"}\n', encoding="utf-8")
+        publish_effect = effects.prepare_effect(
+            effect_key="publish",
+            effect_kind="git_ref_update",
+            target={"repository": "owner/model", "branch_ref": "refs/heads/generated"},
+            expected_state={
+                "schema_version": "solidworks-to-urdf.git-ref-update/v1",
+                "repository": "owner/model",
+                "base_ref": "refs/heads/main",
+                "expected_base_oid": "a" * 40,
+                "branch_ref": "refs/heads/generated",
+                "expected_head_oid": None,
+                "candidate_commit": "b" * 40,
+                "candidate_tree": "c" * 40,
+                "subject_sha256": digest({"subject": "publish"}),
+            },
+            outbound_root=outbound,
+        )
+        freeze_effect_id = self.facts.effect_ids_for_command(self.command.command_id)[0]
+        self.facts.append_effect_fact(
+            effect_id=freeze_effect_id,
+            claim=None,
+            fact_type="conflict",
+            source="reconciliation",
+            state_class=None,
+            payload_artifact=None,
+            payload_digest=digest({"conflict": "deep-ancestor"}),
+            observed_at=self.now + timedelta(seconds=2),
+            fact_id="conflict-deep-freeze",
+            expected_command_id=self.command.command_id,
+        )
+        with self.assertRaisesRegex(FactConflict, "predecessor"):
+            effects.authorize_dispatch(publish_effect.effect_id, source="publish-executor")
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact "
+                "WHERE effect_id = %s AND fact_type = 'dispatch_authorized'",
+                (publish_effect.effect_id,),
+            ),
+            [(0,)],
+        )
+
+    def test_conflict_and_downstream_authorization_serialize_in_two_processes(self) -> None:
+        self._execute(_EffectHandler())
+        freeze = self._predecessor_for(self.command)
+        discover_command = build_discover_command(self.admission_harness.spec, freeze)
+        self.facts.create_command(
+            discover_command,
+            admission=self.admission,
+            predecessor=freeze,
+        )
+        services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "race-work",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": "race-authorizer"}),
+                executor_sha256=self.admission_harness.spec.executors.discover,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now,
+        )
+        claim = services.acquire_claim(discover_command)
+        workspace = services.materialize(discover_command, claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(discover_command, claim, workspace)
+        outbound = workspace.root / "outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"operation":"discover"}\n', encoding="utf-8")
+        discover_effect = effects.prepare_effect(
+            effect_key="native",
+            effect_kind="native_operation",
+            target={"endpoint": "native-discover"},
+            expected_state={"state": "complete"},
+            outbound_root=outbound,
+        )
+        freeze_effect_id = self.facts.effect_ids_for_command(self.command.command_id)[0]
+        context = multiprocessing.get_context("spawn")
+        conflict_ready = context.Event()
+        conflict_release = context.Event()
+        authorization_attempting = context.Event()
+        authorization_result = context.Queue()
+        conflict_process = context.Process(
+            target=_hold_conflict_until_authorization_attempt,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                freeze_effect_id,
+                self.command.command_id,
+                conflict_ready,
+                conflict_release,
+            ),
+        )
+        authorization_process = context.Process(
+            target=_attempt_authorization_blocked_by_conflict,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                str(self.artifacts.root),
+                claim,
+                discover_effect.effect_id,
+                authorization_attempting,
+                authorization_result,
+            ),
+        )
+        self.addCleanup(authorization_process.terminate)
+        self.addCleanup(conflict_process.terminate)
+        conflict_process.start()
+        self.assertTrue(conflict_ready.wait(10), "conflict transaction did not acquire its lock")
+        authorization_process.start()
+        self.assertTrue(
+            authorization_attempting.wait(10),
+            "authorization process did not start",
+        )
+        time.sleep(0.1)
+        self.assertTrue(
+            authorization_process.is_alive(),
+            "authorization returned before the conflicting transaction released its lock",
+        )
+        conflict_release.set()
+        conflict_process.join(20)
+        authorization_process.join(20)
+        self.assertEqual(conflict_process.exitcode, 0)
+        self.assertEqual(authorization_process.exitcode, 0)
+        outcome, detail = authorization_result.get(timeout=5)
+        self.assertEqual(outcome, "conflict", detail)
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact "
+                "WHERE effect_id = %s AND fact_type = 'dispatch_authorized'",
+                (discover_effect.effect_id,),
+            ),
+            [(0,)],
+        )
 
     def test_store_persists_the_six_supported_projection_stages_in_order(self) -> None:
         self._execute(_EffectHandler())

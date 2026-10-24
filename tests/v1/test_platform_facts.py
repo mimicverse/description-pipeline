@@ -138,6 +138,7 @@ class ClaimTests(unittest.TestCase):
             self.command.run_id,
             self.command.stage,
             self.executor,
+            self.command.predecessor_decision_id,
         )
 
     def test_same_owner_reentry_cannot_acquire_the_open_claim_twice(self) -> None:
