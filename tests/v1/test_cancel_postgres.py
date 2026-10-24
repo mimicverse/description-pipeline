@@ -37,7 +37,11 @@ from description_pipeline.pipeline.engine import (
 )
 from description_pipeline.pipeline.contracts import StageExecution
 from description_pipeline.pipeline.contracts import ProtocolError
-from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
+from description_pipeline.pipeline.services import (
+    BoundStageEffectPort,
+    CanonicalStageServices,
+    ClaimPolicy,
+)
 from description_pipeline.platform.facts import FactConflict, FactStore
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from tests.v1.test_pipeline_admission import AdmissionHarness
@@ -491,6 +495,67 @@ class CancellationPostgresTests(unittest.TestCase):
             },
         )
         self.assertEqual(adapter.calls, 1)
+        self.assertEqual(self.facts.effect_state(target_effect.effect_id), EffectState.UNKNOWN)
+
+    def test_cancel_control_preserves_unserializable_mapping_after_write_failure(self) -> None:
+        cancel_command, target_effect = self._unknown_target("write-failure")
+        adapter = mock.Mock()
+        adapter.send.return_value = {
+            "accepted": True,
+            "cancel_command_id": cancel_command.command_id,
+            "raw": b"\xff",
+            "target_effect_id": target_effect.effect_id,
+        }
+        control = self._cancellation_control("write-failure", adapter)
+        with self.assertRaises(TypeError):
+            control.send(
+                cancel_command_id=cancel_command.command_id,
+                target_effect_id=target_effect.effect_id,
+            )
+        retained = control.services.work_root / cancel_command.command_id
+        fallback = next(retained.glob("*/cancel-response/response.repr.json"))
+        self.assertEqual(json.loads(fallback.read_text(encoding="utf-8"))["type"], "dict")
+        self.assertEqual(self.facts.effect_state(target_effect.effect_id), EffectState.UNKNOWN)
+
+    def test_cancel_control_preserves_response_when_observation_recording_fails(self) -> None:
+        cancel_command, target_effect = self._unknown_target("observation-failure")
+        adapter = _CancelAdapter()
+        control = self._cancellation_control("observation-failure", adapter)
+        with (
+            mock.patch.object(
+                BoundStageEffectPort,
+                "record_observation",
+                side_effect=OSError("controlled observation failure"),
+            ),
+            self.assertRaisesRegex(OSError, "controlled observation failure"),
+        ):
+            control.send(
+                cancel_command_id=cancel_command.command_id,
+                target_effect_id=target_effect.effect_id,
+            )
+        retained = control.services.work_root / cancel_command.command_id
+        self.assertTrue(next(retained.glob("*/cancel-response/response.json")).is_file())
+        self.assertEqual(self.facts.effect_state(target_effect.effect_id), EffectState.UNKNOWN)
+
+    def test_cancel_control_preserves_timeout_payload_when_timeout_recording_fails(self) -> None:
+        cancel_command, target_effect = self._unknown_target("timeout-failure")
+        adapter = mock.Mock()
+        adapter.send.side_effect = TimeoutError("native cancel response missing")
+        control = self._cancellation_control("timeout-failure", adapter)
+        with (
+            mock.patch.object(
+                BoundStageEffectPort,
+                "record_timeout",
+                side_effect=OSError("controlled timeout record failure"),
+            ),
+            self.assertRaisesRegex(OSError, "controlled timeout record failure"),
+        ):
+            control.send(
+                cancel_command_id=cancel_command.command_id,
+                target_effect_id=target_effect.effect_id,
+            )
+        retained = control.services.work_root / cancel_command.command_id
+        self.assertTrue(next(retained.glob("*/cancel-timeout/error.json")).is_file())
         self.assertEqual(self.facts.effect_state(target_effect.effect_id), EffectState.UNKNOWN)
 
     def test_old_expired_claim_cannot_close_the_new_fenced_owner(self) -> None:
