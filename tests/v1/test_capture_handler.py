@@ -5,9 +5,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -89,6 +91,7 @@ class _EffectLedger:
         self.intents: dict[str, EffectIntent] = {}
         self.facts: dict[str, list[EffectFact]] = {}
         self.payloads: dict[str, ArtifactRef] = {}
+        self.outbounds: dict[str, ArtifactRef] = {}
 
 
 class _Effects:
@@ -142,6 +145,7 @@ class _Effects:
         )
         self.ledger.intents[intent.effect_id] = intent
         self.ledger.facts.setdefault(intent.effect_id, [])
+        self.ledger.outbounds[intent.effect_id] = outbound
         return intent
 
     def _append(self, effect_id, fact_type, *, source, payload=None, state_class=None):
@@ -226,6 +230,7 @@ class _Effects:
             state=settlement.state,
             decisive_fact=settlement.decisive_fact,
             payload_artifact=payload,
+            outbound_artifact=self.ledger.outbounds[effect_id],
         )
 
     def effect_state(self, effect_id):
@@ -679,6 +684,86 @@ class CaptureHandlerTests(unittest.TestCase):
         self.assertEqual(replay.outcome, "completed")
         operation.assert_not_called()
 
+    def test_effect_outbound_recomputes_after_prepared_inputs_are_removed(self) -> None:
+        workspace = self.workspace()
+        effects = self.effects()
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.capture_tool,
+        ):
+            execution = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(execution.outcome, "completed")
+        outbound_path = workspace.root / "capture-effect-outbound/outbound.json"
+        outbound = read_data(outbound_path)
+        self.assertEqual(
+            outbound["prepared_files"],
+            self.prepared_files,
+        )
+        self.assertEqual(
+            outbound["handoff_sha256"],
+            self.handoff_sha256,
+        )
+        self.assertEqual(outbound["upload_sha256"], self.upload_sha256)
+        self.assertEqual(
+            outbound["native_tool_source_sha256"],
+            self.expected_native_tool_sha256,
+        )
+        self.assertEqual(
+            outbound["native_tool_record_sha256"],
+            self.native_tool_sha256,
+        )
+        for root in workspace.inputs.values():
+            shutil.rmtree(root)
+        self.assertEqual(
+            capture_module.validate_capture_effect_outbound(
+                outbound_path,
+                self.command,
+            ),
+            outbound,
+        )
+
+    def test_effect_reuse_rejects_a_different_current_outbound_closure(self) -> None:
+        workspace = self.workspace()
+        effects = self.effects()
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.capture_tool,
+        ):
+            execution = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(execution.outcome, "completed")
+        request = capture_module.CaptureRequest.from_command(
+            self.command
+        )
+        inputs = capture_module.CaptureInputs.resolve(
+            self.command,
+            workspace,
+            request,
+        )
+        changed = replace(inputs, object_names=("changed-object",))
+        with self.assertRaisesRegex(
+            Exception,
+            "effect_identity_conflict",
+        ):
+            self.handler()._effect_state(
+                self.command,
+                self.claim,
+                workspace,
+                request,
+                changed,
+                self.capture_tool,
+                effects,
+            )
+
     def test_producer_identity_is_rejected_before_native_operation(self) -> None:
         operation = Mock()
         discover = self._discover(producer_run_id="a0000000-0000-4000-8000-000000000099")
@@ -1080,19 +1165,30 @@ class CaptureHandlerTests(unittest.TestCase):
         operation = Mock()
         workspace = self.workspace()
         effects = self.effects()
-        outbound = workspace.root / "prior-effect"
-        outbound.mkdir()
-        (outbound / "request.txt").write_text("capture\n", encoding="utf-8")
-        intent = effects.prepare_effect(
-            effect_key="capture-native",
-            effect_kind="native_operation",
-            target={"stage": "capture"},
-            expected_state={"stage": "capture"},
-            outbound_root=outbound,
+        handler = self.handler(native_operation=operation)
+        request = capture_module.CaptureRequest.from_command(
+            self.command
         )
-        effects.authorize_dispatch(intent.effect_id, source="prior-owner")
+        inputs = capture_module.CaptureInputs.resolve(
+            self.command,
+            workspace,
+            request,
+        )
+        effect_id, _settlement = handler._effect_state(
+            self.command,
+            self.claim,
+            workspace,
+            request,
+            inputs,
+            self.capture_tool,
+            effects,
+        )
+        effects.record_timeout(
+            effect_id,
+            source="prior-owner",
+        )
         with self.assertRaisesRegex(CaptureUnresolved, "effect_unknown"):
-            self.handler(native_operation=operation).execute(
+            handler.execute(
                 self.command,
                 self.claim,
                 workspace,

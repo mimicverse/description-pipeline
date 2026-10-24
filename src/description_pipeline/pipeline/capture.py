@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import shutil
 import tempfile
@@ -69,6 +70,145 @@ NativeOutcome = Literal["completed", "failed", "cancelled", "unknown"]
 
 class CaptureUnresolved(PipelineError):
     """The native operation has a possible external effect with no safe terminal fact."""
+
+
+_CAPTURE_OUTBOUND_FIELDS = frozenset(
+    {
+        "command_id",
+        "effect_key",
+        "execution",
+        "handoff_sha256",
+        "main_assembly",
+        "native_tool_record_sha256",
+        "native_tool_source_sha256",
+        "object_set_sha256",
+        "objects",
+        "prepared_files",
+        "prepared_sha256",
+        "request_digest",
+        "request_evidence",
+        "run_id",
+        "schema_version",
+        "upstream_artifacts",
+        "upload_sha256",
+    }
+)
+
+
+def _outbound_tree_sha256(record: Mapping[str, Any]) -> str:
+    payload = canonical(dict(record))
+    return digest(
+        {
+            "members": [
+                {
+                    "bytes": len(payload),
+                    "path": "outbound.json",
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            ]
+        }
+    )
+
+
+def validate_capture_effect_outbound(
+    source: Path,
+    command: StageCommand,
+) -> dict[str, Any]:
+    """Recompute one Capture effect closure without the prepared package."""
+
+    source = Path(source)
+    path = source / "outbound.json" if source.is_dir() else source
+    record = read_data(path)
+    if (
+        not isinstance(record, dict)
+        or set(record) != _CAPTURE_OUTBOUND_FIELDS
+        or path.read_bytes() != canonical(record)
+    ):
+        raise ProtocolError("capture.effect_outbound", {"where": "outbound.json"})
+    request = CaptureRequest.from_command(command)
+    if (
+        record.get("schema_version") != NATIVE_CAPTURE_EFFECT_SCHEMA
+        or record.get("command_id") != command.command_id
+        or record.get("run_id") != command.run_id
+        or record.get("request_digest") != command.request_digest
+        or record.get("effect_key") != request.effect_key
+        or record.get("handoff_sha256") != request.handoff_sha256
+        or record.get("upload_sha256") != request.upload_sha256
+        or record.get("main_assembly") != request.main_assembly
+        or record.get("prepared_sha256") != request.prepared_sha256
+        or record.get("native_tool_source_sha256")
+        != request.native_tool_source_sha256
+        or record.get("native_tool_record_sha256")
+        != request.native_tool_record_sha256
+    ):
+        raise ProtocolError("capture.effect_outbound", {"where": "request"})
+    prepared_files = record.get("prepared_files")
+    if (
+        not isinstance(prepared_files, dict)
+        or digest(prepared_files) != request.prepared_sha256
+    ):
+        raise ProtocolError("capture.effect_outbound", {"where": "prepared_files"})
+    objects = record.get("objects")
+    if (
+        not isinstance(objects, list)
+        or any(not isinstance(item, str) or not item for item in objects)
+        or objects != sorted(objects)
+        or len(set(objects)) != len(objects)
+        or record.get("object_set_sha256") != digest(objects)
+    ):
+        raise ProtocolError("capture.effect_outbound", {"where": "objects"})
+    upstream = record.get("upstream_artifacts")
+    if not isinstance(upstream, list) or len(upstream) != 2:
+        raise ProtocolError("capture.effect_outbound", {"where": "upstream_artifacts"})
+    try:
+        refs = [ArtifactRef.from_record(item) for item in upstream]
+    except (PipelineError, TypeError, ValueError) as error:
+        raise ProtocolError(
+            "capture.effect_outbound",
+            {"where": "upstream_artifacts"},
+        ) from error
+    command_refs = {
+        item.artifact_id: item
+        for item in command.input_artifacts
+        if item.producer_stage in {"freeze", "discover"}
+    }
+    if (
+        {item.producer_stage for item in refs} != {"freeze", "discover"}
+        or any(command_refs.get(item.artifact_id) != item for item in refs)
+    ):
+        raise ProtocolError(
+            "capture.effect_outbound",
+            {"where": "upstream_artifacts"},
+        )
+    request_evidence = record.get("request_evidence")
+    try:
+        validate_request_record(request_evidence)
+    except PipelineError as error:
+        raise ProtocolError(
+            "capture.effect_outbound",
+            {"where": "request_evidence"},
+        ) from error
+    if (
+        request_evidence.get("main_assembly") != request.main_assembly
+        or request_evidence.get("handoff_digest") != request.upload_sha256
+    ):
+        raise ProtocolError(
+            "capture.effect_outbound",
+            {"where": "request_evidence"},
+        )
+    execution = record.get("execution")
+    if (
+        not isinstance(execution, dict)
+        or execution.get("command_id") != command.command_id
+        or execution.get("run_id") != command.run_id
+        or execution.get("effect_key") != request.effect_key
+        or execution.get("executor_sha256")
+        != command.expected_executor_sha256
+        or execution.get("native_tool_sha256")
+        != request.native_tool_record_sha256
+    ):
+        raise ProtocolError("capture.effect_outbound", {"where": "execution"})
+    return record
 
 
 def _artifact_files(root: Path, artifact: ArtifactRef, *, role: str) -> dict[str, str]:
@@ -954,6 +1094,39 @@ class CaptureHandler:
             admitter = admit_capture
         self._admitter = admitter
 
+    @staticmethod
+    def _outbound_record(
+        command: StageCommand,
+        request: CaptureRequest,
+        inputs: CaptureInputs,
+        execution: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        objects = list(inputs.object_names)
+        prepared_files = dict(sorted(inputs.prepared_files.items()))
+        return {
+            "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
+            "command_id": command.command_id,
+            "effect_key": request.effect_key,
+            "execution": dict(execution),
+            "handoff_sha256": request.handoff_sha256,
+            "main_assembly": request.main_assembly,
+            "native_tool_record_sha256": (
+                request.native_tool_record_sha256
+            ),
+            "native_tool_source_sha256": (
+                request.native_tool_source_sha256
+            ),
+            "object_set_sha256": digest(objects),
+            "objects": objects,
+            "prepared_files": prepared_files,
+            "prepared_sha256": request.prepared_sha256,
+            "request_digest": command.request_digest,
+            "request_evidence": dict(inputs.request_evidence),
+            "run_id": command.run_id,
+            "upstream_artifacts": list(_upstream_records(inputs)),
+            "upload_sha256": request.upload_sha256,
+        }
+
     def _effect_state(
         self,
         command: StageCommand,
@@ -964,8 +1137,67 @@ class CaptureHandler:
         tool: Mapping[str, Any],
         effects: StageEffectPort,
     ) -> tuple[str, EffectSettlement | None]:
+        execution = _execution_record(command, claim, request, tool)
+        outbound = self._outbound_record(
+            command,
+            request,
+            inputs,
+            execution,
+        )
+        outbound_sha256 = _outbound_tree_sha256(outbound)
+        expected_state = {
+            "command_id": command.command_id,
+            "effect_key": request.effect_key,
+            "handoff_sha256": request.handoff_sha256,
+            "main_assembly": request.main_assembly,
+            "native_tool_record_sha256": (
+                request.native_tool_record_sha256
+            ),
+            "native_tool_source_sha256": (
+                request.native_tool_source_sha256
+            ),
+            "object_set_sha256": outbound["object_set_sha256"],
+            "outbound_sha256": outbound_sha256,
+            "prepared_sha256": request.prepared_sha256,
+            "request_digest": command.request_digest,
+            "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
+            "upload_sha256": request.upload_sha256,
+        }
         existing = effects.effect_settlement_for_key(request.effect_key)
         if existing is not None:
+            if (
+                self._artifact_store is None
+                or existing.outbound_artifact is None
+            ):
+                raise ProtocolError(
+                    "capture.effect_outbound_unavailable",
+                    {"effect_key": request.effect_key},
+                )
+            with tempfile.TemporaryDirectory(
+                prefix="capture-existing-outbound-",
+                dir=workspace.root,
+            ) as directory:
+                existing_root = self._artifact_store.materialize(
+                    existing.outbound_artifact,
+                    Path(directory) / "artifact",
+                )
+                existing_outbound = validate_capture_effect_outbound(
+                    existing_root,
+                    command,
+                )
+            stable_keys = _CAPTURE_OUTBOUND_FIELDS - {"execution"}
+            if digest(
+                {
+                    key: existing_outbound[key]
+                    for key in stable_keys
+                }
+            ) != digest(
+                {key: outbound[key] for key in stable_keys}
+            ):
+                raise ProtocolError(
+                    "capture.effect_identity_conflict",
+                    {"effect_key": request.effect_key},
+                )
             if existing.state == EffectState.SATISFIED:
                 return existing.effect_id, existing
             if existing.state in {EffectState.UNKNOWN, EffectState.CONFLICT}:
@@ -977,30 +1209,7 @@ class CaptureHandler:
             effects.authorize_dispatch(existing.effect_id, source="capture-handler")
             return existing.effect_id, existing
 
-        execution = _execution_record(command, claim, request, tool)
         outbound_root = workspace.root / "capture-effect-outbound"
-        # This method is completed by execute below; keeping the intent shape in
-        # one local record prevents target and expected state from diverging.
-        outbound = {
-            "command_id": command.command_id,
-            "execution": execution,
-            "main_assembly": request.main_assembly,
-            "object_set_sha256": digest(list(inputs.object_names)),
-            "objects": list(inputs.object_names),
-            "prepared_sha256": request.prepared_sha256,
-            "request_digest": command.request_digest,
-            "run_id": command.run_id,
-            "upstream_artifacts": list(_upstream_records(inputs)),
-        }
-        expected_state = {
-            "command_id": command.command_id,
-            "effect_key": request.effect_key,
-            "main_assembly": request.main_assembly,
-            "object_set_sha256": digest(list(inputs.object_names)),
-            "prepared_sha256": request.prepared_sha256,
-            "request_digest": command.request_digest,
-            "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
-        }
         outbound_root.mkdir(parents=True, exist_ok=False)
         write_json(outbound_root / "outbound.json", outbound)
         intent = effects.prepare_effect(
