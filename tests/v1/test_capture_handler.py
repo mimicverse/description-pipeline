@@ -8,6 +8,7 @@ import json
 import shutil
 import tempfile
 import unittest
+import zipfile
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -634,6 +635,130 @@ class CaptureHandlerTests(unittest.TestCase):
             claim or self.claim,
         )
 
+    def _observer_client(
+        self,
+        *,
+        archive: Path,
+        outbound_root: Path,
+    ) -> tuple[NativeOperationClient, str]:
+        outbound = read_data(outbound_root / "outbound.json")
+        request = CaptureOperationRequest.from_record(
+            {
+                "schema_version": CAPTURE_OPERATION_SCHEMA,
+                "command_id": self.command.command_id,
+                "run_id": self.command.run_id,
+                "request_digest": self.command.request_digest,
+                "effect_key": "capture-native",
+                "handoff_sha256": outbound["handoff_sha256"],
+                "upload_sha256": outbound["upload_sha256"],
+                "prepared_sha256": outbound["prepared_sha256"],
+                "main_assembly": outbound["main_assembly"],
+                "package_files": outbound["prepared_files"],
+                "upstream_artifacts": outbound["upstream_artifacts"],
+                "execution": outbound["execution"],
+                "native_tool_source_sha256": (
+                    outbound["native_tool_source_sha256"]
+                ),
+                "request_evidence": outbound["request_evidence"],
+            }
+        )
+        operation_id = native_capture_operation_id(
+            run_id=self.command.run_id,
+            command_id=self.command.command_id,
+            effect_key="capture-native",
+        )
+        artifact = NativeArtifactView(
+            name=CAPTURE_ARCHIVE,
+            bytes=archive.stat().st_size,
+            sha256=file_digest(archive),
+            media_type="application/zip",
+        )
+        now = datetime.now(UTC).isoformat()
+        view = NativeOperationView(
+            schema_version=OPERATION_VIEW_SCHEMA,
+            operation_id=operation_id,
+            kind=CAPTURE_KIND,
+            payload_sha256=digest({"operation": operation_id}),
+            state="satisfied",
+            request_sha256=digest(request.to_record()),
+            input_archive_sha256=digest({"input": operation_id}),
+            native_tool_requirement_sha256=digest(
+                self.current_native_tool
+            ),
+            actual_native_tool_sha256=digest(
+                self.current_native_tool
+            ),
+            owner_sha256=outbound["execution"]["owner_sha256"],
+            executor_sha256=outbound["execution"]["executor_sha256"],
+            resource_terminated=True,
+            artifact=artifact,
+            failure=None,
+            created_at=now,
+            started_at=now,
+            finished_at=now,
+        )
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32)
+        )
+        client.get_operation = Mock(return_value=view)
+
+        def download(_operation_id, destination):
+            target = Path(destination)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(archive, target)
+            return ArtifactDownload(
+                operation_id=operation_id,
+                path=target,
+                name=CAPTURE_ARCHIVE,
+                bytes=target.stat().st_size,
+                sha256=file_digest(target),
+                media_type="application/zip",
+            )
+
+        client.download_artifact = Mock(side_effect=download)
+        client.create_operation = Mock(
+            side_effect=AssertionError("observer must not create")
+        )
+        client.upload_input = Mock(
+            side_effect=AssertionError("observer must not upload")
+        )
+        client.cancel_operation = Mock(
+            side_effect=AssertionError("observer must not cancel")
+        )
+        return client, operation_id
+
+    @staticmethod
+    def _rewrite_capture_archive(
+        source: Path,
+        destination: Path,
+        *,
+        remove: set[str] | None = None,
+        replace_manifest: dict | None = None,
+        add: tuple[tuple[str, bytes], ...] = (),
+    ) -> None:
+        remove = remove or set()
+        with zipfile.ZipFile(source) as archive:
+            entries = [
+                (info.filename, archive.read(info))
+                for info in archive.infolist()
+            ]
+        with zipfile.ZipFile(
+            destination,
+            "w",
+            zipfile.ZIP_DEFLATED,
+        ) as archive:
+            for name, payload in entries:
+                if name in remove:
+                    continue
+                if (
+                    name == "transfer-manifest.json"
+                    and replace_manifest is not None
+                ):
+                    payload = canonical(replace_manifest)
+                archive.writestr(zipfile.ZipInfo(name), payload)
+            for name, payload in add:
+                archive.writestr(zipfile.ZipInfo(name), payload)
+
     def test_real_freeze_discover_artifact_store_then_capture_keeps_identities_separate(self) -> None:
         discovery_before = (self.package / "discovery/native-discovery.json").read_bytes()
         effects = self.effects()
@@ -945,6 +1070,224 @@ class CaptureHandlerTests(unittest.TestCase):
                 outbound_root=outbound_root,
                 workspace_root=observer_root,
             )
+
+    def test_pending_capture_reconciles_producer_archive_then_replays_exact_outbound(
+        self,
+    ) -> None:
+        workspace = self.workspace(name="capture-pending-workspace")
+        effects = self.effects()
+        recovered_archive = self.root / "recovered-producer-capture.zip"
+        native_calls = 0
+
+        def lose_response(inputs, output, **kwargs):
+            nonlocal native_calls
+            native_calls += 1
+            completed = capture_module._invoke_native_operation(
+                inputs,
+                output,
+                **kwargs,
+            )
+            self.assertEqual(
+                completed.outcome,
+                "completed",
+                completed.receipt,
+            )
+            self.assertIsNotNone(completed.archive)
+            shutil.copyfile(completed.archive, recovered_archive)
+            return NativeCaptureResult(
+                "unknown",
+                None,
+                None,
+                completed.receipt,
+                False,
+                "capture.response_lost",
+            )
+
+        with (
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=self.current_native_tool,
+            ),
+            self.assertRaises(CaptureUnresolved),
+        ):
+            self.handler(native_operation=lose_response).execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(native_calls, 1)
+        settlement = effects.effect_settlement_for_key("capture-native")
+        self.assertIsNotNone(settlement)
+        self.assertEqual(settlement.state, EffectState.UNKNOWN)
+        self.assertIsNotNone(settlement.outbound_artifact)
+        self.assertTrue(recovered_archive.is_file())
+
+        outbound_root = self.root / "pending-recovery-outbound"
+        self.store.materialize(
+            settlement.outbound_artifact,
+            outbound_root,
+        )
+        outbound_bytes = (outbound_root / "outbound.json").read_bytes()
+        shutil.rmtree(workspace.root)
+        intent = self.effect_ledger.intents[settlement.effect_id]
+        client, operation_id = self._observer_client(
+            archive=recovered_archive,
+            outbound_root=outbound_root,
+        )
+        observer_root = self.root / "pending-capture-observer"
+        observer_root.mkdir()
+        evidence = NativeOperationEffectObserver(client).observe(
+            command=self.command,
+            intent=intent,
+            outbound_root=outbound_root,
+            workspace_root=observer_root,
+        )
+        self.assertEqual(evidence.fact_type, "reconciled")
+        self.assertEqual(evidence.state_class, "known")
+        admitted = observer_root / f"admitted-capture-{operation_id}"
+        self.assertTrue(admitted.is_dir())
+        self.assertEqual(
+            read_data(admitted / "transfer-manifest.json")["run_id"],
+            self.command.run_id,
+        )
+        effects.reconcile_effect(
+            settlement.effect_id,
+            source="native-observer",
+            state_class=evidence.state_class,
+            evidence_root=evidence.payload_root,
+        )
+        self.assertEqual(
+            effects.effect_settlement_for_key("capture-native").state,
+            EffectState.SATISFIED,
+        )
+
+        replay_claim = self._claim(
+            self.command,
+            "claim-capture-recovery-replay",
+            fence=2,
+        )
+        unexpected = Mock(
+            side_effect=AssertionError(
+                "recovered Capture must not call the native operation"
+            )
+        )
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.current_native_tool,
+        ):
+            replayed = self.handler(
+                native_operation=unexpected
+            ).execute(
+                self.command,
+                replay_claim,
+                self.workspace(
+                    name="capture-pending-replay-workspace"
+                ),
+                effects=effects,
+            )
+        self.assertEqual(replayed.outcome, "completed")
+        unexpected.assert_not_called()
+        self.assertEqual(native_calls, 1)
+        self.assertEqual(
+            (outbound_root / "outbound.json").read_bytes(),
+            outbound_bytes,
+        )
+        recovered = effects.effect_settlement_for_key("capture-native")
+        self.assertEqual(
+            recovered.outbound_artifact,
+            settlement.outbound_artifact,
+        )
+        self.store.verify(recovered.outbound_artifact)
+
+    def test_capture_observer_rejects_malformed_or_foreign_producer_archive(
+        self,
+    ) -> None:
+        workspace = self.workspace(name="capture-producer-workspace")
+        effects = self.effects()
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.current_native_tool,
+        ):
+            completed = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(completed.outcome, "completed")
+        producer_archive = (
+            workspace.root
+            / "capture-native"
+            / CAPTURE_ARCHIVE
+        )
+        outbound_root = workspace.root / "capture-effect-outbound"
+        settlement = effects.effect_settlement_for_key("capture-native")
+        self.assertIsNotNone(settlement)
+        intent = self.effect_ledger.intents[settlement.effect_id]
+
+        missing = self.root / "capture-missing-member.zip"
+        self._rewrite_capture_archive(
+            producer_archive,
+            missing,
+            remove={"reports/native-tool.json"},
+        )
+        duplicate = self.root / "capture-duplicate-member.zip"
+        self._rewrite_capture_archive(
+            producer_archive,
+            duplicate,
+            add=(("Reports/Native-Tool.json", b"{}"),),
+        )
+        with zipfile.ZipFile(producer_archive) as archive:
+            foreign_manifest = json.loads(
+                archive.read("transfer-manifest.json")
+            )
+        foreign_manifest["execution"]["owner_sha256"] = "e" * 64
+        foreign = self.root / "capture-foreign-execution.zip"
+        self._rewrite_capture_archive(
+            producer_archive,
+            foreign,
+            replace_manifest=foreign_manifest,
+        )
+
+        cases = (
+            (
+                "missing",
+                missing,
+                "provenance is incomplete",
+            ),
+            (
+                "duplicate",
+                duplicate,
+                "Duplicate transfer member",
+            ),
+            (
+                "foreign",
+                foreign,
+                "another execution identity",
+            ),
+        )
+        for label, archive, expected in cases:
+            with self.subTest(case=label):
+                observer_root = (
+                    self.root / f"capture-observer-{label}"
+                )
+                observer_root.mkdir()
+                client, _operation_id = self._observer_client(
+                    archive=archive,
+                    outbound_root=outbound_root,
+                )
+                with self.assertRaisesRegex(Exception, expected):
+                    NativeOperationEffectObserver(client).observe(
+                        command=self.command,
+                        intent=intent,
+                        outbound_root=outbound_root,
+                        workspace_root=observer_root,
+                    )
+                self.assertEqual(
+                    list(observer_root.glob("admitted-capture-*")),
+                    [],
+                )
 
     def test_producer_identity_is_rejected_before_native_operation(self) -> None:
         operation = Mock()
