@@ -990,85 +990,9 @@ class CaptureHandlerTests(unittest.TestCase):
             for item in self.effect_ledger.intents.values()
             if item.command_id == self.command.command_id
         )
-        operation_id = native_capture_operation_id(
-            run_id=self.command.run_id,
-            command_id=self.command.command_id,
-            effect_key="capture-native",
-        )
-        request = CaptureOperationRequest.from_record(
-            {
-                "schema_version": CAPTURE_OPERATION_SCHEMA,
-                "command_id": self.command.command_id,
-                "run_id": self.command.run_id,
-                "request_digest": self.command.request_digest,
-                "effect_key": "capture-native",
-                "handoff_sha256": outbound["handoff_sha256"],
-                "upload_sha256": outbound["upload_sha256"],
-                "prepared_sha256": outbound["prepared_sha256"],
-                "main_assembly": outbound["main_assembly"],
-                "package_files": outbound["prepared_files"],
-                "upstream_artifacts": outbound["upstream_artifacts"],
-                "execution": outbound["execution"],
-                "native_tool_source_sha256": (
-                    outbound["native_tool_source_sha256"]
-                ),
-                "request_evidence": outbound["request_evidence"],
-            }
-        )
-        native_tool = read_data(payload / "native-tool.json")
-        artifact = NativeArtifactView(
-            name=CAPTURE_ARCHIVE,
-            bytes=archive.stat().st_size,
-            sha256=file_digest(archive),
-            media_type="application/zip",
-        )
-        now = datetime.now(UTC).isoformat()
-        view = NativeOperationView(
-            schema_version=OPERATION_VIEW_SCHEMA,
-            operation_id=operation_id,
-            kind=CAPTURE_KIND,
-            payload_sha256=digest({"operation": operation_id}),
-            state="satisfied",
-            request_sha256=digest(request.to_record()),
-            input_archive_sha256=digest({"input": operation_id}),
-            native_tool_requirement_sha256=digest(native_tool),
-            actual_native_tool_sha256=digest(native_tool),
-            owner_sha256=self.claim.owner_sha256,
-            executor_sha256=self.stage_executor,
-            resource_terminated=True,
-            artifact=artifact,
-            failure=None,
-            created_at=now,
-            started_at=now,
-            finished_at=now,
-        )
-        client = NativeOperationClient(
-            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32)
-        )
-        client.get_operation = Mock(return_value=view)
-
-        def download(_operation_id, destination):
-            target = Path(destination)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read_bytes())
-            return ArtifactDownload(
-                operation_id=operation_id,
-                path=target,
-                name=CAPTURE_ARCHIVE,
-                bytes=target.stat().st_size,
-                sha256=file_digest(target),
-                media_type="application/zip",
-            )
-
-        client.download_artifact = Mock(side_effect=download)
-        client.create_operation = Mock(
-            side_effect=AssertionError("observer must not create")
-        )
-        client.upload_input = Mock(
-            side_effect=AssertionError("observer must not upload")
-        )
-        client.cancel_operation = Mock(
-            side_effect=AssertionError("observer must not cancel")
+        client, _operation_id = self._observer_client(
+            archive=archive,
+            outbound_root=outbound_root,
         )
         observer_root = self.root / "capture-observer-work"
         observer_root.mkdir()
@@ -1086,7 +1010,9 @@ class CaptureHandlerTests(unittest.TestCase):
         )
         self.assertEqual(
             evidence.metadata["request_sha256"],
-            digest(request.to_record()),
+            capture_module._capture_operation_envelope(outbound)[
+                "request_sha256"
+            ],
         )
         self.assertEqual(client.get_operation.call_count, 2)
         client.create_operation.assert_not_called()
