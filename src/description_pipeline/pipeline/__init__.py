@@ -3,6 +3,7 @@
 from .contracts import (
     ArtifactRef,
     ExecutionClaim,
+    RunAdmission,
     StageCandidate,
     StageCommand,
     StageDecision,
@@ -23,6 +24,7 @@ __all__ = [
     "EffectIntent",
     "EffectState",
     "ExecutionClaim",
+    "RunAdmission",
     "RunStatus",
     "StageCandidate",
     "StageCommand",

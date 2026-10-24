@@ -161,10 +161,7 @@ def execute_stage(
         return result
 
     claim = services.acquire_claim(command)
-    if (
-        claim.command_id != command.command_id
-        or claim.owner_sha256 != command.expected_executor_sha256
-    ):
+    if claim.command_id != command.command_id:
         raise ProtocolError("claim.command_mismatch", {"command_id": command.command_id})
 
     candidate = services.candidate_for(command, claim)

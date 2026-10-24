@@ -34,6 +34,80 @@ class ProtocolError(PipelineError):
         self.detail = detail or {}
 
 
+@dataclass(frozen=True, slots=True)
+class RunAdmission:
+    """An immutable accepted run and its complete non-secret request."""
+
+    schema_version: str
+    run_id: str
+    request_id: str
+    parent_run_id: str | None
+    from_stage: StageId | None
+    request: Mapping[str, Any]
+    request_digest: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "description-pipeline.run-admission/v1":
+            raise ProtocolError("admission.schema_unsupported", {"value": self.schema_version})
+        _require_text(self.run_id, "admission.invalid", "run_id")
+        _require_text(self.request_id, "admission.invalid", "request_id")
+        if self.parent_run_id is not None:
+            _require_text(self.parent_run_id, "admission.invalid", "parent_run_id")
+            if self.parent_run_id == self.run_id:
+                raise ProtocolError("admission.invalid", {"where": "parent_run_id", "reason": "self-reference"})
+        if self.from_stage is not None:
+            _require_stage(self.from_stage, "admission.invalid", "from_stage")
+        object.__setattr__(self, "request", _freeze_mapping(self.request, "admission.invalid", "request"))
+        _require_digest(self.request_digest, "admission.invalid", "request_digest")
+        if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
+            raise ProtocolError("admission.invalid", {"where": "created_at"})
+        if digest(self.identity_record()) != self.request_digest:
+            raise ProtocolError("admission.digest_mismatch", {"run_id": self.run_id})
+
+    def identity_record(self) -> dict[str, Any]:
+        return {
+            "from_stage": self.from_stage,
+            "parent_run_id": self.parent_run_id,
+            "request": _json_value(self.request),
+            "request_id": self.request_id,
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        request_id: str,
+        parent_run_id: str | None,
+        from_stage: StageId | None,
+        request: Mapping[str, Any],
+        created_at: datetime,
+    ) -> RunAdmission:
+        values = {
+            "schema_version": "description-pipeline.run-admission/v1",
+            "run_id": run_id,
+            "request_id": request_id,
+            "parent_run_id": parent_run_id,
+            "from_stage": from_stage,
+            "request": dict(request),
+            "created_at": created_at,
+        }
+        request_digest = digest(
+            {
+                "from_stage": from_stage,
+                "parent_run_id": parent_run_id,
+                "request": dict(request),
+                "request_id": request_id,
+                "run_id": run_id,
+                "schema_version": values["schema_version"],
+            }
+        )
+        return cls(request_digest=request_digest, **values)
+
+
 class StageStatus(StrEnum):
     WAITING = "waiting"
     ACTIVE = "active"
@@ -390,10 +464,21 @@ class StageCandidate:
     """A sealed stage result not yet committed as a decision."""
 
     result: StageResult
+    candidate_id: str | None = None
+    claim_id: str | None = None
+    fence: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.result, StageResult):
             raise ProtocolError("candidate.invalid", {"where": "result"})
+        values = (self.candidate_id, self.claim_id, self.fence)
+        if any(value is None for value in values) and not all(value is None for value in values):
+            raise ProtocolError("candidate.invalid", {"reason": "partial-persisted-identity"})
+        if self.candidate_id is not None:
+            _require_text(self.candidate_id, "candidate.invalid", "candidate_id")
+            _require_text(self.claim_id, "candidate.invalid", "claim_id")
+            if type(self.fence) is not int or self.fence <= 0:
+                raise ProtocolError("candidate.invalid", {"where": "fence"})
 
 
 @dataclass(frozen=True, slots=True)

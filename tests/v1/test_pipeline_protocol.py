@@ -14,6 +14,7 @@ from description_pipeline.pipeline import (
     EffectIntent,
     EffectState,
     ExecutionClaim,
+    RunAdmission,
     RunStatus,
     StageCandidate,
     StageCommand,
@@ -192,6 +193,19 @@ class DerivedStateTests(unittest.TestCase):
 
 
 class CommandIdentityTests(unittest.TestCase):
+    def test_run_admission_is_immutable_and_self_contained(self) -> None:
+        admission = RunAdmission.create(
+            run_id="run-1",
+            request_id="request-1",
+            parent_run_id=None,
+            from_stage=None,
+            request={"source": {"files": [{"path": "robot.SLDASM"}]}},
+            created_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        with self.assertRaises(TypeError):
+            admission.request["source"] = {}  # type: ignore[index]
+        self.assertEqual(admission.request_digest, digest(admission.identity_record()))
+
     def test_nested_request_values_are_frozen_but_serialize_as_json(self) -> None:
         value = StageCommand.create(
             command_id="command-nested",

@@ -175,6 +175,10 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIn("UNIQUE (command_id, fence)", text)
         self.assertIn("UNIQUE (effect_id, seq)", text)
         self.assertIn("state_class IN ('known', 'absent', 'unobservable')", text)
+        candidate = text.split("CREATE TABLE IF NOT EXISTS :\"platform_schema\".stage_candidate", 1)[1]
+        candidate = candidate.split(");", 1)[0]
+        self.assertIn("command_id text NOT NULL UNIQUE", candidate)
+        self.assertIn("result_artifact_id text NOT NULL UNIQUE", candidate)
 
     def test_immutable_facts_have_no_service_update_grant(self) -> None:
         text = (PLATFORM_DIR / "roles.sql").read_text(encoding="utf-8")

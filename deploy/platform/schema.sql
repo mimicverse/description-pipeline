@@ -222,6 +222,19 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".stage_decision (
     CHECK (outcome = 'completed' OR reason_code IS NOT NULL)
 );
 
+CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate (
+    candidate_id text PRIMARY KEY,
+    command_id text NOT NULL UNIQUE REFERENCES :"platform_schema".command (command_id),
+    claim_id text NOT NULL REFERENCES :"platform_schema".execution_claim (claim_id),
+    fence bigint NOT NULL CHECK (fence > 0),
+    result_artifact_id text NOT NULL UNIQUE REFERENCES :"platform_schema".artifact (artifact_id),
+    result_digest char(64) NOT NULL CHECK (result_digest ~ '^[0-9a-f]{64}$'),
+    outcome text NOT NULL CHECK (outcome IN ('completed', 'failed', 'cancelled')),
+    reason_code text,
+    created_at timestamptz NOT NULL,
+    CHECK (outcome = 'completed' OR reason_code IS NOT NULL)
+);
+
 CREATE TABLE IF NOT EXISTS :"platform_schema".effect_intent (
     effect_id text PRIMARY KEY,
     command_id text NOT NULL REFERENCES :"platform_schema".command (command_id),

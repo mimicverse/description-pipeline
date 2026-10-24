@@ -13,7 +13,8 @@ GRANT SELECT, INSERT ON :"platform_schema".run_event TO platform_service;
 GRANT SELECT, INSERT ON
     :"platform_schema".run_admission, :"platform_schema".artifact, :"platform_schema".command,
     :"platform_schema".command_input_artifact, :"platform_schema".stage_decision,
-    :"platform_schema".effect_intent, :"platform_schema".effect_fact
+    :"platform_schema".stage_candidate, :"platform_schema".effect_intent,
+    :"platform_schema".effect_fact
     TO platform_service;
 GRANT SELECT, INSERT, UPDATE ON :"platform_schema".execution_claim TO platform_service;
 GRANT SELECT, INSERT, UPDATE ON :"platform_schema".run_display_metadata TO platform_service;

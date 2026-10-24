@@ -1,0 +1,903 @@
+"""PostgreSQL persistence for the canonical six-stage facts.
+
+Every public mutation is one short transaction. Artifact bytes and external
+effects are produced outside these methods; this module only commits the
+already verified identities and observations.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from contextlib import contextmanager
+from datetime import datetime
+from typing import Protocol
+
+from ..io import PipelineError
+from ..pipeline.contracts import (
+    STAGES,
+    ArtifactRef,
+    ExecutionClaim,
+    RunAdmission,
+    StageCandidate,
+    StageCommand,
+    StageDecision,
+    StageResult,
+)
+from ..pipeline.effects import EffectFact, EffectIntent, EffectState, project_effect_state
+
+
+class FactStoreError(PipelineError):
+    """A canonical platform fact cannot be read or committed safely."""
+
+
+class FactConflict(FactStoreError):
+    """A canonical key is already bound to a different immutable value."""
+
+
+class StageResultReader(Protocol):
+    """Read and independently validate one sealed StageResult artifact."""
+
+    def read_result(self, artifact: ArtifactRef) -> StageResult: ...
+
+
+def _plain(value):
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _json(value) -> str:
+    return json.dumps(
+        _plain(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _require_open(cursor) -> None:
+    cursor.execute("SELECT state FROM admission WHERE id = 1 FOR UPDATE")
+    row = cursor.fetchone()
+    if row is None:
+        raise FactStoreError("The platform admission row is missing")
+    if row[0] != "open":
+        raise FactStoreError("The platform admission gate is closed")
+
+
+def _artifact_from_row(row) -> ArtifactRef:
+    return ArtifactRef(
+        artifact_id=row[0],
+        kind=row[1],
+        locator=row[2],
+        manifest_sha256=row[3],
+        set_sha256=row[4],
+        producer_run_id=row[5],
+        producer_stage=row[6],
+        producer_tool_sha256=row[7],
+    )
+
+
+class FactStore:
+    """Canonical fact persistence with injected connection and result reader."""
+
+    def __init__(self, connect, result_reader: StageResultReader) -> None:
+        if not callable(connect):
+            raise FactStoreError("A database connection factory is required")
+        if result_reader is None or not callable(getattr(result_reader, "read_result", None)):
+            raise FactStoreError("A StageResult artifact reader is required")
+        self._connect = connect
+        self._result_reader = result_reader
+
+    @classmethod
+    def from_environment(cls, environ, *, result_reader: StageResultReader) -> FactStore:
+        dsn = environ.get("PLATFORM_SERVICE_DSN")
+        if not dsn:
+            raise FactStoreError("PLATFORM_SERVICE_DSN is not configured")
+
+        def connect():
+            import psycopg2
+
+            return psycopg2.connect(dsn)
+
+        return cls(connect, result_reader)
+
+    @contextmanager
+    def _transaction(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            close = getattr(connection, "close", None)
+            if callable(close):
+                close()
+
+    def _insert_artifact(self, cursor, artifact: ArtifactRef) -> ArtifactRef:
+        cursor.execute(
+            """
+            INSERT INTO artifact (
+                artifact_id, kind, locator, manifest_sha256, set_sha256,
+                producer_run_id, producer_stage, producer_tool_sha256
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING artifact_id, kind, locator, manifest_sha256, set_sha256,
+                      producer_run_id, producer_stage, producer_tool_sha256
+            """,
+            (
+                artifact.artifact_id,
+                artifact.kind,
+                artifact.locator,
+                artifact.manifest_sha256,
+                artifact.set_sha256,
+                artifact.producer_run_id,
+                artifact.producer_stage,
+                artifact.producer_tool_sha256,
+            ),
+        )
+        inserted = cursor.fetchone()
+        if inserted is not None:
+            return _artifact_from_row(inserted)
+        cursor.execute(
+            """
+            SELECT artifact_id, kind, locator, manifest_sha256, set_sha256,
+                   producer_run_id, producer_stage, producer_tool_sha256
+            FROM artifact
+            WHERE artifact_id = %s OR locator = %s
+            """,
+            (artifact.artifact_id, artifact.locator),
+        )
+        existing = cursor.fetchone()
+        if existing is None:
+            raise FactStoreError("The artifact registration conflicted without an existing row")
+        stored = _artifact_from_row(existing)
+        if stored != artifact:
+            raise FactConflict(
+                f"The artifact identity {artifact.artifact_id!r} is already bound to different bytes"
+            )
+        return stored
+
+    def register_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
+        if not isinstance(artifact, ArtifactRef):
+            raise FactStoreError("A canonical ArtifactRef is required")
+        with self._transaction() as connection:
+            return self._insert_artifact(connection.cursor(), artifact)
+
+    def _load_admission_cursor(self, cursor, run_id: str) -> RunAdmission | None:
+        cursor.execute(
+            """
+            SELECT run_id, request_id, parent_run_id, from_stage, request, request_digest, created_at
+            FROM run_admission
+            WHERE run_id = %s
+            """,
+            (run_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return RunAdmission(
+            schema_version="description-pipeline.run-admission/v1",
+            run_id=row[0],
+            request_id=row[1],
+            parent_run_id=row[2],
+            from_stage=row[3],
+            request=row[4],
+            request_digest=row[5],
+            created_at=row[6],
+        )
+
+    def load_admission(self, run_id: str) -> RunAdmission | None:
+        with self._transaction() as connection:
+            return self._load_admission_cursor(connection.cursor(), run_id)
+
+    def admit_run(self, admission: RunAdmission, command: StageCommand) -> StageCommand:
+        """Admit one immutable run and its complete initial Freeze command."""
+
+        if not isinstance(admission, RunAdmission):
+            raise FactStoreError("A canonical RunAdmission is required")
+        if command.run_id != admission.run_id or command.stage != "freeze" or command.kind != "stage":
+            raise FactStoreError("Admission must create the initial Freeze stage command")
+        if command.predecessor_decision_id is not None:
+            raise FactStoreError("The initial Freeze command cannot have a predecessor decision")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            _require_open(cursor)
+            existing = self._load_admission_cursor(cursor, admission.run_id)
+            if existing is not None:
+                if existing != admission:
+                    raise FactConflict(f"The run {admission.run_id!r} is already admitted with different facts")
+                stored_command = self._load_command_cursor(cursor, command.command_id)
+                if stored_command != command:
+                    raise FactConflict(f"The run {admission.run_id!r} carries a different Freeze command")
+                return stored_command
+            cursor.execute("SELECT run_id FROM run_admission WHERE request_id = %s", (admission.request_id,))
+            if cursor.fetchone() is not None:
+                raise FactConflict(f"The request {admission.request_id!r} is already admitted")
+            cursor.execute(
+                """
+                INSERT INTO run_admission (
+                    run_id, request_id, parent_run_id, from_stage, request, request_digest, created_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
+                """,
+                (
+                    admission.run_id,
+                    admission.request_id,
+                    admission.parent_run_id,
+                    admission.from_stage,
+                    _json(admission.request),
+                    admission.request_digest,
+                    admission.created_at,
+                ),
+            )
+            self._insert_command_cursor(cursor, command, admission=admission)
+            return command
+
+    def _load_command_cursor(self, cursor, command_id: str) -> StageCommand | None:
+        cursor.execute(
+            """
+            SELECT command_id, run_id, kind, stage, idempotency_key, request, request_digest,
+                   config_snapshot_sha256, contract_sha256, policy_sha256,
+                   expected_executor_sha256, predecessor_decision_id
+            FROM command
+            WHERE command_id = %s
+            """,
+            (command_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        cursor.execute(
+            """
+            SELECT a.artifact_id, a.kind, a.locator, a.manifest_sha256, a.set_sha256,
+                   a.producer_run_id, a.producer_stage, a.producer_tool_sha256
+            FROM command_input_artifact ci
+            JOIN artifact a ON a.artifact_id = ci.artifact_id
+            WHERE ci.command_id = %s
+            ORDER BY ci.position
+            """,
+            (command_id,),
+        )
+        inputs = tuple(_artifact_from_row(item) for item in cursor.fetchall())
+        return StageCommand(
+            schema_version="description-pipeline.stage-command/v1",
+            command_id=row[0],
+            run_id=row[1],
+            kind=row[2],
+            stage=row[3],
+            idempotency_key=row[4],
+            request=row[5],
+            request_digest=row[6],
+            input_artifacts=inputs,
+            config_snapshot_sha256=row[7],
+            contract_sha256=row[8],
+            policy_sha256=row[9],
+            expected_executor_sha256=row[10],
+            predecessor_decision_id=row[11],
+        )
+
+    def load_command(self, command_id: str) -> StageCommand:
+        with self._transaction() as connection:
+            command = self._load_command_cursor(connection.cursor(), command_id)
+        if command is None:
+            raise FactStoreError(f"The command {command_id!r} is not registered")
+        return command
+
+    def _insert_command_cursor(self, cursor, command: StageCommand, *, admission: RunAdmission) -> None:
+        for artifact in command.input_artifacts:
+            self._insert_artifact(cursor, artifact)
+        cursor.execute(
+            """
+            INSERT INTO command (
+                command_id, run_id, kind, stage, idempotency_key, request, request_digest,
+                config_snapshot_sha256, contract_sha256, policy_sha256,
+                expected_executor_sha256, predecessor_decision_id
+            ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                command.command_id,
+                command.run_id,
+                command.kind,
+                command.stage,
+                command.idempotency_key,
+                _json(command.request),
+                command.request_digest,
+                command.config_snapshot_sha256,
+                command.contract_sha256,
+                command.policy_sha256,
+                command.expected_executor_sha256,
+                command.predecessor_decision_id,
+            ),
+        )
+        for position, artifact in enumerate(command.input_artifacts):
+            cursor.execute(
+                """
+                INSERT INTO command_input_artifact (command_id, artifact_id, position)
+                VALUES (%s, %s, %s)
+                """,
+                (command.command_id, artifact.artifact_id, position),
+            )
+
+    def create_command(self, command: StageCommand) -> StageCommand:
+        """Register one complete successor command after its predecessor decision."""
+
+        if not isinstance(command, StageCommand) or command.kind != "stage" or command.stage is None:
+            raise FactStoreError("A stage command is required")
+        if command.stage == "freeze" or command.predecessor_decision_id is None:
+            raise FactStoreError("Successor commands require a predecessor decision")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT run_id FROM run_admission WHERE run_id = %s FOR UPDATE", (command.run_id,))
+            if cursor.fetchone() is None:
+                raise FactStoreError(f"The run {command.run_id!r} is not admitted")
+            existing = self._load_command_cursor(cursor, command.command_id)
+            if existing is not None:
+                if existing != command:
+                    raise FactConflict(f"The command {command.command_id!r} is already bound differently")
+                return existing
+            cursor.execute(
+                "SELECT run_id, stage, outcome FROM stage_decision WHERE decision_id = %s",
+                (command.predecessor_decision_id,),
+            )
+            predecessor = cursor.fetchone()
+            if predecessor is None or predecessor[0] != command.run_id or predecessor[2] != "completed":
+                raise FactStoreError("The command predecessor is not a completed decision of this run")
+            expected_stage = STAGES[STAGES.index(command.stage) - 1]
+            if predecessor[1] != expected_stage:
+                raise FactStoreError("The command predecessor is not the immediately preceding stage")
+            admission = self._load_admission_cursor(cursor, command.run_id)
+            if admission is None:  # pragma: no cover - checked under the same lock
+                raise FactStoreError("The admitted run disappeared")
+            self._insert_command_cursor(cursor, command, admission=admission)
+            return command
+
+    def _decision_row(self, cursor, *, run_id: str, stage: str):
+        cursor.execute(
+            """
+            SELECT decision_id, run_id, stage, command_id, outcome, result_artifact_id,
+                   result_digest, actual_executor_sha256, original_producer_decision_id,
+                   reason_code, decided_at
+            FROM stage_decision
+            WHERE run_id = %s AND stage = %s
+            """,
+            (run_id, stage),
+        )
+        return cursor.fetchone()
+
+    def _artifact_cursor(self, cursor, artifact_id: str) -> ArtifactRef:
+        cursor.execute(
+            """
+            SELECT artifact_id, kind, locator, manifest_sha256, set_sha256,
+                   producer_run_id, producer_stage, producer_tool_sha256
+            FROM artifact
+            WHERE artifact_id = %s
+            """,
+            (artifact_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise FactStoreError(f"The artifact {artifact_id!r} is not registered")
+        return _artifact_from_row(row)
+
+    def _decision_from_row(self, cursor, row) -> StageDecision:
+        return StageDecision(
+            decision_id=row[0],
+            run_id=row[1],
+            stage=row[2],
+            command_id=row[3],
+            outcome=row[4],
+            result_artifact=self._artifact_cursor(cursor, row[5]),
+            result_digest=row[6],
+            actual_executor_sha256=row[7],
+            original_producer_decision_id=row[8],
+            reason_code=row[9],
+            decided_at=row[10],
+        )
+
+    def decision_for(self, command: StageCommand) -> StageDecision | None:
+        if command.stage is None:
+            raise FactStoreError("Only a stage command has a stage decision")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
+            return None if row is None else self._decision_from_row(cursor, row)
+
+    def load_result(self, decision: StageDecision) -> StageResult:
+        result = self._result_reader.read_result(decision.result_artifact)
+        if (
+            result.command_id != decision.command_id
+            or result.run_id != decision.run_id
+            or result.stage != decision.stage
+            or result.outcome != decision.outcome
+            or result.digest != decision.result_digest
+        ):
+            raise FactStoreError("The sealed StageResult differs from its registered decision")
+        return result
+
+    def acquire_claim(
+        self,
+        command_id: str,
+        *,
+        claim_id: str,
+        owner_sha256: str,
+        now: datetime,
+        expires_at: datetime,
+        lane_key: str | None = None,
+        dag_id: str | None = None,
+        dag_run_id: str | None = None,
+        task_id: str | None = None,
+        map_index: int | None = None,
+    ) -> ExecutionClaim:
+        """Acquire one open fenced execution right without treating lease expiry as success."""
+
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise FactStoreError("Claim time must be timezone-aware")
+        if not isinstance(expires_at, datetime) or expires_at.tzinfo is None or expires_at <= now:
+            raise FactStoreError("Claim expiry must be after a timezone-aware acquisition time")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT command_id, run_id, stage, expected_executor_sha256
+                FROM command
+                WHERE command_id = %s
+                FOR UPDATE
+                """,
+                (command_id,),
+            )
+            command = cursor.fetchone()
+            if command is None:
+                raise FactStoreError(f"The command {command_id!r} is not registered")
+            if command[2] is not None and self._decision_row(cursor, run_id=command[1], stage=command[2]) is not None:
+                raise FactConflict("A decided command cannot acquire a new execution claim")
+            cursor.execute(
+                """
+                SELECT claim_id, command_id, fence, owner_sha256, lane_key, expires_at
+                FROM execution_claim
+                WHERE command_id = %s AND closed_at IS NULL
+                FOR UPDATE
+                """,
+                (command_id,),
+            )
+            current = cursor.fetchone()
+            if current is not None:
+                claim = ExecutionClaim(
+                    claim_id=current[0],
+                    command_id=current[1],
+                    fence=current[2],
+                    owner_sha256=current[3],
+                    lane_key=current[4],
+                    expires_at=current[5],
+                )
+                if claim.owner_sha256 == owner_sha256:
+                    return claim
+                if claim.expires_at > now:
+                    raise FactConflict("Another live executor owns the command")
+                if self._command_has_effect_activity(cursor, command_id):
+                    raise FactConflict("An expired claim carries effect activity and requires reconciliation")
+                cursor.execute(
+                    """
+                    UPDATE execution_claim
+                    SET closed_at = %s, closure_code = 'abandoned_before_effect'
+                    WHERE claim_id = %s AND closed_at IS NULL
+                    """,
+                    (now, claim.claim_id),
+                )
+            cursor.execute(
+                "SELECT COALESCE(MAX(fence), 0) + 1 FROM execution_claim WHERE command_id = %s",
+                (command_id,),
+            )
+            fence = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                INSERT INTO execution_claim (
+                    claim_id, command_id, fence, owner_sha256, lane_key,
+                    dag_id, dag_run_id, task_id, map_index,
+                    issued_at, last_seen_at, expires_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    claim_id,
+                    command_id,
+                    fence,
+                    owner_sha256,
+                    lane_key,
+                    dag_id,
+                    dag_run_id,
+                    task_id,
+                    map_index,
+                    now,
+                    now,
+                    expires_at,
+                ),
+            )
+            return ExecutionClaim(
+                claim_id=claim_id,
+                command_id=command_id,
+                fence=fence,
+                owner_sha256=owner_sha256,
+                lane_key=lane_key,
+                expires_at=expires_at,
+            )
+
+    def _command_has_effect_activity(self, cursor, command_id: str) -> bool:
+        cursor.execute("SELECT effect_id FROM effect_intent WHERE command_id = %s", (command_id,))
+        for (effect_id,) in cursor.fetchall():
+            state = self._effect_state_cursor(cursor, effect_id)
+            if state is not EffectState.PREPARED:
+                return True
+        return False
+
+    def _effect_state_cursor(self, cursor, effect_id: str) -> EffectState:
+        intent, facts = self._effect_cursor(cursor, effect_id)
+        return project_effect_state(intent, facts)
+
+    def _effect_cursor(self, cursor, effect_id: str) -> tuple[EffectIntent, tuple[EffectFact, ...]]:
+        cursor.execute(
+            """
+            SELECT effect_id, command_id, effect_key, effect_kind, target, expected_state,
+                   expected_state_digest, outbound_artifact_id, outbound_digest, created_at
+            FROM effect_intent
+            WHERE effect_id = %s
+            """,
+            (effect_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise FactStoreError(f"The effect {effect_id!r} is not registered")
+        intent = EffectIntent(
+            effect_id=row[0],
+            command_id=row[1],
+            effect_key=row[2],
+            effect_kind=row[3],
+            target=row[4],
+            expected_state=row[5],
+            expected_state_digest=row[6],
+            outbound_artifact_id=row[7],
+            outbound_digest=row[8],
+            created_at=row[9],
+        )
+        cursor.execute(
+            """
+            SELECT fact_id, effect_id, seq, claim_id, fence, fact_type, source,
+                   state_class, payload_artifact_id, payload_digest, observed_at
+            FROM effect_fact
+            WHERE effect_id = %s
+            ORDER BY seq
+            """,
+            (effect_id,),
+        )
+        facts = tuple(
+            EffectFact(
+                fact_id=item[0],
+                effect_id=item[1],
+                seq=item[2],
+                claim_id=item[3],
+                fence=item[4],
+                fact_type=item[5],
+                source=item[6],
+                state_class=item[7],
+                payload_artifact_id=item[8],
+                payload_digest=item[9],
+                observed_at=item[10],
+            )
+            for item in cursor.fetchall()
+        )
+        return intent, facts
+
+    def effect_state(self, effect_id: str) -> EffectState:
+        with self._transaction() as connection:
+            return self._effect_state_cursor(connection.cursor(), effect_id)
+
+    def register_effect_intent(
+        self,
+        intent: EffectIntent,
+        *,
+        claim: ExecutionClaim,
+        outbound_artifact: ArtifactRef,
+    ) -> EffectIntent:
+        if outbound_artifact.artifact_id != intent.outbound_artifact_id:
+            raise FactStoreError("The outbound artifact does not match the effect intent")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            self._verify_open_claim_cursor(cursor, claim)
+            self._insert_artifact(cursor, outbound_artifact)
+            cursor.execute(
+                """
+                INSERT INTO effect_intent (
+                    effect_id, command_id, effect_key, effect_kind, target, expected_state,
+                    expected_state_digest, outbound_artifact_id, outbound_digest, created_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING effect_id
+                """,
+                (
+                    intent.effect_id,
+                    intent.command_id,
+                    intent.effect_key,
+                    intent.effect_kind,
+                    _json(intent.target),
+                    _json(intent.expected_state),
+                    intent.expected_state_digest,
+                    intent.outbound_artifact_id,
+                    intent.outbound_digest,
+                    intent.created_at,
+                ),
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    """
+                    SELECT effect_id FROM effect_intent
+                    WHERE effect_id = %s OR (command_id = %s AND effect_key = %s)
+                    """,
+                    (intent.effect_id, intent.command_id, intent.effect_key),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    raise FactStoreError("The effect intent conflicted without an existing row")
+                stored_intent, _ = self._effect_cursor(cursor, existing[0])
+                if stored_intent != intent:
+                    raise FactConflict("The command/effect key is bound to a different effect intent")
+                return stored_intent
+            return intent
+
+    def _verify_open_claim_cursor(self, cursor, claim: ExecutionClaim) -> None:
+        cursor.execute(
+            """
+            SELECT command_id, fence, owner_sha256, closed_at
+            FROM execution_claim
+            WHERE claim_id = %s
+            FOR UPDATE
+            """,
+            (claim.claim_id,),
+        )
+        row = cursor.fetchone()
+        if row is None or row[0] != claim.command_id or row[1] != claim.fence or row[2] != claim.owner_sha256:
+            raise FactConflict("The execution claim identity is stale or foreign")
+        if row[3] is not None:
+            raise FactConflict("The execution claim is already closed")
+
+    def append_effect_fact(
+        self,
+        *,
+        effect_id: str,
+        claim: ExecutionClaim | None,
+        fact_type: str,
+        source: str,
+        state_class: str | None,
+        payload_artifact: ArtifactRef | None,
+        payload_digest: str,
+        observed_at: datetime,
+        fact_id: str,
+    ) -> EffectFact:
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT command_id FROM effect_intent WHERE effect_id = %s FOR UPDATE", (effect_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise FactStoreError(f"The effect {effect_id!r} is not registered")
+            if claim is not None:
+                if claim.command_id != row[0]:
+                    raise FactConflict("The effect fact claim names another command")
+                cursor.execute(
+                    "SELECT command_id, fence FROM execution_claim WHERE claim_id = %s",
+                    (claim.claim_id,),
+                )
+                stored = cursor.fetchone()
+                if stored != (claim.command_id, claim.fence):
+                    raise FactConflict("The effect fact names a foreign claim/fence")
+            if payload_artifact is not None:
+                self._insert_artifact(cursor, payload_artifact)
+            cursor.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM effect_fact WHERE effect_id = %s", (effect_id,))
+            seq = cursor.fetchone()[0]
+            fact = EffectFact(
+                fact_id=fact_id,
+                effect_id=effect_id,
+                seq=seq,
+                claim_id=None if claim is None else claim.claim_id,
+                fence=None if claim is None else claim.fence,
+                fact_type=fact_type,
+                source=source,
+                state_class=state_class,
+                payload_artifact_id=None if payload_artifact is None else payload_artifact.artifact_id,
+                payload_digest=payload_digest,
+                observed_at=observed_at,
+            )
+            cursor.execute(
+                """
+                INSERT INTO effect_fact (
+                    fact_id, effect_id, seq, claim_id, fence, fact_type, source,
+                    state_class, payload_artifact_id, payload_digest, observed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    fact.fact_id,
+                    fact.effect_id,
+                    fact.seq,
+                    fact.claim_id,
+                    fact.fence,
+                    fact.fact_type,
+                    fact.source,
+                    fact.state_class,
+                    fact.payload_artifact_id,
+                    fact.payload_digest,
+                    fact.observed_at,
+                ),
+            )
+            return fact
+
+    def register_candidate(
+        self,
+        *,
+        candidate_id: str,
+        claim: ExecutionClaim,
+        result_artifact: ArtifactRef,
+        result: StageResult,
+        created_at: datetime,
+    ) -> StageCandidate:
+        if result.result_artifact != result_artifact:
+            raise FactStoreError("The StageResult does not carry its declared artifact")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            self._verify_open_claim_cursor(cursor, claim)
+            self._insert_artifact(cursor, result_artifact)
+            cursor.execute(
+                """
+                INSERT INTO stage_candidate (
+                    candidate_id, command_id, claim_id, fence, result_artifact_id,
+                    result_digest, outcome, reason_code, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING candidate_id
+                """,
+                (
+                    candidate_id,
+                    result.command_id,
+                    claim.claim_id,
+                    claim.fence,
+                    result_artifact.artifact_id,
+                    result.digest,
+                    result.outcome,
+                    result.reason_code,
+                    created_at,
+                ),
+            )
+            if cursor.fetchone() is None:
+                stored = self._candidate_cursor(cursor, result.command_id)
+                if stored is None or stored.result != result:
+                    raise FactConflict("The command is already bound to a different sealed candidate")
+                return stored
+            return StageCandidate(
+                result=result,
+                candidate_id=candidate_id,
+                claim_id=claim.claim_id,
+                fence=claim.fence,
+            )
+
+    def _candidate_cursor(self, cursor, command_id: str) -> StageCandidate | None:
+        cursor.execute(
+            """
+            SELECT candidate_id, claim_id, fence, result_artifact_id
+            FROM stage_candidate
+            WHERE command_id = %s
+            """,
+            (command_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        artifact = self._artifact_cursor(cursor, row[3])
+        result = self._result_reader.read_result(artifact)
+        return StageCandidate(
+            result=result,
+            candidate_id=row[0],
+            claim_id=row[1],
+            fence=row[2],
+        )
+
+    def candidate_for(self, command: StageCommand) -> StageCandidate | None:
+        with self._transaction() as connection:
+            return self._candidate_cursor(connection.cursor(), command.command_id)
+
+    def commit_decision(
+        self,
+        *,
+        decision_id: str,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        candidate: StageCandidate,
+        decided_at: datetime,
+        original_producer_decision_id: str | None = None,
+    ) -> StageDecision:
+        if command.stage is None:
+            raise FactStoreError("Only a stage command can commit a decision")
+        if (
+            candidate.candidate_id is None
+            or candidate.claim_id is None
+            or candidate.fence is None
+        ):
+            raise FactStoreError("Only a persisted candidate can be committed")
+        if (
+            candidate.result.command_id != command.command_id
+            or candidate.result.run_id != command.run_id
+            or candidate.result.stage != command.stage
+            or candidate.result.request_digest != command.request_digest
+        ):
+            raise FactStoreError("The candidate does not belong to the command")
+        if candidate.result.actual_executor_sha256 != claim.owner_sha256:
+            raise FactConflict("The actual executor differs from the claim owner")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT command_id FROM command WHERE command_id = %s FOR UPDATE", (command.command_id,))
+            if cursor.fetchone() is None:
+                raise FactStoreError("The command disappeared before decision commit")
+            existing_row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
+            if existing_row is not None:
+                existing = self._decision_from_row(cursor, existing_row)
+                if (
+                    existing.command_id != command.command_id
+                    or existing.result_digest != candidate.result.digest
+                    or existing.outcome != candidate.result.outcome
+                ):
+                    raise FactConflict("The command is already bound to a different decision")
+                return existing
+            self._verify_open_claim_cursor(cursor, claim)
+            states = {}
+            for effect_id in candidate.result.required_effect_ids:
+                cursor.execute("SELECT effect_id FROM effect_intent WHERE effect_id = %s FOR UPDATE", (effect_id,))
+                if cursor.fetchone() is None:
+                    raise FactConflict(f"The declared effect {effect_id!r} is not registered")
+                states[effect_id] = self._effect_state_cursor(cursor, effect_id)
+            for state in states.values():
+                if state not in {EffectState.SATISFIED, EffectState.DEFINITELY_FAILED}:
+                    raise FactConflict("A terminal decision cannot hide an unsettled external effect")
+                if candidate.result.outcome == "completed" and state is not EffectState.SATISFIED:
+                    raise FactConflict("A completed decision requires every declared effect to be satisfied")
+            cursor.execute(
+                """
+                SELECT candidate_id, result_digest FROM stage_candidate
+                WHERE command_id = %s
+                FOR UPDATE
+                """,
+                (command.command_id,),
+            )
+            stored = cursor.fetchone()
+            if stored != (candidate.candidate_id, candidate.result.digest):
+                raise FactConflict("The stage candidate changed before its decision commit")
+            cursor.execute(
+                """
+                INSERT INTO stage_decision (
+                    decision_id, run_id, stage, command_id, outcome, result_artifact_id,
+                    result_digest, actual_executor_sha256, original_producer_decision_id,
+                    reason_code, decided_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    decision_id,
+                    command.run_id,
+                    command.stage,
+                    command.command_id,
+                    candidate.result.outcome,
+                    candidate.result.result_artifact.artifact_id,
+                    candidate.result.digest,
+                    candidate.result.actual_executor_sha256,
+                    original_producer_decision_id,
+                    candidate.result.reason_code,
+                    decided_at,
+                ),
+            )
+            closure = "completed" if candidate.result.outcome == "completed" else "definite_failure"
+            cursor.execute(
+                """
+                UPDATE execution_claim
+                SET closed_at = %s, closure_code = %s, last_seen_at = %s
+                WHERE claim_id = %s AND closed_at IS NULL
+                """,
+                (decided_at, closure, decided_at, claim.claim_id),
+            )
+            row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
+            if row is None:  # pragma: no cover - inserted in this transaction
+                raise FactStoreError("The committed decision disappeared")
+            return self._decision_from_row(cursor, row)
