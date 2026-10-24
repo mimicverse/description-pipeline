@@ -899,6 +899,24 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
         self.assertEqual(caught.exception.detail["path"], PART)
 
+    def test_final_read_boundary_uses_the_latest_top_read_only_state(self):
+        top = _Doc(PATH)
+        backend = _Backend({PATH: top})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ):
+            backend._rebuild_capture_copy(top, PATH)
+        top._read_only = False
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend.verify_capture_documents_ready()
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["path"], PATH)
+        self.assertIs(caught.exception.detail["state"]["read_only"], False)
+
     def test_pending_part_dependency_cannot_pass_behind_a_clean_top(self):
         part = _Doc(PART, document_type=1, needs_rebuild2=1)
         top = _Doc(PATH, needs_rebuild2=0, children=[_Component("part-1", part)])
