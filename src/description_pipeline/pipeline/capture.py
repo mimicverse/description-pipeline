@@ -70,7 +70,6 @@ NativeOutcome = Literal["completed", "failed", "cancelled", "unknown"]
 
 CAPTURE_INPUT_ARCHIVE = "capture-input.zip"
 
-
 @dataclass(frozen=True, slots=True)
 class CaptureEffectDispatch:
     """One exact sealed Capture dispatch reused across claims and recovery."""
@@ -82,7 +81,6 @@ class CaptureEffectDispatch:
     operation: Mapping[str, Any]
     input_archive: Path
     execution: Mapping[str, Any]
-
 
 class CaptureUnresolved(PipelineError):
     """The native operation has a possible external effect with no safe terminal fact."""

@@ -1176,6 +1176,7 @@ class NativeOperationEffectObserver:
         request_sha256: str,
         native_tool_requirement_sha256: str,
         payload_sha256: str | None = None,
+        input_archive_sha256: str | None = None,
     ) -> None:
         if (
             view.operation_id != operation_id
@@ -1186,6 +1187,10 @@ class NativeOperationEffectObserver:
             or (
                 payload_sha256 is not None
                 and view.payload_sha256 != payload_sha256
+            )
+            or (
+                input_archive_sha256 is not None
+                and view.input_archive_sha256 != input_archive_sha256
             )
         ):
             raise NativeOperationClientConflict(
@@ -1312,6 +1317,8 @@ class NativeOperationEffectObserver:
             kind=CAPTURE_KIND,
             request_sha256=identity.request_sha256,
             native_tool_requirement_sha256=request.native_tool_record_sha256,
+            payload_sha256=identity.payload_sha256,
+            input_archive_sha256=identity.input_archive_sha256,
         )
         if observed.state != "satisfied" and not (
             observed.state == "unknown"
@@ -1451,13 +1458,8 @@ class NativeOperationEffectObserver:
                 identity.native_tool_requirement_sha256
             ),
             payload_sha256=identity.payload_sha256,
+            input_archive_sha256=source_archive_sha256,
         )
-        if observed.input_archive_sha256 != source_archive_sha256:
-            raise NativeOperationClientConflict(
-                "Discover operation input archive differs from the sealed outbound",
-                status=409,
-                code="native_operation_conflict",
-            )
         if observed.state != "satisfied" and not (
             observed.state == "unknown"
             and observed.artifact is not None
