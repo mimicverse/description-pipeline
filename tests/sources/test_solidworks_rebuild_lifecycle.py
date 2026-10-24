@@ -221,6 +221,7 @@ class _Backend(SolidWorksBackend):
         self._refresh = refresh
         self.refresh_calls = []
         self._extra_loaded_documents = []
+        self._current_document = None
         self._sessions = {"copy": _Session(session_pid)}
         if extra_sessions:
             self._sessions.update(extra_sessions)
@@ -234,20 +235,26 @@ class _Backend(SolidWorksBackend):
                 value = self._refresh[str(path)]
             except KeyError as error:
                 raise CadError("document_not_open", "missing test document") from error
-            return value.pop(0) if isinstance(value, list) else value
-        return self._refresh() if callable(self._refresh) else self._refresh
+            result = value.pop(0) if isinstance(value, list) else value
+        else:
+            result = self._refresh() if callable(self._refresh) else self._refresh
+        self._current_document = result
+        return result
 
     def _document_by_path(self, path):
         return self._document_handle_by_path(path)
 
-    def _capture_loaded_documents(self, known_documents=None):
-        docs = dict(known_documents or {})
+    def _capture_loaded_documents(self):
+        docs = {}
         if isinstance(self._refresh, dict):
             for path, value in self._refresh.items():
                 candidates = value if isinstance(value, list) else [value]
                 doc = candidates[0] if candidates else docs.get(path)
                 if isinstance(doc, _Doc):
                     docs[normalize_document_path(os.path.abspath(path))] = doc
+        if isinstance(self._current_document, _Doc):
+            doc = self._current_document
+            docs[normalize_document_path(os.path.abspath(doc.GetPathName))] = doc
         for doc in self._extra_loaded_documents:
             docs[f"extra:{id(doc)}"] = doc
         return [
@@ -262,6 +269,10 @@ class _Backend(SolidWorksBackend):
             }
             for _key, doc in sorted(docs.items())
         ]
+
+    def _rebuild_capture_copy(self, doc, path):
+        self._current_document = doc
+        return super()._rebuild_capture_copy(doc, path)
 
     def _ensure_document(self, path):
         raise AssertionError("a missing document must never be reopened")
