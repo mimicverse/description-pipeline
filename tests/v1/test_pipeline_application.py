@@ -12,7 +12,7 @@ from pathlib import Path
 
 from description_pipeline import cli
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.io import PipelineError, digest
+from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.pipeline.application import (
     STAGES,
     ApplicationError,
@@ -42,6 +42,31 @@ class _CompletingHandler:
         output = workspace.root / f"output-{claim.fence}"
         output.mkdir()
         (output / "stage.txt").write_text(command.stage, encoding="utf-8")
+        if command.stage == "discover":
+            source_files = dict(command.request["source_files"])
+            artifacts = {item.kind: item for item in command.input_artifacts}
+            write_json(
+                output / "result.json",
+                {
+                    "schema_version": "description-pipeline.discover-result/v1",
+                    "command_id": command.command_id,
+                    "run_id": command.run_id,
+                    "request_digest": command.request_digest,
+                    "selection": {
+                        "files": source_files,
+                        "handoff_sha256": digest(source_files),
+                        "upload_sha256": command.request["source_inventory_sha256"],
+                        "main_assembly": command.request["main_assembly"],
+                    },
+                    "prepared_sha256": digest({"prepared": command.command_id}),
+                    "native_observation_sha256": digest({"observation": command.command_id}),
+                    "passed": True,
+                    "native_tool": {"executor": "native"},
+                    "source_set_artifact": artifacts["freeze_originals"].to_record(),
+                    "ruleset_artifact": artifacts["freeze_ruleset"].to_record(),
+                    "configuration_artifact": artifacts["platform_config"].to_record(),
+                },
+            )
         return StageExecution(
             outcome="completed",
             candidate_root=str(output),
@@ -251,7 +276,26 @@ class StageApplicationTests(unittest.TestCase):
             self.application.execute_run("run-1", through="capture")
         self.assertEqual(caught.exception.detail["stage"], "capture")
         self.assertIn("capture", self.application.missing_capabilities()["handlers"])
-        self.assertIn("capture", self.application.missing_capabilities()["builders"])
+        self.assertEqual(self.application.missing_capabilities()["builders"], [])
+
+    def test_verified_discover_result_projects_capture_through_the_same_engine(self):
+        capture = _CompletingHandler()
+        application = StageApplication(
+            services=self.backend,
+            facts=self.backend,
+            artifacts=self.harness.store,
+            handlers={
+                "freeze": self.freeze,
+                "discover": self.discover,
+                "capture": capture,
+            },
+            builders={},
+        )
+        application.admit(self.harness.spec)
+        outcome = application.execute_run("run-1", through="capture")
+        self.assertEqual(outcome.outcome, "completed")
+        self.assertEqual(outcome.stage, "capture")
+        self.assertEqual(capture.executions, 1)
 
     def test_replay_refuses_until_common_command_scope_is_available(self):
         command = self.application.admit(self.harness.spec)

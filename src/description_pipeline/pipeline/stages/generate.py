@@ -257,6 +257,7 @@ class GenerateHandler:
             outcome="completed",
             candidate_root=str(output),
             checks_sha256=checks_sha256,
+            resources_settled=True,
         )
 
     def validate_candidate(

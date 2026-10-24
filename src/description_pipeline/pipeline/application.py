@@ -14,17 +14,22 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 from ..artifacts import ArtifactStore
-from ..io import PipelineError, digest
+from ..io import PipelineError, digest, read_data
 from ..platform.facts import FactStore
 from ..runtime import tool_record
 from .admission import (
     AdmissionSpec,
     VerifiedArtifact,
+    VerifiedDiscoverResult,
     VerifiedPredecessor,
     VerifiedRuleset,
+    build_capture_command,
     build_discover_command,
     build_freeze_command,
+    build_generate_command,
+    build_publish_command,
     build_run_admission,
+    build_verify_command,
     validate_run_admission,
     validate_stage_command,
 )
@@ -97,6 +102,7 @@ class CommandBuildContext:
     admission: AdmissionSpec
     stage: StageId
     predecessors: Mapping[StageId, VerifiedPredecessor]
+    discover_result: VerifiedDiscoverResult | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "predecessors", MappingProxyType(dict(self.predecessors)))
@@ -122,7 +128,36 @@ def _default_builders() -> dict[StageId, CommandBuilder]:
             context.admission,
             context.predecessor("freeze"),
         ),
+        "capture": lambda context: build_capture_command(
+            context.admission,
+            context.predecessor("freeze"),
+            context.predecessor("discover"),
+            context.discover_result
+            if context.discover_result is not None
+            else _missing_discover_result(context.stage),
+        ),
+        "generate": lambda context: build_generate_command(
+            context.admission,
+            context.predecessor("capture"),
+        ),
+        "verify": lambda context: build_verify_command(
+            context.admission,
+            context.predecessor("generate"),
+            context.predecessor("capture"),
+        ),
+        "publish": lambda context: build_publish_command(
+            context.admission,
+            context.predecessor("verify"),
+        ),
     }
+
+
+def _missing_discover_result(stage: StageId) -> VerifiedDiscoverResult:
+    raise ApplicationError(
+        "application.discover_result_missing",
+        "Capture requires the verified Discover result",
+        detail={"stage": stage},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,9 +317,10 @@ class StageApplication:
         spec: AdmissionSpec,
         stage: StageId,
         predecessors: Mapping[StageId, VerifiedPredecessor],
+        discover_result: VerifiedDiscoverResult | None,
     ) -> StageCommand:
         builder = self._require_builder(stage)
-        command = builder(CommandBuildContext(spec, stage, predecessors))
+        command = builder(CommandBuildContext(spec, stage, predecessors, discover_result))
         if (
             command.run_id != spec.run_id
             or command.stage != stage
@@ -292,21 +328,27 @@ class StageApplication:
             or command.contract_sha256 != spec.contract_sha256
             or command.policy_sha256 != spec.policy_sha256
             or command.config_snapshot_sha256 != spec.configuration.ref.set_sha256
-            or command.expected_executor_sha256 != spec.expected_executor_sha256
+            or command.expected_executor_sha256 != spec.executors.for_stage(stage)
         ):
             raise ApplicationError(
                 "application.command_builder_invalid",
                 f"The {stage} builder produced a command outside the admission identity",
                 detail={"stage": stage, "command_id": command.command_id},
             )
-        if stage in {"freeze", "discover"}:
-            validate_stage_command(
-                spec,
-                command,
-                predecessor=predecessors.get(STAGES[STAGES.index(stage) - 1])
-                if stage != "freeze"
-                else None,
-            )
+        index = STAGES.index(stage)
+        previous = predecessors.get(STAGES[index - 1]) if index else None
+        supporting: tuple[VerifiedPredecessor, ...] = ()
+        if stage == "capture":
+            supporting = (predecessors["freeze"],)
+        elif stage == "verify":
+            supporting = (predecessors["capture"],)
+        validate_stage_command(
+            spec,
+            command,
+            predecessor=previous,
+            supporting_predecessors=supporting,
+            discover_result=discover_result,
+        )
         return command
 
     def _completed_predecessor(
@@ -325,6 +367,20 @@ class StageApplication:
             result=result,
             decision=decision,
         )
+
+    def _verified_discover_result(
+        self,
+        predecessor: VerifiedPredecessor,
+    ) -> VerifiedDiscoverResult:
+        if predecessor.stage != "discover":
+            raise ApplicationError("application.discover_result_missing", "Discover predecessor is required")
+        with tempfile.TemporaryDirectory(prefix="description-discover-result-") as directory:
+            root = self.artifacts.materialize(
+                predecessor.result.output_artifact,
+                Path(directory) / "artifact",
+            )
+            record = read_data(root / "result.json")
+        return VerifiedDiscoverResult.from_record(predecessor, record)
 
     def execute_registered_command(self, command_id: str) -> StageResult | FailureEnvelope:
         """Execute one already-registered command through the one common engine."""
@@ -366,9 +422,10 @@ class StageApplication:
                 detail={"from_stage": spec.from_stage},
             )
         predecessors: dict[StageId, VerifiedPredecessor] = {}
+        discover_result: VerifiedDiscoverResult | None = None
         target_index = STAGES.index(stage)
         for current_stage in STAGES[: target_index + 1]:
-            command = self._build_command(spec, current_stage, predecessors)
+            command = self._build_command(spec, current_stage, predecessors, discover_result)
             if current_stage == "freeze":
                 stored = self.facts.load_command(command.command_id)
                 if stored != command:
@@ -387,6 +444,8 @@ class StageApplication:
             predecessor = self._completed_predecessor(stored)
             if predecessor is not None:
                 predecessors[current_stage] = predecessor
+                if current_stage == "discover":
+                    discover_result = self._verified_discover_result(predecessor)
                 continue
             if current_stage != stage:
                 raise ApplicationError(

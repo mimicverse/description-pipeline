@@ -158,6 +158,7 @@ class GenerateHandlerTests(unittest.TestCase):
             output_artifact=output_artifact,
             actual_executor_sha256=self.executor,
             checks_sha256=checks_sha256,
+            resources_settled=True,
         )
         return StageCandidate(result=result)
 

@@ -68,6 +68,19 @@ def current_verifier_identity() -> dict[str, Any]:
     return dict(tool_record(role="portable"))
 
 
+def current_verifier_sha256(identity: Mapping[str, Any]) -> str:
+    """Return the tool source identity carried by a verifier runtime record."""
+
+    value = identity.get("source_sha256")
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise PipelineError("Verifier identity carries no source SHA-256")
+    return value
+
+
 def _json_object(value: Mapping[str, Any], label: str) -> dict[str, Any]:
     try:
         return json.loads(json.dumps(dict(value), sort_keys=True))
@@ -267,13 +280,14 @@ def _generate_receipt(
 ) -> dict[str, Any]:
     receipt = read_data(root / GENERATE_RECEIPT)
     expected = {
+        "actual_executor_sha256",
         "capture_artifact",
         "config_snapshot_sha256",
         "contract_sha256",
-        "executor_sha256",
         "mesh_files",
         "model_sha256",
         "output_contract",
+        "required_executor_sha256",
         "schema_version",
         "semantic_identity",
         "urdf_sha256",
@@ -290,7 +304,8 @@ def _generate_receipt(
     if (
         receipt.get("config_snapshot_sha256") != command.config_snapshot_sha256
         or receipt.get("contract_sha256") != command.contract_sha256
-        or receipt.get("executor_sha256") != generate.artifact.producer_tool_sha256
+        or receipt.get("actual_executor_sha256") != generate.artifact.producer_tool_sha256
+        or receipt.get("required_executor_sha256") != generate.artifact.producer_tool_sha256
     ):
         raise PipelineError("Generate receipt command identity differs from the paired artifacts")
     model = read_data(root / "model/robot.json")
@@ -397,7 +412,7 @@ def _prepare(
     if request.contract_sha256 != CONTRACT_SHA256 or request.policy_sha256 != check_policy_digest():
         raise PipelineError("Verify contract or policy differs from the current verifier")
     verifier = _json_object(identity_provider(), "verifier identity")
-    verifier_sha256 = digest(verifier)
+    verifier_sha256 = current_verifier_sha256(verifier)
     if verifier_sha256 != request.expected_verifier_sha256:
         raise PipelineError("Actual verifier differs from the requested Verify executor")
     closure = digest(
@@ -566,7 +581,9 @@ class VerifyHandler:
         )
         if current_closure != prepared.closure_sha256 or receipt_again != prepared.generate_receipt:
             raise PipelineError("Generate/Capture artifact pair changed during Verify")
-        final_verifier = digest(_json_object(self.identity_provider(), "verifier identity"))
+        final_verifier = current_verifier_sha256(
+            _json_object(self.identity_provider(), "verifier identity")
+        )
         if final_verifier != prepared.verifier_sha256:
             raise PipelineError("Verifier identity changed during Verify")
 
@@ -737,7 +754,9 @@ def _validate_certificate_structure(certificate: Mapping[str, Any]) -> None:
     ):
         raise PipelineError("Verification certificate pair binding differs")
     verifier = certificate.get("actual_verifier")
-    if not isinstance(verifier, dict) or digest(verifier) != certificate.get("actual_verifier_sha256"):
+    if not isinstance(verifier, dict) or current_verifier_sha256(verifier) != certificate.get(
+        "actual_verifier_sha256"
+    ):
         raise PipelineError("Verification certificate verifier identity differs")
     proof = dict(certificate)
     verification_key = proof.pop("verification_key")
@@ -870,6 +889,7 @@ def replay_verification(
 
     provider = identity_provider or current_verifier_identity
     verifier = _json_object(provider(), "verifier identity")
+    verifier_sha256 = current_verifier_sha256(verifier)
     frozen_request, _request_sha = read_request_evidence(Path(capture_root) / "input/request.json")
     command = StageCommand.create(
         command_id="verification-replay",
@@ -887,7 +907,7 @@ def replay_verification(
         config_snapshot_sha256=str(frozen_request["platform_config_digest"]),
         contract_sha256=CONTRACT_SHA256,
         policy_sha256=check_policy_digest(),
-        expected_executor_sha256=digest(verifier),
+        expected_executor_sha256=verifier_sha256,
         predecessor_decision_id=None,
     )
     claim = ExecutionClaim(
@@ -895,7 +915,7 @@ def replay_verification(
         command_id=command.command_id,
         fence=1,
         owner_sha256=digest({"process": "verification-replay"}),
-        executor_sha256=digest(verifier),
+        executor_sha256=verifier_sha256,
         lane_key=None,
         expires_at=datetime(2099, 1, 1, tzinfo=UTC),
     )
