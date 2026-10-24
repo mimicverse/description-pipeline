@@ -177,7 +177,11 @@ def admit_observation_bundle(
                 with source.open(item) as input_stream, target.open("xb") as output_stream:
                     while block := input_stream.read(_READ_CHUNK):
                         output_stream.write(block)
-            return admit_native_observation(destination, request=request)
+            return admit_native_observation(
+                destination,
+                request=request,
+                resources_settled=True,
+            )
     except BaseException:
         if destination.exists():
             import shutil
@@ -338,7 +342,12 @@ class ArchiveDiscoverAdapter:
         destination: Path,
     ) -> NativeObservation:
         root = self.artifacts.materialize(artifact, destination)
-        return admit_native_observation(root, request=request, artifact_ref=artifact)
+        return admit_native_observation(
+            root,
+            request=request,
+            artifact_ref=artifact,
+            resources_settled=True,
+        )
 
 
 __all__ = [

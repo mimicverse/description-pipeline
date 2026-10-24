@@ -389,6 +389,7 @@ class DiscoverHandler:
                     observation.root,
                     request=native_request,
                     artifact_ref=effect_artifact,
+                    resources_settled=observation.resources_settled,
                 )
             except NativeDiscoverRefusal as refusal:
                 raise StageFailure(
@@ -506,7 +507,7 @@ class DiscoverHandler:
                 outcome="completed",
                 candidate_root=str(output),
                 checks_sha256=digest(checks),
-                resources_settled=True,
+                resources_settled=observation.resources_settled,
             )
         except NativeDiscoverRefusal as refusal:
             raise StageFailure(refusal.code, refusal.message) from refusal
