@@ -24,8 +24,11 @@ from description_pipeline.io import PipelineError, digest, file_digest, inventor
 from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
+    ProtocolError,
     StageCandidate,
     StageCommand,
+    StageDeferral,
+    StageEffectWait,
     StageFailure,
     StageResult,
 )
@@ -49,6 +52,7 @@ from description_pipeline.repository.publish import (
 from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import (
     ENGINEERING_MODEL_SCHEMA,
+    STAGE_EFFECT_WAIT_SCHEMA,
     STAGE_RESULT_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
     VERIFICATION_EXECUTION_SCHEMA,
@@ -646,12 +650,43 @@ class PublishHandlerTests(unittest.TestCase):
         self.fixture = PublishFixture()
         self.addCleanup(self.fixture.close)
 
-    def _run(self, *, command=None, workspace=None, claim=None, effects=None, handler=None):
+    def _run(
+        self,
+        *,
+        command=None,
+        workspace=None,
+        claim=None,
+        effects=None,
+        handler=None,
+        resume=None,
+    ):
         return (handler or self.fixture.handler).execute(
             command or self.fixture.command,
             claim or self.fixture.claim,
             workspace or self.fixture.workspace,
             effects=effects or self.fixture.effects,
+            resume=resume,
+        )
+
+    def _effect_wait(self, effect_key: str) -> StageEffectWait:
+        effect_id = self.fixture.effects.by_key[effect_key]
+        intent = self.fixture.effects.intents[effect_id]
+        settlement = self.fixture.effects.effect_settlement_for_key(effect_key)
+        self.assertIsNotNone(settlement)
+        self.assertIsNotNone(settlement.outbound_artifact)
+        return StageEffectWait(
+            schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+            run_id=self.fixture.command.run_id,
+            stage=self.fixture.command.stage,
+            command_id=self.fixture.command.command_id,
+            request_digest=self.fixture.command.request_digest,
+            effect_id=effect_id,
+            effect_key=effect_key,
+            effect_kind=intent.effect_kind,
+            intent_identity_digest=intent.identity_digest,
+            outbound_artifact_id=intent.outbound_artifact_id,
+            outbound_digest=intent.outbound_digest,
+            expected_state_digest=intent.expected_state_digest,
         )
 
     def _pr_recovery_inputs(self):
@@ -1512,11 +1547,13 @@ else:
             )
 
         original = PublicationRepository.push
-        with (
-            patch.object(PublicationRepository, "push", race_then_push),
-            self.assertRaises(publish_stage.PublishIncomplete),
-        ):
-            self._run()
+        with patch.object(PublicationRepository, "push", race_then_push):
+            result = self._run()
+        self.assertIsInstance(result, StageDeferral)
+        git_effect_id = self.fixture.effects.by_key[publish_stage.GIT_EFFECT_KEY]
+        self.assertEqual(result.effect_id, git_effect_id)
+        self.assertIs(self.fixture.effects.states[git_effect_id], EffectState.UNKNOWN)
+        self.assertEqual(self.fixture.pr.create_calls, 0)
         observed = git(self.fixture.repo, "ls-remote", "origin", f"refs/heads/{branch_ref}").stdout.split()[0]
         racing = git(seed, "rev-parse", "HEAD").stdout.strip()
         self.assertEqual(observed, racing)
@@ -1551,12 +1588,49 @@ else:
         hook = self.fixture.remote / "hooks/pre-receive"
         hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         hook.chmod(0o755)
-        with self.assertRaises(publish_stage.PublishIncomplete):
-            self._run()
+        result = self._run()
+        self.assertIsInstance(result, StageDeferral)
         branch_ref = self.fixture.command.request["branch_ref"]
         branch = git(self.fixture.repo, "ls-remote", "origin", f"refs/heads/{branch_ref}")
         self.assertEqual(branch.stdout, "")
         git_effect_id = self.fixture.effects.by_key[publish_stage.GIT_EFFECT_KEY]
+        self.assertEqual(result.effect_id, git_effect_id)
+        self.assertIs(self.fixture.effects.states[git_effect_id], EffectState.UNKNOWN)
+        self.assertEqual(self.fixture.pr.create_calls, 0)
+
+    def test_unavailable_git_readback_returns_deferral(self) -> None:
+        original_observe = PublicationRepository.observe
+        push_attempted = False
+
+        def lose_push(*args, **kwargs):
+            nonlocal push_attempted
+            del args, kwargs
+            push_attempted = True
+            raise RuntimeError("response lost")
+
+        def observe_after_push_fails(*args, **kwargs):
+            if push_attempted:
+                raise RuntimeError("readback unavailable")
+            return original_observe(*args, **kwargs)
+
+        with (
+            patch.object(
+                PublicationRepository,
+                "push",
+                autospec=True,
+                side_effect=lose_push,
+            ),
+            patch.object(
+                PublicationRepository,
+                "observe",
+                autospec=True,
+                side_effect=observe_after_push_fails,
+            ),
+        ):
+            result = self._run()
+        self.assertIsInstance(result, StageDeferral)
+        git_effect_id = self.fixture.effects.by_key[publish_stage.GIT_EFFECT_KEY]
+        self.assertEqual(result.effect_id, git_effect_id)
         self.assertIs(self.fixture.effects.states[git_effect_id], EffectState.UNKNOWN)
         self.assertEqual(self.fixture.pr.create_calls, 0)
 
@@ -1607,6 +1681,107 @@ else:
             1,
         )
 
+    def test_unobserved_pr_effect_returns_deferral_without_resend(self) -> None:
+        original_create = self.fixture.pr.create
+        original_observe = self.fixture.pr.observe
+
+        def create_then_lose(**kwargs):
+            original_create(**kwargs)
+            raise RuntimeError("response lost")
+
+        def observe_after_write_fails(**kwargs):
+            if self.fixture.pr.create_calls:
+                raise RuntimeError("readback unavailable")
+            return original_observe(**kwargs)
+
+        with (
+            patch.object(self.fixture.pr, "create", side_effect=create_then_lose),
+            patch.object(self.fixture.pr, "observe", side_effect=observe_after_write_fails),
+        ):
+            result = self._run()
+
+        self.assertIsInstance(result, StageDeferral)
+        effect_id = self.fixture.effects.by_key[publish_stage.PR_EFFECT_KEY]
+        self.assertEqual(result.effect_id, effect_id)
+        self.assertIs(self.fixture.effects.states[effect_id], EffectState.UNKNOWN)
+        self.assertEqual(self.fixture.pr.create_calls, 1)
+        self.assertEqual(self.fixture.pr.update_calls, 0)
+
+    def test_mismatched_pr_response_returns_deferral(self) -> None:
+        request = self.fixture.command.request
+
+        def create_mismatch(**kwargs):
+            self.fixture.pr.create_calls += 1
+            return PullRequestObservation(
+                number=1,
+                url="https://example.test/example/robot/pull/1",
+                state="OPEN",
+                base_ref=request["base_ref"],
+                head_ref=request["branch_ref"],
+                head_oid=kwargs["candidate_commit"],
+                title="different",
+                body="different",
+            )
+
+        with patch.object(self.fixture.pr, "create", side_effect=create_mismatch):
+            result = self._run()
+
+        self.assertIsInstance(result, StageDeferral)
+        effect_id = self.fixture.effects.by_key[publish_stage.PR_EFFECT_KEY]
+        self.assertEqual(result.effect_id, effect_id)
+        self.assertIs(self.fixture.effects.states[effect_id], EffectState.UNKNOWN)
+        self.assertEqual(self.fixture.pr.create_calls, 1)
+        self.assertEqual(self.fixture.pr.update_calls, 0)
+
+    def test_resume_reuses_settled_effects_without_external_writes(self) -> None:
+        first = self._run()
+        self.assertEqual(first.outcome, "completed")
+        before = (
+            self.fixture.effects.authorizations,
+            self.fixture.pr.observe_calls,
+            self.fixture.pr.create_calls,
+            self.fixture.pr.update_calls,
+        )
+        for index, effect_key in enumerate(
+            (publish_stage.GIT_EFFECT_KEY, publish_stage.PR_EFFECT_KEY)
+        ):
+            workspace = StageWorkspace(
+                root=self.fixture.root / f"resume-settled-{index}",
+                inputs=self.fixture.workspace.inputs,
+            )
+            with (
+                patch.object(
+                    PublicationRepository,
+                    "push",
+                    side_effect=AssertionError("a resumed Git effect must not be sent"),
+                ),
+                patch.object(
+                    self.fixture.pr,
+                    "create",
+                    side_effect=AssertionError("a resumed PR effect must not be sent"),
+                ),
+                patch.object(
+                    self.fixture.pr,
+                    "update",
+                    side_effect=AssertionError("a resumed PR effect must not be sent"),
+                ),
+            ):
+                resumed = self._run(
+                    workspace=workspace,
+                    resume=self._effect_wait(effect_key),
+                )
+
+            self.assertEqual(resumed.outcome, "completed")
+            self.assertEqual(
+                (
+                    self.fixture.effects.authorizations,
+                    self.fixture.pr.observe_calls,
+                    self.fixture.pr.create_calls,
+                    self.fixture.pr.update_calls,
+                ),
+                before,
+            )
+
     def test_unknown_pr_effect_requires_the_claimless_reconciler(self) -> None:
         self._run()
         self.fixture.effects.force_unknown(publish_stage.PR_EFFECT_KEY)
@@ -1619,8 +1794,10 @@ else:
             self.fixture.pr.create_calls,
             self.fixture.pr.update_calls,
         )
-        with self.assertRaisesRegex(PipelineError, "pr_recovery_required"):
-            self._run(workspace=workspace)
+        result = self._run(workspace=workspace)
+        self.assertIsInstance(result, StageDeferral)
+        effect_id = self.fixture.effects.by_key[publish_stage.PR_EFFECT_KEY]
+        self.assertEqual(result.effect_id, effect_id)
         self.assertEqual(
             (
                 self.fixture.pr.observe_calls,
@@ -1652,14 +1829,50 @@ else:
             outbound_root=self._root_with_file("unknown-effect"),
         )
         self.fixture.effects.force_unknown(publish_stage.GIT_EFFECT_KEY)
-        with (
-            patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")),
-            self.assertRaises(publish_stage.PublishIncomplete),
+        with patch.object(
+            PublicationRepository,
+            "push",
+            side_effect=AssertionError("must not resend"),
         ):
-            self._run()
+            result = self._run()
+        self.assertIsInstance(result, StageDeferral)
+        git_effect_id = self.fixture.effects.by_key[publish_stage.GIT_EFFECT_KEY]
+        self.assertEqual(result.effect_id, git_effect_id)
         self.assertEqual(self.fixture.pr.observe_calls, 0)
         self.assertEqual(self.fixture.pr.create_calls, 0)
         self.assertEqual(self.fixture.pr.update_calls, 0)
+
+    def test_resume_rejects_noncanonical_wait_identity(self) -> None:
+        first = self._run()
+        self.assertEqual(first.outcome, "completed")
+        wait = self._effect_wait(publish_stage.PR_EFFECT_KEY)
+        tampered = (
+            replace(wait, run_id="other-run"),
+            replace(wait, stage="verify"),
+            replace(wait, command_id="other-command"),
+            replace(wait, request_digest="0" * 64),
+            replace(wait, effect_id="other-effect"),
+            replace(wait, effect_key="publish.other"),
+            replace(wait, effect_kind="git_ref_update"),
+            replace(wait, intent_identity_digest="0" * 64),
+            replace(wait, outbound_artifact_id="other-outbound"),
+            replace(wait, outbound_digest="0" * 64),
+            replace(wait, expected_state_digest="0" * 64),
+        )
+        with patch.object(
+            PublicationRepository,
+            "push",
+            side_effect=AssertionError("a rejected wait must not be sent"),
+        ):
+            for index, invalid in enumerate(tampered):
+                workspace = StageWorkspace(
+                    root=self.fixture.root / f"resume-invalid-{index}",
+                    inputs=self.fixture.workspace.inputs,
+                )
+                with self.subTest(index=index):
+                    with self.assertRaises(ProtocolError) as raised:
+                        self._run(workspace=workspace, resume=invalid)
+                    self.assertEqual(raised.exception.code, "publish.resume_wait")
 
     def _root_with_file(self, name: str) -> Path:
         root = self.fixture.root / name

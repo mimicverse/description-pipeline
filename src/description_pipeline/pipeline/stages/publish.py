@@ -40,6 +40,8 @@ from ..contracts import (
     ProtocolError,
     StageCandidate,
     StageCommand,
+    StageDeferral,
+    StageEffectWait,
     StageExecution,
     StageFailure,
 )
@@ -828,7 +830,7 @@ def _git_effect(
     settlement: EffectSettlement | None,
     plan_path: Path,
     plan_sha256: str,
-) -> tuple[str, dict, bool]:
+) -> tuple[str, dict, bool] | StageDeferral:
     if settlement is not None and settlement.state is EffectState.SATISFIED:
         observation, observation_root = _effect_observation(
             artifacts=artifacts,
@@ -844,7 +846,7 @@ def _git_effect(
             raise PublicationError("publish.git_effect_mismatch")
         return settlement.effect_id, observation, True
     if settlement is not None and settlement.state is EffectState.UNKNOWN:
-        raise PublicationError("publish.git_recovery_required", {"effect_id": settlement.effect_id})
+        return StageDeferral(settlement.effect_id)
     if settlement is not None and settlement.state is EffectState.CONFLICT:
         raise StageFailure("publish_git_effect_conflict", "The Git effect is conflicted")
     if settlement is not None and settlement.state is EffectState.DEFINITELY_FAILED:
@@ -890,7 +892,22 @@ def _git_effect(
             expected_head_oid=request.expected_head_oid,
         )
     except Exception as error:
-        observed = repository.observe(request.branch_ref)
+        try:
+            observed = repository.observe(request.branch_ref)
+        except Exception as observation_error:
+            detail = workspace.root / "effects/git-timeout"
+            detail.mkdir(parents=True, exist_ok=True)
+            write_json(
+                detail / "timeout.json",
+                {
+                    "error": type(error).__name__,
+                    "message": str(error),
+                    "observation_error": type(observation_error).__name__,
+                    "observation_message": str(observation_error),
+                },
+            )
+            effects.record_timeout(effect_id, source="publish.git", detail_root=detail)
+            return StageDeferral(effect_id)
         if observed == candidate.commit:
             observation = {
                 "state": "known",
@@ -915,10 +932,10 @@ def _git_effect(
             _require_satisfied(effects, key=GIT_EFFECT_KEY, effect_id=effect_id)
             return effect_id, observation, False
         detail = workspace.root / "effects/git-timeout"
-        detail.mkdir(parents=True)
+        detail.mkdir(parents=True, exist_ok=True)
         write_json(detail / "timeout.json", {"error": type(error).__name__, "message": str(error)})
         effects.record_timeout(effect_id, source="publish.git", detail_root=detail)
-        raise PublishIncomplete("publish.git_unknown", {"effect_id": effect_id}) from error
+        return StageDeferral(effect_id)
 
     observed = _observe_git_exact(repository, request, candidate)
     observed["publication_plan_sha256"] = plan_sha256
@@ -936,6 +953,13 @@ def _git_effect(
         state_class="known" if observed["state"] == "known" else "unobservable",
         observation_root=observation_root,
     )
+    settlement = effects.effect_settlement_for_key(GIT_EFFECT_KEY)
+    if (
+        settlement is not None
+        and settlement.effect_id == effect_id
+        and settlement.state is EffectState.UNKNOWN
+    ):
+        return StageDeferral(effect_id)
     _require_satisfied(effects, key=GIT_EFFECT_KEY, effect_id=effect_id)
     if observed["state"] != "known":
         raise StageFailure("publish_git_conflict", "Observed review branch does not match the fixed candidate")
@@ -1005,10 +1029,10 @@ def _pr_matches(
 def _read_sealed_pull_request_outbound_root(
     *,
     request: PublishDomainRequest,
-    intent: EffectIntent,
+    intent: EffectIntent | None,
     outbound_root: Path,
 ) -> dict[str, Any]:
-    """Bind one PR-effect outbound to its immutable intent and Publish command."""
+    """Validate one PR-effect outbound and optionally bind its immutable intent."""
 
     outbound_root = Path(outbound_root)
     if set(inventory(outbound_root, exclude=("manifest.json",))) != {"request.json"}:
@@ -1020,21 +1044,22 @@ def _read_sealed_pull_request_outbound_root(
         raise PublicationError("publish.pr_recovery_request")
 
     expected_state = {name: sealed_request[name] for name in _PR_EXPECTED_STATE_FIELDS}
-    if expected_state != dict(intent.expected_state):
-        raise PublicationError(
-            "publish.pr_recovery_expected_state",
-            {"effect_id": intent.effect_id},
-        )
     target = {
         "repository": sealed_request["repository"],
         "base_ref": sealed_request["base_ref"],
         "head_ref": sealed_request["head_ref"],
     }
-    if set(intent.target) != _PR_TARGET_FIELDS or target != dict(intent.target):
-        raise PublicationError(
-            "publish.pr_recovery_target",
-            {"effect_id": intent.effect_id},
-        )
+    if intent is not None:
+        if expected_state != dict(intent.expected_state):
+            raise PublicationError(
+                "publish.pr_recovery_expected_state",
+                {"effect_id": intent.effect_id},
+            )
+        if set(intent.target) != _PR_TARGET_FIELDS or target != dict(intent.target):
+            raise PublicationError(
+                "publish.pr_recovery_target",
+                {"effect_id": intent.effect_id},
+            )
     command_binding = {
         "repository": request.repository_slug,
         "base_ref": request.base_ref,
@@ -1064,6 +1089,35 @@ def _expected_pr_matches(
         and observation.url == expected_pr["url"]
         and observation.head_oid == expected_pr["head_oid"]
     )
+
+
+def _defer_pull_request_observation(
+    *,
+    effects: StageEffectPort,
+    effect_id: str,
+    workspace: StageWorkspace,
+    observations: tuple[PullRequestObservation, ...],
+    reason: str,
+) -> StageDeferral:
+    """Retain inconclusive PR readback and yield without claiming a conflict."""
+
+    root = workspace.root / "effects/pr-unobservable"
+    root.mkdir(parents=True, exist_ok=True)
+    write_json(
+        root / "observation.json",
+        {
+            "action": "absent" if not observations else "unobservable",
+            "reason": reason,
+            "observed_pull_requests": [observation.to_record() for observation in observations],
+        },
+    )
+    effects.record_observation(
+        effect_id,
+        source="publish.pr",
+        state_class="absent" if not observations else "unobservable",
+        observation_root=root,
+    )
+    return StageDeferral(effect_id)
 
 
 class PublishPullRequestReconciliationAdapter:
@@ -1170,7 +1224,7 @@ def _pr_effect(
     workspace: StageWorkspace,
     title: str,
     body: str,
-) -> tuple[str, PullRequestObservation, bool]:
+) -> tuple[str, PullRequestObservation, bool] | StageDeferral:
     settlement = effects.effect_settlement_for_key(PR_EFFECT_KEY)
     if settlement is not None and settlement.state is EffectState.SATISFIED:
         observation, _observation_root = _effect_observation(
@@ -1188,7 +1242,7 @@ def _pr_effect(
         )
         return settlement.effect_id, pull_request, True
     if settlement is not None and settlement.state is EffectState.UNKNOWN:
-        raise PublicationError("publish.pr_recovery_required", {"effect_id": settlement.effect_id})
+        return StageDeferral(settlement.effect_id)
     if settlement is not None and settlement.state is EffectState.CONFLICT:
         raise StageFailure("publish_pr_effect_conflict", "The PR effect is conflicted")
     if settlement is not None and settlement.state is EffectState.DEFINITELY_FAILED:
@@ -1257,28 +1311,72 @@ def _pr_effect(
                 body=body,
             )
     except Exception as error:
-        observed = client.observe(
-            repository=request.repository_slug,
-            base_ref=request.base_ref,
-            head_ref=request.branch_ref,
-            candidate_commit=candidate.commit,
-        )
+        try:
+            observed = client.observe(
+                repository=request.repository_slug,
+                base_ref=request.base_ref,
+                head_ref=request.branch_ref,
+                candidate_commit=candidate.commit,
+            )
+        except Exception as observation_error:
+            detail = workspace.root / "effects/pr-timeout"
+            detail.mkdir(parents=True, exist_ok=True)
+            write_json(
+                detail / "timeout.json",
+                {
+                    "error": type(error).__name__,
+                    "message": str(error),
+                    "observation_error": type(observation_error).__name__,
+                    "observation_message": str(observation_error),
+                },
+            )
+            effects.record_timeout(effect_id, source="publish.pr", detail_root=detail)
+            return StageDeferral(effect_id)
         if len(observed) == 1:
+            if not _pr_matches(
+                observed[0],
+                request=request,
+                candidate_commit=candidate.commit,
+                title=title,
+                body=body,
+            ):
+                return _defer_pull_request_observation(
+                    effects=effects,
+                    effect_id=effect_id,
+                    workspace=workspace,
+                    observations=observed,
+                    reason="response-mismatch",
+                )
             observation = observed[0]
             action = "reconciled"
+        elif len(observed) > 1:
+            return _defer_pull_request_observation(
+                effects=effects,
+                effect_id=effect_id,
+                workspace=workspace,
+                observations=observed,
+                reason="multiple-responses",
+            )
         else:
             detail = workspace.root / "effects/pr-timeout"
-            detail.mkdir(parents=True)
+            detail.mkdir(parents=True, exist_ok=True)
             write_json(detail / "timeout.json", {"error": type(error).__name__, "message": str(error)})
             effects.record_timeout(effect_id, source="publish.pr", detail_root=detail)
-            raise PublishIncomplete("publish.pr_unknown", {"effect_id": effect_id}) from error
-    _require_pr_match(
+            return StageDeferral(effect_id)
+    if not _pr_matches(
         observation,
         request=request,
         candidate_commit=candidate.commit,
         title=title,
         body=body,
-    )
+    ):
+        return _defer_pull_request_observation(
+            effects=effects,
+            effect_id=effect_id,
+            workspace=workspace,
+            observations=(observation,),
+            reason="response-mismatch",
+        )
     observed_again = client.observe(
         repository=request.repository_slug,
         base_ref=request.base_ref,
@@ -1286,7 +1384,13 @@ def _pr_effect(
         candidate_commit=candidate.commit,
     )
     if len(observed_again) != 1 or observed_again[0] != observation:
-        raise StageFailure("publish_pr_ambiguous", "Pull request identity is not unique and exact")
+        return _defer_pull_request_observation(
+            effects=effects,
+            effect_id=effect_id,
+            workspace=workspace,
+            observations=observed_again,
+            reason="readback-changed",
+        )
     payload = {
         "action": action,
         "pull_request": observation.to_record(),
@@ -1304,8 +1408,140 @@ def _pr_effect(
         state_class="known",
         observation_root=observation_root,
     )
+    settlement = effects.effect_settlement_for_key(PR_EFFECT_KEY)
+    if (
+        settlement is not None
+        and settlement.effect_id == effect_id
+        and settlement.state is EffectState.UNKNOWN
+    ):
+        return StageDeferral(effect_id)
     _require_satisfied(effects, key=PR_EFFECT_KEY, effect_id=effect_id)
     return effect_id, observation, False
+
+
+def _verify_resume_wait(
+    *,
+    command: StageCommand,
+    wait: StageEffectWait,
+    request: PublishDomainRequest,
+    effects: StageEffectPort,
+    artifacts: ArtifactStore,
+    repository: PublicationRepository,
+    workspace: StageWorkspace,
+) -> None:
+    """Reconstruct the non-secret wait identity from canonical Publish effects."""
+
+    if (
+        wait.run_id != command.run_id
+        or wait.stage != command.stage
+        or wait.command_id != command.command_id
+        or wait.request_digest != command.request_digest
+    ):
+        raise ProtocolError(
+            "publish.resume_wait",
+            {"where": "command", "command_id": command.command_id},
+        )
+    settlement = effects.effect_settlement_for_key(wait.effect_key)
+    if (
+        settlement is None
+        or settlement.effect_id != wait.effect_id
+        or settlement.state not in {EffectState.SATISFIED, EffectState.DEFINITELY_FAILED}
+    ):
+        raise ProtocolError(
+            "publish.resume_wait",
+            {"where": "settlement", "effect_key": wait.effect_key},
+        )
+    outbound = settlement.outbound_artifact
+    if (
+        outbound is None
+        or outbound.artifact_id != wait.outbound_artifact_id
+        or outbound.set_sha256 != wait.outbound_digest
+    ):
+        raise ProtocolError(
+            "publish.resume_wait",
+            {"where": "outbound", "effect_key": wait.effect_key},
+        )
+
+    if wait.effect_key == GIT_EFFECT_KEY:
+        if wait.effect_kind != "git_ref_update":
+            raise ProtocolError(
+                "publish.resume_wait",
+                {"where": "effect_kind", "effect_key": wait.effect_key},
+            )
+        outbound_root = artifacts.materialize(
+            outbound,
+            workspace.root / "resume/git-outbound",
+        )
+        sealed_git = _read_sealed_git_outbound_root(
+            repository=repository,
+            request=request,
+            outbound_root=Path(outbound_root),
+        )
+        sealed_request = _require_object(
+            read_data(sealed_git.outbound_root / "request.json"),
+            "sealed Git effect request",
+        )
+        expected_state = {
+            name: value
+            for name, value in sealed_request.items()
+            if name != "parents"
+        }
+        target = {
+            "repository": request.repository_slug,
+            "branch_ref": request.branch_ref,
+        }
+    elif wait.effect_key == PR_EFFECT_KEY:
+        if wait.effect_kind != "pr_upsert":
+            raise ProtocolError(
+                "publish.resume_wait",
+                {"where": "effect_kind", "effect_key": wait.effect_key},
+            )
+        outbound_root = artifacts.materialize(
+            outbound,
+            workspace.root / "resume/pr-outbound",
+        )
+        sealed_request = _read_sealed_pull_request_outbound_root(
+            request=request,
+            intent=None,
+            outbound_root=Path(outbound_root),
+        )
+        expected_state = {
+            name: sealed_request[name]
+            for name in _PR_EXPECTED_STATE_FIELDS
+        }
+        target = {
+            "repository": sealed_request["repository"],
+            "base_ref": sealed_request["base_ref"],
+            "head_ref": sealed_request["head_ref"],
+        }
+    else:
+        raise ProtocolError(
+            "publish.resume_wait",
+            {"where": "effect_key", "effect_key": wait.effect_key},
+        )
+
+    expected_state_digest = digest(expected_state)
+    intent_identity_digest = digest(
+        {
+            "command_id": command.command_id,
+            "effect_id": settlement.effect_id,
+            "effect_key": wait.effect_key,
+            "effect_kind": wait.effect_kind,
+            "expected_state": expected_state,
+            "expected_state_digest": expected_state_digest,
+            "outbound_artifact_id": outbound.artifact_id,
+            "outbound_digest": outbound.set_sha256,
+            "target": target,
+        }
+    )
+    if (
+        wait.expected_state_digest != expected_state_digest
+        or wait.intent_identity_digest != intent_identity_digest
+    ):
+        raise ProtocolError(
+            "publish.resume_wait",
+            {"where": "intent_identity", "effect_key": wait.effect_key},
+        )
 
 
 class PublishHandler:
@@ -1382,7 +1618,8 @@ class PublishHandler:
         workspace: StageWorkspace,
         *,
         effects: StageEffectPort,
-    ) -> StageExecution:
+        resume: StageEffectWait | None = None,
+    ) -> StageExecution | StageDeferral:
         if command.stage != "publish" or (
             command.predecessor_decision_id is None and command.diagnostic_scope is None
         ):
@@ -1410,13 +1647,20 @@ class PublishHandler:
             repository_root,
             expected_origin=request.origin_url,
         )
+        if resume is not None:
+            _verify_resume_wait(
+                command=command,
+                wait=resume,
+                request=request,
+                effects=effects,
+                artifacts=self.artifacts,
+                repository=repository,
+                workspace=workspace,
+            )
         git_settlement = effects.effect_settlement_for_key(GIT_EFFECT_KEY)
         candidate: PreparedCandidate | None = None
         if git_settlement is not None and git_settlement.state is EffectState.UNKNOWN:
-            raise PublishIncomplete(
-                "publish.git_effect_unknown",
-                {"effect_id": git_settlement.effect_id},
-            )
+            return StageDeferral(git_settlement.effect_id)
         elif git_settlement is not None and git_settlement.state is EffectState.SATISFIED:
             sealed = _read_sealed_git_outbound(
                 artifacts=self.artifacts,
@@ -1490,7 +1734,7 @@ class PublishHandler:
             pr_body = inputs.pr_body
             publisher_tool = inputs.publisher_tool
             actual_executor = inputs.actual_executor_sha256
-            git_effect_id, git_observation, git_reused = _git_effect(
+            git_result = _git_effect(
                 effects=effects,
                 artifacts=self.artifacts,
                 repository=repository,
@@ -1501,12 +1745,17 @@ class PublishHandler:
                 plan_path=plan_path,
                 plan_sha256=plan_sha256,
             )
+            if isinstance(git_result, StageDeferral):
+                if candidate is not None:
+                    candidate.cleanup()
+                return git_result
+            git_effect_id, git_observation, git_reused = git_result
         elif git_settlement.state is EffectState.CONFLICT:
             raise StageFailure("publish_git_effect_conflict", "The Git effect is conflicted")
         elif git_settlement.state is EffectState.DEFINITELY_FAILED:
             raise StageFailure("publish_git_effect_failed", "The Git effect is definitively failed")
         try:
-            pr_effect_id, pr_observation, pr_reused = _pr_effect(
+            pr_result = _pr_effect(
                 effects=effects,
                 artifacts=self.artifacts,
                 client=pull_requests,
@@ -1516,6 +1765,9 @@ class PublishHandler:
                 title=pr_title,
                 body=pr_body,
             )
+            if isinstance(pr_result, StageDeferral):
+                return pr_result
+            pr_effect_id, pr_observation, pr_reused = pr_result
             if not (git_reused and pr_reused):
                 if repository.observe(request.branch_ref) != candidate_facts.commit:
                     raise StageFailure("publish_remote_drift", "Published branch changed before stage completion")
