@@ -224,7 +224,11 @@ def _stamp(root: Path, receipt: dict) -> None:
 def _check(root: Path) -> dict:
     from .verification.solidworks_urdf import check_bundle, native_receipts
 
-    return check_bundle(root, native_receipts=native_receipts(root))
+    return check_bundle(
+        root,
+        native_receipts=native_receipts(root),
+        require_native_receipts=True,
+    )
 
 
 def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:

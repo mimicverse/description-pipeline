@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -618,6 +619,31 @@ class HermeticSixStageTests(unittest.TestCase):
         urdf = (self.root / "verify/urdf/robot.urdf").read_text(encoding="utf-8")
         self.assertIn("WARNING metadata.non_native", urdf)
         return original_handoff, native, verified
+
+    def test_published_subject_supports_self_contained_cli_check(self) -> None:
+        from description_pipeline.verification.solidworks_urdf import check_bundle
+
+        _original_handoff, _native, verified = self._generate_and_verify()
+        published = self.root / "self-contained"
+        for name in ("input", "evidence", "model", "urdf", "meshes"):
+            shutil.copytree(self.root / "verify" / name, published / name)
+        shutil.copy2(self.root / "verify/tool.json", published / "tool.json")
+        shutil.copy2(self.root / "verify/manifest.json", published / "manifest.json")
+        (published / "reports").mkdir()
+        shutil.copy2(
+            self.root / "verify/reports/quality.json",
+            published / "reports/quality.json",
+        )
+
+        report = check_bundle(published)
+        self.assertIs(report["passed"], True, report.get("checks"))
+        self.assertEqual(report["subject_sha256"], verified["subject_sha256"])
+
+        with_required_receipts = check_bundle(
+            published,
+            require_native_receipts=True,
+        )
+        self.assertIs(with_required_receipts["passed"], False)
 
     def _capture_with_environment_mutation(self, mutate) -> tuple[Path, dict]:
         from description_pipeline.sources.solidworks import freeze as freeze_module

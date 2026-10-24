@@ -1250,9 +1250,21 @@ def _capture_preparation(root, manifest):
             sorted(item["instances"]) == sorted(before_rows[key]["instances"]),
             "Child rebuild instances contradict the graph",
         )
-        _require(item["state_before"] == before_rows[key]["state"], "Child state_before contradicts the graph")
         state_before = state_row(item["state_before"], "Child state_before")
         state_after = state_row(item["state_after"], "Child state_after")
+        _require(
+            _same_native_path(state_before["path"], item["path"]),
+            "Child state_before names another document",
+        )
+        _require(
+            state_before["configuration"] == before_rows[key]["state"]["configuration"],
+            "Child state_before changed the assembly configuration",
+        )
+        _require(
+            _same_native_path(state_after["path"], item["path"])
+            and state_after["configuration"] == state_before["configuration"],
+            "Child state_after changed its document or configuration",
+        )
         _require(
             state_before["needs_rebuild2_value"] in (1, 2)
             and state_after["needs_rebuild2_value"] == 0
@@ -1735,7 +1747,7 @@ def _tool(root, native_receipts=None):
         Version(version)
     result = {"version": tool["version"], "source_sha256": tool["source_sha256"]}
     if native_receipts is not None:
-        result["transfer"] = _native_receipts_evidence(root, native_receipts)
+        _native_receipts_evidence(root, native_receipts)
     return result
 
 
@@ -2754,7 +2766,12 @@ def native_gate_warning_diagnostics(details: dict) -> list[dict]:
     return projected
 
 
-def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
+def evaluate_bundle(
+    root: Path,
+    *,
+    native_receipts=None,
+    require_native_receipts: bool = False,
+) -> dict:
     """Recompute the quality report without reading the saved quality decision.
 
     ``native_receipts`` are the immutable receipt bytes resolved by the
@@ -2803,6 +2820,7 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
                 manifest,
                 native_geometry=native_geometry,
                 native_receipts=native_receipts,
+                require_native_receipts=require_native_receipts,
             ),
         )
     if model is not None:
@@ -3016,6 +3034,7 @@ def _verify_model(
     *,
     native_geometry=None,
     native_receipts=None,
+    require_native_receipts=False,
 ):
     from .solidworks_physics import verify_physics
 
@@ -3027,6 +3046,7 @@ def _verify_model(
         source,
         manifest,
         native_receipts=native_receipts,
+        require_native_receipts=require_native_receipts,
     )
     gates.add("model.policy", lambda: _policy(source, model))
     gates.add("source.carrier_binding", lambda: _carrier_binding(source, carrier))
@@ -3171,7 +3191,14 @@ def _verify_model(
     gates.add("consumer.urdf", lambda: load_consumer(root))
 
 
-def _metadata_value_warnings(root, source, manifest, *, native_receipts=None):
+def _metadata_value_warnings(
+    root,
+    source,
+    manifest,
+    *,
+    native_receipts=None,
+    require_native_receipts=False,
+):
     if not isinstance(manifest, dict):
         raise PipelineError("Delivery manifest is unavailable for metadata provenance")
     records = manifest.get("subject", {}).get("files", [])
@@ -3195,38 +3222,52 @@ def _metadata_value_warnings(root, source, manifest, *, native_receipts=None):
                     "Native tool evidence differs from the immutable native receipt",
                 )
         else:
-            transfer_path = confined(root, "transfer-manifest.json")
-            transfer = read_data(transfer_path)
-            _require(isinstance(transfer, dict), "Native transfer manifest is not an object")
-            transferred_files = transfer.get("files")
-            _require(
-                isinstance(transferred_files, dict) and bool(transferred_files),
-                "Native transfer manifest has no file inventory",
-            )
-            for relative, expected_sha256 in transferred_files.items():
+            transfer_path = confined(root, "transfer-manifest.json", exists=False)
+            if transfer_path.is_file() or native_tool_path.is_file():
                 _require(
-                    isinstance(relative, str)
-                    and bool(relative)
-                    and isinstance(expected_sha256, str)
-                    and re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is not None,
-                    "Native transfer manifest carries a malformed file row",
+                    transfer_path.is_file() and native_tool_path.is_file(),
+                    "Native transfer receipt and tool evidence must travel together",
                 )
+                transfer = read_data(transfer_path)
+                _require(isinstance(transfer, dict), "Native transfer manifest is not an object")
+                transferred_files = transfer.get("files")
                 _require(
-                    file_digest(confined(root, relative)) == expected_sha256,
-                    f"Native transfer bytes differ from their manifest: {relative}",
+                    isinstance(transferred_files, dict) and bool(transferred_files),
+                    "Native transfer manifest has no file inventory",
                 )
-            native_tool = read_data(native_tool_path)
-            _require(
-                native_tool == transfer.get("native_tool"),
-                "Native tool evidence differs from the verified transfer identity",
-            )
-            native_tool_sha256 = digest(native_tool)
-            _require(
-                transfer.get("native_tool_sha256") == native_tool_sha256
-                and transferred_files.get("reports/native-tool.json") == native_tool_sha256
-                and file_digest(native_tool_path) == native_tool_sha256,
-                "Native tool bytes are not sealed by the transfer identity",
-            )
+                for relative, expected_sha256 in transferred_files.items():
+                    _require(
+                        isinstance(relative, str)
+                        and bool(relative)
+                        and isinstance(expected_sha256, str)
+                        and re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is not None,
+                        "Native transfer manifest carries a malformed file row",
+                    )
+                    _require(
+                        file_digest(confined(root, relative)) == expected_sha256,
+                        f"Native transfer bytes differ from their manifest: {relative}",
+                    )
+                native_tool = read_data(native_tool_path)
+                _require(
+                    native_tool == transfer.get("native_tool"),
+                    "Native tool evidence differs from the verified transfer identity",
+                )
+                native_tool_sha256 = digest(native_tool)
+                _require(
+                    transfer.get("native_tool_sha256") == native_tool_sha256
+                    and transferred_files.get("reports/native-tool.json") == native_tool_sha256
+                    and file_digest(native_tool_path) == native_tool_sha256,
+                    "Native tool bytes are not sealed by the transfer identity",
+                )
+            elif require_native_receipts:
+                raise PipelineError("Native receipt bytes are required at this verification boundary")
+            else:
+                native_tool = runtime.get("toolchain")
+                _require(
+                    isinstance(native_tool, dict),
+                    "Self-contained delivery carries no native tool identity",
+                )
+                native_tool_sha256 = digest(native_tool)
         closure = evidence.dependency_closure(root)
         return metadata_value_warnings(
             runtime,
@@ -4145,9 +4186,18 @@ def _expectation_bounds(bounds):
     return list(bounds)
 
 
-def check_bundle(root: Path, *, native_receipts=None) -> dict:
+def check_bundle(
+    root: Path,
+    *,
+    native_receipts=None,
+    require_native_receipts: bool = False,
+) -> dict:
     """Recompute all gates and require an exact binding to the saved report."""
-    report = evaluate_bundle(root, native_receipts=native_receipts)
+    report = evaluate_bundle(
+        root,
+        native_receipts=native_receipts,
+        require_native_receipts=require_native_receipts,
+    )
     try:
         saved = read_data(confined(Path(root), "reports/quality.json"))
         # The quality report is a JSON document: bind in the JSON data model so a

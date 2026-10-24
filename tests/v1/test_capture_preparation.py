@@ -30,6 +30,7 @@ from tests.v1.test_stage_transfer import (
 TOP = r"C:\capture\source\robot.SLDASM"
 PART = r"C:\capture\source\arm.SLDPRT"
 VIRTUAL = "/tmp/swx21040/VC~~/waist/virtual.SLDPRT"
+CHILD_ASSEMBLY = r"C:\capture\source\arm.SLDASM"
 
 
 def _normalized(path: str) -> str:
@@ -340,6 +341,114 @@ def payload(*, virtual_reuse: bool = False) -> dict:
     }
 
 
+def dynamic_child_payload() -> dict:
+    """One clean initial child becomes pending before its fresh rebuild turn."""
+
+    value = payload()
+    preparation = value["scene"]["notes"]["capture_preparation"]
+    topology = [
+        row
+        for row in preparation["topology_before"]
+        if row["instance"] != "arm-2"
+    ]
+    child = next(row for row in topology if row["instance"] == "arm-1")
+    child.update(
+        document_path=CHILD_ASSEMBLY,
+        normalized_path=_normalized(CHILD_ASSEMBLY),
+        document_type=2,
+    )
+    preparation["topology_before"] = _sort_topology(topology)
+    preparation["topology_after"] = copy.deepcopy(preparation["topology_before"])
+    preparation["component_count"] = 1
+    preparation["assembly_document_count"] = 2
+    preparation["used_api"] = (
+        "IModelDocExtension.NeedsRebuild2/"
+        "IConfiguration.NeedsRebuild/"
+        "IModelDocExtension.Rebuild(swForceRebuildAll=2)"
+    )
+    preparation["rebuild_performed"] = True
+    child_state = _state(CHILD_ASSEMBLY)
+    preparation["assembly_states_before"].append(
+        {
+            "depth": 1,
+            "path": CHILD_ASSEMBLY,
+            "instances": ["arm-1"],
+            "state": copy.deepcopy(child_state),
+        }
+    )
+    preparation["assembly_states_after"].append(
+        {
+            "depth": 1,
+            "path": CHILD_ASSEMBLY,
+            "instances": ["arm-1"],
+            "state": copy.deepcopy(child_state),
+        }
+    )
+    fresh_before = copy.deepcopy(child_state)
+    fresh_before["needs_rebuild2_value"] = 1
+    preparation["child_rebuilds"] = [
+        {
+            "path": CHILD_ASSEMBLY,
+            "depth": 1,
+            "instances": ["arm-1"],
+            "elapsed_seconds": 0.1,
+            "result": True,
+            "state_before": fresh_before,
+            "state_after": copy.deepcopy(child_state),
+        }
+    ]
+    source_files = preparation["source_files_before"]
+    child_key = _normalized(CHILD_ASSEMBLY)
+    source_files.pop(_normalized(PART))
+    source_files[child_key] = {"path": CHILD_ASSEMBLY, "sha256": "b" * 64}
+    preparation["source_files_after"] = copy.deepcopy(source_files)
+    raw = value["discovery"]["raw"]
+    raw["components"] = [
+        {
+            "instance_id": "arm-1",
+            "document": r"cad\arm.SLDASM",
+            "configuration": "Default",
+            "suppressed": False,
+            "suppression_state": 2,
+        }
+    ]
+    closure = raw["source_selection"]["closure"]
+    closure["documents"] = {
+        "cad/robot.SLDASM": {
+            "resolved_edges": [
+                {
+                    "instance": "arm-1",
+                    "resolved": r"cad\arm.SLDASM",
+                    "configuration": "Default",
+                    "suppression_state": 2,
+                }
+            ]
+        },
+        "cad/arm.SLDASM": {"resolved_edges": []},
+    }
+    value["closure"]["copy_files"] = {
+        "source/robot.SLDASM": "a" * 64,
+        "source/arm.SLDASM": "b" * 64,
+    }
+    value["closure"]["mapping"] = [
+        {
+            "instance": "top_level",
+            "source": TOP,
+            "copy": "source/robot.SLDASM",
+            "source_sha256": "a" * 64,
+            "copy_sha256": "a" * 64,
+        },
+        {
+            "instance": "arm-1",
+            "source": CHILD_ASSEMBLY,
+            "copy": "source/arm.SLDASM",
+            "source_sha256": "b" * 64,
+            "copy_sha256": "b" * 64,
+        },
+    ]
+    return value
+
+
 class CapturePreparationTests(unittest.TestCase):
     def validate(self, value: dict) -> dict:
         with (
@@ -430,6 +539,35 @@ class CapturePreparationTests(unittest.TestCase):
         forged_preparation["component_count"] += 1
         with self.assertRaisesRegex(PipelineError, "sealed native occurrence graph"):
             self.validate(forged)
+
+    def test_dynamic_child_fresh_state_is_not_forced_to_equal_initial_state(self) -> None:
+        value = dynamic_child_payload()
+        result = self.validate(value)
+        self.assertEqual(result["rebuilt_document_count"], 1)
+
+        wrong_path = copy.deepcopy(value)
+        wrong_path["scene"]["notes"]["capture_preparation"]["child_rebuilds"][0][
+            "state_before"
+        ]["path"] = PART
+        with self.assertRaisesRegex(PipelineError, "state_before names another document"):
+            self.validate(wrong_path)
+
+        wrong_configuration = copy.deepcopy(value)
+        wrong_configuration["scene"]["notes"]["capture_preparation"]["child_rebuilds"][0][
+            "state_before"
+        ]["configuration"] = "Other"
+        wrong_configuration["scene"]["notes"]["capture_preparation"]["child_rebuilds"][0][
+            "state_before"
+        ]["configurations"][0]["name"] = "Other"
+        with self.assertRaisesRegex(PipelineError, "state_before changed the assembly configuration"):
+            self.validate(wrong_configuration)
+
+        duplicate = copy.deepcopy(value)
+        duplicate["scene"]["notes"]["capture_preparation"]["child_rebuilds"].append(
+            copy.deepcopy(duplicate["scene"]["notes"]["capture_preparation"]["child_rebuilds"][0])
+        )
+        with self.assertRaisesRegex(PipelineError, "rebuilt more than once"):
+            self.validate(duplicate)
 
     def test_schema_state_and_source_mutations_are_rejected(self) -> None:
         cases = (
@@ -581,7 +719,11 @@ class NativeReceiptTests(unittest.TestCase):
         mutations = (
             ("schema", lambda transfer: transfer.update(schema_version="unknown"), "unknown schema"),
             ("file_count", lambda transfer: transfer.update(file_count=transfer["file_count"] + 1), "file count"),
-            ("total_bytes", lambda transfer: transfer.update(total_bytes=transfer["total_bytes"] + 1), "total bytes"),
+            (
+                "total_bytes",
+                lambda transfer: transfer.update(total_bytes=transfer["total_bytes"] + 1),
+                "size differs",
+            ),
             ("run_id", lambda transfer: transfer.update(run_id=RUN_ID + "-other"), "UUID"),
             (
                 "stage_scope",

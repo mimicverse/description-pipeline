@@ -350,7 +350,7 @@ class PublishTests(unittest.TestCase):
                 )
             raise AssertionError(args)
 
-        def verifier(bundle: Path) -> dict:
+        def verifier(bundle: Path, **_kwargs) -> dict:
             from description_pipeline.io import read_data
             from description_pipeline.verification import solidworks_urdf as _verification
 
@@ -835,17 +835,27 @@ class PublishTests(unittest.TestCase):
         )
 
     def test_bad_verification_and_tamper_never_push(self) -> None:
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: lambda bundle: {"passed": False}):
+        with mock.patch.object(
+            urdf_pr,
+            "_load_verifier",
+            lambda: lambda bundle, **_kwargs: {"passed": False},
+        ):
             self.assertEqual(self.submit()["error"], "verification_failed")
         self.assertEqual(self.fx.remote_head(), "")
         with mock.patch.object(
-            urdf_pr, "_load_verifier", lambda: lambda bundle: {"passed": True, "subject_sha256": "0" * 64}
+            urdf_pr,
+            "_load_verifier",
+            lambda: lambda bundle, **_kwargs: {"passed": True, "subject_sha256": "0" * 64},
         ):
             self.assertEqual(self.submit()["error"], "verification_subject_mismatch")
         self.assertEqual(self.fx.remote_head(), "")
         good = {"passed": True, "subject_sha256": subject_digest(self.fx.bundle)}
         (self.fx.bundle / "reports/quality.json").write_text('{"passed": true}\n', encoding="utf-8")
-        with mock.patch.object(urdf_pr, "_load_verifier", lambda: lambda bundle: good):
+        with mock.patch.object(
+            urdf_pr,
+            "_load_verifier",
+            lambda: lambda bundle, **_kwargs: good,
+        ):
             self.assertEqual(self.submit()["error"], "stale_quality_report")
         self.assertEqual(self.fx.remote_head(), "")
 

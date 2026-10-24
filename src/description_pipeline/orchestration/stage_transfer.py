@@ -678,13 +678,26 @@ def _validate_native_discovery(
     return native_files, main[1]
 
 
-def _validate_capture(root: Path, *, run_id: str, handoff_sha256: str, main_assembly: str, native_tool) -> dict:
+def _validate_capture(
+    root: Path,
+    *,
+    run_id: str,
+    handoff_sha256: str,
+    main_assembly: str,
+    native_tool,
+    native_stages=None,
+    native_tool_record=None,
+) -> dict:
     """Re-read a capture root (sealed or freshly extracted) against the transfer contract."""
 
     _validate_native_tool(native_tool)
-    recorded = read_data(confined(root, "reports/native-tool.json"))
+    recorded = (
+        native_tool_record
+        if native_tool_record is not None
+        else read_data(confined(root, "reports/native-tool.json"))
+    )
     _require(recorded == native_tool, "Native tool report differs from the supplied native tool record")
-    view = read_data(confined(root, "reports/native-stages.json"))
+    view = native_stages if native_stages is not None else read_data(confined(root, "reports/native-stages.json"))
     _validate_stage_receipts(
         view,
         run_id=run_id,
@@ -1000,7 +1013,11 @@ def admit_capture(
 
 
 def verify_transfer(
-    bundle: Path, *, regenerated: tuple[str, ...] = (), carried: dict[str, str] | None = None
+    bundle: Path,
+    *,
+    regenerated: tuple[str, ...] = (),
+    carried: dict[str, str] | None = None,
+    native_receipts: dict | None = None,
 ) -> dict | None:
     """Revalidate transferred native provenance inside a delivery bundle.
 
@@ -1021,16 +1038,33 @@ def verify_transfer(
     """
 
     bundle = Path(bundle)
-    present = [name for name in TRANSFER_FILES if (bundle / name).is_file()]
-    if not present:
-        return None
-    missing = sorted(set(TRANSFER_FILES) - set(present))
-    _require(not missing, f"Transferred capture provenance is incomplete; missing: {missing}")
-
+    supplied = {}
+    if native_receipts is not None:
+        _require(isinstance(native_receipts, dict), "Native receipts must be supplied as an object")
+        for name in ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes"):
+            blob = native_receipts.get(name)
+            _require(
+                isinstance(blob, (bytes, bytearray)) and bool(blob),
+                f"Native receipt {name} is missing",
+            )
+            supplied[name] = bytes(blob)
+        try:
+            receipt_manifest = json.loads(supplied["transfer_manifest_bytes"].decode("utf-8"))
+            receipt_native_tool = json.loads(supplied["native_tool_bytes"].decode("utf-8"))
+            receipt_stages = json.loads(supplied["native_stages_bytes"].decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise PipelineError("Native receipts are not UTF-8 JSON") from error
+    else:
+        present = [name for name in TRANSFER_FILES if (bundle / name).is_file()]
+        if not present:
+            return None
+        missing = sorted(set(TRANSFER_FILES) - set(present))
+        _require(not missing, f"Transferred capture provenance is incomplete; missing: {missing}")
+        receipt_manifest = receipt_native_tool = receipt_stages = None
     derived = set(regenerated)
     carried_bindings = dict(carried or {})
     skip = derived | set(carried_bindings)
-    manifest = read_data(confined(bundle, CAPTURE_MANIFEST))
+    manifest = receipt_manifest if receipt_manifest is not None else read_data(confined(bundle, CAPTURE_MANIFEST))
     _require(isinstance(manifest, dict), "Transfer manifest must be an object")
     _require(manifest.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
     files = manifest.get("files")
@@ -1049,8 +1083,14 @@ def verify_transfer(
         _require(_is_sha256(checksum), f"Transfer manifest hash is not a sha256: {name}")
         if name in derived:
             continue
+        if name == "reports/native-tool.json" and receipt_native_tool is not None:
+            actual = hashlib.sha256(supplied["native_tool_bytes"]).hexdigest()
+        elif name == "reports/native-stages.json" and receipt_stages is not None:
+            actual = hashlib.sha256(supplied["native_stages_bytes"]).hexdigest()
+        else:
+            actual = file_digest(confined(bundle, name))
         _require(
-            file_digest(confined(bundle, name)) == checksum,
+            actual == checksum,
             f"Delivered member differs from the transfer manifest: {name}",
         )
     actual_payload = {
@@ -1060,7 +1100,10 @@ def verify_transfer(
         and _allowed_payload(path.relative_to(bundle).as_posix())
         and path.relative_to(bundle).as_posix() not in skip
     }
-    absent = sorted(set(files) - derived - actual_payload)
+    receipt_members = set()
+    if receipt_native_tool is not None:
+        receipt_members = {"reports/native-tool.json", "reports/native-stages.json"}
+    absent = sorted(set(files) - derived - receipt_members - actual_payload)
     extra = sorted(actual_payload - set(files))
     _require(
         not absent and not extra,
@@ -1075,8 +1118,16 @@ def verify_transfer(
             f"Delivered carried original differs from its frozen bytes: {name}",
         )
     if not derived & set(files):
+        member_total = 0
+        for name in files:
+            if name == "reports/native-tool.json" and receipt_native_tool is not None:
+                member_total += len(supplied["native_tool_bytes"])
+            elif name == "reports/native-stages.json" and receipt_stages is not None:
+                member_total += len(supplied["native_stages_bytes"])
+            else:
+                member_total += confined(bundle, name).stat().st_size
         _require(
-            manifest.get("total_bytes") == sum(confined(bundle, name).stat().st_size for name in files),
+            manifest.get("total_bytes") == member_total,
             "Transfer manifest size differs from its members",
         )
     _require(
@@ -1084,10 +1135,16 @@ def verify_transfer(
         "Transfer manifest native tool digest differs from its record",
     )
     _validate_native_tool(manifest.get("native_tool"))
-    _require(
-        read_data(confined(bundle, "reports/native-tool.json")) == manifest.get("native_tool"),
-        "Native tool report differs from the transfer manifest",
-    )
+    if receipt_native_tool is not None:
+        _require(
+            receipt_native_tool == manifest.get("native_tool"),
+            "Native tool receipt differs from the transfer manifest",
+        )
+    else:
+        _require(
+            read_data(confined(bundle, "reports/native-tool.json")) == manifest.get("native_tool"),
+            "Native tool report differs from the transfer manifest",
+        )
     run_id = manifest.get("run_id")
     handoff = manifest.get("handoff_sha256")
     main_assembly = manifest.get("main_assembly")
@@ -1095,12 +1152,19 @@ def verify_transfer(
         isinstance(run_id, str) and run_id and _is_sha256(handoff) and isinstance(main_assembly, str) and main_assembly,
         "Transfer manifest lacks its run, handoff or main assembly",
     )
+    try:
+        canonical_run_id = str(uuid.UUID(run_id))
+    except (ValueError, AttributeError, TypeError) as error:
+        raise PipelineError("Transfer run_id is not a UUID") from error
+    _require(run_id == canonical_run_id, "Transfer run_id is not the canonical lowercase UUID")
     validated = _validate_capture(
         bundle,
         run_id=run_id,
         handoff_sha256=handoff,
         main_assembly=main_assembly,
         native_tool=manifest.get("native_tool"),
+        native_stages=receipt_stages,
+        native_tool_record=receipt_native_tool,
     )
     _require(
         validated["main_assembly_sha256"] == manifest.get("main_assembly_sha256"),
@@ -1121,8 +1185,9 @@ def validate_native_receipts(root: Path, receipts: dict) -> dict:
 
     This is the publisher path: native report files are intentionally absent
     from the model repository, so their immutable bytes are supplied by the
-    platform.  Every semantic check is the same transfer validator used for an
-    on-disk transfer manifest.
+    platform. This is a thin transport adapter over the one on-disk transfer
+    validator; the manifest, stage, input, evidence, and identity semantics are
+    never duplicated.
     """
 
     _require(isinstance(receipts, dict), "Native receipts must be supplied as an object")
@@ -1137,111 +1202,21 @@ def validate_native_receipts(root: Path, receipts: dict) -> dict:
         stages = json.loads(blobs["native_stages_bytes"].decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as error:
         raise PipelineError("Native receipts are not UTF-8 JSON") from error
-    _require(isinstance(transfer, dict), "Transfer manifest must be an object")
-    _require(transfer.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
-    _validate_native_tool(native_tool)
-    run_id = transfer.get("run_id")
-    try:
-        canonical_run_id = str(uuid.UUID(str(run_id)))
-    except (ValueError, AttributeError, TypeError) as error:
-        raise PipelineError("Transfer run_id is not a UUID") from error
-    _require(run_id == canonical_run_id, "Transfer run_id is not the canonical lowercase UUID")
-    handoff_sha256 = transfer.get("handoff_sha256")
-    main_assembly = transfer.get("main_assembly")
-    _require(
-        _is_sha256(handoff_sha256)
-        and isinstance(main_assembly, str)
-        and bool(main_assembly)
-        and transfer.get("native_stage_scope") == list(NATIVE_STAGE_SCOPE),
-        "Transfer manifest lacks its handoff, main assembly, or native stage scope",
-    )
-    _require(transfer.get("native_tool") == native_tool, "Transfer tool differs from the native tool bytes")
-    native_tool_sha256 = hashlib.sha256(blobs["native_tool_bytes"]).hexdigest()
-    native_stages_sha256 = hashlib.sha256(blobs["native_stages_bytes"]).hexdigest()
-    _require(
-        transfer.get("native_tool_sha256") == digest(native_tool) == native_tool_sha256,
-        "Transfer native tool digest differs from the immutable tool bytes",
-    )
-    files = transfer.get("files")
-    _require(isinstance(files, dict) and files, "Transfer manifest declares no files")
-    _require(transfer.get("file_count") == len(files), "Transfer manifest file count differs from its inventory")
-    total_bytes = 0
-    missing_regenerated = 0
-    for name, expected in files.items():
-        _require(isinstance(name, str) and bool(name) and _is_sha256(expected), "Transfer file row is malformed")
-        artifact_path_parts(name)
-        _require(_allowed_payload(name), f"Transfer manifest lists a member outside the capture payload: {name!r}")
-        if name == "reports/native-tool.json":
-            actual = native_tool_sha256
-            size = len(blobs["native_tool_bytes"])
-        elif name == "reports/native-stages.json":
-            actual = native_stages_sha256
-            size = len(blobs["native_stages_bytes"])
-        else:
-            path = confined(root, name, exists=False)
-            if not path.is_file() and name in set(TEAM_REPORTS):
-                missing_regenerated += 1
-                continue
-            _require(path.is_file(), f"Transfer member is absent from the delivery: {name}")
-            actual = file_digest(path)
-            size = path.stat().st_size
-        _require(actual == expected, f"Transfer member differs from its sealed bytes: {name}")
-        total_bytes += size
-    transfer_total = transfer.get("total_bytes")
-    _require(type(transfer_total) is int and transfer_total >= total_bytes, "Transfer total bytes are invalid")
-    if missing_regenerated == 0:
-        _require(transfer_total == total_bytes, "Transfer total bytes differ from its bound members")
-    else:
-        _require(
-            missing_regenerated == len(set(TEAM_REPORTS)),
-            "Only part of the regenerated team-report pair is absent",
-        )
-    _validate_stage_receipts(stages, run_id=run_id, handoff_sha256=handoff_sha256)
-    handoff = read_data(confined(root, "input/handoff.json"))
-    actual_inputs, _input_main, main_assembly_sha256 = _validate_input(root, handoff, main_assembly)
-    native_files, native_main_sha256 = _validate_native_discovery(
+    request_path = confined(root, "input/request.json", exists=False)
+    carried = {"input/request.json": file_digest(request_path)} if request_path.is_file() else {}
+    team_reports_present = all((Path(root) / name).is_file() for name in TEAM_REPORTS)
+    summary = verify_transfer(
         root,
-        main_assembly=main_assembly,
-        handoff_sha256=handoff_sha256,
-        actual_inputs=actual_inputs,
+        regenerated=() if team_reports_present else TEAM_REPORTS,
+        carried=carried,
+        native_receipts=blobs,
     )
-    _require(
-        main_assembly_sha256 == native_main_sha256 == transfer.get("main_assembly_sha256"),
-        "Transfer main assembly hash differs from the delivered bytes",
-    )
-    configuration = str(handoff.get("configuration") or "")
-    _require(bool(configuration), "Frozen handoff lacks its configuration")
-    source = _validate_source_identity(
-        root,
-        handoff_sha256=handoff_sha256,
-        main_assembly=main_assembly,
-        configuration=configuration,
-    )
-    _validate_evidence(
-        root,
-        handoff_sha256=handoff_sha256,
-        main_assembly=main_assembly,
-        configuration=configuration,
-        native_files=native_files,
-        native_tool=native_tool,
-    )
-    _validate_stage_details(
-        root,
-        stages,
-        handoff_sha256=handoff_sha256,
-        main_assembly=main_assembly,
-        main_assembly_sha256=main_assembly_sha256,
-        native_files=native_files,
-    )
+    _require(isinstance(summary, dict), "Native receipts do not bind a transfer")
     return {
         "digests": {name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()},
         "native_tool": native_tool,
-        "native_tool_sha256": native_tool_sha256,
+        "native_tool_sha256": hashlib.sha256(blobs["native_tool_bytes"]).hexdigest(),
         "native_stages": stages,
         "transfer_manifest": transfer,
-        "run_id": run_id,
-        "handoff_sha256": handoff_sha256,
-        "main_assembly": main_assembly,
-        "source_revision_id": source["source_revision_id"],
-        "hardware_id": source["identity"]["hardware_id"],
+        **summary,
     }

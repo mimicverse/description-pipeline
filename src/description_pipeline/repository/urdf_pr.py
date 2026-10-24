@@ -190,9 +190,11 @@ def _load_verifier():
 
 def _run_verifier(root: Path, *, native_receipts=None) -> dict:
     verifier = _load_verifier()
-    if native_receipts is None:
-        return verifier(root)
-    return verifier(root, native_receipts=native_receipts)
+    return verifier(
+        root,
+        native_receipts=native_receipts,
+        require_native_receipts=True,
+    )
 
 
 def _native_receipts(root: Path) -> dict[str, bytes] | None:

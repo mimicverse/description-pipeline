@@ -918,7 +918,11 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
 
     checked(on_event, "verify", "input", "verification.subject", verify_subject)
     receipts = native_receipts(staging)
-    report = evaluate_bundle(staging, native_receipts=receipts)
+    report = evaluate_bundle(
+        staging,
+        native_receipts=receipts,
+        require_native_receipts=True,
+    )
     write_json(staging / "reports/quality.json", report)
     checked(
         on_event,
@@ -933,7 +937,11 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
         "output",
         "verification.report_binding",
         lambda: require_qualified_report(
-            check_bundle(staging, native_receipts=receipts),
+            check_bundle(
+                staging,
+                native_receipts=receipts,
+                require_native_receipts=True,
+            ),
             rebuilt_definition(staging),
             root=staging,
         ),
