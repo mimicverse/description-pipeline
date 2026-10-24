@@ -320,7 +320,7 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
         }
         scene.notes["capture_preparation"] = {
             "session": {"role": "copy", "identity": self.environment()["sessions"]["copy"], "temp_root": None},
-            "schema_version": "solidworks-to-urdf.capture-preparation/v2",
+            "schema_version": "solidworks-to-urdf.capture-preparation/v3",
             "used_api": "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
             "scope": "collected_copy_in_memory",
             "document": str(doc_path),

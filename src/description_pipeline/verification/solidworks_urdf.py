@@ -39,6 +39,7 @@ from ..sources.solidworks.native_limits import (
 )
 from ..sources.solidworks.session_artifacts import (
     embedded_virtual_component_under_root,
+    session_artifact_path,
     session_root_pid,
     session_materialization_under_root,
 )
@@ -597,7 +598,7 @@ def _native(root, manifest):
 def _capture_preparation(root, manifest):
     """Independently compare capture rebuild state with native discovery."""
 
-    schema = "solidworks-to-urdf.capture-preparation/v2"
+    schema = "solidworks-to-urdf.capture-preparation/v3"
     rebuild_api = (
         "IModelDocExtension.NeedsRebuild2/"
         "IConfiguration.NeedsRebuild/"
@@ -1644,12 +1645,13 @@ def _capture_preparation(root, manifest):
             == {
                 "schema_version",
                 "first_attempt",
+                "fresh_attempt",
                 "retirement",
                 "reopen",
                 "fresh_session",
             }
             and session_recovery["schema_version"]
-            == "solidworks-to-urdf.rebuild-session-recovery/v2",
+            == "solidworks-to-urdf.rebuild-session-recovery/v3",
             "Capture session recovery fields are incomplete or unknown",
         )
 
@@ -1725,23 +1727,236 @@ def _capture_preparation(root, manifest):
             )
             return value
 
+        def attempt_graph(value, label):
+            fields = {
+                "session",
+                "source_files",
+                "topology",
+                "loaded_documents",
+                "assembly_states",
+                "initial_pending",
+                "rebuild_candidates",
+            }
+            _require(
+                isinstance(value, dict) and set(value) == fields,
+                f"{label} fields are incomplete or unknown",
+            )
+            session = attempt_session(value["session"], f"{label} session")
+            topology = topology_rows(
+                value["topology"],
+                f"{label} topology",
+                session,
+            )
+            sources = source_map(
+                value["source_files"],
+                f"{label} source_files",
+            )
+            loaded = validate_loaded_inventory(
+                value["loaded_documents"],
+                topology,
+                sources,
+                f"{label} loaded_documents",
+            )
+            assembly_rows = [
+                item
+                for item in topology
+                if item["document_type"] == 2
+                and item["storage_scope"] != "suppressed"
+            ]
+
+            def row_identity(item):
+                return (
+                    session_path_identity(item["document_path"])
+                    if item["storage_scope"] == "session"
+                    else normalized_path(item["document_path"])
+                )
+
+            identity_by_path = {
+                (
+                    session_path_identity(item["document_path"])
+                    if item["storage_scope"] == "session"
+                    else normalized_path(item["document_path"])
+                ): row_identity(item)
+                for item in topology
+                if item["document_path"] is not None
+            }
+            top_rows = [
+                item for item in assembly_rows if item["instance"] == "top"
+            ]
+            _require(
+                len(top_rows) == 1,
+                f"{label} topology has no unique top assembly",
+            )
+            top_identity = row_identity(top_rows[0])
+            groups = {}
+            for item in assembly_rows:
+                identity = row_identity(item)
+                group = groups.setdefault(
+                    identity,
+                    {"depth": item["depth"], "instances": [], "path": item["document_path"]},
+                )
+                group["depth"] = max(group["depth"], item["depth"])
+                group["instances"].append(item["instance"])
+            states = {}
+            for item in value["assembly_states"]:
+                _require(
+                    isinstance(item, dict)
+                    and set(item) == {"depth", "path", "instances", "state"},
+                    f"{label} assembly state row is malformed",
+                )
+                _require(
+                    type(item["depth"]) is int
+                    and item["depth"] >= 0
+                    and isinstance(item["path"], str)
+                    and bool(item["path"])
+                    and isinstance(item["instances"], list)
+                    and bool(item["instances"])
+                    and all(
+                        isinstance(name, str) and bool(name)
+                        for name in item["instances"]
+                    )
+                    and len(item["instances"]) == len(set(item["instances"])),
+                    f"{label} assembly state identity is invalid",
+                )
+                identity = identity_by_path.get(
+                    session_path_identity(item["path"])
+                    if session_artifact_path(item["path"])
+                    else normalized_path(item["path"])
+                )
+                _require(
+                    identity is not None and identity not in states,
+                    f"{label} assembly state names an unknown or repeated document",
+                )
+                state = state_row(item["state"], f"{label} assembly state")
+                _require(
+                    _same_native_path(state["path"], item["path"])
+                    and item["depth"] == groups[identity]["depth"]
+                    and sorted(item["instances"])
+                    == sorted(groups[identity]["instances"]),
+                    f"{label} assembly state contradicts its topology",
+                )
+                states[identity] = state
+            _require(
+                set(states) == set(groups),
+                f"{label} assembly state set differs from its topology",
+            )
+
+            def explicit_identities(field):
+                raw = value[field]
+                _require(
+                    isinstance(raw, list)
+                    and all(isinstance(path, str) and bool(path) for path in raw)
+                    and raw == sorted(set(raw)),
+                    f"{label} {field} is not a unique sorted path list",
+                )
+                identities = []
+                for path in raw:
+                    identity = identity_by_path.get(
+                        session_path_identity(path)
+                        if session_artifact_path(path)
+                        else normalized_path(path)
+                    )
+                    _require(
+                        identity is not None and identity not in identities,
+                        f"{label} {field} names an unknown or repeated document",
+                    )
+                    identities.append(identity)
+                return set(identities)
+
+            pending = {
+                identity
+                for identity, state in states.items()
+                if identity != top_identity
+                and state["needs_rebuild2_value"] in (1, 2)
+            }
+            _require(
+                explicit_identities("initial_pending") == pending,
+                f"{label} initial_pending differs from its live assembly states",
+            )
+            parents = {}
+            rows_by_instance = {
+                item["instance"]: item
+                for item in topology
+                if item["instance"] != "top"
+            }
+            for item in assembly_rows:
+                if item["instance"] == "top":
+                    continue
+                parent_instance = (
+                    "top"
+                    if item["depth"] == 1
+                    else item["instance"].rsplit("/", 1)[0]
+                )
+                parent = (
+                    top_rows[0]
+                    if parent_instance == "top"
+                    else rows_by_instance.get(parent_instance)
+                )
+                _require(
+                    parent is not None and parent["document_type"] == 2,
+                    f"{label} assembly has no exact native parent",
+                )
+                parents.setdefault(row_identity(item), set()).add(
+                    top_identity
+                    if parent_instance == "top"
+                    else row_identity(parent)
+                )
+            candidates = set(pending)
+            queue = list(pending)
+            while queue:
+                child = queue.pop()
+                for parent in parents.get(child, set()):
+                    if parent == top_identity or parent in candidates:
+                        continue
+                    candidates.add(parent)
+                    queue.append(parent)
+            _require(
+                explicit_identities("rebuild_candidates") == candidates,
+                f"{label} rebuild_candidates differs from the exact dirty closure",
+            )
+            return {
+                "session": session,
+                "topology": topology,
+                "sources": sources,
+                "loaded": loaded,
+                "states": states,
+                "top_identity": top_identity,
+                "pending": pending,
+                "candidates": candidates,
+            }
+
         first_attempt = session_recovery["first_attempt"]
         _require(
             isinstance(first_attempt, dict)
             and set(first_attempt)
             == {
                 "session",
-                "rebuild_calls",
                 "source_files",
                 "topology",
                 "loaded_documents",
+                "assembly_states",
+                "initial_pending",
+                "rebuild_candidates",
+                "rebuild_calls",
             },
             "Capture first-attempt evidence is malformed",
         )
-        old_session = attempt_session(
-            first_attempt["session"],
-            "Capture first-attempt session",
+        first_graph = attempt_graph(
+            {
+                key: first_attempt[key]
+                for key in (
+                    "session",
+                    "source_files",
+                    "topology",
+                    "loaded_documents",
+                    "assembly_states",
+                    "initial_pending",
+                    "rebuild_candidates",
+                )
+            },
+            "Capture first-attempt",
         )
+        old_session = first_graph["session"]
         before_sessions = (
             (before_recovery_environment.get("solidworks") or {}).get("sessions")
         )
@@ -1767,6 +1982,37 @@ def _capture_preparation(root, manifest):
             and old_session["identity"]["pid"]
             != final_session["identity"]["pid"],
             "Capture fresh session is not independently owned",
+        )
+        fresh_attempt = session_recovery["fresh_attempt"]
+        fresh_graph = attempt_graph(
+            fresh_attempt,
+            "Capture fresh-attempt",
+        )
+        _require(
+            fresh_graph["session"] == final_session
+            and fresh_graph["sources"] == before_sources
+            and topology_semantic(fresh_graph["topology"])
+            == topology_semantic(topology_before)
+            and fresh_graph["loaded"] == loaded_before,
+            "Capture fresh attempt changed the finalized source or graph",
+        )
+        _require(
+            set(fresh_graph["states"]) == set(before_rows)
+            and all(
+                fresh_graph["states"][key] == before_rows[key]["state"]
+                for key in before_rows
+            ),
+            "Capture fresh-attempt initial states differ from the final graph",
+        )
+        expected_fresh_pending = {
+            key
+            for key, row in before_rows.items()
+            if key != top_key
+            and row["state"]["needs_rebuild2_value"] in (1, 2)
+        }
+        _require(
+            fresh_graph["pending"] == expected_fresh_pending,
+            "Capture fresh-attempt pending set differs from the final graph",
         )
         _require(
             old_session["identity"]["executable"]
@@ -1858,15 +2104,8 @@ def _capture_preparation(root, manifest):
             == final_session["identity"],
             "Capture recovery changed native session continuity",
         )
-        first_topology = topology_rows(
-            first_attempt["topology"],
-            "Capture first-attempt topology",
-            old_session,
-        )
-        first_sources = source_map(
-            first_attempt["source_files"],
-            "Capture first-attempt source_files",
-        )
+        first_topology = first_graph["topology"]
+        first_sources = first_graph["sources"]
         _require(
             first_sources == before_sources,
             "Capture first attempt and final recovery used different source bytes",
@@ -1876,12 +2115,7 @@ def _capture_preparation(root, manifest):
             == topology_semantic(topology_before),
             "Capture first attempt and final recovery changed native topology",
         )
-        first_loaded = validate_loaded_inventory(
-            first_attempt["loaded_documents"],
-            first_topology,
-            first_sources,
-            "Capture first-attempt loaded_documents",
-        )
+        first_loaded = first_graph["loaded"]
         _require(
             first_loaded == loaded_before,
             "Capture recovery loaded a different document inventory",
@@ -1932,39 +2166,7 @@ def _capture_preparation(root, manifest):
             )
             return next(iter(matches))
 
-        first_by_instance = {
-            item["instance"]: item for item in first_topology
-        }
-        first_top_identity = first_document_identity(top_path)
-        first_parents_by_document = {}
-        for item in first_topology:
-            if (
-                item["instance"] == "top"
-                or item["storage_scope"] == "suppressed"
-                or item["document_type"] != 2
-            ):
-                continue
-            parent_instance = (
-                "top"
-                if item["depth"] == 1
-                else item["instance"].rsplit("/", 1)[0]
-            )
-            parent = first_by_instance.get(parent_instance)
-            _require(
-                parent is not None
-                and parent["document_type"] == 2
-                and parent["depth"] == item["depth"] - 1,
-                "Capture first-attempt assembly has no exact parent",
-            )
-            parent_identity = (
-                first_top_identity
-                if parent_instance == "top"
-                else first_document_identity(parent["document_path"])
-            )
-            first_parents_by_document.setdefault(
-                first_document_identity(item["document_path"]),
-                set(),
-            ).add(parent_identity)
+        first_top_identity = first_graph["top_identity"]
 
         first_journal = first_attempt["rebuild_calls"]
         _require(
@@ -1978,40 +2180,24 @@ def _capture_preparation(root, manifest):
             and first_journal[0]["initial_pending"]
             == sorted(set(first_journal[0]["initial_pending"]))
             and first_journal[0]["initial_pending"]
+            == first_attempt["initial_pending"]
             and first_journal[0]["rebuild_candidates"]
-            == sorted(set(first_journal[0]["rebuild_candidates"])),
+            == first_attempt["rebuild_candidates"],
             "Capture first-attempt journal has no exact dirty closure",
         )
-        first_pending = {
-            first_document_identity(path)
-            for path in first_journal[0]["initial_pending"]
-        }
+        first_pending = first_graph["pending"]
         _require(
             first_top_identity not in first_pending,
             "Capture first-attempt top cannot be an initial pending candidate",
         )
-        first_candidates = {
-            first_document_identity(path)
-            for path in first_journal[0]["rebuild_candidates"]
-        }
-        expected_candidates = set(first_pending)
-        pending = list(first_pending)
-        while pending:
-            child = pending.pop()
-            for parent in first_parents_by_document.get(child, set()):
-                if (
-                    parent == first_top_identity
-                    or parent in expected_candidates
-                ):
-                    continue
-                expected_candidates.add(parent)
-                pending.append(parent)
+        first_candidates = first_graph["candidates"]
         _require(
             first_pending <= set(first_assembly_rows)
-            and first_candidates == expected_candidates,
-            "Capture first-attempt candidates differ from the exact dirty ancestor closure",
+            and first_candidates <= set(first_assembly_rows),
+            "Capture first-attempt candidates name unknown assemblies",
         )
         sequence = 1
+        first_child_call_count = 0
         for identity in sorted(
             first_candidates,
             key=lambda key: (-first_assembly_rows[key]["depth"], key),
@@ -2052,6 +2238,11 @@ def _capture_preparation(root, manifest):
                 in group["configurations"],
                 "Capture first-attempt candidate changed document identity",
             )
+            if first_child_call_count == 0:
+                _require(
+                    state == first_graph["states"][identity],
+                    "Capture first-attempt candidate changed before the first child rebuild",
+                )
             sequence += 1
             if state["needs_rebuild2_value"] in (1, 2):
                 _require(
@@ -2102,11 +2293,16 @@ def _capture_preparation(root, manifest):
                     "Capture first-attempt child rebuild changed state or did not converge",
                 )
                 sequence += 1
+                first_child_call_count += 1
             else:
                 _require(
                     candidate["decision"] == "skip_clean",
                     "Capture first-attempt clean candidate was rebuilt",
                 )
+        _require(
+            first_child_call_count > 0,
+            "Capture recovery has no first-attempt child rebuild",
+        )
         _require(
             sequence < len(first_journal),
             "Capture first-attempt journal has no top failure",
@@ -2371,6 +2567,12 @@ def _capture_preparation(root, manifest):
                 continue
             rebuild_candidates.add(parent)
             pending.append(parent)
+    if session_recovery is not None:
+        _require(
+            initial_pending == fresh_graph["pending"]
+            and rebuild_candidates == fresh_graph["candidates"],
+            "Capture fresh-attempt closure differs from the final rebuild graph",
+        )
 
     child_rebuilds = preparation["child_rebuilds"]
     _require(isinstance(child_rebuilds, list), "child_rebuilds is not a list")
@@ -2534,169 +2736,118 @@ def _capture_preparation(root, manifest):
         _require(sequence < len(rebuild_calls), "Rebuild journal ended before its scheduled observation or call")
         return rebuild_calls[sequence]
 
-    if session_recovery is None:
+    _require(
+        len(rebuild_calls)
+        == len(rebuild_candidates)
+        + len(child_rebuilds)
+        + int(top_rebuild is not None)
+        + 1,
+        "Rebuild call journal differs from the recorded native calls",
+    )
+    attempt_initial_states = (
+        fresh_graph["states"]
+        if session_recovery is not None
+        else {key: row["state"] for key, row in before_rows.items()}
+    )
+    initial_call = rebuild_calls[0]
+    expected_initial_kind = (
+        "initial" if session_recovery is None else "recovery_initial"
+    )
+    _require(
+        isinstance(initial_call, dict)
+        and set(initial_call)
+        == {"kind", "initial_pending", "rebuild_candidates"}
+        and initial_call["kind"] == expected_initial_kind
+        and initial_call["initial_pending"] == sorted(initial_pending)
+        and initial_call["rebuild_candidates"]
+        == sorted(rebuild_candidates),
+        "Rebuild journal does not bind the exact dirty ancestor closure",
+    )
+    sequence = 1
+    prior_child_call_count = 0
+    for key in sorted(
+        rebuild_candidates,
+        key=lambda key: (-before_rows[key]["depth"], key),
+    ):
+        candidate = journal_row(sequence)
+        row = before_rows[key]
         _require(
-            len(rebuild_calls)
-            == len(rebuild_candidates)
-            + len(child_rebuilds)
-            + int(top_rebuild is not None)
-            + 1,
-            "Rebuild call journal differs from the recorded native calls",
+            isinstance(candidate, dict)
+            and set(candidate)
+            == {
+                "sequence",
+                "kind",
+                "path",
+                "depth",
+                "required_configurations",
+                "state",
+                "decision",
+            }
+            and candidate["sequence"] == sequence
+            and candidate["kind"] == "candidate"
+            and _same_native_path(candidate["path"], row["path"])
+            and candidate["depth"] == row["depth"]
+            and candidate["required_configurations"]
+            == sorted(groups[key]["configurations"]),
+            "Rebuild journal omits or reorders a dirty closure candidate",
         )
-        initial_call = rebuild_calls[0]
+        fresh = state_row(candidate["state"], "Rebuild candidate state")
         _require(
-            isinstance(initial_call, dict)
-            and set(initial_call)
-            == {"kind", "initial_pending", "rebuild_candidates"}
-            and initial_call["kind"] == "initial"
-            and initial_call["initial_pending"] == sorted(initial_pending)
-            and initial_call["rebuild_candidates"]
-            == sorted(rebuild_candidates),
-            "Rebuild journal does not bind the initial dirty ancestor closure",
+            _same_native_path(fresh["path"], row["path"])
+            and fresh["configuration"]
+            == row["state"]["configuration"],
+            "Rebuild candidate changed its document or configuration",
         )
-        sequence = 1
-        for key in sorted(
-            rebuild_candidates,
-            key=lambda key: (-before_rows[key]["depth"], key),
-        ):
-            candidate = journal_row(sequence)
-            row = before_rows[key]
-            _require(
-                isinstance(candidate, dict)
-                and set(candidate)
-                == {
-                    "sequence",
-                    "kind",
-                    "path",
-                    "depth",
-                    "required_configurations",
-                    "state",
-                    "decision",
-                }
-                and candidate["sequence"] == sequence
-                and candidate["kind"] == "candidate"
-                and _same_native_path(candidate["path"], row["path"])
-                and candidate["depth"] == row["depth"]
-                and candidate["required_configurations"]
-                == sorted(groups[key]["configurations"]),
-                "Rebuild journal omits or reorders an initial dirty closure candidate",
-            )
-            fresh = state_row(candidate["state"], "Rebuild candidate state")
-            _require(
-                _same_native_path(fresh["path"], row["path"])
-                and fresh["configuration"]
-                == row["state"]["configuration"],
-                "Rebuild candidate changed its document or configuration",
-            )
-            _require(
-                groups[key]["configurations"]
-                <= {item["name"] for item in fresh["configurations"]},
-                "Rebuild candidate omits a required configuration",
-            )
-            sequence += 1
-            if fresh["needs_rebuild2_value"] in (1, 2):
-                _require(
-                    candidate["decision"] == "rebuild"
-                    and key in child_calls
-                    and child_calls[key]["state_before"] == fresh,
-                    "A pending candidate has no recorded child-first rebuild",
-                )
-                verify_call(
-                    journal_row(sequence),
-                    child_calls.pop(key),
-                    sequence,
-                    "child",
-                )
-                sequence += 1
-            else:
-                _require(
-                    candidate["decision"] == "skip_clean"
-                    and key not in child_calls
-                    and fresh["configuration_needs_rebuild"] is False
-                    and all(
-                        item["needs_rebuild"] is False
-                        for item in fresh["configurations"]
-                        if item["name"] in groups[key]["configurations"]
-                    ),
-                    "A skipped rebuild candidate was not observed clean",
-                )
         _require(
-            not child_calls,
-            "Child rebuild has no corresponding candidate observation",
+            groups[key]["configurations"]
+            <= {item["name"] for item in fresh["configurations"]},
+            "Rebuild candidate omits a required configuration",
         )
-        if top_rebuild is not None:
+        if prior_child_call_count == 0:
+            _require(
+                fresh == attempt_initial_states[key],
+                "Rebuild candidate changed before the first child rebuild",
+            )
+        sequence += 1
+        if fresh["needs_rebuild2_value"] in (1, 2):
+            _require(
+                candidate["decision"] == "rebuild"
+                and key in child_calls
+                and child_calls[key]["state_before"] == fresh,
+                "A pending candidate has no recorded child-first rebuild",
+            )
             verify_call(
                 journal_row(sequence),
-                top_rebuild,
+                child_calls.pop(key),
                 sequence,
-                "top",
+                "child",
             )
             sequence += 1
-    else:
-        _require(
-            child_rebuilds == [],
-            "A recovered final attempt performed child rebuilds",
-        )
-        _require(
-            len(rebuild_calls)
-            == 1 + len(rebuild_candidates) + int(top_rebuild is not None),
-            "Recovery journal differs from its deferred top-only attempt",
-        )
-        initial_call = rebuild_calls[0]
-        _require(
-            isinstance(initial_call, dict)
-            and set(initial_call)
-            == {"kind", "initial_pending", "rebuild_candidates"}
-            and initial_call["kind"] == "recovery_initial"
-            and initial_call["initial_pending"] == sorted(initial_pending)
-            and initial_call["rebuild_candidates"]
-            == sorted(rebuild_candidates),
-            "Recovery journal does not bind the fresh session graph",
-        )
-        sequence = 1
-        for key in sorted(
-            rebuild_candidates,
-            key=lambda key: (-before_rows[key]["depth"], key),
-        ):
-            candidate = journal_row(sequence)
-            row = before_rows[key]
+            prior_child_call_count += 1
+        else:
             _require(
-                isinstance(candidate, dict)
-                and set(candidate)
-                == {
-                    "sequence",
-                    "kind",
-                    "path",
-                    "depth",
-                    "required_configurations",
-                    "state",
-                    "decision",
-                }
-                and candidate["sequence"] == sequence
-                and candidate["kind"] == "candidate"
-                and _same_native_path(candidate["path"], row["path"])
-                and candidate["depth"] == row["depth"]
-                and candidate["required_configurations"]
-                == sorted(groups[key]["configurations"])
-                and candidate["decision"] == "recovery_defer_to_top",
-                "Recovery journal does not defer a fresh pending candidate",
+                candidate["decision"] == "skip_clean"
+                and key not in child_calls
+                and fresh["configuration_needs_rebuild"] is False
+                and all(
+                    item["needs_rebuild"] is False
+                    for item in fresh["configurations"]
+                    if item["name"] in groups[key]["configurations"]
+                ),
+                "A skipped rebuild candidate was not observed clean",
             )
-            state = state_row(candidate["state"], "Recovery candidate state")
-            _require(
-                _same_native_path(state["path"], row["path"])
-                and state["configuration"]
-                == row["state"]["configuration"],
-                "Recovery candidate changed its document or configuration",
-            )
-            sequence += 1
-        if top_rebuild is not None:
-            verify_call(
-                journal_row(sequence),
-                top_rebuild,
-                sequence,
-                "top_recovery",
-            )
-            sequence += 1
+    _require(
+        not child_calls,
+        "Child rebuild has no corresponding candidate observation",
+    )
+    if top_rebuild is not None:
+        verify_call(
+            journal_row(sequence),
+            top_rebuild,
+            sequence,
+            "top_recovery" if session_recovery is not None else "top",
+        )
+        sequence += 1
     _require(
         sequence == len(rebuild_calls),
         "Rebuild journal contains an unscheduled native call",

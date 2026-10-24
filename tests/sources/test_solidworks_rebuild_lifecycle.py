@@ -847,7 +847,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             )
         self.assertIs(returned, fresh_top)
         self.assertEqual([old_top.rebuild_calls, fresh_top.rebuild_calls], [1, 1])
-        self.assertEqual([old_child.rebuild_calls, fresh_child.rebuild_calls], [1, 0])
+        self.assertEqual([old_child.rebuild_calls, fresh_child.rebuild_calls], [1, 1])
         self.assertEqual(backend.open_calls, [PATH])
         self.assertEqual(
             backend._sessions["copy"].identity(),
@@ -855,7 +855,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(
             preparation["schema_version"],
-            "solidworks-to-urdf.capture-preparation/v2",
+            "solidworks-to-urdf.capture-preparation/v3",
         )
         recovery = preparation["session_recovery"]
         self.assertEqual(
@@ -875,12 +875,15 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             recovery["first_attempt"]["rebuild_calls"][2]["path"],
             CHILD,
         )
-        self.assertEqual(preparation["child_rebuilds"], [])
+        self.assertEqual(
+            [row["path"] for row in preparation["child_rebuilds"]],
+            [CHILD],
+        )
         self.assertEqual(preparation["top_rebuild"]["phase"], "top_recovery")
         self.assertEqual(preparation["needs_rebuild2_after"], 0)
         self.assertEqual(
             [row["kind"] for row in preparation["rebuild_calls"]],
-            ["recovery_initial", "candidate", "top_recovery"],
+            ["recovery_initial", "candidate", "child", "top_recovery"],
         )
         self.assertFalse(old_top.save_calls or old_child.save_calls)
         self.assertFalse(fresh_top.save_calls or fresh_child.save_calls)
@@ -940,6 +943,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             )
 
         self.assertIs(returned, fresh_top)
+        self.assertEqual(fresh_child.rebuild_calls, 1)
         self.assertEqual(fresh_top.rebuild_calls, 1)
         self.assertEqual(fresh_virtual.rebuild_calls, 0)
         self.assertEqual(
@@ -1016,12 +1020,126 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             recovery["fresh_session"]["identity"]["pid"],
             5678,
         )
+        self.assertIsNotNone(recovery["fresh_attempt"])
+        self.assertEqual(
+            recovery["fresh_attempt"]["initial_pending"],
+            [normalize_document_path(os.path.abspath(CHILD))],
+        )
         self.assertEqual(
             backend._capture_rebuild_journal[-1]["error_code"],
             "cad_rebuild_incomplete",
         )
         self.assertEqual([old_top.rebuild_calls, fresh_top.rebuild_calls], [1, 1])
+        self.assertEqual(fresh_child.rebuild_calls, 1)
         self.assertEqual(backend.open_calls, [PATH])
+
+    def test_fresh_child_failure_blocks_top_recovery_without_another_session(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_child = _Doc(
+            CHILD,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+        )
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("child-1", fresh_child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top, CHILD: fresh_child},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="c" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["phase"], "child")
+        self.assertEqual([old_child.rebuild_calls, fresh_child.rebuild_calls], [1, 1])
+        self.assertEqual([old_top.rebuild_calls, fresh_top.rebuild_calls], [1, 0])
+        self.assertEqual(backend.open_calls, [PATH])
+        self.assertIn("session_recovery", caught.exception.detail)
+        fresh_attempt = caught.exception.detail["session_recovery"][
+            "fresh_attempt"
+        ]
+        self.assertEqual(
+            sorted(
+                row["path"]
+                for row in fresh_attempt["assembly_states"]
+            ),
+            sorted([PATH, CHILD]),
+        )
+        self.assertEqual(
+            fresh_attempt["initial_pending"],
+            [normalize_document_path(os.path.abspath(CHILD))],
+        )
+
+    def test_fresh_recovery_rechecks_each_child_before_rebuilding_it(self):
+        old_left = _Doc(LEFT, needs_rebuild2=1)
+        old_right = _Doc(RIGHT, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[
+                _Component("left-1", old_left),
+                _Component("right-1", old_right),
+            ],
+        )
+        fresh_left = _Doc(LEFT, needs_rebuild2=1)
+        fresh_right = _Doc(RIGHT, needs_rebuild2=1)
+        fresh_left._rebuild_callback = lambda: setattr(
+            fresh_right,
+            "needs_rebuild2",
+            0,
+        )
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[
+                _Component("left-1", fresh_left),
+                _Component("right-1", fresh_right),
+            ],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, LEFT: old_left, RIGHT: old_right},
+            {PATH: fresh_top, LEFT: fresh_left, RIGHT: fresh_right},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(
+            [old_left.rebuild_calls, old_right.rebuild_calls],
+            [1, 1],
+        )
+        self.assertEqual(
+            [fresh_left.rebuild_calls, fresh_right.rebuild_calls],
+            [1, 0],
+        )
+        self.assertEqual(fresh_top.rebuild_calls, 1)
+        self.assertEqual(
+            [row["path"] for row in preparation["child_rebuilds"]],
+            [LEFT],
+        )
+        self.assertEqual(
+            [row["kind"] for row in preparation["rebuild_calls"]],
+            [
+                "recovery_initial",
+                "candidate",
+                "child",
+                "candidate",
+                "top_recovery",
+            ],
+        )
 
     def test_recovery_rejects_a_reused_owned_process_id(self):
         old_child = _Doc(CHILD, needs_rebuild2=1)
@@ -1123,7 +1241,14 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             return_value="e" * 64,
         ), self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(old_top, PATH)
-        self.assertEqual(caught.exception.code, "cad_rebuild_recovery_failed")
+        self.assertEqual(
+            caught.exception.code,
+            "cad_rebuild_recovery_invariant",
+        )
+        self.assertEqual(caught.exception.detail["violations"], ["read_only"])
+        self.assertIsNotNone(
+            caught.exception.detail["session_recovery"]["fresh_attempt"]
+        )
         self.assertEqual(fresh_top.rebuild_calls, 0)
 
     def test_recovery_rejects_topology_drift_without_rebuild(self):
@@ -1144,8 +1269,151 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             return_value="f" * 64,
         ), self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(old_top, PATH)
-        self.assertEqual(caught.exception.code, "cad_rebuild_recovery_failed")
+        self.assertEqual(
+            caught.exception.code,
+            "cad_rebuild_recovery_invariant",
+        )
+        self.assertIn(
+            "topology_unchanged",
+            caught.exception.detail["violations"],
+        )
+        self.assertIsNotNone(
+            caught.exception.detail["session_recovery"]["fresh_attempt"]
+        )
         self.assertEqual(fresh_top.rebuild_calls, 0)
+
+    def test_recovery_rejects_fresh_source_drift_and_preserves_its_graph(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_child = _Doc(CHILD, needs_rebuild2=1)
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("child-1", fresh_child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top, CHILD: fresh_child},
+        )
+
+        def source_hash(path):
+            if (
+                path == PATH
+                and backend._sessions["copy"].identity()["pid"] == 5678
+            ):
+                return "f" * 64
+            return "a" * 64
+
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            side_effect=source_hash,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(
+            caught.exception.code,
+            "cad_rebuild_recovery_invariant",
+        )
+        self.assertEqual(
+            caught.exception.detail["violations"],
+            ["source_unchanged"],
+        )
+        fresh_attempt = caught.exception.detail["session_recovery"][
+            "fresh_attempt"
+        ]
+        self.assertEqual(fresh_attempt["session"]["identity"]["pid"], 5678)
+        self.assertEqual(
+            fresh_attempt["source_files"][
+                normalize_document_path(os.path.abspath(PATH))
+            ]["sha256"],
+            "f" * 64,
+        )
+        self.assertEqual([fresh_child.rebuild_calls, fresh_top.rebuild_calls], [0, 0])
+
+    def test_recovery_preserves_fresh_loaded_inventory_on_extra_document(self):
+        class ExtraFreshDocumentBackend(_RecoveryBackend):
+            def open_document(self, path):
+                opened = super().open_document(path)
+                self._extra_loaded_documents = [
+                    _Doc(OTHER, document_type=2)
+                ]
+                return opened
+
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_child = _Doc(CHILD, needs_rebuild2=1)
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("child-1", fresh_child)],
+        )
+        backend = ExtraFreshDocumentBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top, CHILD: fresh_child},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_document_unbound")
+        fresh_attempt = caught.exception.detail["session_recovery"][
+            "fresh_attempt"
+        ]
+        self.assertEqual(fresh_attempt["session"]["identity"]["pid"], 5678)
+        self.assertEqual(
+            {row["path"] for row in fresh_attempt["loaded_inventory"]},
+            {PATH, CHILD, OTHER},
+        )
+        self.assertEqual(fresh_attempt["error"]["code"], "cad_capture_document_unbound")
+
+    def test_recovery_preserves_fresh_loaded_inventory_on_missing_document(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_child = _Doc(CHILD, needs_rebuild2=1)
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("child-1", fresh_child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_document_unbound")
+        fresh_attempt = caught.exception.detail["session_recovery"][
+            "fresh_attempt"
+        ]
+        self.assertEqual(fresh_attempt["session"]["identity"]["pid"], 5678)
+        self.assertEqual(
+            {row["path"] for row in fresh_attempt["loaded_inventory"]},
+            {PATH},
+        )
+        self.assertIn(
+            "missing",
+            caught.exception.detail["session_recovery"]["fresh_attempt"][
+                "error"
+            ]["detail"],
+        )
 
     def test_child_failure_never_opens_a_recovery_session(self):
         child = _Doc(CHILD, needs_rebuild2=1, rebuild_clears=False)
