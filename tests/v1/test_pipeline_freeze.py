@@ -213,6 +213,33 @@ class FreezeDomainTests(unittest.TestCase):
             ],
         )
 
+    def test_freeze_refuses_a_fabricated_predecessor(self) -> None:
+        source = self.harness.command()
+        command = StageCommand.create(
+            command_id="freeze-with-predecessor",
+            run_id=source.run_id,
+            stage="freeze",
+            idempotency_key="freeze-with-predecessor",
+            request=source.to_record()["request"],
+            input_artifacts=source.input_artifacts,
+            config_snapshot_sha256=source.config_snapshot_sha256,
+            contract_sha256=source.contract_sha256,
+            policy_sha256=source.policy_sha256,
+            expected_executor_sha256=source.expected_executor_sha256,
+            predecessor_decision_id="fabricated-predecessor",
+        )
+        with self.assertRaises(StageFailure) as raised:
+            self.handler.execute(
+                command,
+                self.harness.claim(command),
+                self.harness.workspace(),
+                effects=NoEffects(),
+            )
+        self.assertEqual(
+            raised.exception.reason_code,
+            "freeze.predecessor_invalid",
+        )
+
     def test_wrong_request_artifact_binding_raises_stage_failure_with_cause(self) -> None:
         command = self.harness.command(request=self.harness.request(originals_artifact_id="another-artifact"))
         with self.assertRaises(StageFailure) as raised:

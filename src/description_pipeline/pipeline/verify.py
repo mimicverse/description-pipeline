@@ -33,6 +33,7 @@ from ..verification.solidworks_urdf import (
 )
 from .contracts import (
     ArtifactRef,
+    DiagnosticReplayScope,
     ExecutionClaim,
     ProtocolError,
     StageCandidate,
@@ -903,6 +904,7 @@ def replay_verification(
     provider = identity_provider or current_verifier_identity
     verifier = _json_object(provider(), "verifier identity")
     frozen_request, _request_sha = read_request_evidence(Path(capture_root) / "input/request.json")
+    artifacts = (generate_artifact, capture_artifact)
     command = StageCommand.create(
         command_id="verification-replay",
         run_id="verification-replay",
@@ -915,12 +917,16 @@ def replay_verification(
             "purpose": str(frozen_request["purpose"]),
             "schema_version": REQUEST_SCHEMA,
         },
-        input_artifacts=(generate_artifact, capture_artifact),
+        input_artifacts=artifacts,
         config_snapshot_sha256=str(frozen_request["platform_config_digest"]),
         contract_sha256=CONTRACT_SHA256,
         policy_sha256=check_policy_digest(),
         expected_executor_sha256=current_verifier_sha256(verifier),
         predecessor_decision_id=None,
+        diagnostic_scope=DiagnosticReplayScope.from_inputs(
+            "verify",
+            artifacts,
+        ),
     )
     claim = ExecutionClaim(
         claim_id="verification-replay",
