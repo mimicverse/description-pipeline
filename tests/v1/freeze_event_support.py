@@ -12,6 +12,8 @@ FREEZE_RECEIPT_SHA256 = "a" * 64
 
 def freeze_request_fields(source: dict | None = None) -> dict:
     events = validate_freeze_events(source["freeze_events"] if source is not None else freeze_events())
+    if source is not None and source["freeze_events_sha256"] != digest(events):
+        raise ValueError("Parent Freeze events do not match their recorded digest")
     return {
         "freeze_events": copy.deepcopy(events),
         "freeze_events_sha256": digest(events),

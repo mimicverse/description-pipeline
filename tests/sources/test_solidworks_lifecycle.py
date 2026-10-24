@@ -86,6 +86,9 @@ class SessionTests(unittest.TestCase):
 
     def test_capture_rebuild_is_in_memory_and_failure_blocks_measurement(self):
         backend = SolidWorksBackend()
+        backend._sessions["copy"] = Mock(
+            closed=False, identity=Mock(return_value={"pid": 100, "state": "active"}),
+        )
         backend._capture_roots = [normalize_document_path("/snapshot/source")]
         extension = SimpleNamespace(
             NeedsRebuild2=1,

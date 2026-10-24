@@ -104,6 +104,8 @@ def _publish(bundle: Path, evidence: Path) -> dict:
     helpers keep reading it); the frozen delivery is a sibling tree.
     """
 
+    from description_pipeline.io import write_json
+
     source = support.default_source_record(
         main_assembly="3.0 总装1008.SLDASM",
         configuration="Default",
@@ -117,6 +119,10 @@ def _publish(bundle: Path, evidence: Path) -> dict:
         source=source,
     )
     delivery_evidence = Path(bundle) / "delivery" / "evidence"
+    write_json(
+        Path(bundle) / "delivery/reports/native-tool.json",
+        json.loads((evidence / "native-runtime.json").read_text(encoding="utf-8"))["toolchain"],
+    )
     (delivery_evidence / "raw/scene_raw.json").write_text('{"scene": "fixture"}', encoding="utf-8")
     write_manifest(delivery_evidence, kind="solidworks", identity=dict(native_identity), evidence_class="cad")
     support.seal_delivery(Path(bundle) / "delivery")
@@ -141,7 +147,8 @@ def _write_native_metadata_fixture(evidence: Path, *, closure_top_level: str) ->
     rewrite_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(evidence / "raw/dependency_closure.json", {"top_level": closure_top_level})
     write_json(runtime_path, runtime)
-    write_json(rewrite_path, _metadata_environment(session_role="source"))
+    write_json(evidence.parent / "reports/native-tool.json", runtime["toolchain"])
+    write_json(rewrite_path, _metadata_environment())
 
 
 def placement(rotation, translation):

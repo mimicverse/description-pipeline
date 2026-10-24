@@ -29,7 +29,7 @@ from description_pipeline.orchestration.discovery_transfer import (
 from description_pipeline.orchestration.windows import Jobs, read_config
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings
 from tests.sources.test_solidworks_discovery import record as native_record
-from .freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
+from .freeze_event_support import freeze_request_fields
 from .protocol_support import protocol_events
 
 #: The neutral discovery fixture's exact file set and byte layout.
@@ -140,15 +140,12 @@ class EndpointFixture:
     # -- requests, selection rounds, native record --------------------------
 
     def request(self, run_id: str | None = None, **extra) -> dict:
-        prior = freeze_events()
         return {
             "run_id": run_id or str(uuid.uuid4()),
             "upload_files": copy.deepcopy(self.upload_files),
             "upload_sha256": self.upload_sha,
             "main_assembly": MAIN,
-            "freeze_events": prior,
-            "freeze_events_sha256": digest(prior),
-            "freeze_receipt_sha256": FREEZE_RECEIPT_SHA256,
+            **freeze_request_fields(),
             **extra,
         }
 

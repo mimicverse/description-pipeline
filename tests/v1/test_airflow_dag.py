@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.v1._airflow_env import pinned_airflow_home
-from tests.v1.freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
+from tests.v1.freeze_event_support import freeze_events, freeze_request_fields
 
 from description_pipeline.io import digest, file_digest
 from description_pipeline.orchestration.airflow_client import EndpointConfig
@@ -27,15 +27,6 @@ DAG_DIR = ROOT / "deploy/airflow/dags"
 AIRFLOW_HOME = pinned_airflow_home()
 
 _MIGRATED = False
-
-
-def freeze_request_fields() -> dict:
-    events = freeze_events()
-    return {
-        "freeze_events": events,
-        "freeze_events_sha256": digest(events),
-        "freeze_receipt_sha256": FREEZE_RECEIPT_SHA256,
-    }
 
 
 def accepted_freeze_record(

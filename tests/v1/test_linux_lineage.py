@@ -82,7 +82,12 @@ class LinuxLineageTests(unittest.TestCase):
 
         def capture(platform, owner):
             self.registry.gate_calls.append(("capture", owner))
-            return {"handoff_sha256": "a" * 64}
+            return {
+                "handoff_sha256": "a" * 64,
+                "upload_sha256": "a" * 64,
+                "native_prepared_dir": str(self.root / owner / "native"),
+                "native_prepared_files": {"cad/robot.SLDASM": "a" * 64},
+            }
 
         def revalidate(platform, owner, capture_path, frozen_path):
             self.registry.gate_calls.append(("revalidate", owner))
@@ -95,6 +100,8 @@ class LinuxLineageTests(unittest.TestCase):
             mock.patch.object(flow, "registered_capture", side_effect=capture),
             mock.patch.object(flow, "revalidate_capture", side_effect=revalidate),
             mock.patch.object(flow, "portable_identity_gate", side_effect=identity),
+            mock.patch.object(flow, "verify_transfer", return_value={"run_id": run_id}),
+            mock.patch.object(flow, "_registered_request_sha256", return_value="a" * 64),
             mock.patch.object(flow.solidworks, "generate", side_effect=producer),
             mock.patch.object(flow.solidworks, "verify", side_effect=producer),
             mock.patch.object(flow.solidworks, "publish", side_effect=producer),
