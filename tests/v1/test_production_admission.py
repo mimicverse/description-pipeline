@@ -271,6 +271,10 @@ class ProductionAdmissionTests(unittest.TestCase):
         )
         self.assertEqual(spec.native_tool_source_sha256, self.native_tool["source_sha256"])
         self.assertEqual(spec.native_tool_record_sha256, digest(self.native_tool))
+        self.assertNotEqual(
+            spec.dispatch_executor_sha256,
+            spec.executors.freeze,
+        )
         self.assertEqual(self.native_reads, 1)
         self.assertEqual(
             spec.publish_intent.repository.origin_url,

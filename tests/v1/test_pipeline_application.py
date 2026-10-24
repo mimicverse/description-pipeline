@@ -344,6 +344,14 @@ class StageApplicationTests(unittest.TestCase):
         admitted = self.application.admit(self.harness.spec)
         self.assertEqual(admitted.admission, build_run_admission(self.harness.spec))
         self.assertEqual(admitted.dispatch_command.freeze_command_id, admitted.freeze_command.command_id)
+        self.assertEqual(
+            admitted.dispatch_command.expected_executor_sha256,
+            self.harness.spec.dispatch_executor_sha256,
+        )
+        self.assertNotEqual(
+            admitted.dispatch_command.expected_executor_sha256,
+            admitted.freeze_command.expected_executor_sha256,
+        )
         self.assertEqual(admitted.dispatch_command.dag_id, "solidworks_to_urdf")
         self.assertEqual(admitted.dispatch_command.dag_run_id, self.harness.spec.request_id)
         self.assertEqual(

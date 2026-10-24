@@ -29,7 +29,7 @@ from ..repository.publish import (
     seal_repository_snapshot,
 )
 from ..repository.review_branch import review_branch
-from ..runtime import tool_record
+from ..runtime import scoped_executor_sha256, tool_record
 from ..schemas import NATIVE_TOOL_REQUIREMENT_KIND, TOOL_SCHEMA
 from ..sources.solidworks.handoff import describe_handoff
 from ..stages import CONTRACT_SHA256
@@ -430,7 +430,7 @@ class ProductionAdmissionFactory:
             ) from error
         return validated["resolved"], config_snapshot_digest(validated), raw
 
-    def _installed(self) -> tuple[StageExecutors, str]:
+    def _installed(self) -> tuple[StageExecutors, str, str]:
         portable = _canonical_mapping(
             self.portable_tool_provider(),
             "portable_tool",
@@ -452,7 +452,11 @@ class ProductionAdmissionFactory:
                 "portable_tool_sha256": digest(portable),
             }
         )
-        return executors, ingestion
+        dispatch = scoped_executor_sha256(
+            portable,
+            "airflow_dispatch",
+        )
+        return executors, ingestion, dispatch
 
     def _native_requirement(
         self,
@@ -792,7 +796,11 @@ class ProductionAdmissionFactory:
                 {"where": "work_root", "reason": "upload-root-overlap"},
             )
         resolved, platform_config_sha256, snapshot_bytes = self._load_platform()
-        executors, ingestion_tool_sha256 = self._installed()
+        (
+            executors,
+            ingestion_tool_sha256,
+            dispatch_executor_sha256,
+        ) = self._installed()
         native_tool_requirement, native_source_sha256, native_record_sha256 = (
             self._native_requirement(ingestion_tool_sha256)
         )
@@ -829,6 +837,7 @@ class ProductionAdmissionFactory:
             ruleset=ruleset,
             configuration=configuration,
             executors=executors,
+            dispatch_executor_sha256=dispatch_executor_sha256,
             native_tool_source_sha256=native_source_sha256,
             native_tool_record_sha256=native_record_sha256,
             native_tool_requirement=native_tool_requirement,

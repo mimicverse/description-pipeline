@@ -63,6 +63,7 @@ _ADMISSION_FIELDS = frozenset(
     {
         "contract_sha256",
         "created_at",
+        "dispatch_executor_sha256",
         "executors",
         "from_stage",
         "main_assembly",
@@ -338,6 +339,7 @@ class AdmissionSpec:
     ruleset: VerifiedRuleset
     configuration: VerifiedArtifact
     executors: StageExecutors
+    dispatch_executor_sha256: str
     native_tool_source_sha256: str
     native_tool_record_sha256: str
     native_tool_requirement: VerifiedArtifact
@@ -376,6 +378,7 @@ class AdmissionSpec:
         if not isinstance(self.executors, StageExecutors):
             raise ProtocolError("admission.invalid", {"where": "executors"})
         for field in (
+            "dispatch_executor_sha256",
             "native_tool_source_sha256",
             "native_tool_record_sha256",
             "contract_sha256",
@@ -410,6 +413,7 @@ class AdmissionSpec:
             "configuration": self.configuration.to_record(),
             "contract_sha256": self.contract_sha256,
             "created_at": self.created_at.isoformat(),
+            "dispatch_executor_sha256": self.dispatch_executor_sha256,
             "executors": self.executors.to_record(),
             "from_stage": self.from_stage,
             "main_assembly": self.main_assembly,
@@ -466,6 +470,7 @@ class AdmissionSpec:
             ruleset=ruleset,
             configuration=configuration,
             executors=StageExecutors.from_record(record["executors"]),
+            dispatch_executor_sha256=record["dispatch_executor_sha256"],
             native_tool_source_sha256=record["native_tool_source_sha256"],
             native_tool_record_sha256=record["native_tool_record_sha256"],
             native_tool_requirement=_verified_from_record(

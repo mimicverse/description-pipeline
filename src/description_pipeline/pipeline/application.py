@@ -418,7 +418,7 @@ class StageApplication:
             run_id=spec.run_id,
             freeze_command_id=command.command_id,
         )
-        dispatch_executor_sha256 = spec.executors.freeze
+        dispatch_executor_sha256 = spec.dispatch_executor_sha256
         conf_artifact = self.artifacts.seal_dispatch_conf(
             conf,
             producer_run_id=spec.run_id,

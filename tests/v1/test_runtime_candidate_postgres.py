@@ -340,7 +340,9 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.facts = FactStore(self._connect, self.artifacts)
         self.admission = build_run_admission(self.admission_harness.spec)
         self.command = build_freeze_command(self.admission_harness.spec)
-        self.dispatch_executor = digest({"tool": "portal-dispatch"})
+        self.dispatch_executor = (
+            self.admission_harness.spec.dispatch_executor_sha256
+        )
         self.dispatch_conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=self.admission.run_id,
@@ -867,7 +869,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertNotEqual(claim_rows[0][0], claim_rows[0][1])
         self.assertTrue(claim_rows[0][2])
 
-    def test_transport_identity_is_explicit_without_requiring_a_different_digest(self) -> None:
+    def test_transport_identity_is_independent_from_stage_executors(self) -> None:
         admission, freeze_command = self._new_admission("same-transport")
         conf = DispatchConf(
             schema_version="description-pipeline.airflow-dispatch-conf/v1",
@@ -877,7 +879,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         artifact = self.artifacts.seal_dispatch_conf(
             conf,
             producer_run_id=admission.run_id,
-            producer_tool_sha256=self.executor,
+            producer_tool_sha256=self.dispatch_executor,
         )
         dispatch = DispatchCommand.create(
             command_id=f"dispatch-{admission.run_id}",
@@ -887,7 +889,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             dag_id="solidworks_to_urdf",
             dag_run_id=f"portal-{admission.run_id}",
             conf_artifact=artifact,
-            expected_executor_sha256=self.executor,
+            expected_executor_sha256=self.dispatch_executor,
         )
         stored_freeze, stored_dispatch, _intent = self.facts.admit_run(
             admission,
@@ -895,7 +897,14 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             dispatch,
             artifact,
         )
-        self.assertEqual(stored_freeze.expected_executor_sha256, stored_dispatch.expected_executor_sha256)
+        self.assertNotEqual(
+            stored_freeze.expected_executor_sha256,
+            stored_dispatch.expected_executor_sha256,
+        )
+        self.assertEqual(
+            stored_dispatch.expected_executor_sha256,
+            admission.request["dispatch_executor_sha256"],
+        )
         self.assertNotEqual(stored_freeze.command_id, stored_dispatch.command_id)
 
     def test_lost_dispatch_response_observes_the_same_dag_run_without_resending(self) -> None:

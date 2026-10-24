@@ -165,6 +165,9 @@ class AdmissionHarness:
                 verify=digest({"executor": "verify"}),
                 publish=digest({"executor": "publish"}),
             ),
+            dispatch_executor_sha256=digest(
+                {"executor": "airflow-dispatch"}
+            ),
             native_tool_source_sha256=self.native_tool["source_sha256"],
             native_tool_record_sha256=digest(self.native_tool),
             native_tool_requirement=self.native_tool_requirement,
