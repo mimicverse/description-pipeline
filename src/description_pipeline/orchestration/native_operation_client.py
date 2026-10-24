@@ -668,6 +668,7 @@ class NativeOperationCapturePort:
     @staticmethod
     def _request_record(
         inputs,
+        current_native_tool: Mapping[str, object],
         *,
         run_id: str,
         request_digest: str,
@@ -677,16 +678,16 @@ class NativeOperationCapturePort:
         upstream_artifacts: tuple[Mapping[str, object], ...],
         execution: Mapping[str, object],
     ) -> tuple[CaptureOperationRequest, dict[str, object]]:
-        discovered_tool = copy.deepcopy(dict(inputs.native_tool))
-        full_tool_sha256 = digest(discovered_tool)
-        source_sha256 = discovered_tool.get("source_sha256")
+        current_tool = copy.deepcopy(dict(current_native_tool))
+        full_tool_sha256 = digest(current_tool)
+        source_sha256 = current_tool.get("source_sha256")
         if not isinstance(source_sha256, str):
             raise NativeOperationProtocolError(
-                "Discover observation carries no native source identity"
+                "The current native tool carries no source identity"
             )
         if execution.get("native_tool_sha256") != full_tool_sha256:
             raise NativeOperationProtocolError(
-                "Capture execution does not bind the observed full native tool"
+                "Capture execution does not bind the current full native tool"
             )
         record = {
             "schema_version": CAPTURE_OPERATION_SCHEMA,
@@ -706,7 +707,7 @@ class NativeOperationCapturePort:
             "native_tool_source_sha256": source_sha256,
         }
         request = CaptureOperationRequest.from_record(record)
-        return request, discovered_tool
+        return request, current_tool
 
     def __call__(
         self,
@@ -727,8 +728,9 @@ class NativeOperationCapturePort:
             raise NativeOperationProtocolError(
                 "The remote Capture adapter does not accept a Linux CAD backend"
             )
-        request, discovered_tool = self._request_record(
+        request, current_tool = self._request_record(
             inputs,
+            native_tool,
             run_id=run_id,
             request_digest=request_digest,
             handoff_sha256=handoff_sha256,
@@ -737,9 +739,9 @@ class NativeOperationCapturePort:
             upstream_artifacts=upstream_artifacts,
             execution=execution,
         )
-        if dict(native_tool) != discovered_tool:
+        if dict(native_tool) != current_tool:
             raise NativeOperationProtocolError(
-                "Capture handler supplied a tool identity other than the Discover observation"
+                "Capture handler supplied a tool identity other than the current native tool"
             )
         operation_id = self.operation_id(
             run_id=run_id,
@@ -748,7 +750,7 @@ class NativeOperationCapturePort:
         )
         view = observe_native_operation(self.client, operation_id)
         request_sha256 = digest(request.to_record())
-        full_tool_sha256 = digest(discovered_tool)
+        full_tool_sha256 = digest(current_tool)
         if view is not None and (
             view.kind != CAPTURE_KIND
             or view.request_sha256 != request_sha256
@@ -865,6 +867,7 @@ def capture_handler_from_native_operation(
 
     from ..pipeline.capture import CaptureHandler
 
+    tool_provider = NativeOperationToolProvider(client)
     return CaptureHandler(
         artifact_store=artifact_store,
         native_operation=NativeOperationCapturePort(
@@ -872,6 +875,7 @@ def capture_handler_from_native_operation(
             timeout=timeout,
             poll_interval=poll_interval,
         ),
+        native_tool_factory=tool_provider,
     )
 
 

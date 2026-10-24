@@ -425,7 +425,12 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         inputs = SimpleNamespace(
             package=package,
             prepared_files=prepared_files,
-            native_tool=dict(NATIVE_TOOL),
+            historical_native_tool={
+                "schema_version": TOOL_SCHEMA,
+                "pipeline_id": "historical-native-operation-test",
+                "source_sha256": "ef" * 32,
+                "runtime": {"role": "native"},
+            },
         )
         calls = 0
 
@@ -508,7 +513,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(remote.state, "satisfied")
         self.assertEqual(remote.actual_native_tool_sha256, digest(NATIVE_TOOL))
         handler = capture_handler_from_native_operation(client)
-        self.assertIsNone(handler._native_tool_factory)
+        self.assertEqual(handler._native_tool_factory(), NATIVE_TOOL)
 
     def test_capture_transaction_failure_retains_diagnostic_bytes(self) -> None:
         package = self.root / "prepared-failure"
@@ -734,6 +739,35 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(failed.state, "failed")
         self.assertEqual(failed.failure.code, "native_tool_mismatch")
         self.assertTrue(failed.resource_terminated)
+        self.assertEqual(self.calls, 0)
+
+    def test_full_current_tool_record_mismatch_never_calls_cad(self) -> None:
+        current_variant = copy.deepcopy(NATIVE_TOOL)
+        current_variant["runtime"]["execution_variant"] = "different-windows-record"
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: current_variant,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        client.create_operation(_operation("operation-full-tool-mismatch", self.archive))
+        client.upload_input("operation-full-tool-mismatch", self.archive)
+
+        failed = client.wait_for_terminal("operation-full-tool-mismatch")
+
+        self.assertEqual(failed.state, "failed")
+        self.assertEqual(failed.failure.code, "native_tool_mismatch")
+        self.assertEqual(
+            failed.actual_native_tool_sha256,
+            digest(current_variant),
+        )
+        self.assertNotEqual(
+            failed.actual_native_tool_sha256,
+            digest(NATIVE_TOOL),
+        )
         self.assertEqual(self.calls, 0)
 
     def test_definite_native_failure_preserves_workspace_bytes(self) -> None:

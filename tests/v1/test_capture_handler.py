@@ -7,15 +7,17 @@ import hashlib
 import json
 import tempfile
 import unittest
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.io import digest, file_digest, read_data
+from description_pipeline.io import canonical, digest, file_digest, read_data
 from description_pipeline.pipeline import (
     ArtifactRef,
     CaptureHandler,
+    DiagnosticReplayScope,
     DiscoverHandler,
     ExecutionClaim,
     FreezeHandler,
@@ -40,6 +42,7 @@ from description_pipeline.pipeline.effects import (
 from description_pipeline.pipeline.freeze import FREEZE_REQUEST_SCHEMA
 from description_pipeline.orchestration.stage_transfer import admit_capture
 from description_pipeline.sources.solidworks.discovery import PLAN_FILE
+from description_pipeline.schemas import NATIVE_TOOL_REQUIREMENT_KIND
 
 from .split_capture_fixture import fixture_backend
 from .test_pipeline_discover import (
@@ -271,8 +274,13 @@ class CaptureHandlerTests(unittest.TestCase):
             producer_tool_sha256=digest({"producer": CONFIGURATION_KIND}),
         )
         self.capture_tool = build_capture_tool()
+        self.current_native_tool = copy.deepcopy(self.capture_tool)
         self.expected_native_tool_sha256 = self.capture_tool["source_sha256"]
         self.native_tool_sha256 = digest(self.capture_tool)
+        self.native_tool_requirement_ref = self._seal_native_requirement(
+            self.current_native_tool,
+            "native-tool-requirement",
+        )
         freeze_request = {
             "schema_version": FREEZE_REQUEST_SCHEMA,
             "request_id": "request-capture-boundary",
@@ -418,6 +426,27 @@ class CaptureHandlerTests(unittest.TestCase):
             expires_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
 
+    def _seal_native_requirement(
+        self,
+        tool: Mapping[str, object],
+        name: str,
+    ) -> ArtifactRef:
+        root = self.root / f"{name}-source"
+        root.mkdir()
+        (root / "tool.json").write_bytes(canonical(dict(tool)))
+        return self.store.seal_tree(
+            root,
+            kind=NATIVE_TOOL_REQUIREMENT_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"producer": name}),
+        )
+
+    def _native_tool_variant(self, name: str) -> dict:
+        tool = copy.deepcopy(self.capture_tool)
+        tool["runtime"]["execution_variant"] = name
+        return tool
+
     def _materialized_workspace(
         self,
         root: Path,
@@ -436,9 +465,11 @@ class CaptureHandlerTests(unittest.TestCase):
         self,
         *,
         discover: ArtifactRef | None = None,
+        requirement: ArtifactRef | None = None,
         request: dict | None = None,
         expected_executor: str | None = None,
     ) -> StageCommand:
+        requirement_ref = requirement or self.native_tool_requirement_ref
         return StageCommand.create(
             command_id="command-capture",
             run_id=CHILD,
@@ -451,10 +482,17 @@ class CaptureHandlerTests(unittest.TestCase):
                 "main_assembly": MAIN,
                 "native_tool_source_sha256": self.expected_native_tool_sha256,
                 "native_tool_record_sha256": self.native_tool_sha256,
+                "native_tool_requirement_artifact_id": (
+                    requirement_ref.artifact_id
+                ),
                 "prepared_sha256": digest(self.prepared_files),
                 "upload_sha256": self.upload_sha256,
             },
-            input_artifacts=(self.freeze_ref, discover or self.discover_ref),
+            input_artifacts=(
+                self.freeze_ref,
+                discover or self.discover_ref,
+                requirement_ref,
+            ),
             config_snapshot_sha256=digest({"config": "capture"}),
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": "capture"}),
@@ -477,6 +515,50 @@ class CaptureHandlerTests(unittest.TestCase):
             )
         return discover
 
+    def _diagnostic_command(
+        self,
+        current_tool: Mapping[str, object],
+        *,
+        expected_executor: str | None = None,
+        requirement_tool: Mapping[str, object] | None = None,
+    ) -> tuple[StageCommand, ArtifactRef]:
+        requirement = self._seal_native_requirement(
+            requirement_tool or current_tool,
+            "diagnostic-native-tool-requirement",
+        )
+        input_artifacts = (
+            self.freeze_ref,
+            self.discover_ref,
+            requirement,
+        )
+        command = StageCommand.create(
+            command_id="command-capture-diagnostic",
+            run_id=CHILD,
+            stage="capture",
+            idempotency_key=f"{CHILD}/diagnostic/capture",
+            request={
+                "effect_key": "capture-native-diagnostic",
+                "handoff_sha256": self.handoff_sha256,
+                "main_assembly": MAIN,
+                "native_tool_source_sha256": current_tool["source_sha256"],
+                "native_tool_record_sha256": digest(current_tool),
+                "native_tool_requirement_artifact_id": requirement.artifact_id,
+                "prepared_sha256": digest(self.prepared_files),
+                "upload_sha256": self.upload_sha256,
+            },
+            input_artifacts=input_artifacts,
+            config_snapshot_sha256=digest({"config": "capture-diagnostic"}),
+            contract_sha256=digest({"contract": "capture-diagnostic"}),
+            policy_sha256=digest({"policy": "capture-diagnostic"}),
+            expected_executor_sha256=expected_executor or self.stage_executor,
+            predecessor_decision_id=None,
+            diagnostic_scope=DiagnosticReplayScope.from_inputs(
+                "capture",
+                input_artifacts,
+            ),
+        )
+        return command, requirement
+
     def workspace(
         self,
         *,
@@ -485,7 +567,14 @@ class CaptureHandlerTests(unittest.TestCase):
     ) -> StageWorkspace:
         discover = self._discover(producer_run_id=discover_run_id)
         root = self.root / (name or f"workspace-{discover_run_id}")
-        return self._materialized_workspace(root, (self.freeze_ref, discover))
+        return self._materialized_workspace(
+            root,
+            (
+                self.freeze_ref,
+                discover,
+                self.native_tool_requirement_ref,
+            ),
+        )
 
     def handler(
         self,
@@ -496,7 +585,9 @@ class CaptureHandlerTests(unittest.TestCase):
         return CaptureHandler(
             artifact_store=self.store,
             backend_factory=lambda package: fixture_backend(package, MAIN),
-            native_tool_factory=(lambda: tool) if tool is not None else None,
+            native_tool_factory=lambda: (
+                self.current_native_tool if tool is None else tool
+            ),
             native_operation=native_operation,
         )
 
@@ -609,6 +700,307 @@ class CaptureHandlerTests(unittest.TestCase):
             any(intent.command_id == self.command.command_id for intent in self.effect_ledger.intents.values())
         )
 
+    def test_diagnostic_capture_keeps_historical_current_and_executor_tools_separate(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        command, requirement = self._diagnostic_command(current_tool)
+        claim = self._claim(command, "claim-capture-diagnostic", fence=1)
+        self.assertNotEqual(digest(self.capture_tool), digest(current_tool))
+        self.assertNotEqual(digest(current_tool), self.stage_executor)
+        self.assertNotEqual(self.stage_executor, self.native_tool_sha256)
+
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=current_tool,
+        ):
+            execution = self.handler(tool=current_tool).execute(
+                command,
+                claim,
+                self._materialized_workspace(
+                    self.root / "workspace-capture-diagnostic",
+                    (self.freeze_ref, self.discover_ref, requirement),
+                ),
+                effects=self.effects(command, claim),
+            )
+
+        self.assertEqual(execution.outcome, "completed")
+        admitted = Path(execution.candidate_root)
+        manifest = read_data(admitted / "transfer-manifest.json")
+        self.assertEqual(manifest["native_tool"], current_tool)
+        self.assertEqual(manifest["native_tool_sha256"], digest(current_tool))
+        self.assertEqual(
+            manifest["execution"]["native_tool_sha256"],
+            digest(current_tool),
+        )
+        self.assertEqual(
+            manifest["execution"]["executor_sha256"],
+            self.stage_executor,
+        )
+        self.assertNotEqual(
+            manifest["execution"]["native_tool_sha256"],
+            self.native_tool_sha256,
+        )
+
+    def test_diagnostic_capture_rejects_current_tool_bound_to_history(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        command, requirement = self._diagnostic_command(self.capture_tool)
+        claim = self._claim(command, "claim-diagnostic-history-binding", fence=1)
+        operation = Mock()
+        effects = self.effects(command, claim)
+
+        with self.assertRaisesRegex(Exception, "native_tool_mismatch"):
+            self.handler(tool=current_tool, native_operation=operation).execute(
+                command,
+                claim,
+                self._materialized_workspace(
+                    self.root / "workspace-diagnostic-history-binding",
+                    (self.freeze_ref, self.discover_ref, requirement),
+                ),
+                effects=effects,
+            )
+
+        operation.assert_not_called()
+        self.assertFalse(
+            any(
+                intent.command_id == command.command_id
+                for intent in self.effect_ledger.intents.values()
+            )
+        )
+
+    def test_diagnostic_capture_rejects_a_drifted_current_windows_tool(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        drifted_tool = self._native_tool_variant("drifted")
+        command, requirement = self._diagnostic_command(current_tool)
+        claim = self._claim(command, "claim-diagnostic-current-tool", fence=1)
+        operation = Mock()
+        effects = self.effects(command, claim)
+
+        with self.assertRaisesRegex(Exception, "native_tool_mismatch"):
+            self.handler(tool=drifted_tool, native_operation=operation).execute(
+                command,
+                claim,
+                self._materialized_workspace(
+                    self.root / "workspace-diagnostic-current-tool",
+                    (self.freeze_ref, self.discover_ref, requirement),
+                ),
+                effects=effects,
+            )
+
+        operation.assert_not_called()
+        self.assertFalse(
+            any(
+                intent.command_id == command.command_id
+                for intent in self.effect_ledger.intents.values()
+            )
+        )
+
+    def test_diagnostic_capture_rejects_a_different_linux_executor(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        command, requirement = self._diagnostic_command(current_tool)
+        claim = ExecutionClaim(
+            claim_id="claim-diagnostic-executor",
+            command_id=command.command_id,
+            fence=1,
+            owner_sha256=digest({"owner": "diagnostic-executor"}),
+            executor_sha256=digest({"executor": "different-linux-capture"}),
+            lane_key="native",
+            expires_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        operation = Mock()
+        effects = self.effects(command, claim)
+
+        with self.assertRaisesRegex(Exception, "claim_mismatch"):
+            self.handler(tool=current_tool, native_operation=operation).execute(
+                command,
+                claim,
+                self._materialized_workspace(
+                    self.root / "workspace-diagnostic-executor",
+                    (self.freeze_ref, self.discover_ref, requirement),
+                ),
+                effects=effects,
+            )
+
+        operation.assert_not_called()
+        self.assertFalse(
+            any(
+                intent.command_id == command.command_id
+                for intent in self.effect_ledger.intents.values()
+            )
+        )
+
+    def test_diagnostic_capture_rejects_wrong_current_requirement_bytes(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        command, requirement = self._diagnostic_command(
+            current_tool,
+            requirement_tool=self.capture_tool,
+        )
+        claim = self._claim(command, "claim-diagnostic-requirement-bytes", fence=1)
+        operation = Mock()
+        effects = self.effects(command, claim)
+
+        with self.assertRaisesRegex(Exception, "native_requirement_artifact"):
+            self.handler(tool=current_tool, native_operation=operation).execute(
+                command,
+                claim,
+                self._materialized_workspace(
+                    self.root / "workspace-diagnostic-requirement-bytes",
+                    (self.freeze_ref, self.discover_ref, requirement),
+                ),
+                effects=effects,
+            )
+
+        operation.assert_not_called()
+        self.assertFalse(
+            any(
+                intent.command_id == command.command_id
+                for intent in self.effect_ledger.intents.values()
+            )
+        )
+
+    def test_capture_rejects_tampered_historical_discover_bytes(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        command, requirement = self._diagnostic_command(current_tool)
+        claim = self._claim(command, "claim-diagnostic-historical-bytes", fence=1)
+        workspace = self._materialized_workspace(
+            self.root / "workspace-diagnostic-historical-bytes",
+            (self.freeze_ref, self.discover_ref, requirement),
+        )
+        result_path = workspace.inputs[self.discover_ref.artifact_id] / "result.json"
+        result = read_data(result_path)
+        result["native_tool"]["runtime"]["execution_variant"] = "tampered"
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        operation = Mock()
+        effects = self.effects(command, claim)
+
+        with self.assertRaisesRegex(Exception, "artifact_changed|native_history"):
+            self.handler(tool=current_tool, native_operation=operation).execute(
+                command,
+                claim,
+                workspace,
+                effects=effects,
+            )
+
+        operation.assert_not_called()
+        self.assertFalse(
+            any(
+                intent.command_id == command.command_id
+                for intent in self.effect_ledger.intents.values()
+            )
+        )
+
+    def test_formal_capture_does_not_relax_distinct_current_requirement(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        requirement = self._seal_native_requirement(
+            current_tool,
+            "formal-native-tool-requirement",
+        )
+        request = {
+            **self.command.to_record()["request"],
+            "native_tool_source_sha256": current_tool["source_sha256"],
+            "native_tool_record_sha256": digest(current_tool),
+            "native_tool_requirement_artifact_id": requirement.artifact_id,
+        }
+        command = self._command(requirement=requirement, request=request)
+        claim = self._claim(command, "claim-formal-distinct-requirement", fence=1)
+        operation = Mock()
+        effects = self.effects(command, claim)
+
+        with self.assertRaisesRegex(Exception, "native_requirement_binding"):
+            self.handler(tool=current_tool, native_operation=operation).execute(
+                command,
+                claim,
+                self._materialized_workspace(
+                    self.root / "workspace-formal-distinct-requirement",
+                    (self.freeze_ref, self.discover_ref, requirement),
+                ),
+                effects=effects,
+            )
+
+        operation.assert_not_called()
+        self.assertFalse(
+            any(
+                intent.command_id == command.command_id
+                for intent in self.effect_ledger.intents.values()
+            )
+        )
+
+    def test_capture_rejects_an_incomplete_requirement_input_closure(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        requirement = self._seal_native_requirement(
+            current_tool,
+            "unreferenced-native-tool-requirement",
+        )
+        input_artifacts = (self.freeze_ref, self.discover_ref)
+        request = {
+            **self.command.to_record()["request"],
+            "native_tool_source_sha256": current_tool["source_sha256"],
+            "native_tool_record_sha256": digest(current_tool),
+            "native_tool_requirement_artifact_id": requirement.artifact_id,
+        }
+        command = StageCommand.create(
+            command_id="command-capture-missing-requirement",
+            run_id=CHILD,
+            stage="capture",
+            idempotency_key=f"{CHILD}/missing-requirement",
+            request=request,
+            input_artifacts=input_artifacts,
+            config_snapshot_sha256=digest({"config": "missing-requirement"}),
+            contract_sha256=digest({"contract": "missing-requirement"}),
+            policy_sha256=digest({"policy": "missing-requirement"}),
+            expected_executor_sha256=self.stage_executor,
+            predecessor_decision_id=None,
+            diagnostic_scope=DiagnosticReplayScope.from_inputs(
+                "capture",
+                input_artifacts,
+            ),
+        )
+        claim = self._claim(command, "claim-missing-requirement", fence=1)
+        operation = Mock()
+        effects = self.effects(command, claim)
+
+        with self.assertRaisesRegex(Exception, "native_requirement_artifact"):
+            self.handler(tool=current_tool, native_operation=operation).execute(
+                command,
+                claim,
+                self._materialized_workspace(
+                    self.root / "workspace-missing-requirement",
+                    input_artifacts,
+                ),
+                effects=effects,
+            )
+
+        operation.assert_not_called()
+        self.assertFalse(
+            any(
+                intent.command_id == command.command_id
+                for intent in self.effect_ledger.intents.values()
+            )
+        )
+
+    def test_capture_requires_an_explicit_current_tool_provider(self) -> None:
+        operation = Mock()
+        handler = CaptureHandler(
+            artifact_store=self.store,
+            backend_factory=lambda package: fixture_backend(package, MAIN),
+            native_operation=operation,
+        )
+        effects = self.effects()
+
+        with self.assertRaisesRegex(Exception, "native_tool_provider_missing"):
+            handler.execute(
+                self.command,
+                self.claim,
+                self.workspace(),
+                effects=effects,
+            )
+
+        operation.assert_not_called()
+        self.assertFalse(
+            any(
+                intent.command_id == self.command.command_id
+                for intent in self.effect_ledger.intents.values()
+            )
+        )
+
     def test_capture_cannot_rebind_the_discover_native_requirement(self) -> None:
         operation = Mock()
         request = {
@@ -618,7 +1010,7 @@ class CaptureHandlerTests(unittest.TestCase):
         command = self._command(request=request)
         claim = self._claim(command, "claim-native-rebind", fence=1)
         effects = self.effects(command, claim)
-        with self.assertRaisesRegex(Exception, "native_requirement_binding"):
+        with self.assertRaisesRegex(Exception, "native_requirement"):
             self.handler(native_operation=operation).execute(
                 command,
                 claim,
@@ -639,7 +1031,7 @@ class CaptureHandlerTests(unittest.TestCase):
         command = self._command(request=request)
         claim = self._claim(command, "claim-native-source-rebind", fence=1)
         effects = self.effects(command, claim)
-        with self.assertRaisesRegex(Exception, "native_requirement_binding"):
+        with self.assertRaisesRegex(Exception, "native_requirement"):
             self.handler(native_operation=operation).execute(
                 command,
                 claim,
@@ -733,7 +1125,11 @@ class CaptureHandlerTests(unittest.TestCase):
         )
         workspace = self._materialized_workspace(
             self.root / "incomplete-workspace",
-            (self.freeze_ref, incomplete_ref),
+            (
+                self.freeze_ref,
+                incomplete_ref,
+                self.native_tool_requirement_ref,
+            ),
         )
         operation = Mock()
         with self.assertRaisesRegex(Exception, "complete|outside"):

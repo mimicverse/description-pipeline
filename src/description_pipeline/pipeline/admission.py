@@ -18,6 +18,7 @@ from ..schemas import (
     ARTIFACT_MANIFEST_SCHEMA,
     DISCOVER_RESULT_SCHEMA,
     GENERATE_REQUEST_SCHEMA,
+    NATIVE_TOOL_REQUIREMENT_KIND,
 )
 from .contracts import (
     ArtifactRef,
@@ -54,7 +55,6 @@ from .verify_contract import (
 
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
-NATIVE_TOOL_REQUIREMENT_KIND = "native_tool_requirement"
 GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
 SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")

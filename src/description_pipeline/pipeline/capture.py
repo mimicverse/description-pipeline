@@ -18,6 +18,7 @@ from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, writable_output
 from ..io import (
     PipelineError,
     acquire_process_lock,
+    canonical,
     confined,
     digest,
     file_digest,
@@ -37,7 +38,12 @@ from .discover import (
 from ..sources.solidworks.discovery import DISCOVERY_FILE, native_component_identity
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import selection_bindings
-from ..schemas import CAPTURE_EFFECT_FAILURE_SCHEMA, NATIVE_CAPTURE_EFFECT_SCHEMA
+from ..schemas import (
+    CAPTURE_EFFECT_FAILURE_SCHEMA,
+    NATIVE_CAPTURE_EFFECT_SCHEMA,
+    NATIVE_TOOL_REQUIREMENT_KIND,
+    TOOL_SCHEMA,
+)
 from ..stages import stage_view
 from .contracts import (
     ArtifactRef,
@@ -107,6 +113,7 @@ class CaptureRequest:
 
     native_tool_source_sha256: str
     native_tool_record_sha256: str
+    native_tool_requirement_artifact_id: str
     handoff_sha256: str
     upload_sha256: str
     prepared_sha256: str
@@ -124,6 +131,7 @@ class CaptureRequest:
             "main_assembly",
             "native_tool_source_sha256",
             "native_tool_record_sha256",
+            "native_tool_requirement_artifact_id",
             "prepared_sha256",
             "upload_sha256",
         }
@@ -159,7 +167,9 @@ class CaptureInputs:
     prepared_files: Mapping[str, str]
     plan: Mapping[str, Any]
     object_names: tuple[str, ...]
-    native_tool: Mapping[str, Any]
+    historical_native_tool: Mapping[str, Any]
+    current_native_tool: Mapping[str, Any]
+    native_tool_requirement: ArtifactRef
 
     @classmethod
     def resolve(
@@ -169,16 +179,38 @@ class CaptureInputs:
         request: CaptureRequest,
     ) -> CaptureInputs:
         by_stage: dict[str, ArtifactRef] = {}
+        requirements: list[ArtifactRef] = []
         for artifact in command.input_artifacts:
+            if artifact.kind == NATIVE_TOOL_REQUIREMENT_KIND:
+                requirements.append(artifact)
+                continue
             if artifact.producer_stage not in {"freeze", "discover"}:
                 raise ProtocolError("capture.input_stage", {"producer_stage": artifact.producer_stage})
             if artifact.producer_stage in by_stage:
                 raise ProtocolError("capture.input_duplicate", {"producer_stage": artifact.producer_stage})
             by_stage[artifact.producer_stage] = artifact
+        if len(requirements) != 1:
+            raise ProtocolError(
+                "capture.native_requirement_artifact",
+                {"count": len(requirements)},
+            )
         if set(by_stage) != {"freeze", "discover"}:
             raise ProtocolError("capture.input_incomplete", {"stages": sorted(by_stage)})
         freeze = by_stage["freeze"]
         discover = by_stage["discover"]
+        requirement = requirements[0]
+        if (
+            requirement.producer_run_id is not None
+            or requirement.producer_stage is not None
+            or requirement.artifact_id
+            != request.native_tool_requirement_artifact_id
+        ):
+            raise ProtocolError(
+                "capture.native_requirement_binding",
+                {
+                    "artifact_id": request.native_tool_requirement_artifact_id,
+                },
+            )
         if freeze.producer_run_id is None or discover.producer_run_id is None:
             raise ProtocolError(
                 "capture.producer_missing",
@@ -194,30 +226,63 @@ class CaptureInputs:
             )
 
         roots = {}
-        for artifact in (freeze, discover):
+        input_artifacts = (freeze, discover, requirement)
+        for artifact in input_artifacts:
             root = workspace.inputs.get(artifact.artifact_id)
             if not isinstance(root, Path):
                 raise ProtocolError("capture.input_not_materialized", {"artifact_id": artifact.artifact_id})
             if root.is_symlink() or root.is_junction() or not root.is_dir():
                 raise ProtocolError("capture.input_root_invalid", {"artifact_id": artifact.artifact_id})
             roots[artifact.artifact_id] = root
-        if set(workspace.inputs) != {freeze.artifact_id, discover.artifact_id}:
+        expected_input_ids = {artifact.artifact_id for artifact in input_artifacts}
+        if set(workspace.inputs) != expected_input_ids:
             raise ProtocolError(
                 "capture.workspace_invalid",
                 {
-                    "missing": sorted({freeze.artifact_id, discover.artifact_id} - set(workspace.inputs)),
-                    "unknown": sorted(set(workspace.inputs) - {freeze.artifact_id, discover.artifact_id}),
+                    "missing": sorted(expected_input_ids - set(workspace.inputs)),
+                    "unknown": sorted(set(workspace.inputs) - expected_input_ids),
                 },
             )
 
         freeze_files = _artifact_files(roots[freeze.artifact_id], freeze, role="freeze")
         discover_files = _artifact_files(roots[discover.artifact_id], discover, role="discover")
+        requirement_files = _artifact_files(
+            roots[requirement.artifact_id],
+            requirement,
+            role="native-requirement",
+        )
+        if set(requirement_files) != {"tool.json"}:
+            raise ProtocolError(
+                "capture.native_requirement_artifact",
+                {"files": sorted(requirement_files)},
+            )
         for name in ("request.json", "inputs.json", "checks.json"):
             if name not in freeze_files:
                 raise ProtocolError("capture.freeze_incomplete", {"missing": name})
         for name in ("request.json", "result.json", "checks.json", "native-observation/observation.json"):
             if name not in discover_files:
                 raise ProtocolError("capture.discover_incomplete", {"missing": name})
+
+        tool_path = roots[requirement.artifact_id] / "tool.json"
+        if tool_path.is_symlink() or tool_path.is_junction() or not tool_path.is_file():
+            raise ProtocolError(
+                "capture.native_requirement_artifact",
+                {"where": "tool.json"},
+            )
+        current_native_tool = read_data(tool_path)
+        if (
+            not isinstance(current_native_tool, dict)
+            or canonical(current_native_tool) != tool_path.read_bytes()
+            or current_native_tool.get("schema_version") != TOOL_SCHEMA
+            or current_native_tool.get("source_sha256")
+            != request.native_tool_source_sha256
+            or digest(current_native_tool)
+            != request.native_tool_record_sha256
+        ):
+            raise ProtocolError(
+                "capture.native_requirement_artifact",
+                {"where": "tool.json"},
+            )
 
         freeze_request = read_data(roots[freeze.artifact_id] / "request.json")
         freeze_inputs = read_data(roots[freeze.artifact_id] / "inputs.json")
@@ -241,12 +306,50 @@ class CaptureInputs:
         ):
             raise ProtocolError("capture.discover_result_identity", {"where": "result.json"})
         native_tool = discover_result.get("native_tool")
+        historical_source_sha256 = (
+            native_tool.get("source_sha256")
+            if isinstance(native_tool, dict)
+            else None
+        )
         if (
-            discover_request.get("expected_native_tool_sha256")
-            != request.native_tool_source_sha256
+            discover_request.get("expected_native_tool_sha256") != historical_source_sha256
             or not isinstance(native_tool, dict)
-            or native_tool.get("source_sha256")
-            != request.native_tool_source_sha256
+            or not isinstance(historical_source_sha256, str)
+        ):
+            raise ProtocolError(
+                "capture.native_requirement_binding",
+                {
+                    "historical_source": historical_source_sha256,
+                },
+            )
+        native_check = next(
+            (
+                check
+                for check in discover_checks.get("checks", ())
+                if isinstance(check, dict)
+                and check.get("id") == "native.observation"
+            ),
+            None,
+        )
+        native_details = (
+            native_check.get("details")
+            if isinstance(native_check, dict)
+            else None
+        )
+        if (
+            not isinstance(native_check, dict)
+            or native_check.get("state") != "passed"
+            or not isinstance(native_details, dict)
+            or native_details.get("native_tool_sha256") != digest(native_tool)
+            or native_details.get("observation_sha256")
+            != discover_result.get("native_observation_sha256")
+        ):
+            raise ProtocolError(
+                "capture.native_history_binding",
+                {"where": "native.observation"},
+            )
+        if command.diagnostic_scope is None and (
+            historical_source_sha256 != request.native_tool_source_sha256
             or digest(native_tool) != request.native_tool_record_sha256
         ):
             raise ProtocolError(
@@ -378,7 +481,9 @@ class CaptureInputs:
             prepared_files=prepared_files,
             plan=plan,
             object_names=tuple(sorted(active)),
-            native_tool=dict(native_tool),
+            historical_native_tool=dict(native_tool),
+            current_native_tool=dict(current_native_tool),
+            native_tool_requirement=requirement,
         )
 
 
@@ -971,11 +1076,17 @@ class CaptureHandler:
         request = CaptureRequest.from_command(command)
         inputs = CaptureInputs.resolve(command, workspace, request)
         upstream = _upstream_records(inputs)
-        tool = (
-            self._native_tool_factory()
-            if self._native_tool_factory is not None
-            else dict(inputs.native_tool)
-        )
+        if self._native_tool_factory is None:
+            raise ProtocolError(
+                "capture.native_tool_provider_missing",
+                {"command_id": command.command_id},
+            )
+        tool = self._native_tool_factory()
+        if dict(tool) != dict(inputs.current_native_tool):
+            raise ProtocolError(
+                "capture.native_tool_mismatch",
+                {"where": "current-native-tool"},
+            )
         execution = _execution_record(command, claim, request, tool)
         effect_id, settlement = self._effect_state(
             command,

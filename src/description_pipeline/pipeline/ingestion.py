@@ -30,12 +30,11 @@ from ..repository.publish import (
 )
 from ..repository.review_branch import review_branch
 from ..runtime import tool_record
-from ..schemas import TOOL_SCHEMA
+from ..schemas import NATIVE_TOOL_REQUIREMENT_KIND, TOOL_SCHEMA
 from ..sources.solidworks.handoff import describe_handoff
 from ..stages import CONTRACT_SHA256
 from .admission import (
     ADMISSION_SPEC_SCHEMA,
-    NATIVE_TOOL_REQUIREMENT_KIND,
     AdmissionSpec,
     StageExecutors,
     VerifiedArtifact,
