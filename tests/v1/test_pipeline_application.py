@@ -35,26 +35,35 @@ from description_pipeline.pipeline.contracts import (
 )
 from description_pipeline.pipeline.engine import StageWorkspace
 from description_pipeline.pipeline.verify import NoExternalEffects
+from description_pipeline.schemas import (
+    DISCOVER_RESULT_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+    VERIFICATION_CERTIFICATE_SCHEMA,
+    VERIFICATION_EXECUTION_SCHEMA,
+    VERIFY_REQUEST_SCHEMA,
+)
 from tests.v1 import test_pipeline_admission as admission_tests
 
 
 class _CompletingHandler:
-    def __init__(self) -> None:
+    def __init__(self, native_tool=None) -> None:
         self.executions = 0
+        self.native_tool = native_tool
 
     def execute(self, command, claim, workspace: StageWorkspace, *, effects):
         del effects
         self.executions += 1
         output = workspace.root / f"output-{claim.fence}"
         output.mkdir()
-        (output / "stage.txt").write_text(command.stage, encoding="utf-8")
+        if command.stage != "verify":
+            (output / "stage.txt").write_text(command.stage, encoding="utf-8")
+        artifacts = {item.kind: item for item in command.input_artifacts}
         if command.stage == "discover":
             source_files = dict(command.request["source_files"])
-            artifacts = {item.kind: item for item in command.input_artifacts}
             write_json(
                 output / "result.json",
                 {
-                    "schema_version": "description-pipeline.discover-result/v1",
+                    "schema_version": DISCOVER_RESULT_SCHEMA,
                     "command_id": command.command_id,
                     "run_id": command.run_id,
                     "request_digest": command.request_digest,
@@ -67,10 +76,51 @@ class _CompletingHandler:
                     "prepared_sha256": digest({"prepared": command.command_id}),
                     "native_observation_sha256": digest({"observation": command.command_id}),
                     "passed": True,
-                    "native_tool": {"executor": "native"},
+                    "native_tool": dict(self.native_tool),
                     "source_set_artifact": artifacts["freeze_originals"].to_record(),
                     "ruleset_artifact": artifacts["freeze_ruleset"].to_record(),
                     "configuration_artifact": artifacts["platform_config"].to_record(),
+                },
+            )
+        elif command.stage == "verify":
+            generate = artifacts["stage_output:generate"]
+            capture = artifacts["stage_output:capture"]
+            verifier = {"executor": "verify"}
+            verifier_sha256 = digest(verifier)
+            request = {
+                "capture_artifact": capture.to_record(),
+                "config_snapshot_sha256": command.config_snapshot_sha256,
+                "contract_sha256": command.contract_sha256,
+                "expected_verifier_sha256": command.expected_executor_sha256,
+                "generate_artifact": generate.to_record(),
+                "output_contract": "solidworks-to-urdf.verification-artifact/v1",
+                "policy_sha256": command.policy_sha256,
+                "purpose": command.request["purpose"],
+                "schema_version": VERIFY_REQUEST_SCHEMA,
+            }
+            certificate = {
+                "actual_verifier": verifier,
+                "actual_verifier_sha256": verifier_sha256,
+                "capture_artifact": capture.to_record(),
+                "config_snapshot_sha256": command.config_snapshot_sha256,
+                "contract_sha256": command.contract_sha256,
+                "decision": "PASS",
+                "generate_artifact": generate.to_record(),
+                "passed": True,
+                "policy_sha256": command.policy_sha256,
+                "purpose": command.request["purpose"],
+                "request": request,
+                "request_sha256": digest(request),
+                "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
+                "subject_sha256": generate.set_sha256,
+            }
+            certificate["verification_key"] = digest(certificate)
+            write_json(output / "verification-certificate.json", certificate)
+            write_json(
+                output / "verification-execution.json",
+                {
+                    "certificate_sha256": digest(certificate),
+                    "schema_version": VERIFICATION_EXECUTION_SCHEMA,
                 },
             )
         return StageExecution(
@@ -131,7 +181,10 @@ class _MemoryBackend:
         predecessor,
         supporting_predecessors=(),
         discover_result=None,
+        verify_result=None,
+        publish_intent=None,
     ):
+        del discover_result, verify_result, publish_intent
         if admission != self.admission or command.predecessor_decision_id is None:
             raise PipelineError("successor command has no predecessor")
         stored_predecessor = self.decisions.get((command.run_id, predecessor.stage))
@@ -203,7 +256,7 @@ class _MemoryBackend:
             producer_tool_sha256=claim.executor_sha256,
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=command.command_id,
             run_id=command.run_id,
             stage=command.stage,
@@ -276,7 +329,7 @@ class StageApplicationTests(unittest.TestCase):
         self.backend = _MemoryBackend(self.harness.store, self.root / "work")
         self.backend.root.mkdir()
         self.freeze = _CompletingHandler()
-        self.discover = _CompletingHandler()
+        self.discover = _CompletingHandler(self.harness.native_tool)
         self.application = StageApplication(
             services=self.backend,
             facts=self.backend,
@@ -354,7 +407,10 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(capture.executions, 1)
 
     def test_execute_run_routes_all_six_stages_through_the_same_admission(self):
-        handlers = {stage: _CompletingHandler() for stage in STAGES}
+        handlers = {
+            stage: _CompletingHandler(self.harness.native_tool if stage == "discover" else None)
+            for stage in STAGES
+        }
         application = StageApplication(
             services=self.backend,
             facts=self.backend,
@@ -403,11 +459,16 @@ class StageApplicationTests(unittest.TestCase):
     def test_admit_rejects_repository_metadata_detached_from_sealed_bytes(self):
         spec = self.harness.spec
         detached_snapshot = replace(
-            spec.repository_snapshot,
-            snapshot=replace(spec.repository_snapshot.snapshot, base_oid="2" * 40),
+            spec.publish_intent.repository,
+            expected_base_oid="2" * 40,
         )
         with self.assertRaisesRegex(ApplicationError, "Repository snapshot metadata differs"):
-            self.application.admit(replace(spec, repository_snapshot=detached_snapshot))
+            self.application.admit(
+                replace(
+                    spec,
+                    publish_intent=replace(spec.publish_intent, repository=detached_snapshot),
+                )
+            )
 
     def test_cli_dispatches_to_the_same_application(self):
         admitted = self.application.admit(self.harness.spec)

@@ -18,13 +18,16 @@ from ..io import PipelineError, digest, read_data
 from ..platform.facts import FactStore
 from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
+from ..schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from .admission import (
     AdmissionSpec,
     VerifiedArtifact,
     VerifiedDiscoverResult,
     VerifiedPredecessor,
+    VerifiedPublishIntent,
     VerifiedRepositorySnapshot,
     VerifiedRuleset,
+    VerifiedVerifyResult,
     build_capture_command,
     build_discover_command,
     build_freeze_command,
@@ -55,6 +58,7 @@ from .services import CanonicalStageServices, ClaimPolicy
 from .stages.generate import GenerateHandler
 from .stages.publish import PublishHandler
 from .verify import VerifyHandler
+from .verify_contract import CERTIFICATE_FILENAME
 
 STAGES: tuple[StageId, ...] = (
     "freeze",
@@ -125,6 +129,8 @@ class AdmissionFactPort(Protocol):
         predecessor: VerifiedPredecessor,
         supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
         discover_result: VerifiedDiscoverResult | None = None,
+        verify_result: VerifiedVerifyResult | None = None,
+        publish_intent: VerifiedPublishIntent | None = None,
     ) -> StageCommand: ...
 
     def decision_for(self, command: StageCommand) -> StageDecision | None: ...
@@ -140,6 +146,7 @@ class CommandBuildContext:
     stage: StageId
     predecessors: Mapping[StageId, VerifiedPredecessor]
     discover_result: VerifiedDiscoverResult | None = None
+    verify_result: VerifiedVerifyResult | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "predecessors", MappingProxyType(dict(self.predecessors)))
@@ -184,9 +191,10 @@ def _default_builders() -> dict[StageId, CommandBuilder]:
         ),
         "publish": lambda context: build_publish_command(
             context.admission,
-            context.predecessor("verify"),
-            context.predecessor("generate"),
-            context.predecessor("capture"),
+            context.verify_result
+            if context.verify_result is not None
+            else _missing_verify_result(context.stage),
+            context.admission.publish_intent,
         ),
     }
 
@@ -195,6 +203,14 @@ def _missing_discover_result(stage: StageId) -> VerifiedDiscoverResult:
     raise ApplicationError(
         "application.discover_result_missing",
         "Capture requires the verified Discover result",
+        detail={"stage": stage},
+    )
+
+
+def _missing_verify_result(stage: StageId) -> VerifiedVerifyResult:
+    raise ApplicationError(
+        "application.verify_result_missing",
+        "Publish requires a verified certificate",
         detail={"stage": stage},
     )
 
@@ -334,11 +350,12 @@ class StageApplication:
             actual_ruleset = VerifiedRuleset.from_catalog_bytes(ruleset_artifact, catalog.read_bytes())
         if actual_ruleset != spec.ruleset:
             raise ApplicationError("application.ruleset_invalid", "Ruleset version differs from its catalog")
+        repository_snapshot = spec.publish_intent.repository
         snapshot_artifact = VerifiedArtifact.from_store_record(
-            spec.repository_snapshot.artifact.ref,
-            self.artifacts.verify(spec.repository_snapshot.artifact.ref),
+            repository_snapshot.artifact.ref,
+            self.artifacts.verify(repository_snapshot.artifact.ref),
         )
-        if snapshot_artifact != spec.repository_snapshot.artifact:
+        if snapshot_artifact != repository_snapshot.artifact:
             raise ApplicationError(
                 "application.admission_artifact_mismatch",
                 "Admission repository snapshot differs from the artifact store",
@@ -359,7 +376,7 @@ class StageApplication:
                 snapshot_artifact,
                 metadata_path.read_bytes(),
             )
-        if actual_snapshot != spec.repository_snapshot:
+        if actual_snapshot != repository_snapshot:
             raise ApplicationError(
                 "application.repository_snapshot_invalid",
                 "Repository snapshot metadata differs from AdmissionSpec",
@@ -386,7 +403,7 @@ class StageApplication:
         admission = build_run_admission(spec)
         command = build_freeze_command(spec)
         conf = DispatchConf(
-            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=spec.run_id,
             freeze_command_id=command.command_id,
         )
@@ -444,16 +461,25 @@ class StageApplication:
         stage: StageId,
         predecessors: Mapping[StageId, VerifiedPredecessor],
         discover_result: VerifiedDiscoverResult | None,
+        verify_result: VerifiedVerifyResult | None,
     ) -> StageCommand:
         builder = self._require_builder(stage)
-        command = builder(CommandBuildContext(spec, stage, predecessors, discover_result))
+        command = builder(
+            CommandBuildContext(
+                spec,
+                stage,
+                predecessors,
+                discover_result,
+                verify_result,
+            )
+        )
         if (
             command.run_id != spec.run_id
             or command.stage != stage
             or command.kind != "stage"
             or command.contract_sha256 != spec.contract_sha256
             or command.policy_sha256 != spec.policy_sha256
-            or command.config_snapshot_sha256 != spec.configuration.ref.set_sha256
+            or command.config_snapshot_sha256 != spec.platform_config_sha256
             or command.expected_executor_sha256 != spec.executors.for_stage(stage)
         ):
             raise ApplicationError(
@@ -472,6 +498,8 @@ class StageApplication:
             predecessor=previous,
             supporting_predecessors=supporting,
             discover_result=command_discover_result,
+            verify_result=verify_result if stage == "publish" else None,
+            publish_intent=spec.publish_intent if stage == "publish" else None,
         )
         return command
 
@@ -492,8 +520,6 @@ class StageApplication:
             supporting = (predecessors["freeze"],)
         elif stage == "verify":
             supporting = (predecessors["capture"],)
-        elif stage == "publish":
-            supporting = (predecessors["generate"], predecessors["capture"])
         return previous, supporting, discover_result if stage == "capture" else None
 
     def _completed_predecessor(
@@ -526,6 +552,24 @@ class StageApplication:
             )
             record = read_data(root / "result.json")
         return VerifiedDiscoverResult.from_record(predecessor, record)
+
+    def _verified_verify_result(
+        self,
+        predecessor: VerifiedPredecessor,
+    ) -> VerifiedVerifyResult:
+        if predecessor.stage != "verify":
+            raise ApplicationError("application.verify_result_missing", "Verify predecessor is required")
+        artifact = VerifiedArtifact.from_store_record(
+            predecessor.result.output_artifact,
+            self.artifacts.verify(predecessor.result.output_artifact),
+        )
+        with tempfile.TemporaryDirectory(prefix="description-verify-result-") as directory:
+            root = self.artifacts.materialize(
+                predecessor.result.output_artifact,
+                Path(directory) / "artifact",
+            )
+            certificate = (root / CERTIFICATE_FILENAME).read_bytes()
+        return VerifiedVerifyResult.from_artifact_bytes(predecessor, artifact, certificate)
 
     def execute_registered_command(self, command_id: str) -> StageResult | FailureEnvelope:
         """Execute one already-registered command through the one common engine."""
@@ -569,9 +613,16 @@ class StageApplication:
             )
         predecessors: dict[StageId, VerifiedPredecessor] = {}
         discover_result: VerifiedDiscoverResult | None = None
+        verify_result: VerifiedVerifyResult | None = None
         target_index = STAGES.index(stage)
         for current_stage in STAGES[: target_index + 1]:
-            command = self._build_command(spec, current_stage, predecessors, discover_result)
+            command = self._build_command(
+                spec,
+                current_stage,
+                predecessors,
+                discover_result,
+                verify_result,
+            )
             if current_stage == "freeze":
                 stored = self.facts.load_command(command.command_id)
                 if stored != command:
@@ -597,6 +648,8 @@ class StageApplication:
                     predecessor=previous,
                     supporting_predecessors=supporting,
                     discover_result=command_discover_result,
+                    verify_result=verify_result if current_stage == "publish" else None,
+                    publish_intent=spec.publish_intent if current_stage == "publish" else None,
                 )
                 if stored != command:
                     raise ApplicationError(
@@ -609,6 +662,8 @@ class StageApplication:
                 predecessors[current_stage] = predecessor
                 if current_stage == "discover":
                     discover_result = self._verified_discover_result(predecessor)
+                if current_stage == "verify":
+                    verify_result = self._verified_verify_result(predecessor)
                 if current_stage == stage:
                     return self.execute_registered_command(stored.command_id)
                 continue
