@@ -57,10 +57,13 @@ from ..pipeline.contracts import (
 from ..pipeline.effects import (
     EffectFact,
     EffectIntent,
+    EffectResumePhase,
     EffectSettlement,
     EffectState,
     project_effect_settlement,
     project_effect_state,
+    native_transfer_target_digest,
+    require_native_transfer_target,
 )
 from ..schemas import (
     AIRFLOW_DISPATCH_EFFECT_SCHEMA,
@@ -260,7 +263,7 @@ def read_admitted_runs(
                    fact.fact_id, fact.seq, fact.claim_id, fact.fence,
                    fact.fact_type, fact.source, fact.state_class,
                    fact.payload_artifact_id, fact.payload_digest,
-                   fact.metadata_artifact_id, fact.observed_at
+                   fact.metadata_artifact_id, fact.observed_at, fact.resume_phase
             FROM effect_intent AS effect
             JOIN command ON command.command_id = effect.command_id
             LEFT JOIN effect_fact AS fact ON fact.effect_id = effect.effect_id
@@ -305,6 +308,9 @@ def read_admitted_runs(
                     payload_digest=row[19],
                     observed_at=row[21],
                     metadata_artifact_id=row[20],
+                    resume_phase=(
+                        EffectResumePhase(row[22]) if row[22] is not None else None
+                    ),
                 )
                 effects[row[0]][2].append(fact)
                 updated_at[effect_run] = max(updated_at[effect_run], row[21])
@@ -334,8 +340,6 @@ def read_admitted_runs(
             if not isinstance(effect_id, str):
                 continue
             state = effect_states[claim_run].get(effect_id)
-            if state is EffectState.CONFLICT:
-                raise FactStoreError("A latest yielded effect is conflicted")
             if state is EffectState.UNKNOWN:
                 yielded_effect_ids[claim_run].add(effect_id)
 
@@ -1681,11 +1685,12 @@ class FactStore(RunControlStore):
             if stored_command is not None:
                 self._verify_completed_predecessor_chain_cursor(cursor, stored_command)
             self._lock_effect_ledger_cursor(cursor, command_id)
-            effect_states = self._effect_states_for_command_cursor(
+            effect_settlements = self._effect_settlements_for_command_cursor(
                 cursor,
                 command_id,
                 lock=False,
             )
+            effect_states = {effect_id: item.state for effect_id, item in effect_settlements.items()}
             if command[4] != executor_sha256:
                 raise FactConflict("The claim executor identity differs from the command expectation")
             if (
@@ -1716,23 +1721,22 @@ class FactStore(RunControlStore):
                 )
                 if claim.expires_at > now:
                     raise FactConflict("Another live executor owns the command")
-                if any(
-                    state in {EffectState.UNKNOWN, EffectState.CONFLICT}
-                    for state in effect_states.values()
-                ):
+                if self._requires_reconciliation_cursor(effect_settlements):
                     raise FactConflict("An expired claim carries an unresolved effect and requires reconciliation")
+                closure_code = (
+                    "reconciled"
+                    if any(state is not EffectState.PREPARED for state in effect_states.values())
+                    else "abandoned_before_effect"
+                )
                 cursor.execute(
                     """
                     UPDATE execution_claim
-                    SET closed_at = %s, closure_code = 'abandoned_before_effect'
+                    SET closed_at = %s, closure_code = %s
                     WHERE claim_id = %s AND closed_at IS NULL
                     """,
-                    (now, claim.claim_id),
+                    (now, closure_code, claim.claim_id),
                 )
-            elif any(
-                state in {EffectState.UNKNOWN, EffectState.CONFLICT}
-                for state in effect_states.values()
-            ):
+            elif self._requires_reconciliation_cursor(effect_settlements):
                 raise FactConflict("The command carries an unresolved effect and requires reconciliation")
             cursor.execute(
                 "SELECT COALESCE(MAX(fence), 0) + 1 FROM execution_claim WHERE command_id = %s",
@@ -1831,7 +1835,8 @@ class FactStore(RunControlStore):
         cursor.execute(
             """
             SELECT fact_id, effect_id, seq, claim_id, fence, fact_type, source,
-                   state_class, payload_artifact_id, payload_digest, metadata_artifact_id, observed_at
+                   state_class, payload_artifact_id, payload_digest, metadata_artifact_id,
+                   observed_at, resume_phase
             FROM effect_fact
             WHERE effect_id = %s
             ORDER BY seq
@@ -1852,6 +1857,7 @@ class FactStore(RunControlStore):
                 payload_digest=item[9],
                 metadata_artifact_id=item[10],
                 observed_at=item[11],
+                resume_phase=EffectResumePhase(item[12]) if item[12] is not None else None,
             )
             for item in cursor.fetchall()
         )
@@ -2115,13 +2121,13 @@ class FactStore(RunControlStore):
                 WHERE effect_id = %s
                   AND claim_id = %s
                   AND fence = %s
-                  AND fact_type = 'dispatch_authorized'
+                  AND fact_type IN ('dispatch_authorized', 'resume_authorized')
                 LIMIT 1
                 """,
                 (effect_id, claim.claim_id, claim.fence),
             )
             if cursor.fetchone() is None:
-                raise FactConflict("A yielded effect requires its exact dispatch authorization")
+                raise FactConflict("A yielded effect requires its exact scoped authorization")
             cursor.execute(
                 """
                 UPDATE execution_claim
@@ -2150,13 +2156,13 @@ class FactStore(RunControlStore):
                 raise FactConflict("The execution claim changed before it could be yielded")
             return StagePending(self._effect_wait(command, intent))
 
-    def _effect_states_for_command_cursor(
+    def _effect_settlements_for_command_cursor(
         self,
         cursor,
         command_id: str,
         *,
         lock: bool = False,
-    ) -> dict[str, EffectState]:
+    ) -> dict[str, EffectSettlement]:
         if lock:
             self._lock_command_scope_cursor(cursor, command_id)
             self._lock_effect_ledger_cursor(cursor, command_id)
@@ -2171,9 +2177,41 @@ class FactStore(RunControlStore):
         )
         effect_ids = [row[0] for row in cursor.fetchall()]
         return {
-            effect_id: project_effect_state(*self._effect_cursor(cursor, effect_id, lock=lock))
+            effect_id: project_effect_settlement(
+                *self._effect_cursor(cursor, effect_id, lock=lock)
+            )
             for effect_id in effect_ids
         }
+
+    def _effect_states_for_command_cursor(
+        self,
+        cursor,
+        command_id: str,
+        *,
+        lock: bool = False,
+    ) -> dict[str, EffectState]:
+        return {
+            effect_id: settlement.state
+            for effect_id, settlement in self._effect_settlements_for_command_cursor(
+                cursor,
+                command_id,
+                lock=lock,
+            ).items()
+        }
+
+    def _requires_reconciliation_cursor(
+        self,
+        effect_settlements: Mapping[str, EffectSettlement],
+    ) -> bool:
+        for settlement in effect_settlements.values():
+            if settlement.state is EffectState.CONFLICT:
+                return True
+            if (
+                settlement.state is EffectState.UNKNOWN
+                and settlement.resume_phase is not EffectResumePhase.INPUT_TRANSFER_PENDING
+            ):
+                return True
+        return False
 
     def effect_states_for_command(self, command_id: str) -> dict[str, EffectState]:
         with self._transaction() as connection:
@@ -2203,6 +2241,7 @@ class FactStore(RunControlStore):
         fact_id: str,
         expected_command_id: str | None = None,
         metadata_artifact: ArtifactRef | None = None,
+        resume_phase: EffectResumePhase | None = None,
     ) -> EffectFact:
         cursor.execute(
             "SELECT command_id FROM effect_intent WHERE effect_id = %s",
@@ -2218,7 +2257,7 @@ class FactStore(RunControlStore):
         self._lock_effect_ledger_cursor(cursor, command_id)
         stored = None
         if claim is not None:
-            if fact_type == "dispatch_authorized":
+            if fact_type in {"dispatch_authorized", "resume_authorized"}:
                 cursor.execute(
                     "SELECT command_id FROM command WHERE command_id = %s",
                     (claim.command_id,),
@@ -2271,19 +2310,29 @@ class FactStore(RunControlStore):
                 """,
                 (claim.command_id, effect_id),
             )
-            if cursor.fetchone() is not None:
+            if cursor.fetchone() is not None and fact_type != "resume_authorized":
                 raise FactConflict(
-                    "A yielded effect accepts only claim-free reconciliation"
+                    "A yielded effect accepts only claim-free reconciliation or a scoped resume authorization"
                 )
-        if fact_type in {"dispatch_authorized", "response", "timeout"} and claim is None:
+        if fact_type in {"dispatch_authorized", "resume_authorized", "response", "timeout"} and claim is None:
             raise FactConflict(f"{fact_type} requires its execution claim")
+        if fact_type == "resume_authorized":
+            intent, facts = self._effect_cursor(cursor, effect_id, lock=False)
+            settlement = project_effect_settlement(intent, facts)
+            if (
+                settlement.state is not EffectState.UNKNOWN
+                or settlement.resume_phase is not EffectResumePhase.INPUT_TRANSFER_PENDING
+            ):
+                raise FactConflict(
+                    "A resume authorization requires the exact input transfer pending phase"
+                )
         if fact_type in {"response", "timeout"}:
             cursor.execute(
                 """
                 SELECT 1
                 FROM effect_fact
                 WHERE effect_id = %s
-                  AND fact_type = 'dispatch_authorized'
+                  AND fact_type IN ('dispatch_authorized', 'resume_authorized')
                   AND claim_id = %s
                   AND fence = %s
                 LIMIT 1
@@ -2337,13 +2386,15 @@ class FactStore(RunControlStore):
             payload_digest=payload_digest,
             observed_at=observed_at,
             metadata_artifact_id=None if metadata_artifact is None else metadata_artifact.artifact_id,
+            resume_phase=resume_phase,
         )
         cursor.execute(
             """
             INSERT INTO effect_fact (
                 fact_id, effect_id, seq, claim_id, fence, fact_type, source,
-                state_class, payload_artifact_id, payload_digest, metadata_artifact_id, observed_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                state_class, payload_artifact_id, payload_digest, metadata_artifact_id,
+                observed_at, resume_phase
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 fact.fact_id,
@@ -2358,6 +2409,7 @@ class FactStore(RunControlStore):
                 fact.payload_digest,
                 fact.metadata_artifact_id,
                 fact.observed_at,
+                None if fact.resume_phase is None else fact.resume_phase.value,
             ),
         )
         return fact
@@ -2436,6 +2488,85 @@ class FactStore(RunControlStore):
                 effect_id=effect_id,
                 claim=claim,
                 fact_type="dispatch_authorized",
+                source=source,
+                state_class=None,
+                payload_artifact=None,
+                payload_digest=payload_digest,
+                observed_at=observed_at,
+                fact_id=fact_id,
+                expected_command_id=expected_command_id,
+            )
+
+    def authorize_effect_resume(
+        self,
+        *,
+        effect_id: str,
+        claim: ExecutionClaim,
+        source: str,
+        payload_digest: str,
+        observed_at: datetime,
+        fact_id: str,
+        expected_command_id: str | None = None,
+    ) -> EffectFact:
+        """Authorize one exact continuation of a transfer-pending effect."""
+
+        if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
+            raise FactStoreError("Effect resume time must be timezone-aware")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT command_id FROM effect_intent WHERE effect_id = %s",
+                (effect_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise FactStoreError(f"The effect {effect_id!r} is not registered")
+            if row[0] != claim.command_id:
+                raise FactConflict("The effect resume claim names another command")
+            self._lock_command_scope_cursor(cursor, claim.command_id)
+            command = self._load_command_cursor(cursor, claim.command_id)
+            if command is None:
+                raise FactStoreError("The effect resume command disappeared")
+            if command.predecessor_decision_id is not None:
+                self._verify_completed_predecessor_chain_cursor(cursor, command)
+            self._lock_effect_ledger_cursor(cursor, claim.command_id)
+            self._verify_open_claim_cursor(cursor, claim)
+            self._lock_effect_cursor(cursor, effect_id)
+            intent, facts = self._effect_cursor(cursor, effect_id, lock=False)
+            if intent.effect_kind != "native_operation":
+                raise FactConflict(
+                    "Input transfer resume is limited to native operation effects"
+                )
+            require_native_transfer_target(intent.target)
+            settlement = project_effect_settlement(intent, facts)
+            if (
+                settlement.state is not EffectState.UNKNOWN
+                or settlement.resume_phase is not EffectResumePhase.INPUT_TRANSFER_PENDING
+            ):
+                raise FactConflict(
+                    "The effect is not authorized for input transfer resume"
+                )
+            outbound = self._artifact_cursor(cursor, intent.outbound_artifact_id)
+            if outbound.set_sha256 != intent.outbound_digest:
+                raise FactConflict("The resumable outbound bytes differ from the effect intent")
+            verifier = getattr(self._result_reader, "verify", None)
+            if not callable(verifier):
+                raise FactStoreError("The configured artifact reader cannot verify resumable outbound bytes")
+            verifier(outbound)
+            if self._cancel_command_cursor(cursor, claim.command_id) is not None:
+                raise FactConflict("Cancellation was requested before effect resume")
+            for fact in facts:
+                if (
+                    fact.fact_type == "resume_authorized"
+                    and fact.claim_id == claim.claim_id
+                    and fact.fence == claim.fence
+                ):
+                    return fact
+            return self._append_effect_fact_cursor(
+                cursor,
+                effect_id=effect_id,
+                claim=claim,
+                fact_type="resume_authorized",
                 source=source,
                 state_class=None,
                 payload_artifact=None,
@@ -2646,6 +2777,8 @@ class FactStore(RunControlStore):
         observed_at: datetime,
         fact_id: str,
         expected_command_id: str,
+        resume_phase: EffectResumePhase | None = None,
+        resume_target_digest: str | None = None,
     ) -> EffectFact:
         """Append read-only reconciliation evidence without granting a claim."""
 
@@ -2664,6 +2797,12 @@ class FactStore(RunControlStore):
             intent, facts = self._effect_cursor(cursor, effect_id, lock=True)
             if intent.command_id != expected_command_id:
                 raise FactConflict("The reconciliation effect names another command")
+            if resume_phase is not None and intent.effect_kind != "native_operation":
+                raise FactConflict(
+                    "Input transfer resume is limited to native operation effects"
+                )
+            if resume_phase is not None:
+                require_native_transfer_target(intent.target)
             command = self._load_command_cursor(cursor, intent.command_id)
             if command is None:
                 raise FactStoreError("The reconciliation command is missing")
@@ -2680,7 +2819,14 @@ class FactStore(RunControlStore):
                 outbound_artifact=outbound_artifact,
                 payload_artifact=payload_artifact,
                 observed_at=observed_at,
+                resume_phase=resume_phase,
+                resume_target_digest=resume_target_digest,
             )
+            if (
+                resume_phase is not None
+                and resume_target_digest != native_transfer_target_digest(intent.target)
+            ):
+                raise FactConflict("The transfer target differs from the registered effect intent")
             if source != "effect-reconciler:" + record["observer_tool_sha256"]:
                 raise FactConflict("The reconciliation source differs from its metadata observer")
             state = project_effect_state(intent, facts)
@@ -2702,6 +2848,7 @@ class FactStore(RunControlStore):
                 fact_id=fact_id,
                 expected_command_id=expected_command_id,
                 metadata_artifact=metadata_artifact,
+                resume_phase=resume_phase,
             )
 
     def register_candidate(

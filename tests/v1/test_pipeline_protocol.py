@@ -15,6 +15,7 @@ from description_pipeline.pipeline.contracts import (
     DispatchConf,
     ExecutionClaim,
     FailureEnvelope,
+    NativeTargetIdentity,
     ProtocolError,
     RunAdmission,
     RunStatus,
@@ -32,7 +33,9 @@ from description_pipeline.pipeline.contracts import (
 from description_pipeline.pipeline.effects import (
     EffectFact,
     EffectIntent,
+    EffectResumePhase,
     EffectState,
+    project_effect_settlement,
     project_effect_state,
 )
 from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
@@ -105,6 +108,7 @@ class EffectProjectionTests(unittest.TestCase):
         fact_type: str,
         *,
         state_class: str | None = None,
+        resume_phase: EffectResumePhase | None = None,
     ) -> EffectFact:
         return EffectFact(
             fact_id=f"fact-{seq}",
@@ -118,6 +122,7 @@ class EffectProjectionTests(unittest.TestCase):
             payload_artifact_id=f"artifact-{seq}" if state_class is not None else None,
             payload_digest=digest({"fact": seq}),
             observed_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(seconds=seq),
+            resume_phase=resume_phase,
         )
 
     def test_timeout_remains_unknown_until_exact_observation(self) -> None:
@@ -135,6 +140,41 @@ class EffectProjectionTests(unittest.TestCase):
         unobservable = (*authorized, self.fact(2, "reconciled", state_class="unobservable"))
         self.assertEqual(project_effect_state(self.intent, absent), EffectState.DEFINITELY_FAILED)
         self.assertEqual(project_effect_state(self.intent, unobservable), EffectState.UNKNOWN)
+
+    def test_input_transfer_phase_survives_resume_authorization_until_terminal(self) -> None:
+        phase = EffectResumePhase.INPUT_TRANSFER_PENDING
+        native_expected = {"operation": "execute", "state": "complete"}
+        native_intent = EffectIntent(
+            effect_id="effect-1",
+            command_id="command-1",
+            effect_key="native",
+            effect_kind="native_operation",
+            target={"operation": "execute"},
+            expected_state=native_expected,
+            expected_state_digest=digest(native_expected),
+            outbound_artifact_id="outbound-1",
+            outbound_digest=digest({"outbound": 1}),
+            created_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        pending = (
+            self.fact(1, "dispatch_authorized"),
+            self.fact(
+                2,
+                "observation",
+                state_class="unobservable",
+                resume_phase=phase,
+            ),
+            self.fact(3, "resume_authorized"),
+        )
+        settlement = project_effect_settlement(native_intent, pending)
+        self.assertEqual(settlement.state, EffectState.UNKNOWN)
+        self.assertEqual(settlement.resume_phase, phase)
+        terminal = project_effect_settlement(
+            native_intent,
+            (*pending, self.fact(4, "observation", state_class="known")),
+        )
+        self.assertEqual(terminal.state, EffectState.SATISFIED)
+        self.assertIsNone(terminal.resume_phase)
 
     def test_conflict_has_precedence(self) -> None:
         facts = (
@@ -416,6 +456,26 @@ class CommandIdentityTests(unittest.TestCase):
         self.assertNotIn("fence", record)
         with self.assertRaises(ProtocolError):
             StageEffectWait.from_record({**record, "claim_id": "foreign"})
+
+    def test_native_target_identity_separates_install_from_tool_identity(self) -> None:
+        identity = NativeTargetIdentity.create(
+            install_id="native-install-1",
+            pipeline_id="solidworks-to-urdf",
+        )
+        self.assertEqual(NativeTargetIdentity.from_record(identity.to_record()), identity)
+        restarted = NativeTargetIdentity.create(
+            install_id="native-install-1",
+            pipeline_id="solidworks-to-urdf",
+        )
+        self.assertEqual(restarted, identity)
+        same_tool_other_install = NativeTargetIdentity.create(
+            install_id="native-install-2",
+            pipeline_id="solidworks-to-urdf",
+        )
+        self.assertNotEqual(same_tool_other_install.target_id, identity.target_id)
+        changed = {**identity.to_record(), "install_id": "native-install-2"}
+        with self.assertRaises(ProtocolError):
+            NativeTargetIdentity.from_record(changed)
 
     def test_run_admission_is_immutable_and_self_contained(self) -> None:
         admission = RunAdmission.create(

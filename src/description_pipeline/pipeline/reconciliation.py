@@ -18,7 +18,15 @@ from ..schemas import (
     EFFECT_RECONCILIATION_SCHEMA,
 )
 from .contracts import ArtifactRef, ProtocolError, StageCommand
-from .effects import EffectFact, EffectIntent, EffectSettlement, EffectState
+from .effects import (
+    EffectFact,
+    EffectIntent,
+    EffectResumePhase,
+    EffectSettlement,
+    EffectState,
+    native_transfer_target_digest,
+    require_native_transfer_target,
+)
 
 if TYPE_CHECKING:
     from ..artifacts import ArtifactStore
@@ -48,10 +56,12 @@ def reconciliation_metadata_document(
     payload_artifact: ArtifactRef,
     observer_tool_sha256: str,
     observed_at: datetime,
+    resume_phase: EffectResumePhase | None = None,
+    resume_target_digest: str | None = None,
 ) -> dict[str, Any]:
     """Construct the one immutable reconciliation metadata closure."""
 
-    return {
+    record = {
         "schema_version": EFFECT_RECONCILIATION_SCHEMA,
         "command_id": command.command_id,
         "effect_id": intent.effect_id,
@@ -64,6 +74,10 @@ def reconciliation_metadata_document(
         "observer_tool_sha256": observer_tool_sha256,
         "observed_at": observed_at.isoformat(),
     }
+    if resume_phase is not None:
+        record["resume_phase"] = resume_phase.value
+        record["resume_target_digest"] = resume_target_digest
+    return record
 
 
 def read_reconciliation_metadata(
@@ -77,6 +91,8 @@ def read_reconciliation_metadata(
     outbound_artifact: ArtifactRef,
     payload_artifact: ArtifactRef,
     observed_at: datetime,
+    resume_phase: EffectResumePhase | None = None,
+    resume_target_digest: str | None = None,
 ) -> dict[str, Any]:
     """Read and exactly bind reconciliation metadata to one effect closure."""
 
@@ -108,23 +124,27 @@ def read_reconciliation_metadata(
         payload_artifact=payload_artifact,
         observer_tool_sha256=metadata_artifact.producer_tool_sha256,
         observed_at=observed_at,
+        resume_phase=resume_phase,
+        resume_target_digest=resume_target_digest,
     )
+    expected_keys = {
+        "schema_version",
+        "command_id",
+        "effect_id",
+        "effect_key",
+        "fact_type",
+        "state_class",
+        "metadata",
+        "outbound_artifact",
+        "payload_artifact",
+        "observer_tool_sha256",
+        "observed_at",
+    }
+    if resume_phase is not None:
+        expected_keys.update({"resume_phase", "resume_target_digest"})
     if (
         not isinstance(record, dict)
-        or set(record)
-        != {
-            "schema_version",
-            "command_id",
-            "effect_id",
-            "effect_key",
-            "fact_type",
-            "state_class",
-            "metadata",
-            "outbound_artifact",
-            "payload_artifact",
-            "observer_tool_sha256",
-            "observed_at",
-        }
+        or set(record) != expected_keys
         or record != expected
         or metadata_artifact.producer_run_id != command.run_id
         or metadata_artifact.producer_stage != command.stage
@@ -143,12 +163,33 @@ class EffectReconciliationEvidence:
     payload_root: Path | None = None
     payload_artifact: ArtifactRef | None = None
     metadata: Mapping[str, Any] | None = None
+    resume_phase: EffectResumePhase | None = None
+    resume_target_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.fact_type not in {"observation", "reconciled"}:
             raise ProtocolError("reconciliation.invalid", {"where": "fact_type"})
         if self.state_class not in _STATE_CLASSES:
             raise ProtocolError("reconciliation.invalid", {"where": "state_class"})
+        if self.resume_phase is not None:
+            if not isinstance(self.resume_phase, EffectResumePhase):
+                raise ProtocolError("reconciliation.invalid", {"where": "resume_phase"})
+            if self.fact_type != "observation" or self.state_class != "unobservable":
+                raise ProtocolError(
+                    "reconciliation.invalid",
+                    {"where": "resume_phase", "reason": "nonterminal-observation-required"},
+                )
+            if (
+                not isinstance(self.resume_target_digest, str)
+                or len(self.resume_target_digest) != 64
+                or any(character not in "0123456789abcdef" for character in self.resume_target_digest)
+            ):
+                raise ProtocolError("reconciliation.invalid", {"where": "resume_target_digest"})
+        elif self.resume_target_digest is not None:
+            raise ProtocolError(
+                "reconciliation.invalid",
+                {"where": "resume_target_digest", "reason": "phase-required"},
+            )
         if (self.payload_root is None) == (self.payload_artifact is None):
             raise ProtocolError("reconciliation.invalid", {"reason": "one-payload-required"})
         if self.payload_root is not None and not isinstance(self.payload_root, Path):
@@ -183,6 +224,7 @@ class EffectReconciliationResult:
     effect_key: str
     fact: EffectFact | None
     settlement: EffectSettlement
+    resume_phase: EffectResumePhase | None = None
 
 
 class EffectReconciliationFailure(ProtocolError):
@@ -275,6 +317,21 @@ class EffectReconciliationService:
             )
             if not isinstance(evidence, EffectReconciliationEvidence):
                 raise ProtocolError("reconciliation.invalid", {"where": "adapter-result"})
+            if evidence.resume_phase is not None and intent.effect_kind != "native_operation":
+                raise ProtocolError(
+                    "reconciliation.phase_not_allowed",
+                    {"effect_id": intent.effect_id, "effect_kind": intent.effect_kind},
+                )
+            if evidence.resume_phase is not None:
+                require_native_transfer_target(intent.target)
+            if (
+                evidence.resume_phase is not None
+                and evidence.resume_target_digest != native_transfer_target_digest(intent.target)
+            ):
+                raise ProtocolError(
+                    "reconciliation.target_mismatch",
+                    {"effect_id": intent.effect_id},
+                )
             if settlement.state is EffectState.CONFLICT and (
                 evidence.fact_type != "reconciled"
                 or evidence.state_class not in {"known", "absent"}
@@ -322,6 +379,8 @@ class EffectReconciliationService:
                     payload_artifact=payload,
                     observer_tool_sha256=self.observer_tool_sha256,
                     observed_at=observed_at,
+                resume_phase=evidence.resume_phase,
+                resume_target_digest=evidence.resume_target_digest,
                 ),
             )
             metadata = self.artifacts.seal_tree(
@@ -342,6 +401,8 @@ class EffectReconciliationService:
                 observed_at=observed_at,
                 fact_id="fact-" + str(uuid.uuid4()),
                 expected_command_id=command.command_id,
+                resume_phase=evidence.resume_phase,
+                resume_target_digest=evidence.resume_target_digest,
             )
             persisted = True
             final = self.facts.effect_settlement(
@@ -362,6 +423,7 @@ class EffectReconciliationService:
             effect_key=effect_key,
             fact=fact,
             settlement=final,
+            resume_phase=final.resume_phase,
         )
 
     @staticmethod

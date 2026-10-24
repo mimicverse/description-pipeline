@@ -22,6 +22,7 @@ from ..schemas import (
     DIAGNOSTIC_SCOPE_SCHEMA,
     DISPATCH_COMMAND_SCHEMA,
     FAILURE_ENVELOPE_SCHEMA,
+    NATIVE_TARGET_IDENTITY_SCHEMA,
     RUN_ADMISSION_SCHEMA,
     STAGE_COMMAND_SCHEMA,
     STAGE_EFFECT_WAIT_SCHEMA,
@@ -273,6 +274,60 @@ class ArtifactRef:
             raise ProtocolError(
                 "artifact.invalid",
                 {"missing": sorted(expected - set(record)), "unknown": sorted(set(record) - expected)},
+            )
+        return cls(**dict(record))
+
+
+@dataclass(frozen=True, slots=True)
+class NativeTargetIdentity:
+    """The stable runtime target, separate from transport locator and tool identity."""
+
+    schema_version: str
+    install_id: str
+    pipeline_id: str
+    target_id: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != NATIVE_TARGET_IDENTITY_SCHEMA:
+            raise ProtocolError(
+                "target_identity.schema_unsupported",
+                {"value": self.schema_version},
+            )
+        _require_identifier(self.install_id, "target_identity.invalid", "install_id")
+        _require_identifier(self.pipeline_id, "target_identity.invalid", "pipeline_id")
+        _require_digest(self.target_id, "target_identity.invalid", "target_id")
+        if digest(self.identity_record()) != self.target_id:
+            raise ProtocolError(
+                "target_identity.digest_mismatch",
+                {"target_id": self.target_id},
+            )
+
+    def identity_record(self) -> dict[str, str]:
+        return {
+            "schema_version": self.schema_version,
+            "install_id": self.install_id,
+            "pipeline_id": self.pipeline_id,
+        }
+
+    def to_record(self) -> dict[str, str]:
+        return {**self.identity_record(), "target_id": self.target_id}
+
+    @classmethod
+    def create(cls, *, install_id: str, pipeline_id: str) -> NativeTargetIdentity:
+        identity = {
+            "schema_version": NATIVE_TARGET_IDENTITY_SCHEMA,
+            "install_id": install_id,
+            "pipeline_id": pipeline_id,
+        }
+        return cls(target_id=digest(identity), **identity)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> NativeTargetIdentity:
+        expected = {"schema_version", "install_id", "pipeline_id", "target_id"}
+        if not isinstance(record, Mapping) or set(record) != expected:
+            raise ProtocolError(
+                "target_identity.invalid",
+                {"reason": "record-shape"},
             )
         return cls(**dict(record))
 

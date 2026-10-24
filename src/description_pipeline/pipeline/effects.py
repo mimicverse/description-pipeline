@@ -12,11 +12,21 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 from ..io import canonical, digest
-from .contracts import ArtifactRef, EffectKind, ProtocolError
+from .contracts import ArtifactRef, EffectKind, NativeTargetIdentity, ProtocolError
 
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
-_FACT_TYPES = frozenset({"dispatch_authorized", "response", "timeout", "observation", "reconciled", "conflict"})
+_FACT_TYPES = frozenset(
+    {
+        "dispatch_authorized",
+        "resume_authorized",
+        "response",
+        "timeout",
+        "observation",
+        "reconciled",
+        "conflict",
+    }
+)
 _OBSERVATION_STATES = frozenset({"known", "absent", "unobservable"})
 _GIT_OID = re.compile(r"\A[0-9a-f]{40}\Z")
 _REPOSITORY = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -30,6 +40,43 @@ class EffectState(StrEnum):
     CONFLICT = "conflict"
 
 
+class EffectResumePhase(StrEnum):
+    INPUT_TRANSFER_PENDING = "input_transfer_pending"
+
+
+def native_transfer_target_digest(target: Mapping[str, Any]) -> str:
+    identity = {
+        key: _json_value(value)
+        for key, value in target.items()
+        if key != "target_binding_digest"
+    }
+    return digest(identity)
+
+
+def require_native_transfer_target(target: Mapping[str, Any]) -> None:
+    """Require a self-bound native target while excluding transport locators."""
+
+    if not isinstance(target, Mapping):
+        raise ProtocolError("effect.target_invalid", {"where": "native_transfer"})
+    identity = NativeTargetIdentity.from_record(target.get("native_target_identity"))
+    if target.get("native_target_id") != identity.target_id:
+        raise ProtocolError(
+            "effect.target_invalid",
+            {"where": "native_transfer.native_target_id"},
+        )
+    binding = target.get("target_binding_digest")
+    if not isinstance(binding, str) or _HEX64.fullmatch(binding) is None:
+        raise ProtocolError(
+            "effect.target_invalid",
+            {"where": "native_transfer.target_binding_digest"},
+        )
+    if native_transfer_target_digest(target) != binding:
+        raise ProtocolError(
+            "effect.target_digest_mismatch",
+            {"where": "native_transfer.target_binding_digest"},
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class EffectSettlement:
     """The projected state plus the decisive fact and immutable outbound."""
@@ -39,6 +86,7 @@ class EffectSettlement:
     decisive_fact: EffectFact | None
     payload_artifact: ArtifactRef | None = None
     outbound_artifact: ArtifactRef | None = None
+    resume_phase: EffectResumePhase | None = None
 
 
 class StageEffectPort(Protocol):
@@ -60,6 +108,8 @@ class StageEffectPort(Protocol):
     ) -> EffectIntent: ...
 
     def authorize_dispatch(self, effect_id: str, *, source: str) -> EffectFact: ...
+
+    def authorize_resume(self, effect_id: str, *, source: str) -> EffectFact: ...
 
     def record_response(
         self,
@@ -314,6 +364,7 @@ class EffectFact:
     payload_digest: str
     observed_at: datetime
     metadata_artifact_id: str | None = None
+    resume_phase: EffectResumePhase | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.fact_id, "fact_id")
@@ -328,7 +379,10 @@ class EffectFact:
             raise ProtocolError("effect.invalid", {"reason": "claim-fence-pair"})
         if self.fact_type not in _FACT_TYPES:
             raise ProtocolError("effect.invalid", {"where": "fact_type", "value": self.fact_type})
-        if self.fact_type in {"dispatch_authorized", "response", "timeout"} and self.claim_id is None:
+        if (
+            self.fact_type in {"dispatch_authorized", "resume_authorized", "response", "timeout"}
+            and self.claim_id is None
+        ):
             raise ProtocolError("effect.invalid", {"where": "claim_id", "reason": "send-proof-required"})
         _text(self.source, "source")
         if self.state_class is not None and self.state_class not in _OBSERVATION_STATES:
@@ -338,6 +392,14 @@ class EffectFact:
             raise ProtocolError("effect.invalid", {"where": "state_class", "reason": "resolution-required"})
         if not resolution and self.state_class is not None:
             raise ProtocolError("effect.invalid", {"where": "state_class", "reason": "resolution-only"})
+        if self.resume_phase is not None:
+            if not isinstance(self.resume_phase, EffectResumePhase):
+                raise ProtocolError("effect.invalid", {"where": "resume_phase"})
+            if self.fact_type != "observation" or self.state_class != "unobservable":
+                raise ProtocolError(
+                    "effect.invalid",
+                    {"where": "resume_phase", "reason": "nonterminal-observation-required"},
+                )
         if self.payload_artifact_id is not None:
             _identifier(self.payload_artifact_id, "payload_artifact_id")
         if self.metadata_artifact_id is not None:
@@ -369,6 +431,7 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
     state = EffectState.PREPARED
     decisive: EffectFact | None = None
     terminal = False
+    resume_phase = None
     for fact in ordered:
         if state is EffectState.CONFLICT:
             if fact.fact_type == "conflict":
@@ -386,6 +449,7 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
                 )
                 decisive = fact
                 terminal = True
+                resume_phase = None
                 continue
             # Once a contradiction is recorded, an ordinary observation or
             # late send fact remains audit evidence. Only an exact reconciliation
@@ -394,6 +458,12 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
         if fact.fact_type == "dispatch_authorized":
             # Every later send attempt is potentially in flight until a newer
             # exact observation or reconciliation settles it.
+            state = EffectState.UNKNOWN
+            decisive = fact
+            terminal = False
+            resume_phase = None
+            continue
+        if fact.fact_type == "resume_authorized":
             state = EffectState.UNKNOWN
             decisive = fact
             terminal = False
@@ -411,6 +481,7 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
             state = EffectState.CONFLICT
             decisive = fact
             terminal = True
+            resume_phase = None
             continue
         if fact.fact_type == "observation":
             if terminal:
@@ -426,6 +497,7 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
                 state = EffectState.UNKNOWN
             decisive = fact
             terminal = state is EffectState.SATISFIED
+            resume_phase = None if terminal else fact.resume_phase
             continue
         if fact.fact_type == "reconciled":
             if terminal:
@@ -440,6 +512,7 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
                 state = EffectState.UNKNOWN
             decisive = fact
             terminal = state in {EffectState.SATISFIED, EffectState.DEFINITELY_FAILED}
+            resume_phase = None if terminal else fact.resume_phase
             continue
         raise ProtocolError("effect.invalid", {"where": "fact_type", "value": fact.fact_type})
     return EffectSettlement(
@@ -447,6 +520,7 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
         state=state,
         decisive_fact=decisive,
         payload_artifact=None,
+        resume_phase=resume_phase,
     )
 
 

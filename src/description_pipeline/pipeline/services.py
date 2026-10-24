@@ -481,6 +481,22 @@ class BoundStageEffectPort:
             fact_id="fact-" + str(uuid.uuid4()),
         )
 
+    def authorize_resume(self, effect_id: str, *, source: str) -> EffectFact:
+        return self.facts.authorize_effect_resume(
+            effect_id=effect_id,
+            claim=self.claim,
+            source=source,
+            payload_digest=digest(
+                {
+                    "effect_id": effect_id,
+                    "claim_id": self.claim.claim_id,
+                    "fence": self.claim.fence,
+                }
+            ),
+            observed_at=self._now(),
+            fact_id="fact-" + str(uuid.uuid4()),
+        )
+
     def record_response(
         self,
         effect_id: str,

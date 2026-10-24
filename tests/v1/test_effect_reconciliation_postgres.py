@@ -350,6 +350,24 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
                 now=later,
                 expires_at=later + timedelta(minutes=5),
             )
+        retry_services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=self.work_root / "unreconciled-retry",
+            claim_policy=ClaimPolicy(
+                owner_sha256=new_owner,
+                executor_sha256=self.executor,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: later,
+        )
+        with self.assertRaisesRegex(FactConflict, "unresolved"):
+            execute_stage(
+                command_id=command.command_id,
+                handler=_ForbiddenHandler(),
+                services=retry_services,
+            )
+        self.assertEqual(self.http.trigger_count, 1)
 
         resumed = self._run_child(
             "--mode",
@@ -399,7 +417,7 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
         self.assertEqual(
             claims,
             [
-                (1, old_owner, "abandoned_before_effect"),
+                (1, old_owner, "reconciled"),
                 (2, new_owner, "completed"),
             ],
         )

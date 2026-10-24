@@ -202,11 +202,16 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIn("UNIQUE (effect_id, seq)", text)
         self.assertIn("yield_effect_id text", text)
         self.assertIn("closure_code IS NOT DISTINCT FROM 'yielded'", text)
-        self.assertIn("execution_claim_one_yield_per_effect", text)
+        self.assertIn(
+            'DROP INDEX IF EXISTS :"platform_schema".execution_claim_one_yield_per_effect',
+            text,
+        )
         self.assertIn(
             "REFERENCES :\"platform_schema\".effect_intent (effect_id)",
             text,
         )
+        self.assertIn("resume_authorized", text)
+        self.assertIn("resume_phase = 'input_transfer_pending'", text)
         self.assertIn("state_class IN ('known', 'absent', 'unobservable')", text)
         self.assertIn("metadata_artifact_id text REFERENCES", text)
         candidate = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate', 1)[1]

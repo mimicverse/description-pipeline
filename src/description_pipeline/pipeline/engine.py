@@ -28,7 +28,7 @@ from .contracts import (
     StageFailure,
     effect_is_settled,
 )
-from .effects import EffectState, StageEffectPort
+from .effects import EffectResumePhase, EffectState, StageEffectPort
 from .reconciliation import EffectReconciliationResult
 
 
@@ -396,8 +396,16 @@ def execute_stage(
                     "resume.reconciliation_mismatch",
                     {"command_id": command.command_id, "effect_id": resume.effect_id},
                 )
+            if reconciled.resume_phase != reconciled.settlement.resume_phase:
+                raise ProtocolError(
+                    "resume.phase_mismatch",
+                    {"command_id": command.command_id, "effect_id": resume.effect_id},
+                )
             state = reconciled.settlement.state
-            if state is EffectState.UNKNOWN:
+            if (
+                state is EffectState.UNKNOWN
+                and reconciled.resume_phase is not EffectResumePhase.INPUT_TRANSFER_PENDING
+            ):
                 return pending
             if state is EffectState.CONFLICT:
                 raise ProtocolError(

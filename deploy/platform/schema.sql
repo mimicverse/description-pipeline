@@ -209,7 +209,10 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".effect_fact (
     claim_id text REFERENCES :"platform_schema".execution_claim (claim_id),
     fence bigint CHECK (fence IS NULL OR fence > 0),
     fact_type text NOT NULL CHECK (
-        fact_type IN ('dispatch_authorized', 'response', 'timeout', 'observation', 'reconciled', 'conflict')
+        fact_type IN (
+            'dispatch_authorized', 'resume_authorized', 'response', 'timeout',
+            'observation', 'reconciled', 'conflict'
+        )
     ),
     source text NOT NULL,
     state_class text CHECK (
@@ -218,6 +221,10 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".effect_fact (
     payload_artifact_id text REFERENCES :"platform_schema".artifact (artifact_id),
     payload_digest char(64) NOT NULL CHECK (payload_digest ~ '^[0-9a-f]{64}$'),
     metadata_artifact_id text REFERENCES :"platform_schema".artifact (artifact_id),
+    resume_phase text CHECK (
+        resume_phase IS NULL
+        OR resume_phase = 'input_transfer_pending'
+    ),
     observed_at timestamptz NOT NULL,
     UNIQUE (effect_id, seq),
     CHECK (
@@ -228,8 +235,41 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".effect_fact (
         fact_type NOT IN ('observation', 'reconciled')
         OR payload_artifact_id IS NOT NULL
     ),
+    CHECK (
+        resume_phase IS NULL
+        OR (fact_type = 'observation' AND state_class = 'unobservable')
+    ),
     CHECK ((claim_id IS NULL) = (fence IS NULL))
 );
+
+ALTER TABLE :"platform_schema".effect_fact
+    ADD COLUMN IF NOT EXISTS resume_phase text;
+
+ALTER TABLE :"platform_schema".effect_fact
+    DROP CONSTRAINT IF EXISTS effect_fact_fact_type_check;
+ALTER TABLE :"platform_schema".effect_fact
+    ADD CONSTRAINT effect_fact_fact_type_check CHECK (
+        fact_type IN (
+            'dispatch_authorized', 'resume_authorized', 'response', 'timeout',
+            'observation', 'reconciled', 'conflict'
+        )
+    );
+
+ALTER TABLE :"platform_schema".effect_fact
+    DROP CONSTRAINT IF EXISTS effect_fact_resume_phase_check;
+ALTER TABLE :"platform_schema".effect_fact
+    ADD CONSTRAINT effect_fact_resume_phase_check CHECK (
+        resume_phase IS NULL
+        OR resume_phase = 'input_transfer_pending'
+    );
+
+ALTER TABLE :"platform_schema".effect_fact
+    DROP CONSTRAINT IF EXISTS effect_fact_resume_phase_observation_check;
+ALTER TABLE :"platform_schema".effect_fact
+    ADD CONSTRAINT effect_fact_resume_phase_observation_check CHECK (
+        resume_phase IS NULL
+        OR (fact_type = 'observation' AND state_class = 'unobservable')
+    );
 
 ALTER TABLE :"platform_schema".execution_claim
     ADD COLUMN IF NOT EXISTS yield_effect_id text;
@@ -260,9 +300,7 @@ ALTER TABLE :"platform_schema".execution_claim
             = (yield_effect_id IS NOT NULL)
     );
 
-CREATE UNIQUE INDEX IF NOT EXISTS execution_claim_one_yield_per_effect
-    ON :"platform_schema".execution_claim (command_id, yield_effect_id)
-    WHERE yield_effect_id IS NOT NULL;
+DROP INDEX IF EXISTS :"platform_schema".execution_claim_one_yield_per_effect;
 
 CREATE TABLE IF NOT EXISTS :"platform_schema".run_display_metadata (
     run_id text PRIMARY KEY REFERENCES :"platform_schema".run_admission (run_id),

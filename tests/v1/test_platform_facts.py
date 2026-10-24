@@ -257,6 +257,7 @@ class ClaimTests(unittest.TestCase):
                         digest({"fact": 1}),
                         None,
                         created,
+                        None,
                     )
                 ],
                 None,
