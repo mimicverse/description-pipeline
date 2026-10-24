@@ -6,7 +6,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 
 from description_pipeline.io import digest
-from description_pipeline.pipeline import ArtifactRef, RunAdmission, StageCommand
+from description_pipeline.pipeline import ArtifactRef, StageCommand
 from description_pipeline.platform.facts import FactConflict, FactStore
 
 
@@ -123,34 +123,6 @@ class ArtifactRegistrationTests(unittest.TestCase):
         store = FactStore(lambda: connection, _Reader())
         with self.assertRaises(FactConflict):
             store.register_artifact(expected)
-
-
-class AdmissionTests(unittest.TestCase):
-    def test_admission_commits_run_and_complete_freeze_command_together(self) -> None:
-        now = datetime(2026, 10, 25, tzinfo=UTC)
-        admission = RunAdmission.create(
-            run_id="run-1",
-            request_id="request-1",
-            parent_run_id=None,
-            from_stage=None,
-            request={"target": "m3", "source": {"artifact": "upload-1"}},
-            created_at=now,
-        )
-        command = freeze_command()
-        connection = _Connection(
-            [
-                ("open",),
-                None,
-                None,
-                None,
-                None,
-            ]
-        )
-        store = FactStore(lambda: connection, _Reader())
-        self.assertEqual(store.admit_run(admission, command), command)
-        queries = connection.cursor_value.queries
-        self.assertTrue(any("INSERT INTO run_admission" in item[0] for item in queries))
-        self.assertTrue(any("INSERT INTO command" in item[0] for item in queries))
 
 
 class ClaimTests(unittest.TestCase):

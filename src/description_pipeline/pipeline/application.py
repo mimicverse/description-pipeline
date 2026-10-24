@@ -15,13 +15,16 @@ from typing import Any, Protocol
 
 from ..artifacts import ArtifactStore
 from ..io import PipelineError, digest, read_data
+from ..orchestration.discover_protocol import ArchiveDiscoverAdapter
 from ..platform.facts import FactStore
+from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
 from .admission import (
     AdmissionSpec,
     VerifiedArtifact,
     VerifiedDiscoverResult,
     VerifiedPredecessor,
+    VerifiedRepositorySnapshot,
     VerifiedRuleset,
     build_capture_command,
     build_discover_command,
@@ -35,6 +38,9 @@ from .admission import (
 )
 from .capture import CaptureHandler
 from .contracts import (
+    ArtifactRef,
+    DispatchCommand,
+    DispatchConf,
     FailureEnvelope,
     RunAdmission,
     StageCommand,
@@ -43,10 +49,12 @@ from .contracts import (
     StageResult,
 )
 from .discover import DiscoverDomainAdapter, DiscoverHandler
+from .effects import EffectIntent
 from .engine import StageHandler, StageServices, execute_stage
 from .freeze import FreezeHandler
 from .services import CanonicalStageServices, ClaimPolicy
 from .stages.generate import GenerateHandler
+from .stages.publish import PublishHandler
 from .verify import VerifyHandler
 
 STAGES: tuple[StageId, ...] = (
@@ -100,11 +108,25 @@ def _portable_executor_sha256() -> str:
 class AdmissionFactPort(Protocol):
     def load_admission(self, run_id: str) -> RunAdmission | None: ...
 
-    def admit_run(self, admission: RunAdmission, command: StageCommand) -> StageCommand: ...
+    def admit_run(
+        self,
+        admission: RunAdmission,
+        command: StageCommand,
+        dispatch_command: DispatchCommand,
+        dispatch_outbound_artifact: ArtifactRef,
+    ) -> tuple[StageCommand, DispatchCommand, EffectIntent]: ...
 
     def load_command(self, command_id: str) -> StageCommand: ...
 
-    def create_command(self, command: StageCommand) -> StageCommand: ...
+    def create_command(
+        self,
+        command: StageCommand,
+        *,
+        admission: RunAdmission,
+        predecessor: VerifiedPredecessor,
+        supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
+        discover_result: VerifiedDiscoverResult | None = None,
+    ) -> StageCommand: ...
 
     def decision_for(self, command: StageCommand) -> StageDecision | None: ...
 
@@ -164,6 +186,8 @@ def _default_builders() -> dict[StageId, CommandBuilder]:
         "publish": lambda context: build_publish_command(
             context.admission,
             context.predecessor("verify"),
+            context.predecessor("generate"),
+            context.predecessor("capture"),
         ),
     }
 
@@ -193,6 +217,20 @@ class ApplicationOutcome:
             "outcome": self.outcome,
             "payload": self.payload,
             "missing_capabilities": self.missing_capabilities,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionOutcome:
+    """The atomically registered Freeze and technical Airflow commands."""
+
+    freeze_command: StageCommand
+    dispatch_command: DispatchCommand
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "dispatch_command": self.dispatch_command.to_record(),
+            "freeze_command": self.freeze_command.to_record(),
         }
 
 
@@ -297,9 +335,45 @@ class StageApplication:
             actual_ruleset = VerifiedRuleset.from_catalog_bytes(ruleset_artifact, catalog.read_bytes())
         if actual_ruleset != spec.ruleset:
             raise ApplicationError("application.ruleset_invalid", "Ruleset version differs from its catalog")
+        snapshot_artifact = VerifiedArtifact.from_store_record(
+            spec.repository_snapshot.artifact.ref,
+            self.artifacts.verify(spec.repository_snapshot.artifact.ref),
+        )
+        if snapshot_artifact != spec.repository_snapshot.artifact:
+            raise ApplicationError(
+                "application.admission_artifact_mismatch",
+                "Admission repository snapshot differs from the artifact store",
+                detail={"artifact_id": snapshot_artifact.ref.artifact_id},
+            )
+        with tempfile.TemporaryDirectory(prefix="description-admission-repository-") as directory:
+            root = self.artifacts.materialize(
+                snapshot_artifact.ref,
+                Path(directory) / "artifact",
+            )
+            metadata_path = root / REPOSITORY_SNAPSHOT_METADATA
+            if not metadata_path.is_file():
+                raise ApplicationError(
+                    "application.repository_snapshot_invalid",
+                    "Repository snapshot metadata is absent",
+                )
+            actual_snapshot = VerifiedRepositorySnapshot.from_metadata_bytes(
+                snapshot_artifact,
+                metadata_path.read_bytes(),
+            )
+        if actual_snapshot != spec.repository_snapshot:
+            raise ApplicationError(
+                "application.repository_snapshot_invalid",
+                "Repository snapshot metadata differs from AdmissionSpec",
+            )
 
-    def admit(self, spec: AdmissionSpec) -> StageCommand:
-        """Atomically register the immutable admission and its initial Freeze command."""
+    def admit(
+        self,
+        spec: AdmissionSpec,
+        *,
+        dispatch_dag_id: str = "solidworks_to_urdf",
+        dispatch_dag_run_id: str | None = None,
+    ) -> AdmissionOutcome:
+        """Atomically register admission, Freeze and technical Airflow dispatch."""
 
         if not isinstance(spec, AdmissionSpec):
             raise ApplicationError("application.admission_required", "AdmissionSpec is required")
@@ -312,10 +386,47 @@ class StageApplication:
         self._verify_admission_artifacts(spec)
         admission = build_run_admission(spec)
         command = build_freeze_command(spec)
-        stored = self.facts.admit_run(admission, command)
-        if stored != command:
-            raise ApplicationError("application.admission_conflict", "Stored Freeze command differs")
-        return stored
+        conf = DispatchConf(
+            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            run_id=spec.run_id,
+            freeze_command_id=command.command_id,
+        )
+        dispatch_executor_sha256 = spec.executors.freeze
+        conf_artifact = self.artifacts.seal_dispatch_conf(
+            conf,
+            producer_run_id=spec.run_id,
+            producer_tool_sha256=dispatch_executor_sha256,
+        )
+        dag_run_id = dispatch_dag_run_id or spec.request_id
+        dispatch_identity = {
+            "admission_sha256": spec.admission_sha256,
+            "dag_id": dispatch_dag_id,
+            "dag_run_id": dag_run_id,
+            "freeze_command_id": command.command_id,
+            "run_id": spec.run_id,
+        }
+        dispatch_command = DispatchCommand.create(
+            command_id="dispatch:" + digest(dispatch_identity),
+            run_id=spec.run_id,
+            freeze_command_id=command.command_id,
+            idempotency_key=f"{spec.run_id}/dispatch",
+            dag_id=dispatch_dag_id,
+            dag_run_id=dag_run_id,
+            conf_artifact=conf_artifact,
+            expected_executor_sha256=dispatch_executor_sha256,
+        )
+        stored_command, stored_dispatch, _intent = self.facts.admit_run(
+            admission,
+            command,
+            dispatch_command,
+            conf_artifact,
+        )
+        if stored_command != command or stored_dispatch != dispatch_command:
+            raise ApplicationError(
+                "application.admission_conflict",
+                "Stored admission commands differ from their deterministic projection",
+            )
+        return AdmissionOutcome(freeze_command=stored_command, dispatch_command=stored_dispatch)
 
     def _load_spec(self, run_id: str) -> tuple[AdmissionSpec, RunAdmission]:
         admission = self.facts.load_admission(run_id)
@@ -351,6 +462,30 @@ class StageApplication:
                 f"The {stage} builder produced a command outside the admission identity",
                 detail={"stage": stage, "command_id": command.command_id},
             )
+        previous, supporting, command_discover_result = self._command_predecessors(
+            stage,
+            predecessors,
+            discover_result,
+        )
+        validate_stage_command(
+            spec,
+            command,
+            predecessor=previous,
+            supporting_predecessors=supporting,
+            discover_result=command_discover_result,
+        )
+        return command
+
+    @staticmethod
+    def _command_predecessors(
+        stage: StageId,
+        predecessors: Mapping[StageId, VerifiedPredecessor],
+        discover_result: VerifiedDiscoverResult | None,
+    ) -> tuple[
+        VerifiedPredecessor | None,
+        tuple[VerifiedPredecessor, ...],
+        VerifiedDiscoverResult | None,
+    ]:
         index = STAGES.index(stage)
         previous = predecessors.get(STAGES[index - 1]) if index else None
         supporting: tuple[VerifiedPredecessor, ...] = ()
@@ -358,14 +493,9 @@ class StageApplication:
             supporting = (predecessors["freeze"],)
         elif stage == "verify":
             supporting = (predecessors["capture"],)
-        validate_stage_command(
-            spec,
-            command,
-            predecessor=previous,
-            supporting_predecessors=supporting,
-            discover_result=discover_result,
-        )
-        return command
+        elif stage == "publish":
+            supporting = (predecessors["generate"], predecessors["capture"])
+        return previous, supporting, discover_result if stage == "capture" else None
 
     def _completed_predecessor(
         self,
@@ -429,7 +559,7 @@ class StageApplication:
 
         if stage not in STAGES:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {stage!r}")
-        spec, _admission = self._load_spec(run_id)
+        spec, admission = self._load_spec(run_id)
         self._require_handler(stage)
         if spec.from_stage not in {None, "freeze"}:
             raise ApplicationError(
@@ -450,7 +580,24 @@ class StageApplication:
                         "Stored Freeze command differs from its deterministic admission projection",
                     )
             else:
-                stored = self.facts.create_command(command)
+                previous, supporting, command_discover_result = self._command_predecessors(
+                    current_stage,
+                    predecessors,
+                    discover_result,
+                )
+                if previous is None:
+                    raise ApplicationError(
+                        "application.predecessor_missing",
+                        f"{current_stage} requires a completed predecessor",
+                        detail={"stage": current_stage},
+                    )
+                stored = self.facts.create_command(
+                    command,
+                    admission=admission,
+                    predecessor=previous,
+                    supporting_predecessors=supporting,
+                    discover_result=command_discover_result,
+                )
                 if stored != command:
                     raise ApplicationError(
                         "application.command_conflict",
@@ -555,8 +702,15 @@ def application_from_environment(
     )
     installed: dict[StageId, StageHandler] = {
         "capture": CaptureHandler(artifact_store=artifacts),
+        "discover": DiscoverHandler(
+            ArchiveDiscoverAdapter(
+                artifacts=artifacts,
+                native_tool=tool_record(role="native"),
+            )
+        ),
         "freeze": FreezeHandler(),
         "generate": GenerateHandler(artifacts),
+        "publish": PublishHandler(artifacts),
         "verify": VerifyHandler(),
     }
     if discover_adapter is not None:
@@ -583,6 +737,7 @@ def application_from_environment(
     )
 __all__ = [
     "STAGES",
+    "AdmissionOutcome",
     "ApplicationError",
     "ApplicationOutcome",
     "ApplicationPortMissing",

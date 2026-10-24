@@ -3,10 +3,12 @@
 from .admission import (
     AdmissionSpec,
     ArtifactMember,
+    PublicationActor,
     StageExecutors,
     VerifiedArtifact,
     VerifiedDiscoverResult,
     VerifiedPredecessor,
+    VerifiedRepositorySnapshot,
     VerifiedRuleset,
     build_capture_command,
     build_discover_command,
@@ -19,6 +21,7 @@ from .admission import (
     validate_discover_command,
     validate_freeze_command,
     validate_generate_command,
+    validate_publish_command,
     validate_run_admission,
     validate_stage_command,
     validate_store_command,
@@ -26,6 +29,8 @@ from .admission import (
 )
 from .contracts import (
     ArtifactRef,
+    DispatchCommand,
+    DispatchConf,
     ExecutionClaim,
     FailureEnvelope,
     RunAdmission,
@@ -50,6 +55,7 @@ from .effects import (
     project_effect_settlement,
     project_effect_state,
 )
+from .dispatch import DispatchAdapter, DispatchObservation, DispatchResult, TechnicalDispatchService
 from .engine import StageHandler, StageServices, StageWorkspace, execute_stage
 from .discover import DiscoverDomainAdapter, DiscoverHandler
 from .capture import CaptureHandler
@@ -62,6 +68,11 @@ __all__ = [
     "CaptureHandler",
     "DiscoverDomainAdapter",
     "DiscoverHandler",
+    "DispatchAdapter",
+    "DispatchCommand",
+    "DispatchConf",
+    "DispatchObservation",
+    "DispatchResult",
     "EffectFact",
     "EffectIntent",
     "EffectSettlement",
@@ -70,6 +81,7 @@ __all__ = [
     "FailureEnvelope",
     "FreezeHandler",
     "FreezeRefusal",
+    "PublicationActor",
     "RunAdmission",
     "RunStatus",
     "StageCandidate",
@@ -84,9 +96,11 @@ __all__ = [
     "StageServices",
     "StageStatus",
     "StageWorkspace",
+    "TechnicalDispatchService",
     "VerifiedArtifact",
     "VerifiedDiscoverResult",
     "VerifiedPredecessor",
+    "VerifiedRepositorySnapshot",
     "VerifiedRuleset",
     "build_capture_command",
     "build_discover_command",
@@ -105,6 +119,7 @@ __all__ = [
     "validate_discover_command",
     "validate_freeze_command",
     "validate_generate_command",
+    "validate_publish_command",
     "validate_run_admission",
     "validate_stage_command",
     "validate_store_command",

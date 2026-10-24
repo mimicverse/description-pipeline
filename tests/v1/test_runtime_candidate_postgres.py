@@ -7,13 +7,18 @@ throwaway cluster and never contacts an existing platform or Airflow service.
 
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from unittest import mock
 
 try:
@@ -23,21 +28,34 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
-from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.io import digest
+from description_pipeline.io import digest, read_data
 from description_pipeline.pipeline import (
+    DispatchCommand,
+    DispatchConf,
+    DispatchObservation,
     EffectState,
     ExecutionClaim,
-    RunAdmission,
     StageCommand,
     StageExecution,
     StageFailure,
     StageResult,
+    TechnicalDispatchService,
+    VerifiedDiscoverResult,
+    VerifiedPredecessor,
+    build_capture_command,
+    build_discover_command,
+    build_freeze_command,
+    build_generate_command,
+    build_publish_command,
+    build_run_admission,
+    build_verify_command,
     execute_stage,
 )
+from description_pipeline.pipeline.application import StageApplication
 from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
-from description_pipeline.platform.facts import FactConflict, FactStore
+from description_pipeline.platform.facts import FactConflict, FactStore, FactStoreError
+from tests.v1.test_pipeline_admission import AdmissionHarness
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / "schema.sql"
@@ -137,15 +155,145 @@ class _UnexpectedFailureHandler:
         raise AssertionError("An unhandled failure has no candidate")
 
 
+class _AirflowStub:
+    """One local, controlled Airflow HTTP stub with exact fixed identities."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.present: set[tuple[str, str]] = set()
+        self.trigger_count = 0
+        self.observe_count = 0
+        self.lost_response = False
+        self.expected_conf: dict[str, object] | None = None
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format, *_args):
+                return
+
+            def _identity(self):
+                parts = self.path.strip("/").split("/")
+                if len(parts) != 6 or parts[:3] != ["api", "v1", "dags"] or parts[4] != "dagRuns":
+                    self.send_error(404)
+                    return None
+                return parts[3], parts[5]
+
+            def _authorized(self):
+                if self.headers.get("Authorization") != "Bearer controlled-token":
+                    self.send_error(401)
+                    return False
+                return True
+
+            def do_POST(self):
+                identity = self._identity()
+                if identity is None or not self._authorized():
+                    return
+                length = int(self.headers.get("Content-Length") or "0")
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if body != stub.expected_conf:
+                    self.send_error(409)
+                    return
+                with stub.lock:
+                    stub.trigger_count += 1
+                    stub.present.add(identity)
+                    lost = stub.lost_response
+                if lost:
+                    self.close_connection = True
+                    return
+                payload = json.dumps({"dag_id": identity[0], "dag_run_id": identity[1]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                identity = self._identity()
+                if identity is None or not self._authorized():
+                    return
+                with stub.lock:
+                    stub.observe_count += 1
+                    present = identity in stub.present
+                if not present:
+                    self.send_error(404)
+                    return
+                payload = json.dumps(
+                    {"dag_id": identity[0], "dag_run_id": identity[1], "state": "queued"}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.assert_stopped()
+
+    def assert_stopped(self) -> None:
+        if self.thread.is_alive():
+            raise AssertionError("Airflow HTTP stub did not stop")
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+
+class _HttpDispatchAdapter:
+    def __init__(self, *, base_url: str, credential_file: Path) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.credential_file = credential_file
+
+    def _request(self, method: str, command: DispatchCommand, conf: DispatchConf):
+        body = None if method == "GET" else json.dumps(conf.to_record(), sort_keys=True).encode()
+        request = urlrequest.Request(
+            f"{self.base_url}/api/v1/dags/{command.dag_id}/dagRuns/{command.dag_run_id}",
+            data=body,
+            method=method,
+            headers={
+                "Authorization": "Bearer " + self.credential_file.read_text(encoding="utf-8").strip(),
+                "Content-Type": "application/json",
+            },
+        )
+        with urlrequest.urlopen(request, timeout=3) as response:
+            return json.loads(response.read())
+
+    def trigger(self, command: DispatchCommand, conf: DispatchConf):
+        return self._request("POST", command, conf)
+
+    def observe(self, command: DispatchCommand, conf: DispatchConf) -> DispatchObservation:
+        try:
+            payload = self._request("GET", command, conf)
+        except urlerror.HTTPError as error:
+            if error.code == 404:
+                return DispatchObservation("absent", {"error": "not_found"})
+            raise
+        except Exception as error:
+            return DispatchObservation(
+                "unobservable",
+                {"error_type": type(error).__name__, "error_message": str(error)[:200]},
+            )
+        return DispatchObservation("known", payload)
+
+
 @unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
 class RuntimeCandidatePostgresTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.server_root = tempfile.TemporaryDirectory(prefix="runtime-candidate-postgres-")
         cls.server = pgserver.get_server(Path(cls.server_root.name) / "pgdata", cleanup_mode="delete")
+        cls.airflow_stub = _AirflowStub()
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls.airflow_stub.close()
         cls.server.cleanup()
         cls.server_root.cleanup()
 
@@ -162,33 +310,41 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             cursor.execute(schema_sql)
             cursor.execute(f'UPDATE "{self.schema}".admission SET state = %s WHERE id = 1', ("open",))
 
-        self.now = datetime(2026, 10, 25, tzinfo=UTC)
-        self.executor = digest({"tool": "runtime-candidate"})
+        self.admission_harness = AdmissionHarness(Path(self.directory.name) / "admission")
+        self.now = self.admission_harness.spec.created_at
+        self.executor = self.admission_harness.spec.executors.freeze
         self.owner = digest({"process": str(uuid.uuid4())})
-        self.artifacts = ArtifactStore(Path(self.directory.name) / "cas")
+        self.artifacts = self.admission_harness.store
         self.facts = FactStore(self._connect, self.artifacts)
-        self.admission = RunAdmission.create(
-            run_id="run-1",
-            request_id="request-1",
-            parent_run_id=None,
-            from_stage=None,
-            request={"target": "m3", "source": "fixture"},
-            created_at=self.now,
+        self.admission = build_run_admission(self.admission_harness.spec)
+        self.command = build_freeze_command(self.admission_harness.spec)
+        self.dispatch_executor = digest({"tool": "portal-dispatch"})
+        self.dispatch_conf = DispatchConf(
+            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            run_id=self.admission.run_id,
+            freeze_command_id=self.command.command_id,
         )
-        self.command = StageCommand.create(
-            command_id="command-freeze",
-            run_id="run-1",
-            stage="freeze",
-            idempotency_key="run-1/freeze",
-            request={"source": "fixture"},
-            input_artifacts=(),
-            config_snapshot_sha256=digest({"config": 1}),
-            contract_sha256=digest({"contract": 1}),
-            policy_sha256=digest({"policy": 1}),
-            expected_executor_sha256=self.executor,
-            predecessor_decision_id=None,
+        self.conf_artifact = self.artifacts.seal_dispatch_conf(
+            self.dispatch_conf,
+            producer_run_id=self.admission.run_id,
+            producer_tool_sha256=self.dispatch_executor,
         )
-        self.facts.admit_run(self.admission, self.command)
+        self.dispatch_command = DispatchCommand.create(
+            command_id="command-dispatch",
+            run_id=self.admission.run_id,
+            freeze_command_id=self.command.command_id,
+            idempotency_key="run-1/dispatch",
+            dag_id="solidworks_to_urdf",
+            dag_run_id="portal-run-1",
+            conf_artifact=self.conf_artifact,
+            expected_executor_sha256=self.dispatch_executor,
+        )
+        self.freeze_command, self.dispatch_command, self.dispatch_effect = self.facts.admit_run(
+            self.admission,
+            self.command,
+            self.dispatch_command,
+            self.conf_artifact,
+        )
         self.services = CanonicalStageServices(
             facts=self.facts,
             artifacts=self.artifacts,
@@ -200,6 +356,30 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 claim_id_factory=lambda: "claim-" + str(uuid.uuid4()),
             ),
             clock=lambda: self.now,
+        )
+        with self.airflow_stub.lock:
+            self.airflow_stub.present.clear()
+            self.airflow_stub.trigger_count = 0
+            self.airflow_stub.observe_count = 0
+            self.airflow_stub.lost_response = False
+            self.airflow_stub.expected_conf = dict(self.dispatch_conf.to_record())
+        credential = Path(self.directory.name) / "airflow-token"
+        credential.write_text("controlled-token\n", encoding="utf-8")
+        self.dispatch_service = TechnicalDispatchService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "dispatch-work",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": "dispatch-" + str(uuid.uuid4())}),
+                executor_sha256=self.dispatch_executor,
+                lease=timedelta(minutes=5),
+                claim_id_factory=lambda: "dispatch-claim-" + str(uuid.uuid4()),
+            ),
+            clock=lambda: self.now,
+            adapter=_HttpDispatchAdapter(
+                base_url=self.airflow_stub.base_url,
+                credential_file=credential,
+            ),
         )
 
     def _connect(self):
@@ -220,6 +400,416 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(statement, parameters)
             return cursor.fetchall()
+
+    def _new_admission(self, suffix: str):
+        spec = replace(
+            self.admission_harness.spec,
+            run_id=f"run-{suffix}",
+            request_id=f"request-{suffix}",
+            parent_run_id=None,
+            from_stage="freeze",
+        )
+        admission = build_run_admission(spec)
+        command = build_freeze_command(spec)
+        return admission, command
+
+    def _dispatch_for(self, admission, command, *, conf_freeze_id=None):
+        conf = DispatchConf(
+            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            run_id=admission.run_id,
+            freeze_command_id=conf_freeze_id or command.command_id,
+        )
+        artifact = self.artifacts.seal_dispatch_conf(
+            conf,
+            producer_run_id=admission.run_id,
+            producer_tool_sha256=self.dispatch_executor,
+        )
+        dispatch = DispatchCommand.create(
+            command_id=f"command-dispatch-{admission.run_id}",
+            run_id=admission.run_id,
+            freeze_command_id=command.command_id,
+            idempotency_key=f"{admission.run_id}/dispatch",
+            dag_id="solidworks_to_urdf",
+            dag_run_id=f"portal-{admission.run_id}",
+            conf_artifact=artifact,
+            expected_executor_sha256=self.dispatch_executor,
+        )
+        return dispatch, artifact
+
+    def _predecessor_for(self, command: StageCommand) -> VerifiedPredecessor:
+        stored = self.facts.load_command(command.command_id)
+        decision = self.facts.decision_for(stored)
+        self.assertIsNotNone(decision)
+        result = self.facts.load_result(decision)
+        return VerifiedPredecessor(
+            stage=stored.stage,
+            command=stored,
+            result=result,
+            decision=decision,
+        )
+
+    def _persist_predecessor_decision(self, predecessor: VerifiedPredecessor) -> None:
+        self.facts.register_artifact(predecessor.result.output_artifact)
+        self.facts.register_artifact(predecessor.decision.result_record_artifact)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO stage_decision (
+                    decision_id, run_id, stage, command_id, outcome, result_record_artifact_id,
+                    result_digest, actual_executor_sha256, original_producer_decision_id,
+                    reason_code, failure_envelope, failure_digest, decided_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, NULL, NULL, %s)
+                """,
+                (
+                    predecessor.decision.decision_id,
+                    predecessor.decision.run_id,
+                    predecessor.decision.stage,
+                    predecessor.decision.command_id,
+                    predecessor.decision.outcome,
+                    predecessor.decision.result_record_artifact.artifact_id,
+                    predecessor.decision.result_digest,
+                    predecessor.decision.actual_executor_sha256,
+                    predecessor.decision.decided_at,
+                ),
+            )
+
+    def _discover_payload(self, command: StageCommand) -> dict[str, object]:
+        files = {"cad/robot.SLDASM": self.admission_harness.originals.inventory["cad/robot.SLDASM"]}
+        return {
+            "schema_version": "description-pipeline.discover-result/v1",
+            "command_id": command.command_id,
+            "run_id": self.admission_harness.spec.run_id,
+            "request_digest": command.request_digest,
+            "selection": {
+                "files": files,
+                "handoff_sha256": digest(files),
+                "upload_sha256": self.admission_harness.originals.inventory_sha256,
+                "main_assembly": self.admission_harness.spec.main_assembly,
+            },
+            "prepared_sha256": digest({"prepared": 1}),
+            "native_observation_sha256": digest({"observation": 1}),
+            "source_set_artifact": self.admission_harness.originals_ref.to_record(),
+            "ruleset_artifact": self.admission_harness.ruleset_ref.to_record(),
+            "configuration_artifact": self.admission_harness.configuration_ref.to_record(),
+            "native_tool": {"executor": "native"},
+            "passed": True,
+        }
+
+    def test_admission_binds_run_freeze_dispatch_conf_and_effect_atomically(self) -> None:
+        replay = self.facts.admit_run(
+            self.admission,
+            self.command,
+            self.dispatch_command,
+            self.conf_artifact,
+        )
+        self.assertEqual(replay[0], self.command)
+        self.assertEqual(replay[1], self.dispatch_command)
+        rows = self._query(
+            "SELECT "
+            "(SELECT count(*) FROM run_admission WHERE run_id = %s),"
+            "(SELECT count(*) FROM command WHERE run_id = %s AND kind = 'stage'),"
+            "(SELECT count(*) FROM command WHERE run_id = %s AND kind = 'dispatch'),"
+            "(SELECT count(*) FROM effect_intent WHERE command_id = %s),"
+            "(SELECT count(*) FROM stage_decision WHERE command_id = %s)",
+            (
+                self.admission.run_id,
+                self.admission.run_id,
+                self.admission.run_id,
+                self.dispatch_command.command_id,
+                self.dispatch_command.command_id,
+            ),
+        )
+        self.assertEqual(rows[0], (1, 1, 1, 1, 0))
+
+    def test_application_atomically_admits_freeze_and_dispatch(self) -> None:
+        spec = replace(
+            self.admission_harness.spec,
+            run_id="run-application",
+            request_id="request-application",
+            parent_run_id=None,
+            from_stage="freeze",
+        )
+        application = StageApplication(
+            services=self.services,
+            facts=self.facts,
+            artifacts=self.artifacts,
+            handlers={},
+            builders={},
+        )
+        admitted = application.admit(spec, dispatch_dag_run_id="portal-application")
+        rows = self._query(
+            """
+            SELECT kind, stage, command_id
+            FROM command
+            WHERE run_id = %s
+            ORDER BY kind
+            """,
+            (spec.run_id,),
+        )
+        self.assertEqual(
+            rows,
+            [
+                ("dispatch", None, admitted.dispatch_command.command_id),
+                ("stage", "freeze", admitted.freeze_command.command_id),
+            ],
+        )
+        self.assertEqual(admitted.dispatch_command.dag_run_id, "portal-application")
+
+    def test_forged_freeze_command_is_refused_by_typed_admission_before_writes(self) -> None:
+        admission, command = self._new_admission("forged")
+        dispatch, artifact = self._dispatch_for(admission, command)
+        forged_request = {**dict(command.request), "principal": "forged-principal"}
+        forged = AdmissionHarness.manual(command, request=forged_request)
+        with self.assertRaisesRegex(FactStoreError, "typed semantic validation"):
+            self.facts.admit_run(
+                admission,
+                forged,
+                dispatch,
+                artifact,
+            )
+        rows = self._query(
+            "SELECT "
+            "(SELECT count(*) FROM run_admission WHERE run_id = %s),"
+            "(SELECT count(*) FROM command WHERE run_id = %s),"
+            "(SELECT count(*) FROM effect_intent WHERE command_id = %s)",
+            (admission.run_id, admission.run_id, dispatch.command_id),
+        )
+        self.assertEqual(rows[0], (0, 0, 0))
+
+    def test_wrong_dispatch_conf_binding_is_refused_before_any_admission_write(self) -> None:
+        admission, command = self._new_admission("wrong-conf")
+        dispatch, artifact = self._dispatch_for(
+            admission,
+            command,
+            conf_freeze_id="command-from-another-run",
+        )
+        with self.assertRaisesRegex(FactStoreError, "conf names another"):
+            self.facts.admit_run(admission, command, dispatch, artifact)
+        rows = self._query(
+            "SELECT count(*) FROM run_admission WHERE run_id = %s",
+            (admission.run_id,),
+        )
+        self.assertEqual(rows[0][0], 0)
+
+    def test_wrong_original_artifact_is_refused_before_any_admission_write(self) -> None:
+        admission, command = self._new_admission("wrong-original")
+        alternate = self.admission_harness.alternate("freeze_originals", "alternate-originals")
+        forged_inputs = (alternate, *command.input_artifacts[1:])
+        forged = AdmissionHarness.manual(command, input_artifacts=forged_inputs)
+        dispatch, artifact = self._dispatch_for(admission, forged)
+        with self.assertRaisesRegex(FactStoreError, "typed semantic validation"):
+            self.facts.admit_run(admission, forged, dispatch, artifact)
+        rows = self._query(
+            "SELECT "
+            "(SELECT count(*) FROM run_admission WHERE run_id = %s),"
+            "(SELECT count(*) FROM command WHERE run_id = %s),"
+            "(SELECT count(*) FROM effect_intent WHERE command_id = %s)",
+            (admission.run_id, admission.run_id, dispatch.command_id),
+        )
+        self.assertEqual(rows[0], (0, 0, 0))
+
+    def test_discover_is_rebuilt_from_the_registered_freeze_fact_before_insert(self) -> None:
+        self._execute(_EffectHandler())
+        freeze_command = self.facts.load_command(self.command.command_id)
+        freeze_decision = self.facts.decision_for(freeze_command)
+        self.assertIsNotNone(freeze_decision)
+        freeze_result = self.facts.load_result(freeze_decision)
+        predecessor = VerifiedPredecessor(
+            stage="freeze",
+            command=freeze_command,
+            result=freeze_result,
+            decision=freeze_decision,
+        )
+        discover = build_discover_command(self.admission_harness.spec, predecessor)
+        self.assertEqual(
+            self.facts.create_command(
+                discover,
+                admission=self.admission,
+                predecessor=predecessor,
+            ),
+            discover,
+        )
+        self.assertEqual(self.facts.load_command(discover.command_id), discover)
+
+        forged = AdmissionHarness.manual(
+            discover,
+            request={**dict(discover.request), "purpose": "inspection_preview"},
+        )
+        with self.assertRaisesRegex(FactStoreError, "typed semantic validation"):
+            self.facts.create_command(
+                forged,
+                admission=self.admission,
+                predecessor=predecessor,
+            )
+        rows = self._query(
+            "SELECT count(*) FROM command WHERE run_id = %s AND stage = 'discover'",
+            (self.admission.run_id,),
+        )
+        self.assertEqual(rows[0][0], 1)
+
+    def test_store_persists_the_six_supported_projection_stages_in_order(self) -> None:
+        self._execute(_EffectHandler())
+        freeze = self._predecessor_for(self.command)
+
+        discover_command = build_discover_command(self.admission_harness.spec, freeze)
+        self.facts.create_command(
+            discover_command,
+            admission=self.admission,
+            predecessor=freeze,
+        )
+        discover = self.admission_harness.predecessor(
+            "discover",
+            discover_command,
+            self._discover_payload(discover_command),
+        )
+        self._persist_predecessor_decision(discover)
+        self.artifacts.verify(discover.result.output_artifact)
+        discover_result = VerifiedDiscoverResult.from_record(
+            discover,
+            read_data(
+                self.artifacts.objects
+                / discover.result.output_artifact.artifact_id
+                / "result.json"
+            ),
+        )
+
+        capture_command = build_capture_command(
+            self.admission_harness.spec,
+            freeze,
+            discover,
+            discover_result,
+        )
+        self.assertNotEqual(
+            capture_command.expected_executor_sha256,
+            capture_command.request["native_tool_sha256"],
+        )
+        self.facts.create_command(
+            capture_command,
+            admission=self.admission,
+            predecessor=discover,
+            supporting_predecessors=(freeze,),
+            discover_result=discover_result,
+        )
+        capture = self.admission_harness.predecessor(
+            "capture",
+            capture_command,
+            {"stage": "capture"},
+        )
+        self._persist_predecessor_decision(capture)
+
+        generate_command = build_generate_command(self.admission_harness.spec, capture)
+        self.facts.create_command(
+            generate_command,
+            admission=self.admission,
+            predecessor=capture,
+        )
+        generate = self.admission_harness.predecessor(
+            "generate",
+            generate_command,
+            {"stage": "generate"},
+        )
+        self._persist_predecessor_decision(generate)
+
+        verify_command = build_verify_command(
+            self.admission_harness.spec,
+            generate,
+            capture,
+        )
+        self.facts.create_command(
+            verify_command,
+            admission=self.admission,
+            predecessor=generate,
+            supporting_predecessors=(capture,),
+        )
+        verify = self.admission_harness.predecessor(
+            "verify",
+            verify_command,
+            {"stage": "verify"},
+        )
+        self._persist_predecessor_decision(verify)
+        publish_command = build_publish_command(
+            self.admission_harness.spec,
+            verify,
+            generate,
+            capture,
+        )
+        self.facts.create_command(
+            publish_command,
+            admission=self.admission,
+            predecessor=verify,
+            supporting_predecessors=(generate, capture),
+        )
+        rows = self._query(
+            "SELECT stage FROM command WHERE run_id = %s AND kind = 'stage' ORDER BY stage",
+            (self.admission.run_id,),
+        )
+        self.assertEqual(
+            [row[0] for row in rows],
+            ["capture", "discover", "freeze", "generate", "publish", "verify"],
+        )
+        self.assertEqual(
+            self.facts.load_command(publish_command.command_id),
+            publish_command,
+        )
+
+    def test_technical_dispatch_uses_its_own_claim_and_creates_no_stage_decision(self) -> None:
+        result = self.dispatch_service.dispatch(self.dispatch_command.command_id)
+        self.assertEqual(result.state, EffectState.SATISFIED)
+        self.assertEqual(self.airflow_stub.trigger_count, 1)
+        self.assertGreaterEqual(self.airflow_stub.observe_count, 1)
+        replay = self.dispatch_service.dispatch(self.dispatch_command.command_id)
+        self.assertEqual(replay.state, EffectState.SATISFIED)
+        self.assertEqual(self.airflow_stub.trigger_count, 1)
+        rows = self._query(
+            "SELECT "
+            "(SELECT count(*) FROM stage_decision WHERE command_id = %s),"
+            "(SELECT count(*) FROM execution_claim WHERE command_id = %s),"
+            "(SELECT count(*) FROM execution_claim WHERE command_id = %s)",
+            (
+                self.dispatch_command.command_id,
+                self.dispatch_command.command_id,
+                self.command.command_id,
+            ),
+        )
+        self.assertEqual(rows[0], (0, 1, 0))
+        claim_rows = self._query(
+            "SELECT owner_sha256, executor_sha256, closed_at IS NOT NULL "
+            "FROM execution_claim WHERE command_id = %s",
+            (self.dispatch_command.command_id,),
+        )
+        self.assertNotEqual(claim_rows[0][0], claim_rows[0][1])
+        self.assertTrue(claim_rows[0][2])
+
+    def test_lost_dispatch_response_observes_the_same_dag_run_without_resending(self) -> None:
+        with self.airflow_stub.lock:
+            self.airflow_stub.lost_response = True
+        first = self.dispatch_service.dispatch(self.dispatch_command.command_id)
+        self.assertEqual(first.state, EffectState.SATISFIED)
+        self.assertEqual(self.airflow_stub.trigger_count, 1)
+        with self.airflow_stub.lock:
+            self.airflow_stub.lost_response = False
+        second = self.dispatch_service.dispatch(self.dispatch_command.command_id)
+        self.assertEqual(second.state, EffectState.SATISFIED)
+        self.assertEqual(self.airflow_stub.trigger_count, 1)
+
+    def test_dispatch_unknown_does_not_trigger_on_replay(self) -> None:
+        with self.airflow_stub.lock:
+            self.airflow_stub.lost_response = True
+        original_observe = self.dispatch_service.adapter.observe
+        self.dispatch_service.adapter.observe = lambda *_args, **_kwargs: DispatchObservation(
+            "unobservable",
+            {"error": "stub unavailable"},
+        )
+        first = self.dispatch_service.dispatch(self.dispatch_command.command_id)
+        self.assertEqual(first.state, EffectState.UNKNOWN)
+        self.assertEqual(self.airflow_stub.trigger_count, 1)
+        self.dispatch_service.adapter.observe = original_observe
+        with self.airflow_stub.lock:
+            self.airflow_stub.present.clear()
+            self.airflow_stub.lost_response = False
+        second = self.dispatch_service.dispatch(self.dispatch_command.command_id)
+        self.assertEqual(second.state, EffectState.UNKNOWN)
+        self.assertEqual(self.airflow_stub.trigger_count, 1)
 
     def test_real_artifact_effect_claim_and_decision_chain(self) -> None:
         handler = _EffectHandler()

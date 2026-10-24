@@ -10,6 +10,8 @@ from pathlib import Path
 from description_pipeline.io import digest
 from description_pipeline.pipeline import (
     ArtifactRef,
+    DispatchCommand,
+    DispatchConf,
     EffectFact,
     EffectIntent,
     EffectState,
@@ -347,6 +349,40 @@ class CommandIdentityTests(unittest.TestCase):
                 producer_stage="freeze",
                 producer_tool_sha256=digest({"tool": 1}),
             )
+
+    def test_technical_dispatch_round_trips_its_non_secret_fixed_identity(self) -> None:
+        executor = digest({"tool": "dispatch"})
+        conf_artifact = ArtifactRef(
+            artifact_id="dispatch-conf",
+            kind="airflow_dispatch_conf",
+            locator="cas://artifact/dispatch-conf",
+            manifest_sha256=digest({"manifest": "dispatch-conf"}),
+            set_sha256=digest({"set": "dispatch-conf"}),
+            producer_run_id="run-1",
+            producer_stage=None,
+            producer_tool_sha256=executor,
+        )
+        command = DispatchCommand.create(
+            command_id="command-dispatch",
+            run_id="run-1",
+            freeze_command_id="command-freeze",
+            idempotency_key="run-1/dispatch",
+            dag_id="solidworks_to_urdf",
+            dag_run_id="portal-run-1",
+            conf_artifact=conf_artifact,
+            expected_executor_sha256=executor,
+        )
+        self.assertEqual(DispatchCommand.from_record(command.to_record()), command)
+        conf = DispatchConf(
+            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            run_id="run-1",
+            freeze_command_id="command-freeze",
+        )
+        self.assertEqual(DispatchConf.from_record(conf.to_record()), conf)
+        forged = command.to_record()
+        forged["dag_run_id"] = "another-run"
+        with self.assertRaises(ProtocolError):
+            DispatchCommand.from_record(forged)
 
 
 class _Handler:

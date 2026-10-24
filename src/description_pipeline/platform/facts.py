@@ -15,11 +15,19 @@ from datetime import datetime
 from typing import Protocol
 
 from ..io import PipelineError, digest
+from ..pipeline.admission import (
+    AdmissionSpec,
+    VerifiedDiscoverResult,
+    VerifiedPredecessor,
+    validate_store_command,
+)
 from ..pipeline.contracts import (
-    STAGES,
     ArtifactRef,
+    DispatchCommand,
+    DispatchConf,
     ExecutionClaim,
     FailureEnvelope,
+    ProtocolError,
     RunAdmission,
     StageCandidate,
     StageCommand,
@@ -47,7 +55,11 @@ class FactConflict(FactStoreError):
 class StageResultReader(Protocol):
     """Read and independently validate one sealed StageResult artifact."""
 
+    def verify(self, artifact: ArtifactRef) -> Mapping[str, object]: ...
+
     def read_result(self, artifact: ArtifactRef) -> StageResult: ...
+
+    def read_dispatch_conf(self, artifact: ArtifactRef) -> DispatchConf: ...
 
 
 def _plain(value):
@@ -200,15 +212,38 @@ class FactStore:
         with self._transaction() as connection:
             return self._load_admission_cursor(connection.cursor(), run_id)
 
-    def admit_run(self, admission: RunAdmission, command: StageCommand) -> StageCommand:
-        """Admit one immutable run and its complete initial Freeze command."""
+    def admit_run(
+        self,
+        admission: RunAdmission,
+        command: StageCommand,
+        dispatch_command: DispatchCommand,
+        dispatch_outbound_artifact: ArtifactRef,
+    ) -> tuple[StageCommand, DispatchCommand, EffectIntent]:
+        """Atomically admit the run, Freeze command and technical dispatch."""
 
         if not isinstance(admission, RunAdmission):
             raise FactStoreError("A canonical RunAdmission is required")
+        if not isinstance(command, StageCommand) or not isinstance(dispatch_command, DispatchCommand):
+            raise FactStoreError("Canonical Freeze and dispatch commands are required")
         if command.run_id != admission.run_id or command.stage != "freeze" or command.kind != "stage":
             raise FactStoreError("Admission must create the initial Freeze stage command")
         if command.predecessor_decision_id is not None:
             raise FactStoreError("The initial Freeze command cannot have a predecessor decision")
+        if (
+            dispatch_command.run_id != admission.run_id
+            or dispatch_command.freeze_command_id != command.command_id
+            or dispatch_outbound_artifact != dispatch_command.conf_artifact
+        ):
+            raise FactStoreError("The technical dispatch is not bound to this admission and Freeze command")
+        try:
+            spec = AdmissionSpec.from_record(admission.request)
+            validate_store_command(spec, admission, command)
+        except ProtocolError as error:
+            raise FactStoreError("The admission and Freeze command fail typed semantic validation") from error
+        conf = self._read_dispatch_conf(dispatch_command.conf_artifact)
+        if conf.run_id != admission.run_id or conf.freeze_command_id != command.command_id:
+            raise FactStoreError("The Airflow dispatch conf names another run or Freeze command")
+        dispatch_intent = self._dispatch_effect_intent(admission, dispatch_command)
         with self._transaction() as connection:
             cursor = connection.cursor()
             _require_open(cursor)
@@ -219,7 +254,14 @@ class FactStore:
                 stored_command = self._load_command_cursor(cursor, command.command_id)
                 if stored_command != command:
                     raise FactConflict(f"The run {admission.run_id!r} carries a different Freeze command")
-                return stored_command
+                stored_dispatch = self._load_dispatch_command_cursor(cursor, dispatch_command.command_id)
+                stored_intent, _ = self._effect_cursor(cursor, dispatch_intent.effect_id)
+                if (
+                    stored_dispatch != dispatch_command
+                    or stored_intent.identity_digest != dispatch_intent.identity_digest
+                ):
+                    raise FactConflict(f"The run {admission.run_id!r} carries a different dispatch")
+                return stored_command, stored_dispatch, stored_intent
             cursor.execute("SELECT run_id FROM run_admission WHERE request_id = %s", (admission.request_id,))
             if cursor.fetchone() is not None:
                 raise FactConflict(f"The request {admission.request_id!r} is already admitted")
@@ -239,8 +281,58 @@ class FactStore:
                     admission.created_at,
                 ),
             )
-            self._insert_command_cursor(cursor, command, admission=admission)
-            return command
+            self._insert_command_cursor(cursor, command)
+            self._insert_dispatch_command_cursor(
+                cursor,
+                dispatch_command,
+                freeze_command=command,
+                admission=admission,
+            )
+            self._insert_effect_intent_cursor(
+                cursor,
+                dispatch_intent,
+                dispatch_outbound_artifact,
+            )
+            return command, dispatch_command, dispatch_intent
+
+    def _read_dispatch_conf(self, artifact: ArtifactRef) -> DispatchConf:
+        reader = getattr(self._result_reader, "read_dispatch_conf", None)
+        if not callable(reader):
+            raise FactStoreError("The configured artifact reader cannot validate Airflow dispatch conf")
+        return reader(artifact)
+
+    def _dispatch_effect_intent(
+        self,
+        admission: RunAdmission,
+        command: DispatchCommand,
+    ) -> EffectIntent:
+        expected = {
+            "schema_version": "description-pipeline.airflow-dispatch-effect/v1",
+            "conf_artifact_id": command.conf_artifact.artifact_id,
+            "conf_set_sha256": command.conf_artifact.set_sha256,
+            "dag_id": command.dag_id,
+            "dag_run_id": command.dag_run_id,
+            "freeze_command_id": command.freeze_command_id,
+            "request_digest": command.request_digest,
+            "run_id": command.run_id,
+        }
+        return EffectIntent(
+            effect_id="effect-" + digest(
+                {
+                    "command_id": command.command_id,
+                    "effect_key": command.effect_key,
+                }
+            ),
+            command_id=command.command_id,
+            effect_key=command.effect_key,
+            effect_kind="airflow_dispatch",
+            target={"dag_id": command.dag_id, "dag_run_id": command.dag_run_id},
+            expected_state=expected,
+            expected_state_digest=digest(expected),
+            outbound_artifact_id=command.conf_artifact.artifact_id,
+            outbound_digest=command.conf_artifact.set_sha256,
+            created_at=admission.created_at,
+        )
 
     def _load_command_cursor(self, cursor, command_id: str) -> StageCommand | None:
         cursor.execute(
@@ -292,7 +384,38 @@ class FactStore:
             raise FactStoreError(f"The command {command_id!r} is not registered")
         return command
 
-    def _insert_command_cursor(self, cursor, command: StageCommand, *, admission: RunAdmission) -> None:
+    def _load_dispatch_command_cursor(self, cursor, command_id: str) -> DispatchCommand | None:
+        cursor.execute(
+            """
+            SELECT run_id, kind, stage, request, request_digest, expected_executor_sha256
+            FROM command
+            WHERE command_id = %s
+            """,
+            (command_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        if row[1] != "dispatch" or row[2] is not None or not isinstance(row[3], Mapping):
+            raise FactStoreError("The command is not a canonical technical dispatch")
+        command = DispatchCommand.from_record(row[3])
+        if (
+            command.command_id != command_id
+            or command.run_id != row[0]
+            or command.request_digest != row[4]
+            or command.expected_executor_sha256 != row[5]
+        ):
+            raise FactStoreError("The technical dispatch row differs from its recorded command")
+        return command
+
+    def load_dispatch_command(self, command_id: str) -> DispatchCommand:
+        with self._transaction() as connection:
+            command = self._load_dispatch_command_cursor(connection.cursor(), command_id)
+        if command is None:
+            raise FactStoreError(f"The dispatch command {command_id!r} is not registered")
+        return command
+
+    def _insert_command_cursor(self, cursor, command: StageCommand) -> None:
         for artifact in command.input_artifacts:
             self._insert_artifact(cursor, artifact)
         cursor.execute(
@@ -327,38 +450,137 @@ class FactStore:
                 (command.command_id, artifact.artifact_id, position),
             )
 
-    def create_command(self, command: StageCommand) -> StageCommand:
-        """Register one complete successor command after its predecessor decision."""
+    def _insert_dispatch_command_cursor(
+        self,
+        cursor,
+        command: DispatchCommand,
+        *,
+        freeze_command: StageCommand,
+        admission: RunAdmission,
+    ) -> None:
+        if (
+            command.run_id != admission.run_id
+            or command.freeze_command_id != freeze_command.command_id
+            or freeze_command.run_id != admission.run_id
+        ):
+            raise FactStoreError("The technical dispatch is not bound to the admission Freeze command")
+        self._insert_artifact(cursor, command.conf_artifact)
+        cursor.execute(
+            """
+            INSERT INTO command (
+                command_id, run_id, kind, stage, idempotency_key, request, request_digest,
+                config_snapshot_sha256, contract_sha256, policy_sha256,
+                expected_executor_sha256, predecessor_decision_id
+            ) VALUES (%s, %s, 'dispatch', NULL, %s, %s::jsonb, %s, %s, %s, %s, %s, NULL)
+            """,
+            (
+                command.command_id,
+                command.run_id,
+                command.idempotency_key,
+                _json(command.to_record()),
+                command.request_digest,
+                freeze_command.config_snapshot_sha256,
+                freeze_command.contract_sha256,
+                freeze_command.policy_sha256,
+                command.expected_executor_sha256,
+            ),
+        )
 
+    def create_command(
+        self,
+        command: StageCommand,
+        *,
+        admission: RunAdmission,
+        predecessor: VerifiedPredecessor,
+        supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
+        discover_result: VerifiedDiscoverResult | None = None,
+    ) -> StageCommand:
+        """Validate and register one successor command after its predecessor decision."""
+
+        if not isinstance(admission, RunAdmission):
+            raise FactStoreError("A canonical RunAdmission is required")
+        if not isinstance(predecessor, VerifiedPredecessor):
+            raise FactStoreError("A verified committed predecessor is required")
+        if not isinstance(supporting_predecessors, tuple) or not all(
+            isinstance(item, VerifiedPredecessor) for item in supporting_predecessors
+        ):
+            raise FactStoreError("Supporting predecessors must be verified immutable facts")
+        if discover_result is not None and not isinstance(discover_result, VerifiedDiscoverResult):
+            raise FactStoreError("A verified Discover result is required")
         if not isinstance(command, StageCommand) or command.kind != "stage" or command.stage is None:
-            raise FactStoreError("A stage command is required")
-        if command.stage == "freeze" or command.predecessor_decision_id is None:
-            raise FactStoreError("Successor commands require a predecessor decision")
+            raise FactStoreError("A successor stage command is required")
+        try:
+            spec = AdmissionSpec.from_record(admission.request)
+            validate_store_command(
+                spec,
+                admission,
+                command,
+                predecessor=predecessor,
+                supporting_predecessors=supporting_predecessors,
+                discover_result=discover_result,
+            )
+        except ProtocolError as error:
+            raise FactStoreError("The successor command fails typed semantic validation") from error
+        predecessors = (predecessor, *supporting_predecessors)
+        artifact_verifier = getattr(self._result_reader, "verify", None)
+        if not callable(artifact_verifier):
+            raise FactStoreError("The configured artifact reader cannot verify predecessor outputs")
+        for verified in predecessors:
+            if verified.decision.result_record_artifact is None:  # pragma: no cover - verified fact
+                raise FactStoreError("A predecessor has no StageResult record")
+            artifact_verifier(verified.result.output_artifact)
+            sealed_result = self._result_reader.read_result(verified.decision.result_record_artifact)
+            if sealed_result != verified.result:
+                raise FactStoreError("A sealed predecessor StageResult differs from its verified fact")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute("SELECT run_id FROM run_admission WHERE run_id = %s FOR UPDATE", (command.run_id,))
             if cursor.fetchone() is None:
                 raise FactStoreError(f"The run {command.run_id!r} is not admitted")
+            stored_admission = self._load_admission_cursor(cursor, command.run_id)
+            if stored_admission != admission:
+                raise FactConflict("The supplied admission differs from the registered admission")
+            for verified in predecessors:
+                self._verify_registered_predecessor_cursor(cursor, verified)
+            if discover_result is not None:
+                for artifact in (
+                    discover_result.source_set_artifact,
+                    discover_result.ruleset_artifact,
+                    discover_result.configuration_artifact,
+                ):
+                    if self._artifact_cursor(cursor, artifact.artifact_id) != artifact:
+                        raise FactConflict("A Discover result artifact differs from its registered fact")
             existing = self._load_command_cursor(cursor, command.command_id)
             if existing is not None:
                 if existing != command:
                     raise FactConflict(f"The command {command.command_id!r} is already bound differently")
                 return existing
-            cursor.execute(
-                "SELECT run_id, stage, outcome FROM stage_decision WHERE decision_id = %s",
-                (command.predecessor_decision_id,),
-            )
-            predecessor = cursor.fetchone()
-            if predecessor is None or predecessor[0] != command.run_id or predecessor[2] != "completed":
-                raise FactStoreError("The command predecessor is not a completed decision of this run")
-            expected_stage = STAGES[STAGES.index(command.stage) - 1]
-            if predecessor[1] != expected_stage:
-                raise FactStoreError("The command predecessor is not the immediately preceding stage")
-            admission = self._load_admission_cursor(cursor, command.run_id)
-            if admission is None:  # pragma: no cover - checked under the same lock
-                raise FactStoreError("The admitted run disappeared")
-            self._insert_command_cursor(cursor, command, admission=admission)
+            self._insert_command_cursor(cursor, command)
             return command
+
+    def _verify_registered_predecessor_cursor(self, cursor, predecessor: VerifiedPredecessor) -> None:
+        stored_command = self._load_command_cursor(cursor, predecessor.command.command_id)
+        if stored_command != predecessor.command:
+            raise FactConflict("A predecessor command differs from its registered command")
+        decision_row = self._decision_row(
+            cursor,
+            run_id=predecessor.command.run_id,
+            stage=predecessor.stage,
+        )
+        if decision_row is None:
+            raise FactStoreError("A predecessor is not a completed decision of this run")
+        stored_decision = self._decision_from_row(cursor, decision_row)
+        if stored_decision != predecessor.decision:
+            raise FactConflict("A predecessor decision differs from its verified fact")
+        if predecessor.decision.result_record_artifact is None:  # pragma: no cover - verified fact
+            raise FactStoreError("A predecessor has no StageResult record")
+        if (
+            self._artifact_cursor(cursor, predecessor.result.output_artifact.artifact_id)
+            != predecessor.result.output_artifact
+            or self._artifact_cursor(cursor, predecessor.decision.result_record_artifact.artifact_id)
+            != predecessor.decision.result_record_artifact
+        ):
+            raise FactConflict("Predecessor artifacts differ from their verified facts")
 
     def _decision_row(self, cursor, *, run_id: str, stage: str):
         cursor.execute(
@@ -871,50 +1093,58 @@ class FactStore:
     ) -> EffectIntent:
         if intent.command_id != claim.command_id:
             raise FactConflict("The effect intent names another command than the claim")
-        if outbound_artifact.artifact_id != intent.outbound_artifact_id:
-            raise FactStoreError("The outbound artifact does not match the effect intent")
         with self._transaction() as connection:
             cursor = connection.cursor()
             self._verify_open_claim_cursor(cursor, claim)
-            self._insert_artifact(cursor, outbound_artifact)
+            return self._insert_effect_intent_cursor(cursor, intent, outbound_artifact)
+
+    def _insert_effect_intent_cursor(
+        self,
+        cursor,
+        intent: EffectIntent,
+        outbound_artifact: ArtifactRef,
+    ) -> EffectIntent:
+        if outbound_artifact.artifact_id != intent.outbound_artifact_id:
+            raise FactStoreError("The outbound artifact does not match the effect intent")
+        self._insert_artifact(cursor, outbound_artifact)
+        cursor.execute(
+            """
+            INSERT INTO effect_intent (
+                effect_id, command_id, effect_key, effect_kind, target, expected_state,
+                expected_state_digest, outbound_artifact_id, outbound_digest, created_at
+            ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING effect_id
+            """,
+            (
+                intent.effect_id,
+                intent.command_id,
+                intent.effect_key,
+                intent.effect_kind,
+                _json(intent.target),
+                _json(intent.expected_state),
+                intent.expected_state_digest,
+                intent.outbound_artifact_id,
+                intent.outbound_digest,
+                intent.created_at,
+            ),
+        )
+        if cursor.fetchone() is None:
             cursor.execute(
                 """
-                INSERT INTO effect_intent (
-                    effect_id, command_id, effect_key, effect_kind, target, expected_state,
-                    expected_state_digest, outbound_artifact_id, outbound_digest, created_at
-                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-                RETURNING effect_id
+                SELECT effect_id FROM effect_intent
+                WHERE effect_id = %s OR (command_id = %s AND effect_key = %s)
                 """,
-                (
-                    intent.effect_id,
-                    intent.command_id,
-                    intent.effect_key,
-                    intent.effect_kind,
-                    _json(intent.target),
-                    _json(intent.expected_state),
-                    intent.expected_state_digest,
-                    intent.outbound_artifact_id,
-                    intent.outbound_digest,
-                    intent.created_at,
-                ),
+                (intent.effect_id, intent.command_id, intent.effect_key),
             )
-            if cursor.fetchone() is None:
-                cursor.execute(
-                    """
-                    SELECT effect_id FROM effect_intent
-                    WHERE effect_id = %s OR (command_id = %s AND effect_key = %s)
-                    """,
-                    (intent.effect_id, intent.command_id, intent.effect_key),
-                )
-                existing = cursor.fetchone()
-                if existing is None:
-                    raise FactStoreError("The effect intent conflicted without an existing row")
-                stored_intent, _ = self._effect_cursor(cursor, existing[0])
-                if stored_intent.identity_digest != intent.identity_digest:
-                    raise FactConflict("The command/effect key is bound to a different effect intent")
-                return stored_intent
-            return intent
+            existing = cursor.fetchone()
+            if existing is None:
+                raise FactStoreError("The effect intent conflicted without an existing row")
+            stored_intent, _ = self._effect_cursor(cursor, existing[0])
+            if stored_intent.identity_digest != intent.identity_digest:
+                raise FactConflict("The command/effect key is bound to a different effect intent")
+            return stored_intent
+        return intent
 
     def _verify_open_claim_cursor(self, cursor, claim: ExecutionClaim) -> None:
         cursor.execute(
@@ -937,6 +1167,30 @@ class FactStore:
             raise FactConflict("The execution claim identity is stale or foreign")
         if row[4] is not None:
             raise FactConflict("The execution claim is already closed")
+
+    def close_open_claim(
+        self,
+        command_id: str,
+        *,
+        closure_code: str,
+        closed_at: datetime,
+    ) -> None:
+        if closure_code not in {"completed", "definite_failure"}:
+            raise FactStoreError("A technical command closes only as completed or definite_failure")
+        if not isinstance(closed_at, datetime) or closed_at.tzinfo is None:
+            raise FactStoreError("Claim closure time must be timezone-aware")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE execution_claim
+                SET closed_at = %s, closure_code = %s, last_seen_at = %s
+                WHERE command_id = %s AND closed_at IS NULL
+                RETURNING claim_id
+                """,
+                (closed_at, closure_code, closed_at, command_id),
+            )
+            cursor.fetchall()
 
     def append_effect_fact(
         self,

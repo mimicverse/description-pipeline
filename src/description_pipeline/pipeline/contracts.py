@@ -364,6 +364,163 @@ class StageCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class DispatchConf:
+    """The non-secret Airflow conf, containing references only."""
+
+    schema_version: str
+    run_id: str
+    freeze_command_id: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "description-pipeline.airflow-dispatch-conf/v1":
+            raise ProtocolError("dispatch_conf.schema_unsupported", {"value": self.schema_version})
+        _require_identifier(self.run_id, "dispatch_conf.invalid", "run_id")
+        _require_identifier(self.freeze_command_id, "dispatch_conf.invalid", "freeze_command_id")
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "freeze_command_id": self.freeze_command_id,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> DispatchConf:
+        if not isinstance(record, Mapping):
+            raise ProtocolError("dispatch_conf.invalid", {"reason": "not-an-object"})
+        expected = {"schema_version", "run_id", "freeze_command_id"}
+        if set(record) != expected:
+            raise ProtocolError(
+                "dispatch_conf.invalid",
+                {"missing": sorted(expected - set(record)), "unknown": sorted(set(record) - expected)},
+            )
+        return cls(**dict(record))
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchCommand:
+    """One immutable technical Airflow dispatch bound to a run and Freeze command."""
+
+    schema_version: str
+    command_id: str
+    run_id: str
+    freeze_command_id: str
+    idempotency_key: str
+    dag_id: str
+    dag_run_id: str
+    conf_artifact: ArtifactRef
+    request_digest: str
+    expected_executor_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "description-pipeline.dispatch-command/v1":
+            raise ProtocolError("dispatch.schema_unsupported", {"value": self.schema_version})
+        _require_identifier(self.command_id, "dispatch.invalid", "command_id")
+        _require_identifier(self.run_id, "dispatch.invalid", "run_id")
+        _require_identifier(self.freeze_command_id, "dispatch.invalid", "freeze_command_id")
+        _require_text(self.idempotency_key, "dispatch.invalid", "idempotency_key")
+        _require_identifier(self.dag_id, "dispatch.invalid", "dag_id")
+        _require_identifier(self.dag_run_id, "dispatch.invalid", "dag_run_id")
+        if not isinstance(self.conf_artifact, ArtifactRef):
+            raise ProtocolError("dispatch.invalid", {"where": "conf_artifact"})
+        if (
+            self.conf_artifact.kind != "airflow_dispatch_conf"
+            or self.conf_artifact.producer_run_id != self.run_id
+            or self.conf_artifact.producer_stage is not None
+            or self.conf_artifact.producer_tool_sha256 != self.expected_executor_sha256
+        ):
+            raise ProtocolError("dispatch.invalid", {"where": "conf_artifact", "reason": "binding"})
+        _require_digest(self.request_digest, "dispatch.invalid", "request_digest")
+        _require_digest(self.expected_executor_sha256, "dispatch.invalid", "expected_executor_sha256")
+        if digest(self.identity_record()) != self.request_digest:
+            raise ProtocolError("dispatch.digest_mismatch", {"command_id": self.command_id})
+
+    @property
+    def effect_key(self) -> str:
+        return "airflow_dispatch"
+
+    def identity_record(self) -> dict[str, Any]:
+        return {
+            "command_id": self.command_id,
+            "conf_artifact": self.conf_artifact.to_record(),
+            "dag_id": self.dag_id,
+            "dag_run_id": self.dag_run_id,
+            "expected_executor_sha256": self.expected_executor_sha256,
+            "freeze_command_id": self.freeze_command_id,
+            "idempotency_key": self.idempotency_key,
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        command_id: str,
+        run_id: str,
+        freeze_command_id: str,
+        idempotency_key: str,
+        dag_id: str,
+        dag_run_id: str,
+        conf_artifact: ArtifactRef,
+        expected_executor_sha256: str,
+    ) -> DispatchCommand:
+        values = {
+            "schema_version": "description-pipeline.dispatch-command/v1",
+            "command_id": command_id,
+            "run_id": run_id,
+            "freeze_command_id": freeze_command_id,
+            "idempotency_key": idempotency_key,
+            "dag_id": dag_id,
+            "dag_run_id": dag_run_id,
+            "conf_artifact": conf_artifact,
+            "expected_executor_sha256": expected_executor_sha256,
+        }
+        identity = {
+            **values,
+            "conf_artifact": conf_artifact.to_record(),
+        }
+        return cls(request_digest=digest(identity), **values)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> DispatchCommand:
+        if not isinstance(record, Mapping):
+            raise ProtocolError("dispatch.invalid", {"reason": "not-an-object"})
+        expected = {
+            "command_id",
+            "conf_artifact",
+            "dag_id",
+            "dag_run_id",
+            "expected_executor_sha256",
+            "freeze_command_id",
+            "idempotency_key",
+            "request_digest",
+            "run_id",
+            "schema_version",
+        }
+        if set(record) != expected:
+            raise ProtocolError(
+                "dispatch.invalid",
+                {"missing": sorted(expected - set(record)), "unknown": sorted(set(record) - expected)},
+            )
+        return cls(
+            schema_version=record["schema_version"],
+            command_id=record["command_id"],
+            run_id=record["run_id"],
+            freeze_command_id=record["freeze_command_id"],
+            idempotency_key=record["idempotency_key"],
+            dag_id=record["dag_id"],
+            dag_run_id=record["dag_run_id"],
+            conf_artifact=ArtifactRef.from_record(record["conf_artifact"]),
+            request_digest=record["request_digest"],
+            expected_executor_sha256=record["expected_executor_sha256"],
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        return {**self.identity_record(), "request_digest": self.request_digest}
+
+
+@dataclass(frozen=True, slots=True)
 class StageResult:
     """One immutable business result for a stage command."""
 

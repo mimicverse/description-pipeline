@@ -187,6 +187,18 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIn("failure_envelope jsonb", decision)
         self.assertIn("failure_digest char(64)", decision)
 
+    def test_technical_dispatch_is_separate_from_stage_commands_and_unique_per_run(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        command = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".command', 1)[1]
+        command = command.split(");", 1)[0]
+        self.assertIn("kind IN ('stage', 'dispatch', 'cancel', 'reconcile')", command)
+        self.assertIn("CHECK (kind <> 'stage' OR stage IS NOT NULL)", command)
+        self.assertIn(
+            "CREATE UNIQUE INDEX IF NOT EXISTS command_dispatch_once",
+            text,
+        )
+        self.assertIn("WHERE kind = 'dispatch';", text)
+
     def test_immutable_facts_have_no_service_update_grant(self) -> None:
         text = (PLATFORM_DIR / "roles.sql").read_text(encoding="utf-8")
         immutable = re.search(

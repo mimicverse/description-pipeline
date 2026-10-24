@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import io
+import json
 import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -22,6 +24,8 @@ from description_pipeline.pipeline.application import (
     application_from_environment,
 )
 from description_pipeline.pipeline.capture import CaptureHandler
+from description_pipeline.pipeline.discover import DiscoverHandler
+from description_pipeline.pipeline.stages.publish import PublishHandler
 from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
     StageCandidate,
@@ -90,6 +94,7 @@ class _MemoryBackend:
         self.root = root
         self.admission = None
         self.commands: dict[str, StageCommand] = {}
+        self.dispatch_commands = {}
         self.decisions: dict[tuple[str, str], StageDecision] = {}
         self.results: dict[str, StageResult] = {}
         self.candidates: dict[str, StageCandidate] = {}
@@ -98,10 +103,20 @@ class _MemoryBackend:
     def load_admission(self, run_id: str):
         return self.admission if self.admission is not None and self.admission.run_id == run_id else None
 
-    def admit_run(self, admission, command: StageCommand):
+    def admit_run(self, admission, command: StageCommand, dispatch_command, dispatch_outbound_artifact):
         self.admission = admission
         self.commands[command.command_id] = command
-        return command
+        self.dispatch_commands[dispatch_command.command_id] = dispatch_command
+        if (
+            dispatch_command.conf_artifact != dispatch_outbound_artifact
+            or dispatch_command.freeze_command_id != command.command_id
+            or dispatch_command.run_id != command.run_id
+        ):
+            raise PipelineError("dispatch identity conflict")
+        conf = self.artifacts.read_dispatch_conf(dispatch_outbound_artifact)
+        if conf.run_id != command.run_id or conf.freeze_command_id != command.command_id:
+            raise PipelineError("dispatch conf identity conflict")
+        return command, dispatch_command, None
 
     def load_command(self, command_id: str):
         try:
@@ -109,13 +124,29 @@ class _MemoryBackend:
         except KeyError as error:
             raise PipelineError(f"unknown command: {command_id}") from error
 
-    def create_command(self, command: StageCommand):
-        if command.predecessor_decision_id is None:
+    def create_command(
+        self,
+        command: StageCommand,
+        *,
+        admission,
+        predecessor,
+        supporting_predecessors=(),
+        discover_result=None,
+    ):
+        if admission != self.admission or command.predecessor_decision_id is None:
             raise PipelineError("successor command has no predecessor")
-        expected = STAGES[STAGES.index(command.stage) - 1]
-        predecessor = self.decisions.get((command.run_id, expected))
-        if predecessor is None or predecessor.decision_id != command.predecessor_decision_id:
+        stored_predecessor = self.decisions.get((command.run_id, predecessor.stage))
+        if (
+            stored_predecessor is None
+            or stored_predecessor != predecessor.decision
+            or stored_predecessor.decision_id != command.predecessor_decision_id
+        ):
             raise PipelineError("successor predecessor is unavailable")
+        if any(
+            self.decisions.get((command.run_id, item.stage)) != item.decision
+            for item in supporting_predecessors
+        ):
+            raise PipelineError("supporting predecessor is unavailable")
         existing = self.commands.get(command.command_id)
         if existing is not None and existing != command:
             raise PipelineError("command identity conflict")
@@ -256,11 +287,22 @@ class StageApplicationTests(unittest.TestCase):
 
     def test_admit_then_run_stage_uses_one_admission_and_real_engine(self):
         admitted = self.application.admit(self.harness.spec)
+        self.assertEqual(admitted.dispatch_command.freeze_command_id, admitted.freeze_command.command_id)
+        self.assertEqual(admitted.dispatch_command.dag_id, "solidworks_to_urdf")
+        self.assertEqual(admitted.dispatch_command.dag_run_id, self.harness.spec.request_id)
+        self.assertEqual(
+            self.harness.store.read_dispatch_conf(admitted.dispatch_command.conf_artifact).freeze_command_id,
+            admitted.freeze_command.command_id,
+        )
+        self.assertEqual(
+            self.backend.dispatch_commands[admitted.dispatch_command.command_id],
+            admitted.dispatch_command,
+        )
         freeze = self.application.run_stage("run-1", "freeze")
         self.assertIsInstance(freeze, StageResult)
         self.assertEqual(freeze.outcome, "completed")
         self.assertEqual(self.freeze.executions, 1)
-        again = self.application.execute_registered_command(admitted.command_id)
+        again = self.application.execute_registered_command(admitted.freeze_command.command_id)
         self.assertEqual(again, freeze)
         self.assertEqual(self.freeze.executions, 1)
 
@@ -269,7 +311,7 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(discover.outcome, "completed")
         self.assertEqual(self.discover.executions, 1)
         self.assertEqual(set(self.backend.commands), {
-            admitted.command_id,
+            admitted.freeze_command.command_id,
             discover.command_id,
         })
 
@@ -300,19 +342,65 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(outcome.stage, "capture")
         self.assertEqual(capture.executions, 1)
 
+    def test_execute_run_routes_all_six_stages_through_the_same_admission(self):
+        handlers = {stage: _CompletingHandler() for stage in STAGES}
+        application = StageApplication(
+            services=self.backend,
+            facts=self.backend,
+            artifacts=self.harness.store,
+            handlers=handlers,
+            builders={},
+        )
+        application.admit(self.harness.spec)
+        outcome = application.execute_run("run-1")
+        self.assertEqual(outcome.outcome, "completed")
+        self.assertEqual(outcome.stage, "publish")
+        self.assertEqual(
+            {stage: handler.executions for stage, handler in handlers.items()},
+            dict.fromkeys(STAGES, 1),
+        )
+
     def test_replay_refuses_until_common_command_scope_is_available(self):
-        command = self.application.admit(self.harness.spec)
+        admitted = self.application.admit(self.harness.spec)
         with self.assertRaisesRegex(ApplicationError, "diagnostic qualification"):
-            self.application.replay(command.command_id)
+            self.application.replay(admitted.freeze_command.command_id)
+
+    def test_admit_rejects_repository_metadata_detached_from_sealed_bytes(self):
+        spec = self.harness.spec
+        detached_snapshot = replace(
+            spec.repository_snapshot,
+            snapshot=replace(spec.repository_snapshot.snapshot, base_oid="2" * 40),
+        )
+        with self.assertRaisesRegex(ApplicationError, "Repository snapshot metadata differs"):
+            self.application.admit(replace(spec, repository_snapshot=detached_snapshot))
 
     def test_cli_dispatches_to_the_same_application(self):
-        command = self.application.admit(self.harness.spec)
+        admitted = self.application.admit(self.harness.spec)
         with redirect_stdout(io.StringIO()):
             code = cli.main(
-                ["stage", command.command_id],
+                ["stage", admitted.freeze_command.command_id],
                 application_factory=lambda: self.application,
             )
         self.assertEqual(code, 0)
+
+    def test_cli_admit_reports_both_atomic_commands(self):
+        spec_path = self.root / "admission.json"
+        write_json(spec_path, self.harness.spec.to_record())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = cli.main(
+                ["admit", str(spec_path)],
+                application_factory=lambda: self.application,
+            )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["outcome"], "admitted")
+        self.assertIn("freeze_command", payload)
+        self.assertIn("dispatch_command", payload)
+        self.assertEqual(
+            payload["dispatch_command"]["freeze_command_id"],
+            payload["freeze_command"]["command_id"],
+        )
 
     def test_environment_composition_uses_the_portable_source_identity(self):
         executor = "a" * 64
@@ -328,7 +416,8 @@ class StageApplicationTests(unittest.TestCase):
             application = application_from_environment(environment)
         self.assertEqual(application.services.claim_policy.executor_sha256, executor)
         self.assertIsInstance(application.handlers["capture"], CaptureHandler)
-        self.assertNotIn("publish", application.handlers)
+        self.assertIsInstance(application.handlers["discover"], DiscoverHandler)
+        self.assertIsInstance(application.handlers["publish"], PublishHandler)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,13 @@ from typing import Any
 
 from ..interface_records import REQUEST_PURPOSES
 from ..io import PipelineError, artifact_path_parts, digest, parse_data
+from ..repository.publish import (
+    REPOSITORY_SNAPSHOT_FILE,
+    REPOSITORY_SNAPSHOT_KIND,
+    REPOSITORY_SNAPSHOT_METADATA,
+    PublicationError,
+    RepositorySnapshot,
+)
 from .contracts import (
     ArtifactRef,
     ProtocolError,
@@ -38,7 +45,9 @@ GENERATE_REQUEST_SCHEMA = "description-pipeline.generate-request/v1"
 GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
 VERIFY_REQUEST_SCHEMA = "description-pipeline.verify-request/v1"
 VERIFY_OUTPUT_CONTRACT = "solidworks-to-urdf.verification-artifact/v1"
-SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify")
+PUBLISH_REQUEST_SCHEMA = "description-pipeline.publish-request/v1"
+PUBLISH_OUTPUT_CONTRACT = "solidworks-to-urdf.publication-artifact/v1"
+SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _ADMISSION_FIELDS = frozenset(
     {
@@ -52,7 +61,9 @@ _ADMISSION_FIELDS = frozenset(
         "parent_run_id",
         "policy_sha256",
         "principal",
+        "publication_actor",
         "purpose",
+        "repository_snapshot",
         "request_id",
         "ruleset",
         "run_id",
@@ -298,6 +309,88 @@ class VerifiedRuleset:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicationActor:
+    """The fixed Git and pull-request author identity of one admitted run."""
+
+    name: str
+    email: str
+
+    def __post_init__(self) -> None:
+        for field in ("name", "email"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip() or "\x00" in value or "\n" in value:
+                raise ProtocolError("admission.invalid", {"where": f"publication_actor.{field}"})
+        if "@" not in self.email:
+            raise ProtocolError("admission.invalid", {"where": "publication_actor.email"})
+
+    def to_record(self) -> dict[str, str]:
+        return {"email": self.email, "name": self.name}
+
+    @classmethod
+    def from_record(cls, record: object) -> PublicationActor:
+        if not isinstance(record, Mapping) or set(record) != {"email", "name"}:
+            raise ProtocolError("admission.invalid", {"where": "publication_actor"})
+        return cls(name=record["name"], email=record["email"])
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedRepositorySnapshot:
+    """One sealed Git bundle whose metadata fixes the Publish baseline."""
+
+    artifact: VerifiedArtifact
+    snapshot: RepositorySnapshot
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.artifact, VerifiedArtifact)
+            or self.artifact.ref.kind != REPOSITORY_SNAPSHOT_KIND
+            or not isinstance(self.snapshot, RepositorySnapshot)
+        ):
+            raise ProtocolError("admission.invalid", {"where": "repository_snapshot"})
+        if set(self.artifact.inventory) != {
+            REPOSITORY_SNAPSHOT_FILE,
+            REPOSITORY_SNAPSHOT_METADATA,
+        } or self.artifact.inventory.get(REPOSITORY_SNAPSHOT_FILE) != self.snapshot.bundle_sha256:
+            raise ProtocolError("admission.invalid", {"where": "repository_snapshot.artifact"})
+
+    @classmethod
+    def from_metadata_bytes(
+        cls,
+        artifact: VerifiedArtifact,
+        metadata_bytes: bytes,
+    ) -> VerifiedRepositorySnapshot:
+        if not isinstance(metadata_bytes, bytes) or not metadata_bytes:
+            raise ProtocolError("admission.invalid", {"where": "repository_snapshot.metadata"})
+        expected = artifact.inventory.get(REPOSITORY_SNAPSHOT_METADATA)
+        if expected is None or hashlib.sha256(metadata_bytes).hexdigest() != expected:
+            raise ProtocolError(
+                "admission.invalid",
+                {"where": "repository_snapshot.metadata", "reason": "bytes-mismatch"},
+            )
+        try:
+            record = parse_data(metadata_bytes, Path(REPOSITORY_SNAPSHOT_METADATA))
+            snapshot = RepositorySnapshot.from_record(record)
+        except (PipelineError, PublicationError, TypeError, ValueError) as error:
+            raise ProtocolError("admission.invalid", {"where": "repository_snapshot.metadata"}) from error
+        return cls(artifact=artifact, snapshot=snapshot)
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "artifact": self.artifact.to_record(),
+            "snapshot": self.snapshot.to_record(),
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> VerifiedRepositorySnapshot:
+        if not isinstance(record, Mapping) or set(record) != {"artifact", "snapshot"}:
+            raise ProtocolError("admission.invalid", {"where": "repository_snapshot.record"})
+        return cls(
+            artifact=_verified_from_record(record["artifact"]),
+            snapshot=RepositorySnapshot.from_record(record["snapshot"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionSpec:
     """The one immutable administrative and input-closure fact for a run."""
 
@@ -314,6 +407,8 @@ class AdmissionSpec:
     originals: VerifiedArtifact
     ruleset: VerifiedRuleset
     configuration: VerifiedArtifact
+    repository_snapshot: VerifiedRepositorySnapshot
+    publication_actor: PublicationActor
     executors: StageExecutors
     native_tool_sha256: str
     contract_sha256: str
@@ -341,6 +436,10 @@ class AdmissionSpec:
             raise ProtocolError("admission.invalid", {"where": "ruleset"})
         if not isinstance(self.configuration, VerifiedArtifact) or self.configuration.ref.kind != CONFIGURATION_KIND:
             raise ProtocolError("admission.invalid", {"where": "configuration"})
+        if not isinstance(self.repository_snapshot, VerifiedRepositorySnapshot):
+            raise ProtocolError("admission.invalid", {"where": "repository_snapshot"})
+        if not isinstance(self.publication_actor, PublicationActor):
+            raise ProtocolError("admission.invalid", {"where": "publication_actor"})
         if self.main_assembly not in self.originals.inventory:
             raise ProtocolError(
                 "admission.invalid",
@@ -371,7 +470,9 @@ class AdmissionSpec:
             "parent_run_id": self.parent_run_id,
             "policy_sha256": self.policy_sha256,
             "principal": self.principal,
+            "publication_actor": self.publication_actor.to_record(),
             "purpose": self.purpose,
+            "repository_snapshot": self.repository_snapshot.to_record(),
             "request_id": self.request_id,
             "ruleset": self.ruleset.to_record(),
             "run_id": self.run_id,
@@ -384,11 +485,12 @@ class AdmissionSpec:
             **{
                 key: value
                 for key, value in self.identity_record().items()
-                if key not in {"configuration", "originals", "ruleset"}
+                if key not in {"configuration", "originals", "repository_snapshot", "ruleset"}
             },
             "originals": self.originals.to_record(),
             "ruleset": self.ruleset.to_record(),
             "configuration": self.configuration.to_record(),
+            "repository_snapshot": self.repository_snapshot.to_record(),
             "created_at": self.created_at.isoformat(),
             "admission_sha256": self.admission_sha256,
         }
@@ -400,6 +502,7 @@ class AdmissionSpec:
         originals = _verified_from_record(record["originals"])
         ruleset = VerifiedRuleset.from_record(record["ruleset"])
         configuration = _verified_from_record(record["configuration"])
+        repository_snapshot = VerifiedRepositorySnapshot.from_record(record["repository_snapshot"])
         value = cls(
             schema_version=record["schema_version"],
             run_id=record["run_id"],
@@ -414,6 +517,8 @@ class AdmissionSpec:
             originals=originals,
             ruleset=ruleset,
             configuration=configuration,
+            repository_snapshot=repository_snapshot,
+            publication_actor=PublicationActor.from_record(record["publication_actor"]),
             executors=StageExecutors.from_record(record["executors"]),
             native_tool_sha256=record["native_tool_sha256"],
             contract_sha256=record["contract_sha256"],
@@ -430,7 +535,7 @@ def _verified_from_record(record: object) -> VerifiedArtifact:
         raise ProtocolError("artifact.invalid", {"where": "verified_record"})
     ref = ArtifactRef.from_record(record["artifact"])
     raw_members = record["members"]
-    if not isinstance(raw_members, list):
+    if not isinstance(raw_members, (list, tuple)):
         raise ProtocolError("artifact.invalid", {"where": "members"})
     members = tuple(
         ArtifactMember(path=item.get("path"), bytes=item.get("bytes"), sha256=item.get("sha256"))
@@ -825,28 +930,71 @@ def build_verify_command(
     )
 
 
-def build_publish_command(spec: AdmissionSpec, verify: VerifiedPredecessor) -> StageCommand:
-    """Reserve the static boundary until the Publish handler schema is fixed."""
+def build_publish_command(
+    spec: AdmissionSpec,
+    verify: VerifiedPredecessor,
+    generate: VerifiedPredecessor,
+    capture: VerifiedPredecessor,
+) -> StageCommand:
+    """Project Publish from verified stage outputs and one sealed repository baseline."""
 
-    _require_predecessor(verify, stage="verify", run_id=spec.run_id)
-    raise ProtocolError(
-        "admission.publish_contract_pending",
-        {
-            "required": [
-                "verify_output_artifact",
-                "generated_output_artifact",
-                "repository",
-                "base_ref",
-                "head_ref",
-                "expected_base_oid",
-                "expected_head_oid",
-                "candidate_commit",
-                "candidate_tree",
-                "title_digest",
-                "body_digest",
-                "expected_pr",
-            ]
+    verify = _require_predecessor(verify, stage="verify", run_id=spec.run_id)
+    generate = _require_predecessor(generate, stage="generate", run_id=spec.run_id)
+    capture = _require_predecessor(capture, stage="capture", run_id=spec.run_id)
+    generate_artifact = generate.result.output_artifact
+    capture_artifact = capture.result.output_artifact
+    verify_artifact = verify.result.output_artifact
+    if (
+        verify.command.request.get("generate_artifact_id") != generate_artifact.artifact_id
+        or verify.command.request.get("capture_artifact_id") != capture_artifact.artifact_id
+        or generate.command.request.get("capture_artifact_id") != capture_artifact.artifact_id
+    ):
+        raise ProtocolError("admission.lineage_mismatch", {"stage": "publish"})
+    snapshot = spec.repository_snapshot.snapshot
+    subject = next(
+        (line.strip() for line in spec.change_summary.splitlines() if line.strip()),
+        "",
+    )
+    if not subject:
+        raise ProtocolError("admission.invalid", {"where": "change_summary"})
+    actor = spec.publication_actor.to_record()
+    created_at = spec.created_at.isoformat()
+    request = {
+        "base_ref": snapshot.base_ref,
+        "branch_ref": snapshot.branch_ref,
+        "capture_artifact_id": capture_artifact.artifact_id,
+        "commit": {
+            "author_email": actor["email"],
+            "author_name": actor["name"],
+            "authored_at": created_at,
+            "body": spec.change_summary,
+            "committed_at": created_at,
+            "committer_email": actor["email"],
+            "committer_name": actor["name"],
+            "subject": subject,
         },
+        "expected_base_oid": snapshot.base_oid,
+        "expected_head_oid": snapshot.head_oid,
+        "generate_artifact_id": generate_artifact.artifact_id,
+        "origin_url": snapshot.origin_url,
+        "output_contract": PUBLISH_OUTPUT_CONTRACT,
+        "repository_slug": snapshot.repository,
+        "repository_snapshot_artifact_id": spec.repository_snapshot.artifact.ref.artifact_id,
+        "schema_version": PUBLISH_REQUEST_SCHEMA,
+        "verified_subject_sha256": generate_artifact.set_sha256,
+        "verify_artifact_id": verify_artifact.artifact_id,
+    }
+    return _base_command(
+        spec,
+        stage="publish",
+        request=request,
+        input_artifacts=(
+            generate_artifact,
+            capture_artifact,
+            verify_artifact,
+            spec.repository_snapshot.artifact.ref,
+        ),
+        predecessor_decision_id=verify.decision.decision_id,
     )
 
 
@@ -932,6 +1080,16 @@ def validate_verify_command(
     return _validate(build_verify_command(spec, generate, capture), command)
 
 
+def validate_publish_command(
+    spec: AdmissionSpec,
+    verify: VerifiedPredecessor,
+    generate: VerifiedPredecessor,
+    capture: VerifiedPredecessor,
+    command: StageCommand,
+) -> StageCommand:
+    return _validate(build_publish_command(spec, verify, generate, capture), command)
+
+
 def validate_stage_command(
     spec: AdmissionSpec,
     command: StageCommand,
@@ -968,6 +1126,16 @@ def validate_stage_command(
         if predecessor is None or len(supporting_predecessors) != 1 or discover_result is not None:
             raise ProtocolError("admission.predecessor_required", {"stage": "verify"})
         return validate_verify_command(spec, predecessor, supporting_predecessors[0], command)
+    if command.stage == "publish":
+        if predecessor is None or len(supporting_predecessors) != 2 or discover_result is not None:
+            raise ProtocolError("admission.predecessor_required", {"stage": "publish"})
+        return validate_publish_command(
+            spec,
+            predecessor,
+            supporting_predecessors[0],
+            supporting_predecessors[1],
+            command,
+        )
     raise ProtocolError("admission.stage_not_supported", {"stage": command.stage})
 
 
@@ -998,15 +1166,19 @@ __all__ = [
     "GENERATE_ARTIFACT_KIND",
     "GENERATE_OUTPUT_CONTRACT",
     "GENERATE_REQUEST_SCHEMA",
+    "PUBLISH_OUTPUT_CONTRACT",
+    "PUBLISH_REQUEST_SCHEMA",
     "SUPPORTED_PROJECTION_STAGES",
     "VERIFY_OUTPUT_CONTRACT",
     "VERIFY_REQUEST_SCHEMA",
     "AdmissionSpec",
     "ArtifactMember",
+    "PublicationActor",
     "StageExecutors",
     "VerifiedArtifact",
     "VerifiedDiscoverResult",
     "VerifiedPredecessor",
+    "VerifiedRepositorySnapshot",
     "VerifiedRuleset",
     "build_capture_command",
     "build_discover_command",
@@ -1019,6 +1191,7 @@ __all__ = [
     "validate_discover_command",
     "validate_freeze_command",
     "validate_generate_command",
+    "validate_publish_command",
     "validate_run_admission",
     "validate_stage_command",
     "validate_store_command",

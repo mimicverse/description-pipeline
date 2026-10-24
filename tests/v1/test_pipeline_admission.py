@@ -10,10 +10,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.io import digest, write_json
+from description_pipeline.io import digest, file_digest, write_json
 from description_pipeline.pipeline import (
     AdmissionSpec,
     ArtifactRef,
+    PublicationActor,
     StageCommand,
     StageDecision,
     StageResult,
@@ -21,6 +22,7 @@ from description_pipeline.pipeline import (
     VerifiedArtifact,
     VerifiedDiscoverResult,
     VerifiedPredecessor,
+    VerifiedRepositorySnapshot,
     VerifiedRuleset,
     build_capture_command,
     build_discover_command,
@@ -47,6 +49,7 @@ from description_pipeline.pipeline.discover import (
     SOURCE_SET_KIND,
 )
 from description_pipeline.pipeline.freeze import FREEZE_REQUEST_SCHEMA, RULESET_CATALOG_SCHEMA
+from description_pipeline.repository.publish import REPOSITORY_SNAPSHOT_KIND
 
 
 def _plain(value):
@@ -89,9 +92,35 @@ class AdmissionHarness:
             root / "configuration",
             {"config.json": b'{"snapshot":"config-1"}\n'},
         )
+        snapshot_root = root / "repository-snapshot"
+        snapshot_root.mkdir()
+        (snapshot_root / "repository.bundle").write_bytes(b"sealed git bundle\n")
+        write_json(
+            snapshot_root / "snapshot.json",
+            {
+                "schema_version": "description-pipeline.repository-snapshot/v1",
+                "repository": "example/robot",
+                "origin_url": "https://example.test/example/robot.git",
+                "base_ref": "main",
+                "base_oid": "1" * 40,
+                "branch_ref": "work/solidworks/m3.0/engineering",
+                "head_oid": None,
+                "bundle_sha256": file_digest(snapshot_root / "repository.bundle"),
+            },
+        )
+        self.repository_snapshot_ref = self._seal_source(
+            REPOSITORY_SNAPSHOT_KIND,
+            snapshot_root,
+            {},
+        )
         self.originals = self._verified(self.originals_ref)
         self.ruleset = self._verified(self.ruleset_ref)
         self.configuration = self._verified(self.configuration_ref)
+        snapshot_artifact = self._verified(self.repository_snapshot_ref)
+        self.repository_snapshot = VerifiedRepositorySnapshot.from_metadata_bytes(
+            snapshot_artifact,
+            (snapshot_root / "snapshot.json").read_bytes(),
+        )
         self.verified_ruleset = VerifiedRuleset.from_catalog_bytes(
             self.ruleset,
             (root / "rules/catalog.json").read_bytes(),
@@ -110,6 +139,11 @@ class AdmissionHarness:
             originals=self.originals,
             ruleset=self.verified_ruleset,
             configuration=self.configuration,
+            repository_snapshot=self.repository_snapshot,
+            publication_actor=PublicationActor(
+                name="Description Pipeline",
+                email="description-pipeline@example.test",
+            ),
             executors=StageExecutors(
                 freeze=digest({"executor": "freeze"}),
                 discover=digest({"executor": "discover"}),
@@ -169,7 +203,7 @@ class AdmissionHarness:
             run_id=command.run_id if run_id is None else run_id,
             stage=command.stage if stage is None else stage,
             idempotency_key=command.idempotency_key,
-            request=_request(command) if request is None else request,
+            request=_request(command) if request is None else _plain(request),
             input_artifacts=command.input_artifacts if input_artifacts is None else input_artifacts,
             config_snapshot_sha256=(
                 command.config_snapshot_sha256 if config_snapshot_sha256 is None else config_snapshot_sha256
@@ -605,7 +639,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             validate_capture_command(self.harness.spec, freeze, discover, discover_result, forged)
         self.assertIn("request.prepared_sha256", raised.exception.detail["fields"])
 
-    def test_publish_boundary_is_explicitly_pending(self) -> None:
+    def test_publish_projects_from_the_single_admission_and_verified_lineage(self) -> None:
         freeze = self.harness.freeze_result(self.command)
         discover_command = build_discover_command(self.harness.spec, freeze)
         discover_payload = {
@@ -633,14 +667,53 @@ class AdmissionProjectionTests(unittest.TestCase):
         capture = self.harness.predecessor("capture", capture_command, {"stage": "capture"})
         generate_command = build_generate_command(self.harness.spec, capture)
         generate = self.harness.predecessor("generate", generate_command, {"stage": "generate"})
-        verify = self.harness.predecessor(
-            "verify",
-            build_verify_command(self.harness.spec, generate, capture),
-            {"stage": "verify"},
+        verify_command = build_verify_command(self.harness.spec, generate, capture)
+        verify = self.harness.predecessor("verify", verify_command, {"stage": "verify"})
+        publish = build_publish_command(self.harness.spec, verify, generate, capture)
+        self.assertEqual(publish.stage, "publish")
+        self.assertEqual(publish.predecessor_decision_id, verify.decision.decision_id)
+        self.assertEqual(
+            publish.input_artifacts,
+            (
+                generate.result.output_artifact,
+                capture.result.output_artifact,
+                verify.result.output_artifact,
+                self.harness.repository_snapshot_ref,
+            ),
         )
-        with self.assertRaises(ProtocolError) as raised:
-            build_publish_command(self.harness.spec, verify)
-        self.assertEqual(raised.exception.code, "admission.publish_contract_pending")
+        self.assertEqual(publish.request["generate_artifact_id"], generate.result.output_artifact.artifact_id)
+        self.assertEqual(publish.request["capture_artifact_id"], capture.result.output_artifact.artifact_id)
+        self.assertEqual(publish.request["verify_artifact_id"], verify.result.output_artifact.artifact_id)
+        self.assertEqual(
+            publish.request["repository_snapshot_artifact_id"],
+            self.harness.repository_snapshot_ref.artifact_id,
+        )
+        self.assertEqual(
+            publish.request["verified_subject_sha256"],
+            generate.result.output_artifact.set_sha256,
+        )
+        self.assertEqual(
+            publish.request["commit"],
+            {
+                "author_email": "description-pipeline@example.test",
+                "author_name": "Description Pipeline",
+                "authored_at": "2026-10-25T09:30:00+00:00",
+                "body": "Admitted revision",
+                "committed_at": "2026-10-25T09:30:00+00:00",
+                "committer_email": "description-pipeline@example.test",
+                "committer_name": "Description Pipeline",
+                "subject": "Admitted revision",
+            },
+        )
+        self.assertEqual(
+            validate_stage_command(
+                self.harness.spec,
+                publish,
+                predecessor=verify,
+                supporting_predecessors=(generate, capture),
+            ),
+            publish,
+        )
 
     def test_invalid_predecessor_fact_cannot_project_discover(self) -> None:
         predecessor = self.harness.freeze_result(self.command)
@@ -666,7 +739,7 @@ class AdmissionProjectionTests(unittest.TestCase):
                 decision=wrong,
             )
 
-    def test_unsupported_stage_is_explicit(self) -> None:
+    def test_publish_without_verified_predecessors_is_rejected(self) -> None:
         publish = StageCommand.create(
             command_id="publish-command",
             run_id="run-1",
@@ -682,7 +755,7 @@ class AdmissionProjectionTests(unittest.TestCase):
         )
         with self.assertRaises(ProtocolError) as raised:
             validate_stage_command(self.harness.spec, publish)
-        self.assertEqual(raised.exception.code, "admission.stage_not_supported")
+        self.assertEqual(raised.exception.code, "admission.predecessor_required")
 
 
 if __name__ == "__main__":

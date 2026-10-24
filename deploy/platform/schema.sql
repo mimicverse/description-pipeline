@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".artifact (
 CREATE TABLE IF NOT EXISTS :"platform_schema".command (
     command_id text PRIMARY KEY,
     run_id text NOT NULL REFERENCES :"platform_schema".run_admission (run_id),
-    kind text NOT NULL CHECK (kind IN ('stage', 'cancel', 'reconcile')),
+    kind text NOT NULL CHECK (kind IN ('stage', 'dispatch', 'cancel', 'reconcile')),
     stage text CHECK (
         stage IS NULL
         OR stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'publish')
@@ -161,6 +161,10 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".command (
 CREATE UNIQUE INDEX IF NOT EXISTS command_stage_once
     ON :"platform_schema".command (run_id, stage)
     WHERE kind = 'stage';
+
+CREATE UNIQUE INDEX IF NOT EXISTS command_dispatch_once
+    ON :"platform_schema".command (run_id)
+    WHERE kind = 'dispatch';
 
 CREATE TABLE IF NOT EXISTS :"platform_schema".command_input_artifact (
     command_id text NOT NULL REFERENCES :"platform_schema".command (command_id),

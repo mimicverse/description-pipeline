@@ -11,7 +11,7 @@ from pathlib import Path
 from . import __version__
 from .io import PipelineError, pin_utf8_streams, read_data
 from .pipeline.admission import AdmissionSpec
-from .pipeline.application import ApplicationOutcome, STAGES, StageApplication
+from .pipeline.application import AdmissionOutcome, ApplicationOutcome, STAGES, StageApplication
 from .pipeline.contracts import FailureEnvelope, StageResult
 from .runtime import tool_record
 
@@ -28,6 +28,8 @@ def parser() -> argparse.ArgumentParser:
 
     admit = operations.add_parser("admit", help="admit one immutable AdmissionSpec")
     admit.add_argument("spec", type=Path)
+    admit.add_argument("--dispatch-dag-id", default="solidworks_to_urdf")
+    admit.add_argument("--dispatch-dag-run-id")
 
     stage = operations.add_parser("stage", help="execute one already-registered stage command")
     stage.add_argument("command_id")
@@ -66,8 +68,16 @@ def main(
             application = (application_factory or _default_application)()
             if arguments.operation == "admit":
                 spec = AdmissionSpec.from_record(read_data(arguments.spec))
-                command = application.admit(spec)
-                result = {"passed": True, "outcome": "admitted", "command": command.to_record()}
+                admitted = application.admit(
+                    spec,
+                    dispatch_dag_id=arguments.dispatch_dag_id,
+                    dispatch_dag_run_id=arguments.dispatch_dag_run_id,
+                )
+                result = {
+                    "passed": True,
+                    "outcome": "admitted",
+                    **(admitted.to_record() if isinstance(admitted, AdmissionOutcome) else {}),
+                }
             elif arguments.operation == "stage":
                 result = _record(application.execute_registered_command(arguments.command_id))
             else:

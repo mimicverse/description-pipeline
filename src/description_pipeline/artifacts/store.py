@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 from ..io import PipelineError, canonical, digest, file_digest, read_data
-from ..pipeline.contracts import ArtifactRef, StageId, StageResult
+from ..pipeline.contracts import ArtifactRef, DispatchConf, StageId, StageResult
 
 MANIFEST_NAME = "manifest.json"
 MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
@@ -270,3 +270,37 @@ class ArtifactStore:
         ):
             raise ArtifactStoreError("The StageResult record differs from its artifact producer")
         return result
+
+    def seal_dispatch_conf(
+        self,
+        conf: DispatchConf,
+        *,
+        producer_run_id: str,
+        producer_tool_sha256: str,
+    ) -> ArtifactRef:
+        if not isinstance(conf, DispatchConf) or conf.run_id != producer_run_id:
+            raise ArtifactStoreError("The dispatch conf differs from its producer run")
+        with tempfile.TemporaryDirectory(prefix="airflow-dispatch-conf-") as directory:
+            root = Path(directory)
+            (root / "conf.json").write_bytes(canonical(conf.to_record()) + b"\n")
+            _fsync_path(root / "conf.json")
+            _fsync_dir(root)
+            return self.seal_tree(
+                root,
+                kind="airflow_dispatch_conf",
+                producer_run_id=producer_run_id,
+                producer_stage=None,
+                producer_tool_sha256=producer_tool_sha256,
+            )
+
+    def read_dispatch_conf(self, artifact: ArtifactRef) -> DispatchConf:
+        if artifact.kind != "airflow_dispatch_conf" or artifact.producer_stage is not None:
+            raise ArtifactStoreError("The requested artifact is not an Airflow dispatch conf")
+        record = self.verify(artifact)
+        members = record["members"]
+        if not isinstance(members, list) or len(members) != 1 or members[0].get("path") != "conf.json":
+            raise ArtifactStoreError("The Airflow dispatch conf has an unexpected member set")
+        conf = DispatchConf.from_record(read_data(self.objects / artifact.artifact_id / "conf.json"))
+        if conf.run_id != artifact.producer_run_id:
+            raise ArtifactStoreError("The Airflow dispatch conf differs from its producer")
+        return conf
