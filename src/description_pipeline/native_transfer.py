@@ -31,7 +31,6 @@ from .io import (
 from .request_evidence import read_request_evidence
 from .runtime import RUNTIME_VERSIONS, required_packages
 from .schemas import TOOL_SCHEMA, NATIVE_DISCOVERY_SCHEMA
-from .pipeline.contracts import ArtifactRef
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.handoff import MAX_HANDOFF_BYTES, MAX_HANDOFF_FILES
 from .sources.solidworks.revision import package_inventory
@@ -99,6 +98,8 @@ def _is_sha256(value) -> bool:
 
 def _capture_upstream(value) -> list[dict]:
     """Validate the exact Freeze/Discover producer references of one Capture."""
+
+    from .pipeline.contracts import ArtifactRef
 
     _require(
         isinstance(value, (list, tuple)) and len(value) == 2,
