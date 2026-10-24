@@ -297,21 +297,16 @@ class NativeCurveDomainTests(unittest.TestCase):
                     row["u_min"],
                 ) or native_u_equal(evidence["u"], row["u_max"]):
                     affected_vertices.add(vertex_id)
-                    evidence["closest_point_on_raw"][:3] = common_point
-                    evidence["evaluate_payload"][:3] = common_point
-                    evidence["source_point_m"] = list(common_point)
-                    evidence["projection_error_m"] = 0.0
-                    evidence["source_evaluate_error_m"] = 0.0
-                    evidence["point_tolerance_m"] = (
-                        native_curve_endpoint_operation_tolerance(
+                    u_value = evidence["u"]
+                    evidence.clear()
+                    evidence.update(
+                        support._u_evidence(
+                            u_value,
                             common_point,
-                            common_point,
-                            common_point,
+                            projected_point_m=common_point,
+                            evaluated_point_m=common_point,
                         )
                     )
-                    evidence["closest_point_error_m"] = 0.0
-                    evidence["evaluate_point_error_m"] = 0.0
-                    evidence["closest_evaluate_error_m"] = 0.0
         for vertex in tessellation["itessellation"]["vertices"]:
             if vertex["vertex_id"] in affected_vertices:
                 vertex["point_m"] = list(common_point)

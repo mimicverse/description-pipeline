@@ -696,28 +696,6 @@ class ComponentMeshExportTests(unittest.TestCase):
         )
         face_list_patch.start()
         self.addCleanup(face_list_patch.stop)
-        production_read_edge_tolerance = native_module._read_edge_tolerance
-
-        class EdgeToleranceVariant:
-            def __init__(self, varianttype, value):
-                self.varianttype = varianttype
-                self.value = value
-
-        def read_edge_tolerance(edge):
-            return production_read_edge_tolerance(
-                edge,
-                variant_factory=EdgeToleranceVariant,
-                vt_byref=0x4000,
-                vt_r8=5,
-            )
-
-        tolerance_patch = patch.object(
-            native_module,
-            "_read_edge_tolerance",
-            side_effect=read_edge_tolerance,
-        )
-        tolerance_patch.start()
-        self.addCleanup(tolerance_patch.stop)
 
     def test_sheet_only_part_exports_its_faces(self):
         body = FakeBody([FakeFace(TRIANGLE)])

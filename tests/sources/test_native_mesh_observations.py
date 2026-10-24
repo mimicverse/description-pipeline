@@ -7,6 +7,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from . import _paths  # noqa: F401
 from . import support
@@ -231,6 +232,20 @@ class NativeMeshObservationTests(unittest.TestCase):
         self.assertEqual(warning["code"], "cad_sheet_face_untessellated")
         self.assertFalse(warning["tessellate_result"])
         self.assertIn("unqualified", warning["qualification"])
+
+    def test_source_scope_rejection_is_not_swallowed_by_mesh_consumer(self):
+        with (
+            patch(
+                "description_pipeline.verification.native_mesh_observations."
+                "evidence.source_scopes",
+                side_effect=PipelineError("source scope evidence mismatch"),
+            ),
+            self.assertRaisesRegex(
+                PipelineError,
+                "source scope evidence mismatch",
+            ),
+        ):
+            self.verify()
 
     def test_collapsed_fin_warning_is_separate_from_untessellated_area(self):
         from .test_solidworks_native_fin_capture import NativeFinCaptureTests  # noqa: PLC0415
@@ -1586,7 +1601,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
 
     def test_curved_native_edge_rejects_same_u_direction(self):
         tessellation, triangles = self.fixture()
-        edge, external_fins = self.edge_fins(tessellation)
+        _edge, external_fins = self.edge_fins(tessellation)
         by_id = {
             fin["fin_id"]: fin
             for fin in tessellation["itessellation"]["bodies"][0]["fins"]
@@ -1609,10 +1624,6 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                     support._u_evidence(
                         fin[f"{endpoint}_u"],
                         point,
-                        domain_lower=edge["u_min"],
-                        domain_upper=edge["u_max"],
-                        curve_start=edge["curve_start_point_m"],
-                        curve_end=edge["curve_end_point_m"],
                     )
                 )
         for index in (3, 4, 5):

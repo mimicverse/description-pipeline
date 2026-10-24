@@ -33,13 +33,14 @@ from ...geometry.native_u import (
     NATIVE_PART_WITNESS_DERIVED,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_PERSISTENT_IDENTITY_RULE,
-    NATIVE_OPEN_EDGE_SCOPE_RULE,
+    NATIVE_SOURCE_SCOPE_RULE,
     NATIVE_SCOPE_IDENTITY_RULE,
     NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
     NATIVE_SCOPE_MAPPING_METHOD,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
     NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
     NATIVE_TOPOLOGY_IDENTITY_DERIVED,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
@@ -50,15 +51,10 @@ from ...geometry.native_u import (
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
     native_fin_interval,
-    native_open_edge_boundary_identity,
-    native_open_edge_scope_binding,
-    native_point_euclidean_error,
     native_point_error,
     native_point_roundtrip_tolerance,
+    native_point_within_max_coordinate_bound,
     native_scope_identity_sha256,
-    native_tolerant_edge_boundary,
-    native_tolerant_edge_evidence,
-    native_tolerant_edge_gap,
     native_u_equal,
     native_u_in_closed_interval,
     native_u_intervals_cover,
@@ -1071,73 +1067,6 @@ def _read_curve_end_params(
         }
     )
     return evidence
-
-
-def _read_edge_tolerance(
-    edge,
-    *,
-    variant_factory=None,
-    vt_byref=None,
-    vt_r8=None,
-):
-    """Read IEdge.IsTolerant and its sole by-ref tolerance output."""
-
-    record = {
-        "api": "IEdge.IsTolerant(out VARIANT VT_BYREF|VT_R8)",
-        "call_form": "one_argument_out_variant_r8",
-        "argument_count": 1,
-        "state": "error",
-        "error": None,
-        "return_value": None,
-        "return_type": None,
-        "out_variant_type": None,
-        "gap_m": None,
-        "gap_type": None,
-        "gap_bits_u64": None,
-    }
-    try:
-        if variant_factory is None or vt_byref is None or vt_r8 is None:
-            import pythoncom
-
-            variant_factory = _win32().VARIANT
-            vt_byref = pythoncom.VT_BYREF if vt_byref is None else vt_byref
-            vt_r8 = pythoncom.VT_R8 if vt_r8 is None else vt_r8
-        variant_type = vt_byref | vt_r8
-        tolerance = variant_factory(variant_type, math.nan)
-        is_tolerant = _method(edge, "IsTolerant", tolerance)
-        if type(is_tolerant) is not bool:
-            raise ValueError("IEdge.IsTolerant must return a strict boolean")
-        if (
-            variant_type != 0x4005
-            or getattr(tolerance, "varianttype", None) != 0x4005
-        ):
-            raise ValueError(
-                "IEdge.IsTolerant tolerance output must be VT_BYREF|VT_R8"
-            )
-        value = getattr(tolerance, "value", None)
-        if type(value) is not float or not math.isfinite(value):
-            raise ValueError(
-                "IEdge.IsTolerant tolerance output must be a finite float"
-            )
-        gap_m = native_tolerant_edge_gap(value)
-    except Exception as error:  # noqa: BLE001 - record exact tolerant-edge availability
-        record["error"] = f"{type(error).__name__}: {error}"[:300]
-        return record
-    record.update(
-        {
-            "state": "success",
-            "return_value": is_tolerant,
-            "return_type": type(is_tolerant).__name__,
-            "out_variant_type": tolerance.varianttype,
-            "gap_m": gap_m,
-            "gap_type": type(value).__name__,
-            "gap_bits_u64": struct.unpack(
-                "<Q",
-                struct.pack("<d", gap_m),
-            )[0],
-        }
-    )
-    return record
 
 
 def _active_configuration(doc):
@@ -6811,17 +6740,11 @@ class SolidWorksBackend(CadBackend):
                 audit=False,
                 edge_index=edge_index,
             )
-            tolerance = call(
-                "IEdge.IsTolerant(VARIANT(VT_BYREF|VT_R8))",
-                lambda edge=edge: _read_edge_tolerance(edge),
-                edge_index=edge_index,
-            )
             edge_rows.append(
                 {
                     "index": edge_index,
                     "object": edge,
                     "reference": reference,
-                    "edge_tolerance": tolerance,
                 }
             )
 
@@ -8257,9 +8180,30 @@ class SolidWorksBackend(CadBackend):
             fin_id,
             endpoint,
             edge_reference_sha256,
-            edge_tolerance,
-            topology_accepted,
+            diagnostic_context,
         ):
+            common = {
+                **base,
+                **diagnostic_context,
+                "fin_id": fin_id,
+                "endpoint": endpoint,
+                "edge_reference_sha256": edge_reference_sha256,
+                "u_parameter_rule": NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
+                "projection_rule": (
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
+                ),
+                "projection_metric": (
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC
+                ),
+                "projection_tolerance_m": (
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+                ),
+                "curve_u_min": domain["u_min"],
+                "curve_u_max": domain["u_max"],
+                "curve_sense": domain["sense"],
+                "curve_start_point_m": domain["start_point_m"],
+                "curve_end_point_m": domain["end_point_m"],
+            }
             closest = call(
                 "IEdge.GetClosestPointOn",
                 lambda edge=edge, point=point: _as_list(
@@ -8282,7 +8226,10 @@ class SolidWorksBackend(CadBackend):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
                     "GetClosestPointOn returned malformed point/U evidence",
-                    {**base, "fin_id": fin_id, "endpoint": endpoint},
+                    {
+                        **common,
+                        "get_closest_point_on_raw": repr(closest)[:500],
+                    },
                 )
             closest_point = _binary64_xyz(closest[0:3])
             closest_u = float(closest[3])
@@ -8295,29 +8242,26 @@ class SolidWorksBackend(CadBackend):
                 )
 
             projection_error = point_error(point, closest_point)
-            if projection_error > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M:
+            if not native_point_within_max_coordinate_bound(
+                point,
+                closest_point,
+                NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+            ):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
                     "tessellation edge projection exceeds the 50 micrometre bound",
                     {
-                        **base,
-                        "fin_id": fin_id,
-                        "endpoint": endpoint,
-                        "edge_reference_sha256": edge_reference_sha256,
+                        **common,
                         "source_point_m": list(point),
-                        "closest_point_on_raw": [
-                            *closest_point,
-                            closest_u,
-                        ],
+                        "closest_point_on_raw": closest_evidence,
                         "closest_point_m": list(closest_point),
                         "u": closest_u,
-                        "curve_u_min": domain["u_min"],
-                        "curve_u_max": domain["u_max"],
-                        "curve_sense": domain["sense"],
-                        "projection_tolerance_m": (
-                            NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-                        ),
-                        "projection_error_m": projection_error,
+                        "projection_errors_m": {
+                            "source_to_closest": projection_error,
+                            "closest_to_evaluate": None,
+                            "source_to_evaluate": None,
+                        },
+                        "rejected_predicates": ["source_to_closest"],
                     },
                 )
             endpoint_u = closest_u
@@ -8331,13 +8275,7 @@ class SolidWorksBackend(CadBackend):
                     "cad_native_tessellation_unreadable",
                     "GetClosestPointOn endpoint U is outside the edge domain",
                     {
-                        **base,
-                        "fin_id": fin_id,
-                        "endpoint": endpoint,
-                        "edge_reference_sha256": edge_reference_sha256,
-                        "curve_u_min": domain["u_min"],
-                        "curve_u_max": domain["u_max"],
-                        "curve_sense": domain["sense"],
+                        **common,
                         "source_point_m": list(point),
                         "closest_point_on_raw": closest_evidence,
                         "closest_point_m": list(closest_point),
@@ -8358,10 +8296,7 @@ class SolidWorksBackend(CadBackend):
                     "cad_native_tessellation_unreadable",
                     "Evaluate2 shape or point payload is invalid",
                     {
-                        **base,
-                        "fin_id": fin_id,
-                        "endpoint": endpoint,
-                        "edge_reference_sha256": edge_reference_sha256,
+                        **common,
                         "source_point_m": list(point),
                         "closest_point_on_raw": closest_evidence,
                         "u": endpoint_u,
@@ -8373,10 +8308,7 @@ class SolidWorksBackend(CadBackend):
                     "cad_native_tessellation_unreadable",
                     "Evaluate2 packed success bit is zero",
                     {
-                        **base,
-                        "fin_id": fin_id,
-                        "endpoint": endpoint,
-                        "edge_reference_sha256": edge_reference_sha256,
+                        **common,
                         "source_point_m": list(point),
                         "closest_point_on_raw": closest_evidence,
                         "u": endpoint_u,
@@ -8389,156 +8321,69 @@ class SolidWorksBackend(CadBackend):
             evaluated_point = _binary64_xyz(
                 evaluate_evidence["payload"][:3]
             )
-            tolerant_edge_evidence = None
-            tolerant_edge_boundary = None
-            tolerance_available = edge_tolerance["state"] == "success"
-            is_tolerant = (
-                edge_tolerance["return_value"]
-                if tolerance_available
-                else False
-            )
-            tolerant_gap_m = (
-                edge_tolerance["gap_m"] if tolerance_available else 0.0
-            )
-            if native_u_equal(endpoint_u, domain["u_min"]):
-                curve_endpoint = domain["start_point_m"]
-                opposite_endpoint = domain["end_point_m"]
-                tolerant_edge_boundary = native_tolerant_edge_boundary(
+            projection_errors = {
+                "source_to_closest": projection_error,
+                "closest_to_evaluate": point_error(
                     closest_point,
                     evaluated_point,
-                    curve_endpoint,
-                    opposite_endpoint,
-                    is_tolerant=is_tolerant,
-                    gap_m=tolerant_gap_m,
-                    topology_accepted=topology_accepted,
-                )
-                point_tolerance = tolerant_edge_boundary[
-                    "point_tolerance_m"
-                ]
-                boundary_name = "u_min"
-            elif native_u_equal(endpoint_u, domain["u_max"]):
-                curve_endpoint = domain["end_point_m"]
-                opposite_endpoint = domain["start_point_m"]
-                tolerant_edge_boundary = native_tolerant_edge_boundary(
-                    closest_point,
+                ),
+                "source_to_evaluate": point_error(
+                    point,
                     evaluated_point,
-                    curve_endpoint,
-                    opposite_endpoint,
-                    is_tolerant=is_tolerant,
-                    gap_m=tolerant_gap_m,
-                    topology_accepted=topology_accepted,
+                ),
+            }
+            projection_pairs = {
+                "source_to_closest": (point, closest_point),
+                "closest_to_evaluate": (closest_point, evaluated_point),
+                "source_to_evaluate": (point, evaluated_point),
+            }
+            rejected_predicates = [
+                name
+                for name, pair in projection_pairs.items()
+                if not native_point_within_max_coordinate_bound(
+                    pair[0],
+                    pair[1],
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
                 )
-                point_tolerance = tolerant_edge_boundary[
-                    "point_tolerance_m"
-                ]
-                boundary_name = "u_max"
-            else:
-                point_tolerance = native_point_roundtrip_tolerance(
-                    closest_point,
-                    evaluated_point,
-                )
-                point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
-                boundary_name = None
-            if tolerant_edge_boundary is not None:
-                if tolerant_edge_boundary["gap_used"] is True:
-                    if tolerant_edge_boundary["accepted"] is True:
-                        tolerant_edge_evidence = (
-                            native_tolerant_edge_evidence(
-                                tolerant_edge_boundary,
-                                edge_reference_sha256=(
-                                    edge_reference_sha256
-                                ),
-                                parameter_boundary=boundary_name,
-                                eligible_gap_m=tolerant_gap_m,
-                            )
-                        )
-                        point_roundtrip_rule = (
-                            tolerant_edge_boundary["point_roundtrip_rule"]
-                        )
-                else:
-                    point_roundtrip_rule = (
-                        NATIVE_CURVE_ENDPOINT_OPERATION_RULE
-                    )
-            evaluate_error = point_error(closest_point, evaluated_point)
-            source_evaluate_error = point_error(point, evaluated_point)
-            closest_evaluate_error = point_error(
-                closest_point,
-                evaluated_point,
-            )
-            official_evaluate_error = (
-                tolerant_edge_boundary["evaluate_point_error_m"]
-                if tolerant_edge_boundary is not None
-                else evaluate_error
-            )
-            boundary_rejected = (
-                tolerant_edge_boundary is not None
-                and tolerant_edge_boundary["accepted"] is not True
-            )
-            nonboundary_rejected = (
-                tolerant_edge_boundary is None
-                and max(
-                    evaluate_error,
-                    closest_evaluate_error,
-                ) > point_tolerance
-            )
-            if boundary_rejected or nonboundary_rejected:
+            ]
+            if rejected_predicates:
                 raise CadError(
                     "cad_native_tessellation_unreadable",
-                    "native U evaluation does not reproduce the fin endpoint",
+                    "native closest-point projection exceeds the 50 micrometre bound",
                     {
-                        **base,
-                        "fin_id": fin_id,
-                        "endpoint": endpoint,
-                        "edge_reference_sha256": edge_reference_sha256,
+                        **common,
                         "source_point_m": list(point),
                         "closest_point_on_raw": closest_evidence,
                         "closest_point_m": list(closest_point),
                         "u": endpoint_u,
-                        "curve_u_min": domain["u_min"],
-                        "curve_u_max": domain["u_max"],
-                        "curve_sense": domain["sense"],
-                        "curve_start_point_m": domain["start_point_m"],
-                        "curve_end_point_m": domain["end_point_m"],
                         "evaluate2_raw": list(evaluated_raw),
                         "evaluate_payload": evaluate_evidence["payload"],
                         "evaluate_packed_status": evaluate_evidence[
                             "packed_status"
                         ],
-                        "closest_point_error_m": projection_error,
-                        "projection_error_m": projection_error,
-                        "evaluate_point_error_m": official_evaluate_error,
-                        "source_evaluate_error_m": source_evaluate_error,
-                        "closest_evaluate_error_m": closest_evaluate_error,
-                        "point_tolerance_m": point_tolerance,
-                        "point_error_m": official_evaluate_error,
-                        "tolerant_edge_evidence": tolerant_edge_evidence,
+                        "projection_errors_m": projection_errors,
+                        "rejected_predicates": rejected_predicates,
                     },
                 )
             return {
                 "u": endpoint_u,
                 "u_parameter_rule": u_parameter_rule,
                 "rule_version": NATIVE_U_IDENTITY_RULE,
-                "point_roundtrip_rule": point_roundtrip_rule,
                 "projection_rule": NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
+                "projection_metric": (
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC
+                ),
                 "projection_tolerance_m": (
                     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
                 ),
                 "source_point_m": list(point),
-                "projection_error_m": projection_error,
-                "point_tolerance_m": point_tolerance,
-                "point_error_m": official_evaluate_error,
-                "closest_point_error_m": projection_error,
-                "evaluate_point_error_m": official_evaluate_error,
-                "source_evaluate_error_m": source_evaluate_error,
-                "closest_evaluate_error_m": closest_evaluate_error,
-                "tolerant_edge_evidence": tolerant_edge_evidence,
                 "closest_point_on_raw": closest_evidence,
+                "evaluate2_raw": list(evaluated_raw),
                 "evaluate_payload": evaluate_evidence["payload"],
                 "evaluate_packed_status": evaluate_evidence[
                     "packed_status"
                 ],
-                "open_edge_identity_sha256": None,
-                "topology_endpoint_set_accepted": False,
+                "projection_errors_m": projection_errors,
             }
 
         u_observation_cache = {}
@@ -8565,7 +8410,6 @@ class SolidWorksBackend(CadBackend):
                         "end_evidence": None,
                         "cofin_raw_id": None,
                         "cofin_id": None,
-                        "open_edge_boundary_identity": None,
                     }
                 )
             else:
@@ -8639,36 +8483,6 @@ class SolidWorksBackend(CadBackend):
                         },
                     )
                 topology_assignment = edge["topology_endpoint_assignment"]
-                direct_error = (
-                    topology_assignment["direct_error_m"]
-                    if topology_assignment is not None
-                    else None
-                )
-                swapped_error = (
-                    topology_assignment["swapped_error_m"]
-                    if topology_assignment is not None
-                    else None
-                )
-                tolerance = (
-                    topology_assignment["tolerance_m"]
-                    if topology_assignment is not None
-                    else None
-                )
-                unique_topology_accepted = (
-                    topology_assignment is not None
-                    and topology_assignment["accepted"] is True
-                    and topology_assignment["complete_match_count"] == 1
-                )
-                endpoint_set_mode = (
-                    topology_assignment is not None
-                    and direct_error <= tolerance
-                    and swapped_error <= tolerance
-                )
-                open_identity_candidate = (
-                    body_type == 1
-                    and incidence == 1
-                    and cofin_id == -1
-                )
                 endpoint_evidence = []
                 for endpoint, vertex_id in zip(
                     ("start", "end"),
@@ -8686,6 +8500,45 @@ class SolidWorksBackend(CadBackend):
                     )
                     evidence = u_observation_cache.get(cache_key)
                     if evidence is None:
+                        face_row = face_rows[row["face_index"]]
+                        diagnostic_context = {
+                            "body_reference_sha256": body_reference[
+                                "typed_sha256"
+                            ],
+                            "native_body_reference_sha256": body_reference[
+                                "raw_sha256"
+                            ],
+                            "face_index": row["face_index"],
+                            "face_reference_sha256": face_row["reference"][
+                                "typed_sha256"
+                            ],
+                            "native_face_reference_sha256": face_row[
+                                "reference"
+                            ]["raw_sha256"],
+                            "edge_index": edge["index"],
+                            "edge_endpoint_refs": [
+                                (
+                                    edge["endpoints"][name]["reference"][
+                                        "typed_sha256"
+                                    ]
+                                    if edge["endpoints"][name]["reference"]
+                                    is not None
+                                    else None
+                                )
+                                for name in ("start", "end")
+                            ],
+                            "edge_start_point_m": edge["endpoints"]["start"][
+                                "point_m"
+                            ],
+                            "edge_end_point_m": edge["endpoints"]["end"][
+                                "point_m"
+                            ],
+                            "topology_endpoint_assignment": topology_assignment,
+                            "fin_vertex_ids": row["vertex_ids"],
+                            "cofin_raw_id": cofin_id,
+                            "edge_fin_ids": edge["fin_ids"],
+                            "source_scope": body_scope,
+                        }
                         observed = fin_endpoint_u(
                             edge["object"],
                             point,
@@ -8695,14 +8548,7 @@ class SolidWorksBackend(CadBackend):
                             edge_reference_sha256=(
                                 edge["reference"]["typed_sha256"]
                             ),
-                            edge_tolerance=edge["edge_tolerance"],
-                            topology_accepted=(
-                                unique_topology_accepted
-                                or (
-                                    endpoint_set_mode
-                                    and open_identity_candidate
-                                )
-                            ),
+                            diagnostic_context=diagnostic_context,
                         )
                         u_observation_cache[cache_key] = copy.deepcopy(
                             observed
@@ -8711,18 +8557,13 @@ class SolidWorksBackend(CadBackend):
                     else:
                         u_cache_hits += 1
                         evidence = copy.deepcopy(evidence)
-                    tolerant_edge_evidence = evidence[
-                        "tolerant_edge_evidence"
-                    ]
-                    if tolerant_edge_evidence is not None:
-                        parameter_endpoint = (
-                            "start"
-                            if native_u_equal(
-                                evidence["u"],
-                                domain["u_min"],
-                            )
-                            else "end"
-                        )
+                    if native_u_equal(evidence["u"], domain["u_min"]):
+                        parameter_endpoint = "start"
+                    elif native_u_equal(evidence["u"], domain["u_max"]):
+                        parameter_endpoint = "end"
+                    else:
+                        parameter_endpoint = None
+                    if parameter_endpoint is not None:
                         repeated = edge["curve_endpoint_evaluations"][
                             parameter_endpoint
                         ]
@@ -8772,245 +8613,6 @@ class SolidWorksBackend(CadBackend):
                 row["end_u"] = end_evidence["u"]
                 row["start_evidence"] = start_evidence
                 row["end_evidence"] = end_evidence
-                uses_tolerant_gap = any(
-                    evidence["tolerant_edge_evidence"] is not None
-                    for evidence in endpoint_evidence
-                )
-                row["open_edge_boundary_identity"] = None
-                requires_open_identity = False
-                if uses_tolerant_gap and not unique_topology_accepted:
-                    if not endpoint_set_mode or not open_identity_candidate:
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "tolerant gap use requires an open-edge endpoint identity",
-                            {
-                                **base,
-                                "edge_index": edge_row["index"],
-                                "fin_id": fin_id,
-                                "direct_error_m": direct_error,
-                                "swapped_error_m": swapped_error,
-                                "face_count": incidence,
-                                "cofin_raw_id": cofin_id,
-                            },
-                        )
-                    requires_open_identity = True
-                if requires_open_identity:
-                    edge_tolerance = edge["edge_tolerance"]
-                    if edge_tolerance["state"] != "success":
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "tolerant gap use requires a successful IsTolerant read",
-                            {
-                                **base,
-                                "edge_index": edge_row["index"],
-                                "fin_id": fin_id,
-                                "edge_tolerance": edge_tolerance,
-                            },
-                        )
-                    endpoints = edge["endpoints"]
-                    face_row = face_rows[row["face_index"]]
-                    face_identity = face_row.get("identity")
-                    face_identity_mode = (
-                        NATIVE_SCOPE_IDENTITY_RULE
-                        if face_identity is not None
-                        else NATIVE_PERSISTENT_IDENTITY_RULE
-                    )
-                    try:
-                        scope_binding = native_open_edge_scope_binding(
-                            component=component,
-                            source_document_path=body_scope[
-                                "source_document_path"
-                            ],
-                            source_copy_path=body_scope[
-                                "source_copy_path"
-                            ],
-                            source_document_sha256=body_scope[
-                                "source_document_sha256"
-                            ],
-                            source_copy_sha256=body_scope[
-                                "source_copy_sha256"
-                            ],
-                            source_document_identity_sha256=body_scope[
-                                "source_document_identity_sha256"
-                            ],
-                            source_document_identity_kind=body_scope[
-                                "source_document_identity_kind"
-                            ],
-                            referenced_configuration=body_scope[
-                                "referenced_configuration"
-                            ],
-                            occurrence_scope=body_scope[
-                                "occurrence_scope"
-                            ],
-                            virtual_owner=body_scope["virtual_owner"],
-                            virtual_owner_sha256=body_scope[
-                                "virtual_owner_sha256"
-                            ],
-                            virtual_session_document_path=body_scope[
-                                "virtual_session_document_path"
-                            ],
-                            virtual_session_temp_root=body_scope[
-                                "virtual_session_temp_root"
-                            ],
-                            virtual_native_api_pid=body_scope[
-                                "virtual_native_api_pid"
-                            ],
-                            body_type=body_type,
-                            body_index=body_index,
-                            body_reference_sha256=body_reference[
-                                "typed_sha256"
-                            ],
-                            native_body_reference_sha256=body_reference[
-                                "raw_sha256"
-                            ],
-                            face_index=row["face_index"],
-                            face_reference_sha256=face_row["reference"][
-                                "typed_sha256"
-                            ],
-                            native_face_reference_sha256=face_row[
-                                "reference"
-                            ][
-                                "raw_sha256"
-                            ],
-                            face_identity_mode=face_identity_mode,
-                            owner_scope_key=(
-                                face_identity.get("owner_scope_key")
-                                if isinstance(face_identity, dict)
-                                else None
-                            ),
-                        )
-                        open_identity = native_open_edge_boundary_identity(
-                            component=component,
-                            scope_binding=scope_binding,
-                            edge_reference_sha256=edge["reference"][
-                                "typed_sha256"
-                            ],
-                            edge_endpoint_refs=(
-                                endpoints["start"]["reference"]["typed_sha256"],
-                                endpoints["end"]["reference"]["typed_sha256"],
-                            ),
-                            edge_start_point=endpoints["start"]["point_m"],
-                            edge_end_point=endpoints["end"]["point_m"],
-                            fin_id=fin_id,
-                            fin_vertex_ids=row["vertex_ids"],
-                            fin_start_point=vertex_points_binary64[
-                                row["vertex_ids"][0]
-                            ],
-                            fin_end_point=vertex_points_binary64[
-                                row["vertex_ids"][1]
-                            ],
-                            curve_start_point=domain["start_point_m"],
-                            curve_end_point=domain["end_point_m"],
-                            curve_u_min=domain["u_min"],
-                            curve_u_max=domain["u_max"],
-                            fin_endpoint_u=(
-                                start_evidence["u"],
-                                end_evidence["u"],
-                            ),
-                            curve_sense=domain["sense"],
-                            gap_m=edge_tolerance["gap_m"],
-                            body_type=body_type,
-                            face_count=incidence,
-                            cofin_raw_id=cofin_id,
-                            edge_fin_ids=tuple(edge["fin_ids"]),
-                            topology_set_accepted=(
-                                topology_assignment["accepted"] is True
-                            ),
-                        )
-                    except ValueError as error:
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "open-edge boundary identity is not reproducible",
-                            {
-                                **base,
-                                "edge_index": edge_row["index"],
-                                "fin_id": fin_id,
-                                "error": str(error)[:300],
-                                "body_reference_sha256": body_reference[
-                                    "typed_sha256"
-                                ],
-                                "native_body_reference_sha256": (
-                                    body_reference["raw_sha256"]
-                                ),
-                                "face_index": row["face_index"],
-                                "face_reference_sha256": face_row[
-                                    "reference"
-                                ]["typed_sha256"],
-                                "native_face_reference_sha256": face_row[
-                                    "reference"
-                                ]["raw_sha256"],
-                                "edge_reference_sha256": edge[
-                                    "reference"
-                                ]["typed_sha256"],
-                                "edge_endpoint_refs": [
-                                    endpoints["start"]["reference"][
-                                        "typed_sha256"
-                                    ],
-                                    endpoints["end"]["reference"][
-                                        "typed_sha256"
-                                    ],
-                                ],
-                                "edge_start_point_m": endpoints["start"][
-                                    "point_m"
-                                ],
-                                "edge_end_point_m": endpoints["end"][
-                                    "point_m"
-                                ],
-                                "edge_length_m": native_point_euclidean_error(
-                                    endpoints["start"]["point_m"],
-                                    endpoints["end"]["point_m"],
-                                ),
-                                "curve_u_min": domain["u_min"],
-                                "curve_u_max": domain["u_max"],
-                                "curve_start_point_m": domain[
-                                    "start_point_m"
-                                ],
-                                "curve_end_point_m": domain["end_point_m"],
-                                "fin_endpoint_u": [
-                                    start_evidence["u"],
-                                    end_evidence["u"],
-                                ],
-                                "fin_endpoint_points_m": [
-                                    vertex_points_binary64[
-                                        row["vertex_ids"][0]
-                                    ],
-                                    vertex_points_binary64[
-                                        row["vertex_ids"][1]
-                                    ],
-                                ],
-                                "tolerant_endpoints": [
-                                    start_evidence[
-                                        "tolerant_edge_evidence"
-                                    ]
-                                    is not None,
-                                    end_evidence[
-                                        "tolerant_edge_evidence"
-                                    ]
-                                    is not None,
-                                ],
-                                "edge_fin_ids": list(edge["fin_ids"]),
-                                "face_indices": list(
-                                    edge_row["face_indices"]
-                                ),
-                                "curve_sense": domain["sense"],
-                                "curve_closed": edge_row["curve_end_params"][
-                                    "is_closed"
-                                ],
-                                "curve_periodic": edge_row["curve_end_params"][
-                                    "is_periodic"
-                                ],
-                                "gap_m": edge_tolerance["gap_m"],
-                            },
-                        ) from error
-                    row["open_edge_boundary_identity"] = open_identity
-                    for evidence in endpoint_evidence:
-                        evidence["open_edge_identity_sha256"] = open_identity[
-                            "identity_chain_sha256"
-                        ]
-                        evidence["topology_endpoint_set_accepted"] = True
-                elif unique_topology_accepted:
-                    for evidence in endpoint_evidence:
-                        evidence["topology_endpoint_set_accepted"] = True
         for edge_row in edge_rows:
             incidence = len(edge_row["face_indices"])
             relation_fins = {
@@ -9231,9 +8833,6 @@ class SolidWorksBackend(CadBackend):
                         "end_evidence": fin["end_evidence"],
                         "cofin_raw_id": fin["cofin_raw_id"],
                         "cofin_id": fin["cofin_id"],
-                        "open_edge_boundary_identity": fin[
-                            "open_edge_boundary_identity"
-                        ],
                     }
                     for fin_id, fin in sorted(fins_by_id.items())
                 ],
@@ -9314,7 +8913,6 @@ class SolidWorksBackend(CadBackend):
                     "curve_end_point_m": row["curve"]["end_point_m"],
                     "curve_sense": row["curve"]["sense"],
                     "curve_type": row["curve"]["curve_type"],
-                    "edge_tolerance": row["edge_tolerance"],
                     "curve_closed": row["curve_end_params"]["is_closed"],
                     "curve_periodic": row["curve_end_params"]["is_periodic"],
                     "curve_end_params": row["curve_end_params"],
@@ -10153,7 +9751,7 @@ class SolidWorksBackend(CadBackend):
         else:
             return None
         return {
-            "rule_version": NATIVE_OPEN_EDGE_SCOPE_RULE,
+            "rule_version": NATIVE_SOURCE_SCOPE_RULE,
             "component": component,
             "source_document_path": source_path,
             "source_copy_path": source_copy_path,
