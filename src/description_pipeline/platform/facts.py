@@ -565,6 +565,27 @@ class FactStore(AdmissionControlStore):
             raise FactStoreError(f"The command {command_id!r} is not registered")
         return command
 
+    def load_stage_command(self, run_id: str, stage: str) -> StageCommand:
+        if stage not in STAGES:
+            raise FactStoreError(f"The stage {stage!r} is not a canonical pipeline stage")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT command_id
+                FROM command
+                WHERE run_id = %s AND kind = 'stage' AND stage = %s
+                """,
+                (run_id, stage),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise FactStoreError(f"The run {run_id!r} has no {stage!r} command")
+            command = self._load_command_cursor(cursor, row[0])
+        if command is None:  # pragma: no cover - selected in the same transaction
+            raise FactStoreError("The selected stage command disappeared")
+        return command
+
     def _load_dispatch_command_cursor(self, cursor, command_id: str) -> DispatchCommand | None:
         cursor.execute(
             """
@@ -788,12 +809,12 @@ class FactStore(AdmissionControlStore):
             stored_command,
             result=predecessor.result,
         )
+        self._verify_completed_predecessor_chain_cursor(cursor, stored_command)
         self._verify_completed_command_effects_cursor(
             cursor,
             stored_command,
             decision=stored_decision,
         )
-        self._verify_completed_predecessor_chain_cursor(cursor, stored_command)
 
     def _decision_row(self, cursor, *, run_id: str, stage: str):
         cursor.execute(
@@ -856,8 +877,8 @@ class FactStore(AdmissionControlStore):
                 return None
             decision = self._decision_from_row(cursor, row)
             if decision.outcome == "completed":
-                self._verify_completed_command_effects_cursor(cursor, command, decision=decision)
                 self._verify_completed_predecessor_chain_cursor(cursor, command)
+                self._verify_completed_command_effects_cursor(cursor, command, decision=decision)
         if decision.command_id != command.command_id:
             raise FactConflict("The stage decision is bound to another command")
         return decision
@@ -1769,6 +1790,8 @@ class FactStore(AdmissionControlStore):
         expected_command_id: str | None = None,
         metadata_artifact: ArtifactRef | None = None,
     ) -> EffectFact:
+        if metadata_artifact is not None:
+            raise FactStoreError("Reconciliation metadata must use append_reconciliation_fact")
         with self._transaction() as connection:
             return self._append_effect_fact_cursor(
                 connection.cursor(),
@@ -1805,16 +1828,36 @@ class FactStore(AdmissionControlStore):
             raise FactStoreError("A reconciliation fact must be observation or reconciled")
         if metadata_artifact.kind != "effect_reconciliation_metadata":
             raise FactStoreError("The reconciliation metadata artifact has the wrong kind")
+        if payload_digest != payload_artifact.set_sha256:
+            raise FactStoreError("The reconciliation payload digest differs from its artifact closure")
         verifier = getattr(self._result_reader, "verify", None)
         if not callable(verifier):
             raise FactStoreError("The configured artifact reader cannot verify reconciliation evidence")
         verifier(payload_artifact)
-        verifier(metadata_artifact)
         with self._transaction() as connection:
             cursor = connection.cursor()
             intent, facts = self._effect_cursor(cursor, effect_id, lock=True)
             if intent.command_id != expected_command_id:
                 raise FactConflict("The reconciliation effect names another command")
+            command = self._load_command_cursor(cursor, intent.command_id)
+            if command is None:
+                raise FactStoreError("The reconciliation command is missing")
+            outbound_artifact = self._artifact_cursor(cursor, intent.outbound_artifact_id)
+            from ..pipeline.reconciliation import read_reconciliation_metadata
+
+            record = read_reconciliation_metadata(
+                self._result_reader,
+                metadata_artifact,
+                command=command,
+                intent=intent,
+                fact_type=fact_type,
+                state_class=state_class,
+                outbound_artifact=outbound_artifact,
+                payload_artifact=payload_artifact,
+                observed_at=observed_at,
+            )
+            if source != "effect-reconciler:" + record["observer_tool_sha256"]:
+                raise FactConflict("The reconciliation source differs from its metadata observer")
             state = project_effect_state(intent, facts)
             if state is EffectState.CONFLICT:
                 if fact_type != "reconciled" or state_class not in {"known", "absent"}:

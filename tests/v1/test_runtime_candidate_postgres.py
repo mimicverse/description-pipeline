@@ -175,6 +175,64 @@ def _attempt_authorization_blocked_by_conflict(
         result.put(("authorized", ""))
 
 
+def _hold_effect_row(
+    uri: str,
+    schema: str,
+    effect_id: str,
+    ready,
+    release,
+) -> None:
+    import psycopg2
+
+    connection = psycopg2.connect(
+        uri,
+        options=f"-c search_path={schema},public",
+    )
+    try:
+        with connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT effect_id FROM effect_intent WHERE effect_id = %s FOR UPDATE",
+                (effect_id,),
+            )
+            if cursor.fetchone() is None:
+                raise AssertionError("lock target effect is missing")
+            ready.set()
+            if not release.wait(20):
+                raise TimeoutError("effect lock release timed out")
+    finally:
+        connection.close()
+
+
+def _attempt_completed_decision_read(
+    uri: str,
+    schema: str,
+    artifact_root: str,
+    command_id: str,
+    attempting,
+    result,
+) -> None:
+    import psycopg2
+
+    from description_pipeline.artifacts import ArtifactStore
+    from description_pipeline.platform.facts import FactStore
+
+    def connect():
+        return psycopg2.connect(
+            uri,
+            options=f"-c search_path={schema},public",
+        )
+
+    facts = FactStore(connect, ArtifactStore(artifact_root))
+    command = facts.load_command(command_id)
+    attempting.set()
+    try:
+        decision = facts.decision_for(command)
+    except Exception as error:
+        result.put(("error", f"{type(error).__name__}: {error}"))
+    else:
+        result.put((None if decision is None else decision.outcome, ""))
+
+
 class _EffectHandler:
     def __init__(self) -> None:
         self.external_calls = 0
@@ -595,6 +653,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         *,
         predecessor_decision_id: str,
         with_decision: bool = True,
+        with_effect: bool = False,
     ) -> StageCommand:
         spec = self.admission_harness.spec
         executor = spec.executors.for_stage(stage)
@@ -651,6 +710,33 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 producer_stage=stage,
                 producer_tool_sha256=executor,
             )
+        required_effect_ids: tuple[str, ...] = ()
+        effect_id = None
+        outbound = None
+        payload = None
+        if with_effect:
+            effect_id = f"effect-{stage}-" + str(uuid.uuid4())
+            with tempfile.TemporaryDirectory(prefix=f"lineage-{stage}-outbound-") as directory:
+                root = Path(directory)
+                (root / "outbound.json").write_text('{"operation":"native"}\n', encoding="utf-8")
+                outbound = self.artifacts.seal_tree(
+                    root,
+                    kind="effect_outbound",
+                    producer_run_id=self.admission.run_id,
+                    producer_stage=stage,
+                    producer_tool_sha256=executor,
+                )
+            with tempfile.TemporaryDirectory(prefix=f"lineage-{stage}-payload-") as directory:
+                root = Path(directory)
+                (root / "observation.json").write_text('{"present":true}\n', encoding="utf-8")
+                payload = self.artifacts.seal_tree(
+                    root,
+                    kind="effect_observation",
+                    producer_run_id=self.admission.run_id,
+                    producer_stage=stage,
+                    producer_tool_sha256=digest({"observer": stage}),
+                )
+            required_effect_ids = (effect_id,)
         result = StageResult(
             schema_version=STAGE_RESULT_SCHEMA,
             command_id=command.command_id,
@@ -662,10 +748,14 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             actual_executor_sha256=executor,
             checks_sha256=digest({"checks": stage}),
             resources_settled=True,
+            required_effect_ids=required_effect_ids,
         )
         result_record = self.artifacts.seal_stage_result(result)
         self.facts.register_artifact(output)
         self.facts.register_artifact(result_record)
+        if outbound is not None and payload is not None:
+            self.facts.register_artifact(outbound)
+            self.facts.register_artifact(payload)
         decision_id = f"lineage-decision-{stage}-" + str(uuid.uuid4())
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -692,6 +782,87 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                     command.predecessor_decision_id,
                 ),
             )
+            if effect_id is not None and outbound is not None and payload is not None:
+                claim_id = f"claim-{effect_id}"
+                owner = digest({"owner": claim_id})
+                expected_state = {"command_id": command.command_id, "state": "complete"}
+                cursor.execute(
+                    """
+                    INSERT INTO execution_claim (
+                        claim_id, command_id, fence, owner_sha256, executor_sha256,
+                        issued_at, last_seen_at, expires_at, closed_at, closure_code
+                    ) VALUES (%s, %s, 1, %s, %s, %s, %s, %s, %s, 'completed')
+                    """,
+                    (
+                        claim_id,
+                        command.command_id,
+                        owner,
+                        executor,
+                        self.now,
+                        self.now,
+                        self.now + timedelta(minutes=5),
+                        self.now,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO effect_intent (
+                        effect_id, command_id, effect_key, effect_kind, target,
+                        expected_state, expected_state_digest, outbound_artifact_id,
+                        outbound_digest, created_at
+                    ) VALUES (%s, %s, %s, 'native_operation', %s::jsonb, %s::jsonb, %s, %s, %s, %s)
+                    """,
+                    (
+                        effect_id,
+                        command.command_id,
+                        f"native-{stage}",
+                        json.dumps({"command_id": command.command_id}),
+                        json.dumps(expected_state),
+                        digest(expected_state),
+                        outbound.artifact_id,
+                        outbound.set_sha256,
+                        self.now,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO effect_fact (
+                        fact_id, effect_id, seq, claim_id, fence, fact_type,
+                        source, state_class, payload_artifact_id, payload_digest,
+                        metadata_artifact_id, observed_at
+                    ) VALUES (
+                        %s, %s, 1, %s, 1, 'dispatch_authorized',
+                        'lineage', NULL, NULL, %s, NULL, %s
+                    )
+                    """,
+                    (
+                        f"fact-dispatch-{effect_id}",
+                        effect_id,
+                        claim_id,
+                        digest({"dispatch": effect_id}),
+                        self.now,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO effect_fact (
+                        fact_id, effect_id, seq, claim_id, fence, fact_type,
+                        source, state_class, payload_artifact_id, payload_digest,
+                        metadata_artifact_id, observed_at
+                    ) VALUES (
+                        %s, %s, 2, %s, 1, 'observation',
+                        'lineage', 'known', %s, %s, NULL, %s
+                    )
+                    """,
+                    (
+                        f"fact-observed-{effect_id}",
+                        effect_id,
+                        claim_id,
+                        payload.artifact_id,
+                        payload.set_sha256,
+                        self.now + timedelta(seconds=1),
+                    ),
+                )
             cursor.execute(
                 """
                 INSERT INTO stage_decision (
@@ -761,6 +932,14 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             ),
         )
         self.assertEqual(rows[0], (1, 1, 1, 1, 0))
+
+    def test_fact_store_loads_the_unique_stage_command_for_a_run(self) -> None:
+        self.assertEqual(
+            self.facts.load_stage_command(self.admission.run_id, "freeze"),
+            self.command,
+        )
+        with self.assertRaisesRegex(FactStoreError, "no 'discover' command"):
+            self.facts.load_stage_command(self.admission.run_id, "discover")
 
     def test_forged_freeze_command_is_refused_by_typed_admission_before_writes(self) -> None:
         admission, command = self._new_admission("forged")
@@ -1091,6 +1270,130 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 (discover_effect.effect_id,),
             ),
             [(0,)],
+        )
+
+    def test_completed_decision_and_publish_authorization_use_identical_lock_order(self) -> None:
+        self._execute(_EffectHandler())
+        freeze = self._predecessor_for(self.command)
+        predecessor_decision = freeze.decision
+        stage_commands = {}
+        for stage in ("discover", "capture", "generate", "verify"):
+            command = self._seed_synthetic_completed_stage(
+                stage,
+                predecessor_decision_id=predecessor_decision.decision_id,
+                with_effect=stage in {"discover", "capture"},
+            )
+            stage_commands[stage] = command
+            decision = self.facts.decision_for(command)
+            self.assertIsNotNone(decision)
+            predecessor_decision = decision
+        publish_command = self._seed_synthetic_completed_stage(
+            "publish",
+            predecessor_decision_id=predecessor_decision.decision_id,
+            with_decision=False,
+        )
+        services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "lock-order-publish",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": "lock-order-publish"}),
+                executor_sha256=self.admission_harness.spec.executors.publish,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now,
+        )
+        publish_claim = services.acquire_claim(publish_command)
+        workspace = services.materialize(publish_command, publish_claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(publish_command, publish_claim, workspace)
+        outbound = workspace.root / "outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"operation":"publish"}\n', encoding="utf-8")
+        publish_effect = effects.prepare_effect(
+            effect_key="publish",
+            effect_kind="git_ref_update",
+            target={"repository": "owner/model", "branch_ref": "refs/heads/generated"},
+            expected_state={
+                "schema_version": "solidworks-to-urdf.git-ref-update/v1",
+                "repository": "owner/model",
+                "base_ref": "refs/heads/main",
+                "expected_base_oid": "a" * 40,
+                "branch_ref": "refs/heads/generated",
+                "expected_head_oid": None,
+                "candidate_commit": "b" * 40,
+                "candidate_tree": "c" * 40,
+                "subject_sha256": digest({"subject": "publish"}),
+            },
+            outbound_root=outbound,
+        )
+        capture_effect = self.facts.effect_ids_for_command(
+            stage_commands["capture"].command_id
+        )[0]
+        context = multiprocessing.get_context("spawn")
+        capture_held = context.Event()
+        capture_release = context.Event()
+        decision_attempting = context.Event()
+        authorization_attempting = context.Event()
+        decision_result = context.Queue()
+        authorization_result = context.Queue()
+        holder = context.Process(
+            target=_hold_effect_row,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                capture_effect,
+                capture_held,
+                capture_release,
+            ),
+        )
+        decision_reader = context.Process(
+            target=_attempt_completed_decision_read,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                str(self.artifacts.root),
+                stage_commands["capture"].command_id,
+                decision_attempting,
+                decision_result,
+            ),
+        )
+        authorization = context.Process(
+            target=_attempt_authorization_blocked_by_conflict,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                str(self.artifacts.root),
+                publish_claim,
+                publish_effect.effect_id,
+                authorization_attempting,
+                authorization_result,
+            ),
+        )
+        for process in (holder, decision_reader, authorization):
+            self.addCleanup(lambda item=process: item.terminate() if item.is_alive() else None)
+        holder.start()
+        self.assertTrue(capture_held.wait(10), "capture effect lock was not acquired")
+        decision_reader.start()
+        authorization.start()
+        self.assertTrue(decision_attempting.wait(10), "completed decision reader did not start")
+        self.assertTrue(authorization_attempting.wait(10), "publish authorization did not start")
+        time.sleep(0.1)
+        self.assertTrue(decision_reader.is_alive())
+        self.assertTrue(authorization.is_alive())
+        capture_release.set()
+        for process in (holder, decision_reader, authorization):
+            process.join(20)
+            self.assertEqual(process.exitcode, 0)
+        self.assertEqual(decision_result.get(timeout=5), ("completed", ""))
+        self.assertEqual(authorization_result.get(timeout=5), ("authorized", ""))
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact "
+                "WHERE effect_id = %s AND fact_type = 'dispatch_authorized'",
+                (publish_effect.effect_id,),
+            ),
+            [(1,)],
         )
 
     def test_store_persists_the_six_supported_projection_stages_in_order(self) -> None:

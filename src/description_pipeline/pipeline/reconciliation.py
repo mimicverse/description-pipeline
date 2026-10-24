@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-from ..io import canonical, write_json
+from ..io import canonical, read_data, write_json
 from ..schemas import (
     EFFECT_RECONCILIATION_FAILURE_SCHEMA,
     EFFECT_RECONCILIATION_SCHEMA,
@@ -35,6 +35,103 @@ def _plain(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_plain(item) for item in value]
     return value
+
+
+def reconciliation_metadata_document(
+    *,
+    command: StageCommand,
+    intent: EffectIntent,
+    fact_type: str,
+    state_class: str,
+    metadata: Mapping[str, Any] | None,
+    outbound_artifact: ArtifactRef,
+    payload_artifact: ArtifactRef,
+    observer_tool_sha256: str,
+    observed_at: datetime,
+) -> dict[str, Any]:
+    """Construct the one immutable reconciliation metadata closure."""
+
+    return {
+        "schema_version": EFFECT_RECONCILIATION_SCHEMA,
+        "command_id": command.command_id,
+        "effect_id": intent.effect_id,
+        "effect_key": intent.effect_key,
+        "fact_type": fact_type,
+        "state_class": state_class,
+        "metadata": _plain(metadata or {}),
+        "outbound_artifact": outbound_artifact.to_record(),
+        "payload_artifact": payload_artifact.to_record(),
+        "observer_tool_sha256": observer_tool_sha256,
+        "observed_at": observed_at.isoformat(),
+    }
+
+
+def read_reconciliation_metadata(
+    artifacts,
+    metadata_artifact: ArtifactRef,
+    *,
+    command: StageCommand,
+    intent: EffectIntent,
+    fact_type: str,
+    state_class: str,
+    outbound_artifact: ArtifactRef,
+    payload_artifact: ArtifactRef,
+    observed_at: datetime,
+) -> dict[str, Any]:
+    """Read and exactly bind reconciliation metadata to one effect closure."""
+
+    if metadata_artifact.kind != "effect_reconciliation_metadata":
+        raise ProtocolError("reconciliation.metadata_invalid", {"where": "kind"})
+    if getattr(artifacts, "verify", None) is None or getattr(artifacts, "materialize", None) is None:
+        raise ProtocolError("reconciliation.metadata_invalid", {"where": "artifact-reader"})
+    artifacts.verify(metadata_artifact)
+    with tempfile.TemporaryDirectory(prefix="effect-reconciliation-metadata-") as directory:
+        root = artifacts.materialize(
+            metadata_artifact,
+            Path(directory) / "metadata",
+        )
+        files = {
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+        if files != {"manifest.json", "metadata.json"} or any(path.is_symlink() for path in root.rglob("*")):
+            raise ProtocolError("reconciliation.metadata_invalid", {"where": "members"})
+        record = read_data(root / "metadata.json")
+    expected = reconciliation_metadata_document(
+        command=command,
+        intent=intent,
+        fact_type=fact_type,
+        state_class=state_class,
+        metadata=record.get("metadata") if isinstance(record, dict) else None,
+        outbound_artifact=outbound_artifact,
+        payload_artifact=payload_artifact,
+        observer_tool_sha256=metadata_artifact.producer_tool_sha256,
+        observed_at=observed_at,
+    )
+    if (
+        not isinstance(record, dict)
+        or set(record)
+        != {
+            "schema_version",
+            "command_id",
+            "effect_id",
+            "effect_key",
+            "fact_type",
+            "state_class",
+            "metadata",
+            "outbound_artifact",
+            "payload_artifact",
+            "observer_tool_sha256",
+            "observed_at",
+        }
+        or record != expected
+        or metadata_artifact.producer_run_id != command.run_id
+        or metadata_artifact.producer_stage != command.stage
+        or len(metadata_artifact.producer_tool_sha256) != 64
+    ):
+        raise ProtocolError("reconciliation.metadata_mismatch", {"effect_id": intent.effect_id})
+    return record
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,19 +312,17 @@ class EffectReconciliationService:
             metadata_root = workspace / "reconciliation-metadata"
             write_json(
                 metadata_root / "metadata.json",
-                {
-                    "schema_version": EFFECT_RECONCILIATION_SCHEMA,
-                    "command_id": command.command_id,
-                    "effect_id": intent.effect_id,
-                    "effect_key": intent.effect_key,
-                    "fact_type": evidence.fact_type,
-                    "state_class": evidence.state_class,
-                    "metadata": _plain(evidence.metadata or {}),
-                    "outbound_artifact": settlement.outbound_artifact.to_record(),
-                    "payload_artifact": payload.to_record(),
-                    "observer_tool_sha256": self.observer_tool_sha256,
-                    "observed_at": observed_at.isoformat(),
-                },
+                reconciliation_metadata_document(
+                    command=command,
+                    intent=intent,
+                    fact_type=evidence.fact_type,
+                    state_class=evidence.state_class,
+                    metadata=evidence.metadata,
+                    outbound_artifact=settlement.outbound_artifact,
+                    payload_artifact=payload,
+                    observer_tool_sha256=self.observer_tool_sha256,
+                    observed_at=observed_at,
+                ),
             )
             metadata = self.artifacts.seal_tree(
                 metadata_root,
@@ -295,4 +390,6 @@ __all__ = [
     "EffectReconciliationFailure",
     "EffectReconciliationResult",
     "EffectReconciliationService",
+    "read_reconciliation_metadata",
+    "reconciliation_metadata_document",
 ]

@@ -17,7 +17,7 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
-from description_pipeline.io import digest
+from description_pipeline.io import digest, write_json
 from description_pipeline.pipeline.cancellation import (
     CancellationRequest,
     CancellationControlService,
@@ -37,11 +37,9 @@ from description_pipeline.pipeline.engine import (
 )
 from description_pipeline.pipeline.contracts import StageExecution
 from description_pipeline.pipeline.contracts import ProtocolError
-from description_pipeline.pipeline.services import (
-    BoundStageEffectPort,
-    CanonicalStageServices,
-    ClaimPolicy,
-)
+from description_pipeline.pipeline.reconciliation import reconciliation_metadata_document
+from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
+from description_pipeline.pipeline.services import BoundStageEffectPort
 from description_pipeline.platform.facts import FactConflict, FactStore
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from tests.v1.test_pipeline_admission import AdmissionHarness
@@ -406,30 +404,47 @@ class CancellationPostgresTests(unittest.TestCase):
         payload_root.mkdir()
         metadata_root.mkdir()
         (payload_root / "result.json").write_text('{"present":false}\n', encoding="utf-8")
-        (metadata_root / "metadata.json").write_text('{"source":"exact-operation"}\n', encoding="utf-8")
+        observer_tool = digest({"tool": "observer"})
+        observed_at = self.now + timedelta(minutes=1)
         payload = self.artifacts.seal_tree(
             payload_root,
             kind="effect_observation",
             producer_run_id=self.command.run_id,
             producer_stage="freeze",
-            producer_tool_sha256=digest({"tool": "observer"}),
+            producer_tool_sha256=observer_tool,
+        )
+        target_settlement = self.facts.effect_settlement(intent.effect_id)
+        self.assertIsNotNone(target_settlement.outbound_artifact)
+        write_json(
+            metadata_root / "metadata.json",
+            reconciliation_metadata_document(
+                command=self.command,
+                intent=intent,
+                fact_type="reconciled",
+                state_class="absent",
+                metadata={"source": "exact-operation"},
+                outbound_artifact=target_settlement.outbound_artifact,
+                payload_artifact=payload,
+                observer_tool_sha256=observer_tool,
+                observed_at=observed_at,
+            ),
         )
         metadata = self.artifacts.seal_tree(
             metadata_root,
             kind="effect_reconciliation_metadata",
             producer_run_id=self.command.run_id,
             producer_stage="freeze",
-            producer_tool_sha256=digest({"tool": "observer"}),
+            producer_tool_sha256=observer_tool,
         )
         self.facts.append_reconciliation_fact(
             effect_id=intent.effect_id,
             fact_type="reconciled",
-            source="observer",
+            source="effect-reconciler:" + observer_tool,
             state_class="absent",
             payload_artifact=payload,
             metadata_artifact=metadata,
             payload_digest=payload.set_sha256,
-            observed_at=self.now + timedelta(minutes=1),
+            observed_at=observed_at,
             fact_id="absent-" + intent.effect_id,
             expected_command_id=self.command.command_id,
         )

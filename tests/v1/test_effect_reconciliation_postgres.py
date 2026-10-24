@@ -22,18 +22,19 @@ except ImportError:
     psycopg2 = None
 
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.io import digest
-from description_pipeline.pipeline.contracts import ExecutionClaim
+from description_pipeline.io import digest, write_json
+from description_pipeline.pipeline.contracts import ArtifactRef, ExecutionClaim, ProtocolError
 from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
 from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.reconciliation import (
     EffectReconciliationEvidence,
     EffectReconciliationFailure,
     EffectReconciliationService,
+    reconciliation_metadata_document,
 )
 from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
-from description_pipeline.platform.facts import FactConflict, FactStore
+from description_pipeline.platform.facts import FactConflict, FactStore, FactStoreError
 from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
@@ -216,6 +217,15 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(statement, parameters)
             return cursor.fetchall()
+
+    def _artifact_ref(self, artifact_id: str) -> ArtifactRef:
+        row = self._query(
+            "SELECT artifact_id, kind, locator, manifest_sha256, set_sha256, "
+            "producer_run_id, producer_stage, producer_tool_sha256 "
+            "FROM artifact WHERE artifact_id = %s",
+            (artifact_id,),
+        )[0]
+        return ArtifactRef(*row)
 
     def _admit_fixture(self, suffix: str):
         input_root = Path(self.directory.name) / f"input-{suffix}"
@@ -613,6 +623,155 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
                 ("observation",),
                 ("reconciled",),
             ],
+        )
+
+    def test_reconciliation_metadata_cannot_be_reused_across_effect_closures(self) -> None:
+        command_a, _services_a, _workspace_a, _effects_a, intent_a = self._authorize_unknown_effect(
+            "metadata-a"
+        )
+        command_b, _services_b, _workspace_b, _effects_b, _intent_b = self._authorize_unknown_effect(
+            "metadata-b"
+        )
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=self.work_root / "metadata-source-b",
+            observer_tool_sha256=self.observer_tool,
+            clock=lambda: self.now + timedelta(minutes=1),
+        )
+        resolved_b = reconciler.reconcile(
+            command_id=command_b.command_id,
+            effect_key="native",
+            adapter=_KnownAdapter(),
+        )
+        self.assertEqual(resolved_b.settlement.state, EffectState.SATISFIED)
+        self.assertIsNotNone(resolved_b.settlement.payload_artifact)
+        self.assertIsNotNone(resolved_b.settlement.outbound_artifact)
+        self.assertIsNotNone(resolved_b.fact)
+        self.assertIsNotNone(resolved_b.fact.metadata_artifact_id)
+        payload_b = resolved_b.settlement.payload_artifact
+        outbound_b = resolved_b.settlement.outbound_artifact
+        metadata_b = self._artifact_ref(resolved_b.fact.metadata_artifact_id)
+        observed_b = resolved_b.fact.observed_at
+
+        with self.assertRaisesRegex(FactStoreError, "append_reconciliation_fact"):
+            self.facts.append_effect_fact(
+                effect_id=intent_a.effect_id,
+                claim=None,
+                fact_type="reconciled",
+                source="effect-reconciler:" + self.observer_tool,
+                state_class="known",
+                payload_artifact=payload_b,
+                payload_digest=payload_b.set_sha256,
+                observed_at=observed_b,
+                fact_id="common-metadata-bypass",
+                expected_command_id=command_a.command_id,
+                metadata_artifact=metadata_b,
+            )
+        with self.assertRaisesRegex(ProtocolError, "metadata_mismatch"):
+            self.facts.append_reconciliation_fact(
+                effect_id=intent_a.effect_id,
+                fact_type="reconciled",
+                source="effect-reconciler:" + self.observer_tool,
+                state_class="known",
+                payload_artifact=payload_b,
+                metadata_artifact=metadata_b,
+                payload_digest=payload_b.set_sha256,
+                observed_at=observed_b,
+                fact_id="foreign-effect-metadata",
+                expected_command_id=command_a.command_id,
+            )
+
+        payload_root = Path(self.directory.name) / "metadata-a-payload"
+        payload_root.mkdir()
+        (payload_root / "payload.json").write_text('{"effect":"a"}\n', encoding="utf-8")
+        payload_a = self.artifacts.seal_tree(
+            payload_root,
+            kind="effect_observation",
+            producer_run_id=command_a.run_id,
+            producer_stage=command_a.stage,
+            producer_tool_sha256=self.observer_tool,
+        )
+        settlement_a = self.facts.effect_settlement_for_key(command_a.command_id, "native")
+        self.assertIsNotNone(settlement_a.outbound_artifact)
+        outbound_a = settlement_a.outbound_artifact
+        observed_at = self.now + timedelta(minutes=2)
+
+        def seal_metadata(label: str, **overrides) -> ArtifactRef:
+            root = Path(self.directory.name) / f"metadata-{label}"
+            root.mkdir()
+            document = reconciliation_metadata_document(
+                command=command_a,
+                intent=intent_a,
+                fact_type="reconciled",
+                state_class="known",
+                metadata={"label": label},
+                outbound_artifact=outbound_a,
+                payload_artifact=payload_a,
+                observer_tool_sha256=self.observer_tool,
+                observed_at=observed_at,
+            )
+            document.update(overrides)
+            write_json(root / "metadata.json", document)
+            return self.artifacts.seal_tree(
+                root,
+                kind="effect_reconciliation_metadata",
+                producer_run_id=command_a.run_id,
+                producer_stage=command_a.stage,
+                producer_tool_sha256=self.observer_tool,
+            )
+
+        cases = {
+            "wrong_outbound": {
+                "outbound_artifact": outbound_b.to_record(),
+            },
+            "wrong_payload": {
+                "payload_artifact": payload_b.to_record(),
+            },
+            "wrong_state": {
+                "state_class": "absent",
+            },
+            "wrong_fact_type": {
+                "fact_type": "observation",
+            },
+        }
+        for label, overrides in cases.items():
+            with self.subTest(case=label):
+                metadata = seal_metadata(label, **overrides)
+                with self.assertRaisesRegex(ProtocolError, "metadata_mismatch"):
+                    self.facts.append_reconciliation_fact(
+                        effect_id=intent_a.effect_id,
+                        fact_type="reconciled",
+                        source="effect-reconciler:" + self.observer_tool,
+                        state_class="known",
+                        payload_artifact=payload_a,
+                        metadata_artifact=metadata,
+                        payload_digest=payload_a.set_sha256,
+                        observed_at=observed_at,
+                        fact_id=f"invalid-{label}",
+                        expected_command_id=command_a.command_id,
+                    )
+
+        cross_run_payload_metadata = seal_metadata(
+            "cross-run-payload",
+            payload_artifact=payload_b.to_record(),
+        )
+        resolved_a = self.facts.append_reconciliation_fact(
+            effect_id=intent_a.effect_id,
+            fact_type="reconciled",
+            source="effect-reconciler:" + self.observer_tool,
+            state_class="known",
+            payload_artifact=payload_b,
+            metadata_artifact=cross_run_payload_metadata,
+            payload_digest=payload_b.set_sha256,
+            observed_at=observed_at,
+            fact_id="cross-run-payload-reconciliation",
+            expected_command_id=command_a.command_id,
+        )
+        self.assertEqual(resolved_a.fact_type, "reconciled")
+        self.assertEqual(
+            self.facts.effect_settlement_for_key(command_a.command_id, "native").state,
+            EffectState.SATISFIED,
         )
 
     def test_observation_absence_and_expired_lease_do_not_settle_until_reconciled(self) -> None:
