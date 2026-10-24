@@ -62,6 +62,22 @@ class ArtifactStoreTests(unittest.TestCase):
         with self.assertRaises(ArtifactStoreError):
             self.seal(source)
 
+    def test_symlink_source_root_is_rejected(self) -> None:
+        source = self.source("source")
+        linked = self.root / "linked"
+        try:
+            os.symlink(source, linked, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"The host cannot create a symbolic link: {error}")
+        with self.assertRaisesRegex(ArtifactStoreError, "source root"):
+            self.store.seal_tree(
+                linked,
+                kind="generated",
+                producer_run_id="run-1",
+                producer_stage="generate",
+                producer_tool_sha256=self.tool,
+            )
+
     def test_stage_result_record_roundtrip_is_byte_verified(self) -> None:
         output = self.seal(self.source("output"))
         result = StageResult(
@@ -71,7 +87,7 @@ class ArtifactStoreTests(unittest.TestCase):
             stage="generate",
             request_digest=digest({"request": 1}),
             outcome="completed",
-            result_artifact=output,
+            output_artifact=output,
             actual_executor_sha256=self.tool,
             checks_sha256=digest({"checks": 1}),
             required_effect_ids=(),

@@ -41,7 +41,7 @@ class _Facts:
         return self.decision
 
     def load_result(self, decision):
-        return self.artifacts.read_result(decision.result_artifact)
+        return self.artifacts.read_result(decision.result_record_artifact)
 
     def acquire_claim(self, command_id, **kwargs):
         if command_id != self.command.command_id:
@@ -51,19 +51,37 @@ class _Facts:
     def candidate_for(self, command):
         return self.candidate
 
-    def register_candidate(self, *, candidate_id, claim, result_artifact, result, created_at):
+    def register_candidate(
+        self,
+        *,
+        candidate_id,
+        claim,
+        output_artifact,
+        result_record_artifact,
+        result,
+        created_at,
+    ):
+        if result.output_artifact != output_artifact:
+            raise AssertionError("output artifact mismatch")
         self.candidate_writes += 1
         self.candidate = StageCandidate(
             result=result,
-            result_record_artifact=result_artifact,
+            result_record_artifact=result_record_artifact,
             candidate_id=candidate_id,
             claim_id=claim.claim_id,
             fence=claim.fence,
         )
         return self.candidate
 
-    def effect_state(self, effect_id):
-        return self.effects[effect_id]
+    def effect_ids_for_command(self, command_id):
+        if command_id != self.command.command_id:
+            raise AssertionError(command_id)
+        return tuple(sorted(self.effects))
+
+    def effect_states_for_command(self, command_id):
+        if command_id != self.command.command_id:
+            raise AssertionError(command_id)
+        return dict(self.effects)
 
     def commit_decision(
         self,
@@ -81,15 +99,19 @@ class _Facts:
             run_id=command.run_id,
             stage=command.stage,
             command_id=command.command_id,
-            result_artifact=candidate.result_record_artifact,
+            result_record_artifact=candidate.result_record_artifact,
             result_digest=candidate.result.digest,
             actual_executor_sha256=candidate.result.actual_executor_sha256,
             outcome=candidate.result.outcome,
             original_producer_decision_id=original_producer_decision_id,
             reason_code=candidate.result.reason_code,
+            failure_envelope=None,
             decided_at=decided_at,
         )
         return self.decision
+
+    def commit_failure(self, command, claim, failure):
+        raise AssertionError("failure not expected")
 
 
 class _Handler:
@@ -97,7 +119,7 @@ class _Handler:
         self.executions = 0
         self.validations = 0
 
-    def execute(self, command, claim, workspace):
+    def execute(self, command, claim, workspace, *, effects):
         self.executions += 1
         output = workspace.root / "output"
         output.mkdir()
@@ -106,10 +128,9 @@ class _Handler:
             outcome="completed",
             candidate_root=str(output),
             checks_sha256=digest({"checks": 1}),
-            required_effect_ids=("effect-1",),
         )
 
-    def validate_candidate(self, command, claim, candidate):
+    def validate_candidate(self, command, claim, candidate, *, effects):
         self.validations += 1
         return candidate
 
@@ -137,12 +158,14 @@ class CanonicalStageServicesTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.command = command()
         self.owner = digest({"process": 1})
+        self.executor = self.command.expected_executor_sha256
         self.now = datetime(2026, 10, 25, tzinfo=UTC)
         self.claim = ExecutionClaim(
             claim_id="claim-1",
             command_id=self.command.command_id,
             fence=1,
             owner_sha256=self.owner,
+            executor_sha256=self.executor,
             lane_key=None,
             expires_at=self.now + timedelta(minutes=5),
         )
@@ -154,6 +177,7 @@ class CanonicalStageServicesTests(unittest.TestCase):
             work_root=self.root / "work",
             claim_policy=ClaimPolicy(
                 owner_sha256=self.owner,
+                executor_sha256=self.executor,
                 lease=timedelta(minutes=5),
                 claim_id_factory=lambda: self.claim.claim_id,
             ),
@@ -173,9 +197,15 @@ class CanonicalStageServicesTests(unittest.TestCase):
         self.assertEqual(result.outcome, "completed")
         self.assertEqual(self.facts.candidate_writes, 1)
         self.assertEqual(self.facts.commit_count, 1)
-        self.assertNotEqual(result.result_artifact.artifact_id, self.facts.decision.result_artifact.artifact_id)
-        self.assertEqual(self.artifacts.read_result(self.facts.decision.result_artifact), result)
-        output = self.artifacts.materialize(result.result_artifact, self.root / "verified-output")
+        self.assertNotEqual(
+            result.output_artifact.artifact_id,
+            self.facts.decision.result_record_artifact.artifact_id,
+        )
+        self.assertEqual(
+            self.artifacts.read_result(self.facts.decision.result_record_artifact),
+            result,
+        )
+        output = self.artifacts.materialize(result.output_artifact, self.root / "verified-output")
         self.assertEqual((output / "model.txt").read_text(encoding="utf-8"), "generated\n")
 
     def test_existing_decision_returns_without_new_domain_execution(self) -> None:
@@ -192,7 +222,7 @@ class CanonicalStageServicesTests(unittest.TestCase):
         result = self.execute()
         self.assertEqual(result.outcome, "completed")
         self.assertEqual(self.handler.executions, 1)
-        self.assertEqual(self.handler.validations, 1)
+        self.assertEqual(self.handler.validations, 2)
         self.assertEqual(self.facts.candidate_writes, 1)
         self.assertEqual(self.facts.commit_count, 2)
 

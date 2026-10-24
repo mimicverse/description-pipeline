@@ -27,8 +27,7 @@ PYTHON_SQL_OWNERS = (
 def fake_psql(log: Path) -> Path:
     script = log.parent / "fake-psql"
     script.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$@" >> "{log}"\n',
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "{log}"\n',
         encoding="utf-8",
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
@@ -159,7 +158,7 @@ class SchemaQualifierTests(unittest.TestCase):
 class CanonicalFactSchemaTests(unittest.TestCase):
     def test_six_stage_decisions_are_unique_and_never_store_unresolved(self) -> None:
         text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
-        decision = text.split("CREATE TABLE IF NOT EXISTS :\"platform_schema\".stage_decision", 1)[1]
+        decision = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_decision', 1)[1]
         decision = decision.split(");", 1)[0]
         self.assertIn("UNIQUE (run_id, stage)", decision)
         self.assertIn("command_id text NOT NULL UNIQUE", decision)
@@ -173,12 +172,20 @@ class CanonicalFactSchemaTests(unittest.TestCase):
             text,
         )
         self.assertIn("UNIQUE (command_id, fence)", text)
+        self.assertIn("executor_sha256 char(64) NOT NULL", text)
+        self.assertIn("CHECK (owner_sha256 <> executor_sha256)", text)
         self.assertIn("UNIQUE (effect_id, seq)", text)
         self.assertIn("state_class IN ('known', 'absent', 'unobservable')", text)
-        candidate = text.split("CREATE TABLE IF NOT EXISTS :\"platform_schema\".stage_candidate", 1)[1]
+        candidate = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate', 1)[1]
         candidate = candidate.split(");", 1)[0]
         self.assertIn("command_id text NOT NULL UNIQUE", candidate)
-        self.assertIn("result_artifact_id text NOT NULL UNIQUE", candidate)
+        self.assertIn("output_artifact_id text NOT NULL", candidate)
+        self.assertIn("result_record_artifact_id text NOT NULL UNIQUE", candidate)
+        self.assertIn("output_artifact_id <> result_record_artifact_id", candidate)
+        decision = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_decision', 1)[1]
+        decision = decision.split(");", 1)[0]
+        self.assertIn("failure_envelope jsonb", decision)
+        self.assertIn("failure_digest char(64)", decision)
 
     def test_immutable_facts_have_no_service_update_grant(self) -> None:
         text = (PLATFORM_DIR / "roles.sql").read_text(encoding="utf-8")
@@ -192,7 +199,7 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIsNotNone(immutable)
         self.assertNotIn("UPDATE", immutable.group(0))
         self.assertIn(
-            "GRANT SELECT, INSERT, UPDATE ON :\"platform_schema\".execution_claim",
+            'GRANT SELECT, INSERT, UPDATE ON :"platform_schema".execution_claim',
             text,
         )
 

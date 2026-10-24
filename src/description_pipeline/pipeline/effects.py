@@ -7,17 +7,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Protocol
 
 from ..io import canonical, digest
-from .contracts import EffectKind, ProtocolError
+from .contracts import ArtifactRef, EffectKind, ProtocolError
 
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
-_FACT_TYPES = frozenset(
-    {"dispatch_authorized", "response", "timeout", "observation", "reconciled", "conflict"}
-)
+_SAFE_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_FACT_TYPES = frozenset({"dispatch_authorized", "response", "timeout", "observation", "reconciled", "conflict"})
 _OBSERVATION_STATES = frozenset({"known", "absent", "unobservable"})
+_GIT_OID = re.compile(r"\A[0-9a-f]{40}\Z")
+_REPOSITORY = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 
 class EffectState(StrEnum):
@@ -28,6 +30,77 @@ class EffectState(StrEnum):
     CONFLICT = "conflict"
 
 
+@dataclass(frozen=True, slots=True)
+class EffectSettlement:
+    """The projected state plus the decisive append-only fact."""
+
+    effect_id: str
+    state: EffectState
+    decisive_fact: EffectFact | None
+    payload_artifact: ArtifactRef | None = None
+
+
+class StageEffectPort(Protocol):
+    """The command/claim-bound capability injected into a stage handler.
+
+    The port, not the handler, binds command identity, claim/fence, artifact
+    sealing and persistence. A handler cannot append a self-declared effect-id
+    list or send an effect before ``authorize_dispatch`` succeeds.
+    """
+
+    def prepare_effect(
+        self,
+        *,
+        effect_key: str,
+        effect_kind: EffectKind,
+        target: Mapping[str, Any],
+        expected_state: Mapping[str, Any],
+        outbound_root: str | Path,
+    ) -> EffectIntent: ...
+
+    def authorize_dispatch(self, effect_id: str, *, source: str) -> EffectFact: ...
+
+    def record_response(
+        self,
+        effect_id: str,
+        *,
+        source: str,
+        response_root: str | Path,
+    ) -> EffectFact: ...
+
+    def record_timeout(
+        self,
+        effect_id: str,
+        *,
+        source: str,
+        detail_root: str | Path | None = None,
+    ) -> EffectFact: ...
+
+    def record_observation(
+        self,
+        effect_id: str,
+        *,
+        source: str,
+        state_class: str,
+        observation_root: str | Path,
+    ) -> EffectFact: ...
+
+    def reconcile_effect(
+        self,
+        effect_id: str,
+        *,
+        source: str,
+        state_class: str,
+        evidence_root: str | Path,
+    ) -> EffectFact: ...
+
+    def effect_state(self, effect_id: str) -> EffectState: ...
+
+    def effect_settlement(self, effect_id: str) -> EffectSettlement: ...
+
+    def effect_settlement_for_key(self, effect_key: str) -> EffectSettlement | None: ...
+
+
 def _mapping(value: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ProtocolError("effect.invalid", {"where": where})
@@ -36,6 +109,7 @@ def _mapping(value: Mapping[str, Any], where: str) -> Mapping[str, Any]:
         canonical(result)
     except (TypeError, ValueError) as error:
         raise ProtocolError("effect.invalid", {"where": where, "reason": str(error)}) from error
+
     def freeze(item: Any) -> Any:
         if isinstance(item, Mapping):
             return MappingProxyType({key: freeze(child) for key, child in item.items()})
@@ -60,6 +134,12 @@ def _text(value: object, where: str) -> str:
     return value
 
 
+def _identifier(value: object, where: str) -> str:
+    if not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None:
+        raise ProtocolError("effect.invalid", {"where": where})
+    return value
+
+
 def _digest(value: object, where: str) -> str:
     if not isinstance(value, str) or _HEX64.fullmatch(value) is None:
         raise ProtocolError("effect.invalid", {"where": where})
@@ -70,6 +150,102 @@ def _utc(value: object, where: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ProtocolError("effect.invalid", {"where": where})
     return value
+
+
+def _exact_keys(value: Mapping[str, Any], keys: set[str], where: str) -> None:
+    if set(value) != keys:
+        raise ProtocolError(
+            "effect.expected_state_invalid",
+            {"where": where, "missing": sorted(keys - set(value)), "unknown": sorted(set(value) - keys)},
+        )
+
+
+def _git_oid(value: object, where: str) -> str:
+    if not isinstance(value, str) or _GIT_OID.fullmatch(value) is None:
+        raise ProtocolError("effect.expected_state_invalid", {"where": where})
+    return value
+
+
+def _git_ref(value: object, where: str) -> str:
+    text = _text(value, where)
+    if text.startswith("-") or ".." in text or "@{" in text or text.endswith(("/", ".", ".lock")):
+        raise ProtocolError("effect.expected_state_invalid", {"where": where})
+    return text
+
+
+def _validate_typed_state(
+    effect_kind: str,
+    target: Mapping[str, Any],
+    expected_state: Mapping[str, Any],
+) -> None:
+    if effect_kind == "git_ref_update":
+        expected_keys = {
+            "schema_version",
+            "repository",
+            "base_ref",
+            "expected_base_oid",
+            "branch_ref",
+            "expected_head_oid",
+            "candidate_commit",
+            "candidate_tree",
+            "subject_sha256",
+        }
+        _exact_keys(expected_state, expected_keys, "git_ref_update.expected_state")
+        _exact_keys(target, {"repository", "branch_ref"}, "git_ref_update.target")
+        if expected_state["schema_version"] != "solidworks-to-urdf.git-ref-update/v1":
+            raise ProtocolError("effect.expected_state_invalid", {"where": "schema_version"})
+        repository = _text(expected_state["repository"], "expected_state.repository")
+        if _REPOSITORY.fullmatch(repository) is None:
+            raise ProtocolError("effect.expected_state_invalid", {"where": "expected_state.repository"})
+        _git_ref(expected_state["base_ref"], "expected_state.base_ref")
+        _git_ref(expected_state["branch_ref"], "expected_state.branch_ref")
+        for key in ("expected_base_oid", "candidate_commit", "candidate_tree"):
+            _git_oid(expected_state[key], f"expected_state.{key}")
+        if expected_state["expected_head_oid"] is not None:
+            _git_oid(expected_state["expected_head_oid"], "expected_state.expected_head_oid")
+        _digest(expected_state["subject_sha256"], "expected_state.subject_sha256")
+        if target["repository"] != expected_state["repository"] or target["branch_ref"] != expected_state["branch_ref"]:
+            raise ProtocolError("effect.expected_state_invalid", {"where": "git_ref_update.target"})
+    elif effect_kind == "pr_upsert":
+        expected_keys = {
+            "schema_version",
+            "repository",
+            "base_ref",
+            "head_ref",
+            "candidate_commit",
+            "subject_sha256",
+            "title_digest",
+            "body_digest",
+            "expected_pr",
+        }
+        _exact_keys(expected_state, expected_keys, "pr_upsert.expected_state")
+        _exact_keys(target, {"repository", "base_ref", "head_ref"}, "pr_upsert.target")
+        if expected_state["schema_version"] != "solidworks-to-urdf.pr-upsert/v1":
+            raise ProtocolError("effect.expected_state_invalid", {"where": "schema_version"})
+        repository = _text(expected_state["repository"], "expected_state.repository")
+        if _REPOSITORY.fullmatch(repository) is None:
+            raise ProtocolError("effect.expected_state_invalid", {"where": "expected_state.repository"})
+        _git_ref(expected_state["base_ref"], "expected_state.base_ref")
+        _git_ref(expected_state["head_ref"], "expected_state.head_ref")
+        _git_oid(expected_state["candidate_commit"], "expected_state.candidate_commit")
+        for key in ("subject_sha256", "title_digest", "body_digest"):
+            _digest(expected_state[key], f"expected_state.{key}")
+        expected_pr = expected_state["expected_pr"]
+        if expected_pr is not None:
+            if not isinstance(expected_pr, Mapping):
+                raise ProtocolError("effect.expected_state_invalid", {"where": "expected_pr"})
+            _exact_keys(expected_pr, {"number", "url", "head_oid"}, "expected_pr")
+            if type(expected_pr["number"]) is not int or expected_pr["number"] <= 0:
+                raise ProtocolError("effect.expected_state_invalid", {"where": "expected_pr.number"})
+            _text(expected_pr["url"], "expected_pr.url")
+            if expected_pr["head_oid"] != expected_state["candidate_commit"]:
+                raise ProtocolError("effect.expected_state_invalid", {"where": "expected_pr.head_oid"})
+        if (
+            target["repository"] != expected_state["repository"]
+            or target["base_ref"] != expected_state["base_ref"]
+            or target["head_ref"] != expected_state["head_ref"]
+        ):
+            raise ProtocolError("effect.expected_state_invalid", {"where": "pr_upsert.target"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,19 +264,37 @@ class EffectIntent:
     created_at: datetime
 
     def __post_init__(self) -> None:
-        _text(self.effect_id, "effect_id")
-        _text(self.command_id, "command_id")
+        _identifier(self.effect_id, "effect_id")
+        _identifier(self.command_id, "command_id")
         _text(self.effect_key, "effect_key")
         if self.effect_kind not in {"airflow_dispatch", "native_operation", "git_ref_update", "pr_upsert"}:
             raise ProtocolError("effect.invalid", {"where": "effect_kind", "value": self.effect_kind})
         object.__setattr__(self, "target", _mapping(self.target, "target"))
         object.__setattr__(self, "expected_state", _mapping(self.expected_state, "expected_state"))
+        _validate_typed_state(self.effect_kind, self.target, self.expected_state)
         _digest(self.expected_state_digest, "expected_state_digest")
         if digest(_json_value(self.expected_state)) != self.expected_state_digest:
             raise ProtocolError("effect.expected_state_digest_mismatch", {"effect_id": self.effect_id})
-        _text(self.outbound_artifact_id, "outbound_artifact_id")
+        _identifier(self.outbound_artifact_id, "outbound_artifact_id")
         _digest(self.outbound_digest, "outbound_digest")
         _utc(self.created_at, "created_at")
+
+    def identity_record(self) -> dict[str, Any]:
+        return {
+            "command_id": self.command_id,
+            "effect_id": self.effect_id,
+            "effect_key": self.effect_key,
+            "effect_kind": self.effect_kind,
+            "expected_state": _json_value(self.expected_state),
+            "expected_state_digest": self.expected_state_digest,
+            "outbound_artifact_id": self.outbound_artifact_id,
+            "outbound_digest": self.outbound_digest,
+            "target": _json_value(self.target),
+        }
+
+    @property
+    def identity_digest(self) -> str:
+        return digest(self.identity_record())
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,32 +314,38 @@ class EffectFact:
     observed_at: datetime
 
     def __post_init__(self) -> None:
-        _text(self.fact_id, "fact_id")
-        _text(self.effect_id, "effect_id")
+        _identifier(self.fact_id, "fact_id")
+        _identifier(self.effect_id, "effect_id")
         if type(self.seq) is not int or self.seq <= 0:
             raise ProtocolError("effect.invalid", {"where": "seq"})
         if self.claim_id is not None:
-            _text(self.claim_id, "claim_id")
+            _identifier(self.claim_id, "claim_id")
         if self.fence is not None and (type(self.fence) is not int or self.fence <= 0):
             raise ProtocolError("effect.invalid", {"where": "fence"})
+        if (self.claim_id is None) != (self.fence is None):
+            raise ProtocolError("effect.invalid", {"reason": "claim-fence-pair"})
         if self.fact_type not in _FACT_TYPES:
             raise ProtocolError("effect.invalid", {"where": "fact_type", "value": self.fact_type})
+        if self.fact_type in {"dispatch_authorized", "response", "timeout"} and self.claim_id is None:
+            raise ProtocolError("effect.invalid", {"where": "claim_id", "reason": "send-proof-required"})
         _text(self.source, "source")
         if self.state_class is not None and self.state_class not in _OBSERVATION_STATES:
             raise ProtocolError("effect.invalid", {"where": "state_class", "value": self.state_class})
-        resolution = self.fact_type in {"response", "observation", "reconciled"}
+        resolution = self.fact_type in {"observation", "reconciled"}
         if resolution and self.state_class is None:
             raise ProtocolError("effect.invalid", {"where": "state_class", "reason": "resolution-required"})
         if not resolution and self.state_class is not None:
             raise ProtocolError("effect.invalid", {"where": "state_class", "reason": "resolution-only"})
         if self.payload_artifact_id is not None:
-            _text(self.payload_artifact_id, "payload_artifact_id")
+            _identifier(self.payload_artifact_id, "payload_artifact_id")
+        if self.fact_type in {"observation", "reconciled"} and self.payload_artifact_id is None:
+            raise ProtocolError("effect.invalid", {"where": "payload_artifact_id", "reason": "resolution-required"})
         _digest(self.payload_digest, "payload_digest")
         _utc(self.observed_at, "observed_at")
 
 
-def project_effect_state(intent: EffectIntent, facts: tuple[EffectFact, ...]) -> EffectState:
-    """Derive one effect state from its immutable intent and append-only facts.
+def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...]) -> EffectSettlement:
+    """Derive one effect state and retain the fact that established it.
 
     A retry cannot be inferred from a missing response or elapsed lease. The
     only safe result is ``UNKNOWN`` after any send authorization until an exact
@@ -162,19 +362,48 @@ def project_effect_state(intent: EffectIntent, facts: tuple[EffectFact, ...]) ->
     if sequences != list(range(1, len(facts) + 1)):
         raise ProtocolError("effect.fact_sequence_invalid", {"effect_id": intent.effect_id})
     ordered = tuple(sorted(facts, key=lambda fact: fact.seq))
-    if any(fact.fact_type == "conflict" for fact in ordered):
-        return EffectState.CONFLICT
-
-    for fact in reversed(ordered):
-        if fact.fact_type not in {"response", "observation", "reconciled"}:
+    state = EffectState.PREPARED
+    decisive: EffectFact | None = None
+    for fact in ordered:
+        if fact.fact_type in {"dispatch_authorized", "response", "timeout"}:
+            # Every later send attempt is potentially in flight until a newer
+            # exact observation or reconciliation settles it.
+            state = EffectState.UNKNOWN
+            decisive = fact
             continue
-        if fact.state_class == "unobservable":
-            return EffectState.UNKNOWN
-        if fact.state_class == "known":
-            return EffectState.SATISFIED
-        if fact.state_class == "absent":
-            return EffectState.DEFINITELY_FAILED
+        if fact.fact_type == "conflict":
+            state = EffectState.CONFLICT
+            decisive = fact
+            continue
+        if fact.fact_type == "observation":
+            if fact.state_class in {"known", "unobservable"}:
+                state = EffectState.SATISFIED if fact.state_class == "known" else EffectState.UNKNOWN
+            elif fact.state_class == "absent" and state is not EffectState.PREPARED:
+                # A current target being absent does not prove that an earlier
+                # request cannot still arrive. Only reconciliation can make the
+                # absence terminal.
+                state = EffectState.UNKNOWN
+            decisive = fact
+            continue
+        if fact.fact_type == "reconciled":
+            if fact.state_class == "known":
+                state = EffectState.SATISFIED
+            elif fact.state_class == "absent":
+                state = EffectState.DEFINITELY_FAILED
+            else:
+                state = EffectState.UNKNOWN
+            decisive = fact
+            continue
+        raise ProtocolError("effect.invalid", {"where": "fact_type", "value": fact.fact_type})
+    return EffectSettlement(
+        effect_id=intent.effect_id,
+        state=state,
+        decisive_fact=decisive,
+        payload_artifact=None,
+    )
 
-    if any(fact.fact_type in {"dispatch_authorized", "timeout"} for fact in ordered):
-        return EffectState.UNKNOWN
-    return EffectState.PREPARED
+
+def project_effect_state(intent: EffectIntent, facts: tuple[EffectFact, ...]) -> EffectState:
+    """Derive one effect state from its immutable intent and append-only facts."""
+
+    return project_effect_settlement(intent, facts).state

@@ -9,15 +9,17 @@ from typing import Protocol
 
 from .contracts import (
     ExecutionClaim,
+    FailureEnvelope,
     ProtocolError,
     StageCandidate,
     StageCommand,
     StageDecision,
     StageExecution,
     StageResult,
+    StageFailure,
     effect_is_settled,
 )
-from .effects import EffectState
+from .effects import EffectState, StageEffectPort
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +35,7 @@ class StageWorkspace:
         if not isinstance(self.inputs, Mapping):
             raise ProtocolError("workspace.invalid", {"where": "inputs"})
         if any(
-            not isinstance(key, str) or not key or not isinstance(value, Path)
-            for key, value in self.inputs.items()
+            not isinstance(key, str) or not key or not isinstance(value, Path) for key, value in self.inputs.items()
         ):
             raise ProtocolError("workspace.invalid", {"where": "inputs"})
 
@@ -76,7 +77,14 @@ class StageServices(Protocol):
         candidate: StageCandidate,
     ) -> StageCandidate: ...
 
-    def effect_state(self, effect_id: str) -> EffectState: ...
+    def effect_states_for_command(self, command_id: str) -> Mapping[str, EffectState]: ...
+
+    def effect_port(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+    ) -> StageEffectPort: ...
 
     def commit_decision(
         self,
@@ -84,6 +92,15 @@ class StageServices(Protocol):
         claim: ExecutionClaim,
         candidate: StageCandidate,
     ) -> StageDecision: ...
+
+    def commit_failure(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        failure: StageFailure,
+    ) -> FailureEnvelope: ...
+
+    def discard_workspace(self, workspace: StageWorkspace) -> None: ...
 
 
 class StageHandler(Protocol):
@@ -94,6 +111,8 @@ class StageHandler(Protocol):
         command: StageCommand,
         claim: ExecutionClaim,
         workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
     ) -> StageExecution: ...
 
     def validate_candidate(
@@ -101,6 +120,8 @@ class StageHandler(Protocol):
         command: StageCommand,
         claim: ExecutionClaim,
         candidate: StageCandidate,
+        *,
+        effects: StageEffectPort,
     ) -> StageCandidate: ...
 
 
@@ -110,12 +131,25 @@ def _validate_result_identity(command: StageCommand, result: StageResult) -> Non
         or result.run_id != command.run_id
         or result.stage != command.stage
         or result.request_digest != command.request_digest
+        or result.actual_executor_sha256 != command.expected_executor_sha256
     ):
         raise ProtocolError("result.command_mismatch", {"command_id": command.command_id})
 
 
-def _validate_effect_settlement(services: StageServices, result: StageResult) -> None:
-    states = tuple(services.effect_state(effect_id) for effect_id in result.required_effect_ids)
+def _validate_effect_settlement(services: StageServices, command: StageCommand, result: StageResult) -> None:
+    ledger_states = services.effect_states_for_command(command.command_id)
+    declared = set(result.required_effect_ids)
+    ledger = set(ledger_states)
+    if declared != ledger:
+        raise ProtocolError(
+            "effect.identity_mismatch",
+            {
+                "command_id": command.command_id,
+                "declared": sorted(declared),
+                "ledger": sorted(ledger),
+            },
+        )
+    states = tuple(ledger_states[effect_id] for effect_id in sorted(ledger_states))
     if any(not effect_is_settled(state) for state in states):
         raise ProtocolError(
             "effect.unsettled",
@@ -139,7 +173,7 @@ def execute_stage(
     command_id: str,
     handler: StageHandler,
     services: StageServices,
-) -> StageResult:
+) -> StageResult | FailureEnvelope:
     """Execute one stage to a unique decision or return its existing decision.
 
     Unhandled domain or infrastructure exceptions intentionally propagate. A
@@ -155,6 +189,8 @@ def execute_stage(
 
     confirmed = services.decision_for(command)
     if confirmed is not None:
+        if confirmed.failure_envelope is not None:
+            return confirmed.failure_envelope
         result = services.load_result(confirmed)
         _validate_result_identity(command, result)
         services.verify_decision(confirmed, result)
@@ -166,22 +202,49 @@ def execute_stage(
 
     candidate = services.candidate_for(command, claim)
     workspace = services.materialize(command, claim, candidate=candidate)
-    if candidate is None:
-        execution = handler.execute(command, claim, workspace)
-        candidate = services.seal_candidate(command, claim, execution)
-    else:
-        candidate = handler.validate_candidate(command, claim, candidate)
-        candidate = services.verify_candidate(command, claim, candidate)
+    try:
+        effects = services.effect_port(command, claim, workspace)
+        try:
+            if candidate is None:
+                execution = handler.execute(command, claim, workspace, effects=effects)
+                try:
+                    candidate = services.seal_candidate(command, claim, execution)
+                except Exception as error:
+                    if execution.outcome not in {"failed", "cancelled"}:
+                        raise
+                    failure = StageFailure(
+                        execution.reason_code or "failure_envelope_required",
+                        f"Failure result artifact unavailable: {type(error).__name__}: {error}"[:4096],
+                        outcome=execution.outcome,
+                        unavailable_reason="diagnostic_or_result_seal_failed",
+                    )
+                    try:
+                        return services.commit_failure(
+                            command,
+                            claim,
+                            failure,
+                        )
+                    except Exception as envelope_error:
+                        raise failure from envelope_error
+            candidate = handler.validate_candidate(command, claim, candidate, effects=effects)
+            candidate = services.verify_candidate(command, claim, candidate)
+        except StageFailure as failure:
+            try:
+                return services.commit_failure(command, claim, failure)
+            except Exception as error:
+                raise failure from error
 
-    _validate_result_identity(command, candidate.result)
-    _validate_effect_settlement(services, candidate.result)
-    decision = services.commit_decision(command, claim, candidate)
-    if (
-        decision.command_id != command.command_id
-        or decision.run_id != command.run_id
-        or decision.stage != command.stage
-        or decision.result_digest != candidate.result.digest
-        or decision.outcome != candidate.result.outcome
-    ):
-        raise ProtocolError("decision.command_mismatch", {"command_id": command.command_id})
-    return candidate.result
+        _validate_result_identity(command, candidate.result)
+        _validate_effect_settlement(services, command, candidate.result)
+        decision = services.commit_decision(command, claim, candidate)
+        if (
+            decision.command_id != command.command_id
+            or decision.run_id != command.run_id
+            or decision.stage != command.stage
+            or decision.result_digest != candidate.result.digest
+            or decision.outcome != candidate.result.outcome
+        ):
+            raise ProtocolError("decision.command_mismatch", {"command_id": command.command_id})
+        return candidate.result
+    finally:
+        services.discard_workspace(workspace)

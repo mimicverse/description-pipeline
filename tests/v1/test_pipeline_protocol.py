@@ -35,7 +35,7 @@ def artifact(name: str, *, stage="generate") -> ArtifactRef:
     return ArtifactRef(
         artifact_id=name,
         kind="stage_result",
-        locator=f"cas://{name}",
+        locator=f"cas://artifact/{name}",
         manifest_sha256=digest({"manifest": name}),
         set_sha256=digest({"set": name}),
         producer_run_id="run-1",
@@ -62,14 +62,25 @@ def command() -> StageCommand:
 
 class EffectProjectionTests(unittest.TestCase):
     def setUp(self) -> None:
+        expected = {
+            "schema_version": "solidworks-to-urdf.git-ref-update/v1",
+            "repository": "owner/repo",
+            "base_ref": "refs/heads/main",
+            "expected_base_oid": "a" * 40,
+            "branch_ref": "refs/heads/generated",
+            "expected_head_oid": "b" * 40,
+            "candidate_commit": "c" * 40,
+            "candidate_tree": "d" * 40,
+            "subject_sha256": digest({"subject": 1}),
+        }
         self.intent = EffectIntent(
             effect_id="effect-1",
             command_id="command-1",
             effect_key="git",
             effect_kind="git_ref_update",
-            target={"repository": "owner/repo", "branch": "generated"},
-            expected_state={"base": "a" * 40, "head": "b" * 40},
-            expected_state_digest=digest({"base": "a" * 40, "head": "b" * 40}),
+            target={"repository": "owner/repo", "branch_ref": "refs/heads/generated"},
+            expected_state=expected,
+            expected_state_digest=digest(expected),
             outbound_artifact_id="outbound-1",
             outbound_digest=digest({"outbound": 1}),
             created_at=datetime(2026, 10, 25, tzinfo=UTC),
@@ -91,7 +102,7 @@ class EffectProjectionTests(unittest.TestCase):
             fact_type=fact_type,
             source="test",
             state_class=state_class,
-            payload_artifact_id=None,
+            payload_artifact_id=f"artifact-{seq}" if state_class is not None else None,
             payload_digest=digest({"fact": seq}),
             observed_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(seconds=seq),
         )
@@ -120,6 +131,20 @@ class EffectProjectionTests(unittest.TestCase):
         )
         self.assertEqual(project_effect_state(self.intent, facts), EffectState.CONFLICT)
 
+    def test_new_dispatch_after_known_is_unknown(self) -> None:
+        facts = (
+            self.fact(1, "observation", state_class="known"),
+            self.fact(2, "dispatch_authorized"),
+        )
+        self.assertEqual(project_effect_state(self.intent, facts), EffectState.UNKNOWN)
+
+    def test_absent_observation_after_send_is_not_definite_failure(self) -> None:
+        facts = (
+            self.fact(1, "dispatch_authorized"),
+            self.fact(2, "observation", state_class="absent"),
+        )
+        self.assertEqual(project_effect_state(self.intent, facts), EffectState.UNKNOWN)
+
     def test_fact_sequence_and_identity_are_strict(self) -> None:
         wrong = self.fact(2, "dispatch_authorized")
         with self.assertRaises(ProtocolError):
@@ -128,8 +153,8 @@ class EffectProjectionTests(unittest.TestCase):
             fact_id="other",
             effect_id="effect-2",
             seq=1,
-            claim_id=None,
-            fence=None,
+            claim_id="claim-2",
+            fence=2,
             fact_type="dispatch_authorized",
             source="test",
             state_class=None,
@@ -139,6 +164,66 @@ class EffectProjectionTests(unittest.TestCase):
         )
         with self.assertRaises(ProtocolError):
             project_effect_state(self.intent, (other,))
+
+    def test_git_and_pr_expected_states_are_independently_fixed(self) -> None:
+        git = self.intent
+        pr_expected = {
+            "schema_version": "solidworks-to-urdf.pr-upsert/v1",
+            "repository": "owner/repo",
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/generated",
+            "candidate_commit": "c" * 40,
+            "subject_sha256": digest({"subject": 1}),
+            "title_digest": digest({"title": 1}),
+            "body_digest": digest({"body": 1}),
+            "expected_pr": None,
+        }
+        pr = EffectIntent(
+            effect_id="effect-2",
+            command_id="command-1",
+            effect_key="pr",
+            effect_kind="pr_upsert",
+            target={
+                "repository": "owner/repo",
+                "base_ref": "refs/heads/main",
+                "head_ref": "refs/heads/generated",
+            },
+            expected_state=pr_expected,
+            expected_state_digest=digest(pr_expected),
+            outbound_artifact_id="outbound-2",
+            outbound_digest=digest({"outbound": 2}),
+            created_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        self.assertNotEqual(git.effect_id, pr.effect_id)
+        changed_target = dict(pr.target, head_ref="refs/heads/other")
+        with self.assertRaises(ProtocolError):
+            EffectIntent(
+                effect_id="effect-3",
+                command_id="command-1",
+                effect_key="pr-mismatch",
+                effect_kind="pr_upsert",
+                target=changed_target,
+                expected_state=pr_expected,
+                expected_state_digest=digest(pr_expected),
+                outbound_artifact_id="outbound-3",
+                outbound_digest=digest({"outbound": 3}),
+                created_at=datetime(2026, 10, 25, tzinfo=UTC),
+            )
+
+    def test_effect_intent_identity_ignores_only_creation_time(self) -> None:
+        replay = EffectIntent(
+            effect_id=self.intent.effect_id,
+            command_id=self.intent.command_id,
+            effect_key=self.intent.effect_key,
+            effect_kind=self.intent.effect_kind,
+            target=self.intent.target,
+            expected_state=self.intent.expected_state,
+            expected_state_digest=self.intent.expected_state_digest,
+            outbound_artifact_id=self.intent.outbound_artifact_id,
+            outbound_digest=self.intent.outbound_digest,
+            created_at=datetime(2026, 10, 26, tzinfo=UTC),
+        )
+        self.assertEqual(replay.identity_digest, self.intent.identity_digest)
 
 
 class DerivedStateTests(unittest.TestCase):
@@ -225,22 +310,48 @@ class CommandIdentityTests(unittest.TestCase):
         record = value.to_record()
         self.assertEqual(record["request"], {"nested": {"items": [{"name": "source"}]}})
 
+    def test_path_bearing_identifiers_and_locators_are_canonical(self) -> None:
+        with self.assertRaises(ProtocolError):
+            StageCommand.create(
+                command_id="../escape",
+                run_id="run-1",
+                stage="freeze",
+                idempotency_key="run-1/freeze",
+                request={},
+                input_artifacts=(),
+                config_snapshot_sha256=digest({"config": 1}),
+                contract_sha256=digest({"contract": 1}),
+                policy_sha256=digest({"policy": 1}),
+                expected_executor_sha256=digest({"executor": "freeze"}),
+                predecessor_decision_id=None,
+            )
+        with self.assertRaises(ProtocolError):
+            ArtifactRef(
+                artifact_id="artifact-1",
+                kind="input_set",
+                locator="cas://artifact/../escape",
+                manifest_sha256=digest({"manifest": 1}),
+                set_sha256=digest({"set": 1}),
+                producer_run_id="run-1",
+                producer_stage="freeze",
+                producer_tool_sha256=digest({"tool": 1}),
+            )
+
 
 class _Handler:
     def __init__(self) -> None:
         self.executions = 0
         self.validations = 0
 
-    def execute(self, command_value, claim, workspace):
+    def execute(self, command_value, claim, workspace, *, effects):
         self.executions += 1
         return StageExecution(
             outcome="completed",
             candidate_root=str(workspace.root / "generated"),
             checks_sha256=digest({"checks": 1}),
-            required_effect_ids=("native-effect",),
         )
 
-    def validate_candidate(self, command_value, claim, candidate):
+    def validate_candidate(self, command_value, claim, candidate, *, effects):
         self.validations += 1
         return candidate
 
@@ -258,7 +369,8 @@ class _Services:
             claim_id="claim-1",
             command_id=command_value.command_id,
             fence=1,
-            owner_sha256=command_value.expected_executor_sha256,
+            owner_sha256=digest({"process": "test"}),
+            executor_sha256=command_value.expected_executor_sha256,
             lane_key=None,
             expires_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(minutes=5),
         )
@@ -290,12 +402,22 @@ class _Services:
 
     def seal_candidate(self, command_value, claim, execution):
         self.seal_calls += 1
-        result_artifact = ArtifactRef(
-            artifact_id="result-1",
-            kind="stage_result",
-            locator="cas://result-1",
+        output_artifact = ArtifactRef(
+            artifact_id="output-1",
+            kind="stage_output",
+            locator="cas://artifact/output-1",
             manifest_sha256=digest({"manifest": 1}),
             set_sha256=digest({"set": 1}),
+            producer_run_id=command_value.run_id,
+            producer_stage=command_value.stage,
+            producer_tool_sha256=command_value.expected_executor_sha256,
+        )
+        result_record_artifact = ArtifactRef(
+            artifact_id="result-1",
+            kind="stage_result",
+            locator="cas://artifact/result-1",
+            manifest_sha256=digest({"manifest": "result"}),
+            set_sha256=digest({"set": "result"}),
             producer_run_id=command_value.run_id,
             producer_stage=command_value.stage,
             producer_tool_sha256=command_value.expected_executor_sha256,
@@ -307,20 +429,29 @@ class _Services:
             stage=command_value.stage,
             request_digest=command_value.request_digest,
             outcome=execution.outcome,
-            result_artifact=result_artifact,
+            output_artifact=output_artifact,
             actual_executor_sha256=command_value.expected_executor_sha256,
             checks_sha256=execution.checks_sha256,
-            required_effect_ids=execution.required_effect_ids,
+            required_effect_ids=("native-effect",),
             reason_code=execution.reason_code,
         )
-        self.candidate = StageCandidate(result=result)
+        self.candidate = StageCandidate(
+            result=result,
+            result_record_artifact=result_record_artifact,
+            candidate_id=f"candidate-{result.digest}",
+            claim_id=claim.claim_id,
+            fence=claim.fence,
+        )
         return self.candidate
 
     def verify_candidate(self, command_value, claim, candidate):
         return candidate
 
-    def effect_state(self, effect_id):
-        return self.effects[effect_id]
+    def effect_states_for_command(self, command_id):
+        return dict(self.effects)
+
+    def effect_port(self, command_value, claim, workspace):
+        return object()
 
     def commit_decision(self, command_value, claim, candidate):
         self.commit_calls += 1
@@ -329,15 +460,22 @@ class _Services:
             run_id=command_value.run_id,
             stage=command_value.stage,
             command_id=command_value.command_id,
-            result_artifact=candidate.result.result_artifact,
+            result_record_artifact=candidate.result_record_artifact,
             result_digest=candidate.result.digest,
             actual_executor_sha256=candidate.result.actual_executor_sha256,
             outcome=candidate.result.outcome,
             original_producer_decision_id=None,
             reason_code=candidate.result.reason_code,
+            failure_envelope=None,
             decided_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
         return self.decision
+
+    def commit_failure(self, command_value, claim, failure):
+        raise AssertionError("failure not expected")
+
+    def discard_workspace(self, workspace):
+        return None
 
 
 class StageEngineTests(unittest.TestCase):
@@ -361,7 +499,7 @@ class StageEngineTests(unittest.TestCase):
         )
         self.assertEqual(first, second)
         self.assertEqual(self.handler.executions, 1)
-        self.assertEqual(self.handler.validations, 0)
+        self.assertEqual(self.handler.validations, 1)
         self.assertEqual(self.services.seal_calls, 1)
         self.assertEqual(self.services.commit_calls, 1)
 
@@ -390,7 +528,7 @@ class StageEngineTests(unittest.TestCase):
             services=self.services,
         )
         self.assertEqual(self.handler.executions, 1)
-        self.assertEqual(self.handler.validations, 1)
+        self.assertEqual(self.handler.validations, 2)
         self.assertEqual(self.services.commit_calls, 2)
 
 

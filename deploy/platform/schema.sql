@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
     command_id text NOT NULL REFERENCES :"platform_schema".command (command_id),
     fence bigint NOT NULL CHECK (fence > 0),
     owner_sha256 char(64) NOT NULL CHECK (owner_sha256 ~ '^[0-9a-f]{64}$'),
+    executor_sha256 char(64) NOT NULL CHECK (executor_sha256 ~ '^[0-9a-f]{64}$'),
     lane_key text,
     dag_id text,
     dag_run_id text,
@@ -193,6 +194,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
         (closed_at IS NULL AND closure_code IS NULL)
         OR (closed_at IS NOT NULL AND closure_code IS NOT NULL)
     ),
+    CHECK (owner_sha256 <> executor_sha256),
     CHECK (expires_at >= issued_at)
 );
 
@@ -212,14 +214,35 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".stage_decision (
     ),
     command_id text NOT NULL UNIQUE REFERENCES :"platform_schema".command (command_id),
     outcome text NOT NULL CHECK (outcome IN ('completed', 'failed', 'cancelled')),
-    result_artifact_id text NOT NULL REFERENCES :"platform_schema".artifact (artifact_id),
-    result_digest char(64) NOT NULL CHECK (result_digest ~ '^[0-9a-f]{64}$'),
+    result_record_artifact_id text REFERENCES :"platform_schema".artifact (artifact_id),
+    result_digest char(64) CHECK (result_digest IS NULL OR result_digest ~ '^[0-9a-f]{64}$'),
     actual_executor_sha256 char(64) NOT NULL CHECK (actual_executor_sha256 ~ '^[0-9a-f]{64}$'),
     original_producer_decision_id text REFERENCES :"platform_schema".stage_decision (decision_id),
     reason_code text,
+    failure_envelope jsonb,
+    failure_digest char(64) CHECK (failure_digest IS NULL OR failure_digest ~ '^[0-9a-f]{64}$'),
     decided_at timestamptz NOT NULL,
     UNIQUE (run_id, stage),
-    CHECK (outcome = 'completed' OR reason_code IS NOT NULL)
+    CHECK (
+        outcome <> 'completed'
+        OR (result_record_artifact_id IS NOT NULL AND result_digest IS NOT NULL AND failure_envelope IS NULL)
+    ),
+    CHECK (
+        outcome = 'completed'
+        OR (
+            reason_code IS NOT NULL
+            AND (
+                (result_record_artifact_id IS NOT NULL AND result_digest IS NOT NULL AND failure_envelope IS NULL)
+                OR (
+                    result_record_artifact_id IS NULL
+                    AND result_digest IS NULL
+                    AND failure_envelope IS NOT NULL
+                    AND failure_digest IS NOT NULL
+                )
+            )
+        )
+    ),
+    CHECK ((failure_envelope IS NULL) = (failure_digest IS NULL))
 );
 
 CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate (
@@ -227,11 +250,13 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate (
     command_id text NOT NULL UNIQUE REFERENCES :"platform_schema".command (command_id),
     claim_id text NOT NULL REFERENCES :"platform_schema".execution_claim (claim_id),
     fence bigint NOT NULL CHECK (fence > 0),
-    result_artifact_id text NOT NULL UNIQUE REFERENCES :"platform_schema".artifact (artifact_id),
+    output_artifact_id text NOT NULL REFERENCES :"platform_schema".artifact (artifact_id),
+    result_record_artifact_id text NOT NULL UNIQUE REFERENCES :"platform_schema".artifact (artifact_id),
     result_digest char(64) NOT NULL CHECK (result_digest ~ '^[0-9a-f]{64}$'),
     outcome text NOT NULL CHECK (outcome IN ('completed', 'failed', 'cancelled')),
     reason_code text,
     created_at timestamptz NOT NULL,
+    CHECK (output_artifact_id <> result_record_artifact_id),
     CHECK (outcome = 'completed' OR reason_code IS NOT NULL)
 );
 
@@ -269,8 +294,12 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".effect_fact (
     observed_at timestamptz NOT NULL,
     UNIQUE (effect_id, seq),
     CHECK (
-        (fact_type IN ('response', 'observation', 'reconciled') AND state_class IS NOT NULL)
-        OR (fact_type NOT IN ('response', 'observation', 'reconciled') AND state_class IS NULL)
+        (fact_type IN ('observation', 'reconciled') AND state_class IS NOT NULL)
+        OR (fact_type NOT IN ('observation', 'reconciled') AND state_class IS NULL)
+    ),
+    CHECK (
+        fact_type NOT IN ('observation', 'reconciled')
+        OR payload_artifact_id IS NOT NULL
     ),
     CHECK ((claim_id IS NULL) = (fence IS NULL))
 );

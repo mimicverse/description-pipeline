@@ -61,7 +61,7 @@ def artifact(name: str) -> ArtifactRef:
     return ArtifactRef(
         artifact_id=name,
         kind="input_set",
-        locator=f"cas://{name}",
+        locator=f"cas://artifact/{name}",
         manifest_sha256=digest({"manifest": name}),
         set_sha256=digest({"set": name}),
         producer_run_id="run-source",
@@ -156,7 +156,8 @@ class AdmissionTests(unittest.TestCase):
 class ClaimTests(unittest.TestCase):
     def setUp(self) -> None:
         self.command = freeze_command()
-        self.owner = self.command.expected_executor_sha256
+        self.owner = digest({"process": "claim-owner"})
+        self.executor = self.command.expected_executor_sha256
         self.now = datetime(2026, 10, 25, tzinfo=UTC)
 
     def command_row(self):
@@ -164,28 +165,28 @@ class ClaimTests(unittest.TestCase):
             self.command.command_id,
             self.command.run_id,
             self.command.stage,
-            self.owner,
+            self.executor,
         )
 
-    def test_same_owner_reuses_the_open_claim(self) -> None:
+    def test_same_owner_reentry_cannot_acquire_the_open_claim_twice(self) -> None:
         expiry = self.now + timedelta(minutes=5)
         connection = _Connection(
             [
                 self.command_row(),
                 None,
-                ("claim-1", self.command.command_id, 1, self.owner, None, expiry),
+                ("claim-1", self.command.command_id, 1, self.owner, self.executor, None, expiry),
             ]
         )
         store = FactStore(lambda: connection, _Reader())
-        claim = store.acquire_claim(
-            self.command.command_id,
-            claim_id="ignored-new-id",
-            owner_sha256=self.owner,
-            now=self.now,
-            expires_at=expiry,
-        )
-        self.assertEqual(claim.claim_id, "claim-1")
-        self.assertEqual(claim.fence, 1)
+        with self.assertRaises(FactConflict):
+            store.acquire_claim(
+                self.command.command_id,
+                claim_id="claim-2",
+                owner_sha256=self.owner,
+                executor_sha256=self.executor,
+                now=self.now,
+                expires_at=expiry,
+            )
 
     def test_live_foreign_owner_is_refused(self) -> None:
         connection = _Connection(
@@ -197,6 +198,7 @@ class ClaimTests(unittest.TestCase):
                     self.command.command_id,
                     1,
                     self.owner,
+                    self.executor,
                     None,
                     self.now + timedelta(minutes=5),
                 ),
@@ -208,6 +210,7 @@ class ClaimTests(unittest.TestCase):
                 self.command.command_id,
                 claim_id="claim-2",
                 owner_sha256=digest({"executor": "other"}),
+                executor_sha256=self.executor,
                 now=self.now,
                 expires_at=self.now + timedelta(minutes=5),
             )
@@ -222,6 +225,7 @@ class ClaimTests(unittest.TestCase):
                     self.command.command_id,
                     1,
                     self.owner,
+                    self.executor,
                     None,
                     self.now - timedelta(seconds=1),
                 ),
@@ -236,6 +240,7 @@ class ClaimTests(unittest.TestCase):
             self.command.command_id,
             claim_id="claim-2",
             owner_sha256=digest({"executor": "replacement"}),
+            executor_sha256=self.executor,
             now=self.now,
             expires_at=self.now + timedelta(minutes=5),
         )
@@ -252,6 +257,7 @@ class ClaimTests(unittest.TestCase):
                     self.command.command_id,
                     1,
                     self.owner,
+                    self.executor,
                     None,
                     self.now - timedelta(seconds=1),
                 ),
@@ -291,6 +297,7 @@ class ClaimTests(unittest.TestCase):
                 self.command.command_id,
                 claim_id="claim-2",
                 owner_sha256=digest({"executor": "replacement"}),
+                executor_sha256=self.executor,
                 now=self.now,
                 expires_at=self.now + timedelta(minutes=5),
             )

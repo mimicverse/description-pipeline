@@ -173,7 +173,12 @@ class ArtifactStore:
         producer_stage: StageId | None,
         producer_tool_sha256: str,
     ) -> ArtifactRef:
-        origin = Path(source).resolve()
+        supplied = Path(source)
+        if supplied.is_symlink() or supplied.is_junction():
+            raise ArtifactStoreError("An artifact source root may not be a symbolic link")
+        origin = supplied.resolve()
+        if any(parent.is_symlink() for parent in origin.parents):
+            raise ArtifactStoreError("An artifact source may not traverse a symbolic link")
         first = self._members(origin)
         record = self._descriptor(
             kind=kind,

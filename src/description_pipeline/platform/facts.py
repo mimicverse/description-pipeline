@@ -10,21 +10,30 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 from typing import Protocol
 
-from ..io import PipelineError
+from ..io import PipelineError, digest
 from ..pipeline.contracts import (
     STAGES,
     ArtifactRef,
     ExecutionClaim,
+    FailureEnvelope,
     RunAdmission,
     StageCandidate,
     StageCommand,
     StageDecision,
     StageResult,
 )
-from ..pipeline.effects import EffectFact, EffectIntent, EffectState, project_effect_state
+from ..pipeline.effects import (
+    EffectFact,
+    EffectIntent,
+    EffectSettlement,
+    EffectState,
+    project_effect_settlement,
+    project_effect_state,
+)
 
 
 class FactStoreError(PipelineError):
@@ -155,9 +164,7 @@ class FactStore:
             raise FactStoreError("The artifact registration conflicted without an existing row")
         stored = _artifact_from_row(existing)
         if stored != artifact:
-            raise FactConflict(
-                f"The artifact identity {artifact.artifact_id!r} is already bound to different bytes"
-            )
+            raise FactConflict(f"The artifact identity {artifact.artifact_id!r} is already bound to different bytes")
         return stored
 
     def register_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
@@ -356,9 +363,9 @@ class FactStore:
     def _decision_row(self, cursor, *, run_id: str, stage: str):
         cursor.execute(
             """
-            SELECT decision_id, run_id, stage, command_id, outcome, result_artifact_id,
+            SELECT decision_id, run_id, stage, command_id, outcome, result_record_artifact_id,
                    result_digest, actual_executor_sha256, original_producer_decision_id,
-                   reason_code, decided_at
+                   reason_code, decided_at, failure_envelope, failure_digest
             FROM stage_decision
             WHERE run_id = %s AND stage = %s
             """,
@@ -382,18 +389,23 @@ class FactStore:
         return _artifact_from_row(row)
 
     def _decision_from_row(self, cursor, row) -> StageDecision:
+        failure_record = row[11]
+        failure = FailureEnvelope.from_record(failure_record) if failure_record is not None else None
+        if failure is not None and digest(failure.to_record()) != row[12]:
+            raise FactStoreError("The failure envelope digest differs from the registered digest")
         return StageDecision(
             decision_id=row[0],
             run_id=row[1],
             stage=row[2],
             command_id=row[3],
             outcome=row[4],
-            result_artifact=self._artifact_cursor(cursor, row[5]),
+            result_record_artifact=self._artifact_cursor(cursor, row[5]) if row[5] is not None else None,
             result_digest=row[6],
             actual_executor_sha256=row[7],
             original_producer_decision_id=row[8],
             reason_code=row[9],
             decided_at=row[10],
+            failure_envelope=failure,
         )
 
     def decision_for(self, command: StageCommand) -> StageDecision | None:
@@ -405,7 +417,9 @@ class FactStore:
             return None if row is None else self._decision_from_row(cursor, row)
 
     def load_result(self, decision: StageDecision) -> StageResult:
-        result = self._result_reader.read_result(decision.result_artifact)
+        if decision.result_record_artifact is None:
+            raise FactStoreError("A minimal failure envelope has no StageResult artifact")
+        result = self._result_reader.read_result(decision.result_record_artifact)
         if (
             result.command_id != decision.command_id
             or result.run_id != decision.run_id
@@ -422,6 +436,7 @@ class FactStore:
         *,
         claim_id: str,
         owner_sha256: str,
+        executor_sha256: str,
         now: datetime,
         expires_at: datetime,
         lane_key: str | None = None,
@@ -450,11 +465,13 @@ class FactStore:
             command = cursor.fetchone()
             if command is None:
                 raise FactStoreError(f"The command {command_id!r} is not registered")
+            if command[3] != executor_sha256:
+                raise FactConflict("The claim executor identity differs from the command expectation")
             if command[2] is not None and self._decision_row(cursor, run_id=command[1], stage=command[2]) is not None:
                 raise FactConflict("A decided command cannot acquire a new execution claim")
             cursor.execute(
                 """
-                SELECT claim_id, command_id, fence, owner_sha256, lane_key, expires_at
+                SELECT claim_id, command_id, fence, owner_sha256, executor_sha256, lane_key, expires_at
                 FROM execution_claim
                 WHERE command_id = %s AND closed_at IS NULL
                 FOR UPDATE
@@ -468,15 +485,14 @@ class FactStore:
                     command_id=current[1],
                     fence=current[2],
                     owner_sha256=current[3],
-                    lane_key=current[4],
-                    expires_at=current[5],
+                    executor_sha256=current[4],
+                    lane_key=current[5],
+                    expires_at=current[6],
                 )
-                if claim.owner_sha256 == owner_sha256:
-                    return claim
                 if claim.expires_at > now:
                     raise FactConflict("Another live executor owns the command")
-                if self._command_has_effect_activity(cursor, command_id):
-                    raise FactConflict("An expired claim carries effect activity and requires reconciliation")
+                if self._command_has_unresolved_effect(cursor, command_id):
+                    raise FactConflict("An expired claim carries an unresolved effect and requires reconciliation")
                 cursor.execute(
                     """
                     UPDATE execution_claim
@@ -485,6 +501,8 @@ class FactStore:
                     """,
                     (now, claim.claim_id),
                 )
+            elif self._command_has_unresolved_effect(cursor, command_id):
+                raise FactConflict("The command carries an unresolved effect and requires reconciliation")
             cursor.execute(
                 "SELECT COALESCE(MAX(fence), 0) + 1 FROM execution_claim WHERE command_id = %s",
                 (command_id,),
@@ -493,16 +511,18 @@ class FactStore:
             cursor.execute(
                 """
                 INSERT INTO execution_claim (
-                    claim_id, command_id, fence, owner_sha256, lane_key,
+                    claim_id, command_id, fence, owner_sha256, executor_sha256,
+                    lane_key,
                     dag_id, dag_run_id, task_id, map_index,
                     issued_at, last_seen_at, expires_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     claim_id,
                     command_id,
                     fence,
                     owner_sha256,
+                    executor_sha256,
                     lane_key,
                     dag_id,
                     dag_run_id,
@@ -518,30 +538,47 @@ class FactStore:
                 command_id=command_id,
                 fence=fence,
                 owner_sha256=owner_sha256,
+                executor_sha256=executor_sha256,
                 lane_key=lane_key,
                 expires_at=expires_at,
             )
 
-    def _command_has_effect_activity(self, cursor, command_id: str) -> bool:
+    def _command_has_unresolved_effect(self, cursor, command_id: str) -> bool:
         cursor.execute("SELECT effect_id FROM effect_intent WHERE command_id = %s", (command_id,))
         for (effect_id,) in cursor.fetchall():
             state = self._effect_state_cursor(cursor, effect_id)
-            if state is not EffectState.PREPARED:
+            if state in {EffectState.UNKNOWN, EffectState.CONFLICT}:
                 return True
         return False
 
-    def _effect_state_cursor(self, cursor, effect_id: str) -> EffectState:
-        intent, facts = self._effect_cursor(cursor, effect_id)
+    def _effect_state_cursor(
+        self,
+        cursor,
+        effect_id: str,
+        *,
+        expected_command_id: str | None = None,
+    ) -> EffectState:
+        intent, facts = self._effect_cursor(cursor, effect_id, lock=True)
+        if expected_command_id is not None and intent.command_id != expected_command_id:
+            raise FactConflict("The effect names another command")
         return project_effect_state(intent, facts)
 
-    def _effect_cursor(self, cursor, effect_id: str) -> tuple[EffectIntent, tuple[EffectFact, ...]]:
+    def _effect_cursor(
+        self,
+        cursor,
+        effect_id: str,
+        *,
+        lock: bool = False,
+    ) -> tuple[EffectIntent, tuple[EffectFact, ...]]:
+        lock_sql = " FOR UPDATE" if lock else ""
         cursor.execute(
             """
             SELECT effect_id, command_id, effect_key, effect_kind, target, expected_state,
                    expected_state_digest, outbound_artifact_id, outbound_digest, created_at
             FROM effect_intent
             WHERE effect_id = %s
-            """,
+            """
+            + lock_sql,
             (effect_id,),
         )
         row = cursor.fetchone()
@@ -566,7 +603,8 @@ class FactStore:
             FROM effect_fact
             WHERE effect_id = %s
             ORDER BY seq
-            """,
+            """
+            + lock_sql,
             (effect_id,),
         )
         facts = tuple(
@@ -587,9 +625,242 @@ class FactStore:
         )
         return intent, facts
 
-    def effect_state(self, effect_id: str) -> EffectState:
+    def effect_state(self, effect_id: str, *, expected_command_id: str | None = None) -> EffectState:
         with self._transaction() as connection:
-            return self._effect_state_cursor(connection.cursor(), effect_id)
+            return self._effect_state_cursor(
+                connection.cursor(),
+                effect_id,
+                expected_command_id=expected_command_id,
+            )
+
+    def _effect_settlement_cursor(
+        self,
+        cursor,
+        effect_id: str,
+        *,
+        expected_command_id: str | None = None,
+    ) -> EffectSettlement:
+        intent, facts = self._effect_cursor(cursor, effect_id, lock=True)
+        if expected_command_id is not None and intent.command_id != expected_command_id:
+            raise FactConflict("The effect names another command")
+        settlement = project_effect_settlement(intent, facts)
+        artifact_id = settlement.decisive_fact.payload_artifact_id if settlement.decisive_fact else None
+        if artifact_id is None:
+            return settlement
+        return replace(settlement, payload_artifact=self._artifact_cursor(cursor, artifact_id))
+
+    def effect_settlement(self, effect_id: str, *, expected_command_id: str | None = None) -> EffectSettlement:
+        with self._transaction() as connection:
+            return self._effect_settlement_cursor(
+                connection.cursor(),
+                effect_id,
+                expected_command_id=expected_command_id,
+            )
+
+    def effect_settlement_for_key(self, command_id: str, effect_key: str) -> EffectSettlement | None:
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT effect_id
+                FROM effect_intent
+                WHERE command_id = %s AND effect_key = %s
+                FOR UPDATE
+                """,
+                (command_id, effect_key),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return self._effect_settlement_cursor(cursor, row[0], expected_command_id=command_id)
+
+    def _effect_states_for_command_cursor(
+        self,
+        cursor,
+        command_id: str,
+        *,
+        lock: bool = False,
+    ) -> dict[str, EffectState]:
+        cursor.execute(
+            """
+            SELECT effect_id
+            FROM effect_intent
+            WHERE command_id = %s
+            ORDER BY effect_id
+            """
+            + (" FOR UPDATE" if lock else ""),
+            (command_id,),
+        )
+        effect_ids = [row[0] for row in cursor.fetchall()]
+        return {
+            effect_id: project_effect_state(*self._effect_cursor(cursor, effect_id, lock=lock))
+            for effect_id in effect_ids
+        }
+
+    def effect_states_for_command(self, command_id: str) -> dict[str, EffectState]:
+        with self._transaction() as connection:
+            return self._effect_states_for_command_cursor(connection.cursor(), command_id)
+
+    def effect_ids_for_command(self, command_id: str) -> tuple[str, ...]:
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT effect_id FROM effect_intent WHERE command_id = %s ORDER BY effect_id",
+                (command_id,),
+            )
+            return tuple(row[0] for row in cursor.fetchall())
+
+    def _append_effect_fact_cursor(
+        self,
+        cursor,
+        *,
+        effect_id: str,
+        claim: ExecutionClaim | None,
+        fact_type: str,
+        source: str,
+        state_class: str | None,
+        payload_artifact: ArtifactRef | None,
+        payload_digest: str,
+        observed_at: datetime,
+        fact_id: str,
+        expected_command_id: str | None = None,
+    ) -> EffectFact:
+        stored = None
+        if claim is not None:
+            cursor.execute(
+                """
+                SELECT command_id, fence, owner_sha256, executor_sha256, closed_at
+                FROM execution_claim
+                WHERE claim_id = %s
+                FOR UPDATE
+                """,
+                (claim.claim_id,),
+            )
+            stored = cursor.fetchone()
+            if stored is None or stored[:4] != (
+                claim.command_id,
+                claim.fence,
+                claim.owner_sha256,
+                claim.executor_sha256,
+            ):
+                raise FactConflict("The effect fact names a foreign claim/fence")
+            if fact_type == "dispatch_authorized" and stored[4] is not None:
+                raise FactConflict("The dispatch authorization claim is already closed")
+        cursor.execute("SELECT command_id FROM effect_intent WHERE effect_id = %s FOR UPDATE", (effect_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise FactStoreError(f"The effect {effect_id!r} is not registered")
+        if expected_command_id is not None and row[0] != expected_command_id:
+            raise FactConflict("The effect fact names another command")
+        if claim is not None and claim.command_id != row[0]:
+            raise FactConflict("The effect fact claim names another command")
+        if fact_type in {"dispatch_authorized", "response", "timeout"} and claim is None:
+            raise FactConflict(f"{fact_type} requires its execution claim")
+        if fact_type in {"response", "timeout"}:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM effect_fact
+                WHERE effect_id = %s
+                  AND fact_type = 'dispatch_authorized'
+                  AND claim_id = %s
+                  AND fence = %s
+                LIMIT 1
+                """,
+                (effect_id, claim.claim_id, claim.fence),
+            )
+            if cursor.fetchone() is None:
+                raise FactConflict("The response/timeout has no matching dispatch authorization")
+        if payload_artifact is not None:
+            self._insert_artifact(cursor, payload_artifact)
+        cursor.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM effect_fact WHERE effect_id = %s",
+            (effect_id,),
+        )
+        seq = cursor.fetchone()[0]
+        fact = EffectFact(
+            fact_id=fact_id,
+            effect_id=effect_id,
+            seq=seq,
+            claim_id=None if claim is None else claim.claim_id,
+            fence=None if claim is None else claim.fence,
+            fact_type=fact_type,
+            source=source,
+            state_class=state_class,
+            payload_artifact_id=None if payload_artifact is None else payload_artifact.artifact_id,
+            payload_digest=payload_digest,
+            observed_at=observed_at,
+        )
+        cursor.execute(
+            """
+            INSERT INTO effect_fact (
+                fact_id, effect_id, seq, claim_id, fence, fact_type, source,
+                state_class, payload_artifact_id, payload_digest, observed_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                fact.fact_id,
+                fact.effect_id,
+                fact.seq,
+                fact.claim_id,
+                fact.fence,
+                fact.fact_type,
+                fact.source,
+                fact.state_class,
+                fact.payload_artifact_id,
+                fact.payload_digest,
+                fact.observed_at,
+            ),
+        )
+        return fact
+
+    def authorize_effect_dispatch(
+        self,
+        *,
+        effect_id: str,
+        claim: ExecutionClaim,
+        source: str,
+        payload_digest: str,
+        observed_at: datetime,
+        fact_id: str,
+        expected_command_id: str | None = None,
+    ) -> EffectFact:
+        """Persist the only permission that may precede the external call."""
+
+        if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
+            raise FactStoreError("Effect dispatch time must be timezone-aware")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            self._verify_open_claim_cursor(cursor, claim)
+            cursor.execute("SELECT command_id FROM effect_intent WHERE effect_id = %s FOR UPDATE", (effect_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise FactStoreError(f"The effect {effect_id!r} is not registered")
+            if row[0] != claim.command_id:
+                raise FactConflict("The effect dispatch claim names another command")
+            cursor.execute(
+                "SELECT expires_at FROM execution_claim WHERE claim_id = %s FOR UPDATE",
+                (claim.claim_id,),
+            )
+            expiry = cursor.fetchone()
+            if expiry is None or observed_at >= expiry[0]:
+                raise FactConflict("Lease expiry does not authorize an external dispatch")
+            state = self._effect_state_cursor(cursor, effect_id)
+            if state is not EffectState.PREPARED:
+                raise FactConflict(f"The effect is {state.value}; observe or reconcile it before another dispatch")
+            return self._append_effect_fact_cursor(
+                cursor,
+                effect_id=effect_id,
+                claim=claim,
+                fact_type="dispatch_authorized",
+                source=source,
+                state_class=None,
+                payload_artifact=None,
+                payload_digest=payload_digest,
+                observed_at=observed_at,
+                fact_id=fact_id,
+                expected_command_id=expected_command_id,
+            )
 
     def register_effect_intent(
         self,
@@ -598,6 +869,8 @@ class FactStore:
         claim: ExecutionClaim,
         outbound_artifact: ArtifactRef,
     ) -> EffectIntent:
+        if intent.command_id != claim.command_id:
+            raise FactConflict("The effect intent names another command than the claim")
         if outbound_artifact.artifact_id != intent.outbound_artifact_id:
             raise FactStoreError("The outbound artifact does not match the effect intent")
         with self._transaction() as connection:
@@ -638,7 +911,7 @@ class FactStore:
                 if existing is None:
                     raise FactStoreError("The effect intent conflicted without an existing row")
                 stored_intent, _ = self._effect_cursor(cursor, existing[0])
-                if stored_intent != intent:
+                if stored_intent.identity_digest != intent.identity_digest:
                     raise FactConflict("The command/effect key is bound to a different effect intent")
                 return stored_intent
             return intent
@@ -646,7 +919,7 @@ class FactStore:
     def _verify_open_claim_cursor(self, cursor, claim: ExecutionClaim) -> None:
         cursor.execute(
             """
-            SELECT command_id, fence, owner_sha256, closed_at
+            SELECT command_id, fence, owner_sha256, executor_sha256, closed_at
             FROM execution_claim
             WHERE claim_id = %s
             FOR UPDATE
@@ -654,9 +927,15 @@ class FactStore:
             (claim.claim_id,),
         )
         row = cursor.fetchone()
-        if row is None or row[0] != claim.command_id or row[1] != claim.fence or row[2] != claim.owner_sha256:
+        if (
+            row is None
+            or row[0] != claim.command_id
+            or row[1] != claim.fence
+            or row[2] != claim.owner_sha256
+            or row[3] != claim.executor_sha256
+        ):
             raise FactConflict("The execution claim identity is stale or foreign")
-        if row[3] is not None:
+        if row[4] is not None:
             raise FactConflict("The execution claim is already closed")
 
     def append_effect_fact(
@@ -671,84 +950,52 @@ class FactStore:
         payload_digest: str,
         observed_at: datetime,
         fact_id: str,
+        expected_command_id: str | None = None,
     ) -> EffectFact:
         with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute("SELECT command_id FROM effect_intent WHERE effect_id = %s FOR UPDATE", (effect_id,))
-            row = cursor.fetchone()
-            if row is None:
-                raise FactStoreError(f"The effect {effect_id!r} is not registered")
-            if claim is not None:
-                if claim.command_id != row[0]:
-                    raise FactConflict("The effect fact claim names another command")
-                cursor.execute(
-                    "SELECT command_id, fence FROM execution_claim WHERE claim_id = %s",
-                    (claim.claim_id,),
-                )
-                stored = cursor.fetchone()
-                if stored != (claim.command_id, claim.fence):
-                    raise FactConflict("The effect fact names a foreign claim/fence")
-            if payload_artifact is not None:
-                self._insert_artifact(cursor, payload_artifact)
-            cursor.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM effect_fact WHERE effect_id = %s", (effect_id,))
-            seq = cursor.fetchone()[0]
-            fact = EffectFact(
-                fact_id=fact_id,
+            return self._append_effect_fact_cursor(
+                connection.cursor(),
                 effect_id=effect_id,
-                seq=seq,
-                claim_id=None if claim is None else claim.claim_id,
-                fence=None if claim is None else claim.fence,
+                claim=claim,
                 fact_type=fact_type,
                 source=source,
                 state_class=state_class,
-                payload_artifact_id=None if payload_artifact is None else payload_artifact.artifact_id,
+                payload_artifact=payload_artifact,
                 payload_digest=payload_digest,
                 observed_at=observed_at,
+                fact_id=fact_id,
+                expected_command_id=expected_command_id,
             )
-            cursor.execute(
-                """
-                INSERT INTO effect_fact (
-                    fact_id, effect_id, seq, claim_id, fence, fact_type, source,
-                    state_class, payload_artifact_id, payload_digest, observed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    fact.fact_id,
-                    fact.effect_id,
-                    fact.seq,
-                    fact.claim_id,
-                    fact.fence,
-                    fact.fact_type,
-                    fact.source,
-                    fact.state_class,
-                    fact.payload_artifact_id,
-                    fact.payload_digest,
-                    fact.observed_at,
-                ),
-            )
-            return fact
 
     def register_candidate(
         self,
         *,
         candidate_id: str,
         claim: ExecutionClaim,
-        result_artifact: ArtifactRef,
+        output_artifact: ArtifactRef,
+        result_record_artifact: ArtifactRef,
         result: StageResult,
         created_at: datetime,
     ) -> StageCandidate:
-        if result.result_artifact != result_artifact:
-            raise FactStoreError("The StageResult does not carry its declared artifact")
+        if result.command_id != claim.command_id:
+            raise FactConflict("The StageResult names another command than the claim")
+        if result.output_artifact != output_artifact:
+            raise FactStoreError("The StageResult does not carry its declared output artifact")
+        if result_record_artifact.kind != "stage_result":
+            raise FactStoreError("The result record artifact has the wrong kind")
+        if result.actual_executor_sha256 != claim.executor_sha256:
+            raise FactConflict("The candidate executor differs from the claim executor")
         with self._transaction() as connection:
             cursor = connection.cursor()
             self._verify_open_claim_cursor(cursor, claim)
-            self._insert_artifact(cursor, result_artifact)
+            self._insert_artifact(cursor, output_artifact)
+            self._insert_artifact(cursor, result_record_artifact)
             cursor.execute(
                 """
                 INSERT INTO stage_candidate (
-                    candidate_id, command_id, claim_id, fence, result_artifact_id,
-                    result_digest, outcome, reason_code, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    candidate_id, command_id, claim_id, fence, output_artifact_id,
+                    result_record_artifact_id, result_digest, outcome, reason_code, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 RETURNING candidate_id
                 """,
@@ -757,7 +1004,8 @@ class FactStore:
                     result.command_id,
                     claim.claim_id,
                     claim.fence,
-                    result_artifact.artifact_id,
+                    output_artifact.artifact_id,
+                    result_record_artifact.artifact_id,
                     result.digest,
                     result.outcome,
                     result.reason_code,
@@ -771,7 +1019,7 @@ class FactStore:
                 return stored
             return StageCandidate(
                 result=result,
-                result_record_artifact=result_artifact,
+                result_record_artifact=result_record_artifact,
                 candidate_id=candidate_id,
                 claim_id=claim.claim_id,
                 fence=claim.fence,
@@ -780,7 +1028,7 @@ class FactStore:
     def _candidate_cursor(self, cursor, command_id: str) -> StageCandidate | None:
         cursor.execute(
             """
-            SELECT candidate_id, claim_id, fence, result_artifact_id
+            SELECT candidate_id, claim_id, fence, output_artifact_id, result_record_artifact_id
             FROM stage_candidate
             WHERE command_id = %s
             """,
@@ -789,11 +1037,14 @@ class FactStore:
         row = cursor.fetchone()
         if row is None:
             return None
-        artifact = self._artifact_cursor(cursor, row[3])
-        result = self._result_reader.read_result(artifact)
+        output_artifact = self._artifact_cursor(cursor, row[3])
+        result_record_artifact = self._artifact_cursor(cursor, row[4])
+        result = self._result_reader.read_result(result_record_artifact)
+        if result.output_artifact != output_artifact:
+            raise FactStoreError("The candidate output artifact differs from its StageResult")
         return StageCandidate(
             result=result,
-            result_record_artifact=artifact,
+            result_record_artifact=result_record_artifact,
             candidate_id=row[0],
             claim_id=row[1],
             fence=row[2],
@@ -815,11 +1066,7 @@ class FactStore:
     ) -> StageDecision:
         if command.stage is None:
             raise FactStoreError("Only a stage command can commit a decision")
-        if (
-            candidate.candidate_id is None
-            or candidate.claim_id is None
-            or candidate.fence is None
-        ):
+        if candidate.candidate_id is None or candidate.claim_id is None or candidate.fence is None:
             raise FactStoreError("Only a persisted candidate can be committed")
         if (
             candidate.result.command_id != command.command_id
@@ -828,8 +1075,10 @@ class FactStore:
             or candidate.result.request_digest != command.request_digest
         ):
             raise FactStoreError("The candidate does not belong to the command")
-        if candidate.result.actual_executor_sha256 != claim.owner_sha256:
-            raise FactConflict("The actual executor differs from the claim owner")
+        if candidate.result.actual_executor_sha256 != claim.executor_sha256:
+            raise FactConflict("The StageResult executor differs from the claim executor")
+        if candidate.result.actual_executor_sha256 != command.expected_executor_sha256:
+            raise FactConflict("The actual executor differs from the command expectation")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute("SELECT command_id FROM command WHERE command_id = %s FOR UPDATE", (command.command_id,))
@@ -846,35 +1095,50 @@ class FactStore:
                     raise FactConflict("The command is already bound to a different decision")
                 return existing
             self._verify_open_claim_cursor(cursor, claim)
-            states = {}
-            for effect_id in candidate.result.required_effect_ids:
-                cursor.execute("SELECT effect_id FROM effect_intent WHERE effect_id = %s FOR UPDATE", (effect_id,))
-                if cursor.fetchone() is None:
-                    raise FactConflict(f"The declared effect {effect_id!r} is not registered")
-                states[effect_id] = self._effect_state_cursor(cursor, effect_id)
-            for state in states.values():
-                if state not in {EffectState.SATISFIED, EffectState.DEFINITELY_FAILED}:
-                    raise FactConflict("A terminal decision cannot hide an unsettled external effect")
-                if candidate.result.outcome == "completed" and state is not EffectState.SATISFIED:
-                    raise FactConflict("A completed decision requires every declared effect to be satisfied")
+            states = self._effect_states_for_command_cursor(
+                cursor,
+                command.command_id,
+                lock=True,
+            )
+            declared = set(candidate.result.required_effect_ids)
+            if declared != set(states):
+                raise FactConflict(
+                    "The candidate effect ids do not exactly match the command ledger: "
+                    f"declared={sorted(declared)} ledger={sorted(states)}"
+                )
+            for effect_id, state in states.items():
+                if candidate.result.outcome == "completed":
+                    if state is not EffectState.SATISFIED:
+                        raise FactConflict(f"A completed decision requires effect {effect_id!r} to be satisfied")
+                elif state in {EffectState.UNKNOWN, EffectState.CONFLICT}:
+                    raise FactConflict(f"A definite failure cannot hide the unresolved external effect {effect_id!r}")
             cursor.execute(
                 """
-                SELECT candidate_id, result_digest FROM stage_candidate
+                SELECT candidate_id, claim_id, fence, result_digest,
+                       output_artifact_id, result_record_artifact_id
+                FROM stage_candidate
                 WHERE command_id = %s
                 FOR UPDATE
                 """,
                 (command.command_id,),
             )
             stored = cursor.fetchone()
-            if stored != (candidate.candidate_id, candidate.result.digest):
+            if stored != (
+                candidate.candidate_id,
+                candidate.claim_id,
+                candidate.fence,
+                candidate.result.digest,
+                candidate.result.output_artifact.artifact_id,
+                candidate.result_record_artifact.artifact_id,
+            ):
                 raise FactConflict("The stage candidate changed before its decision commit")
             cursor.execute(
                 """
                 INSERT INTO stage_decision (
-                    decision_id, run_id, stage, command_id, outcome, result_artifact_id,
+                    decision_id, run_id, stage, command_id, outcome, result_record_artifact_id,
                     result_digest, actual_executor_sha256, original_producer_decision_id,
-                    reason_code, decided_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reason_code, failure_envelope, failure_digest, decided_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s)
                 """,
                 (
                     decision_id,
@@ -882,7 +1146,7 @@ class FactStore:
                     command.stage,
                     command.command_id,
                     candidate.result.outcome,
-                    candidate.result.result_artifact.artifact_id,
+                    candidate.result_record_artifact.artifact_id,
                     candidate.result.digest,
                     candidate.result.actual_executor_sha256,
                     original_producer_decision_id,
@@ -903,3 +1167,84 @@ class FactStore:
             if row is None:  # pragma: no cover - inserted in this transaction
                 raise FactStoreError("The committed decision disappeared")
             return self._decision_from_row(cursor, row)
+
+    def commit_failure_envelope(
+        self,
+        *,
+        decision_id: str,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        failure: FailureEnvelope,
+    ) -> FailureEnvelope:
+        """Commit a minimal failure without depending on diagnostic artifact sealing."""
+
+        if command.stage is None:
+            raise FactStoreError("Only a stage command can commit a failure envelope")
+        if (
+            failure.command_id != command.command_id
+            or failure.run_id != command.run_id
+            or failure.stage != command.stage
+            or failure.request_digest != command.request_digest
+        ):
+            raise FactConflict("The failure envelope names another command")
+        if failure.actual_executor_sha256 != claim.executor_sha256:
+            raise FactConflict("The failure executor differs from the claim executor")
+        if failure.actual_executor_sha256 != command.expected_executor_sha256:
+            raise FactConflict("The failure executor differs from the command expectation")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT command_id FROM command WHERE command_id = %s FOR UPDATE",
+                (command.command_id,),
+            )
+            if cursor.fetchone() is None:
+                raise FactStoreError("The command disappeared before failure commit")
+            existing_row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
+            if existing_row is not None:
+                existing = self._decision_from_row(cursor, existing_row)
+                if (
+                    existing.command_id == command.command_id
+                    and existing.outcome == failure.outcome
+                    and existing.failure_envelope == failure
+                ):
+                    return failure
+                raise FactConflict("The command is already bound to a different decision")
+            self._verify_open_claim_cursor(cursor, claim)
+            states = self._effect_states_for_command_cursor(cursor, command.command_id, lock=True)
+            declared = dict(failure.effect_states)
+            if declared != {effect_id: state.value for effect_id, state in states.items()}:
+                raise FactConflict("The failure effect states do not exactly match the command ledger")
+            if any(state in {EffectState.UNKNOWN, EffectState.CONFLICT} for state in states.values()):
+                raise FactConflict("A definite failure cannot hide an unknown or conflicting effect")
+            for artifact in failure.evidence_artifacts:
+                self._insert_artifact(cursor, artifact)
+            cursor.execute(
+                """
+                INSERT INTO stage_decision (
+                    decision_id, run_id, stage, command_id, outcome, result_record_artifact_id,
+                    result_digest, actual_executor_sha256, original_producer_decision_id,
+                    reason_code, failure_envelope, failure_digest, decided_at
+                ) VALUES (%s, %s, %s, %s, %s, NULL, NULL, %s, NULL, %s, %s::jsonb, %s, %s)
+                """,
+                (
+                    decision_id,
+                    command.run_id,
+                    command.stage,
+                    command.command_id,
+                    failure.outcome,
+                    failure.actual_executor_sha256,
+                    failure.reason_code,
+                    _json(failure.to_record()),
+                    digest(failure.to_record()),
+                    failure.occurred_at,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE execution_claim
+                SET closed_at = %s, closure_code = 'definite_failure', last_seen_at = %s
+                WHERE claim_id = %s AND closed_at IS NULL
+                """,
+                (failure.occurred_at, failure.occurred_at, claim.claim_id),
+            )
+            return failure
