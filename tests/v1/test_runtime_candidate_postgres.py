@@ -832,6 +832,17 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertNotEqual(claim_rows[0][0], claim_rows[0][1])
         self.assertTrue(claim_rows[0][2])
 
+    def test_fact_store_owns_the_single_admission_control_row(self) -> None:
+        initial = self.facts.admission()
+        self.assertEqual(initial.state, "open")
+        self.assertEqual(initial.revision, 1)
+        closed = self.facts.close_admission(reason="drain", actor="operator")
+        self.assertEqual((closed.state, closed.revision), ("closed", 2))
+        repeated = self.facts.close_admission(reason="ignored", actor="other")
+        self.assertEqual(repeated, closed)
+        opened = self.facts.open_admission(reason="start", actor="operator")
+        self.assertEqual((opened.state, opened.revision), ("open", 3))
+
     def test_transport_identity_is_explicitly_bound_by_its_own_field(self) -> None:
         admission, freeze_command = self._new_admission("same-transport")
         conf = DispatchConf(

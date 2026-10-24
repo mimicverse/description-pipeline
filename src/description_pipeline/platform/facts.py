@@ -30,6 +30,7 @@ from ..pipeline.diagnostic import (
     validate_diagnostic_command,
 )
 from ..pipeline.contracts import (
+    AdmissionControl,
     ArtifactRef,
     CancellationRequest,
     DispatchCommand,
@@ -238,6 +239,51 @@ class FactStore:
     def load_admission(self, run_id: str) -> RunAdmission | None:
         with self._transaction() as connection:
             return self._load_admission_cursor(connection.cursor(), run_id)
+
+    def admission(self) -> AdmissionControl:
+        """Read the single administrative admission gate."""
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT state, reason, actor, changed_at, revision FROM admission WHERE id = 1")
+            row = cursor.fetchone()
+        if row is None:
+            raise FactStoreError("The platform admission projection is empty")
+        return AdmissionControl(*row)
+
+    def close_admission(self, *, reason: str, actor: str) -> AdmissionControl:
+        return self._set_admission("closed", reason=reason, actor=actor)
+
+    def open_admission(self, *, reason: str, actor: str) -> AdmissionControl:
+        return self._set_admission("open", reason=reason, actor=actor)
+
+    def _set_admission(self, state: str, *, reason: str, actor: str) -> AdmissionControl:
+        for name, value in (("reason", reason), ("actor", actor)):
+            if not isinstance(value, str) or not value or "\x00" in value:
+                raise FactStoreError(f"The admission {name} is invalid")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT state, reason, actor, changed_at, revision "
+                "FROM admission WHERE id = 1 FOR UPDATE"
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise FactStoreError("The platform admission row is missing")
+            current = AdmissionControl(*row)
+            if current.state == state:
+                return current
+            cursor.execute(
+                "UPDATE admission SET state = %s, reason = %s, actor = %s,"
+                " changed_at = now(), revision = revision + 1"
+                " WHERE id = 1"
+                " RETURNING state, reason, actor, changed_at, revision",
+                (state, reason, actor),
+            )
+            updated = cursor.fetchone()
+        if updated is None:
+            raise FactStoreError("The platform admission row vanished during close/open")
+        return AdmissionControl(*updated)
 
     def admit_diagnostic(
         self,

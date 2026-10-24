@@ -48,6 +48,27 @@ class ProtocolError(PipelineError):
 
 
 @dataclass(frozen=True, slots=True)
+class AdmissionControl:
+    """The single administrative admission gate row."""
+
+    state: Literal["open", "closed"]
+    reason: str
+    actor: str
+    changed_at: datetime
+    revision: int
+
+    def __post_init__(self) -> None:
+        if self.state not in {"open", "closed"}:
+            raise ProtocolError("admission_control.invalid", {"where": "state"})
+        for field in ("reason", "actor"):
+            _require_text(getattr(self, field), "admission_control.invalid", field)
+        if not isinstance(self.changed_at, datetime) or self.changed_at.tzinfo is None:
+            raise ProtocolError("admission_control.invalid", {"where": "changed_at"})
+        if type(self.revision) is not int or self.revision <= 0:
+            raise ProtocolError("admission_control.invalid", {"where": "revision"})
+
+
+@dataclass(frozen=True, slots=True)
 class RunAdmission:
     """An immutable accepted run and its complete non-secret request."""
 

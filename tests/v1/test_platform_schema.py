@@ -20,7 +20,9 @@ APPLY = ROOT / "deploy/platform/apply.sh"
 PLATFORM_DIR = ROOT / "deploy/platform"
 PYTHON_SQL_OWNERS = (
     ROOT / "src/description_pipeline/platform/store.py",
+    ROOT / "src/description_pipeline/platform/facts.py",
     ROOT / "src/description_pipeline/orchestration/lifecycle_state.py",
+    ROOT / "src/description_pipeline/pipeline/cancellation.py",
 )
 
 
@@ -132,16 +134,24 @@ class SchemaQualifierTests(unittest.TestCase):
             "the platform-service reconcile reads the terminal attempt number",
         )
 
-    def test_unbound_cancel_controls_do_not_fabricate_a_scheduling_row(self) -> None:
+    def test_lifecycle_uses_canonical_facts_and_real_airflow_keys(self) -> None:
         text = (PLATFORM_DIR / "views.sql").read_text(encoding="utf-8")
-        self.assertIn(
-            "o.kind <> 'cancel'\n"
-            "          OR o.dag_id IS NOT NULL\n"
-            "          OR o.dag_run_id IS NOT NULL\n"
-            "          OR o.task_id IS NOT NULL\n"
-            "          OR o.map_index IS NOT NULL\n",
-            text,
-        )
+        for token in (
+            ':"platform_schema".run_admission',
+            ':"platform_schema".command',
+            ':"platform_schema".execution_claim',
+            ':"platform_schema".stage_decision',
+            ':"platform_schema".effect_intent',
+            ':"platform_schema".effect_fact',
+            ':"airflow_schema".task_instance',
+            ':"airflow_schema".dag_run',
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, text)
+        self.assertIn("ti.dag_id = c.dag_id", text)
+        self.assertIn("ti.task_id = c.task_id", text)
+        self.assertIn("ti.run_id = c.dag_run_id", text)
+        self.assertIn("ti.map_index = c.map_index", text)
 
     def test_operatorctl_uses_the_single_airflow_grants_owner(self) -> None:
         text = (ROOT / "deploy/operator/operatorctl.sh").read_text(encoding="utf-8")
@@ -156,6 +166,17 @@ class SchemaQualifierTests(unittest.TestCase):
 
 
 class CanonicalFactSchemaTests(unittest.TestCase):
+    def test_legacy_business_tables_are_absent(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        for table in ("request", "run", "stage", "operation", "run_event"):
+            with self.subTest(table=table):
+                self.assertNotRegex(
+                    text,
+                    rf'CREATE TABLE IF NOT EXISTS :"platform_schema"\.{table}\b',
+                )
+                self.assertIn(f'DROP TABLE IF EXISTS :"platform_schema".{table}', text)
+        self.assertIn('CREATE TABLE IF NOT EXISTS :"platform_schema".admission', text)
+
     def test_six_stage_decisions_are_unique_and_never_store_unresolved(self) -> None:
         text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
         decision = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_decision', 1)[1]
@@ -199,6 +220,11 @@ class CanonicalFactSchemaTests(unittest.TestCase):
             text,
         )
         self.assertIn("WHERE kind = 'dispatch';", text)
+        self.assertIn(
+            "CREATE UNIQUE INDEX IF NOT EXISTS command_cancel_target_once",
+            text,
+        )
+        self.assertIn("WHERE kind = 'cancel';", text)
 
     def test_artifact_producer_is_descriptive_and_has_no_local_run_fk(self) -> None:
         text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
@@ -218,10 +244,15 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         )
         self.assertIsNotNone(immutable)
         self.assertNotIn("UPDATE", immutable.group(0))
-        self.assertIn(
-            'GRANT SELECT, INSERT, UPDATE ON :"platform_schema".execution_claim',
+        self.assertRegex(
             text,
+            r'GRANT SELECT, INSERT, UPDATE ON\s+[^;]*execution_claim',
         )
+        for table in ("request", "run", "stage", "operation", "run_event"):
+            self.assertNotRegex(
+                text,
+                rf":\"platform_schema\"\.{table}\b",
+            )
 
 
 if __name__ == "__main__":
