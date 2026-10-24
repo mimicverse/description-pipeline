@@ -16,7 +16,7 @@ from .native_transfer import load_native_receipts
 from pathlib import Path
 
 from . import __version__
-from .delivery import PIPELINE_ID, read_source_record, subject_digest, subject_inventory
+from .delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest, subject_inventory
 from .interface_records import PURPOSE_ENGINEERING, REQUEST_PURPOSES
 from .io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from .runtime import tool_record
@@ -956,12 +956,8 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
         "verification.gates",
         lambda: require_qualified_report(report, rebuilt_definition(staging), root=staging),
     )
-    report = checked(
-        on_event,
-        "verify",
-        "output",
-        "verification.report_binding",
-        lambda: require_qualified_report(
+    def replay_and_reread():
+        replayed = require_qualified_report(
             check_bundle(
                 staging,
                 native_receipts=receipts,
@@ -969,7 +965,26 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
             ),
             rebuilt_definition(staging),
             root=staging,
-        ),
+        )
+        current_subject = subject_digest(staging)
+        current_receipts = load_native_receipts(staging)
+        if (
+            current_subject != generated_subject
+            or replayed.get("subject_sha256") != generated_subject
+            or current_receipts != receipts
+        ):
+            raise PipelineError("Verification inputs changed after the final report was replayed")
+        manifest = read_delivery_manifest(staging)
+        if manifest["subject"]["digest"] != generated_subject:
+            raise PipelineError("Verification inputs changed after the final report was replayed")
+        return replayed
+
+    report = checked(
+        on_event,
+        "verify",
+        "output",
+        "verification.report_binding",
+        replay_and_reread,
         describe=lambda value: {
             "passed": value.get("passed"),
             "subject_sha256": value.get("subject_sha256"),
