@@ -859,14 +859,14 @@ import os
 
 import psycopg2
 
-from description_pipeline.platform.store import PlatformStore
+from description_pipeline.platform.facts import AdmissionControlStore
 
 
 def connect():
     return psycopg2.connect(os.environ["PLATFORM_SERVICE_DSN"])
 
 
-view = PlatformStore(connect).close_admission(
+view = AdmissionControlStore(connect).close_admission(
     reason=os.environ["PLATFORM_CLOSE_REASON"], actor=os.environ["PLATFORM_CLOSE_ACTOR"]
 )
 print(f"admission={view.state} revision={view.revision}")
@@ -881,14 +881,14 @@ import os
 
 import psycopg2
 
-from description_pipeline.platform.store import PlatformStore
+from description_pipeline.platform.facts import AdmissionControlStore
 
 
 def connect():
     return psycopg2.connect(os.environ["PLATFORM_SERVICE_DSN"])
 
 
-view = PlatformStore(connect).open_admission(reason="start", actor="operatorctl start")
+view = AdmissionControlStore(connect).open_admission(reason="start", actor="operatorctl start")
 print(f"admission={view.state} revision={view.revision}")
 PY
 }

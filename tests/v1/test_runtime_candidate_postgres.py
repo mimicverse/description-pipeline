@@ -63,7 +63,12 @@ from description_pipeline.pipeline.verify_contract import (
     CERTIFICATE_FILENAME,
     EXECUTION_RECEIPT_FILENAME,
 )
-from description_pipeline.platform.facts import FactConflict, FactStore, FactStoreError
+from description_pipeline.platform.facts import (
+    AdmissionControlStore,
+    FactConflict,
+    FactStore,
+    FactStoreError,
+)
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     DISCOVER_RESULT_SCHEMA,
@@ -842,6 +847,14 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertEqual(repeated, closed)
         opened = self.facts.open_admission(reason="start", actor="operator")
         self.assertEqual((opened.state, opened.revision), ("open", 3))
+
+    def test_operator_admission_control_does_not_require_an_artifact_reader(self) -> None:
+        control = AdmissionControlStore(self._connect)
+        self.assertEqual(control.admission(), self.facts.admission())
+        closed = control.close_admission(reason="operator-drain", actor="operator")
+        self.assertEqual((closed.state, closed.revision), ("closed", 2))
+        reopened = control.open_admission(reason="operator-start", actor="operator")
+        self.assertEqual((reopened.state, reopened.revision), ("open", 3))
 
     def test_transport_identity_is_explicitly_bound_by_its_own_field(self) -> None:
         admission, freeze_command = self._new_admission("same-transport")

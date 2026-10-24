@@ -130,15 +130,91 @@ def _artifact_from_row(row) -> ArtifactRef:
     )
 
 
-class FactStore:
+class AdmissionControlStore:
+    """The single administrative admission gate with no business-state authority."""
+
+    def __init__(self, connect) -> None:
+        if not callable(connect):
+            raise FactStoreError("A database connection factory is required")
+        self._connect = connect
+
+    @classmethod
+    def from_environment(cls, environ):
+        dsn = environ.get("PLATFORM_SERVICE_DSN")
+        if not dsn:
+            raise FactStoreError("PLATFORM_SERVICE_DSN is not configured")
+
+        def connect():
+            import psycopg2
+
+            return psycopg2.connect(dsn)
+
+        return cls(connect)
+
+    @contextmanager
+    def _transaction(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            close = getattr(connection, "close", None)
+            if callable(close):
+                close()
+
+    def admission(self) -> AdmissionControl:
+        """Read the single administrative admission gate."""
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT state, reason, actor, changed_at, revision FROM admission WHERE id = 1")
+            row = cursor.fetchone()
+        if row is None:
+            raise FactStoreError("The platform admission projection is empty")
+        return AdmissionControl(*row)
+
+    def close_admission(self, *, reason: str, actor: str) -> AdmissionControl:
+        return self._set_admission("closed", reason=reason, actor=actor)
+
+    def open_admission(self, *, reason: str, actor: str) -> AdmissionControl:
+        return self._set_admission("open", reason=reason, actor=actor)
+
+    def _set_admission(self, state: str, *, reason: str, actor: str) -> AdmissionControl:
+        for name, value in (("reason", reason), ("actor", actor)):
+            if not isinstance(value, str) or not value or "\x00" in value:
+                raise FactStoreError(f"The admission {name} is invalid")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT state, reason, actor, changed_at, revision "
+                "FROM admission WHERE id = 1 FOR UPDATE"
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise FactStoreError("The platform admission row is missing")
+            current = AdmissionControl(*row)
+            if current.state == state:
+                return current
+            cursor.execute(
+                "UPDATE admission SET state = %s, reason = %s, actor = %s,"
+                " changed_at = now(), revision = revision + 1"
+                " WHERE id = 1"
+                " RETURNING state, reason, actor, changed_at, revision",
+                (state, reason, actor),
+            )
+            updated = cursor.fetchone()
+        if updated is None:
+            raise FactStoreError("The platform admission row vanished during close/open")
+        return AdmissionControl(*updated)
+
+
+class FactStore(AdmissionControlStore):
     """Canonical fact persistence with injected connection and result reader."""
 
     def __init__(self, connect, result_reader: StageResultReader) -> None:
-        if not callable(connect):
-            raise FactStoreError("A database connection factory is required")
+        super().__init__(connect)
         if result_reader is None or not callable(getattr(result_reader, "read_result", None)):
             raise FactStoreError("A StageResult artifact reader is required")
-        self._connect = connect
         self._result_reader = result_reader
 
     @classmethod
@@ -153,17 +229,6 @@ class FactStore:
             return psycopg2.connect(dsn)
 
         return cls(connect, result_reader)
-
-    @contextmanager
-    def _transaction(self):
-        connection = self._connect()
-        try:
-            with connection:
-                yield connection
-        finally:
-            close = getattr(connection, "close", None)
-            if callable(close):
-                close()
 
     def _insert_artifact(self, cursor, artifact: ArtifactRef) -> ArtifactRef:
         cursor.execute(
@@ -239,51 +304,6 @@ class FactStore:
     def load_admission(self, run_id: str) -> RunAdmission | None:
         with self._transaction() as connection:
             return self._load_admission_cursor(connection.cursor(), run_id)
-
-    def admission(self) -> AdmissionControl:
-        """Read the single administrative admission gate."""
-
-        with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute("SELECT state, reason, actor, changed_at, revision FROM admission WHERE id = 1")
-            row = cursor.fetchone()
-        if row is None:
-            raise FactStoreError("The platform admission projection is empty")
-        return AdmissionControl(*row)
-
-    def close_admission(self, *, reason: str, actor: str) -> AdmissionControl:
-        return self._set_admission("closed", reason=reason, actor=actor)
-
-    def open_admission(self, *, reason: str, actor: str) -> AdmissionControl:
-        return self._set_admission("open", reason=reason, actor=actor)
-
-    def _set_admission(self, state: str, *, reason: str, actor: str) -> AdmissionControl:
-        for name, value in (("reason", reason), ("actor", actor)):
-            if not isinstance(value, str) or not value or "\x00" in value:
-                raise FactStoreError(f"The admission {name} is invalid")
-        with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute(
-                "SELECT state, reason, actor, changed_at, revision "
-                "FROM admission WHERE id = 1 FOR UPDATE"
-            )
-            row = cursor.fetchone()
-            if row is None:
-                raise FactStoreError("The platform admission row is missing")
-            current = AdmissionControl(*row)
-            if current.state == state:
-                return current
-            cursor.execute(
-                "UPDATE admission SET state = %s, reason = %s, actor = %s,"
-                " changed_at = now(), revision = revision + 1"
-                " WHERE id = 1"
-                " RETURNING state, reason, actor, changed_at, revision",
-                (state, reason, actor),
-            )
-            updated = cursor.fetchone()
-        if updated is None:
-            raise FactStoreError("The platform admission row vanished during close/open")
-        return AdmissionControl(*updated)
 
     def admit_diagnostic(
         self,
