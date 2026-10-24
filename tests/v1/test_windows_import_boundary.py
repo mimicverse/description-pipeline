@@ -34,8 +34,6 @@ def leaks():
             continue
         if name.startswith("description_pipeline.verification"):
             bad.append(name)
-        elif name.startswith("description_pipeline.steps"):
-            bad.append(name)
         elif name == "description_pipeline.solidworks":
             bad.append(name)
         elif "sources.solidworks." in name and name.rsplit(".", 1)[-1] in _NATIVE_LEAVES:

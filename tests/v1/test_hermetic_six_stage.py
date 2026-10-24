@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from description_pipeline import solidworks, steps
+from description_pipeline import solidworks
 from description_pipeline.delivery import read_delivery_manifest
 from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.io import digest
@@ -33,6 +33,7 @@ from description_pipeline.sources.solidworks.scene import combine_mass_propertie
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend
+from tests.v1 import workflow_fixture as steps
 from tests.v1.test_split_roundtrip import AxisFixtureBackend, capture_record
 from tests.v1.test_stage_transfer import native_tool
 

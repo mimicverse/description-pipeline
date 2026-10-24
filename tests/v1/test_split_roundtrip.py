@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from description_pipeline import solidworks, steps
+from description_pipeline import solidworks
 from description_pipeline.io import digest
 from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.orchestration import stage_transfer as transfer
@@ -29,6 +29,7 @@ from description_pipeline.sources.solidworks.selection import seal_closure_selec
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend, record as native_record
+from tests.v1 import workflow_fixture as steps
 from .test_stage_transfer import native_tool
 
 
