@@ -18,16 +18,22 @@ from pathlib import Path
 from typing import Protocol
 
 from ..io import acquire_process_lock, canonical, digest, file_digest
+from ..native_transfer import CAPTURE_TRANSFER_SCHEMA, MAX_TRANSFER_BYTES
+from ..pipeline.contracts import ArtifactRef, ProtocolError
 from ..sources.solidworks.discover_stage import (
     NATIVE_OBSERVATION_SCHEMA,
     NativeDiscoverRefusal,
     NativeDiscoverRequest,
 )
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
+from ..sources.solidworks.selection import validate_file_index
 from .discover_protocol import run_windows_discover, seal_observation_bundle
+from .selection_transport import StagedSelection
+from .stage_transfer import CAPTURE_ARCHIVE
 
 OPERATION_SCHEMA = "description-pipeline.native-operation-request/v1"
 OPERATION_VIEW_SCHEMA = "description-pipeline.native-operation-view/v1"
+CAPTURE_OPERATION_SCHEMA = "description-pipeline.native-capture-operation/v1"
 DISCOVER_KIND = "discover"
 CAPTURE_KIND = "capture"
 _KINDS = frozenset({DISCOVER_KIND, CAPTURE_KIND})
@@ -53,6 +59,35 @@ _WINDOWS_RESERVED_NAMES = frozenset(
         "NUL",
         *(f"COM{index}" for index in range(1, 10)),
         *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
+_CAPTURE_REQUEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "command_id",
+        "run_id",
+        "request_digest",
+        "effect_key",
+        "handoff_sha256",
+        "upload_sha256",
+        "prepared_sha256",
+        "main_assembly",
+        "package_files",
+        "upstream_artifacts",
+        "execution",
+        "native_tool_source_sha256",
+    }
+)
+_CAPTURE_EXECUTION_FIELDS = frozenset(
+    {
+        "claim_id",
+        "command_id",
+        "effect_key",
+        "executor_sha256",
+        "fence",
+        "native_tool_sha256",
+        "owner_sha256",
+        "run_id",
     }
 )
 
@@ -443,6 +478,155 @@ class NativeOperationView:
 
 
 @dataclass(frozen=True, slots=True)
+class CaptureOperationRequest:
+    """The immutable Capture request executed by the native transaction."""
+
+    schema_version: str
+    command_id: str
+    run_id: str
+    request_digest: str
+    effect_key: str
+    handoff_sha256: str
+    upload_sha256: str
+    prepared_sha256: str
+    main_assembly: str
+    package_files: Mapping[str, str]
+    upstream_artifacts: tuple[Mapping[str, object], ...]
+    execution: Mapping[str, object]
+    native_tool_source_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != CAPTURE_OPERATION_SCHEMA:
+            raise NativeOperationError("Native Capture request schema is unsupported")
+        for field, value in (
+            ("command_id", self.command_id),
+            ("run_id", self.run_id),
+            ("effect_key", self.effect_key),
+            ("main_assembly", self.main_assembly),
+        ):
+            _text(value, field)
+        _sha256(self.request_digest, "request_digest")
+        _sha256(self.handoff_sha256, "handoff_sha256")
+        _sha256(self.upload_sha256, "upload_sha256")
+        _sha256(self.prepared_sha256, "prepared_sha256")
+        _sha256(
+            self.native_tool_source_sha256,
+            "native_tool_source_sha256",
+        )
+        try:
+            files = validate_file_index(self.package_files)
+        except Exception as error:
+            raise NativeOperationError(
+                "Native Capture package_files are invalid",
+                detail={"reason": str(error)},
+            ) from error
+        if self.main_assembly not in files:
+            raise NativeOperationError(
+                "Native Capture main_assembly is absent from package_files"
+            )
+        if digest(files) != self.prepared_sha256:
+            raise NativeOperationError(
+                "Native Capture prepared_sha256 differs from package_files"
+            )
+        object.__setattr__(self, "package_files", files)
+        if (
+            not isinstance(self.upstream_artifacts, (tuple, list))
+            or len(self.upstream_artifacts) != 2
+        ):
+            raise NativeOperationError(
+                "Native Capture requires exactly the Freeze and Discover artifacts"
+            )
+        refs: list[ArtifactRef] = []
+        try:
+            refs = [
+                ArtifactRef.from_record(record)
+                for record in self.upstream_artifacts
+            ]
+        except (ProtocolError, TypeError, ValueError) as error:
+            raise NativeOperationError(
+                "Native Capture upstream_artifacts are invalid",
+                detail={"reason": str(error)},
+            ) from error
+        if {ref.producer_stage for ref in refs} != {"freeze", "discover"}:
+            raise NativeOperationError(
+                "Native Capture upstream_artifacts must bind Freeze and Discover"
+            )
+        object.__setattr__(
+            self,
+            "upstream_artifacts",
+            tuple(ref.to_record() for ref in refs),
+        )
+        execution = copy.deepcopy(dict(self.execution))
+        if set(execution) != _CAPTURE_EXECUTION_FIELDS:
+            raise NativeOperationError(
+                "Native Capture execution fields are incomplete or unknown"
+            )
+        for field in (
+            "claim_id",
+            "command_id",
+            "effect_key",
+            "run_id",
+        ):
+            _text(execution[field], f"execution.{field}")
+        for field in (
+            "executor_sha256",
+            "native_tool_sha256",
+            "owner_sha256",
+        ):
+            _sha256(execution[field], f"execution.{field}")
+        if type(execution["fence"]) is not int or execution["fence"] <= 0:
+            raise NativeOperationError("execution.fence must be a positive integer")
+        if (
+            execution["command_id"] != self.command_id
+            or execution["run_id"] != self.run_id
+            or execution["effect_key"] != self.effect_key
+        ):
+            raise NativeOperationError(
+                "Native Capture execution identity differs from its request"
+            )
+        object.__setattr__(self, "execution", execution)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> CaptureOperationRequest:
+        if not isinstance(record, Mapping) or set(record) != _CAPTURE_REQUEST_FIELDS:
+            raise NativeOperationError(
+                "Native Capture request fields are incomplete or unknown",
+                detail={
+                    "missing": sorted(
+                        _CAPTURE_REQUEST_FIELDS - set(record)
+                        if isinstance(record, Mapping)
+                        else _CAPTURE_REQUEST_FIELDS
+                    ),
+                    "unknown": sorted(
+                        set(record) - _CAPTURE_REQUEST_FIELDS
+                        if isinstance(record, Mapping)
+                        else set()
+                    ),
+                },
+            )
+        return cls(**dict(record))
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "command_id": self.command_id,
+            "run_id": self.run_id,
+            "request_digest": self.request_digest,
+            "effect_key": self.effect_key,
+            "handoff_sha256": self.handoff_sha256,
+            "upload_sha256": self.upload_sha256,
+            "prepared_sha256": self.prepared_sha256,
+            "main_assembly": self.main_assembly,
+            "package_files": dict(self.package_files),
+            "upstream_artifacts": [
+                dict(record) for record in self.upstream_artifacts
+            ],
+            "execution": copy.deepcopy(dict(self.execution)),
+            "native_tool_source_sha256": self.native_tool_source_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class NativeOperationCreate:
     schema_version: str
     operation_id: str
@@ -502,6 +686,24 @@ class NativeOperationCreate:
             if self.input_archive_bytes > MAX_HANDOFF_BYTES:
                 raise NativeOperationError(
                     "Discover input archive exceeds the source-set transfer limit",
+                    status=413,
+                )
+        else:
+            capture = CaptureOperationRequest.from_record(request)
+            if self.output_contract != CAPTURE_TRANSFER_SCHEMA:
+                raise NativeOperationError(
+                    "Capture output_contract must name the native Capture transfer schema"
+                )
+            if (
+                capture.execution["native_tool_sha256"]
+                != self.native_tool_requirement_sha256
+            ):
+                raise NativeOperationError(
+                    "Capture execution tool digest differs from the full native tool requirement"
+                )
+            if self.input_archive_bytes > MAX_TRANSFER_BYTES:
+                raise NativeOperationError(
+                    "Capture input archive exceeds the Capture transfer limit",
                     status=413,
                 )
 
@@ -675,6 +877,153 @@ class DiscoverOperationExecutor:
             artifact_name="native-observation.zip",
             output_contract=NATIVE_OBSERVATION_SCHEMA,
             resource_terminated=True,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureOperationExecutor:
+    """Run the production Capture transaction over one complete prepared archive."""
+
+    transaction: Callable[..., Mapping[str, object]] | None = None
+    backend_factory: Callable[[Path], object] | None = None
+    on_event: Callable | None = None
+    on_activity: Callable | None = None
+
+    def __call__(
+        self,
+        request: Mapping[str, object],
+        source_archive: Path,
+        workspace: Path,
+        native_tool: Mapping[str, object],
+    ) -> NativeOperationResult:
+        capture = CaptureOperationRequest.from_record(request)
+        if native_tool.get("source_sha256") != capture.native_tool_source_sha256:
+            raise NativeOperationFailure(
+                "capture.native_tool_mismatch",
+                "Installed native tool differs from the Capture request",
+                resource_terminated=True,
+                detail={
+                    "expected": capture.native_tool_source_sha256,
+                    "actual": native_tool.get("source_sha256"),
+                },
+            )
+        try:
+            staged = StagedSelection(
+                workspace / "capture-input",
+                dict(capture.package_files),
+                capture.main_assembly,
+                reader_sha256=capture.native_tool_source_sha256,
+            )
+            accepted = staged.accept_batch(Path(source_archive))
+            if accepted is not True:
+                raise NativeOperationFailure(
+                    "capture.input_repeated",
+                    "A Capture operation must admit its complete prepared archive once",
+                    resource_terminated=True,
+                )
+            from ..sources.solidworks.revision import package_inventory
+
+            if package_inventory(staged.stage) != dict(capture.package_files):
+                raise NativeOperationFailure(
+                    "capture.input_inventory_changed",
+                    "Staged prepared inputs differ from the Capture request",
+                    resource_terminated=True,
+                )
+        except NativeOperationFailure:
+            raise
+        except Exception as error:
+            raise NativeOperationFailure(
+                "capture.input_invalid",
+                f"{type(error).__name__}: {error}",
+                resource_terminated=True,
+            ) from error
+
+        transaction = self.transaction
+        if transaction is None:
+            from ..pipeline.capture import _capture_native_transaction
+
+            transaction = _capture_native_transaction
+        output = workspace / "capture-output"
+        backend = (
+            self.backend_factory(staged.stage)
+            if self.backend_factory is not None
+            else None
+        )
+        try:
+            result = dict(
+                transaction(
+                    staged.stage,
+                    output,
+                    backend=backend,
+                    run_id=capture.run_id,
+                    on_event=self.on_event,
+                    on_activity=self.on_activity,
+                    prior_events=(),
+                    expected_inputs=dict(capture.package_files),
+                    handoff_sha256=capture.handoff_sha256,
+                    upload_sha256=capture.upload_sha256,
+                    main_assembly=capture.main_assembly,
+                    upstream_artifacts=tuple(capture.upstream_artifacts),
+                    execution=dict(capture.execution),
+                    native_tool_factory=lambda: dict(native_tool),
+                    execution_scope=("capture",),
+                )
+            )
+        except Exception as error:
+            raise NativeOperationUnresolved(
+                "capture.native_unknown",
+                f"{type(error).__name__}: {error}",
+            ) from error
+        settlement = result.get("resource_settlement")
+        settled = (
+            isinstance(settlement, Mapping)
+            and settlement.get("settled") is True
+        )
+        if result.get("native_complete") is True:
+            archive_receipt = result.get("capture_archive")
+            if not isinstance(archive_receipt, Mapping):
+                raise NativeOperationUnresolved(
+                    "capture.archive_invalid",
+                    "Native Capture returned no archive receipt",
+                )
+            archive = output / CAPTURE_ARCHIVE
+            if (
+                archive_receipt.get("name") != CAPTURE_ARCHIVE
+                or not archive.is_file()
+                or archive.is_symlink()
+                or not settled
+            ):
+                raise NativeOperationUnresolved(
+                    "capture.archive_invalid",
+                    "Native Capture did not seal a settled transfer",
+                )
+            return NativeOperationResult(
+                artifact_path=archive,
+                artifact_name=CAPTURE_ARCHIVE,
+                output_contract=CAPTURE_TRANSFER_SCHEMA,
+                resource_terminated=True,
+            )
+        reason = str(
+            result.get("error_code")
+            or "capture.native_failed"
+        )
+        message = str(result.get("error") or "Native Capture failed")
+        diagnostic = result.get("diagnostic_path")
+        if settled and result.get("state") == "failed" and isinstance(diagnostic, str):
+            raise NativeOperationFailure(
+                reason,
+                message,
+                resource_terminated=True,
+                detail={"diagnostic_path": diagnostic},
+            )
+        raise NativeOperationUnresolved(
+            reason if not settled else "capture.native_unknown",
+            message,
+            resource_terminated=settled,
+            detail={
+                "state": result.get("state"),
+                "diagnostic_path": diagnostic,
+            },
         )
 
 
@@ -1746,9 +2095,12 @@ class NativeOperationRuntime:
 
 __all__ = [
     "CAPTURE_KIND",
+    "CAPTURE_OPERATION_SCHEMA",
     "DISCOVER_KIND",
     "OPERATION_SCHEMA",
     "OPERATION_VIEW_SCHEMA",
+    "CaptureOperationExecutor",
+    "CaptureOperationRequest",
     "DiscoverOperationExecutor",
     "NativeArtifactView",
     "NativeFailureView",

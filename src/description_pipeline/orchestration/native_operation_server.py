@@ -16,6 +16,7 @@ from ..io import PipelineError, canonical, digest, parse_data
 from .native_operation_runtime import NativeOperationError, NativeOperationRuntime
 
 HEALTH_SCHEMA = "description-pipeline.native-operation-health/v1"
+NATIVE_TOOL_IDENTITY_SCHEMA = "description-pipeline.native-tool-identity/v1"
 MAX_JSON_BYTES = 8 * 1024**2
 MAX_ARCHIVE_BYTES = 16 * 1024**3
 
@@ -46,6 +47,16 @@ def _health(runtime: NativeOperationRuntime) -> dict:
         "native_tool_sha256": native_tool_sha256,
         "native_tool_error": native_tool_error,
         "operations": stats,
+    }
+
+
+def _native_tool_identity(runtime: NativeOperationRuntime) -> dict:
+    tool = dict(runtime.native_tool_factory())
+    canonical(tool)
+    return {
+        "schema_version": NATIVE_TOOL_IDENTITY_SCHEMA,
+        "tool": tool,
+        "tool_sha256": digest(tool),
     }
 
 
@@ -160,6 +171,9 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
                 if path == "/health":
                     self._reply(200, _health(runtime))
                     return
+                if path == "/native-tool":
+                    self._reply(200, _native_tool_identity(runtime))
+                    return
                 if path.startswith("/operations/"):
                     suffix = path[len("/operations/") :]
                     if suffix.endswith("/artifact"):
@@ -219,4 +233,10 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
     return Handler
 
 
-__all__ = ["HEALTH_SCHEMA", "MAX_ARCHIVE_BYTES", "MAX_JSON_BYTES", "native_operation_handler"]
+__all__ = [
+    "HEALTH_SCHEMA",
+    "MAX_ARCHIVE_BYTES",
+    "MAX_JSON_BYTES",
+    "NATIVE_TOOL_IDENTITY_SCHEMA",
+    "native_operation_handler",
+]

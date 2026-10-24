@@ -14,7 +14,9 @@ from ..io import PipelineError, digest, read_data
 from ..ports import SOLIDWORKS_ENDPOINT_PORT
 from ..runtime import tool_record
 from .native_operation_runtime import (
+    CAPTURE_KIND,
     DISCOVER_KIND,
+    CaptureOperationExecutor,
     DiscoverOperationExecutor,
     NativeOperationExecutor,
     NativeOperationRuntime,
@@ -129,7 +131,8 @@ def build_runtime(
     registry: dict[str, NativeOperationExecutor] = {
         DISCOVER_KIND: DiscoverOperationExecutor(
             cad_ownership_file=ownership_file,
-        )
+        ),
+        CAPTURE_KIND: CaptureOperationExecutor(),
     }
     registry.update(executors or {})
     return NativeOperationRuntime(

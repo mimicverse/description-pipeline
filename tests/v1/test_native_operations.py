@@ -9,20 +9,31 @@ import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from description_pipeline.io import digest, file_digest
+from description_pipeline.native_transfer import CAPTURE_TRANSFER_SCHEMA
 from description_pipeline.orchestration.native_operation_client import (
+    NativeOperationCapturePort,
     NativeOperationClient,
     NativeOperationClientConflict,
     NativeOperationDiscoverPort,
     NativeOperationEndpoint,
+    NativeOperationNotFound,
     NativeOperationProtocolError,
+    NativeOperationToolProvider,
+    capture_handler_from_native_operation,
+    discover_adapter_from_native_operation,
+    native_capture_operation_id,
 )
+from description_pipeline.orchestration.discover_protocol import seal_source_archive
 from description_pipeline.orchestration.native_operation_runtime import (
     CAPTURE_KIND,
+    CAPTURE_OPERATION_SCHEMA,
+    CaptureOperationExecutor,
     DISCOVER_KIND,
     DiscoverOperationExecutor,
     NativeOperationFailure,
@@ -30,6 +41,9 @@ from description_pipeline.orchestration.native_operation_runtime import (
     NativeOperationRuntime,
     build_operation_record,
 )
+from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.sources.solidworks.revision import package_inventory
+from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
 from description_pipeline.orchestration.windows import handler as windows_handler
 from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.sources.solidworks.discover_stage import (
@@ -48,7 +62,7 @@ NATIVE_TOOL = {
     "source_sha256": TOOL_SHA256,
     "runtime": {"role": "native"},
 }
-OUTPUT_CONTRACT = "description-pipeline.test-artifact/v1"
+OUTPUT_CONTRACT = CAPTURE_TRANSFER_SCHEMA
 
 
 def _wait_for(predicate, *, timeout: float = 5.0):
@@ -69,15 +83,67 @@ def _operation(
     request: dict | None = None,
     output_contract: str = OUTPUT_CONTRACT,
     tool=NATIVE_TOOL,
+    package_files: dict[str, str] | None = None,
 ) -> dict:
+    if request is None:
+        if kind == CAPTURE_KIND:
+            package_files = package_files or {"cad/robot.SLDASM": "a" * 64}
+            execution = {
+                "claim_id": f"claim-{operation_id}",
+                "command_id": operation_id,
+                "effect_key": "capture-native",
+                "executor_sha256": digest({"executor": operation_id}),
+                "fence": 1,
+                "native_tool_sha256": digest(tool),
+                "owner_sha256": digest({"owner": operation_id}),
+                "run_id": operation_id,
+            }
+            request = {
+                "schema_version": CAPTURE_OPERATION_SCHEMA,
+                "command_id": operation_id,
+                "run_id": operation_id,
+                "request_digest": digest({"request": operation_id}),
+                "effect_key": "capture-native",
+                "handoff_sha256": "b" * 64,
+                "upload_sha256": "c" * 64,
+                "prepared_sha256": digest(package_files),
+                "main_assembly": "cad/robot.SLDASM",
+                "package_files": package_files,
+                "upstream_artifacts": [
+                    _artifact(stage, operation_id)
+                    for stage in ("freeze", "discover")
+                ],
+                "execution": execution,
+                "native_tool_source_sha256": tool["source_sha256"],
+            }
+        else:
+            request = {"marker": operation_id}
     return build_operation_record(
         operation_id=operation_id,
         kind=kind,
-        request=request or {"marker": operation_id},
+        request=request,
         input_archive_sha256=file_digest(archive),
         input_archive_bytes=archive.stat().st_size,
         native_tool_requirement_sha256=digest(tool),
         output_contract=output_contract,
+    )
+
+
+def _artifact(stage: str, operation_id: str) -> dict:
+    return _artifact_ref(stage, operation_id).to_record()
+
+
+def _artifact_ref(stage: str, operation_id: str) -> ArtifactRef:
+    artifact_id = digest({"artifact": stage, "operation_id": operation_id})
+    return ArtifactRef(
+        artifact_id=artifact_id,
+        kind=f"stage_output:{stage}",
+        locator=f"cas://artifact/{artifact_id}",
+        manifest_sha256=digest({"manifest": artifact_id}),
+        set_sha256=digest({"set": artifact_id}),
+        producer_run_id=operation_id,
+        producer_stage=stage,
+        producer_tool_sha256=digest({"producer": stage}),
     )
 
 
@@ -209,6 +275,35 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             urlrequest.urlopen(request, timeout=5)
         self.assertEqual(raised.exception.code, 404)
 
+    def test_full_native_tool_provider_reads_windows_once(self) -> None:
+        reads = 0
+
+        def tool_factory():
+            nonlocal reads
+            reads += 1
+            return dict(NATIVE_TOOL)
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=tool_factory,
+            executors={},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        provider = NativeOperationToolProvider(server.client())
+        self.assertEqual(provider(), NATIVE_TOOL)
+        self.assertEqual(provider(), NATIVE_TOOL)
+        self.assertEqual(reads, 1)
+        self.assertEqual(provider.identity.tool_sha256, digest(NATIVE_TOOL))
+        adapter = discover_adapter_from_native_operation(
+            server.client(),
+            provider,
+            SimpleNamespace(materialize=lambda *args: None),
+        )
+        self.assertEqual(adapter.port.native_tool, NATIVE_TOOL)
+        self.assertEqual(reads, 1)
+
     def test_changed_input_bytes_are_refused_before_execution(self) -> None:
         runtime = NativeOperationRuntime(
             state_root=self.root / "state",
@@ -227,6 +322,262 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             client.upload_input("operation-input-mismatch", other)
         self.assertEqual(raised.exception.code, "input_archive_mismatch")
         self.assertEqual(self.calls, 0)
+
+    def test_capture_executor_calls_the_shared_native_transaction(self) -> None:
+        package = self.root / "prepared"
+        files = {
+            "cad/robot.SLDASM": b"prepared assembly",
+            "source.json": b"prepared source",
+        }
+        for name, payload in files.items():
+            path = package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        prepared_files = package_inventory(package)
+        archive = seal_source_archive(
+            package,
+            prepared_files,
+            self.root / "prepared.zip",
+        )
+        captured = {}
+
+        def transaction(
+            transaction_package,
+            output,
+            **kwargs,
+        ):
+            captured["package_inventory"] = package_inventory(transaction_package)
+            captured["output"] = Path(output)
+            captured["kwargs"] = kwargs
+            Path(output).mkdir(parents=True)
+            (Path(output) / CAPTURE_ARCHIVE).write_bytes(b"sealed capture")
+            return {
+                "native_complete": True,
+                "capture_archive": {"name": CAPTURE_ARCHIVE},
+                "resource_settlement": {"settled": True},
+                "output": str(output),
+            }
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: CaptureOperationExecutor()},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        envelope = _operation(
+            "operation-capture-transaction",
+            archive,
+            package_files=prepared_files,
+        )
+        with mock.patch(
+            "description_pipeline.pipeline.capture._capture_native_transaction",
+            side_effect=transaction,
+        ) as native_transaction:
+            client.create_operation(envelope)
+            client.upload_input("operation-capture-transaction", archive)
+            result = client.wait_for_terminal("operation-capture-transaction")
+        self.assertEqual(result.state, "satisfied")
+        native_transaction.assert_called_once()
+        self.assertEqual(captured["package_inventory"], prepared_files)
+        self.assertEqual(
+            captured["kwargs"]["execution_scope"],
+            ("capture",),
+        )
+        self.assertEqual(
+            captured["kwargs"]["native_tool_factory"](),
+            NATIVE_TOOL,
+        )
+
+    def test_linux_capture_adapter_observes_exact_identity_and_calls_windows_once(self) -> None:
+        package = self.root / "prepared-adapter"
+        files = {
+            "cad/robot.SLDASM": b"adapter assembly",
+            "source.json": b"adapter source",
+        }
+        for name, payload in files.items():
+            path = package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        prepared_files = package_inventory(package)
+        run_id = "run-capture-adapter"
+        command_id = "command-capture-adapter"
+        effect_key = "capture-native"
+        operation_id = native_capture_operation_id(
+            run_id=run_id,
+            command_id=command_id,
+            effect_key=effect_key,
+        )
+        execution = {
+            "claim_id": "claim-capture-adapter",
+            "command_id": command_id,
+            "effect_key": effect_key,
+            "executor_sha256": digest({"executor": "capture-adapter"}),
+            "fence": 1,
+            "native_tool_sha256": digest(NATIVE_TOOL),
+            "owner_sha256": digest({"owner": "capture-adapter"}),
+            "run_id": run_id,
+        }
+        freeze = _artifact_ref("freeze", run_id)
+        discover = _artifact_ref("discover", run_id)
+        inputs = SimpleNamespace(
+            package=package,
+            prepared_files=prepared_files,
+            native_tool=dict(NATIVE_TOOL),
+        )
+        calls = 0
+
+        def transaction(transaction_package, output, **kwargs):
+            nonlocal calls
+            calls += 1
+            del transaction_package, kwargs
+            Path(output).mkdir(parents=True)
+            (Path(output) / CAPTURE_ARCHIVE).write_bytes(b"remote capture")
+            return {
+                "native_complete": True,
+                "capture_archive": {"name": CAPTURE_ARCHIVE},
+                "resource_settlement": {"settled": True},
+                "output": str(output),
+            }
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: CaptureOperationExecutor()},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        port = NativeOperationCapturePort(
+            client,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        self.assertIsNone(
+            port.observe(
+                run_id=run_id,
+                command_id=command_id,
+                effect_key=effect_key,
+            )
+        )
+        with self.assertRaises(NativeOperationNotFound):
+            client.get_operation(operation_id)
+        self.assertEqual(runtime.stats()["queued"], 0)
+
+        with mock.patch(
+            "description_pipeline.pipeline.capture._capture_native_transaction",
+            side_effect=transaction,
+        ):
+            first = port(
+                inputs,
+                self.root / "linux-output",
+                backend=None,
+                run_id=run_id,
+                request_digest=digest({"request": run_id}),
+                handoff_sha256="b" * 64,
+                upload_sha256="c" * 64,
+                main_assembly="cad/robot.SLDASM",
+                upstream_artifacts=(freeze.to_record(), discover.to_record()),
+                execution=execution,
+                native_tool=NATIVE_TOOL,
+            )
+            second = port(
+                inputs,
+                self.root / "linux-output",
+                backend=None,
+                run_id=run_id,
+                request_digest=digest({"request": run_id}),
+                handoff_sha256="b" * 64,
+                upload_sha256="c" * 64,
+                main_assembly="cad/robot.SLDASM",
+                upstream_artifacts=(freeze.to_record(), discover.to_record()),
+                execution=execution,
+                native_tool=NATIVE_TOOL,
+            )
+        self.assertEqual(first.outcome, "completed")
+        self.assertEqual(second.outcome, "completed")
+        self.assertEqual(calls, 1)
+        remote = port.observe(
+            run_id=run_id,
+            command_id=command_id,
+            effect_key=effect_key,
+        )
+        self.assertEqual(remote.state, "satisfied")
+        self.assertEqual(remote.actual_native_tool_sha256, digest(NATIVE_TOOL))
+        handler = capture_handler_from_native_operation(client)
+        self.assertIsNone(handler._native_tool_factory)
+
+    def test_capture_transaction_failure_retains_diagnostic_bytes(self) -> None:
+        package = self.root / "prepared-failure"
+        files = {
+            "cad/robot.SLDASM": b"failure assembly",
+            "source.json": b"failure source",
+        }
+        for name, payload in files.items():
+            path = package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        prepared_files = package_inventory(package)
+        archive = seal_source_archive(
+            package,
+            prepared_files,
+            self.root / "prepared-failure.zip",
+        )
+
+        def transaction(transaction_package, output, **kwargs):
+            del transaction_package, kwargs
+            diagnostic = Path(output)
+            diagnostic.mkdir(parents=True)
+            (diagnostic / "raw-failure.bin").write_bytes(b"native failure bytes")
+            return {
+                "state": "failed",
+                "error": "capture failed",
+                "error_code": "capture.native_failed",
+                "diagnostic_path": str(diagnostic),
+                "resource_settlement": {"settled": True},
+            }
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: CaptureOperationExecutor()},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        with mock.patch(
+            "description_pipeline.pipeline.capture._capture_native_transaction",
+            side_effect=transaction,
+        ):
+            client.create_operation(
+                _operation(
+                    "operation-capture-failure",
+                    archive,
+                    package_files=prepared_files,
+                )
+            )
+            client.upload_input("operation-capture-failure", archive)
+            failed = client.wait_for_terminal("operation-capture-failure")
+        self.assertEqual(failed.state, "failed")
+        self.assertEqual(failed.failure.code, "capture.native_failed")
+        self.assertTrue(failed.resource_terminated)
+        claim_id = next(
+            event["payload"]["claim_id"]
+            for event in runtime._events("operation-capture-failure")
+            if event["type"] == "claimed"
+        )
+        evidence = (
+            runtime.workspace_root
+            / "operation-capture-failure"
+            / claim_id
+            / "capture-output"
+            / "raw-failure.bin"
+        )
+        self.assertEqual(evidence.read_bytes(), b"native failure bytes")
 
     def test_cache_hit_returns_original_result_without_executor_or_upload(self) -> None:
         runtime = NativeOperationRuntime(
@@ -662,35 +1013,45 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             poll_interval=0.01,
         )
         capture = mock.Mock(side_effect=AssertionError("Discover must not run Capture"))
+        workspace = self.root / "workspace-single"
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        request = self.request("discover-operation-single")
+        self.assertIsNone(port.observe(request))
 
         with mock.patch("description_pipeline.solidworks.capture", capture):
-            execution = port.discover(
-                self.request("discover-operation-single"),
-                self.source,
-                self.root / "workspace-single",
+            observation = port.invoke(
+                archive,
+                request,
+                workspace,
             )
 
-        self.assertEqual(execution.effect_id, "native-discover:discover-operation-single")
         self.assertEqual(reader.calls, 1)
         self.assertEqual(backend.calls, 1)
         capture.assert_not_called()
         self.assertEqual(
-            set(execution.observation.selection["files"]),
+            set(observation.selection["files"]),
             {self.MAIN, self.SELECTED},
         )
-        self.assertNotIn(self.DECOY, execution.observation.selection["files"])
+        self.assertNotIn(self.DECOY, observation.selection["files"])
 
         remote = client.get_operation("discover-operation-single")
         self.assertEqual(remote.state, "satisfied")
         self.assertTrue(remote.resource_terminated)
         self.assertEqual(remote.kind, DISCOVER_KIND)
         self.assertEqual(remote.artifact.media_type, "application/zip")
-        repeated = port.discover(
-            self.request("discover-operation-single"),
-            self.source,
-            self.root / "workspace-single",
+        repeated = port.invoke(
+            archive,
+            request,
+            workspace,
         )
-        self.assertEqual(repeated.effect_id, execution.effect_id)
+        self.assertEqual(
+            repeated.observation_sha256,
+            observation.observation_sha256,
+        )
         self.assertEqual(reader.calls, 1)
         self.assertEqual(backend.calls, 1)
 
@@ -709,8 +1070,6 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             expected_native_tool_sha256=refused_tool_sha256,
         )
         source_archive = self.root / "source-set.zip"
-        from description_pipeline.orchestration.discover_protocol import seal_source_archive
-
         seal_source_archive(self.source, request.source_files, source_archive)
         envelope = _operation(
             request.operation_id,

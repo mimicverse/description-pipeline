@@ -495,7 +495,7 @@ class CaptureHandlerTests(unittest.TestCase):
         return CaptureHandler(
             artifact_store=self.store,
             backend_factory=lambda package: fixture_backend(package, MAIN),
-            native_tool_factory=lambda: tool or self.capture_tool,
+            native_tool_factory=(lambda: tool) if tool is not None else None,
             native_operation=native_operation,
         )
 

@@ -85,6 +85,7 @@ print("WINDOWS_LOADED=" + str("description_pipeline.orchestration.windows" in sy
 print("LEAKS_IMPORT=" + ",".join(after_import))
 print("LEAKS_BUILD=" + ",".join(after_build))
 print("STATS=" + json.dumps(states, sort_keys=True))
+print("EXECUTORS=" + ",".join(sorted(runtime.executors)))
 """
 
 
@@ -118,6 +119,7 @@ class WindowsImportBoundaryTests(unittest.TestCase):
             fields.get("STATS"),
             '{"active": 0, "queued": 0, "unresolved": 0}',
         )
+        self.assertEqual(fields.get("EXECUTORS"), "capture,discover")
 
 
 if __name__ == "__main__":

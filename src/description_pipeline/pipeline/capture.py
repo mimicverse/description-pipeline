@@ -156,6 +156,7 @@ class CaptureInputs:
     prepared_files: Mapping[str, str]
     plan: Mapping[str, Any]
     object_names: tuple[str, ...]
+    native_tool: Mapping[str, Any]
 
     @classmethod
     def resolve(
@@ -368,6 +369,7 @@ class CaptureInputs:
             prepared_files=prepared_files,
             plan=plan,
             object_names=tuple(sorted(active)),
+            native_tool=dict(native_tool),
         )
 
 
@@ -716,6 +718,7 @@ def _invoke_native_operation(
     *,
     backend,
     run_id: str,
+    request_digest: str,
     handoff_sha256: str,
     upload_sha256: str,
     main_assembly: str,
@@ -725,6 +728,7 @@ def _invoke_native_operation(
 ) -> NativeCaptureResult:
     """Call the production native reader, sealer and receipt writer."""
 
+    del request_digest
     result = _capture_native_transaction(
         inputs.package,
         output,
@@ -779,7 +783,7 @@ class CaptureHandler:
         self._artifact_store = artifact_store
         self._backend_factory = backend_factory
         self._native_operation = native_operation or _invoke_native_operation
-        self._native_tool_factory = native_tool_factory or _native_tool_record
+        self._native_tool_factory = native_tool_factory
         if admitter is None:
             from ..orchestration.stage_transfer import admit_capture
 
@@ -953,7 +957,11 @@ class CaptureHandler:
         request = CaptureRequest.from_command(command)
         inputs = CaptureInputs.resolve(command, workspace, request)
         upstream = _upstream_records(inputs)
-        tool = self._native_tool_factory()
+        tool = (
+            self._native_tool_factory()
+            if self._native_tool_factory is not None
+            else dict(inputs.native_tool)
+        )
         execution = _execution_record(command, claim, request, tool)
         effect_id, settlement = self._effect_state(
             command,
@@ -992,6 +1000,7 @@ class CaptureHandler:
             output,
             backend=backend,
             run_id=command.run_id,
+            request_digest=command.request_digest,
             handoff_sha256=request.handoff_sha256,
             upload_sha256=request.upload_sha256,
             main_assembly=request.main_assembly,
