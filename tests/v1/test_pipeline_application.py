@@ -25,6 +25,7 @@ from description_pipeline.pipeline.application import (
     application_from_environment,
 )
 from description_pipeline.pipeline.stages.publish import PublishHandler
+from description_pipeline.schemas import RUN_ADMISSION_SCHEMA
 from description_pipeline.pipeline.contracts import (
     DiagnosticReplayScope,
     ExecutionClaim,
@@ -355,7 +356,7 @@ class StageApplicationTests(unittest.TestCase):
                 "request_digest": admitted.admission.request_digest,
                 "request_id": self.harness.spec.request_id,
                 "run_id": self.harness.spec.run_id,
-                "schema_version": "description-pipeline.run-admission/v1",
+                "schema_version": RUN_ADMISSION_SCHEMA,
             },
         )
         self.assertEqual(
