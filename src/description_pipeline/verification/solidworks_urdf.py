@@ -675,11 +675,34 @@ def _capture_preparation(root, manifest):
         module = path_module(value)
         return module.abspath(str(value)).replace("/", "\\").strip().lower()
 
+    def recorded_relative_path(value, root):
+        module = path_module(value)
+        try:
+            relative = module.relpath(module.abspath(str(value)), module.abspath(str(root)))
+        except (TypeError, ValueError) as error:
+            raise PipelineError("A recorded path has no relative identity") from error
+        parts = re.split(r"[\\/]", relative)
+        _require(
+            relative not in {"", "."}
+            and not module.isabs(relative)
+            and all(part not in {"", ".", ".."} for part in parts),
+            "A recorded path escapes its capture root",
+        )
+        return "/".join(part.casefold() for part in parts)
+
     def document_key(value):
         text = str(value or "").replace("\\", "/")
         normalized = posixpath.normpath(text)
         _require(normalized not in {"", "."}, "A topology document identity is empty")
         return normalized.casefold()
+
+    def session_path_suffix(value, marker):
+        parts = [part.casefold() for part in re.split(r"[\\/]", str(value or "")) if part]
+        positions = [index for index, part in enumerate(parts) if part == marker.casefold()]
+        _require(len(positions) == 1, f"A session path lacks one {marker} identity")
+        suffix = parts[positions[0] + 1 :]
+        _require(bool(suffix), f"A session path has no path below {marker}")
+        return "/".join(suffix)
 
     def copy_matches_document(copy_path, resolved):
         copy_parts = [item for item in document_key(copy_path).split("/") if item]
@@ -702,6 +725,11 @@ def _capture_preparation(root, manifest):
     _require(
         isinstance(scene.get("document"), str) and _same_native_path(scene["document"], top_path),
         "Capture scene document differs from the dependency closure",
+    )
+    scene_source_root = scene.get("source_root")
+    _require(
+        isinstance(scene_source_root, str) and bool(scene_source_root),
+        "Capture scene carries no source root",
     )
     _require(
         isinstance(preparation["document"], str) and _same_native_path(preparation["document"], top_path),
@@ -1011,6 +1039,10 @@ def _capture_preparation(root, manifest):
             "document_type": 2 if str(item.get("session_document_path") or "").casefold().endswith(".sldasm") else 1,
             "configuration": item.get("configuration"),
             "provenance_state": "embedded_virtual_component",
+            "session_suffix": session_path_suffix(
+                item.get("session_document_path"),
+                "VC~~",
+            ),
         }
     imports = selection_closure.get("imports")
     _require(isinstance(imports, list), "Native discovery import list is missing")
@@ -1022,6 +1054,10 @@ def _capture_preparation(root, manifest):
             "document_type": 2 if str(item.get("materialization") or "").casefold().endswith(".sldasm") else 1,
             "configuration": item.get("configuration"),
             "provenance_state": "cached_materialization",
+            "session_suffix": session_path_suffix(
+                item.get("materialization"),
+                "IC~~",
+            ),
         }
     suppressed_entries = selection_closure.get("suppressed")
     _require(isinstance(suppressed_entries, list), "Native discovery suppressed occurrence list is missing")
@@ -1052,6 +1088,11 @@ def _capture_preparation(root, manifest):
             _require(row["storage_scope"] == "session", f"Session occurrence was treated as a file: {instance}")
             _require(row["provenance_state"] == expected["provenance_state"], f"Session class changed: {instance}")
             _require(row["document_type"] == expected["document_type"], f"Session type changed: {instance}")
+            marker = "VC~~" if expected["provenance_state"] == "embedded_virtual_component" else "IC~~"
+            _require(
+                session_path_suffix(row["document_path"], marker) == expected["session_suffix"],
+                f"Session path identity changed: {instance}",
+            )
             _require(
                 expected["configuration"] in {None, row["referenced_configuration"]},
                 f"Session configuration changed: {instance}",
@@ -1122,8 +1163,9 @@ def _capture_preparation(root, manifest):
         _require(copied.get(copy_name) == row["sha256"], f"Closure copy digest differs: {copy_name}")
         _require(mapped.get("copy_sha256") == row["sha256"], f"Closure copy identity differs: {copy_name}")
         copy_relative = copy_name[7:] if copy_name.casefold().startswith("source/") else copy_name
+        source_relative = recorded_relative_path(topology["document_path"], scene_source_root)
         _require(
-            copy_matches_document(copy_relative, topology["document_path"]),
+            document_key(copy_relative) == source_relative,
             f"Closure copy names another capture path: {occurrence}",
         )
         expected_edge = selection_edges.get(topology["instance"])
@@ -1132,9 +1174,21 @@ def _capture_preparation(root, manifest):
             copy_matches_document(copy_relative, expected_document),
             f"Closure copy names another document: {occurrence}",
         )
+        _require(
+            copy_matches_document(mapped.get("source"), expected_document),
+            f"Closure source names another document: {occurrence}",
+        )
     session_rows = [item for item in not_top if item["storage_scope"] == "session"]
+    session_dependencies = preparation["session_dependency_paths"]
     _require(
-        set(preparation["session_dependency_paths"]) == {item["document_path"] for item in session_rows},
+        isinstance(session_dependencies, list)
+        and all(isinstance(value, str) and value for value in session_dependencies)
+        and len(session_dependencies) == len(set(session_dependencies))
+        and session_dependencies == sorted(session_dependencies),
+        "Session dependency inventory must be a unique sorted list",
+    )
+    _require(
+        set(session_dependencies) == {item["document_path"] for item in session_rows},
         "Session dependency inventory differs from topology",
     )
     top_sha256 = before_sources[top_key]["sha256"]
@@ -1712,23 +1766,30 @@ def _native_receipts_evidence(root, receipts):
     return evidence
 
 
-def native_receipts(root: Path) -> dict[str, bytes] | None:
+def load_native_receipts(root: Path) -> dict[str, bytes] | None:
     """Load the complete native receipt triplet from one delivery boundary."""
 
     names = {
         "native_tool_bytes": "reports/native-tool.json",
         "native_stages_bytes": "reports/native-stages.json",
         "transfer_manifest_bytes": "transfer-manifest.json",
+        "structural_team_md_bytes": "reports/structural-team.md",
+        "structural_team_json_bytes": "reports/structural-team.json",
     }
     paths = {
         name: confined(root, relative, exists=False)
         for name, relative in names.items()
     }
-    present = [path.is_file() for path in paths.values()]
+    required = ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes")
+    present = [paths[name].is_file() for name in required]
     if not any(present):
         return None
     _require(all(present), "Native receipt triplet is incomplete")
-    return {name: path.read_bytes() for name, path in paths.items()}
+    return {
+        name: path.read_bytes()
+        for name, path in paths.items()
+        if path.is_file()
+    }
 
 
 def _tool(root, native_receipts=None):
@@ -3210,64 +3271,18 @@ def _metadata_value_warnings(
     try:
         runtime = evidence.runtime(root)
         rewrite = read_data(confined(root, REWRITE_ENVIRONMENT_EVIDENCE))
-        native_tool_path = confined(root, "reports/native-tool.json", exists=False)
-        if native_receipts is not None:
-            native_receipt = _native_receipts_evidence(root, native_receipts)
+        receipts = native_receipts if native_receipts is not None else load_native_receipts(root)
+        if receipts is not None:
+            native_receipt = _native_receipts_evidence(root, receipts)
             native_tool = native_receipt["native_tool"]
-            native_tool_sha256 = native_receipt["native_tool_sha256"]
-            if native_tool_path.is_file():
-                _require(
-                    read_data(native_tool_path) == native_tool
-                    and file_digest(native_tool_path) == native_tool_sha256,
-                    "Native tool evidence differs from the immutable native receipt",
-                )
+        elif require_native_receipts:
+            raise PipelineError("Native receipt bytes are required at this verification boundary")
         else:
-            transfer_path = confined(root, "transfer-manifest.json", exists=False)
-            if transfer_path.is_file() or native_tool_path.is_file():
-                _require(
-                    transfer_path.is_file() and native_tool_path.is_file(),
-                    "Native transfer receipt and tool evidence must travel together",
-                )
-                transfer = read_data(transfer_path)
-                _require(isinstance(transfer, dict), "Native transfer manifest is not an object")
-                transferred_files = transfer.get("files")
-                _require(
-                    isinstance(transferred_files, dict) and bool(transferred_files),
-                    "Native transfer manifest has no file inventory",
-                )
-                for relative, expected_sha256 in transferred_files.items():
-                    _require(
-                        isinstance(relative, str)
-                        and bool(relative)
-                        and isinstance(expected_sha256, str)
-                        and re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is not None,
-                        "Native transfer manifest carries a malformed file row",
-                    )
-                    _require(
-                        file_digest(confined(root, relative)) == expected_sha256,
-                        f"Native transfer bytes differ from their manifest: {relative}",
-                    )
-                native_tool = read_data(native_tool_path)
-                _require(
-                    native_tool == transfer.get("native_tool"),
-                    "Native tool evidence differs from the verified transfer identity",
-                )
-                native_tool_sha256 = digest(native_tool)
-                _require(
-                    transfer.get("native_tool_sha256") == native_tool_sha256
-                    and transferred_files.get("reports/native-tool.json") == native_tool_sha256
-                    and file_digest(native_tool_path) == native_tool_sha256,
-                    "Native tool bytes are not sealed by the transfer identity",
-                )
-            elif require_native_receipts:
-                raise PipelineError("Native receipt bytes are required at this verification boundary")
-            else:
-                native_tool = runtime.get("toolchain")
-                _require(
-                    isinstance(native_tool, dict),
-                    "Self-contained delivery carries no native tool identity",
-                )
-                native_tool_sha256 = digest(native_tool)
+            native_tool = runtime.get("toolchain")
+            _require(
+                isinstance(native_tool, dict),
+                "Self-contained delivery carries no native tool identity",
+            )
         closure = evidence.dependency_closure(root)
         return metadata_value_warnings(
             runtime,

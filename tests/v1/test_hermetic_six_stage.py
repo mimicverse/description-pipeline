@@ -639,6 +639,14 @@ class HermeticSixStageTests(unittest.TestCase):
         self.assertIs(report["passed"], True, report.get("checks"))
         self.assertEqual(report["subject_sha256"], verified["subject_sha256"])
 
+        shutil.copy2(
+            self.root / "verify/reports/native-stages.json",
+            published / "reports/native-stages.json",
+        )
+        partial_receipts = check_bundle(published)
+        self.assertIs(partial_receipts["passed"], False)
+        (published / "reports/native-stages.json").unlink()
+
         with_required_receipts = check_bundle(
             published,
             require_native_receipts=True,

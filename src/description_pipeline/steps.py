@@ -285,7 +285,7 @@ def _archive_input(package: Path, staging: Path) -> None:
     ``input/records``.  Nothing is duplicated.
     """
 
-    from .sources.solidworks.discovery import DISCOVERY_FILE
+    from .sources.solidworks.discovery import DISCOVERY_FILE, FINDINGS_FILE
 
     payload = read_data(package / DISCOVERY_FILE)
     native_files = payload.get("native_files") if isinstance(payload.get("native_files"), dict) else {}
@@ -315,6 +315,10 @@ def _archive_input(package: Path, staging: Path) -> None:
     source_path = package / "source.json"
     if source_path.is_file():
         shutil.copyfile(source_path, destination / "source.json")
+    for relative in (DISCOVERY_FILE, FINDINGS_FILE):
+        target = confined(destination, relative, exists=False)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(confined(package, relative), target)
 
 
 def _rehome_evidence(staging: Path, package: Path) -> None:
@@ -813,7 +817,13 @@ def capture_evidence(
             from .runtime import native_readiness
 
             return native_readiness()
-        return {"scope": "provided CAD backend; native qualification is recorded in the capture evidence"}
+        reader = getattr(backend, "native_ready", None)
+        if callable(reader):
+            return reader()
+        return {
+            "role": "native",
+            "scope": "provided CAD backend; native qualification is recorded in the capture evidence",
+        }
 
     checked(on_event, "capture", "input", "runtime.ready", ready)
     _require(package_inventory(package) == original_files, "Prepared inputs changed before native capture")
@@ -903,7 +913,7 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
     from .verification.solidworks_urdf import (
         check_bundle,
         evaluate_bundle,
-        native_receipts,
+        load_native_receipts,
         rebuilt_definition,
         require_qualified_report,
     )
@@ -917,7 +927,7 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
         return {"subject_sha256": actual}
 
     checked(on_event, "verify", "input", "verification.subject", verify_subject)
-    receipts = native_receipts(staging)
+    receipts = load_native_receipts(staging)
     report = evaluate_bundle(
         staging,
         native_receipts=receipts,

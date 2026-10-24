@@ -2919,6 +2919,13 @@ class PlatformStore:
                 "map_index": bound_map,
                 "native_run_id": native_run,
                 "native_receipt_sha256": native_sha,
+                "native_stages_sha256": receipt.get("native_stages_sha256"),
+                "native_handoff_sha256": receipt.get("native_handoff_sha256"),
+                "capture_receipt_sha256": (
+                    digest(stages["capture"][2])
+                    if actual_stage == "capture" and isinstance(stages["capture"][2], dict)
+                    else None
+                ),
             },
         )
         reconcile_operation = reconcile.get("operation_id") if isinstance(reconcile, dict) else None
@@ -3378,6 +3385,11 @@ class PlatformStore:
         manifest = read_delivery_manifest(root)
         subject = manifest.get("subject") or {}
         stage = receipt.get("stage")
+        if (
+            receipt.get("subject_sha256") is not None
+            and subject.get("digest") != receipt.get("subject_sha256")
+        ):
+            raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         if completed and stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
             raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         records = subject.get("files") or []
@@ -3686,8 +3698,35 @@ class PlatformStore:
             }
             if {name: record["state"] for name, record in stages.items()} != expected:
                 raise PlatformStoreError("The native capture replay does not match its terminal stage projection")
+            discover_receipt = stages["discover"]["receipt"]
+            capture_receipt = stages["capture"]["receipt"]
+            capture_binding_matches = (
+                isinstance(binding, dict)
+                and _is_sha256(binding.get("native_stages_sha256"))
+                and _is_sha256(binding.get("native_handoff_sha256"))
+                and _is_sha256(binding.get("capture_receipt_sha256"))
+                and binding.get("native_stages_sha256")
+                == discover_receipt.get("native_stages_sha256")
+                and binding.get("native_handoff_sha256")
+                == discover_receipt.get("handoff_sha256")
+                and binding.get("capture_receipt_sha256") == digest(capture_receipt)
+                and binding.get("native_run_id") == native_run_id(owner_run)
+                and (
+                    capture_receipt.get("native_receipt_sha256") is None
+                    or capture_receipt.get("native_receipt_sha256")
+                    == binding.get("native_receipt_sha256")
+                )
+            )
+            if not capture_binding_matches:
+                raise PlatformStoreError("The native capture replay does not bind its stage receipt bytes")
             for stage_name in ("freeze", "discover"):
                 record = stages[stage_name]
+                self._verify_checkpoint_scope(
+                    record["checkpoint_uri"],
+                    run_id=run_id,
+                    stage=stage_name,
+                    reused_from_run=record["reused_from_run"],
+                )
                 definition, sealed_root = self._verify_sealed(
                     record["checkpoint_uri"],
                     record["receipt"],
@@ -3702,6 +3741,12 @@ class PlatformStore:
                     root=sealed_root,
                 )
             capture_record = stages["capture"]
+            self._verify_checkpoint_scope(
+                capture_record["checkpoint_uri"],
+                run_id=run_id,
+                stage="capture",
+                reused_from_run=capture_record["reused_from_run"],
+            )
             self._verify_sealed(
                 capture_record["checkpoint_uri"],
                 capture_record["receipt"],

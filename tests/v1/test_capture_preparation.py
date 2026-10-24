@@ -31,6 +31,8 @@ TOP = r"C:\capture\source\robot.SLDASM"
 PART = r"C:\capture\source\arm.SLDPRT"
 VIRTUAL = "/tmp/swx21040/VC~~/waist/virtual.SLDPRT"
 CHILD_ASSEMBLY = r"C:\capture\source\arm.SLDASM"
+SOURCE_TOP = r"C:\stage\cad\robot.SLDASM"
+SOURCE_PART = r"C:\stage\cad\arm.SLDPRT"
 
 
 def _normalized(path: str) -> str:
@@ -172,7 +174,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
         mapping = [
             {
                 "instance": "top_level",
-                "source": TOP,
+                "source": SOURCE_TOP,
                 "copy": "source/robot.SLDASM",
                 "source_sha256": "a" * 64,
                 "copy_sha256": "a" * 64,
@@ -248,7 +250,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
         mapping = [
             {
                 "instance": "top_level",
-                "source": TOP,
+                "source": SOURCE_TOP,
                 "copy": "source/robot.SLDASM",
                 "source_sha256": "a" * 64,
                 "copy_sha256": "a" * 64,
@@ -256,7 +258,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
             *[
                 {
                     "instance": instance,
-                    "source": PART,
+                    "source": SOURCE_PART,
                     "copy": "source/arm.SLDPRT",
                     "source_sha256": "b" * 64,
                     "copy_sha256": "b" * 64,
@@ -318,7 +320,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
     return {
         "scene": {
             "document": TOP,
-            "source_root": str(Path(TOP).parent),
+            "source_root": ntpath.dirname(TOP),
             "notes": {"capture_preparation": preparation},
         },
         "closure": {
@@ -433,14 +435,14 @@ def dynamic_child_payload() -> dict:
     value["closure"]["mapping"] = [
         {
             "instance": "top_level",
-            "source": TOP,
+            "source": SOURCE_TOP,
             "copy": "source/robot.SLDASM",
             "source_sha256": "a" * 64,
             "copy_sha256": "a" * 64,
         },
         {
             "instance": "arm-1",
-            "source": CHILD_ASSEMBLY,
+            "source": r"C:\stage\cad\arm.SLDASM",
             "copy": "source/arm.SLDASM",
             "source_sha256": "b" * 64,
             "copy_sha256": "b" * 64,
@@ -568,6 +570,73 @@ class CapturePreparationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineError, "rebuilt more than once"):
             self.validate(duplicate)
+
+    def test_file_and_session_occurrence_paths_are_not_rebound_by_basename(self) -> None:
+        rebound_file = payload()
+        rebound_path = r"C:\other\arm.SLDPRT"
+        preparation = self.preparation(rebound_file)
+        topology_row = next(
+            row
+            for row in preparation["topology_before"]
+            if row["instance"] == "arm-1"
+        )
+        preparation["topology_before"] = [
+            row
+            for row in preparation["topology_before"]
+            if row["instance"] != "arm-2"
+        ]
+        preparation["component_count"] -= 1
+        rebound_file["discovery"]["raw"]["components"] = [
+            row
+            for row in rebound_file["discovery"]["raw"]["components"]
+            if row["instance_id"] != "arm-2"
+        ]
+        closure = rebound_file["discovery"]["raw"]["source_selection"]["closure"]
+        closure["documents"]["cad/robot.SLDASM"]["resolved_edges"] = [
+            edge
+            for edge in closure["documents"]["cad/robot.SLDASM"]["resolved_edges"]
+            if edge["instance"] != "arm-2"
+        ]
+        topology_row["document_path"] = rebound_path
+        topology_row["normalized_path"] = _normalized(rebound_path)
+        preparation["topology_after"] = copy.deepcopy(preparation["topology_before"])
+        source_files = preparation["source_files_before"]
+        source_files.pop(_normalized(PART))
+        source_files[_normalized(rebound_path)] = {
+            "path": rebound_path,
+            "sha256": "b" * 64,
+        }
+        preparation["source_files_after"] = copy.deepcopy(source_files)
+        with self.assertRaisesRegex(PipelineError, "escapes its capture root"):
+            self.validate(rebound_file)
+
+        rebound_session = payload(virtual_reuse=True)
+        changed_session = "/tmp/swx21040/VC~~/other/virtual.SLDPRT"
+        preparation = self.preparation(rebound_session)
+        for row in preparation["topology_before"]:
+            if row["storage_scope"] == "session":
+                row["document_path"] = changed_session
+                row["normalized_path"] = _normalized(changed_session)
+        preparation["topology_after"] = copy.deepcopy(preparation["topology_before"])
+        preparation["session_dependency_paths"] = [changed_session]
+        with self.assertRaisesRegex(PipelineError, "Session path identity changed"):
+            self.validate(rebound_session)
+
+    def test_session_dependency_inventory_is_a_unique_sorted_list(self) -> None:
+        duplicated = payload(virtual_reuse=True)
+        duplicated["scene"]["notes"]["capture_preparation"]["session_dependency_paths"] = [
+            VIRTUAL,
+            VIRTUAL,
+        ]
+        with self.assertRaisesRegex(PipelineError, "unique sorted list"):
+            self.validate(duplicated)
+
+        mapping = payload(virtual_reuse=True)
+        mapping["scene"]["notes"]["capture_preparation"]["session_dependency_paths"] = {
+            VIRTUAL: True
+        }
+        with self.assertRaisesRegex(PipelineError, "unique sorted list"):
+            self.validate(mapping)
 
     def test_schema_state_and_source_mutations_are_rejected(self) -> None:
         cases = (
@@ -720,10 +789,21 @@ class NativeReceiptTests(unittest.TestCase):
             ("schema", lambda transfer: transfer.update(schema_version="unknown"), "unknown schema"),
             ("file_count", lambda transfer: transfer.update(file_count=transfer["file_count"] + 1), "file count"),
             (
+                "file_count_type",
+                lambda transfer: transfer.update(file_count=float(transfer["file_count"])),
+                "file count",
+            ),
+            (
                 "total_bytes",
                 lambda transfer: transfer.update(total_bytes=transfer["total_bytes"] + 1),
                 "size differs",
             ),
+            (
+                "total_bytes_type",
+                lambda transfer: transfer.update(total_bytes=float(transfer["total_bytes"])),
+                "total bytes",
+            ),
+            ("unknown_field", lambda transfer: transfer.update(extra=True), "incomplete or unknown"),
             ("run_id", lambda transfer: transfer.update(run_id=RUN_ID + "-other"), "UUID"),
             (
                 "stage_scope",
@@ -748,8 +828,30 @@ class NativeReceiptTests(unittest.TestCase):
         transfer["files"]["reports/native-stages.json"] = hashlib.sha256(stages_blob).hexdigest()
         receipts["native_stages_bytes"] = stages_blob
         receipts["transfer_manifest_bytes"] = canonical(transfer)
+        (root / "reports/native-stages.json").write_bytes(stages_blob)
         with self.assertRaisesRegex(PipelineError, "raw protocol events"):
             _native_receipts_evidence(root, receipts)
+
+    def test_required_receipt_members_cannot_be_dropped_around_changed_blobs(self) -> None:
+        root, receipts, transfer = self.receipts()
+        original_lengths = {
+            name: len(receipts[name])
+            for name in ("native_tool_bytes", "native_stages_bytes")
+        }
+        transfer["files"].pop("reports/native-tool.json")
+        transfer["files"].pop("reports/native-stages.json")
+        transfer["file_count"] -= 2
+        transfer["total_bytes"] -= sum(original_lengths.values())
+        receipts["native_tool_bytes"] = b" " + receipts["native_tool_bytes"]
+        receipts["transfer_manifest_bytes"] = canonical(transfer)
+
+        with self.assertRaisesRegex(PipelineError, "omits required capture reports"):
+            _native_receipts_evidence(root, receipts)
+        write_json(root / "transfer-manifest.json", transfer)
+        with self.assertRaisesRegex(PipelineError, "omits required capture reports"):
+            from description_pipeline.orchestration.stage_transfer import verify_transfer
+
+            verify_transfer(root)
 
 
 if __name__ == "__main__":

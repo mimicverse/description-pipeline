@@ -11,7 +11,6 @@ qualified success: verification still runs on Linux.
 from __future__ import annotations
 
 import hashlib
-import json
 import ntpath
 import os
 import shutil
@@ -29,7 +28,17 @@ from .. import __version__
 from ..build.archive import ZIP_EPOCH
 from ..delivery import PIPELINE_ID, TRANSFER_FILES
 from ..interface_records import validate_source_record
-from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, inventory, read_data
+from ..io import (
+    PipelineError,
+    artifact_path_parts,
+    canonical,
+    confined,
+    digest,
+    file_digest,
+    inventory,
+    parse_data,
+    read_data,
+)
 from ..request_evidence import read_request_evidence
 from ..runtime import RUNTIME_VERSIONS, required_packages
 from ..sources.snapshot import verify_snapshot
@@ -63,6 +72,10 @@ _REQUIRED_REPORTS = (
 #: payload so the Linux side can always hand them to the structural team, and the portable
 #: pipeline re-creates its own copy in a delivery.
 TEAM_REPORTS = ("reports/structural-team.md", "reports/structural-team.json")
+_TEAM_RECEIPT_KEYS = {
+    "reports/structural-team.md": "structural_team_md_bytes",
+    "reports/structural-team.json": "structural_team_json_bytes",
+}
 #: The live stage view is ignored at seal: Linux re-renders it after admission.
 #: A stray receipt (for example a legacy reports/run.json) is not ignored - the
 #: closed payload inventory below refuses unknown members instead.
@@ -90,6 +103,10 @@ def _is_sha256(value) -> bool:
 
 def _document_basename(value) -> str:
     return ntpath.basename(str(value or "").replace("/", "\\"))
+
+
+def _normalize_document_path(value) -> str:
+    return ntpath.normpath(str(value or "").replace("/", "\\")).casefold()
 
 
 def _validate_native_tool(native_tool) -> None:
@@ -151,8 +168,8 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
         isinstance(stages, list)
         and all(isinstance(stage, dict) for stage in stages)
         and len(stages) == len(STAGE_IDS)
-        and {stage.get("id") for stage in stages} == set(STAGE_IDS),
-        "Stage receipts must list all six engineering stages exactly once",
+        and [stage.get("id") for stage in stages] == list(STAGE_IDS),
+        "Stage receipts must list the six engineering stages once in contract order",
     )
     by_id = {stage["id"]: stage for stage in stages}
     for stage_id in NATIVE_STAGE_SCOPE:
@@ -273,8 +290,6 @@ def _validate_stage_receipts(view, *, run_id: str, handoff_sha256: str) -> None:
         _receipt_projection(recomputed) == _receipt_projection(view),
         "Native stage receipts differ from the stage view rebuilt from their own events",
     )
-
-
 def _receipt_projection(view) -> dict:
     """The native rows and boundary-check states a receipt must actually prove."""
 
@@ -289,6 +304,9 @@ def _receipt_projection(view) -> dict:
                 if isinstance(item, dict):
                     checks[(boundary, item.get("id"))] = item.get("state")
         projection[stage_id] = {
+            "at": stage.get("at"),
+            "input_qc": stage.get("input_qc"),
+            "output_qc": stage.get("output_qc"),
             "state": stage.get("state"),
             "in_scope": stage.get("in_scope"),
             "checks_passed": stage.get("checks_passed"),
@@ -329,7 +347,8 @@ def _validate_input(root: Path, report, main_assembly: str) -> tuple[dict[str, s
     actual_casefold = _casefold_inventory(actual, "Archived CAD inventory")
     recorded_casefold = _casefold_inventory(recorded, "Handoff CAD inventory")
     _require(
-        dict(actual_casefold.values()) == dict(recorded_casefold.values()),
+        {key: value[1] for key, value in actual_casefold.items()}
+        == {key: value[1] for key, value in recorded_casefold.items()},
         "Archived input differs from the frozen handoff inventory",
     )
     main_row = actual_casefold.get(main_assembly.casefold())
@@ -349,6 +368,10 @@ def _validate_evidence(
 ) -> dict:
     evidence = Path(root) / "evidence"
     manifest = verify_snapshot(evidence)
+    _require(
+        manifest.get("kind") == "solidworks" and manifest.get("evidence_class") == "cad",
+        "Evidence snapshot is not native SolidWorks CAD evidence",
+    )
     scene = manifest.get("scene")
     _require(
         isinstance(scene, str) and scene in (manifest.get("files") or {}),
@@ -446,6 +469,51 @@ def _validate_evidence(
         "Material provenance uses another configuration",
     )
     collected_document = capture.get("collected_document")
+    source_assembly = _normalize_document_path(identity.get("assembly"))
+    source_document = _normalize_document_path(identity.get("document_id"))
+    source_material = _normalize_document_path(material.get("assembly"))
+    collected_source = _normalize_document_path(collected_document)
+    closure_source = _normalize_document_path(raw_closure.get("top_level"))
+    expected_source_suffix = "\\" + _normalize_document_path(main_assembly)
+    _require(
+        source_assembly == source_document == source_material
+        and source_assembly.endswith(expected_source_suffix),
+        "Evidence source paths disagree or do not bind the selected main assembly",
+    )
+    _require(
+        collected_source == closure_source
+        and collected_source.endswith("\\" + _document_basename(main_assembly).casefold()),
+        "Evidence collected document differs from the dependency closure top level",
+    )
+    _source_name, source_sha256 = next(
+        (
+            (name, checksum)
+            for name, checksum in native_files.items()
+            if _normalize_document_path(name) == _normalize_document_path(main_assembly)
+        ),
+        (None, None),
+    )
+    _require(source_sha256 is not None, "Native discovery lacks the selected main assembly")
+    original_files = raw_closure.get("original_files")
+    _require(
+        isinstance(original_files, dict)
+        and any(
+            _normalize_document_path(path) == source_assembly and checksum == source_sha256
+            for path, checksum in original_files.items()
+        ),
+        "Evidence dependency closure does not bind the selected source assembly",
+    )
+    mapping = raw_closure.get("mapping")
+    _require(
+        isinstance(mapping, list)
+        and any(
+            isinstance(row, dict)
+            and _normalize_document_path(row.get("source")) == source_assembly
+            and row.get("source_sha256") == source_sha256
+            for row in mapping
+        ),
+        "Evidence dependency mapping does not bind the selected source assembly",
+    )
     _require(
         isinstance(collected_document, str)
         and _document_basename(collected_document).casefold()
@@ -484,11 +552,28 @@ def expected_native_check_details(
         for name, checksum in inventory(input_root).items()
         if name not in {"handoff.json", "request.json"}
     }
+    handoff_record = read_data(confined(root, "input/handoff.json"))
+    package_files = handoff_record.get("package_files")
+    package_casefold = _casefold_inventory(package_files, "Frozen package files")
+    input_casefold = _casefold_inventory(input_inventory, "Archived input files")
+    for name, (_original, checksum) in package_casefold.items():
+        _require(
+            name in input_casefold and input_casefold[name][1] == checksum,
+            f"Frozen package file is absent from archived input or changed: {name}",
+        )
+    derived_inputs = {
+        name
+        for name in input_casefold
+        if name == "capture-plan.json" or name.startswith("discovery/")
+    }
+    _require(
+        set(input_casefold) == set(package_casefold) | derived_inputs,
+        "Archived input contains an unbound non-package file",
+    )
     expected_input = {
         f"input/{name}": checksum
         for name, checksum in input_inventory.items()
     }
-    handoff_record = read_data(confined(root, "input/handoff.json"))
     discovery_record = read_data(confined(root, "evidence/discovery.json"))
     derivation = (
         discovery_record.get("derivation")
@@ -533,7 +618,7 @@ def expected_native_check_details(
         "input.valid": {
             "cad_revision": handoff_record.get("cad_revision"),
             "files": expected_input,
-            "files_sha256": digest(handoff_record.get("package_files")),
+            "files_sha256": digest(package_files),
             "handoff_sha256": handoff_sha256,
             "passed": True,
             "warnings": list(handoff_record.get("warnings") or []),
@@ -572,11 +657,138 @@ def _validate_stage_details(
         set(expected) <= set(checks),
         f"Native stage receipts lack required details: {sorted(set(expected) - set(checks))}",
     )
+    extra_required = {
+        "handoff.admission",
+        "discovery.definition",
+        "discovery.binding",
+        "runtime.ready",
+    }
+    _require(
+        extra_required <= set(checks),
+        f"Native stage receipts lack required details: {sorted(extra_required - set(checks))}",
+    )
     for identifier, details in expected.items():
         _require(
             checks[identifier].get("details") == details,
             f"Native stage detail differs from its captured bytes: {identifier}",
         )
+
+    admission = checks["handoff.admission"].get("details")
+    _require(
+        isinstance(admission, dict)
+        and admission.get("handoff_sha256") == handoff_sha256
+        and isinstance(admission.get("package"), str)
+        and bool(admission["package"]),
+        "Freeze handoff.admission differs from the frozen identity",
+    )
+
+    discovery_record = read_data(confined(root, "evidence/discovery.json"))
+    discovery_identity = (
+        discovery_record.get("identity")
+        if isinstance(discovery_record, dict)
+        else {}
+    )
+    native_discovery_path = confined(
+        root,
+        "input/discovery/native-discovery.json",
+        exists=False,
+    )
+    _require(native_discovery_path.is_file(), "Archived input lacks its native discovery record")
+    definition = checks["discovery.definition"].get("details")
+    _require(isinstance(definition, dict), "Discover discovery.definition details are missing")
+    findings = (
+        discovery_record.get("findings")
+        if isinstance(discovery_record, dict)
+        else None
+    )
+    _require(
+        definition.get("discovery_sha256") == file_digest(native_discovery_path)
+        and definition.get("findings") == findings
+        and definition.get("hardware_id") == discovery_identity.get("hardware_id")
+        and definition.get("revision") == discovery_identity.get("revision")
+        and type(definition.get("passed")) is bool,
+        "Discover discovery.definition differs from the sealed discovery record",
+    )
+
+    binding = checks["discovery.binding"].get("details")
+    _require(isinstance(binding, dict), "Discover discovery.binding details are missing")
+    binding_files = binding.get("files")
+    _require(
+        isinstance(binding_files, dict) and bool(binding_files),
+        "Discover discovery.binding has no file inventory",
+    )
+    archived_inputs = {
+        f"input/{name}": checksum
+        for name, checksum in inventory(Path(root) / "input").items()
+    }
+    capture_plan = confined(root, "evidence/capture-plan.json", exists=False)
+    if capture_plan.is_file():
+        archived_inputs["evidence/capture-plan.json"] = file_digest(capture_plan)
+    archived_by_name = {}
+    for path, checksum in archived_inputs.items():
+        key = (_document_basename(path).casefold(), checksum)
+        archived_by_name.setdefault(key, []).append(path)
+    for relative, checksum in binding_files.items():
+        _require(
+            isinstance(relative, str)
+            and relative.startswith("input/")
+            and _is_sha256(checksum),
+            f"Discover discovery.binding has a malformed row: {relative!r}",
+        )
+        key = (_document_basename(relative).casefold(), checksum)
+        candidates = archived_by_name.get(key, [])
+        _require(
+            len(candidates) == 1,
+            f"Discover discovery.binding file is absent or ambiguous: {relative}",
+        )
+    _require(
+        binding.get("prepared_sha256")
+        == digest({name.removeprefix("input/"): checksum for name, checksum in binding_files.items()}),
+        "Discover discovery.binding prepared digest differs from its file inventory",
+    )
+    handoff_files = read_data(confined(root, "input/handoff.json")).get("package_files")
+    _require(
+        isinstance(handoff_files, dict)
+        and all(
+            (
+                _document_basename(name).casefold(),
+                checksum,
+            )
+            in archived_by_name
+            for name, checksum in handoff_files.items()
+        ),
+        "Discover discovery.binding omits an archived package file",
+    )
+    _require(
+        binding.get("discovery_sha256") == file_digest(native_discovery_path)
+        and binding.get("hardware_id") == discovery_identity.get("hardware_id")
+        and binding.get("revision") == discovery_identity.get("revision")
+        and (
+            binding.get("base") is None
+            or isinstance(binding.get("base"), str)
+        )
+        and (
+            binding.get("repository_slug") is None
+            or isinstance(binding.get("repository_slug"), str)
+        )
+        and (
+            binding.get("prepared_sha256") is None
+            or _is_sha256(binding.get("prepared_sha256"))
+        ),
+        "Discover discovery.binding differs from the sealed discovery identity",
+    )
+
+    runtime_ready = checks["runtime.ready"].get("details")
+    _require(
+        isinstance(runtime_ready, dict)
+        and runtime_ready.get("role") == "native"
+        and isinstance(runtime_ready.get("scope"), str)
+        and bool(runtime_ready["scope"])
+        and isinstance(runtime_ready.get("solidworks_executable"), str)
+        and _document_basename(runtime_ready["solidworks_executable"]).casefold()
+        == "sldworks.exe",
+        "Capture runtime.ready does not bind the native SolidWorks executable",
+    )
 
 
 def _validate_source_identity(
@@ -620,6 +832,45 @@ def _validate_source_identity(
         and discovery_identity.get("hardware_id") == hardware,
         "Native discovery identity differs from the source record",
     )
+    discovery_records = discovery.get("records")
+    _require(isinstance(discovery_records, list), "Native discovery controlled-record list is missing")
+    by_reference = {}
+    for item in discovery_records:
+        _require(isinstance(item, dict), "Native discovery controlled record is malformed")
+        reference = item.get("reference")
+        _require(
+            isinstance(reference, str)
+            and bool(reference)
+            and reference not in by_reference,
+            "Native discovery repeats a controlled-record reference",
+        )
+        by_reference[reference] = item
+    source_records = identity["records"]
+    _require(
+        {item["reference"] for item in source_records} == set(by_reference),
+        "Source record controlled references differ from native discovery",
+    )
+    for item in source_records:
+        expected = by_reference[item["reference"]]
+        package_file = expected.get("package_file")
+        _require(
+            isinstance(package_file, str)
+            and bool(package_file)
+            and expected.get("source_sha256") == item["file_sha256"]
+            and len(
+                package_candidates := [
+                    name
+                    for name, checksum in (handoff.get("package_files") or {}).items()
+                    if _document_basename(name).casefold()
+                    == _document_basename(package_file).casefold()
+                    and checksum == item["file_sha256"]
+                ]
+            )
+            == 1
+            and file_digest(confined(root, "input/" + package_candidates[0]))
+            == item["file_sha256"],
+            f"Controlled record bytes differ from the source record: {item['reference']}",
+        )
     request_path = confined(root, "input/request.json", exists=False)
     if request_path.is_file():
         request, _request_sha256 = read_request_evidence(request_path)
@@ -635,6 +886,7 @@ def _validate_source_identity(
 def _validate_native_discovery(
     root: Path,
     *,
+    run_id: str,
     main_assembly: str,
     handoff_sha256: str,
     actual_inputs: dict[str, str],
@@ -647,6 +899,19 @@ def _validate_native_discovery(
 
     record = read_data(confined(root, "evidence/discovery.json"))
     _require(isinstance(record, dict), "Native discovery record must be an object")
+    _require(
+        record.get("schema_version") == "solidworks-to-urdf.native-discovery/v1",
+        "Native discovery record uses an unknown schema",
+    )
+    recorded_run_id = record.get("run_id")
+    try:
+        canonical_discovery_run = str(uuid.UUID(str(recorded_run_id)))
+    except (ValueError, AttributeError, TypeError) as error:
+        raise PipelineError("Native discovery run_id is not a UUID") from error
+    _require(
+        recorded_run_id == canonical_discovery_run == run_id,
+        "Native discovery record belongs to another run",
+    )
     identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
     recorded = identity.get("main_assembly")
     _require(isinstance(recorded, str) and recorded, "Native discovery record names no main assembly")
@@ -662,12 +927,38 @@ def _validate_native_discovery(
     native_casefold = _casefold_inventory(native_files, "Native discovery file inventory")
     actual_casefold = _casefold_inventory(actual_inputs, "Archived capture input inventory")
     _require(
-        dict(native_casefold.values()) == dict(actual_casefold.values()),
+        {key: value[1] for key, value in native_casefold.items()}
+        == {key: value[1] for key, value in actual_casefold.items()},
         "Native discovery inventory differs from the archived capture input",
     )
     _require(
         digest(native_files) == handoff_sha256,
         "The native discovery file inventory does not digest to its handoff",
+    )
+    discovery_files = record.get("files")
+    _require(
+        isinstance(discovery_files, list)
+        and discovery_files
+        and all(
+            isinstance(item, dict)
+            and set(item) == {"path", "sha256"}
+            for item in discovery_files
+        ),
+        "Native discovery carries no exact file list",
+    )
+    listed = {
+        str(item["path"]).casefold(): item["sha256"]
+        for item in discovery_files
+    }
+    _require(
+        len(listed) == len(discovery_files)
+        and listed
+        == {key: value[1] for key, value in native_casefold.items()},
+        "Native discovery file list differs from its inventory",
+    )
+    _require(
+        record.get("native_inventory_sha256") == digest(discovery_files),
+        "Native discovery inventory digest differs from its file list",
     )
     main = native_casefold.get(main_assembly.casefold())
     _require(main is not None, f"The native discovery record does not inventory the main assembly: {main_assembly!r}")
@@ -707,6 +998,7 @@ def _validate_capture(
     actual_inputs, input_main, main_assembly_sha256 = _validate_input(root, handoff, main_assembly)
     native_files, native_sha256 = _validate_native_discovery(
         root,
+        run_id=run_id,
         main_assembly=main_assembly,
         handoff_sha256=handoff_sha256,
         actual_inputs=actual_inputs,
@@ -896,7 +1188,7 @@ def _extract(archive: Path, staging: Path) -> dict:
             _require(manifest_info.file_size <= MAX_MANIFEST_BYTES, "Transfer manifest exceeds the size limit")
             manifest_bytes = source.read(manifest_info)
             try:
-                manifest = json.loads(manifest_bytes.decode("utf-8"))
+                manifest = parse_data(manifest_bytes, Path(CAPTURE_MANIFEST))
             except (UnicodeDecodeError, ValueError) as error:
                 raise PipelineError(f"Transfer manifest is not readable JSON: {error}") from error
             _require(isinstance(manifest, dict), "Transfer manifest must be an object")
@@ -1039,6 +1331,7 @@ def verify_transfer(
 
     bundle = Path(bundle)
     supplied = {}
+    team_receipts = {}
     if native_receipts is not None:
         _require(isinstance(native_receipts, dict), "Native receipts must be supplied as an object")
         for name in ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes"):
@@ -1048,11 +1341,28 @@ def verify_transfer(
                 f"Native receipt {name} is missing",
             )
             supplied[name] = bytes(blob)
+        for report, key in _TEAM_RECEIPT_KEYS.items():
+            blob = native_receipts.get(key)
+            if blob is not None:
+                _require(
+                    isinstance(blob, (bytes, bytearray)) and bool(blob),
+                    f"Native receipt {key} is malformed",
+                )
+                team_receipts[report] = bytes(blob)
         try:
-            receipt_manifest = json.loads(supplied["transfer_manifest_bytes"].decode("utf-8"))
-            receipt_native_tool = json.loads(supplied["native_tool_bytes"].decode("utf-8"))
-            receipt_stages = json.loads(supplied["native_stages_bytes"].decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as error:
+            receipt_manifest = parse_data(
+                supplied["transfer_manifest_bytes"],
+                Path("transfer_manifest_bytes.json"),
+            )
+            receipt_native_tool = parse_data(
+                supplied["native_tool_bytes"],
+                Path("native_tool_bytes.json"),
+            )
+            receipt_stages = parse_data(
+                supplied["native_stages_bytes"],
+                Path("native_stages_bytes.json"),
+            )
+        except PipelineError as error:
             raise PipelineError("Native receipts are not UTF-8 JSON") from error
     else:
         present = [name for name in TRANSFER_FILES if (bundle / name).is_file()]
@@ -1066,14 +1376,45 @@ def verify_transfer(
     skip = derived | set(carried_bindings)
     manifest = receipt_manifest if receipt_manifest is not None else read_data(confined(bundle, CAPTURE_MANIFEST))
     _require(isinstance(manifest, dict), "Transfer manifest must be an object")
+    _require(
+        set(manifest)
+        == {
+            "schema_version",
+            "run_id",
+            "handoff_sha256",
+            "main_assembly",
+            "main_assembly_sha256",
+            "native_tool",
+            "native_tool_sha256",
+            "files",
+            "file_count",
+            "total_bytes",
+            "native_stage_scope",
+        },
+        "Transfer manifest fields are incomplete or unknown",
+    )
     _require(manifest.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
     files = manifest.get("files")
     _require(isinstance(files, dict) and files, "Transfer manifest declares no files")
     _require(
+        set(_REQUIRED_REPORTS) <= set(files),
+        f"Transfer manifest omits required capture reports: {sorted(set(_REQUIRED_REPORTS) - set(files))}",
+    )
+    _require(
         manifest.get("native_stage_scope") == list(NATIVE_STAGE_SCOPE),
         "Transfer manifest declares another native stage scope",
     )
-    _require(manifest.get("file_count") == len(files), "Transfer manifest file count differs from its inventory")
+    _require(
+        type(manifest.get("file_count")) is int
+        and manifest["file_count"] == len(files),
+        "Transfer manifest file count differs from its inventory",
+    )
+    _require(
+        type(manifest.get("total_bytes")) is int
+        and manifest["total_bytes"] >= 0,
+        "Transfer manifest total bytes are invalid",
+    )
+    sized_members = {}
     for name, checksum in files.items():
         artifact_path_parts(name)
         _require(
@@ -1082,17 +1423,58 @@ def verify_transfer(
         )
         _require(_is_sha256(checksum), f"Transfer manifest hash is not a sha256: {name}")
         if name in derived:
+            team_blob = team_receipts.get(name)
+            if receipt_manifest is None:
+                continue
+            _require(
+                team_blob is not None or confined(bundle, name, exists=False).is_file(),
+                f"Derived transfer member has no receipt or delivery bytes: {name}",
+            )
+            actual = (
+                hashlib.sha256(team_blob).hexdigest()
+                if team_blob is not None
+                else file_digest(confined(bundle, name))
+            )
+            disk_path = confined(bundle, name, exists=False)
+            if team_blob is not None and disk_path.is_file():
+                _require(
+                    file_digest(disk_path) == checksum,
+                    f"Native disk receipt differs from the transfer manifest: {name}",
+                )
+            sized_members[name] = len(team_blob) if team_blob is not None else disk_path.stat().st_size
+            _require(
+                actual == checksum,
+                f"Delivered member differs from the transfer manifest: {name}",
+            )
             continue
         if name == "reports/native-tool.json" and receipt_native_tool is not None:
             actual = hashlib.sha256(supplied["native_tool_bytes"]).hexdigest()
+            disk_path = confined(bundle, name, exists=False)
+            if disk_path.is_file():
+                _require(
+                    file_digest(disk_path) == checksum,
+                    f"Native disk receipt differs from the transfer manifest: {name}",
+                )
         elif name == "reports/native-stages.json" and receipt_stages is not None:
             actual = hashlib.sha256(supplied["native_stages_bytes"]).hexdigest()
+            disk_path = confined(bundle, name, exists=False)
+            if disk_path.is_file():
+                _require(
+                    file_digest(disk_path) == checksum,
+                    f"Native disk receipt differs from the transfer manifest: {name}",
+                )
         else:
             actual = file_digest(confined(bundle, name))
         _require(
             actual == checksum,
             f"Delivered member differs from the transfer manifest: {name}",
         )
+        if name == "reports/native-tool.json" and receipt_native_tool is not None:
+            sized_members[name] = len(supplied["native_tool_bytes"])
+        elif name == "reports/native-stages.json" and receipt_stages is not None:
+            sized_members[name] = len(supplied["native_stages_bytes"])
+        else:
+            sized_members[name] = confined(bundle, name).stat().st_size
     actual_payload = {
         path.relative_to(bundle).as_posix()
         for path in bundle.rglob("*")
@@ -1117,17 +1499,9 @@ def verify_transfer(
             file_digest(confined(bundle, name)) == checksum,
             f"Delivered carried original differs from its frozen bytes: {name}",
         )
-    if not derived & set(files):
-        member_total = 0
-        for name in files:
-            if name == "reports/native-tool.json" and receipt_native_tool is not None:
-                member_total += len(supplied["native_tool_bytes"])
-            elif name == "reports/native-stages.json" and receipt_stages is not None:
-                member_total += len(supplied["native_stages_bytes"])
-            else:
-                member_total += confined(bundle, name).stat().st_size
+    if receipt_manifest is not None or not derived & set(files):
         _require(
-            manifest.get("total_bytes") == member_total,
+            manifest.get("total_bytes") == sum(sized_members.values()),
             "Transfer manifest size differs from its members",
         )
     _require(
@@ -1192,15 +1566,23 @@ def validate_native_receipts(root: Path, receipts: dict) -> dict:
 
     _require(isinstance(receipts, dict), "Native receipts must be supplied as an object")
     blobs = {}
-    for name in ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes"):
+    receipt_names = (
+        "native_tool_bytes",
+        "native_stages_bytes",
+        "transfer_manifest_bytes",
+        *_TEAM_RECEIPT_KEYS.values(),
+    )
+    for name in receipt_names:
+        if name not in receipts and name in _TEAM_RECEIPT_KEYS.values():
+            continue
         blob = receipts.get(name)
         _require(isinstance(blob, (bytes, bytearray)) and bool(blob), f"Native receipt {name} is missing")
         blobs[name] = bytes(blob)
     try:
-        transfer = json.loads(blobs["transfer_manifest_bytes"].decode("utf-8"))
-        native_tool = json.loads(blobs["native_tool_bytes"].decode("utf-8"))
-        stages = json.loads(blobs["native_stages_bytes"].decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as error:
+        transfer = parse_data(blobs["transfer_manifest_bytes"], Path("transfer_manifest_bytes.json"))
+        native_tool = parse_data(blobs["native_tool_bytes"], Path("native_tool_bytes.json"))
+        stages = parse_data(blobs["native_stages_bytes"], Path("native_stages_bytes.json"))
+    except PipelineError as error:
         raise PipelineError("Native receipts are not UTF-8 JSON") from error
     request_path = confined(root, "input/request.json", exists=False)
     carried = {"input/request.json": file_digest(request_path)} if request_path.is_file() else {}

@@ -158,7 +158,10 @@ def build_fixture_capture(
     )
     tool = native_twin()
     capture_output = root / "capture-delivery"
-    with patch.object(solidworks, "_native_tool_record", return_value=tool):
+    with (
+        patch.object(solidworks, "_native_tool_record", return_value=tool),
+        patch("description_pipeline.runtime.tool_record", return_value=tool),
+    ):
         capture = capture_entry(
             prepared_package,
             capture_output,

@@ -8,6 +8,7 @@ side's battery, not claimed by these unit tests.
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import tempfile
@@ -3711,6 +3712,47 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
             )
         self.world.stages[(self.run_id, "capture")] = original_capture
 
+        for label, mutate in (
+            ("subject", lambda receipt: receipt.update(subject_sha256="f" * 64)),
+            ("error", lambda receipt: receipt.update(error="FORGED CAPTURE ERROR")),
+            ("native-receipt", lambda receipt: receipt.update(native_receipt_sha256="f" * 64)),
+        ):
+            with self.subTest(mutation=label):
+                changed_capture = copy.deepcopy(original_capture[1])
+                mutate(changed_capture)
+                self.world.stages[(self.run_id, "capture")] = (
+                    "failed",
+                    changed_capture,
+                    *original_capture[2:],
+                )
+                before = self.world.snapshot_state()
+                with self.assertRaises(PlatformStoreError):
+                    self.store.completed_native_capture_recovery(
+                        run_id=self.run_id,
+                        operation_key=reconcile["operation_key"],
+                        params_digest=reconcile["params_digest"],
+                        owner_operation_id=self.native_id,
+                    )
+                self.assertEqual(self.world.snapshot_state(), before)
+                self.world.stages[(self.run_id, "capture")] = original_capture
+
+        original_discover = self.world.stages[(self.run_id, "discover")]
+        changed_discover = copy.deepcopy(original_discover[1])
+        changed_discover["native_stages_sha256"] = "f" * 64
+        self.world.stages[(self.run_id, "discover")] = (
+            "completed",
+            changed_discover,
+            *original_discover[2:],
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "stage receipt bytes"):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.world.stages[(self.run_id, "discover")] = original_discover
+
         self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "running"
         with self.assertRaises(PlatformStoreError):
             self.store.completed_native_capture_recovery(
@@ -3733,6 +3775,33 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 owner_operation_id=self.native_id,
             )
         shutil.copytree(backup, discover_root)
+
+    def test_state_first_recovery_refuses_foreign_checkpoint_scope(self) -> None:
+        self._prepare_capture_failure()
+        reconcile = self._capture_reconcile()
+        self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
+        foreign_run = "11111111-1111-4111-8111-111111111111"
+        for stage in ("freeze", "discover", "capture"):
+            with self.subTest(stage=stage):
+                original = self.world.stages[(self.run_id, stage)]
+                source = self.tmp / self.run_id / stage
+                foreign = self.tmp / foreign_run / stage
+                shutil.copytree(source, foreign)
+                self.world.stages[(self.run_id, stage)] = (
+                    original[0],
+                    original[1],
+                    f"store://sealed/{foreign_run}/{stage}",
+                    *original[3:],
+                )
+                with self.assertRaisesRegex(PlatformStoreError, "proven origin"):
+                    self.store.completed_native_capture_recovery(
+                        run_id=self.run_id,
+                        operation_key=reconcile["operation_key"],
+                        params_digest=reconcile["params_digest"],
+                        owner_operation_id=self.native_id,
+                    )
+                self.world.stages[(self.run_id, stage)] = original
+                shutil.rmtree(foreign)
 
     def test_capture_settlement_refuses_a_foreign_owner_binding(self) -> None:
         self._prepare_capture_failure()

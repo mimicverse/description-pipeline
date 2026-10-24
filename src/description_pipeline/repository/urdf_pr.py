@@ -200,10 +200,10 @@ def _run_verifier(root: Path, *, native_receipts=None) -> dict:
 def _native_receipts(root: Path) -> dict[str, bytes] | None:
     """Load the immutable native provenance bytes when this boundary carries them."""
 
-    from ..verification.solidworks_urdf import native_receipts
+    from ..verification.solidworks_urdf import load_native_receipts
 
     try:
-        return native_receipts(Path(root))
+        return load_native_receipts(Path(root))
     except PipelineError as error:
         raise PrError("native_receipts_incomplete", str(error)) from error
 

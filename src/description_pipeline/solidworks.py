@@ -222,11 +222,11 @@ def _stamp(root: Path, receipt: dict) -> None:
 
 
 def _check(root: Path) -> dict:
-    from .verification.solidworks_urdf import check_bundle, native_receipts
+    from .verification.solidworks_urdf import check_bundle, load_native_receipts
 
     return check_bundle(
         root,
-        native_receipts=native_receipts(root),
+        native_receipts=load_native_receipts(root),
         require_native_receipts=True,
     )
 
