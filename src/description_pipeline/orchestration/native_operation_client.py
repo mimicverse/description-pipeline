@@ -655,6 +655,176 @@ def _capture_archive_manifest(archive: Path) -> dict[str, object]:
 
 
 @dataclass(frozen=True, slots=True)
+class SealedNativeOperationRequest:
+    """The canonical request identity reconstructed from a sealed outbound."""
+
+    operation_id: str
+    kind: str
+    request: CaptureOperationRequest | NativeDiscoverRequest
+    request_sha256: str
+    payload_sha256: str | None
+    native_tool_requirement_sha256: str
+    input_archive: Path | None = None
+    input_archive_sha256: str | None = None
+
+
+def read_sealed_native_operation_request(
+    command: StageCommand,
+    intent: EffectIntent,
+    outbound_root: Path,
+) -> SealedNativeOperationRequest:
+    """Read one canonical native request from immutable effect evidence."""
+
+    if command.stage == "capture":
+        from ..pipeline.capture import (
+            CaptureRequest,
+            _outbound_tree_sha256,
+            validate_capture_effect_outbound,
+        )
+
+        outbound = validate_capture_effect_outbound(outbound_root, command)
+        request = CaptureRequest.from_command(command)
+        objects = outbound["objects"]
+        expected_upstream = [
+            artifact.to_record()
+            for artifact in sorted(
+                (
+                    item
+                    for item in command.input_artifacts
+                    if item.producer_stage in {"freeze", "discover"}
+                ),
+                key=lambda item: (str(item.producer_stage), item.artifact_id),
+            )
+        ]
+        expected_state = {
+            "command_id": command.command_id,
+            "effect_key": request.effect_key,
+            "handoff_sha256": request.handoff_sha256,
+            "main_assembly": request.main_assembly,
+            "native_tool_record_sha256": request.native_tool_record_sha256,
+            "native_tool_source_sha256": request.native_tool_source_sha256,
+            "object_set_sha256": digest(objects),
+            "outbound_sha256": _outbound_tree_sha256(outbound),
+            "prepared_sha256": request.prepared_sha256,
+            "request_digest": command.request_digest,
+            "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
+            "upload_sha256": request.upload_sha256,
+        }
+        if (
+            outbound["upstream_artifacts"] != expected_upstream
+            or dict(intent.expected_state) != expected_state
+        ):
+            raise NativeOperationProtocolError(
+                "Capture reconciliation outbound differs from the frozen command"
+            )
+        request_record = {
+            "schema_version": CAPTURE_OPERATION_SCHEMA,
+            "command_id": command.command_id,
+            "run_id": command.run_id,
+            "request_digest": command.request_digest,
+            "effect_key": request.effect_key,
+            "handoff_sha256": outbound["handoff_sha256"],
+            "upload_sha256": outbound["upload_sha256"],
+            "prepared_sha256": request.prepared_sha256,
+            "main_assembly": outbound["main_assembly"],
+            "package_files": outbound["prepared_files"],
+            "upstream_artifacts": outbound["upstream_artifacts"],
+            "execution": outbound["execution"],
+            "native_tool_source_sha256": request.native_tool_source_sha256,
+            "request_evidence": outbound["request_evidence"],
+        }
+        try:
+            native_request = CaptureOperationRequest.from_record(request_record)
+        except Exception as error:
+            raise NativeOperationProtocolError(
+                "Capture reconciliation outbound is not a canonical native request"
+            ) from error
+        return SealedNativeOperationRequest(
+            operation_id=native_capture_operation_id(
+                run_id=command.run_id,
+                command_id=command.command_id,
+                effect_key=request.effect_key,
+            ),
+            kind=CAPTURE_KIND,
+            request=native_request,
+            request_sha256=digest(native_request.to_record()),
+            payload_sha256=None,
+            native_tool_requirement_sha256=request.native_tool_record_sha256,
+        )
+
+    if command.stage == "discover":
+        request = NativeDiscoverRequest.from_record(
+            read_data(outbound_root / "request.json")
+        )
+        source = read_data(outbound_root / "source.json")
+        archive = outbound_root / SOURCE_ARCHIVE
+        if (
+            source
+            != {
+                "source_files": dict(request.source_files),
+                "source_inventory_sha256": request.source_inventory_sha256,
+            }
+            or request.command_id != command.command_id
+            or request.run_id != command.run_id
+            or request.request_digest != command.request_digest
+            or request.expected_native_tool_sha256
+            != command.request.get("expected_native_tool_sha256")
+            or request.expected_native_tool_record_sha256
+            != command.request.get("expected_native_tool_record_sha256")
+            or request.native_tool_requirement_artifact_id
+            != command.request.get("native_tool_requirement_artifact_id")
+            or not archive.is_file()
+            or archive.is_symlink()
+        ):
+            raise NativeOperationProtocolError(
+                "Discover reconciliation outbound differs from the frozen command"
+            )
+        source_archive_sha256 = file_digest(archive)
+        if (
+            intent.expected_state.get("source_archive_sha256")
+            != source_archive_sha256
+            or intent.expected_state.get("request_digest")
+            != command.request_digest
+            or intent.expected_state.get("native_tool_record_sha256")
+            != request.expected_native_tool_record_sha256
+            or intent.expected_state.get(
+                "native_tool_requirement_artifact_id"
+            )
+            != request.native_tool_requirement_artifact_id
+        ):
+            raise NativeOperationProtocolError(
+                "Discover reconciliation outbound differs from its effect intent"
+            )
+        operation = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=source_archive_sha256,
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=(
+                request.expected_native_tool_record_sha256
+            ),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+        )
+        return SealedNativeOperationRequest(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request,
+            request_sha256=digest(request.to_record()),
+            payload_sha256=operation["payload_sha256"],
+            native_tool_requirement_sha256=(
+                request.expected_native_tool_record_sha256
+            ),
+            input_archive=archive,
+            input_archive_sha256=source_archive_sha256,
+        )
+
+    raise NativeOperationProtocolError(
+        "native reconciliation supports only Discover and Capture"
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class NativeOperationEffectObserver:
     """Read one exact native operation as domain reconciliation evidence."""
 
@@ -815,6 +985,7 @@ class NativeOperationEffectObserver:
         kind: str,
         request_sha256: str,
         native_tool_requirement_sha256: str,
+        payload_sha256: str | None = None,
     ) -> None:
         if (
             view.operation_id != operation_id
@@ -822,6 +993,10 @@ class NativeOperationEffectObserver:
             or view.request_sha256 != request_sha256
             or view.native_tool_requirement_sha256
             != native_tool_requirement_sha256
+            or (
+                payload_sha256 is not None
+                and view.payload_sha256 != payload_sha256
+            )
         ):
             raise NativeOperationClientConflict(
                 "native operation differs from the sealed outbound request",
@@ -878,82 +1053,30 @@ class NativeOperationEffectObserver:
         outbound_root: Path,
         workspace_root: Path,
     ) -> EffectReconciliationEvidence:
-        from ..pipeline.capture import (
-            CaptureRequest,
-            _outbound_tree_sha256,
-            validate_capture_effect_outbound,
-        )
+        from ..pipeline.capture import CaptureRequest
         from ..pipeline.reconciliation import EffectReconciliationEvidence
         from .native_operation_runtime import CaptureOperationRequest
 
-        outbound = validate_capture_effect_outbound(outbound_root, command)
-        request = CaptureRequest.from_command(command)
-        execution = outbound["execution"]
-        objects = outbound["objects"]
-        upstream = outbound["upstream_artifacts"]
-        prepared_files = outbound["prepared_files"]
-        request_evidence = outbound["request_evidence"]
-        expected_upstream = [
-            artifact.to_record()
-            for artifact in sorted(
-                (
-                    item
-                    for item in command.input_artifacts
-                    if item.producer_stage in {"freeze", "discover"}
-                ),
-                key=lambda item: (str(item.producer_stage), item.artifact_id),
-            )
-        ]
-        expected_state = {
-            "command_id": command.command_id,
-            "effect_key": request.effect_key,
-            "handoff_sha256": request.handoff_sha256,
-            "main_assembly": request.main_assembly,
-            "native_tool_record_sha256": request.native_tool_record_sha256,
-            "native_tool_source_sha256": request.native_tool_source_sha256,
-            "object_set_sha256": digest(objects),
-            "outbound_sha256": _outbound_tree_sha256(outbound),
-            "prepared_sha256": request.prepared_sha256,
-            "request_digest": command.request_digest,
-            "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
-            "upload_sha256": request.upload_sha256,
-        }
-        request_record = {
-            "schema_version": CAPTURE_OPERATION_SCHEMA,
-            "command_id": command.command_id,
-            "run_id": command.run_id,
-            "request_digest": command.request_digest,
-            "effect_key": request.effect_key,
-            "handoff_sha256": outbound["handoff_sha256"],
-            "upload_sha256": outbound["upload_sha256"],
-            "prepared_sha256": request.prepared_sha256,
-            "main_assembly": outbound["main_assembly"],
-            "package_files": prepared_files,
-            "upstream_artifacts": upstream,
-            "execution": execution,
-            "native_tool_source_sha256": request.native_tool_source_sha256,
-            "request_evidence": request_evidence,
-        }
-        try:
-            native_request = CaptureOperationRequest.from_record(request_record)
-        except Exception as error:
-            raise NativeOperationProtocolError(
-                "Capture reconciliation outbound is not a canonical native request"
-            ) from error
-        request_sha256 = digest(native_request.to_record())
+        identity = read_sealed_native_operation_request(
+            command,
+            intent,
+            outbound_root,
+        )
         if (
-            upstream != expected_upstream
-            or dict(intent.expected_state) != expected_state
+            identity.kind != CAPTURE_KIND
+            or not isinstance(identity.request, CaptureOperationRequest)
         ):
             raise NativeOperationProtocolError(
-                "Capture reconciliation outbound differs from the frozen command"
+                "Capture reconciliation resolved another request kind"
             )
-
-        operation_id = native_capture_operation_id(
-            run_id=command.run_id,
-            command_id=command.command_id,
-            effect_key=request.effect_key,
-        )
+        request = CaptureRequest.from_command(command)
+        native_request = identity.request
+        execution = dict(native_request.execution)
+        upstream = [
+            dict(record) for record in native_request.upstream_artifacts
+        ]
+        prepared_files = dict(native_request.package_files)
+        operation_id = identity.operation_id
         observed = self._operation(
             operation_id,
             workspace_root=workspace_root,
@@ -964,7 +1087,7 @@ class NativeOperationEffectObserver:
             observed,
             operation_id=operation_id,
             kind=CAPTURE_KIND,
-            request_sha256=request_sha256,
+            request_sha256=identity.request_sha256,
             native_tool_requirement_sha256=request.native_tool_record_sha256,
         )
         if observed.state != "satisfied" and not (
@@ -1069,50 +1192,23 @@ class NativeOperationEffectObserver:
     ) -> EffectReconciliationEvidence:
         from ..pipeline.reconciliation import EffectReconciliationEvidence
 
-        request = NativeDiscoverRequest.from_record(
-            read_data(outbound_root / "request.json")
+        identity = read_sealed_native_operation_request(
+            command,
+            intent,
+            outbound_root,
         )
-        source = read_data(outbound_root / "source.json")
-        archive = outbound_root / SOURCE_ARCHIVE
-        expected_source = {
-            "source_files": dict(request.source_files),
-            "source_inventory_sha256": request.source_inventory_sha256,
-        }
         if (
-            source != expected_source
-            or request.operation_id != command.command_id
-            or request.command_id != command.command_id
-            or request.run_id != command.run_id
-            or request.request_digest != command.request_digest
-            or request.expected_native_tool_sha256
-            != command.request.get("expected_native_tool_sha256")
-            or request.expected_native_tool_record_sha256
-            != command.request.get("expected_native_tool_record_sha256")
-            or request.native_tool_requirement_artifact_id
-            != command.request.get("native_tool_requirement_artifact_id")
-            or not archive.is_file()
-            or archive.is_symlink()
+            identity.kind != DISCOVER_KIND
+            or not isinstance(identity.request, NativeDiscoverRequest)
+            or identity.input_archive is None
+            or identity.input_archive_sha256 is None
         ):
             raise NativeOperationProtocolError(
-                "Discover reconciliation outbound differs from the frozen command"
+                "Discover reconciliation resolved another request kind"
             )
-        source_archive_sha256 = file_digest(archive)
-        if (
-            intent.expected_state.get("source_archive_sha256")
-            != source_archive_sha256
-            or intent.expected_state.get("request_digest")
-            != command.request_digest
-            or intent.expected_state.get("native_tool_record_sha256")
-            != request.expected_native_tool_record_sha256
-            or intent.expected_state.get(
-                "native_tool_requirement_artifact_id"
-            )
-            != request.native_tool_requirement_artifact_id
-        ):
-            raise NativeOperationProtocolError(
-                "Discover reconciliation outbound differs from its effect intent"
-            )
-        operation_id = request.operation_id
+        request = identity.request
+        source_archive_sha256 = identity.input_archive_sha256
+        operation_id = identity.operation_id
         observed = self._operation(
             operation_id,
             workspace_root=workspace_root,
@@ -1123,10 +1219,11 @@ class NativeOperationEffectObserver:
             observed,
             operation_id=operation_id,
             kind=DISCOVER_KIND,
-            request_sha256=digest(request.to_record()),
+            request_sha256=identity.request_sha256,
             native_tool_requirement_sha256=(
-                request.expected_native_tool_record_sha256
+                identity.native_tool_requirement_sha256
             ),
+            payload_sha256=identity.payload_sha256,
         )
         if observed.input_archive_sha256 != source_archive_sha256:
             raise NativeOperationClientConflict(
@@ -1725,8 +1822,10 @@ __all__ = [
     "NativeRemoteDiscoverAdapter",
     "NativeToolIdentity",
     "RemoteNativeCaptureResult",
+    "SealedNativeOperationRequest",
     "capture_handler_from_native_operation",
     "discover_adapter_from_native_operation",
     "native_capture_operation_id",
     "observe_native_operation",
+    "read_sealed_native_operation_request",
 ]

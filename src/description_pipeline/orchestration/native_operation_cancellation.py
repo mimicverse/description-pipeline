@@ -8,27 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..io import digest, file_digest, read_data
-from ..sources.solidworks.discover_stage import (
-    NATIVE_OBSERVATION_SCHEMA,
-    NativeDiscoverRequest,
-)
-from .discover_protocol import SOURCE_ARCHIVE
 from .native_operation_client import (
+    SealedNativeOperationRequest,
     NativeOperationClient,
     NativeOperationClientConflict,
-    NativeOperationClientError,
     NativeOperationProtocolError,
-    native_capture_operation_id,
+    read_sealed_native_operation_request,
 )
-from .native_operation_runtime import (
-    CAPTURE_KIND,
-    CAPTURE_OPERATION_SCHEMA,
-    DISCOVER_KIND,
-    CaptureOperationRequest,
-    NativeOperationView,
-    build_operation_record,
-)
+from .native_operation_runtime import NativeOperationView
 
 if TYPE_CHECKING:
     from ..artifacts import ArtifactStore
@@ -108,7 +95,7 @@ class NativeOperationCancellationAdapter:
                 outbound_artifact,
                 Path(directory) / "outbound",
             )
-            identity = self._operation_identity(
+            identity = read_sealed_native_operation_request(
                 target_command,
                 target_effect,
                 outbound_root,
@@ -139,125 +126,9 @@ class NativeOperationCancellationAdapter:
         }
 
     @staticmethod
-    def _operation_identity(
-        command: StageCommand,
-        effect: EffectIntent,
-        outbound_root: Path,
-    ) -> _OperationIdentity:
-        if command.stage == "capture":
-            from ..pipeline.capture import (
-                CaptureRequest,
-                validate_capture_effect_outbound,
-            )
-
-            outbound = validate_capture_effect_outbound(outbound_root, command)
-            request = CaptureRequest.from_command(command)
-            native_request = CaptureOperationRequest.from_record(
-                {
-                    "schema_version": CAPTURE_OPERATION_SCHEMA,
-                    "command_id": command.command_id,
-                    "run_id": command.run_id,
-                    "request_digest": command.request_digest,
-                    "effect_key": request.effect_key,
-                    "handoff_sha256": outbound["handoff_sha256"],
-                    "upload_sha256": outbound["upload_sha256"],
-                    "prepared_sha256": request.prepared_sha256,
-                    "main_assembly": outbound["main_assembly"],
-                    "package_files": outbound["prepared_files"],
-                    "upstream_artifacts": outbound["upstream_artifacts"],
-                    "execution": outbound["execution"],
-                    "native_tool_source_sha256": (
-                        request.native_tool_source_sha256
-                    ),
-                    "request_evidence": outbound["request_evidence"],
-                }
-            )
-            operation_id = native_capture_operation_id(
-                run_id=command.run_id,
-                command_id=command.command_id,
-                effect_key=request.effect_key,
-            )
-            if (
-                effect.target.get("run_id") != command.run_id
-                or effect.target.get("stage") != command.stage
-                or outbound["effect_key"] != request.effect_key
-            ):
-                raise NativeOperationProtocolError(
-                    "Capture cancellation does not bind the sealed operation"
-                )
-            return _OperationIdentity(
-                operation_id=operation_id,
-                kind=CAPTURE_KIND,
-                payload_sha256=None,
-                request_sha256=digest(native_request.to_record()),
-                native_tool_requirement_sha256=(
-                    request.native_tool_record_sha256
-                ),
-            )
-
-        if command.stage == "discover":
-            request = NativeDiscoverRequest.from_record(
-                read_data(outbound_root / "request.json")
-            )
-            source = read_data(outbound_root / "source.json")
-            archive = outbound_root / SOURCE_ARCHIVE
-            if (
-                source
-                != {
-                    "source_files": dict(request.source_files),
-                    "source_inventory_sha256": (
-                        request.source_inventory_sha256
-                    ),
-                }
-                or request.command_id != command.command_id
-                or request.run_id != command.run_id
-                or request.request_digest != command.request_digest
-                or command.request.get("expected_native_tool_sha256")
-                != request.expected_native_tool_sha256
-                or command.request.get(
-                    "expected_native_tool_record_sha256"
-                )
-                != request.expected_native_tool_record_sha256
-                or command.request.get(
-                    "native_tool_requirement_artifact_id"
-                )
-                != request.native_tool_requirement_artifact_id
-                or not archive.is_file()
-                or archive.is_symlink()
-            ):
-                raise NativeOperationProtocolError(
-                    "Discover cancellation does not bind the sealed operation"
-                )
-            record = build_operation_record(
-                operation_id=request.operation_id,
-                kind=DISCOVER_KIND,
-                request=request.to_record(),
-                input_archive_sha256=file_digest(archive),
-                input_archive_bytes=archive.stat().st_size,
-                native_tool_requirement_sha256=(
-                    request.expected_native_tool_record_sha256
-                ),
-                output_contract=NATIVE_OBSERVATION_SCHEMA,
-            )
-            return _OperationIdentity(
-                operation_id=request.operation_id,
-                kind=DISCOVER_KIND,
-                payload_sha256=record["payload_sha256"],
-                request_sha256=digest(request.to_record()),
-                native_tool_requirement_sha256=(
-                    request.expected_native_tool_record_sha256
-                ),
-            )
-
-        raise NativeOperationClientError(
-            "native cancellation supports only Discover and Capture",
-            code="native_operation_cancel_unsupported",
-        )
-
-    @staticmethod
     def _validate_view(
         view: NativeOperationView,
-        identity: _OperationIdentity,
+        identity: SealedNativeOperationRequest,
     ) -> None:
         if (
             view.operation_id != identity.operation_id
@@ -276,23 +147,13 @@ class NativeOperationCancellationAdapter:
                 code="native_operation_conflict",
             )
 
-
-@dataclass(frozen=True, slots=True)
-class _OperationIdentity:
-    operation_id: str
-    kind: str
-    payload_sha256: str | None
-    request_sha256: str
-    native_tool_requirement_sha256: str
-
-
 def native_operation_cancellation_adapter(
     client: NativeOperationClient,
     *,
     facts: FactStore,
     artifacts: ArtifactStore,
 ) -> NativeOperationCancellationAdapter:
-    """Construct the one read-only native cancellation transport."""
+    """Construct the one credential-bearing native cancellation transport."""
 
     return NativeOperationCancellationAdapter(
         client=client,
