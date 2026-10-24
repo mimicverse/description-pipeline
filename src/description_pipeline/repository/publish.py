@@ -17,7 +17,7 @@ from typing import Any, Protocol
 from ..delivery import subject_digest
 from ..io import PipelineError, digest, inventory, read_data, write_json
 from ..schemas import REPOSITORY_SNAPSHOT_SCHEMA
-from .urdf_pr import is_review_branch
+from .review_branch import is_review_branch
 
 GOVERNED_PATHS = (
     "manifest.json",

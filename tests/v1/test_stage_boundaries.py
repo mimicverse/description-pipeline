@@ -111,7 +111,7 @@ class StageBoundaryTests(unittest.TestCase):
         return fake_capture
 
     def test_capture_forwards_activity_and_stops_at_the_seal(self) -> None:
-        calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}
+        calls = {"capture": 0, "generate": 0, "verify": 0}
         records = []
         run_id = "8d0c55c4-1cad-5aff-af5f-5cc0bfc5a977"
         native_events = self._native_events(run_id)
@@ -128,7 +128,6 @@ class StageBoundaryTests(unittest.TestCase):
             ),
             patch.object(steps, "generate_model", side_effect=forbid(calls, "generate")),
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
-            patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
         ):
             result = solidworks.capture(
                 self.package,
@@ -145,10 +144,10 @@ class StageBoundaryTests(unittest.TestCase):
 
         self.assertEqual(records, [{"phase": "capture", "action": "seal"}])
         self.assertIs(result["native_complete"], True)
-        self.assertEqual(calls, {"capture": 1, "generate": 0, "verify": 0, "publish": 0})
+        self.assertEqual(calls, {"capture": 1, "generate": 0, "verify": 0})
 
     def test_capture_seals_transfer_and_stops(self) -> None:
-        calls = {"capture": 0, "generate": 0, "verify": 0, "publish": 0}
+        calls = {"capture": 0, "generate": 0, "verify": 0}
         run_id = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
         native_events = self._native_events(run_id)
 
@@ -164,7 +163,6 @@ class StageBoundaryTests(unittest.TestCase):
             ),
             patch.object(steps, "generate_model", side_effect=forbid(calls, "generate")),
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
-            patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
         ):
             result = solidworks.capture(
                 self.package,
@@ -191,7 +189,7 @@ class StageBoundaryTests(unittest.TestCase):
         self.assertEqual(info["sha256"], file_digest(archive))
         self.assertEqual(info["size"], archive.stat().st_size)
         self.assertEqual(info["manifest_sha256"], file_digest(manifest))
-        self.assertEqual(calls, {"capture": 1, "generate": 0, "verify": 0, "publish": 0})
+        self.assertEqual(calls, {"capture": 1, "generate": 0, "verify": 0})
         self.assertTrue((self.output / "reports/native-tool.json").is_file())
         self.assertTrue((self.output / "reports/stages.json").is_file())
         native_stages = self.output / "reports" / "native-stages.json"
@@ -237,7 +235,7 @@ class StageBoundaryTests(unittest.TestCase):
 
     def test_generate_installs_unverified_checkpoint(self) -> None:
         seed = make_seed(self.root)
-        calls = {"generate": 0, "verify": 0, "publish": 0}
+        calls = {"generate": 0, "verify": 0}
 
         def fake_generate(staging, definition, input_report, on_event=None):
             calls["generate"] += 1
@@ -246,7 +244,6 @@ class StageBoundaryTests(unittest.TestCase):
         with (
             patch.object(steps, "generate_model", side_effect=fake_generate),
             patch.object(steps, "verify_delivery", side_effect=forbid(calls, "verify")),
-            patch.object(steps, "publish_model", side_effect=forbid(calls, "publish")),
             patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
         ):
             result = solidworks.generate(
@@ -258,7 +255,7 @@ class StageBoundaryTests(unittest.TestCase):
         self.assertIs(result["passed"], False)
         self.assertEqual(result["subject_sha256"], "a" * 64)
         self.assertEqual(result["execution_scope"], ["generate"])
-        self.assertEqual(calls, {"generate": 1, "verify": 0, "publish": 0})
+        self.assertEqual(calls, {"generate": 1, "verify": 0})
         self.assertTrue((self.output / "input" / "robot.yaml").is_file())
         self.assertTrue((self.output / "reports/stages.json").is_file())
         self.assertFalse((self.output / "reports" / "quality.json").exists())

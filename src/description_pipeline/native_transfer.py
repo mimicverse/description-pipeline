@@ -218,7 +218,7 @@ def _validate_native_tool(native_tool) -> None:
     )
     # Source/PYTHONPATH checkouts embed no tool-release.json, so this local
     # cross-release comparison is skipped for them; publication refuses without
-    # the embedded identity (steps.publish_model, ORC-04).
+    # the embedded identity used by the canonical Publish stage.
     release = Path(__file__).resolve().parent / "tool-release.json"
     if release.is_file():
         identity = read_data(release)

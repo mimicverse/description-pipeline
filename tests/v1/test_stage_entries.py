@@ -12,7 +12,6 @@ from unittest.mock import patch
 from description_pipeline import solidworks, steps
 from description_pipeline.delivery import subject_inventory
 from description_pipeline.io import digest, inventory, write_json
-from description_pipeline.verification import solidworks_urdf
 
 SHA = "a" * 64
 
@@ -127,46 +126,6 @@ class StageEntryTests(unittest.TestCase):
             mismatch = solidworks.verify(seed, self.root / "delivery-mismatch", expected_subject="b" * 64)
         self.assertIs(mismatch["passed"], False)
         self.assertIn("does not match", mismatch["error"])
-
-    def test_publish_seals_the_verified_checkpoint_and_records_the_submission(self) -> None:
-        seed = make_seed(self.root)
-        before = tree_bytes(seed)
-        subject = digest(subject_inventory(seed))
-        repository = self.root / "repo"
-        repository.mkdir()
-        calls = {"publish": 0}
-
-        def fake_publish(bundle, repo, base=None, message=None, on_event=None):
-            calls["publish"] += 1
-            return {
-                "passed": True,
-                "state": "noop",
-                "url": "https://github.com/example/repo/pull/1",
-                "subject": subject,
-            }
-
-        with (
-            patch.object(steps, "inspect_prepared_input", return_value=REPLAYED_INSPECTION),
-            patch.object(steps, "publish_model", side_effect=fake_publish),
-            patch.object(solidworks_urdf, "check_bundle", return_value={"passed": True, "subject_sha256": subject}),
-            patch.object(solidworks_urdf, "rebuilt_definition", return_value={}),
-            patch.object(
-                solidworks_urdf,
-                "require_qualified_report",
-                side_effect=lambda report, definition, root=None: {"passed": True, "subject_sha256": subject},
-            ),
-        ):
-            result = solidworks.publish(
-                seed,
-                self.output,
-                expected_subject=subject,
-                repository=repository,
-            )
-        self.assertIs(result["passed"], True)
-        self.assertEqual(result["submission"]["state"], "noop")
-        self.assertEqual(result["execution_scope"], ["publish"])
-        self.assertEqual(calls["publish"], 1)
-        self.assertEqual(tree_bytes(seed), before)
 
     def test_a_missing_checkpoint_part_fails_closed(self) -> None:
         seed = self.root / "seed-missing"

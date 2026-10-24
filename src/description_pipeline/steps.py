@@ -16,13 +16,13 @@ from .native_transfer import load_native_receipts
 from pathlib import Path
 
 from . import __version__
-from .delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest, subject_inventory
+from .delivery import read_delivery_manifest, subject_digest, subject_inventory
 from .interface_records import PURPOSE_ENGINEERING, REQUEST_PURPOSES
 from .io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from .runtime import tool_record
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.revision import package_inventory
-from .stages import checked, publication_succeeded
+from .stages import checked
 
 
 def _state(emit, stage, state, **details):
@@ -991,49 +991,3 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
     )
     _state(on_event, "verify", "completed")
     return report
-
-
-def publish_model(
-    bundle: Path, repository: Path, *, base: str | None = None, message: str | None = None, on_event=None
-) -> dict:
-    """Recheck and submit the frozen delivery on the Linux publication stage."""
-
-    from .repository.urdf_pr import review_branch, submit_bundle
-    from .request_evidence import read_request_evidence
-
-    _state(on_event, "publish", "running")
-    # Fail closed on degraded installs: a source/PYTHONPATH checkout carries no
-    # embedded release identity, so the split-workflow gate compares empty
-    # release records.  Publication must never bind a PR to an unidentified
-    # tool (ORC-04).
-    tool = tool_record()
-    _require(
-        isinstance(tool.get("release"), dict) and bool(tool.get("release")),
-        "Refusing to publish: this runtime carries no embedded release identity "
-        "(tool-release.json is absent); install the released distribution",
-    )
-    source = read_source_record(bundle)
-    hardware = source["identity"]["hardware_id"]
-    record, _request_sha = read_request_evidence(bundle / "input" / "request.json")
-    purpose = str(record.get("purpose") or "")
-    result = submit_bundle(
-        bundle,
-        repository,
-        base=base or f"feature/{hardware}",
-        branch=review_branch(hardware, purpose),
-        message=message,
-        on_event=on_event,
-    )
-    subject = result.get("subject")
-    result = {
-        **result,
-        "pipeline_id": PIPELINE_ID,
-        "subject_sha256": subject,
-        "passed": publication_succeeded(result, subject),
-    }
-
-    state = "completed" if result["passed"] else result.get("state", "failed")
-    if state not in {"completed", "failed", "unresolved"}:
-        state = "failed"
-    _state(on_event, "publish", state, error=result.get("error"))
-    return result

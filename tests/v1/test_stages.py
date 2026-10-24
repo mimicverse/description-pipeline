@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import ast
 import json
 import tempfile
 import unittest
@@ -163,34 +162,6 @@ class StageTests(unittest.TestCase):
         view = stage_view({"execution_scope": ["generate", "verify"]})
         with self.assertRaisesRegex(PipelineError, "all six engineering stages"):
             require_complete(view)
-
-    def test_contract_has_exactly_one_domain_producer_per_boundary(self):
-        root = Path(__file__).resolve().parents[2]
-        producers = []
-        for name in ("steps.py", "repository/urdf_pr.py"):
-            tree = ast.parse((root / "src/description_pipeline" / name).read_text())
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-                    continue
-                if node.func.id == "checked":
-                    stage, boundary, identifier = [ast.literal_eval(value) for value in node.args[1:4]]
-                    producers.append((stage, boundary, identifier))
-                elif (
-                    node.func.id == "observed"
-                    and isinstance(node.args[0], ast.Constant)
-                    and len(node.args) >= 2
-                    and node.args[1].value == "passed"
-                ):
-                    identifier = node.args[0].value
-                    boundary = "input" if identifier == "publication.inputs" else "output"
-                    producers.append(("publish", boundary, identifier))
-        expected = [
-            (stage["id"], boundary, check["id"])
-            for stage in CONTRACT["stages"]
-            for boundary in ("input", "output")
-            for check in stage[f"{boundary}_qc"]
-        ]
-        self.assertCountEqual(producers, expected)
 
     def test_stage_table_and_mechanical_responsibilities_match_the_contract(self):
         docs = Path(__file__).resolve().parents[2] / "docs"

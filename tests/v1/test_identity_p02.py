@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from description_pipeline.orchestration import portal, uploads
 from description_pipeline.orchestration.airflow_client import (
@@ -17,7 +16,6 @@ from description_pipeline.orchestration.airflow_client import (
     submission_identity,
 )
 from description_pipeline.orchestration.discovery_transfer import _GENERATED_MEMBERS
-from description_pipeline.repository import urdf_pr
 from description_pipeline.sources.solidworks import discovery
 from tests.sources import support
 
@@ -331,16 +329,3 @@ class SubmissionIdentityHelperTests(unittest.TestCase):
         )
         self.assertIsNone(payload["parent_revision"])
         self.assertEqual(len(warnings), 1)
-
-
-class PublishedRevisionTimeoutTests(unittest.TestCase):
-    def test_fetch_timeout_reports_unknown_not_absent(self) -> None:
-        """A fetch timeout is an unknown state; it must not masquerade as 'no parent'."""
-
-        with (
-            patch.object(urdf_pr, "_validate_ref"),
-            patch.object(urdf_pr.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 60)),
-            self.assertRaises(urdf_pr.PrError) as raised,
-        ):
-            urdf_pr.published_revision(Path("/srv/models/arm"), "m3.0", "engineering")
-        self.assertEqual(raised.exception.code, "published_revision_unknown")

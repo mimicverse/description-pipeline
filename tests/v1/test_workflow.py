@@ -209,25 +209,13 @@ class WorkflowTests(unittest.TestCase):
         )
         return author, record
 
-    def test_bound_missing_admin_allows_inspection_but_not_publication(self):
+    def test_bound_missing_admin_allows_inspection(self):
         self.acquisition_without_admin()
         report = steps.inspect_prepared_input(self.package)
         self.assertTrue(report["passed"], report["errors"])
         self.assertIsNone(report["input"])
         self.assertIsNone(report["cad_revision"])
         self.assertIn("input.source_identity_pending", [row["code"] for row in report["warnings"]])
-        bundle = self.root / "unpublished"
-        bundle.mkdir()
-        shutil.copytree(self.package, bundle / "input")
-        with (
-            patch.object(
-                steps, "tool_record", return_value={"release": {"schema_version": "solidworks-to-urdf.release/v1"}}
-            ),
-            patch("description_pipeline.repository.urdf_pr.submit_bundle") as publish,
-            self.assertRaisesRegex(PipelineError, "input/source.json"),
-        ):
-            steps.publish_model(bundle, self.root / "repository")
-        publish.assert_not_called()
 
     def test_malformed_content_identity_is_refused(self):
         write_json(self.package / "source.json", {"schema_version": "x"})
@@ -415,8 +403,6 @@ class WorkflowTests(unittest.TestCase):
         self.seal()
         bundle = self.root / "frozen"
         (bundle / "reports").mkdir(parents=True)
-        import shutil
-
         shutil.copytree(self.package, bundle / "input")
         (bundle / "input" / "discovery").mkdir()
         write_json(
@@ -501,8 +487,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_rebuild_refuses_frozen_evidence_changed_during_preparation(self):
-        import shutil
-
         from description_pipeline.delivery import subject_digest
 
         self.seal()

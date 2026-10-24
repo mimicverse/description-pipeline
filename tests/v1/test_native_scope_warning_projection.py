@@ -42,18 +42,10 @@ from description_pipeline.orchestration.portal import (
     _quality_warnings,
 )
 from description_pipeline.orchestration.report_view import _recorded_warnings
-from description_pipeline.repository.urdf_pr import _body
-from description_pipeline.repository import urdf_pr as urdf_pr_module
 from description_pipeline.structural_report import build_structural_report
 from description_pipeline.verification.solidworks_urdf import (
     native_gate_warning_diagnostics,
 )
-
-BODY_OPTIONS = {
-    "slug": "example/m3.0",
-    "quality_sha256": "c" * 64,
-}
-
 
 def raw_warnings() -> list[dict]:
     """The exact grouped warning shape emitted by the native parser."""
@@ -301,18 +293,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             NATIVE_TOLERANT_EDGE_GAP_WARNING,
         )
         self.assertEqual(portal_warning["detail"], projected[0]["detail"])
-        self.assertEqual(
-            urdf_pr_module._warning_diagnostics(quality)[0]["code"],
-            NATIVE_TOLERANT_EDGE_GAP_WARNING,
-        )
-        pr_rows = urdf_pr_module._general_warning_rows(quality)
-        pr_tolerant, = [
-            row
-            for row in pr_rows
-            if row["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING
-        ]
-        self.assertEqual(pr_tolerant["detail"], projected[0]["detail"])
-
         forged = native_gate_warning_diagnostics({"warnings": [raw]})
         forged[0]["detail"]["evaluate_metric"] = (
             NATIVE_TOLERANT_EDGE_PROJECTION_METRIC
@@ -326,8 +306,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             )
         with self.assertRaises((PipelineError, PortalError)):
             _quality_warnings(quality_report(forged, [raw]))
-        with self.assertRaises(PipelineError):
-            urdf_pr_module._warning_diagnostics(quality_report(forged, [raw]))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             write_json(
@@ -439,22 +417,14 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             )
         )
 
-    def test_warning_consumers_share_canonical_serialization_and_body_hash(self) -> None:
+    def test_warning_consumers_share_canonical_serialization(self) -> None:
         self.assertIs(portal_module.canonical_json_value, canonical_json_value)
-        self.assertIs(urdf_pr_module.canonical_json_value, canonical_json_value)
 
         quality = quality_report(diagnostics())
         portal_rows = [
             {key: value for key, value in row.items() if key != "source"}
             for row in _quality_warnings(quality)
         ]
-        self.assertEqual(portal_rows, urdf_pr_module._warning_diagnostics(quality))
-
-        body = _body("a" * 64, "b" * 40, quality, "engineering", **BODY_OPTIONS)
-        self.assertEqual(
-            hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            "754f87f4c84e34578501d8c3cfc2b2a039b07fe5c7f4c83da1c8d4538e3ae2ca",
-        )
         self.assertEqual(
             canonical_json_value(portal_rows),
             json.dumps(
@@ -657,8 +627,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         )
         with self.assertRaises(PortalError):
             _quality_warnings(quality)
-        with self.assertRaises(PipelineError):
-            _body("a" * 64, "b" * 40, quality, "engineering", **BODY_OPTIONS)
 
     def test_a_passed_gate_must_explicitly_carry_its_warning_list(
         self,
@@ -689,8 +657,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             )
             with self.assertRaises(PortalError):
                 _quality_warnings(quality)
-            with self.assertRaises(PipelineError):
-                _body("a" * 64, "b" * 40, quality, "engineering", **BODY_OPTIONS)
             with self.assertRaises(PipelineError):
                 _recorded_warnings(
                     {"id": "verify", "name": "Verify"},
@@ -790,17 +756,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             )
         )
 
-        body = _body("a" * 64, "b" * 40, quality, "engineering", **BODY_OPTIONS)
-        self.assertIn(
-            f"warning codes: total={len(NATIVE_SCOPE_IDENTITY_WARNING_CODES)}; "
-            f"shown={len(NATIVE_SCOPE_IDENTITY_WARNING_CODES)}; omitted=0",
-            body,
-        )
-        self.assertTrue(all(f"`{code}` groups=1 rows=1" in body for code in NATIVE_SCOPE_IDENTITY_WARNING_CODES))
-        self.assertNotIn("- general warning ", body)
-        self.assertNotIn("object_indices=", body)
-        self.assertNotIn("native scope identity", body)
-
     def test_downstream_projection_refuses_forged_objects(self) -> None:
         forged = diagnostics()
         forged[0]["object"] = "part-1:face:0/9"
@@ -820,14 +775,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         quality = quality_report(forged)
         with self.assertRaises(PortalError):
             _quality_warnings(quality)
-        with self.assertRaisesRegex(PipelineError, "incomplete or forged"):
-            _body(
-                "a" * 64,
-                "b" * 40,
-                quality,
-                "engineering",
-                **BODY_OPTIONS,
-            )
 
         encoded = json.dumps(forged, sort_keys=True)
         self.assertIn("part-1:face:0/9", encoded)
@@ -856,14 +803,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         )
         with self.assertRaises(PortalError):
             _quality_warnings(missing_quality)
-        with self.assertRaises(PipelineError):
-            _body(
-                "a" * 64,
-                "b" * 40,
-                missing_quality,
-                "engineering",
-                **BODY_OPTIONS,
-            )
 
     def test_report_view_rejects_orphan_groups_and_partial_fields(self) -> None:
         first = raw_warnings()

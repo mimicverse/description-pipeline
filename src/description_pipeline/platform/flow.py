@@ -21,7 +21,6 @@ from ..orchestration.airflow_client import JOB_SCHEMA, validate_run_id
 from ..native_transfer import CAPTURE_MANIFEST, TEAM_REPORTS, verify_transfer
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..stages import (
-    DELIVERY_STAGES,
     STAGE_IDS,
     canonical_freeze_timestamp,
     publication_succeeded,
@@ -30,7 +29,8 @@ from .store import PlatformStore
 
 log = logging.getLogger(__name__)
 
-_SEED_STAGE = {"generate": "capture", "verify": "generate", "publish": "verify"}
+_PORTABLE_STAGES = frozenset({"generate", "verify"})
+_SEED_STAGE = {"generate": "capture", "verify": "generate"}
 #: Registered run states projected onto the job-status vocabulary the run page reads.
 _JOB_STATUS_BY_RUN_STATE = {"succeeded": "passed", "cancelled": "failed", "unresolved": "failed"}
 
@@ -277,8 +277,6 @@ def run_stage(
     run_id: str,
     stage: str,
     *,
-    repository: Path | None = None,
-    base: str | None = None,
     expected_subject: str | None = None,
     source_run_id: str | None = None,
     on_event=None,
@@ -299,8 +297,8 @@ def run_stage(
     from this attempt's completed registered checkpoint.
     """
     run_id = validate_run_id(run_id)
-    if stage not in DELIVERY_STAGES:
-        raise PipelineError(f"stage must be one of {DELIVERY_STAGES}: {stage!r}")
+    if stage not in _PORTABLE_STAGES:
+        raise PipelineError(f"stage must be one of {tuple(sorted(_PORTABLE_STAGES))}: {stage!r}")
     paths = RunPaths(root, run_id)
     owner = validate_run_id(source_run_id) if source_run_id else run_id
     confirmed = platform.confirmed_stage(run_id, stage)
@@ -320,13 +318,11 @@ def run_stage(
             portable_identity_gate(platform, owner)
             if stage == "generate" and expected_subject is not None:
                 raise PipelineError("generate does not take an expected subject")
-            if stage in {"verify", "publish"} and not expected_subject:
+            if stage == "verify" and not expected_subject:
                 raise PipelineError(f"{stage} requires the recorded subject of the previous checkpoint")
-            if stage == "publish" and repository is None:
-                raise PipelineError("publish requires the configured model repository checkout")
             seed_owner = owner if boundary == stage else run_id
             seed = registered_checkpoint(platform, seed_owner, _SEED_STAGE[stage])
-            if stage in {"verify", "publish"}:
+            if stage == "verify":
                 upload_sha256 = capture_receipt.get("upload_sha256")
                 prepared_dir = capture_receipt.get("native_prepared_dir")
                 prepared_files = capture_receipt.get("native_prepared_files")
@@ -362,17 +358,8 @@ def run_stage(
             }
             if stage == "generate":
                 receipt = solidworks.generate(seed, output, **common)
-            elif stage == "verify":
-                receipt = solidworks.verify(seed, output, expected_subject=expected_subject, **common)
             else:
-                receipt = solidworks.publish(
-                    seed,
-                    output,
-                    expected_subject=expected_subject,
-                    repository=Path(repository),
-                    base=base,
-                    **common,
-                )
+                receipt = solidworks.verify(seed, output, expected_subject=expected_subject, **common)
         except Exception as error:
             _write_failure_products(platform, paths, run_id, stage, error)
             raise

@@ -1277,38 +1277,6 @@ class StageTransferTests(unittest.TestCase):
         finally:
             support.cleanup(work)
 
-    def test_publisher_keeps_native_receipts_out_of_the_model_repo(self) -> None:
-        from description_pipeline.repository.urdf_pr import _copy_governed
-
-        bundle = self.base / "publish-bundle"
-        for name in ("input", "evidence", "model", "urdf", "meshes"):
-            (bundle / name).mkdir(parents=True)
-        (bundle / "README.md").write_text("delivery\n", encoding="utf-8")
-        write_json(bundle / "input/handoff.json", {"passed": True})
-        write_json(bundle / "reports/tool.json", {"role": "portable"})
-        write_json(bundle / "reports/quality.json", {"passed": True})
-        write_json(bundle / "reports/native-tool.json", native_tool())
-        write_json(bundle / "reports/native-stages.json", stage_view())
-        write_json(bundle / "transfer-manifest.json", {"schema_version": native_transfer.TRANSFER_SCHEMA})
-
-        worktree = self.base / "publish-worktree"
-        _copy_governed(bundle, worktree)
-        # Receipts live in platform run storage; they never enter the model repo.
-        self.assertFalse((worktree / "reports/native-tool.json").exists())
-        self.assertFalse((worktree / "reports/native-stages.json").exists())
-        self.assertFalse((worktree / transfer.CAPTURE_MANIFEST).exists())
-
-        neutral = self.base / "neutral-bundle"
-        for name in ("input", "evidence", "model", "urdf", "meshes"):
-            (neutral / name).mkdir(parents=True)
-        (neutral / "README.md").write_text("delivery\n", encoding="utf-8")
-        write_json(neutral / "input/handoff.json", {"passed": True})
-        write_json(neutral / "reports/tool.json", {"role": "portable"})
-        neutral_worktree = self.base / "neutral-worktree"
-        _copy_governed(neutral, neutral_worktree)
-        self.assertFalse((neutral_worktree / "reports/native-tool.json").exists())
-        self.assertFalse((neutral_worktree / transfer.CAPTURE_MANIFEST).exists())
-
     def test_transfer_receipts_never_enter_the_delivery_subject(self) -> None:
         from description_pipeline.delivery import check_layout, subject_inventory
 
@@ -1967,7 +1935,7 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(native_transfer.verify_transfer(destination)["main_assembly"], MAIN_ASSEMBLY)
 
     def test_git_attributes_protect_the_delivered_bytes(self) -> None:
-        from description_pipeline.repository.urdf_pr import GIT_ATTRIBUTES
+        from description_pipeline.repository.publish import GIT_ATTRIBUTES
 
         for line in (
             b"/manifest.json -text -filter -working-tree-encoding\n",

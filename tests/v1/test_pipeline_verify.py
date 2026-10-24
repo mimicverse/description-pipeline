@@ -180,10 +180,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 "description_pipeline.steps.verify_delivery",
                 side_effect=AssertionError("legacy Verify path must not run"),
             ),
-            patch(
-                "description_pipeline.solidworks.publish",
-                side_effect=AssertionError("Verify must not start Publish"),
-            ),
         ):
             execution = VerifyHandler(
                 identity_provider=hermetic._portable_tool,

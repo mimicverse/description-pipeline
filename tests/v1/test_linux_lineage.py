@@ -104,7 +104,6 @@ class LinuxLineageTests(unittest.TestCase):
             mock.patch.object(flow, "_registered_request_sha256", return_value="a" * 64),
             mock.patch.object(flow.solidworks, "generate", side_effect=producer),
             mock.patch.object(flow.solidworks, "verify", side_effect=producer),
-            mock.patch.object(flow.solidworks, "publish", side_effect=producer),
         ):
             receipt = flow.run_stage(
                 self.registry,
@@ -113,8 +112,6 @@ class LinuxLineageTests(unittest.TestCase):
                 stage,
                 source_run_id=source,
                 expected_subject=subject,
-                repository=repository,
-                base="main",
             )
         return receipt, seeds
 
@@ -128,8 +125,6 @@ class LinuxLineageTests(unittest.TestCase):
         self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "capture")])
         _, seeds = self.run_stage(CHILD, "verify", subject="b" * 64)
         self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "generate")])
-        _, seeds = self.run_stage(CHILD, "publish", subject="b" * 64, repository=self.root / "repo")
-        self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "verify")])
         self.assertEqual(self.gate_owners(), {CHILD})
 
     def test_a_portable_resume_seeds_the_boundary_from_the_parent_then_the_attempt(self):
@@ -141,9 +136,6 @@ class LinuxLineageTests(unittest.TestCase):
         self.registry.seal(CHILD, "generate")
         _, seeds = self.run_stage(CHILD, "verify", source=PARENT, subject="b" * 64)
         self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "generate")])
-        self.registry.seal(CHILD, "verify")
-        _, seeds = self.run_stage(CHILD, "publish", source=PARENT, subject="b" * 64, repository=self.root / "repo")
-        self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "verify")])
         # The capture/input authority stays bound to the parent for the whole attempt.
         self.assertEqual(self.gate_owners(), {PARENT})
 
@@ -153,9 +145,6 @@ class LinuxLineageTests(unittest.TestCase):
         self.registry.seal(PARENT, "capture", "generate", "verify")
         _, seeds = self.run_stage(CHILD, "verify", source=PARENT, subject="b" * 64)
         self.assertEqual(seeds, [self.registry.sealed_seed(PARENT, "generate")])
-        self.registry.seal(CHILD, "verify")
-        _, seeds = self.run_stage(CHILD, "publish", source=PARENT, subject="b" * 64, repository=self.root / "repo")
-        self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "verify")])
         self.assertEqual(self.gate_owners(), {PARENT})
 
     def test_a_native_boundary_linked_attempt_consumes_its_own_capture(self):
@@ -170,8 +159,6 @@ class LinuxLineageTests(unittest.TestCase):
                 self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "capture")])
                 _, seeds = self.run_stage(CHILD, "verify", subject="b" * 64)
                 self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "generate")])
-                _, seeds = self.run_stage(CHILD, "publish", subject="b" * 64, repository=self.root / "repo")
-                self.assertEqual(seeds, [self.registry.sealed_seed(CHILD, "verify")])
                 self.assertEqual(self.gate_owners(), {CHILD})
                 self.assertNotIn(PARENT, self.gate_owners())
 
@@ -219,10 +206,8 @@ class LinuxLineageTests(unittest.TestCase):
             self.run_stage(CHILD, "generate", subject="b" * 64)
         with self.assertRaisesRegex(PipelineError, "requires the recorded subject"):
             self.run_stage(CHILD, "verify", subject=None)
-        with self.assertRaisesRegex(PipelineError, "requires the recorded subject"):
-            self.run_stage(CHILD, "publish", subject=None, repository=self.root / "repo")
-        with self.assertRaisesRegex(PipelineError, "requires the configured model repository checkout"):
-            self.run_stage(CHILD, "publish", subject="b" * 64, repository=None)
+        with self.assertRaisesRegex(PipelineError, "stage must be one of"):
+            self.run_stage(CHILD, "publish", subject="b" * 64, repository=self.root / "repo")
 
 
 if __name__ == "__main__":
