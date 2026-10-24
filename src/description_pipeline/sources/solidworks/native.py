@@ -969,6 +969,20 @@ def _method(obj, name, *args):
     raise CadError("cad_member_not_callable", name)
 
 
+_CURVE_END_PARAMS_FIELDS = frozenset(
+    {
+        "call_form",
+        "success",
+        "error",
+        "start",
+        "end",
+        "is_closed",
+        "is_periodic",
+        "raw_outputs",
+    }
+)
+
+
 def _read_curve_end_params(
     curve,
     *,
@@ -6617,6 +6631,19 @@ class SolidWorksBackend(CadBackend):
                 if read_end_params is not None
                 else _read_curve_end_params(curve)
             )
+            if (
+                not isinstance(end_params, dict)
+                or set(end_params) != _CURVE_END_PARAMS_FIELDS
+            ):
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "a native edge curve-end record is incomplete or unknown",
+                    {
+                        **base,
+                        "edge_index": edge_row["index"],
+                        "curve_end_params": end_params,
+                    },
+                )
             edge_row["curve_end_params"] = end_params
             try:
                 curve_domain_transform = native_curve_domain_transform(
@@ -8292,12 +8319,14 @@ class SolidWorksBackend(CadBackend):
                     evidence["tolerant_edge_evidence"] is not None
                     for evidence in endpoint_evidence
                 )
+                uses_closest_fallback = any(
+                    evidence["parameter_u_source"] == "closest_point_fallback"
+                    for evidence in endpoint_evidence
+                )
                 row["open_edge_boundary_identity"] = None
+                requires_open_identity = False
                 if uses_tolerant_gap and not unique_topology_accepted:
-                    if (
-                        not endpoint_set_mode
-                        or not open_identity_candidate
-                    ):
+                    if not endpoint_set_mode or not open_identity_candidate:
                         raise CadError(
                             "cad_native_tessellation_unreadable",
                             "tolerant gap use requires an open-edge endpoint identity",
@@ -8311,6 +8340,28 @@ class SolidWorksBackend(CadBackend):
                                 "cofin_raw_id": cofin_id,
                             },
                         )
+                    requires_open_identity = True
+                elif (
+                    uses_closest_fallback
+                    and open_identity_candidate
+                    and not unique_topology_accepted
+                ):
+                    if not endpoint_set_mode:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "ambiguous closest-point fallback requires an open-edge endpoint identity",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "fin_id": fin_id,
+                                "direct_error_m": direct_error,
+                                "swapped_error_m": swapped_error,
+                                "face_count": incidence,
+                                "cofin_raw_id": cofin_id,
+                            },
+                        )
+                    requires_open_identity = True
+                if requires_open_identity:
                     edge_tolerance = edge["edge_tolerance"]
                     if edge_tolerance["state"] != "success":
                         raise CadError(
@@ -8521,8 +8572,12 @@ class SolidWorksBackend(CadBackend):
                                     edge_row["face_indices"]
                                 ),
                                 "curve_sense": domain["sense"],
-                                "curve_closed": domain["is_closed"],
-                                "curve_periodic": domain["is_periodic"],
+                                "curve_closed": edge_row["curve_end_params"][
+                                    "is_closed"
+                                ],
+                                "curve_periodic": edge_row["curve_end_params"][
+                                    "is_periodic"
+                                ],
                                 "gap_m": edge_tolerance["gap_m"],
                             },
                         ) from error

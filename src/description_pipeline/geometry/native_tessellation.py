@@ -3072,6 +3072,42 @@ def _parse_itessellation_evidence(
                     fin["end_evidence"],
                 )
             )
+            uses_closest_fallback = any(
+                isinstance(evidence_value, dict)
+                and evidence_value["parameter_u_source"]
+                == "closest_point_fallback"
+                for evidence_value in (
+                    fin["start_evidence"],
+                    fin["end_evidence"],
+                )
+            )
+            open_identity_candidate = (
+                body_key[0] == 1
+                and len(edge["face_indices"]) == 1
+                and fin["cofin_raw_id"] == -1
+            )
+            requires_open_identity = False
+            if uses_tolerant_gap:
+                requires_open_identity = not unique_topology_accepted
+                if requires_open_identity:
+                    _require(
+                        endpoint_set_mode and open_identity_candidate,
+                        component
+                        + f": native tessellation v8 edge {reference} "
+                        + "uses a tolerant gap without open-edge endpoint identity",
+                    )
+            elif (
+                uses_closest_fallback
+                and open_identity_candidate
+                and not unique_topology_accepted
+            ):
+                _require(
+                    endpoint_set_mode,
+                    component
+                    + f": native tessellation v8 edge {reference} "
+                    + "uses fallback boundary evidence without open-edge endpoint identity",
+                )
+                requires_open_identity = True
             recomputed_open_identity = None
             open_identity_sha256 = None
             topology_accepted = unique_topology_accepted
@@ -3082,15 +3118,12 @@ def _parse_itessellation_evidence(
                     + f": native tessellation v8 edge {reference} "
                     + f"fin {fin['fin_id']} carries unnecessary open-edge identity",
                 )
-            elif uses_tolerant_gap:
+            elif requires_open_identity:
                 _require(
-                    body_key[0] == 1
-                    and len(edge["face_indices"]) == 1
-                    and fin["cofin_raw_id"] == -1
-                    and endpoint_set_mode,
+                    endpoint_set_mode,
                     component
                     + f": native tessellation v8 edge {reference} "
-                    + "uses a tolerant gap without open-edge endpoint identity",
+                    + "uses fallback boundary evidence without an open-edge endpoint identity",
                 )
                 try:
                     face_span = face_spans_by_key[
@@ -3471,23 +3504,17 @@ def _parse_itessellation_evidence(
                     and assignment["swapped_error_m"]
                     <= assignment["tolerance_m"]
                 )
+                current_edge_unique_topology = (
+                    assignment["accepted"] is True
+                    and assignment["complete_match_count"] == 1
+                )
                 open_identity_accepted = endpoint_set_mode and any(
-                    evidence["fins"][fin_id][
-                        "open_edge_boundary_identity"
-                    ]
+                    evidence["fins"][fin_id]["open_edge_boundary_identity"]
                     is not None
-                    and any(
-                        evidence["fins"][fin_id][field] is not None
-                        and evidence["fins"][fin_id][field][
-                            "tolerant_edge_evidence"
-                        ]
-                        is not None
-                        for field in ("start_evidence", "end_evidence")
-                    )
                     for fin_id in actual
                 )
                 _require(
-                    unique_topology_accepted
+                    current_edge_unique_topology
                     or open_identity_accepted
                     or (
                         endpoint_set_mode
