@@ -407,6 +407,21 @@ class _Services:
         del command
         return None
 
+    @staticmethod
+    def pending_effect_for_command(command_id):
+        del command_id
+        return None
+
+    @staticmethod
+    def verify_pending_effect(command, pending):
+        del command
+        return pending
+
+    @staticmethod
+    def yield_claim_for_effect(command, claim, effect_id):
+        del command, claim, effect_id
+        raise AssertionError("Freeze never defers an external effect")
+
     def load_result(self, decision):
         return self.candidate.result
 
