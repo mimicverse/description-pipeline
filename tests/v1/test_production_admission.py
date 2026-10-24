@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ except ImportError:
     psycopg2 = None
 
 from description_pipeline.artifacts import ArtifactStore
+from description_pipeline import __version__
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.interface_records import config_snapshot_digest
 from description_pipeline.io import PipelineError, canonical, digest
@@ -190,19 +192,41 @@ class ProductionAdmissionTests(unittest.TestCase):
             principal="cli:tenant:ou_worker",
             from_stage="freeze",
         )
+        package_files = {
+            "description_pipeline/runtime.py": digest({"release-file": "runtime"}),
+        }
+        self.release_identity = {
+            "schema_version": "solidworks-to-urdf.release/v1",
+            "pipeline_id": PIPELINE_ID,
+            "version": __version__,
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "source_sha256": digest(package_files),
+            "package_files": package_files,
+        }
         self.portable_tool = {
             "schema_version": TOOL_SCHEMA,
             "pipeline_id": PIPELINE_ID,
+            "version": __version__,
             "source_sha256": digest({"portable": "installed"}),
-            "release": None,
-            "runtime": {"role": "portable"},
+            "release": copy.deepcopy(self.release_identity),
+            "runtime": {
+                "role": "portable",
+                "system": "Linux",
+                "python": "3.12.10",
+            },
         }
         self.native_tool = {
             "schema_version": TOOL_SCHEMA,
             "pipeline_id": PIPELINE_ID,
+            "version": __version__,
             "source_sha256": digest({"native": "observed"}),
-            "release": {"source_sha256": digest({"native": "observed"})},
-            "runtime": {"role": "native", "system": "Windows"},
+            "release": copy.deepcopy(self.release_identity),
+            "runtime": {
+                "role": "native",
+                "system": "Windows",
+                "python": "3.12.10",
+            },
         }
         self.native_reads = 0
         self.artifacts = ArtifactStore(self.artifacts_root)
@@ -1011,10 +1035,74 @@ class ProductionAdmissionTests(unittest.TestCase):
 
         self.native_tool = {
             **self.native_tool,
-            "release": {"source_sha256": "f" * 64},
+            "release": {
+                **self.release_identity,
+                "source_commit": "f" * 40,
+            },
         }
-        with self.assertRaisesRegex(ProtocolError, "native_tool_invalid"):
+        with self.assertRaisesRegex(ProtocolError, "release_mismatch"):
             self._factory(work_root=work).prepare(self.request)
+
+    def test_formal_dual_end_release_identity_is_required_and_exact(self) -> None:
+        work = self.root / "release-work"
+        work.mkdir()
+        portable = copy.deepcopy(self.portable_tool)
+        native = copy.deepcopy(self.native_tool)
+        self.portable_tool = {**portable, "release": None}
+        self.native_tool = {**native, "release": None}
+        with self.assertRaises(ProtocolError) as missing:
+            self._factory(work_root=work).prepare(self.request)
+        self.assertEqual(
+            missing.exception.code,
+            "admission_ingestion.release_missing",
+        )
+
+        cases = [
+            (
+                "version",
+                lambda tool: None,
+                lambda tool: tool.update(
+                    version="9.9.9",
+                    release={**tool["release"], "version": "9.9.9"},
+                ),
+            ),
+            (
+                "source_commit",
+                lambda tool: tool["release"].update(
+                    source_commit="c" * 40
+                ),
+                lambda tool: None,
+            ),
+            (
+                "source_tree",
+                lambda tool: None,
+                lambda tool: tool["release"].update(
+                    source_tree="d" * 40
+                ),
+            ),
+        ]
+        for field, mutate_portable, mutate_native in cases:
+            with self.subTest(field=field):
+                portable = copy.deepcopy(self.portable_tool)
+                native = copy.deepcopy(self.native_tool)
+                portable["release"] = copy.deepcopy(self.release_identity)
+                portable["version"] = __version__
+                native["release"] = copy.deepcopy(self.release_identity)
+                native["version"] = __version__
+                mutate_portable(portable)
+                mutate_native(native)
+                self.portable_tool = portable
+                self.native_tool = native
+                with self.assertRaises(ProtocolError) as mismatch:
+                    self._factory(work_root=work).prepare(self.request)
+                self.assertEqual(
+                    mismatch.exception.code,
+                    "admission_ingestion.release_mismatch",
+                )
+                self.assertIn(
+                    field,
+                    mismatch.exception.detail["fields"],
+                )
 
     def test_missing_publication_actor_configuration_is_refused(self) -> None:
         _git(self.checkout, "config", "--unset", "user.email")

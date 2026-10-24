@@ -51,10 +51,12 @@ from .publish_contract import REPOSITORY_SNAPSHOT_KIND, REPOSITORY_SNAPSHOT_META
 from ..orchestration.feishu_oauth import valid_actor_principal
 
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
+_GIT_OBJECT = re.compile(r"\A[0-9a-f]{40}\Z")
 _IDENTIFIER = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _TARGET = re.compile(r"\A[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 _REF = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_RELEASE_SCHEMA = "solidworks-to-urdf.release/v1"
 _RECEIPT_FIELDS = frozenset(
     {
         "folder",
@@ -119,6 +121,85 @@ def _sha256(value: object, where: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise ProtocolError("admission_ingestion.invalid", {"where": where})
     return value
+
+
+def _formal_release(
+    tool: Mapping[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    release = tool.get("release")
+    if release is None:
+        raise ProtocolError(
+            "admission_ingestion.release_missing",
+            {"role": role},
+        )
+    if not isinstance(release, Mapping):
+        raise ProtocolError(
+            "admission_ingestion.release_invalid",
+            {"role": role, "where": "release"},
+        )
+    record = dict(release)
+    required = {
+        "schema_version",
+        "pipeline_id",
+        "version",
+        "source_commit",
+        "source_tree",
+        "source_sha256",
+        "package_files",
+    }
+    if not required.issubset(record):
+        raise ProtocolError(
+            "admission_ingestion.release_invalid",
+            {
+                "role": role,
+                "missing": sorted(required - set(record)),
+            },
+        )
+    if (
+        record["schema_version"] != _RELEASE_SCHEMA
+        or record["pipeline_id"] != tool.get("pipeline_id")
+        or record["version"] != tool.get("version")
+        or not isinstance(record["source_commit"], str)
+        or _GIT_OBJECT.fullmatch(record["source_commit"]) is None
+        or not isinstance(record["source_tree"], str)
+        or _GIT_OBJECT.fullmatch(record["source_tree"]) is None
+    ):
+        raise ProtocolError(
+            "admission_ingestion.release_invalid",
+            {"role": role, "where": "identity"},
+        )
+    _sha256(record["source_sha256"], f"{role}.release.source_sha256")
+    package_files = record["package_files"]
+    if (
+        not isinstance(package_files, Mapping)
+        or not package_files
+        or not all(
+            isinstance(path, str)
+            and path
+            and isinstance(checksum, str)
+            and _SHA256.fullmatch(checksum)
+            for path, checksum in package_files.items()
+        )
+    ):
+        raise ProtocolError(
+            "admission_ingestion.release_invalid",
+            {"role": role, "where": "package_files"},
+        )
+    runtime = tool.get("runtime")
+    expected_system = "Windows" if role == "native" else "Linux"
+    if (
+        not isinstance(runtime, Mapping)
+        or runtime.get("role") != role
+        or runtime.get("system") != expected_system
+        or not str(runtime.get("python") or "").startswith("3.12")
+    ):
+        raise ProtocolError(
+            "admission_ingestion.release_invalid",
+            {"role": role, "where": "runtime"},
+        )
+    return record
 
 
 def _real_directory(value: object, where: str) -> Path:
@@ -566,7 +647,9 @@ class ProductionAdmissionFactory:
             ) from error
         return validated["resolved"], config_snapshot_digest(validated), raw
 
-    def _installed(self) -> tuple[StageExecutors, str, str]:
+    def _installed(
+        self,
+    ) -> tuple[StageExecutors, str, str, Mapping[str, Any]]:
         portable = _canonical_mapping(
             self.portable_tool_provider(),
             "portable_tool",
@@ -574,6 +657,7 @@ class ProductionAdmissionFactory:
         if portable.get("schema_version") != TOOL_SCHEMA:
             raise ProtocolError("admission_ingestion.installation_invalid")
         source = _sha256(portable.get("source_sha256"), "portable_tool.source_sha256")
+        _formal_release(portable, role="portable")
         executors = StageExecutors(
             freeze=source,
             discover=source,
@@ -586,11 +670,12 @@ class ProductionAdmissionFactory:
             portable,
             "airflow_dispatch",
         )
-        return executors, source, dispatch
+        return executors, source, dispatch, portable
 
     def _native_requirement(
         self,
         ingestion_executor_sha256: str,
+        portable_tool: Mapping[str, Any],
     ) -> tuple[VerifiedArtifact, str, str]:
         tool = _canonical_mapping(
             self.native_tool_provider(),
@@ -599,14 +684,18 @@ class ProductionAdmissionFactory:
         if tool.get("schema_version") != TOOL_SCHEMA:
             raise ProtocolError("admission_ingestion.native_tool_invalid")
         source = _sha256(tool.get("source_sha256"), "native_tool.source_sha256")
-        release = tool.get("release")
-        if isinstance(release, Mapping) and release.get("source_sha256") not in {
-            None,
-            source,
-        }:
+        native_release = _formal_release(tool, role="native")
+        portable_release = _formal_release(portable_tool, role="portable")
+        if native_release != portable_release:
             raise ProtocolError(
-                "admission_ingestion.native_tool_invalid",
-                {"reason": "release-source-mismatch"},
+                "admission_ingestion.release_mismatch",
+                {
+                    "fields": sorted(
+                        key
+                        for key in set(native_release) | set(portable_release)
+                        if native_release.get(key) != portable_release.get(key)
+                    )
+                },
             )
         record_sha256 = digest(tool)
         with tempfile.TemporaryDirectory(
@@ -945,9 +1034,13 @@ class ProductionAdmissionFactory:
             executors,
             ingestion_executor_sha256,
             dispatch_executor_sha256,
+            portable_tool,
         ) = self._installed()
         native_tool_requirement, native_source_sha256, native_record_sha256 = (
-            self._native_requirement(ingestion_executor_sha256)
+            self._native_requirement(
+                ingestion_executor_sha256,
+                portable_tool,
+            )
         )
         created_at = self._now()
         originals = self._seal_upload(
