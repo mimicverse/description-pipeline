@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+import os
 import re
+import signal
 import shutil
 import tempfile
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +75,19 @@ PR_EFFECT_KEY = "publish.pull-request"
 _HEX40 = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 _GIT_OUTBOUND_FILES = frozenset({"candidate.bundle", PUBLICATION_PLAN, "request.json"})
+_GIT_EXPECTED_STATE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "repository",
+        "base_ref",
+        "expected_base_oid",
+        "branch_ref",
+        "expected_head_oid",
+        "candidate_commit",
+        "candidate_tree",
+        "subject_sha256",
+    }
+)
 _PUBLICATION_PLAN_FIELDS = frozenset(
     {
         "base_ref",
@@ -1419,6 +1438,47 @@ def _pr_effect(
     return effect_id, observation, False
 
 
+def _verify_publish_wait_identity(
+    *,
+    wait: StageEffectWait,
+    outbound: ArtifactRef,
+    expected_state: Mapping[str, Any],
+    target: Mapping[str, Any],
+) -> None:
+    """Verify one wait against the sealed effect identity it names."""
+
+    if (
+        outbound.artifact_id != wait.outbound_artifact_id
+        or outbound.set_sha256 != wait.outbound_digest
+    ):
+        raise ProtocolError(
+            "publish.resume_wait",
+            {"where": "outbound", "effect_key": wait.effect_key},
+        )
+    expected_state_digest = digest(expected_state)
+    intent_identity_digest = digest(
+        {
+            "command_id": wait.command_id,
+            "effect_id": wait.effect_id,
+            "effect_key": wait.effect_key,
+            "effect_kind": wait.effect_kind,
+            "expected_state": dict(expected_state),
+            "expected_state_digest": expected_state_digest,
+            "outbound_artifact_id": outbound.artifact_id,
+            "outbound_digest": outbound.set_sha256,
+            "target": dict(target),
+        }
+    )
+    if (
+        wait.expected_state_digest != expected_state_digest
+        or wait.intent_identity_digest != intent_identity_digest
+    ):
+        raise ProtocolError(
+            "publish.resume_wait",
+            {"where": "intent_identity", "effect_key": wait.effect_key},
+        )
+
+
 def _verify_resume_wait(
     *,
     command: StageCommand,
@@ -1520,27 +1580,454 @@ def _verify_resume_wait(
             {"where": "effect_key", "effect_key": wait.effect_key},
         )
 
-    expected_state_digest = digest(expected_state)
-    intent_identity_digest = digest(
-        {
-            "command_id": command.command_id,
-            "effect_id": settlement.effect_id,
-            "effect_key": wait.effect_key,
-            "effect_kind": wait.effect_kind,
-            "expected_state": expected_state,
-            "expected_state_digest": expected_state_digest,
-            "outbound_artifact_id": outbound.artifact_id,
-            "outbound_digest": outbound.set_sha256,
-            "target": target,
-        }
+    _verify_publish_wait_identity(
+        wait=wait,
+        outbound=outbound,
+        expected_state=expected_state,
+        target=target,
     )
-    if (
-        wait.expected_state_digest != expected_state_digest
-        or wait.intent_identity_digest != intent_identity_digest
-    ):
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadOnlyCommandResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+AsyncCommandRunner = Callable[
+    [tuple[str, ...], float],
+    Awaitable[_ReadOnlyCommandResult],
+]
+
+
+async def _run_read_only_command(
+    argv: tuple[str, ...],
+    timeout: float,
+) -> _ReadOnlyCommandResult:
+    """Run one read-only CLI command with no stdin and a bounded process group."""
+
+    environment = {
+        **os.environ,
+        "GH_PROMPT_DISABLED": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LC_ALL": "C",
+        "NO_COLOR": "1",
+    }
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+        return _ReadOnlyCommandResult(returncode=-1, stdout=b"", stderr=b"")
+    if len(stdout) > 256 * 1024 or len(stderr) > 256 * 1024:
+        return _ReadOnlyCommandResult(returncode=-1, stdout=b"", stderr=b"")
+    return _ReadOnlyCommandResult(
+        returncode=process.returncode if process.returncode is not None else -1,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PublishEffectWakeupHint:
+    """One trigger-only hint; it is never a stage result or qualification."""
+
+    wait_digest: str
+    observed_at: datetime
+    changed: bool
+
+
+def _probe_outbound_names(root: Path, expected: frozenset[str]) -> None:
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ProtocolError("publish.probe_outbound", {"reason": "root"})
+    names = set()
+    for item in root.iterdir():
+        if item.name == "manifest.json":
+            continue
+        if item.is_symlink() or not item.is_file():
+            raise ProtocolError("publish.probe_outbound", {"reason": "member"})
+        names.add(item.name)
+    if names != expected:
         raise ProtocolError(
-            "publish.resume_wait",
-            {"where": "intent_identity", "effect_key": wait.effect_key},
+            "publish.probe_outbound",
+            {
+                "missing": sorted(expected - names),
+                "unknown": sorted(names - expected),
+            },
+        )
+
+
+def _read_canonical_probe_object(path: Path, label: str) -> dict[str, Any]:
+    value = read_data(path)
+    if not isinstance(value, dict) or path.read_bytes() != canonical(value):
+        raise ProtocolError("publish.probe_request", {"member": label})
+    return value
+
+
+def _probe_timeout(value: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0 < float(value) <= 60
+    ):
+        raise ProtocolError("publish.probe_timeout")
+    return float(value)
+
+
+@dataclass(frozen=True, slots=True)
+class PublishGitStatusProbe:
+    """Read-only exact branch probe initialized from one sealed Git effect."""
+
+    wait: StageEffectWait
+    origin_url: str
+    base_ref: str
+    expected_base_oid: str
+    branch_ref: str
+    candidate_commit: str
+    runner: AsyncCommandRunner = field(default=_run_read_only_command, repr=False)
+    timeout: float = 15.0
+
+    def __post_init__(self) -> None:
+        if (
+            self.wait.effect_key != GIT_EFFECT_KEY
+            or self.wait.effect_kind != "git_ref_update"
+        ):
+            raise ProtocolError("publish.probe_effect", {"effect_key": self.wait.effect_key})
+        if (
+            not isinstance(self.origin_url, str)
+            or not self.origin_url
+            or "\x00" in self.origin_url
+            or _HEX40.fullmatch(self.expected_base_oid) is None
+            or _HEX40.fullmatch(self.candidate_commit) is None
+        ):
+            raise ProtocolError("publish.probe_expectation")
+        object.__setattr__(self, "timeout", _probe_timeout(self.timeout))
+
+    @classmethod
+    def from_sealed_outbound(
+        cls,
+        *,
+        wait: StageEffectWait,
+        outbound: ArtifactRef,
+        outbound_root: Path,
+        runner: AsyncCommandRunner = _run_read_only_command,
+        timeout: float = 15.0,
+    ) -> PublishGitStatusProbe:
+        if (
+            wait.effect_key != GIT_EFFECT_KEY
+            or wait.effect_kind != "git_ref_update"
+        ):
+            raise ProtocolError("publish.probe_effect", {"effect_key": wait.effect_key})
+        _probe_outbound_names(outbound_root, _GIT_OUTBOUND_FILES)
+        request = _read_canonical_probe_object(
+            Path(outbound_root) / "request.json",
+            "request.json",
+        )
+        plan = _read_canonical_probe_object(
+            Path(outbound_root) / PUBLICATION_PLAN,
+            PUBLICATION_PLAN,
+        )
+        if (
+            set(request) != {*_GIT_EXPECTED_STATE_FIELDS, "parents"}
+            or request["schema_version"] != "solidworks-to-urdf.git-ref-update/v1"
+            or set(plan) != _PUBLICATION_PLAN_FIELDS
+            or plan["schema_version"] != PUBLICATION_PLAN_SCHEMA
+        ):
+            raise ProtocolError("publish.probe_request")
+        expected_state = {
+            name: request[name]
+            for name in _GIT_EXPECTED_STATE_FIELDS
+        }
+        target = {
+            "repository": request["repository"],
+            "branch_ref": request["branch_ref"],
+        }
+        _verify_publish_wait_identity(
+            wait=wait,
+            outbound=outbound,
+            expected_state=expected_state,
+            target=target,
+        )
+        candidate = request["candidate_commit"]
+        tree = request["candidate_tree"]
+        parents = request["parents"]
+        if (
+            _HEX40.fullmatch(candidate) is None
+            or _HEX40.fullmatch(tree) is None
+            or not isinstance(parents, list)
+            or any(not isinstance(item, str) or _HEX40.fullmatch(item) is None for item in parents)
+            or plan.get("candidate_commit") != candidate
+            or plan.get("candidate_tree") != tree
+            or plan.get("candidate_parents") != parents
+            or plan.get("repository") != request["repository"]
+            or plan.get("base_ref") != request["base_ref"]
+            or plan.get("branch_ref") != request["branch_ref"]
+            or plan.get("expected_base_oid") != request["expected_base_oid"]
+            or plan.get("expected_head_oid") != request["expected_head_oid"]
+        ):
+            raise ProtocolError("publish.probe_request")
+        return cls(
+            wait=wait,
+            origin_url=plan["origin_url"],
+            base_ref=request["base_ref"],
+            expected_base_oid=request["expected_base_oid"],
+            branch_ref=request["branch_ref"],
+            candidate_commit=candidate,
+            runner=runner,
+            timeout=timeout,
+        )
+
+    async def observe(self) -> PublishEffectWakeupHint:
+        observed_at = datetime.now(UTC)
+        command = (
+            "git",
+            "ls-remote",
+            "--",
+            self.origin_url,
+            f"refs/heads/{self.base_ref}",
+            f"refs/heads/{self.branch_ref}",
+        )
+        try:
+            result = await self.runner(command, self.timeout)
+        except Exception:
+            return PublishEffectWakeupHint(
+                wait_digest=self.wait.digest,
+                observed_at=observed_at,
+                changed=False,
+            )
+        if result.returncode != 0:
+            return PublishEffectWakeupHint(
+                wait_digest=self.wait.digest,
+                observed_at=observed_at,
+                changed=False,
+            )
+        try:
+            lines = result.stdout.decode("utf-8").splitlines()
+            refs: dict[str, str] = {}
+            for line in lines:
+                if not line:
+                    continue
+                fields = line.split()
+                if (
+                    len(fields) != 2
+                    or _HEX40.fullmatch(fields[0]) is None
+                    or fields[1] in refs
+                ):
+                    return PublishEffectWakeupHint(
+                        wait_digest=self.wait.digest,
+                        observed_at=observed_at,
+                        changed=False,
+                    )
+                refs[fields[1]] = fields[0]
+        except UnicodeDecodeError:
+            return PublishEffectWakeupHint(
+                wait_digest=self.wait.digest,
+                observed_at=observed_at,
+                changed=False,
+            )
+        base = refs.get(f"refs/heads/{self.base_ref}")
+        branch = refs.get(f"refs/heads/{self.branch_ref}")
+        changed = (
+            branch == self.candidate_commit
+            or (base is not None and base != self.expected_base_oid)
+        )
+        return PublishEffectWakeupHint(
+            wait_digest=self.wait.digest,
+            observed_at=observed_at,
+            changed=changed,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PublishPullRequestStatusProbe:
+    """Read-only exact PR probe initialized from one sealed PR effect."""
+
+    wait: StageEffectWait
+    repository: str
+    base_ref: str
+    head_ref: str
+    candidate_commit: str
+    title_sha256: str
+    body_sha256: str
+    expected_pr: Mapping[str, Any] | None
+    runner: AsyncCommandRunner = field(default=_run_read_only_command, repr=False)
+    timeout: float = 15.0
+
+    def __post_init__(self) -> None:
+        if (
+            self.wait.effect_key != PR_EFFECT_KEY
+            or self.wait.effect_kind != "pr_upsert"
+            or _HEX40.fullmatch(self.candidate_commit) is None
+            or _HEX64.fullmatch(self.title_sha256) is None
+            or _HEX64.fullmatch(self.body_sha256) is None
+        ):
+            raise ProtocolError("publish.probe_effect", {"effect_key": self.wait.effect_key})
+        object.__setattr__(self, "timeout", _probe_timeout(self.timeout))
+
+    @classmethod
+    def from_sealed_outbound(
+        cls,
+        *,
+        wait: StageEffectWait,
+        outbound: ArtifactRef,
+        outbound_root: Path,
+        runner: AsyncCommandRunner = _run_read_only_command,
+        timeout: float = 15.0,
+    ) -> PublishPullRequestStatusProbe:
+        if (
+            wait.effect_key != PR_EFFECT_KEY
+            or wait.effect_kind != "pr_upsert"
+        ):
+            raise ProtocolError("publish.probe_effect", {"effect_key": wait.effect_key})
+        _probe_outbound_names(outbound_root, frozenset({"request.json"}))
+        request = _read_canonical_probe_object(
+            Path(outbound_root) / "request.json",
+            "request.json",
+        )
+        if (
+            set(request) != _PR_OUTBOUND_FIELDS
+            or request["schema_version"] != "solidworks-to-urdf.pr-upsert/v1"
+        ):
+            raise ProtocolError("publish.probe_request")
+        title = request["title"]
+        body = request["body"]
+        if (
+            not isinstance(title, str)
+            or not isinstance(body, str)
+            or request["title_digest"] != digest({"title": title})
+            or request["body_digest"] != digest({"body": body})
+        ):
+            raise ProtocolError("publish.probe_request")
+        expected_state = {
+            name: request[name]
+            for name in _PR_EXPECTED_STATE_FIELDS
+        }
+        target = {
+            "repository": request["repository"],
+            "base_ref": request["base_ref"],
+            "head_ref": request["head_ref"],
+        }
+        _verify_publish_wait_identity(
+            wait=wait,
+            outbound=outbound,
+            expected_state=expected_state,
+            target=target,
+        )
+        expected_pr = request["expected_pr"]
+        if expected_pr is not None and (
+            not isinstance(expected_pr, dict)
+            or set(expected_pr) != {"number", "url", "head_oid"}
+            or type(expected_pr["number"]) is not int
+            or expected_pr["number"] <= 0
+            or not isinstance(expected_pr["url"], str)
+            or _HEX40.fullmatch(expected_pr["head_oid"]) is None
+        ):
+            raise ProtocolError("publish.probe_request")
+        return cls(
+            wait=wait,
+            repository=request["repository"],
+            base_ref=request["base_ref"],
+            head_ref=request["head_ref"],
+            candidate_commit=request["candidate_commit"],
+            title_sha256=request["title_digest"],
+            body_sha256=request["body_digest"],
+            expected_pr=expected_pr,
+            runner=runner,
+            timeout=timeout,
+        )
+
+    async def observe(self) -> PublishEffectWakeupHint:
+        observed_at = datetime.now(UTC)
+        command = (
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            self.repository,
+            "--base",
+            self.base_ref,
+            "--head",
+            self.head_ref,
+            "--state",
+            "open",
+            "--limit",
+            "2",
+            "--json",
+            "number,url,state,baseRefName,headRefName,headRefOid,title,body",
+        )
+        try:
+            result = await self.runner(command, self.timeout)
+        except Exception:
+            return PublishEffectWakeupHint(
+                wait_digest=self.wait.digest,
+                observed_at=observed_at,
+                changed=False,
+            )
+        if result.returncode != 0:
+            return PublishEffectWakeupHint(
+                wait_digest=self.wait.digest,
+                observed_at=observed_at,
+                changed=False,
+            )
+        try:
+            rows = json.loads(result.stdout.decode("utf-8") or "[]")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            rows = None
+        if not isinstance(rows, list) or len(rows) > 2:
+            return PublishEffectWakeupHint(
+                wait_digest=self.wait.digest,
+                observed_at=observed_at,
+                changed=False,
+            )
+        matches = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {
+                "number",
+                "url",
+                "state",
+                "baseRefName",
+                "headRefName",
+                "headRefOid",
+                "title",
+                "body",
+            }:
+                continue
+            title = row["title"]
+            body = row["body"]
+            if (
+                row["state"] == "OPEN"
+                and row["baseRefName"] == self.base_ref
+                and row["headRefName"] == self.head_ref
+                and row["headRefOid"] == self.candidate_commit
+                and isinstance(title, str)
+                and digest({"title": title}) == self.title_sha256
+                and isinstance(body, str)
+                and digest({"body": body}) == self.body_sha256
+                and (
+                    self.expected_pr is None
+                    or (
+                        row["number"] == self.expected_pr["number"]
+                        and row["url"] == self.expected_pr["url"]
+                        and row["headRefOid"] == self.expected_pr["head_oid"]
+                    )
+                )
+            ):
+                matches.append(row)
+        return PublishEffectWakeupHint(
+            wait_digest=self.wait.digest,
+            observed_at=observed_at,
+            changed=len(matches) == 1,
         )
 
 

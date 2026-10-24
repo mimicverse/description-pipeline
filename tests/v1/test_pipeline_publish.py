@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -42,6 +44,8 @@ from description_pipeline.pipeline.stages.publish import (
     PUBLISH_REQUEST_SCHEMA,
     VERIFY_ARTIFACT_KIND,
     PublishHandler,
+    PublishGitStatusProbe,
+    PublishPullRequestStatusProbe,
     validate_publication_receipt,
 )
 from description_pipeline.repository.publish import (
@@ -688,6 +692,17 @@ class PublishHandlerTests(unittest.TestCase):
             outbound_digest=intent.outbound_digest,
             expected_state_digest=intent.expected_state_digest,
         )
+
+    def _probe_source(self, effect_key: str, name: str):
+        wait = self._effect_wait(effect_key)
+        settlement = self.fixture.effects.effect_settlement_for_key(effect_key)
+        self.assertIsNotNone(settlement)
+        self.assertIsNotNone(settlement.outbound_artifact)
+        root = self.fixture.store.materialize(
+            settlement.outbound_artifact,
+            self.fixture.root / "probe-sources" / name,
+        )
+        return wait, settlement.outbound_artifact, Path(root)
 
     def _pr_recovery_inputs(self):
         first = self._run()
@@ -1781,6 +1796,179 @@ else:
                 ),
                 before,
             )
+
+    def test_git_status_probe_is_read_only_and_hints_exact_refs_only(self) -> None:
+        first = self._run()
+        self.assertEqual(first.outcome, "completed")
+        wait, artifact, root = self._probe_source(
+            publish_stage.GIT_EFFECT_KEY,
+            "git-probe",
+        )
+        before = inventory(root)
+        intent = self.fixture.effects.intents[wait.effect_id]
+        base_ref = intent.expected_state["base_ref"]
+        branch_ref = intent.expected_state["branch_ref"]
+        expected_base = intent.expected_state["expected_base_oid"]
+        candidate = intent.expected_state["candidate_commit"]
+        results = iter(
+            (
+                SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        f"{expected_base} refs/heads/{base_ref}\n"
+                        f"{candidate} refs/heads/{branch_ref}\n"
+                    ).encode(),
+                    stderr=b"",
+                ),
+                SimpleNamespace(
+                    returncode=0,
+                    stdout=f"{'f' * 40} refs/heads/{base_ref}\n".encode(),
+                    stderr=b"",
+                ),
+                SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                SimpleNamespace(returncode=1, stdout=b"", stderr=b"not found"),
+            )
+        )
+        calls = []
+
+        async def runner(argv, timeout):
+            calls.append((argv, timeout))
+            return next(results)
+
+        probe = publish_stage.PublishGitStatusProbe.from_sealed_outbound(
+            wait=wait,
+            outbound=artifact,
+            outbound_root=root,
+            runner=runner,
+        )
+        exact = asyncio.run(probe.observe())
+        base_drift = asyncio.run(probe.observe())
+        empty = asyncio.run(probe.observe())
+        unavailable = asyncio.run(probe.observe())
+
+        self.assertIsInstance(probe, PublishGitStatusProbe)
+        self.assertTrue(exact.changed)
+        self.assertTrue(base_drift.changed)
+        self.assertFalse(empty.changed)
+        self.assertFalse(unavailable.changed)
+        self.assertEqual(exact.wait_digest, wait.digest)
+        self.assertTrue(all(call[0][:3] == ("git", "ls-remote", "--") for call in calls))
+        self.assertTrue(all(call[1] == 15.0 for call in calls))
+        self.assertEqual(inventory(root), before)
+
+    def test_git_status_probe_runs_the_default_child_contract(self) -> None:
+        first = self._run()
+        self.assertEqual(first.outcome, "completed")
+        wait, artifact, root = self._probe_source(
+            publish_stage.GIT_EFFECT_KEY,
+            "git-probe-default-runner",
+        )
+        probe = publish_stage.PublishGitStatusProbe.from_sealed_outbound(
+            wait=wait,
+            outbound=artifact,
+            outbound_root=root,
+        )
+        hint = asyncio.run(probe.observe())
+        self.assertTrue(hint.changed)
+        self.assertEqual(hint.wait_digest, wait.digest)
+
+    def test_pr_status_probe_uses_one_exact_read_only_hint(self) -> None:
+        first = self._run()
+        self.assertEqual(first.outcome, "completed")
+        wait, artifact, root = self._probe_source(
+            publish_stage.PR_EFFECT_KEY,
+            "pr-probe",
+        )
+        before = inventory(root)
+        request = read_data(root / "request.json")
+        expected_pr = request["expected_pr"]
+        exact_row = {
+            "number": expected_pr["number"] if expected_pr is not None else 7,
+            "url": expected_pr["url"] if expected_pr is not None else "https://example.test/pull/7",
+            "state": "OPEN",
+            "baseRefName": request["base_ref"],
+            "headRefName": request["head_ref"],
+            "headRefOid": request["candidate_commit"],
+            "title": request["title"],
+            "body": request["body"],
+        }
+        results = iter(
+            (
+                SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([exact_row]).encode(),
+                    stderr=b"",
+                ),
+                SimpleNamespace(returncode=0, stdout=b"[]", stderr=b""),
+                SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([{**exact_row, "title": "different"}]).encode(),
+                    stderr=b"",
+                ),
+                SimpleNamespace(returncode=1, stdout=b"", stderr=b"not found"),
+            )
+        )
+        calls = []
+
+        async def runner(argv, timeout):
+            calls.append((argv, timeout))
+            return next(results)
+
+        probe = publish_stage.PublishPullRequestStatusProbe.from_sealed_outbound(
+            wait=wait,
+            outbound=artifact,
+            outbound_root=root,
+            runner=runner,
+        )
+        exact = asyncio.run(probe.observe())
+        empty = asyncio.run(probe.observe())
+        wrong = asyncio.run(probe.observe())
+        unavailable = asyncio.run(probe.observe())
+
+        self.assertIsInstance(probe, PublishPullRequestStatusProbe)
+        self.assertTrue(exact.changed)
+        self.assertFalse(empty.changed)
+        self.assertFalse(wrong.changed)
+        self.assertFalse(unavailable.changed)
+        self.assertEqual(exact.wait_digest, wait.digest)
+        self.assertTrue(all(call[0][:3] == ("gh", "pr", "list") for call in calls))
+        self.assertTrue(all(call[1] == 15.0 for call in calls))
+        self.assertEqual(inventory(root), before)
+
+    def test_publish_status_probe_rejects_tampered_wait(self) -> None:
+        first = self._run()
+        self.assertEqual(first.outcome, "completed")
+        wait, artifact, root = self._probe_source(
+            publish_stage.GIT_EFFECT_KEY,
+            "git-probe-tampered",
+        )
+        with self.assertRaises(ProtocolError) as raised:
+            publish_stage.PublishGitStatusProbe.from_sealed_outbound(
+                wait=replace(wait, expected_state_digest="0" * 64),
+                outbound=artifact,
+                outbound_root=root,
+            )
+        self.assertEqual(raised.exception.code, "publish.resume_wait")
+
+    def test_publish_status_probe_runner_has_no_stdin_or_unbounded_child(self) -> None:
+        no_stdin = asyncio.run(
+            publish_stage._run_read_only_command(
+                (
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.write(sys.stdin.read())",
+                ),
+                2.0,
+            )
+        )
+        self.assertEqual((no_stdin.returncode, no_stdin.stdout), (0, b""))
+        timed_out = asyncio.run(
+            publish_stage._run_read_only_command(
+                (sys.executable, "-c", "import time; time.sleep(60)"),
+                0.1,
+            )
+        )
+        self.assertEqual(timed_out.returncode, -1)
 
     def test_unknown_pr_effect_requires_the_claimless_reconciler(self) -> None:
         self._run()
