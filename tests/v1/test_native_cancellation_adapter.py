@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -40,7 +41,11 @@ from description_pipeline.orchestration.native_operation_runtime import (
 from description_pipeline.pipeline.cancellation import (
     CancellationControlService,
 )
-from description_pipeline.pipeline.contracts import ProtocolError, StageCommand
+from description_pipeline.pipeline.contracts import (
+    FailureEnvelope,
+    ProtocolError,
+    StageCommand,
+)
 from description_pipeline.pipeline.engine import execute_cancellation
 from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.services import (
@@ -381,7 +386,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
             started_at=timestamp,
             finished_at=timestamp,
         )
-        return target_command, effect, cancel_command, view, services
+        return target_command, effect, cancel_command, view, services, claim
 
     def _control(self, adapter):
         return CancellationControlService(
@@ -398,7 +403,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         )
 
     def test_ack_reports_one_exact_post_and_does_not_finish_target(self) -> None:
-        target, effect, cancel_command, view, services = self._target()
+        target, effect, cancel_command, view, services, claim = self._target()
         loopback = _CancelServer(
             operation_id=view.operation_id,
             view=view,
@@ -443,8 +448,60 @@ class NativeCancellationAdapterTests(unittest.TestCase):
             )
         self.assertEqual(unresolved.exception.code, "cancel.effect_unresolved")
 
+        observation_root = Path(self.directory.name) / "observed-result"
+        metadata_root = Path(self.directory.name) / "observed-metadata"
+        observation_root.mkdir()
+        metadata_root.mkdir()
+        write_json(observation_root / "result.json", {"complete": True})
+        write_json(metadata_root / "metadata.json", {"source": "fixture"})
+        payload = self.artifacts.seal_tree(
+            observation_root,
+            kind="effect_observation",
+            producer_run_id=target.run_id,
+            producer_stage=target.stage,
+            producer_tool_sha256=digest({"observer": "fixture"}),
+        )
+        metadata = self.artifacts.seal_tree(
+            metadata_root,
+            kind="effect_reconciliation_metadata",
+            producer_run_id=target.run_id,
+            producer_stage=target.stage,
+            producer_tool_sha256=digest({"observer": "fixture"}),
+        )
+        self.facts.append_reconciliation_fact(
+            effect_id=effect.effect_id,
+            fact_type="reconciled",
+            source="fixture-observer",
+            state_class="known",
+            payload_artifact=payload,
+            metadata_artifact=metadata,
+            payload_digest=payload.set_sha256,
+            observed_at=self.now + timedelta(minutes=2),
+            fact_id="known-" + effect.effect_id,
+            expected_command_id=target.command_id,
+        )
+        self.facts.close_open_claim(
+            claim,
+            closure_code="completed",
+            closed_at=self.now + timedelta(minutes=2),
+        )
+        completed = execute_cancellation(
+            command_id=target.command_id,
+            services=services,
+        )
+        self.assertIsInstance(completed, FailureEnvelope)
+        self.assertEqual(completed.outcome, "cancelled")
+        self.assertEqual(
+            dict(completed.effect_states),
+            {effect.effect_id: "satisfied"},
+        )
+        self.assertEqual(
+            self.facts.effect_state(effect.effect_id),
+            EffectState.SATISFIED,
+        )
+
     def _assert_unresolved_without_retry(self, mode: str) -> None:
-        target, effect, cancel_command, view, _services = self._target()
+        target, effect, cancel_command, view, _services, _claim = self._target()
         loopback = _CancelServer(
             operation_id=view.operation_id,
             view=view,
@@ -481,6 +538,38 @@ class NativeCancellationAdapterTests(unittest.TestCase):
 
     def test_lost_response_remains_unknown_without_retry(self) -> None:
         self._assert_unresolved_without_retry("lost")
+
+    def test_mismatched_ack_identity_is_not_accepted(self) -> None:
+        target, effect, cancel_command, view, _services, _claim = self._target()
+        changed = replace(
+            view,
+            payload_sha256=digest({"operation": "other"}),
+        )
+        loopback = _CancelServer(
+            operation_id=view.operation_id,
+            view=changed,
+            mode="success",
+        )
+        self.addCleanup(loopback.close)
+        adapter = native_operation_cancellation_adapter(
+            NativeOperationClient(loopback.endpoint),
+            facts=self.facts,
+            artifacts=self.artifacts,
+        )
+        result = self._control(adapter).send(
+            cancel_command_id=cancel_command.command_id,
+            target_effect_id=effect.effect_id,
+        )
+        self.assertEqual(result.cancel_effect_state, EffectState.UNKNOWN)
+        self.assertEqual(len(loopback.post_paths), 1)
+        self.assertEqual(
+            self.facts.effect_state(effect.effect_id),
+            EffectState.UNKNOWN,
+        )
+        self.assertEqual(
+            target.command_id,
+            cancel_command.request["target_command_id"],
+        )
 
 
 if __name__ == "__main__":
