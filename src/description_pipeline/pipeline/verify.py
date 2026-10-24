@@ -37,6 +37,7 @@ from .contracts import (
     StageCandidate,
     StageCommand,
     StageExecution,
+    StageFailure,
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
@@ -624,11 +625,23 @@ class VerifyHandler:
             command=command,
             claim=claim,
         )
+        if result.passed:
+            return StageExecution(
+                outcome="completed",
+                candidate_root=str(result.candidate_root),
+                checks_sha256=digest(result.certificate),
+                resources_settled=True,
+            )
         return StageExecution(
-            outcome="completed" if result.passed else "failed",
+            outcome="failed",
             candidate_root=str(result.candidate_root),
             checks_sha256=digest(result.certificate),
-            reason_code=None if result.passed else "verification_failed",
+            resources_settled=True,
+            failure=StageFailure(
+                "verification_failed",
+                "Independent verification did not establish PASS",
+                outcome="failed",
+            ),
         )
 
     def validate_candidate(

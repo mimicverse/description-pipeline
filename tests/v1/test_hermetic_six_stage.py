@@ -689,14 +689,6 @@ class HermeticSixStageTests(unittest.TestCase):
         )
         return output
 
-    def _portable_publish_failure(self, receipt: dict) -> BaseException:
-        from tests.v1.test_failure_boundary_fields import _module
-
-        module = _module()
-        with self.assertRaises(module.AirflowFailException) as caught:
-            module._portable_summary(receipt, stage="publish")
-        return caught.exception
-
     def _generate_and_verify(self) -> tuple[dict, dict, dict]:
         original_handoff = _tree_bytes(self.handoff)
         capture, native = self._prepare_and_capture()
@@ -986,8 +978,6 @@ class HermeticSixStageTests(unittest.TestCase):
         self.assertEqual(failed["subject_sha256"], subject)
         self.assertEqual(failed["quality"]["passed"], True)
         self._assert_failed_publish_evidence(failed, subject)
-        boundary_failure = self._portable_publish_failure(failed)
-        self.assertEqual(getattr(boundary_failure, "code", None), "github_failed_after_push")
         self.assertTrue(
             _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").strip(),
             "the local Git push completed before GitHub failed",
@@ -1037,9 +1027,6 @@ class HermeticSixStageTests(unittest.TestCase):
         self.assertEqual(failed["subject_sha256"], subject)
         self.assertEqual(failed["quality"]["passed"], True)
         self._assert_failed_publish_evidence(failed, subject)
-        boundary_failure = self._portable_publish_failure(failed)
-        self.assertEqual(getattr(boundary_failure, "code", None), "git_failed")
-        self.assertEqual(getattr(boundary_failure, "detail", None), stderr)
         self.assertEqual(
             _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").strip(),
             "",

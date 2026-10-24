@@ -1,5 +1,20 @@
 """Shared application protocol for the six engineering stages."""
 
+from .admission import (
+    AdmissionSpec,
+    ArtifactMember,
+    VerifiedArtifact,
+    VerifiedPredecessor,
+    VerifiedRuleset,
+    build_discover_command,
+    build_freeze_command,
+    build_run_admission,
+    validate_discover_command,
+    validate_freeze_command,
+    validate_run_admission,
+    validate_stage_command,
+    validate_store_command,
+)
 from .contracts import (
     ArtifactRef,
     ExecutionClaim,
@@ -31,6 +46,8 @@ from .discover import DiscoverDomainAdapter, DiscoverHandler
 from .freeze import FreezeHandler, FreezeRefusal
 
 __all__ = [
+    "AdmissionSpec",
+    "ArtifactMember",
     "ArtifactRef",
     "DiscoverDomainAdapter",
     "DiscoverHandler",
@@ -55,10 +72,21 @@ __all__ = [
     "StageServices",
     "StageStatus",
     "StageWorkspace",
+    "VerifiedArtifact",
+    "VerifiedPredecessor",
+    "VerifiedRuleset",
+    "build_discover_command",
+    "build_freeze_command",
+    "build_run_admission",
     "effect_is_settled",
     "execute_stage",
     "project_effect_settlement",
     "project_effect_state",
     "project_run_status",
     "project_stage_status",
+    "validate_discover_command",
+    "validate_freeze_command",
+    "validate_run_admission",
+    "validate_stage_command",
+    "validate_store_command",
 ]

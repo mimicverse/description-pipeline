@@ -472,7 +472,7 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
         # the case owns the flow's seeding and caller forwarding, while the
         # confirmation grammar lives in the store suite (tests.v1.test_platform_store)
         # and the caller-side sealing/registration in the DAG suite
-        # (tests.v1.test_airflow_dag).
+        # against the canonical StageApplication runtime.
         verify_uri = f"store://sealed/{RUN}/verify"
         shutil.copytree(self.store.sealed_path(generate_uri), self.store.sealed_path(verify_uri))
         self.world.stages[(RUN, "verify")] = ("completed", {"state": "verified"}, verify_uri)
