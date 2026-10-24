@@ -200,7 +200,7 @@ class NativeObserverPostgresTests(unittest.TestCase):
             builders={},
             clock=lambda: now,
             reconciler=reconciliation,
-            reconciliation_adapter=observer,
+            reconciliation_adapters={"native_operation": observer},
         )
 
         with (
@@ -306,7 +306,7 @@ class NativeObserverPostgresTests(unittest.TestCase):
             builders={},
             clock=lambda: recovery_time,
             reconciler=reconciliation,
-            reconciliation_adapter=observer,
+            reconciliation_adapters={"native_operation": observer},
         )
         replayed = recovery_application.execute_registered_command(
             command.command_id
