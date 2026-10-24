@@ -8,16 +8,53 @@ import json
 import sys
 import tempfile
 import unittest
+import uuid
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+try:
+    import pgserver
+    import psycopg2
+except ImportError:
+    pgserver = None
+    psycopg2 = None
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import digest, file_digest, read_data, write_json
+from description_pipeline.orchestration.native_operation_client import (
+    capture_handler_from_native_operation,
+    native_capture_operation_id,
+    observe_native_operation,
+)
+from description_pipeline.orchestration.native_operation_runtime import (
+    CAPTURE_KIND,
+    NativeOperationFailure,
+    NativeOperationRuntime,
+)
+from description_pipeline.pipeline.application import StageApplication
+from description_pipeline.pipeline.capture import (
+    CaptureInputs,
+    CaptureRequest,
+)
 from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.pipeline.diagnostic import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_command,
+)
+from description_pipeline.pipeline.engine import StageWorkspace
+from description_pipeline.pipeline.services import (
+    CanonicalStageServices,
+    ClaimPolicy,
+)
+from description_pipeline.platform.facts import FactStore
 from tests.sources.selection_support import sealed_selection
+from tests.v1.test_native_operations import _Server
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION_TOOL = ROOT / "tools" / "migrate_historical_capture_input.py"
+PLATFORM_SCHEMA = ROOT / "deploy" / "platform" / "schema.sql"
+PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 RUN_ID = "preflight-fixture-0123456789abcdef"
 MAIN = "robot.SLDASM"
 SOURCE_SHA256 = digest({"migration-source": 1})
@@ -155,9 +192,14 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
         write_json(
             self.source_request,
             {
+                "schema_version": "solidworks-to-urdf.request/v2",
+                "request_id": "request-fixture",
+                "purpose": "inspection_preview",
+                "change_summary": "Migrate a historical closure",
                 "target_hardware": "m3.0",
                 "main_assembly": MAIN,
                 "handoff_digest": upload,
+                "platform_config_digest": digest({"config": 1}),
             },
         )
         self.capture_request = self.root / "capture-request.zip"
@@ -212,6 +254,11 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
             "source_sha256": SOURCE_SHA256,
             "runtime": {"role": "portable"},
         }
+        self.native_tool_record = {
+            "schema_version": "solidworks-to-urdf.tool/v1",
+            "source_sha256": digest({"native-source": 1}),
+            "runtime": {"role": "native"},
+        }
 
     def _migrate(self, **overrides):
         arguments = {
@@ -226,6 +273,13 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
             artifact_store=self.artifact_store,
             work_root=self.work_root,
             migration_tool=self.tool_record,
+            native_tool=self.native_tool_record,
+            diagnostic_created_at=datetime(
+                2026,
+                10,
+                25,
+                tzinfo=UTC,
+            ),
         )
 
     def test_complete_legacy_closure_becomes_an_isolated_byte_exact_artifact(
@@ -270,6 +324,43 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
                 (root / "legacy/prepared" / name).read_bytes(),
                 (self.prepared / name).read_bytes(),
             )
+        admission = DiagnosticAdmissionSpec.from_record(
+            receipt["diagnostic_admission"]
+        )
+        command = build_diagnostic_command(admission)
+        self.assertEqual(
+            command.to_record(),
+            receipt["diagnostic_command"],
+        )
+        workspace = StageWorkspace(
+            root=self.root / "diagnostic-workspace",
+            inputs={
+                artifact.artifact_id: store.materialize(
+                    artifact,
+                    self.root
+                    / "diagnostic-workspace-inputs"
+                    / artifact.artifact_id,
+                )
+                for artifact in admission.input_artifacts
+            },
+        )
+        resolved = CaptureInputs.resolve(
+            command,
+            workspace,
+            CaptureRequest.from_command(command),
+        )
+        self.assertEqual(
+            resolved.historical_native_tool["source_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(
+            resolved.current_native_tool["source_sha256"],
+            self.native_tool_record["source_sha256"],
+        )
+        self.assertEqual(
+            resolved.plan["run_id"],
+            RUN_ID,
+        )
 
     def test_plan_snapshot_drift_is_refused_before_sealing(self) -> None:
         path = self.prepared / "discovery/native-discovery.json"
@@ -305,8 +396,161 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
                 artifact_store=self.artifact_store,
                 work_root=self.work_root,
                 migration_tool=self.tool_record,
+                native_tool=self.native_tool_record,
+                diagnostic_created_at=datetime(
+                    2026,
+                    10,
+                    25,
+                    tzinfo=UTC,
+                ),
                 expected_run_id="fa1-" + "0" * 32,
             )
+
+    @unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
+    def test_migrated_closure_reaches_capture_through_the_common_engine(
+        self,
+    ) -> None:
+        receipt = self._migrate()
+        spec = DiagnosticAdmissionSpec.from_record(
+            receipt["diagnostic_admission"]
+        )
+        command = build_diagnostic_command(spec)
+        server_root = tempfile.TemporaryDirectory(
+            prefix="historical-capture-postgres-"
+        )
+        self.addCleanup(server_root.cleanup)
+        database = pgserver.get_server(
+            Path(server_root.name) / "pgdata",
+            cleanup_mode="delete",
+        )
+        self.addCleanup(database.cleanup)
+        schema = "historical_capture_" + uuid.uuid4().hex
+        schema_sql = PLATFORM_SCHEMA.read_text(encoding="utf-8").replace(
+            ':"platform_schema"',
+            f'"{schema}"',
+        )
+        with (
+            psycopg2.connect(database.get_uri()) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(schema_sql)
+            cursor.execute(
+                f'UPDATE "{schema}".admission SET state = %s WHERE id = 1',
+                ("open",),
+            )
+
+        def connect():
+            return psycopg2.connect(
+                database.get_uri(),
+                options=f"-c search_path={schema},public",
+            )
+
+        store = ArtifactStore(self.artifact_store)
+        facts = FactStore(connect, store)
+        facts.admit_diagnostic(spec, command)
+        observed: dict[str, object] = {}
+
+        def controlled_native_boundary(
+            request,
+            source_archive,
+            workspace,
+            native_tool,
+        ):
+            observed.update(
+                {
+                    "request": dict(request),
+                    "archive_sha256": file_digest(source_archive),
+                    "archive_bytes": source_archive.stat().st_size,
+                    "workspace": str(workspace),
+                    "native_tool": dict(native_tool),
+                }
+            )
+            raise NativeOperationFailure(
+                "historical_capture.offline_boundary",
+                "The controlled loopback boundary intentionally stops before CAD",
+                resource_terminated=True,
+                detail={
+                    "diagnostic_only": True,
+                    "formal_checkpoint_eligible": False,
+                },
+            )
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "native-state",
+            native_tool_factory=lambda: dict(
+                self.native_tool_record
+            ),
+            executors={CAPTURE_KIND: controlled_native_boundary},
+        )
+        self.addCleanup(runtime.close)
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        client = server.client()
+        handler = capture_handler_from_native_operation(
+            client,
+            artifact_store=store,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        services = CanonicalStageServices(
+            facts=facts,
+            artifacts=store,
+            work_root=self.root / "engine-work",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"owner": "historical-capture"}),
+                executor_sha256=spec.expected_executor_sha256,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: spec.created_at,
+        )
+        application = StageApplication(
+            services=services,
+            facts=facts,
+            artifacts=store,
+            handlers={"capture": handler},
+            builders={},
+            clock=lambda: spec.created_at,
+        )
+        outcome = application.execute_registered_command(command.command_id)
+        self.assertEqual(outcome.outcome, "failed")
+        self.assertEqual(
+            outcome.reason_code,
+            "historical_capture.offline_boundary",
+        )
+        request = observed["request"]
+        self.assertEqual(
+            len(request["package_files"]),
+            len(self.prepared_files()),
+        )
+        self.assertEqual(
+            request["native_tool_source_sha256"],
+            self.native_tool_record["source_sha256"],
+        )
+        self.assertEqual(
+            observed["native_tool"],
+            self.native_tool_record,
+        )
+        operation_id = native_capture_operation_id(
+            run_id=spec.run_id,
+            command_id=command.command_id,
+            effect_key="capture-native",
+        )
+        view = observe_native_operation(client, operation_id)
+        self.assertIsNotNone(view)
+        self.assertEqual(view.state, "failed")
+        self.assertEqual(view.input_archive_sha256, observed["archive_sha256"])
+        self.assertEqual(
+            view.actual_native_tool_sha256,
+            digest(self.native_tool_record),
+        )
+
+    def prepared_files(self) -> dict[str, str]:
+        return {
+            path.relative_to(self.prepared).as_posix(): file_digest(path)
+            for path in self.prepared.rglob("*")
+            if path.is_file()
+        }
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ import tempfile
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from description_pipeline.artifacts import ArtifactStore  # noqa: E402
+from description_pipeline.interface_records import check_policy_digest  # noqa: E402
 from description_pipeline.io import (  # noqa: E402
     PipelineError,
     digest,
@@ -29,8 +30,28 @@ from description_pipeline.io import (  # noqa: E402
     read_data,
     write_json,
 )
+from description_pipeline.pipeline.diagnostic import (  # noqa: E402
+    DiagnosticAdmissionSpec,
+    build_diagnostic_command,
+)
+from description_pipeline.pipeline.discover import (  # noqa: E402
+    CONFIGURATION_KIND,
+    DISCOVER_CHECKS_SCHEMA,
+    DISCOVER_REQUEST_SCHEMA,
+    DISCOVER_RESULT_SCHEMA,
+    RULESET_KIND,
+    SOURCE_SET_KIND,
+)
+from description_pipeline.pipeline.freeze import (  # noqa: E402
+    FREEZE_CHECKS_SCHEMA,
+    FREEZE_REQUEST_SCHEMA,
+)
 from description_pipeline.runtime import tool_record  # noqa: E402
-from description_pipeline.schemas import TOOL_SCHEMA  # noqa: E402
+from description_pipeline.schemas import (  # noqa: E402
+    DIAGNOSTIC_ADMISSION_SCHEMA,
+    NATIVE_TOOL_REQUIREMENT_KIND,
+    TOOL_SCHEMA,
+)
 from description_pipeline.sources.solidworks.capture_package import (  # noqa: E402
     consume_sealed_definition,
 )
@@ -40,6 +61,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     PLAN_SCHEMA,
     SOURCE_FILE,
 )
+from description_pipeline.stages import CONTRACT_SHA256  # noqa: E402
 
 MIGRATION_SCHEMA = "solidworks-to-urdf.historical-capture-diagnostic/v1"
 MIGRATION_KIND = "historical_capture_diagnostic_input"
@@ -304,6 +326,8 @@ def validate_legacy_inputs(inputs: MigrationInputs) -> dict[str, Any]:
         for name, checksum in files.items()
         if name.casefold().endswith((".sldasm", ".sldprt"))
     }
+    for name in selected:
+        _zip_name(name)
     if actual_cad != selected:
         raise HistoricalMigrationError(
             "historical_capture.plan_prepared_mismatch",
@@ -398,14 +422,308 @@ def validate_legacy_inputs(inputs: MigrationInputs) -> dict[str, Any]:
     }
 
 
+def _seal_current_diagnostic(
+    *,
+    store: ArtifactStore,
+    root: Path,
+    validated: Mapping[str, Any],
+    migration_tool: Mapping[str, Any],
+    native_tool: Mapping[str, Any],
+    created_at: datetime,
+) -> tuple[DiagnosticAdmissionSpec, dict[str, Any]]:
+    """Build the current Capture contract around the immutable legacy bytes."""
+
+    plan = validated["plan"]
+    prepared = validated["prepared"]
+    prepared_files = dict(validated["prepared_files"])
+    selected = dict(plan["selection"]["files"])
+    old_tool = dict(
+        validated["capture_request_manifest"]["native_tool"]
+    )
+    source_request = dict(validated["source_request"])
+    migration_source = migration_tool["source_sha256"]
+
+    originals_root = root / "originals"
+    for name, checksum in selected.items():
+        source = prepared.joinpath(*PurePosixPath(name).parts)
+        target = originals_root.joinpath(*PurePosixPath(name).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        if file_digest(target) != checksum:
+            raise HistoricalMigrationError(
+                "historical_capture.originals_changed",
+                {"path": name},
+            )
+    originals = store.seal_tree(
+        originals_root,
+        kind=SOURCE_SET_KIND,
+        producer_run_id=plan["run_id"],
+        producer_stage="freeze",
+        producer_tool_sha256=migration_source,
+    )
+
+    ruleset_root = root / "ruleset"
+    write_json(
+        ruleset_root / "catalog.json",
+        {
+            "schema_version": "solidworks-to-urdf.historical-migration/v1",
+            "source_label": plan["run_id"].rsplit("-", 1)[0],
+        },
+    )
+    ruleset = store.seal_tree(
+        ruleset_root,
+        kind=RULESET_KIND,
+        producer_run_id=plan["run_id"],
+        producer_stage="freeze",
+        producer_tool_sha256=migration_source,
+    )
+    configuration_root = root / "configuration"
+    write_json(
+        configuration_root / "config-snapshot.json",
+        {
+            "schema_version": "solidworks-to-urdf.historical-migration/v1",
+            "platform_config_sha256": source_request[
+                "platform_config_digest"
+            ],
+        },
+    )
+    configuration = store.seal_tree(
+        configuration_root,
+        kind=CONFIGURATION_KIND,
+        producer_run_id=plan["run_id"],
+        producer_stage="freeze",
+        producer_tool_sha256=migration_source,
+    )
+    current_tool = dict(native_tool)
+    if (
+        current_tool.get("schema_version") != TOOL_SCHEMA
+        or not isinstance(current_tool.get("runtime"), Mapping)
+        or current_tool["runtime"].get("role") != "native"
+    ):
+        raise HistoricalMigrationError(
+            "historical_capture.current_native_tool",
+            {"where": "identity"},
+        )
+    current_tool_source = _sha256(
+        current_tool.get("source_sha256"),
+        "current_native_tool.source_sha256",
+    )
+    current_tool_record = digest(current_tool)
+    requirement_root = root / "native-tool-requirement"
+    requirement_root.mkdir()
+    (requirement_root / "tool.json").write_bytes(
+        json.dumps(
+            current_tool,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    requirement = store.seal_tree(
+        requirement_root,
+        kind=NATIVE_TOOL_REQUIREMENT_KIND,
+        producer_run_id=None,
+        producer_stage=None,
+        producer_tool_sha256=current_tool_source,
+    )
+
+    freeze_root = root / "freeze"
+    freeze_request = {
+        "schema_version": FREEZE_REQUEST_SCHEMA,
+        "request_id": source_request["request_id"],
+        "principal": "diagnostic:historical-capture",
+        "target_hardware": plan["identity"]["hardware_id"],
+        "purpose": source_request["purpose"],
+        "change_summary": source_request["change_summary"],
+        "main_assembly": plan["main_assembly"],
+        "ruleset_version": "historical-migration-v1",
+        "originals_artifact_id": originals.artifact_id,
+        "ruleset_artifact_id": ruleset.artifact_id,
+        "configuration_artifact_id": configuration.artifact_id,
+        "upload_inventory_sha256": validated["identity"]["upload_sha256"],
+        "ruleset_catalog_sha256": ruleset.set_sha256,
+        "platform_config_sha256": source_request[
+            "platform_config_digest"
+        ],
+    }
+    freeze_request_digest = digest(freeze_request)
+    write_json(freeze_root / "stage-request.json", freeze_request)
+    write_json(freeze_root / "request.json", source_request)
+    write_json(
+        freeze_root / "inputs.json",
+        {
+            "artifacts": {
+                "configuration": configuration.to_record(),
+                "originals": originals.to_record(),
+                "ruleset": ruleset.to_record(),
+            },
+            "upload_inventory": selected,
+        },
+    )
+    write_json(
+        freeze_root / "checks.json",
+        {
+            "schema_version": FREEZE_CHECKS_SCHEMA,
+            "request_digest": freeze_request_digest,
+            "checks": [
+                {
+                    "id": "historical.migration",
+                    "state": "passed",
+                    "details": {
+                        "diagnostic_only": True,
+                        "legacy_run_id": plan["run_id"],
+                    },
+                }
+            ],
+        },
+    )
+    freeze = store.seal_tree(
+        freeze_root,
+        kind="stage_output:freeze",
+        producer_run_id=plan["run_id"],
+        producer_stage="freeze",
+        producer_tool_sha256=migration_source,
+    )
+
+    discover_root = root / "discover"
+    shutil.copytree(
+        prepared,
+        discover_root / "prepared",
+        symlinks=False,
+    )
+    observation = (
+        prepared / DISCOVERY_FILE
+    ).read_bytes()
+    (discover_root / "native-observation").mkdir()
+    (discover_root / "native-observation/observation.json").write_bytes(
+        observation
+    )
+    observation_sha256 = hashlib.sha256(observation).hexdigest()
+    discover_request = {
+        "schema_version": DISCOVER_REQUEST_SCHEMA,
+        "freeze_artifact_id": freeze.artifact_id,
+        "source_set_artifact_id": originals.artifact_id,
+        "ruleset_artifact_id": ruleset.artifact_id,
+        "configuration_artifact_id": configuration.artifact_id,
+        "source_files": selected,
+        "source_inventory_sha256": validated["identity"][
+            "upload_sha256"
+        ],
+        "main_assembly": plan["main_assembly"],
+        "purpose": source_request["purpose"],
+        "ruleset_version": freeze_request["ruleset_version"],
+        "ruleset_catalog_sha256": ruleset.set_sha256,
+        "platform_config_sha256": source_request[
+            "platform_config_digest"
+        ],
+        "submission_identity": {
+            "hardware_id": plan["identity"]["hardware_id"],
+            "owner": None,
+            "change_summary": source_request["change_summary"],
+            "parent_revision": None,
+            "control_reference": None,
+            "as_of": None,
+            "inventory_digest": None,
+        },
+        "expected_native_tool_sha256": old_tool["source_sha256"],
+        "expected_native_tool_record_sha256": digest(old_tool),
+        "native_tool_requirement_artifact_id": requirement.artifact_id,
+    }
+    discover_request_digest = digest(discover_request)
+    discover_command_id = "historical-discover-" + discover_request_digest
+    write_json(discover_root / "request.json", discover_request)
+    write_json(
+        discover_root / "checks.json",
+        {
+            "schema_version": DISCOVER_CHECKS_SCHEMA,
+            "command_id": discover_command_id,
+            "request_digest": discover_request_digest,
+            "checks": [
+                {
+                    "id": "native.observation",
+                    "state": "passed",
+                    "details": {
+                        "native_tool_sha256": digest(old_tool),
+                        "observation_sha256": observation_sha256,
+                    },
+                }
+            ],
+        },
+    )
+    write_json(
+        discover_root / "result.json",
+        {
+            "schema_version": DISCOVER_RESULT_SCHEMA,
+            "run_id": plan["run_id"],
+            "command_id": discover_command_id,
+            "request_digest": discover_request_digest,
+            "passed": True,
+            "native_tool": old_tool,
+            "native_observation_sha256": observation_sha256,
+            "prepared_sha256": digest(prepared_files),
+            "prepared_files": prepared_files,
+            "selection": validated["native_record"]["source_selection"],
+            "source_set_artifact": originals.to_record(),
+            "ruleset_artifact": ruleset.to_record(),
+            "configuration_artifact": configuration.to_record(),
+        },
+    )
+    discover = store.seal_tree(
+        discover_root,
+        kind="stage_output:discover",
+        producer_run_id=plan["run_id"],
+        producer_stage="discover",
+        producer_tool_sha256=migration_source,
+    )
+
+    capture_request = {
+        "effect_key": "capture-native",
+        "handoff_sha256": plan["handoff_sha256"],
+        "main_assembly": plan["main_assembly"],
+        "native_tool_source_sha256": current_tool_source,
+        "native_tool_record_sha256": current_tool_record,
+        "native_tool_requirement_artifact_id": requirement.artifact_id,
+        "prepared_sha256": digest(prepared_files),
+        "upload_sha256": validated["identity"]["upload_sha256"],
+    }
+    variables = {
+        "config_snapshot_sha256": source_request[
+            "platform_config_digest"
+        ],
+        "contract_sha256": CONTRACT_SHA256,
+        "created_at": created_at,
+        "expected_executor_sha256": migration_source,
+        "input_artifacts": (freeze, discover, requirement),
+        "policy_sha256": check_policy_digest(),
+        "request": capture_request,
+        "request_id": "historical-capture-" + plan["run_id"],
+        "run_id": plan["run_id"],
+        "schema_version": DIAGNOSTIC_ADMISSION_SCHEMA,
+        "target_stage": "capture",
+    }
+    admission = DiagnosticAdmissionSpec(**variables)
+    build_diagnostic_command(admission)
+    return admission, {
+        "configuration": configuration.to_record(),
+        "freeze": freeze.to_record(),
+        "discover": discover.to_record(),
+        "native_tool_requirement": requirement.to_record(),
+        "originals": originals.to_record(),
+        "ruleset": ruleset.to_record(),
+    }
+
+
 def migrate_historical_capture_input(
     inputs: MigrationInputs,
     *,
     artifact_store: Path,
     work_root: Path,
     migration_tool: Mapping[str, Any] | None = None,
+    native_tool: Mapping[str, Any] | None = None,
     expected_run_id: str | None = None,
     expected_prepared_sha256: str | None = None,
+    diagnostic_created_at: datetime | None = None,
 ) -> dict[str, Any]:
     validated = validate_legacy_inputs(inputs)
     plan = validated["plan"]
@@ -437,6 +755,15 @@ def migrate_historical_capture_input(
         tool.get("source_sha256"),
         "migration_tool.source_sha256",
     )
+    current_native_tool = dict(
+        native_tool or tool_record(role="native")
+    )
+    created_at = diagnostic_created_at or datetime.now(UTC)
+    if not isinstance(created_at, datetime) or created_at.tzinfo is None:
+        raise HistoricalMigrationError(
+            "historical_capture.diagnostic_time",
+            {"where": "created_at"},
+        )
     store = ArtifactStore(artifact_store)
     work_root = _regular_directory(work_root, "work_root")
     if work_root.is_relative_to(store.root) or store.root.is_relative_to(work_root):
@@ -500,6 +827,18 @@ def migrate_historical_capture_input(
             },
         }
         write_json(staging / "migration.json", migration)
+        admission, current_inputs = _seal_current_diagnostic(
+            store=store,
+            root=Path(temporary) / "current",
+            validated=validated,
+            migration_tool=tool,
+            native_tool=current_native_tool,
+            created_at=created_at,
+        )
+        write_json(
+            staging / "diagnostic-admission.json",
+            admission.to_record(),
+        )
         artifact = store.seal_tree(
             staging,
             kind=MIGRATION_KIND,
@@ -512,6 +851,9 @@ def migrate_historical_capture_input(
         "created_at": datetime.now().astimezone().isoformat(),
         "artifact": artifact.to_record(),
         "migration": migration,
+        "diagnostic_admission": admission.to_record(),
+        "diagnostic_command": build_diagnostic_command(admission).to_record(),
+        "current_inputs": current_inputs,
     }
 
 
@@ -524,6 +866,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--artifact-store", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--tool-record", type=Path)
+    parser.add_argument("--current-native-tool", type=Path)
     parser.add_argument("--expected-run-id")
     parser.add_argument("--expected-prepared-sha256")
     parser.add_argument("--receipt", type=Path, required=True)
@@ -534,6 +877,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         tool = read_data(args.tool_record) if args.tool_record is not None else None
+        current_native_tool = (
+            read_data(args.current_native_tool)
+            if args.current_native_tool is not None
+            else None
+        )
         receipt = migrate_historical_capture_input(
             MigrationInputs(
                 prepared=args.prepared,
@@ -544,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
             artifact_store=args.artifact_store,
             work_root=args.work_root,
             migration_tool=tool,
+            native_tool=current_native_tool,
             expected_run_id=args.expected_run_id,
             expected_prepared_sha256=args.expected_prepared_sha256,
         )
