@@ -13,12 +13,8 @@ from pathlib import Path
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import canonical, digest, write_json
-from description_pipeline.pipeline import (
+from description_pipeline.pipeline.admission import (
     AdmissionSpec,
-    ArtifactRef,
-    StageCommand,
-    StageDecision,
-    StageResult,
     StageExecutors,
     VerifiedArtifact,
     VerifiedDiscoverResult,
@@ -34,6 +30,7 @@ from description_pipeline.pipeline import (
     build_publish_command,
     build_run_admission,
     build_verify_command,
+    NATIVE_TOOL_REQUIREMENT_KIND,
     validate_capture_command,
     validate_discover_command,
     validate_freeze_command,
@@ -44,11 +41,14 @@ from description_pipeline.pipeline import (
     validate_verify_command,
     validate_store_command,
 )
-from description_pipeline.pipeline.admission import (
-    ADMISSION_SPEC_SCHEMA,
-    NATIVE_TOOL_REQUIREMENT_KIND,
+from description_pipeline.pipeline.admission import ADMISSION_SPEC_SCHEMA
+from description_pipeline.pipeline.contracts import (
+    ArtifactRef,
+    ProtocolError,
+    StageCommand,
+    StageDecision,
+    StageResult,
 )
-from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.schemas import (
     DISCOVER_RESULT_SCHEMA,
     GENERATE_REQUEST_SCHEMA,

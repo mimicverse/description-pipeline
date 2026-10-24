@@ -6295,12 +6295,13 @@ def _validate_windows_recovery_state(document: object) -> dict:
     transition_python_action = (
         identity["release_identity_sha256"] == WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
         and normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
-        and normalized_action["arguments"] == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
+        and normalized_action["arguments"]
+        == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
     )
     python_module_action = (
         normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
         and normalized_action["arguments"]
-        == f'-I -B -m description_pipeline serve --config "{normalized["config_path"]}"'
+        == f'-I -B -m description_pipeline.orchestration.windows serve --config "{normalized["config_path"]}"'
     ) or transition_python_action
     legacy_launcher_action = (
         normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/description.exe"

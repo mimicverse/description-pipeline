@@ -23,24 +23,22 @@ from description_pipeline.io import canonical, digest, write_json
 from description_pipeline.orchestration.discover_protocol import (
     ArchiveDiscoverAdapter,
 )
-from description_pipeline.pipeline import (
+from description_pipeline.pipeline.admission import (
     AdmissionSpec,
-    CaptureHandler,
-    DiscoverHandler,
-    FreezeHandler,
     StageExecutors,
+    ADMISSION_SPEC_SCHEMA,
+    NATIVE_TOOL_REQUIREMENT_KIND,
     VerifiedArtifact,
     VerifiedPublishIntent,
     VerifiedRepositorySnapshot,
     VerifiedRuleset,
 )
-from description_pipeline.pipeline.admission import (
-    ADMISSION_SPEC_SCHEMA,
-    NATIVE_TOOL_REQUIREMENT_KIND,
-)
 from description_pipeline.pipeline.application import StageApplication
+from description_pipeline.pipeline.capture import CaptureHandler
+from description_pipeline.pipeline.discover import DiscoverHandler
 from description_pipeline.pipeline.freeze import (
     CONFIGURATION_KIND,
+    FreezeHandler,
     ORIGINALS_KIND,
     RULESET_KIND,
 )

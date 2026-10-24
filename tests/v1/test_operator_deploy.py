@@ -988,7 +988,7 @@ class LifecycleTests(unittest.TestCase):
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
-            "\"arguments\":\"-I -B -m description_pipeline serve --config "
+            "\"arguments\":\"-I -B -m description_pipeline.orchestration.windows serve --config "
             "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
             "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
@@ -1386,7 +1386,9 @@ class LifecycleTests(unittest.TestCase):
         target = "C:/description-e2e/state/lifecycle/gen-2/generation"
         previous = "C:/description-e2e/state/instance-promotions/previous-0001"
         exact_arguments = (
-            '-I -B -m description_pipeline serve --config "' + target + '/endpoint.json"'
+            '-I -B -m description_pipeline.orchestration.windows serve --config "'
+            + target
+            + '/endpoint.json"'
         )
         binding = {
             "dir": "C:/description-e2e/state/lifecycle/gen-2",
@@ -4060,7 +4062,7 @@ class InstallOrderingTests(unittest.TestCase):
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
-            "\"arguments\":\"-I -B -m description_pipeline serve --config "
+            "\"arguments\":\"-I -B -m description_pipeline.orchestration.windows serve --config "
             "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
             "\"action_count\":1,\"launch_contract\":\"python_module_v1\","

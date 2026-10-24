@@ -6,7 +6,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 
 from description_pipeline.io import digest
-from description_pipeline.pipeline import ArtifactRef, StageCommand
+from description_pipeline.pipeline.contracts import ArtifactRef, StageCommand
 from description_pipeline.platform.facts import FactConflict, FactStore
 
 

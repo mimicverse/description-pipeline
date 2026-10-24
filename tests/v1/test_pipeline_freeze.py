@@ -9,19 +9,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from description_pipeline.io import digest, file_digest, read_data, write_json
-from description_pipeline.pipeline import (
+from description_pipeline.pipeline.contracts import (
     ArtifactRef,
     ExecutionClaim,
-    FreezeHandler,
     StageCandidate,
     StageCommand,
     StageDecision,
     StageResult,
     StageFailure,
-    StageWorkspace,
-    execute_stage,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
+from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
 from description_pipeline.pipeline.freeze import (
     CONFIGURATION_KIND,
     FREEZE_REQUEST_SCHEMA,
@@ -29,6 +27,7 @@ from description_pipeline.pipeline.freeze import (
     ORIGINALS_KIND,
     RULESET_CATALOG_SCHEMA,
     RULESET_KIND,
+    FreezeHandler,
 )
 from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 

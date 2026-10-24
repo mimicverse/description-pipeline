@@ -9,14 +9,14 @@ from pathlib import Path
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import digest
-from description_pipeline.pipeline import (
+from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
     StageCandidate,
     StageCommand,
     StageDecision,
     StageExecution,
-    execute_stage,
 )
+from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 

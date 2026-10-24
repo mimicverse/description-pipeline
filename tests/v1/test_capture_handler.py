@@ -14,18 +14,18 @@ from unittest.mock import Mock, patch
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import canonical, digest, file_digest, read_data
-from description_pipeline.pipeline import (
-    ArtifactRef,
+import description_pipeline.pipeline.capture as capture_module
+from description_pipeline.pipeline.capture import (
     CaptureHandler,
-    DiagnosticReplayScope,
-    DiscoverHandler,
-    ExecutionClaim,
-    FreezeHandler,
-    StageCommand,
-    StageWorkspace,
+    CaptureUnresolved,
+    NativeCaptureResult,
 )
-from description_pipeline.pipeline import capture as capture_module
-from description_pipeline.pipeline.capture import CaptureUnresolved, NativeCaptureResult
+from description_pipeline.pipeline.contracts import (
+    ArtifactRef,
+    DiagnosticReplayScope,
+    ExecutionClaim,
+    StageCommand,
+)
 from description_pipeline.pipeline.discover import (
     CONFIGURATION_KIND,
     FREEZE_RESULT_KIND,
@@ -40,6 +40,9 @@ from description_pipeline.pipeline.effects import (
     project_effect_settlement,
 )
 from description_pipeline.pipeline.freeze import FREEZE_REQUEST_SCHEMA
+from description_pipeline.pipeline.discover import DiscoverHandler
+from description_pipeline.pipeline.engine import StageWorkspace
+from description_pipeline.pipeline.freeze import FreezeHandler
 from description_pipeline.orchestration.stage_transfer import admit_capture
 from description_pipeline.sources.solidworks.discovery import PLAN_FILE
 from description_pipeline.schemas import NATIVE_TOOL_REQUIREMENT_KIND

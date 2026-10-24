@@ -23,17 +23,16 @@ except ImportError:
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import digest
-from description_pipeline.pipeline import (
-    DiagnosticAdmissionSpec,
+from description_pipeline.pipeline.contracts import ExecutionClaim
+from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
+from description_pipeline.pipeline.effects import EffectState
+from description_pipeline.pipeline.reconciliation import (
     EffectReconciliationEvidence,
     EffectReconciliationFailure,
     EffectReconciliationService,
-    EffectState,
-    ExecutionClaim,
-    execute_stage,
-    build_diagnostic_command,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
+from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.platform.facts import FactConflict, FactStore
 from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA

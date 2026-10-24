@@ -182,7 +182,7 @@ function Write-Receipt([string]$path, [hashtable]$payload) {
 function Runtime-Python([string]$generation) { Join-Path $generation 'runtime\Scripts\python.exe' }
 function Runtime-Launcher([string]$generation) { Join-Path $generation 'runtime\Scripts\python.exe' }
 function Runtime-LauncherArguments([string]$generation) {
-  '-I -B -m description_pipeline serve --config "' + (Config-Path $generation) + '"'
+  '-I -B -m description_pipeline.orchestration.windows serve --config "' + (Config-Path $generation) + '"'
 }
 function Config-Path([string]$generation) { Join-Path $generation 'endpoint.json' }
 function Python-Module-LaunchContract { 'python_module_v1' }
@@ -289,13 +289,14 @@ function Test-Bytecode-TransitionGeneration([string]$generation) {
 function Test-Python-Module-LauncherArguments([string]$arguments, [string]$generation) {
   $current = [regex]::Match(
     $arguments,
-    '^(-I -B -m description_pipeline serve --config )"([^"]+)"$')
+    '^(-I -B -m description_pipeline\.orchestration\.windows serve --config )"([^"]+)"$')
   if (
     $current.Success -and
-    $current.Groups[1].Value -ceq '-I -B -m description_pipeline serve --config ' -and
+    $current.Groups[1].Value -ceq '-I -B -m description_pipeline.orchestration.windows serve --config ' -and
     (Normalize-PathIdentity $current.Groups[2].Value) -eq
       (Normalize-PathIdentity (Config-Path $generation))
   ) { return $true }
+  # The fixed bytecode-transition generation predates the native module split.
   $transition = [regex]::Match(
     $arguments,
     '^(-I -m description_pipeline serve --config )"([^"]+)"$')

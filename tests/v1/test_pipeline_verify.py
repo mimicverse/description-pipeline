@@ -21,19 +21,18 @@ except ImportError:
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
-from description_pipeline.pipeline import verify as pipeline_verify
+import description_pipeline.pipeline.verify as pipeline_verify
 from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
     StageCandidate,
     StageCommand,
     StageResult,
 )
-from description_pipeline.pipeline.engine import StageWorkspace
-from description_pipeline.pipeline import (
+from description_pipeline.pipeline.diagnostic import (
     DiagnosticAdmissionSpec,
     build_diagnostic_command,
-    execute_stage,
 )
+from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.stages.generate import (
     GENERATE_OUTPUT_CONTRACT,

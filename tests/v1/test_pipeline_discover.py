@@ -19,7 +19,8 @@ from description_pipeline.orchestration.discover_protocol import (
     admit_observation_bundle,
     seal_observation_bundle,
 )
-from description_pipeline.pipeline import (
+import description_pipeline.pipeline.discover as discover_module
+from description_pipeline.pipeline.contracts import (
     ArtifactRef,
     ExecutionClaim,
     StageCandidate,
@@ -27,11 +28,8 @@ from description_pipeline.pipeline import (
     StageDecision,
     StageResult,
     StageFailure,
-    StageWorkspace,
-    execute_stage,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
-from description_pipeline.pipeline import discover as discover_module
 from description_pipeline.pipeline.discover import (
     CONFIGURATION_KIND,
     DISCOVER_REQUEST_SCHEMA,
@@ -41,6 +39,7 @@ from description_pipeline.pipeline.discover import (
     SOURCE_SET_KIND,
     DiscoverHandler,
 )
+from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
 from description_pipeline.pipeline.effects import EffectSettlement, EffectState
 from description_pipeline.schemas import (
     NATIVE_DISCOVER_EFFECT_SCHEMA,

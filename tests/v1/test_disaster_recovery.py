@@ -917,7 +917,9 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             },
             "action": {
                 "execute": generation + "/runtime/Scripts/python.exe",
-                "arguments": '-I -B -m description_pipeline serve --config "' + generation + '/endpoint.json"',
+                "arguments": '-I -B -m description_pipeline.orchestration.windows serve --config "'
+                + generation
+                + '/endpoint.json"',
                 "working_directory": "C:/description/state",
             },
             "settings": {"multiple_instances": "IgnoreNew"},

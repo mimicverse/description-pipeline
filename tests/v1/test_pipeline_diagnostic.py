@@ -8,9 +8,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from description_pipeline.io import digest
-from description_pipeline.pipeline import (
+from description_pipeline.pipeline.admission import VerifiedPredecessor
+from description_pipeline.pipeline.contracts import (
     ArtifactRef,
-    DiagnosticAdmissionSpec,
     DiagnosticReplayScope,
     FailureEnvelope,
     RunAdmission,
@@ -18,11 +18,13 @@ from description_pipeline.pipeline import (
     StageDecision,
     StageQualification,
     StageResult,
-    VerifiedPredecessor,
-    build_diagnostic_command,
-    build_diagnostic_run_admission,
     qualify_stage,
     require_formal_qualification,
+)
+from description_pipeline.pipeline.diagnostic import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_command,
+    build_diagnostic_run_admission,
     validate_diagnostic_command,
 )
 from description_pipeline.pipeline.contracts import ProtocolError

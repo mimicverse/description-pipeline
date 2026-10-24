@@ -17,16 +17,11 @@ except ImportError:
 
 from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline.io import digest
-from description_pipeline.pipeline import (
-    DiagnosticAdmissionSpec,
-    EffectState,
-    StageCommand,
-    StageExecution,
-    StageFailure,
-    VerifiedPredecessor,
-    build_diagnostic_command,
-    execute_stage,
-)
+from description_pipeline.pipeline.admission import VerifiedPredecessor
+from description_pipeline.pipeline.contracts import StageCommand, StageExecution, StageFailure
+from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
+from description_pipeline.pipeline.effects import EffectState
+from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.platform.diagnostic import DiagnosticRuntimeConfig, open_diagnostic_stores

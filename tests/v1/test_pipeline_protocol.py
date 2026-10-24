@@ -9,15 +9,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from description_pipeline.io import digest
-from description_pipeline.pipeline import (
+from description_pipeline.pipeline.contracts import (
     ArtifactRef,
     DispatchCommand,
     DispatchConf,
-    EffectFact,
-    EffectIntent,
-    EffectState,
     ExecutionClaim,
     FailureEnvelope,
+    ProtocolError,
     RunAdmission,
     RunStatus,
     StageCandidate,
@@ -26,13 +24,16 @@ from description_pipeline.pipeline import (
     StageExecution,
     StageResult,
     StageStatus,
-    StageWorkspace,
-    execute_stage,
-    project_effect_state,
     project_run_status,
     project_stage_status,
 )
-from description_pipeline.pipeline.contracts import ProtocolError
+from description_pipeline.pipeline.effects import (
+    EffectFact,
+    EffectIntent,
+    EffectState,
+    project_effect_state,
+)
+from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     FAILURE_ENVELOPE_SCHEMA,

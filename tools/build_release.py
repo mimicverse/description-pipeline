@@ -181,11 +181,21 @@ def offline_bundle(source, output, wheel, platform, bound):
             name, version, _, _ = parse_wheel_filename(path.name)
             locked.append(f"{name}=={version} --hash=sha256:{bound.file_digest(path)}")
         (staging / "requirements.lock").write_text("\n".join(locked) + "\n", encoding="utf-8")
+        doctor_command = (
+            "description doctor"
+            if platform == "linux"
+            else (
+                "python -I -B -c \"import json; "
+                "from description_pipeline.runtime import tool_record; "
+                "from description_pipeline.solidworks import doctor; "
+                "print(json.dumps({'tool': tool_record(role='native'), 'doctor': doctor()}))\""
+            )
+        )
         (staging / "README.md").write_text(
             "# Offline installation\n\nRequires CPython 3.12, x86_64. Create a dedicated virtual environment, "
             "then run its Python from this directory:\n\n"
             "```sh\npython -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock\n"
-            "description doctor\n```\n\nFollow docs/deployment.md in the matching deployment archive.\n",
+            f"{doctor_command}\n```\n\nFollow docs/deployment.md in the matching deployment archive.\n",
             encoding="utf-8",
         )
         bound.write_json(staging / "files.json", bound.inventory(staging))

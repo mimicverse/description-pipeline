@@ -105,7 +105,7 @@ Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfi
   $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
 Check 'wording.python_module_task_action' ($source.Contains('function Runtime-LauncherArguments') -and
   $source.Contains('function Test-Runtime-Launcher') -and
-  $source.Contains('-I -B -m description_pipeline serve --config') -and
+  $source.Contains('-I -B -m description_pipeline.orchestration.windows serve --config') -and
   $source.Contains('function Legacy-Launcher') -and
   $source.Contains('function Legacy-LauncherArguments') -and
   $source.Contains('launch_contract=(Python-Module-LaunchContract)') -and
@@ -858,7 +858,7 @@ $binding = @{ task_name = 'test-endpoint'; port = 8765; state_root = $root; gene
 Check 'launch.python_entrypoint' ((Normalize-PathIdentity (Runtime-Launcher $generation)) -eq
   (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\python.exe')))
 Check 'launch.module_arguments' ((Runtime-LauncherArguments $generation) -eq
-  ('-I -B -m description_pipeline serve --config "' + (Config-Path $generation) + '"'))
+  ('-I -B -m description_pipeline.orchestration.windows serve --config "' + (Config-Path $generation) + '"'))
 Check 'launch.candidate_action_accepted' (Test-Runtime-Launcher (Runtime-Launcher $generation) `
   (Runtime-LauncherArguments $generation) $generation)
 Check 'launch.bytecode_flag_required' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `

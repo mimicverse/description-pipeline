@@ -1595,6 +1595,7 @@ function Test-Transition-LaunchArguments([string]$arguments, [string]$generation
       $release.version -cne '1.5.0' -or $release.role -cne 'native') {{
     return $false
   }}
+  # The fixed bytecode-transition generation predates the native module split.
   $match = [regex]::Match(
     $arguments,
     '^(-I -m description_pipeline serve --config )"([^"]+)"$')
@@ -1609,10 +1610,10 @@ function Test-LaunchArguments([string]$arguments, [string]$generation, [string]$
   if ($contract -ceq 'python_module_v1') {{
     $match = [regex]::Match(
       $arguments,
-      '^(-I -B -m description_pipeline serve --config )"([^"]+)"$')
+      '^(-I -B -m description_pipeline\.orchestration\.windows serve --config )"([^"]+)"$')
     if (
       $match.Success -and
-      $match.Groups[1].Value -ceq '-I -B -m description_pipeline serve --config ' -and
+      $match.Groups[1].Value -ceq '-I -B -m description_pipeline.orchestration.windows serve --config ' -and
       (Normalize-PathIdentity $match.Groups[2].Value) -eq
       (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))
     ) {{ return $true }}
@@ -3057,7 +3058,8 @@ def normalize(value):
 def parse_arguments(value):
     text = str(value or "").strip()
     for pattern in (
-        r'^(-I -B -m description_pipeline serve --config )"([^"]+)"$',
+        r'^(-I -B -m description_pipeline\.orchestration\.windows serve --config )"([^"]+)"$',
+        # The fixed bytecode-transition generation predates the native module split.
         r'^(-I -m description_pipeline serve --config )"([^"]+)"$',
         r'^(serve --config )"([^"]+)"$',
     ):
@@ -3117,7 +3119,7 @@ def runs(generation):
         and config == (generation + "/endpoint.json").lower()
         and arguments
         == (
-            '-I -B -m description_pipeline serve --config ',
+            '-I -B -m description_pipeline.orchestration.windows serve --config ',
             normalize(generation + "/endpoint.json").lower(),
         )
         and working_directory == normalize(binding.get("state_root")).lower()

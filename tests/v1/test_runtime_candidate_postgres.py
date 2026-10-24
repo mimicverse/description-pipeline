@@ -29,17 +29,7 @@ except ImportError:
     psycopg2 = None
 
 from description_pipeline.io import canonical, digest, read_data
-from description_pipeline.pipeline import (
-    DispatchCommand,
-    DispatchConf,
-    DispatchObservation,
-    EffectState,
-    ExecutionClaim,
-    StageCommand,
-    StageExecution,
-    StageFailure,
-    StageResult,
-    TechnicalDispatchService,
+from description_pipeline.pipeline.admission import (
     VerifiedArtifact,
     VerifiedDiscoverResult,
     VerifiedPredecessor,
@@ -51,9 +41,23 @@ from description_pipeline.pipeline import (
     build_publish_command,
     build_run_admission,
     build_verify_command,
-    execute_stage,
 )
-from description_pipeline.pipeline.contracts import ProtocolError
+from description_pipeline.pipeline.contracts import (
+    DispatchCommand,
+    DispatchConf,
+    ExecutionClaim,
+    ProtocolError,
+    StageCommand,
+    StageExecution,
+    StageFailure,
+    StageResult,
+)
+from description_pipeline.pipeline.dispatch import (
+    DispatchObservation,
+    TechnicalDispatchService,
+)
+from description_pipeline.pipeline.effects import EffectState
+from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.verify_contract import (
     CERTIFICATE_FILENAME,

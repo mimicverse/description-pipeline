@@ -10,7 +10,7 @@ from pathlib import Path
 
 from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline.io import digest
-from description_pipeline.pipeline import DispatchConf, StageResult
+from description_pipeline.pipeline.contracts import DispatchConf, StageResult
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA, STAGE_RESULT_SCHEMA
 
 

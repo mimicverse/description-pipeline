@@ -17,12 +17,9 @@ except ImportError:
 
 from description_pipeline.io import digest, read_data
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.pipeline import (
-    DiagnosticAdmissionSpec,
-    build_diagnostic_command,
-    execute_stage,
-    qualify_stage,
-)
+from description_pipeline.pipeline.contracts import qualify_stage
+from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
+from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.contracts import ExecutionClaim, ProtocolError, StageCommand
 from description_pipeline.pipeline.engine import StageWorkspace
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy

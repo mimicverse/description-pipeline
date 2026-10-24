@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import os
@@ -176,10 +177,27 @@ def serve(config_path: Path) -> None:
             return
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="description-windows")
+    commands = parser.add_subparsers(dest="operation", required=True)
+    serve_command = commands.add_parser("serve", help="run the loopback native-operation endpoint")
+    serve_command.add_argument("--config", type=Path, required=True)
+    arguments = parser.parse_args(argv)
+    if arguments.operation == "serve":
+        serve(arguments.config)
+        return 0
+    raise AssertionError(f"unhandled operation: {arguments.operation}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = [
     "CONFIG_SCHEMA",
     "build_runtime",
     "handler",
+    "main",
     "read_config",
     "serve",
 ]
