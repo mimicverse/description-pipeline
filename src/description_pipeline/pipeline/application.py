@@ -665,6 +665,65 @@ class StageApplication:
             dispatch_command=stored_dispatch,
         )
 
+    def load_verified_freeze_origins(self, run_id: str) -> VerifiedArtifact:
+        """Read parent CAD originals only through one committed Freeze closure."""
+
+        spec, admission = self._load_spec(run_id)
+        freeze_command = build_freeze_command(spec)
+        stored_command = self.facts.load_command(freeze_command.command_id)
+        if stored_command != freeze_command:
+            raise ApplicationError(
+                "application.freeze_origin_mismatch",
+                "Stored Freeze command differs from its admission projection",
+            )
+        predecessor = self._completed_predecessor(stored_command)
+        if predecessor is None:
+            raise ApplicationError(
+                "application.freeze_origin_uncommitted",
+                "The parent run has no completed Freeze decision",
+            )
+        result = predecessor.result
+        if (
+            result.stage != "freeze"
+            or result.run_id != admission.run_id
+            or result.command_id != stored_command.command_id
+        ):
+            raise ApplicationError(
+                "application.freeze_origin_invalid",
+                "The parent Freeze result has another identity",
+            )
+        self.artifacts.verify(result.output_artifact)
+        with tempfile.TemporaryDirectory(prefix="description-freeze-origin-") as directory:
+            root = self.artifacts.materialize(
+                result.output_artifact,
+                Path(directory) / "artifact",
+            )
+            inputs = read_data(root / "inputs.json")
+        if (
+            not isinstance(inputs, Mapping)
+            or set(inputs) != {"artifacts", "upload_inventory"}
+            or not isinstance(inputs.get("artifacts"), Mapping)
+            or set(inputs["artifacts"])
+            != {"configuration", "originals", "ruleset"}
+            or inputs["artifacts"].get("originals")
+            != spec.originals.ref.to_record()
+            or inputs.get("upload_inventory") != spec.originals.inventory
+        ):
+            raise ApplicationError(
+                "application.freeze_origin_invalid",
+                "The parent Freeze closure differs from its admitted originals",
+            )
+        actual = VerifiedArtifact.from_store_record(
+            spec.originals.ref,
+            self.artifacts.verify(spec.originals.ref),
+        )
+        if actual != spec.originals:
+            raise ApplicationError(
+                "application.freeze_origin_invalid",
+                "The parent originals differ from the artifact store",
+            )
+        return spec.originals
+
     def _load_spec(self, run_id: str) -> tuple[AdmissionSpec, RunAdmission]:
         admission = self.facts.load_admission(run_id)
         if admission is None:

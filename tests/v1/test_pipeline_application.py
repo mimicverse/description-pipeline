@@ -400,6 +400,14 @@ class StageApplicationTests(unittest.TestCase):
             discover.command_id,
         })
 
+    def test_linked_freeze_origins_require_the_parent_committed_closure(self):
+        self.application.admit(self.harness.spec)
+        with self.assertRaisesRegex(
+            ApplicationError,
+            "no completed Freeze decision",
+        ):
+            self.application.load_verified_freeze_origins("run-1")
+
     def test_execute_run_resumes_after_a_completed_prefix(self):
         self.application.admit(self.harness.spec)
         freeze = self.application.run_stage("run-1", "freeze")
