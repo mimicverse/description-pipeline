@@ -425,9 +425,8 @@ class DistributionTests(unittest.TestCase):
             with self.assertRaisesRegex(PipelineError, "tracked test closure"):
                 verify_release(root, identity)
 
-    def test_deployment_rejects_ci_only_scripts_and_test_imports(self):
+    def test_deployment_rejects_test_imports(self):
         for members in (
-            {"tools/settlement_fixtures.py": b"pass\n"},
             {"deploy/example.py": b"from tests.v1 import fixture\n"},
             {"deploy/example.py": b"import tests.sources.support\n"},
         ):

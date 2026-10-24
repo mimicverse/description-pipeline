@@ -342,6 +342,7 @@ jobs:
           cache-dependency-path: |
             deploy/airflow/requirements.lock
             requirements/build-py312.lock
+            requirements/test-py312.lock
       - name: Install the hash-locked Airflow runtime
         env:
           AIRFLOW_HOME: ${{ runner.temp }}/airflow-home
@@ -353,6 +354,8 @@ jobs:
           python -m venv "$AIRFLOW_VENV"
           "$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
             -r deploy/airflow/requirements.lock
+          "$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
+            -r requirements/test-py312.lock
           "$AIRFLOW_VENV/bin/python" -m pip install --no-deps -e .
       - name: Install the PostgreSQL client
         run: |
@@ -425,6 +428,10 @@ jobs:
           [ "${#wheels[@]}" -eq 1 ] || { echo "expected exactly one supervised wheel" >&2; exit 1; }
           DESCRIPTION_SUPERVISED_WHEEL="${wheels[0]}" "$AIRFLOW_VENV/bin/python" -B -m unittest \
             tests.v1.test_supervised_freeze_identity -v 2>&1 | tee "$RUNNER_TEMP/supervised-test.log"
+          if grep -Fq "skipped" "$RUNNER_TEMP/supervised-test.log"; then
+            echo "The supervised Airflow identity proof was skipped" >&2
+            exit 1
+          fi
       - name: The failed freeze intent reconcile transaction (real PostgreSQL)
         env:
           DESCRIPTION_RECONCILE_AIRFLOW_DSN: postgresql+psycopg2://airflow_runtime@127.0.0.1:5432/${{ env.SUPERVISED_DATABASE }}
@@ -449,14 +456,22 @@ jobs:
           "$AIRFLOW_VENV/bin/python" -m unittest \
             tests.v1.test_airflow_dag \
             tests.v1.test_linked_run_ownership \
-            tests.v1.test_recovery \
             tests.v1.test_portal \
             tests.v1.test_run_metadata
-      - name: The interface-layer reuse fixtures (production store, real PostgreSQL)
+      - name: Common diagnostic and recovery boundaries (real PostgreSQL)
         if: always()
         run: |
-          "$AIRFLOW_VENV/bin/python" tools/settlement_fixtures.py \
-            --report "$RUNNER_TEMP/settlement-fixtures.json"
+          set -o pipefail
+          "$AIRFLOW_VENV/bin/python" -B -m unittest \
+            tests.v1.test_diagnostic_stage_postgres \
+            tests.v1.test_effect_reconciliation_postgres \
+            tests.v1.test_pipeline_publish_recovery_postgres \
+            tests.v1.test_real_six_stage_chain -v 2>&1 \
+            | tee "$RUNNER_TEMP/common-diagnostic-recovery.log"
+          if grep -Fq "pgserver/psycopg2 are not installed" "$RUNNER_TEMP/common-diagnostic-recovery.log"; then
+            echo "The real PostgreSQL common diagnostic/recovery tests were skipped" >&2
+            exit 1
+          fi
       - name: Keep the real-chain evidence with the run
         if: always()
         uses: actions/upload-artifact@v4
@@ -468,7 +483,7 @@ jobs:
             ${{ runner.temp }}/supervised-test.log
             ${{ runner.temp }}/reconcile-test.log
             ${{ runner.temp }}/config-identity-real-airflow.log
-            ${{ runner.temp }}/settlement-fixtures.json
+            ${{ runner.temp }}/common-diagnostic-recovery.log
             ${{ runner.temp }}/airflow-home/logs/smoke/*.log
             ${{ runner.temp }}/airflow-home/logs/dag_id=*/*/*/*.log
           if-no-files-found: warn

@@ -34,11 +34,6 @@ from description_pipeline.io import (
 from description_pipeline.interface_records import release_domain_identity
 from description_pipeline.runtime import LINUX_PLATFORMS, TARGET_ABI, TARGET_PYTHON, WINDOWS_PLATFORMS
 
-CI_ONLY_SCRIPTS = {
-    "tools/settlement_fixtures.py",
-}
-
-
 def safe_members(names):
     keys = []
     for name in names:
@@ -49,11 +44,8 @@ def safe_members(names):
 
 
 def validate_deployment_boundary(members: dict[str, bytes]) -> None:
-    """Deployment output must carry neither CI-only scripts nor their test dependencies."""
+    """Deployment output must not import test-only modules."""
 
-    forbidden = sorted(CI_ONLY_SCRIPTS & set(members))
-    if forbidden:
-        raise PipelineError(f"Deployment contains CI-only scripts: {forbidden}")
     references = []
     for name, payload in sorted(members.items()):
         if not name.endswith(".py"):
