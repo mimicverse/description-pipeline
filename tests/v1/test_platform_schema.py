@@ -200,6 +200,13 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIn("executor_sha256 char(64) NOT NULL", text)
         self.assertIn("CHECK (owner_sha256 <> executor_sha256)", text)
         self.assertIn("UNIQUE (effect_id, seq)", text)
+        self.assertIn("yield_effect_id text", text)
+        self.assertIn("closure_code IS NOT DISTINCT FROM 'yielded'", text)
+        self.assertIn("execution_claim_one_yield_per_effect", text)
+        self.assertIn(
+            "REFERENCES :\"platform_schema\".effect_intent (effect_id)",
+            text,
+        )
         self.assertIn("state_class IN ('known', 'absent', 'unobservable')", text)
         self.assertIn("metadata_artifact_id text REFERENCES", text)
         candidate = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate', 1)[1]
@@ -249,7 +256,7 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIsNotNone(immutable)
         self.assertNotIn("UPDATE", immutable.group(0))
         self.assertIn(
-            "GRANT UPDATE (last_seen_at, closed_at, closure_code)\n"
+            "GRANT UPDATE (last_seen_at, closed_at, closure_code, yield_effect_id)\n"
             '    ON :"platform_schema".execution_claim TO platform_service;',
             text,
         )

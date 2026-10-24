@@ -25,6 +25,7 @@ from .contracts import (
     StageDecision,
     StageExecution,
     StageFailure,
+    StagePending,
     StageResult,
 )
 from .effects import EffectFact, EffectIntent, EffectKind, EffectSettlement, EffectState, StageEffectPort
@@ -268,6 +269,32 @@ class CanonicalStageServices:
 
     def effect_states_for_command(self, command_id: str) -> dict[str, EffectState]:
         return self.facts.effect_states_for_command(command_id)
+
+    def pending_effect_for_command(self, command_id: str) -> StagePending | None:
+        return self.facts.pending_effect_for_command(command_id)
+
+    def verify_pending_effect(
+        self,
+        command: StageCommand,
+        pending: StagePending,
+    ) -> StagePending:
+        return self.facts.verify_pending_effect(command, pending)
+
+    def yield_claim_for_effect(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        effect_id: str,
+    ) -> StagePending:
+        now = self.clock()
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise ProtocolError("clock.invalid", {"where": "yield_claim_for_effect"})
+        return self.facts.yield_claim_for_effect(
+            command=command,
+            claim=claim,
+            effect_id=effect_id,
+            yielded_at=now,
+        )
 
     def commit_decision(
         self,

@@ -87,6 +87,11 @@ class _Facts:
             raise AssertionError(command_id)
         return dict(self.effects)
 
+    def pending_effect_for_command(self, command_id):
+        if command_id != self.command.command_id:
+            raise AssertionError(command_id)
+        return None
+
     def commit_decision(
         self,
         *,

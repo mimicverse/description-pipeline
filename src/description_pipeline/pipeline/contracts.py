@@ -24,6 +24,7 @@ from ..schemas import (
     FAILURE_ENVELOPE_SCHEMA,
     RUN_ADMISSION_SCHEMA,
     STAGE_COMMAND_SCHEMA,
+    STAGE_EFFECT_WAIT_SCHEMA,
     STAGE_QUALIFICATION_SCHEMA,
     STAGE_RESULT_SCHEMA,
 )
@@ -982,6 +983,107 @@ class ExecutionClaim:
             raise ProtocolError("claim.invalid", {"where": "expires_at"})
 
 
+@dataclass(frozen=True, slots=True)
+class StageDeferral:
+    """A handler request to yield an execution claim for one unresolved effect."""
+
+    effect_id: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.effect_id, "deferral.invalid", "effect_id")
+
+
+@dataclass(frozen=True, slots=True)
+class StageEffectWait:
+    """A non-secret immutable locator for one yielded stage effect."""
+
+    schema_version: str
+    run_id: str
+    stage: StageId
+    command_id: str
+    request_digest: str
+    effect_id: str
+    effect_key: str
+    effect_kind: EffectKind
+    intent_identity_digest: str
+    outbound_artifact_id: str
+    outbound_digest: str
+    expected_state_digest: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != STAGE_EFFECT_WAIT_SCHEMA:
+            raise ProtocolError("effect_wait.schema_unsupported", {"value": self.schema_version})
+        _require_identifier(self.run_id, "effect_wait.invalid", "run_id")
+        _require_stage(self.stage, "effect_wait.invalid", "stage")
+        _require_identifier(self.command_id, "effect_wait.invalid", "command_id")
+        _require_digest(self.request_digest, "effect_wait.invalid", "request_digest")
+        _require_identifier(self.effect_id, "effect_wait.invalid", "effect_id")
+        _require_text(self.effect_key, "effect_wait.invalid", "effect_key")
+        if self.effect_kind not in {"airflow_dispatch", "native_operation", "git_ref_update", "pr_upsert"}:
+            raise ProtocolError("effect_wait.invalid", {"where": "effect_kind"})
+        _require_digest(self.intent_identity_digest, "effect_wait.invalid", "intent_identity_digest")
+        _require_identifier(self.outbound_artifact_id, "effect_wait.invalid", "outbound_artifact_id")
+        _require_digest(self.outbound_digest, "effect_wait.invalid", "outbound_digest")
+        _require_digest(self.expected_state_digest, "effect_wait.invalid", "expected_state_digest")
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "command_id": self.command_id,
+            "effect_id": self.effect_id,
+            "effect_key": self.effect_key,
+            "effect_kind": self.effect_kind,
+            "expected_state_digest": self.expected_state_digest,
+            "intent_identity_digest": self.intent_identity_digest,
+            "outbound_artifact_id": self.outbound_artifact_id,
+            "outbound_digest": self.outbound_digest,
+            "request_digest": self.request_digest,
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+            "stage": self.stage,
+        }
+
+    @property
+    def digest(self) -> str:
+        return digest(self.to_record())
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> StageEffectWait:
+        expected = {
+            "command_id",
+            "effect_id",
+            "effect_key",
+            "effect_kind",
+            "expected_state_digest",
+            "intent_identity_digest",
+            "outbound_artifact_id",
+            "outbound_digest",
+            "request_digest",
+            "run_id",
+            "schema_version",
+            "stage",
+        }
+        if not isinstance(record, Mapping) or set(record) != expected:
+            raise ProtocolError(
+                "effect_wait.invalid",
+                {
+                    "missing": sorted(expected - set(record)) if isinstance(record, Mapping) else [],
+                    "unknown": sorted(set(record) - expected) if isinstance(record, Mapping) else [],
+                },
+            )
+        return cls(**dict(record))
+
+
+@dataclass(frozen=True, slots=True)
+class StagePending:
+    """A non-terminal attempt result that instructs the caller to defer."""
+
+    wait: StageEffectWait
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.wait, StageEffectWait):
+            raise ProtocolError("stage_pending.invalid", {"where": "wait"})
+
+
 class StageFailure(RuntimeError):
     """A trusted domain handler's definite failure or cancellation signal."""
 
@@ -1194,6 +1296,9 @@ class FailureEnvelope:
     @property
     def digest(self) -> str:
         return digest(self.to_record())
+
+
+StageAttemptResult = StageResult | FailureEnvelope | StagePending
 
 
 @dataclass(frozen=True, slots=True)
@@ -1503,10 +1608,19 @@ def project_stage_status(
     effect_states: tuple[str, ...],
     predecessor_completed: bool,
     open_claim: bool,
+    pending_effect_states: tuple[str, ...] = (),
 ) -> StageStatus:
     """Derive the stage status; unknown external effects have precedence."""
 
-    if "unknown" in effect_states or "conflict" in effect_states:
+    unresolved_effect_states = list(effect_states)
+    for state in pending_effect_states:
+        if state != "unknown" or "unknown" not in unresolved_effect_states:
+            raise ProtocolError(
+                "stage_status.invalid",
+                {"where": "pending_effect_states", "state": state},
+            )
+        unresolved_effect_states.remove("unknown")
+    if "unknown" in unresolved_effect_states or "conflict" in unresolved_effect_states:
         return StageStatus.UNRESOLVED
     if decision_outcome is not None:
         if decision_outcome not in {"completed", "failed", "cancelled"}:
@@ -1525,12 +1639,21 @@ def project_run_status(
     *,
     stage_outcomes: tuple[str | None, ...],
     effect_states: tuple[str, ...],
+    pending_effect_states: tuple[str, ...] = (),
 ) -> RunStatus:
     """Derive a run status from ordered stage decisions and effect facts."""
 
     if len(stage_outcomes) != len(STAGES):
         raise ProtocolError("run_status.invalid", {"reason": "six-stage-outcomes-required"})
-    if "unknown" in effect_states or "conflict" in effect_states:
+    unresolved_effect_states = list(effect_states)
+    for state in pending_effect_states:
+        if state != "unknown" or "unknown" not in unresolved_effect_states:
+            raise ProtocolError(
+                "run_status.invalid",
+                {"where": "pending_effect_states", "state": state},
+            )
+        unresolved_effect_states.remove("unknown")
+    if "unknown" in unresolved_effect_states or "conflict" in unresolved_effect_states:
         return RunStatus.UNRESOLVED
     for outcome in stage_outcomes:
         if outcome is None:

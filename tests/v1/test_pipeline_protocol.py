@@ -21,7 +21,9 @@ from description_pipeline.pipeline.contracts import (
     StageCandidate,
     StageCommand,
     StageDecision,
+    StageEffectWait,
     StageExecution,
+    StagePending,
     StageResult,
     StageStatus,
     project_run_status,
@@ -37,6 +39,7 @@ from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     FAILURE_ENVELOPE_SCHEMA,
+    STAGE_EFFECT_WAIT_SCHEMA,
     STAGE_RESULT_SCHEMA,
 )
 
@@ -356,8 +359,64 @@ class DerivedStateTests(unittest.TestCase):
             RunStatus.UNRESOLVED,
         )
 
+    def test_pending_effect_is_waiting_without_hiding_other_unknowns(self) -> None:
+        self.assertEqual(
+            project_stage_status(
+                decision_outcome=None,
+                effect_states=("unknown",),
+                predecessor_completed=True,
+                open_claim=False,
+                pending_effect_states=("unknown",),
+            ),
+            StageStatus.WAITING,
+        )
+        self.assertEqual(
+            project_run_status(
+                stage_outcomes=("completed", None, None, None, None, None),
+                effect_states=("unknown",),
+                pending_effect_states=("unknown",),
+            ),
+            RunStatus.INCOMPLETE,
+        )
+        self.assertEqual(
+            project_stage_status(
+                decision_outcome=None,
+                effect_states=("unknown", "unknown"),
+                predecessor_completed=True,
+                open_claim=False,
+                pending_effect_states=("unknown",),
+            ),
+            StageStatus.UNRESOLVED,
+        )
+
 
 class CommandIdentityTests(unittest.TestCase):
+    def test_stage_effect_wait_is_strict_non_secret_identity(self) -> None:
+        value = StagePending(
+            StageEffectWait(
+                schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+                run_id="run-1",
+                stage="capture",
+                command_id="capture:command",
+                request_digest=digest({"request": 1}),
+                effect_id="effect-native",
+                effect_key="native-capture",
+                effect_kind="native_operation",
+                intent_identity_digest=digest({"intent": 1}),
+                outbound_artifact_id="outbound-1",
+                outbound_digest=digest({"outbound": 1}),
+                expected_state_digest=digest({"expected": 1}),
+            )
+        )
+        record = value.wait.to_record()
+        self.assertEqual(StageEffectWait.from_record(record), value.wait)
+        self.assertEqual(len(value.wait.digest), 64)
+        self.assertNotIn("locator", record)
+        self.assertNotIn("claim_id", record)
+        self.assertNotIn("fence", record)
+        with self.assertRaises(ProtocolError):
+            StageEffectWait.from_record({**record, "claim_id": "foreign"})
+
     def test_run_admission_is_immutable_and_self_contained(self) -> None:
         admission = RunAdmission.create(
             run_id="run-1",
@@ -580,6 +639,9 @@ class _Services:
 
     def effect_states_for_command(self, command_id):
         return dict(self.effects)
+
+    def pending_effect_for_command(self, command_id):
+        return None
 
     def effect_port(self, command_value, claim, workspace):
         return object()

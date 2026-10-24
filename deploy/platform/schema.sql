@@ -107,9 +107,13 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
     last_seen_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
     closed_at timestamptz,
+    yield_effect_id text,
     closure_code text CHECK (
         closure_code IS NULL
-        OR closure_code IN ('completed', 'definite_failure', 'abandoned_before_effect', 'reconciled', 'operator_closed')
+        OR closure_code IN (
+            'completed', 'definite_failure', 'abandoned_before_effect',
+            'reconciled', 'operator_closed', 'yielded'
+        )
     ),
     UNIQUE (command_id, fence),
     CHECK (
@@ -226,6 +230,39 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".effect_fact (
     ),
     CHECK ((claim_id IS NULL) = (fence IS NULL))
 );
+
+ALTER TABLE :"platform_schema".execution_claim
+    ADD COLUMN IF NOT EXISTS yield_effect_id text;
+
+ALTER TABLE :"platform_schema".execution_claim
+    DROP CONSTRAINT IF EXISTS execution_claim_closure_code_check;
+ALTER TABLE :"platform_schema".execution_claim
+    ADD CONSTRAINT execution_claim_closure_code_check CHECK (
+        closure_code IS NULL
+        OR closure_code IN (
+            'completed', 'definite_failure', 'abandoned_before_effect',
+            'reconciled', 'operator_closed', 'yielded'
+        )
+    );
+
+ALTER TABLE :"platform_schema".execution_claim
+    DROP CONSTRAINT IF EXISTS execution_claim_yield_effect_id_fkey;
+ALTER TABLE :"platform_schema".execution_claim
+    ADD CONSTRAINT execution_claim_yield_effect_id_fkey
+    FOREIGN KEY (yield_effect_id)
+    REFERENCES :"platform_schema".effect_intent (effect_id);
+
+ALTER TABLE :"platform_schema".execution_claim
+    DROP CONSTRAINT IF EXISTS execution_claim_yield_effect_closure_check;
+ALTER TABLE :"platform_schema".execution_claim
+    ADD CONSTRAINT execution_claim_yield_effect_closure_check CHECK (
+        (closure_code IS NOT DISTINCT FROM 'yielded')
+            = (yield_effect_id IS NOT NULL)
+    );
+
+CREATE UNIQUE INDEX IF NOT EXISTS execution_claim_one_yield_per_effect
+    ON :"platform_schema".execution_claim (command_id, yield_effect_id)
+    WHERE yield_effect_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS :"platform_schema".run_display_metadata (
     run_id text PRIMARY KEY REFERENCES :"platform_schema".run_admission (run_id),

@@ -19,12 +19,17 @@ from .contracts import (
     StageCandidate,
     StageCommand,
     StageDecision,
+    StageAttemptResult,
+    StageDeferral,
+    StageEffectWait,
     StageExecution,
+    StagePending,
     StageResult,
     StageFailure,
     effect_is_settled,
 )
 from .effects import EffectState, StageEffectPort
+from .reconciliation import EffectReconciliationResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +91,21 @@ class StageServices(Protocol):
 
     def effect_states_for_command(self, command_id: str) -> Mapping[str, EffectState]: ...
 
+    def pending_effect_for_command(self, command_id: str) -> StagePending | None: ...
+
+    def verify_pending_effect(
+        self,
+        command: StageCommand,
+        pending: StagePending,
+    ) -> StagePending: ...
+
+    def yield_claim_for_effect(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        effect_id: str,
+    ) -> StagePending: ...
+
     def effect_port(
         self,
         command: StageCommand,
@@ -122,7 +142,8 @@ class StageHandler(Protocol):
         workspace: StageWorkspace,
         *,
         effects: StageEffectPort,
-    ) -> StageExecution: ...
+        resume: StageEffectWait | None = None,
+    ) -> StageExecution | StageDeferral: ...
 
     def validate_candidate(
         self,
@@ -132,6 +153,17 @@ class StageHandler(Protocol):
         *,
         effects: StageEffectPort,
     ) -> StageCandidate: ...
+
+
+class EffectResumeReconciler(Protocol):
+    """Read-only external-effect observer supplied by the production application."""
+
+    def reconcile_effect(
+        self,
+        *,
+        command_id: str,
+        effect_key: str,
+    ) -> EffectReconciliationResult: ...
 
 
 def _validate_result_identity(command: StageCommand, result: StageResult) -> None:
@@ -299,12 +331,15 @@ def execute_stage(
     command_id: str,
     handler: StageHandler,
     services: StageServices,
-) -> StageResult | FailureEnvelope:
-    """Execute one stage to a unique decision or return its existing decision.
+    resume: StageEffectWait | None = None,
+    resume_reconciler: EffectResumeReconciler | None = None,
+) -> StageAttemptResult:
+    """Execute one stage, resume a yielded effect, or return the canonical pending wait.
 
     Unhandled domain or infrastructure exceptions intentionally propagate. A
     process failure is not evidence of a definite stage failure and must remain
-    associated with the open claim for reconciliation.
+    associated with the open claim for reconciliation. A yielded effect closes
+    its old fence atomically and is never another external-send authorization.
     """
 
     command = services.load_command(command_id)
@@ -316,6 +351,59 @@ def execute_stage(
     confirmed = services.decision_for(command)
     if confirmed is not None:
         return _confirmed_decision_record(services, command, confirmed)
+
+    recovered_from_history = False
+    if resume is None:
+        recovered = services.pending_effect_for_command(command.command_id)
+        if recovered is not None:
+            states = services.effect_states_for_command(command.command_id)
+            state = states.get(recovered.wait.effect_id)
+            if state is EffectState.UNKNOWN:
+                return recovered
+            if state is EffectState.CONFLICT:
+                raise ProtocolError(
+                    "resume.effect_conflict",
+                    {"command_id": command.command_id, "effect_id": recovered.wait.effect_id},
+                )
+            if state not in {EffectState.SATISFIED, EffectState.DEFINITELY_FAILED}:
+                raise ProtocolError(
+                    "resume.effect_state_invalid",
+                    {
+                        "command_id": command.command_id,
+                        "effect_id": recovered.wait.effect_id,
+                        "state": None if state is None else state.value,
+                    },
+                )
+            resume = recovered.wait
+            recovered_from_history = True
+
+    if resume is not None:
+        if resume.command_id != command.command_id:
+            raise ProtocolError("resume.command_mismatch", {"command_id": command.command_id})
+        pending = services.verify_pending_effect(
+            command,
+            StagePending(resume),
+        )
+        if not recovered_from_history:
+            if resume_reconciler is None:
+                raise ProtocolError("resume.reconciler_missing", {"command_id": command.command_id})
+            reconciled = resume_reconciler.reconcile_effect(
+                command_id=command.command_id,
+                effect_key=resume.effect_key,
+            )
+            if reconciled.command_id != command.command_id or reconciled.effect_id != resume.effect_id:
+                raise ProtocolError(
+                    "resume.reconciliation_mismatch",
+                    {"command_id": command.command_id, "effect_id": resume.effect_id},
+                )
+            state = reconciled.settlement.state
+            if state is EffectState.UNKNOWN:
+                return pending
+            if state is EffectState.CONFLICT:
+                raise ProtocolError(
+                    "resume.effect_conflict",
+                    {"command_id": command.command_id, "effect_id": resume.effect_id},
+                )
 
     cancel_command = services.cancellation_for(command)
     if cancel_command is not None:
@@ -332,7 +420,24 @@ def execute_stage(
         effects = services.effect_port(command, claim, workspace)
         try:
             if candidate is None:
-                execution = handler.execute(command, claim, workspace, effects=effects)
+                if resume is None:
+                    execution = handler.execute(command, claim, workspace, effects=effects)
+                else:
+                    execution = handler.execute(
+                        command,
+                        claim,
+                        workspace,
+                        effects=effects,
+                        resume=resume,
+                    )
+                if isinstance(execution, StageDeferral):
+                    pending = services.yield_claim_for_effect(
+                        command,
+                        claim,
+                        execution.effect_id,
+                    )
+                    cleanup_workspace = True
+                    return pending
                 try:
                     candidate = services.seal_candidate(command, claim, execution)
                 except Exception as error:

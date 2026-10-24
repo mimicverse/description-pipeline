@@ -943,6 +943,9 @@ class _Services:
     def effect_states_for_command(self, command_id):
         return self.harness.effects.states_for_command(command_id)
 
+    def pending_effect_for_command(self, command_id):
+        return None
+
     def effect_port(self, command, claim, workspace):
         return self.harness.effects.bind(command, claim, workspace)
 

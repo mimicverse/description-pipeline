@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import multiprocessing
 import tempfile
+import time
 import unittest
 import uuid
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 try:
@@ -30,6 +31,14 @@ from description_pipeline.pipeline.contracts import (
     DispatchCommand,
     DispatchConf,
     ExecutionClaim,
+    StageDeferral,
+    StageEffectWait,
+    StageExecution,
+    StagePending,
+)
+from description_pipeline.pipeline.diagnostic import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_command,
 )
 from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.effects import EffectState
@@ -38,9 +47,10 @@ from description_pipeline.pipeline.reconciliation import (
     EffectReconciliationService,
 )
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
-from description_pipeline.platform.facts import FactStore
+from description_pipeline.platform.facts import FactConflict, FactStore, RunControlStore
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
+    DIAGNOSTIC_ADMISSION_SCHEMA,
 )
 from tests.v1.test_pipeline_admission import AdmissionHarness
 from tests.v1.test_runtime_candidate_postgres import _EffectHandler
@@ -112,6 +122,259 @@ class _KnownReconciliationAdapter:
         )
 
 
+class _UnknownReconciliationAdapter:
+    def observe(self, *, command, intent, outbound_root, workspace_root):
+        payload = workspace_root / "unknown-payload"
+        payload.mkdir()
+        (payload / "observation.json").write_text(
+            json.dumps(
+                {
+                    "command_id": command.command_id,
+                    "effect_id": intent.effect_id,
+                    "state": "running",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return EffectReconciliationEvidence(
+            fact_type="observation",
+            state_class="unobservable",
+            payload_root=payload,
+            metadata={"observer": "unknown-resume-test"},
+        )
+
+
+class _ResumeHandler:
+    def __init__(self, artifacts) -> None:
+        self.artifacts = artifacts
+        self.executions = 0
+        self.validations = 0
+
+    def execute(self, command, claim, workspace, *, effects, resume=None):
+        if not isinstance(resume, StageEffectWait):
+            raise AssertionError("resume wait is required")
+        settlement = effects.effect_settlement_for_key("native")
+        if settlement is None or settlement.state is not EffectState.SATISFIED:
+            raise AssertionError("the resumed effect is not satisfied")
+        if settlement.payload_artifact is None:
+            raise AssertionError("the resumed effect has no sealed payload")
+        payload = self.artifacts.materialize(
+            settlement.payload_artifact,
+            workspace.root / "resume-payload",
+        )
+        if not (payload / "observation.json").is_file():
+            raise AssertionError("the resumed payload is incomplete")
+        output = workspace.root / "resume-output"
+        output.mkdir()
+        (output / "result.json").write_text(
+            json.dumps(
+                {
+                    "command_id": command.command_id,
+                    "effect_id": settlement.effect_id,
+                    "fence": claim.fence,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.executions += 1
+        return StageExecution(
+            outcome="completed",
+            candidate_root=str(output),
+            checks_sha256=digest({"resume": command.command_id}),
+            resources_settled=True,
+        )
+
+    def validate_candidate(self, command, claim, candidate, *, effects):
+        del command, claim, effects
+        self.validations += 1
+        return candidate
+
+
+class _SequentialDeferralHandler:
+    def execute(self, command, claim, workspace, *, effects, resume=None):
+        if not isinstance(resume, StageEffectWait):
+            raise AssertionError("resume wait is required")
+        first = effects.effect_settlement_for_key("native")
+        if first is None or first.state is not EffectState.SATISFIED:
+            raise AssertionError("the first effect is not satisfied")
+        outbound = workspace.root / "second-outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"effect":"second"}\n', encoding="utf-8")
+        second = effects.prepare_effect(
+            effect_key="second",
+            effect_kind="native_operation",
+            target={"operation": "second"},
+            expected_state={"state": "complete"},
+            outbound_root=outbound,
+        )
+        effects.authorize_dispatch(second.effect_id, source="restricted-service")
+        return StageDeferral(second.effect_id)
+
+    def validate_candidate(self, command, claim, candidate, *, effects):
+        raise AssertionError("sequential deferral has no candidate")
+
+
+class _Reconciler:
+    def __init__(self, service: EffectReconciliationService) -> None:
+        self.service = service
+
+    def reconcile_effect(self, *, command_id: str, effect_key: str):
+        return self.service.reconcile(
+            command_id=command_id,
+            effect_key=effect_key,
+            adapter=_KnownReconciliationAdapter(),
+        )
+
+
+class _UnknownReconciler(_Reconciler):
+    def reconcile_effect(self, *, command_id: str, effect_key: str):
+        return self.service.reconcile(
+            command_id=command_id,
+            effect_key=effect_key,
+            adapter=_UnknownReconciliationAdapter(),
+        )
+
+
+class _PausedEffectLockStore(FactStore):
+    def __init__(
+        self,
+        connect,
+        artifacts,
+        *,
+        effect_id: str,
+        ready,
+        release,
+    ) -> None:
+        super().__init__(connect, artifacts)
+        self._paused_effect_id = effect_id
+        self._ready = ready
+        self._release = release
+        self._paused = False
+
+    def _lock_effect_cursor(self, cursor, effect_id: str) -> None:
+        if effect_id == self._paused_effect_id and not self._paused:
+            self._paused = True
+            self._ready.set()
+            if not self._release.wait(20):
+                raise TimeoutError("ledger pause release timed out")
+        super()._lock_effect_cursor(cursor, effect_id)
+
+
+def _settlement_during_pause(
+    uri: str,
+    schema: str,
+    artifact_root: str,
+    command_id: str,
+    effect_id: str,
+    ready,
+    release,
+    result,
+) -> None:
+    import psycopg2
+    from description_pipeline.artifacts import ArtifactStore
+
+    def connect():
+        return psycopg2.connect(
+            uri,
+            user="platform_service",
+            options=f"-c search_path={schema},public",
+        )
+
+    artifacts = ArtifactStore(artifact_root)
+    facts = _PausedEffectLockStore(
+        connect,
+        artifacts,
+        effect_id=effect_id,
+        ready=ready,
+        release=release,
+    )
+    try:
+        settlement = facts.effect_settlement_for_key(command_id, "native")
+        result.put(("ok", None if settlement is None else settlement.state.value))
+    except Exception as error:
+        result.put(("error", f"{type(error).__name__}: {error}"))
+
+
+def _reconcile_during_pause(
+    uri: str,
+    schema: str,
+    artifact_root: str,
+    work_root: str,
+    command_id: str,
+    result,
+) -> None:
+    import psycopg2
+    from description_pipeline.artifacts import ArtifactStore
+
+    def connect():
+        return psycopg2.connect(
+            uri,
+            user="platform_service",
+            options=f"-c search_path={schema},public",
+        )
+
+    artifacts = ArtifactStore(artifact_root)
+    facts = FactStore(connect, artifacts)
+    service = EffectReconciliationService(
+        facts=facts,
+        artifacts=artifacts,
+        work_root=work_root,
+        observer_tool_sha256=digest({"observer": "lock-order"}),
+        clock=lambda: datetime(2026, 10, 25, 6, 0, tzinfo=UTC),
+    )
+    try:
+        reconciled = service.reconcile(
+            command_id=command_id,
+            effect_key="native",
+            adapter=_KnownReconciliationAdapter(),
+        )
+        result.put(("ok", reconciled.settlement.state.value))
+    except Exception as error:
+        cause = getattr(error, "cause", error)
+        retained = getattr(error, "retained_workspace", None)
+        result.put(
+            (
+                "error",
+                f"{type(cause).__name__}: {cause}; retained={retained}",
+            )
+        )
+
+
+def _effect_first_lock_control(
+    uri: str,
+    schema: str,
+    command_id: str,
+    effect_id: str,
+    effect_acquired,
+    result,
+) -> None:
+    import psycopg2
+
+    def connect():
+        return psycopg2.connect(
+            uri,
+            user="platform_service",
+            options=f"-c search_path={schema},public",
+        )
+
+    facts = FactStore(connect, _Reader())
+    try:
+        with facts._transaction() as connection:
+            cursor = connection.cursor()
+            facts._lock_effect_cursor(cursor, effect_id)
+            effect_acquired.set()
+            facts._lock_command_scope_cursor(cursor, command_id)
+            facts._lock_effect_ledger_cursor(cursor, command_id)
+    except psycopg2.errors.DeadlockDetected:
+        result.put(("deadlock", None))
+    except Exception as error:
+        result.put(("error", f"{type(error).__name__}: {error}"))
+    else:
+        result.put(("ok", None))
+
+
 def _claim_worker(
     uri: str,
     schema: str,
@@ -153,6 +416,40 @@ def _claim_worker(
         result.put(("error", claim_id, type(error).__name__, str(error)))
     else:
         result.put(("acquired", claim.claim_id, claim.fence, claim.owner_sha256))
+
+
+def _diagnostic_admission_worker(
+    uri: str,
+    schema: str,
+    artifact_root: str,
+    spec_record,
+    command_record,
+    start,
+    result,
+) -> None:
+    import psycopg2
+    from description_pipeline.artifacts import ArtifactStore
+
+    spec = DiagnosticAdmissionSpec.from_record(spec_record)
+    from description_pipeline.pipeline.contracts import StageCommand
+
+    command = StageCommand.from_record(command_record)
+
+    def connect():
+        return psycopg2.connect(
+            uri,
+            user="platform_service",
+            options=f"-c search_path={schema},public",
+        )
+
+    facts = FactStore(connect, ArtifactStore(artifact_root))
+    start.wait(20)
+    try:
+        facts.admit_diagnostic(spec, command)
+    except Exception as error:
+        result.put(("error", type(error).__name__, str(error)))
+    else:
+        result.put(("ok", command.command_id))
 
 
 @unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
@@ -341,6 +638,27 @@ class PlatformServicePostgresTests(unittest.TestCase):
             clock=lambda: self.now,
         )
 
+    def _prepared_pending_effect(self, suffix: str):
+        spec, _admission, command = self._admit(suffix)
+        services = self._services(suffix, executor_sha256=spec.executors.freeze)
+        claim = services.acquire_claim(command)
+        workspace = services.materialize(command, claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(command, claim, workspace)
+        outbound = workspace.root / f"{suffix}-outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"operation":"native"}\n', encoding="utf-8")
+        intent = effects.prepare_effect(
+            effect_key="native",
+            effect_kind="native_operation",
+            target={"operation": command.command_id},
+            expected_state={"operation": command.command_id},
+            outbound_root=outbound,
+        )
+        effects.authorize_dispatch(intent.effect_id, source="restricted-service")
+        pending = services.yield_claim_for_effect(command, claim, intent.effect_id)
+        return spec, command, services, claim, workspace, effects, intent, pending, outbound
+
     def test_restricted_service_completes_decision_and_reads_candidate(self) -> None:
         spec, _admission, command = self._admit("decision")
         services = self._services("decision", executor_sha256=spec.executors.freeze)
@@ -470,6 +788,87 @@ class PlatformServicePostgresTests(unittest.TestCase):
         restored = recovered.effect_settlement_for_key(command.command_id, "native")
         self.assertEqual(restored.state, EffectState.SATISFIED)
 
+    def test_concurrent_diagnostics_share_artifact_order_without_deadlock(self) -> None:
+        first_root = Path(self.directory.name) / "shared-artifact-a"
+        second_root = Path(self.directory.name) / "shared-artifact-b"
+        first_root.mkdir()
+        second_root.mkdir()
+        (first_root / "payload.json").write_text('{"artifact":"a"}\n', encoding="utf-8")
+        (second_root / "payload.json").write_text('{"artifact":"b"}\n', encoding="utf-8")
+        producer = digest({"tool": "diagnostic-artifact"})
+        first, second = sorted(
+            (
+                self.artifacts.seal_tree(
+                    first_root,
+                    kind="fixture_input",
+                    producer_run_id=None,
+                    producer_stage=None,
+                    producer_tool_sha256=producer,
+                ),
+                self.artifacts.seal_tree(
+                    second_root,
+                    kind="fixture_input",
+                    producer_run_id=None,
+                    producer_stage=None,
+                    producer_tool_sha256=producer,
+                ),
+            ),
+            key=lambda artifact: artifact.artifact_id,
+        )
+        specs = []
+        commands = []
+        for suffix, inputs in (
+            ("reverse-a", (second, first)),
+            ("reverse-b", (first, second)),
+        ):
+            spec = DiagnosticAdmissionSpec(
+                schema_version=DIAGNOSTIC_ADMISSION_SCHEMA,
+                run_id=f"artifact-order-{suffix}",
+                request_id=f"artifact-order-request-{suffix}",
+                target_stage="capture",
+                request={"schema_version": "artifact-order/v1", "suffix": suffix},
+                input_artifacts=inputs,
+                expected_executor_sha256=digest({"executor": "diagnostic"}),
+                config_snapshot_sha256=digest({"config": "diagnostic"}),
+                contract_sha256=digest({"contract": "diagnostic"}),
+                policy_sha256=digest({"policy": "diagnostic"}),
+                created_at=self.now,
+            )
+            specs.append(spec)
+            commands.append(build_diagnostic_command(spec))
+
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        result = context.Queue()
+        workers = [
+            context.Process(
+                target=_diagnostic_admission_worker,
+                args=(
+                    self.server.get_uri(),
+                    self.schema,
+                    str(self.artifacts.root),
+                    spec.to_record(),
+                    command.to_record(),
+                    start,
+                    result,
+                ),
+            )
+            for spec, command in zip(specs, commands, strict=True)
+        ]
+        for process in workers:
+            self.addCleanup(lambda item=process: item.terminate() if item.is_alive() else None)
+            process.start()
+        start.set()
+        for process in workers:
+            process.join(20)
+            self.assertEqual(process.exitcode, 0)
+        outcomes = [result.get(timeout=5), result.get(timeout=5)]
+        self.assertEqual(
+            sorted(row[0] for row in outcomes),
+            ["ok", "ok"],
+            outcomes,
+        )
+
     def test_restricted_service_two_process_claim_race_preserves_fence_order(self) -> None:
         spec, _admission, command = self._admit("fence")
         executor = spec.executors.freeze
@@ -525,6 +924,660 @@ class PlatformServicePostgresTests(unittest.TestCase):
         )
         next_claim = self._services("fence-next", executor_sha256=executor).acquire_claim(command)
         self.assertEqual(next_claim.fence, 2)
+
+    def test_restricted_service_yields_and_resumes_the_same_effect_with_a_new_fence(self) -> None:
+        (
+            _spec,
+            command,
+            services,
+            claim,
+            _workspace,
+            effects,
+            intent,
+            pending,
+            outbound,
+        ) = self._prepared_pending_effect("pending")
+        self.assertEqual(pending.wait.command_id, command.command_id)
+        self.assertEqual(pending.wait.effect_id, intent.effect_id)
+        self.assertEqual(services.pending_effect_for_command(command.command_id), pending)
+        self.assertIsNone(self.facts.decision_for(command))
+        self.assertEqual(
+            RunControlStore(self._service_connect)
+            .get_admitted_run(command.run_id)
+            .state,
+            "incomplete",
+        )
+        self.assertEqual(
+            self._query(
+                """
+                SELECT closure_code, yield_effect_id
+                FROM execution_claim
+                WHERE claim_id = %s
+                """,
+                (claim.claim_id,),
+            ),
+            [("yielded", intent.effect_id)],
+        )
+        with self.assertRaisesRegex(FactConflict, "yielded"):
+            effects.record_response(
+                intent.effect_id,
+                source="stale-owner",
+                response_root=outbound,
+            )
+        with self.assertRaisesRegex(FactConflict, "unresolved effect"):
+            services.acquire_claim(command)
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact WHERE effect_id = %s "
+                "AND fact_type = 'dispatch_authorized'",
+                (intent.effect_id,),
+            ),
+            [(1,)],
+        )
+
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "resume-reconcile",
+            observer_tool_sha256=digest({"observer": "resume"}),
+            clock=lambda: self.now + timedelta(seconds=4),
+        )
+        handler = _ResumeHandler(self.artifacts)
+        result = execute_stage(
+            command_id=command.command_id,
+            handler=handler,
+            services=services,
+            resume=pending.wait,
+            resume_reconciler=_Reconciler(reconciler),
+        )
+        self.assertEqual(result.outcome, "completed")
+        self.assertEqual(handler.executions, 1)
+        self.assertEqual(handler.validations, 1)
+        candidate = self.facts.candidate_for(command)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.fence, 2)
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact WHERE effect_id = %s "
+                "AND fact_type = 'dispatch_authorized'",
+                (intent.effect_id,),
+            ),
+            [(1,)],
+        )
+        self.assertIsNone(services.pending_effect_for_command(command.command_id))
+
+    def test_yield_history_resumes_without_defer_kwargs_after_reconcile_ack_loss(self) -> None:
+        (
+            _spec,
+            command,
+            services,
+            _claim,
+            _workspace,
+            _effects,
+            intent,
+            _pending,
+            _outbound,
+        ) = self._prepared_pending_effect("pending-reconcile-ack")
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "reconcile-ack",
+            observer_tool_sha256=digest({"observer": "reconcile-ack"}),
+            clock=lambda: self.now + timedelta(seconds=10),
+        )
+        resolved = reconciler.reconcile(
+            command_id=command.command_id,
+            effect_key="native",
+            adapter=_KnownReconciliationAdapter(),
+        )
+        self.assertEqual(resolved.settlement.state, EffectState.SATISFIED)
+        handler = _ResumeHandler(self.artifacts)
+        result = execute_stage(
+            command_id=command.command_id,
+            handler=handler,
+            services=services,
+        )
+        self.assertEqual(result.outcome, "completed")
+        self.assertEqual(handler.executions, 1)
+        candidate = self.facts.candidate_for(command)
+        self.assertEqual(candidate.fence, 2)
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact WHERE effect_id = %s "
+                "AND fact_type = 'dispatch_authorized'",
+                (intent.effect_id,),
+            ),
+            [(1,)],
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM execution_claim WHERE command_id = %s",
+                (command.command_id,),
+            ),
+            [(2,)],
+        )
+
+    def test_expired_resume_claim_is_replaced_using_historical_wait(self) -> None:
+        (
+            spec,
+            command,
+            _services,
+            _claim,
+            _workspace,
+            _effects,
+            intent,
+            _pending,
+            _outbound,
+        ) = self._prepared_pending_effect("pending-resume-crash")
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "resume-crash",
+            observer_tool_sha256=digest({"observer": "resume-crash"}),
+            clock=lambda: self.now + timedelta(seconds=10),
+        )
+        reconciler.reconcile(
+            command_id=command.command_id,
+            effect_key="native",
+            adapter=_KnownReconciliationAdapter(),
+        )
+        crashed_services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "crashed-resume",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"owner": "crashed-resume"}),
+                executor_sha256=spec.executors.freeze,
+                lease=timedelta(minutes=1),
+            ),
+            clock=lambda: self.now + timedelta(seconds=11),
+        )
+        crashed_claim = crashed_services.acquire_claim(command)
+        self.assertEqual(crashed_claim.fence, 2)
+
+        restarted_services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "restarted-resume",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"owner": "restarted-resume"}),
+                executor_sha256=spec.executors.freeze,
+                lease=timedelta(minutes=1),
+            ),
+            clock=lambda: self.now + timedelta(minutes=2),
+        )
+        handler = _ResumeHandler(self.artifacts)
+        result = execute_stage(
+            command_id=command.command_id,
+            handler=handler,
+            services=restarted_services,
+        )
+        self.assertEqual(result.outcome, "completed")
+        candidate = self.facts.candidate_for(command)
+        self.assertEqual(candidate.fence, 3)
+        rows = self._query(
+            "SELECT fence, closure_code FROM execution_claim "
+            "WHERE command_id = %s ORDER BY fence",
+            (command.command_id,),
+        )
+        self.assertEqual(
+            rows,
+            [
+                (1, "yielded"),
+                (2, "abandoned_before_effect"),
+                (3, "completed"),
+            ],
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact WHERE effect_id = %s "
+                "AND fact_type = 'dispatch_authorized'",
+                (intent.effect_id,),
+            ),
+            [(1,)],
+        )
+
+    def test_second_yield_supersedes_old_wait_without_ambiguous_ledger(self) -> None:
+        (
+            _spec,
+            command,
+            services,
+            _claim,
+            _workspace,
+            _effects,
+            _first_intent,
+            first_pending,
+            _outbound,
+        ) = self._prepared_pending_effect("pending-first")
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "sequential-reconcile",
+            observer_tool_sha256=digest({"observer": "sequential"}),
+            clock=lambda: self.now + timedelta(seconds=12),
+        )
+        second_pending = execute_stage(
+            command_id=command.command_id,
+            handler=_SequentialDeferralHandler(),
+            services=services,
+            resume=first_pending.wait,
+            resume_reconciler=_Reconciler(reconciler),
+        )
+        self.assertIsInstance(second_pending, StagePending)
+        self.assertNotEqual(second_pending.wait.effect_id, first_pending.wait.effect_id)
+        self.assertEqual(services.pending_effect_for_command(command.command_id), second_pending)
+        claims = self._query(
+            "SELECT fence, closure_code, yield_effect_id "
+            "FROM execution_claim WHERE command_id = %s ORDER BY fence",
+            (command.command_id,),
+        )
+        self.assertEqual(
+            claims,
+            [
+                (1, "yielded", first_pending.wait.effect_id),
+                (2, "yielded", second_pending.wait.effect_id),
+            ],
+        )
+        with self.assertRaisesRegex(FactConflict, "canonical yielded claim"):
+            execute_stage(
+                command_id=command.command_id,
+                handler=_ResumeHandler(self.artifacts),
+                services=services,
+                resume=first_pending.wait,
+                resume_reconciler=_Reconciler(reconciler),
+            )
+
+    def test_unknown_resume_rewais_without_acquiring_dispatch_rights(self) -> None:
+        (
+            _spec,
+            command,
+            services,
+            _claim,
+            _workspace,
+            _effects,
+            intent,
+            pending,
+            _outbound,
+        ) = self._prepared_pending_effect("pending-unknown")
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "unknown-resume-reconcile",
+            observer_tool_sha256=digest({"observer": "unknown-resume"}),
+            clock=lambda: self.now + timedelta(seconds=5),
+        )
+        result = execute_stage(
+            command_id=command.command_id,
+            handler=_ResumeHandler(self.artifacts),
+            services=services,
+            resume=pending.wait,
+            resume_reconciler=_UnknownReconciler(reconciler),
+        )
+        self.assertEqual(result, pending)
+        self.assertEqual(services.pending_effect_for_command(command.command_id), pending)
+        self.assertEqual(
+            self._query(
+                """
+                SELECT count(*), count(*) FILTER (WHERE closed_at IS NULL)
+                FROM execution_claim
+                WHERE command_id = %s
+                """,
+                (command.command_id,),
+            ),
+            [(1, 0)],
+        )
+        facts_before = self._query(
+            "SELECT count(*) FROM effect_fact WHERE effect_id = %s",
+            (intent.effect_id,),
+        )
+        wrong = replace(pending.wait, effect_key="foreign-effect")
+        with self.assertRaisesRegex(FactConflict, "canonical intent"):
+            execute_stage(
+                command_id=command.command_id,
+                handler=_ResumeHandler(self.artifacts),
+                services=services,
+                resume=wrong,
+                resume_reconciler=_UnknownReconciler(reconciler),
+            )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact WHERE effect_id = %s",
+                (intent.effect_id,),
+            ),
+            facts_before,
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM execution_claim WHERE command_id = %s",
+                (command.command_id,),
+            ),
+            [(1,)],
+        )
+
+    def test_yield_committed_before_caller_ack_reconstructs_pending_without_wait_kwargs(self) -> None:
+        (
+            spec,
+            command,
+            _services,
+            _claim,
+            _workspace,
+            _effects,
+            intent,
+            pending,
+            _outbound,
+        ) = self._prepared_pending_effect("pending-lost-ack")
+        restarted = FactStore(self._service_connect, self.artifacts)
+        restarted_services = CanonicalStageServices(
+            facts=restarted,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "restarted-service",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"owner": "restarted"}),
+                executor_sha256=spec.executors.freeze,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now + timedelta(seconds=6),
+        )
+        reconstructed = restarted_services.pending_effect_for_command(command.command_id)
+        self.assertEqual(reconstructed, pending)
+        handler = _EffectHandler()
+        result = execute_stage(
+            command_id=command.command_id,
+            handler=handler,
+            services=restarted_services,
+        )
+        self.assertEqual(result, pending)
+        self.assertEqual(handler.external_calls, 0)
+        self.assertEqual(
+            self._query(
+                """
+                SELECT count(*), count(*) FILTER (WHERE closed_at IS NULL),
+                       count(*) FILTER (WHERE yield_effect_id = %s)
+                FROM execution_claim
+                WHERE command_id = %s
+                """,
+                (intent.effect_id, command.command_id),
+            ),
+            [(1, 0, 1)],
+        )
+
+    def test_ledger_selects_the_exact_pending_effect_when_another_effect_is_settled(self) -> None:
+        spec, _admission, command = self._admit("pending-multi-effect")
+        services = self._services("pending-multi", executor_sha256=spec.executors.freeze)
+        claim = services.acquire_claim(command)
+        workspace = services.materialize(command, claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(command, claim, workspace)
+
+        settled_root = workspace.root / "settled-outbound"
+        settled_root.mkdir()
+        (settled_root / "request.json").write_text('{"effect":"settled"}\n', encoding="utf-8")
+        settled = effects.prepare_effect(
+            effect_key="settled",
+            effect_kind="native_operation",
+            target={"operation": "settled"},
+            expected_state={"state": "complete"},
+            outbound_root=settled_root,
+        )
+        effects.authorize_dispatch(settled.effect_id, source="restricted-service")
+        settled_payload = workspace.root / "settled-payload"
+        settled_payload.mkdir()
+        (settled_payload / "result.json").write_text('{"state":"complete"}\n', encoding="utf-8")
+        effects.record_observation(
+            settled.effect_id,
+            source="restricted-service",
+            state_class="known",
+            observation_root=settled_payload,
+        )
+
+        pending_root = workspace.root / "pending-outbound"
+        pending_root.mkdir()
+        (pending_root / "request.json").write_text('{"effect":"pending"}\n', encoding="utf-8")
+        pending_intent = effects.prepare_effect(
+            effect_key="pending",
+            effect_kind="native_operation",
+            target={"operation": "pending"},
+            expected_state={"state": "complete"},
+            outbound_root=pending_root,
+        )
+        effects.authorize_dispatch(pending_intent.effect_id, source="restricted-service")
+        pending = services.yield_claim_for_effect(command, claim, pending_intent.effect_id)
+        self.assertEqual(pending.wait.effect_id, pending_intent.effect_id)
+        self.assertEqual(services.pending_effect_for_command(command.command_id), pending)
+        self.assertEqual(
+            services.effect_states_for_command(command.command_id),
+            {
+                settled.effect_id: EffectState.SATISFIED,
+                pending_intent.effect_id: EffectState.UNKNOWN,
+            },
+        )
+
+    def test_registered_cancel_advances_while_target_waits_without_a_target_claim(self) -> None:
+        (
+            _spec,
+            command,
+            _services,
+            _claim,
+            _workspace,
+            _effects,
+            intent,
+            pending,
+            _outbound,
+        ) = self._prepared_pending_effect("pending-cancel")
+        cancel_executor = digest({"executor": "cancel"})
+        cancel_command = self.facts.request_cancel(
+            target_command_id=command.command_id,
+            cancel_executor_sha256=cancel_executor,
+            reason_code="operator_cancelled",
+            reason="Cancel while target effect is pending",
+            requested_by="test",
+            requested_at=self.now + timedelta(seconds=7),
+        )
+        self.assertEqual(cancel_command.request["target_command_id"], command.command_id)
+        control = CancellationControlService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "pending-cancel",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"owner": "pending-cancel"}),
+                executor_sha256=cancel_executor,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now + timedelta(seconds=8),
+            adapter=_AcceptedCancellation(),
+        )
+        sent = control.send(
+            cancel_command_id=cancel_command.command_id,
+            target_effect_id=intent.effect_id,
+        )
+        self.assertTrue(sent.sent)
+        self.assertEqual(sent.target_effect_state, EffectState.UNKNOWN)
+        self.assertEqual(sent.cancel_effect_state, EffectState.SATISFIED)
+        self.assertEqual(self.facts.pending_effect_for_command(command.command_id).wait, pending.wait)
+        rows = self._query(
+            "SELECT closure_code, yield_effect_id, closed_at IS NULL "
+            "FROM execution_claim WHERE command_id = %s ORDER BY fence",
+            (command.command_id,),
+        )
+        self.assertEqual(rows, [("yielded", intent.effect_id, False)])
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM execution_claim WHERE command_id = %s",
+                (cancel_command.command_id,),
+            ),
+            [(1,)],
+        )
+
+    def test_public_reconcile_and_settlement_share_one_lock_order_without_deadlock(self) -> None:
+        (
+            _spec,
+            command,
+            _services,
+            _claim,
+            _workspace,
+            _effects,
+            intent,
+            _pending,
+            _outbound,
+        ) = self._prepared_pending_effect("lock-order")
+        context = multiprocessing.get_context("spawn")
+        paused = context.Event()
+        release = context.Event()
+        result = context.Queue()
+        reader = context.Process(
+            target=_settlement_during_pause,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                str(self.artifacts.root),
+                command.command_id,
+                intent.effect_id,
+                paused,
+                release,
+                result,
+            ),
+        )
+        reconciler = context.Process(
+            target=_reconcile_during_pause,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                str(self.artifacts.root),
+                str(Path(self.directory.name) / "public-lock-order"),
+                command.command_id,
+                result,
+            ),
+        )
+        for process in (reader, reconciler):
+            self.addCleanup(lambda item=process: item.terminate() if item.is_alive() else None)
+        reader.start()
+        self.assertTrue(paused.wait(10), "settlement reader did not hold its canonical locks")
+        reconciler.start()
+        time.sleep(0.2)
+        self.assertTrue(reader.is_alive())
+        self.assertTrue(reconciler.is_alive())
+        release.set()
+        for process in (reader, reconciler):
+            process.join(20)
+            self.assertEqual(process.exitcode, 0)
+        outcomes = [result.get(timeout=5), result.get(timeout=5)]
+        self.assertNotIn("error", {row[0] for row in outcomes}, outcomes)
+        self.assertIn(("ok", "unknown"), outcomes)
+        self.assertIn(("ok", "satisfied"), outcomes)
+
+    def test_reverse_lock_order_control_is_detected_by_postgres(self) -> None:
+        (
+            _spec,
+            command,
+            _services,
+            _claim,
+            _workspace,
+            _effects,
+            intent,
+            _pending,
+            _outbound,
+        ) = self._prepared_pending_effect("reverse-lock-control")
+        context = multiprocessing.get_context("spawn")
+        paused = context.Event()
+        effect_acquired = context.Event()
+        release = context.Event()
+        result = context.Queue()
+        command_first = context.Process(
+            target=_settlement_during_pause,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                str(self.artifacts.root),
+                command.command_id,
+                intent.effect_id,
+                paused,
+                release,
+                result,
+            ),
+        )
+        effect_first = context.Process(
+            target=_effect_first_lock_control,
+            args=(
+                self.server.get_uri(),
+                self.schema,
+                command.command_id,
+                intent.effect_id,
+                effect_acquired,
+                result,
+            ),
+        )
+        for process in (command_first, effect_first):
+            self.addCleanup(lambda item=process: item.terminate() if item.is_alive() else None)
+        command_first.start()
+        self.assertTrue(paused.wait(10), "command-first worker did not reach the effect lock")
+        effect_first.start()
+        self.assertTrue(effect_acquired.wait(10), "effect-first worker did not acquire its first lock")
+        release.set()
+        for process in (command_first, effect_first):
+            process.join(20)
+            self.assertEqual(process.exitcode, 0)
+        outcomes = [result.get(timeout=5), result.get(timeout=5)]
+        self.assertTrue(
+            any(
+                row[0] == "deadlock"
+                or (
+                    row[0] == "error"
+                    and isinstance(row[1], str)
+                    and "DeadlockDetected" in row[1]
+                )
+                for row in outcomes
+            ),
+            outcomes,
+        )
+
+    def test_non_yield_closed_claim_keeps_late_response_audit_without_advancing_fence(self) -> None:
+        spec, _admission, command = self._admit("late-response")
+        services = self._services("late-response", executor_sha256=spec.executors.freeze)
+        claim = services.acquire_claim(command)
+        workspace = services.materialize(command, claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(command, claim, workspace)
+        outbound = workspace.root / "late-outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"operation":"native"}\n', encoding="utf-8")
+        intent = effects.prepare_effect(
+            effect_key="native",
+            effect_kind="native_operation",
+            target={"operation": command.command_id},
+            expected_state={"operation": command.command_id},
+            outbound_root=outbound,
+        )
+        effects.authorize_dispatch(intent.effect_id, source="restricted-service")
+        self.facts.close_open_claim(
+            claim,
+            closure_code="completed",
+            closed_at=self.now + timedelta(seconds=9),
+        )
+        response = workspace.root / "late-response"
+        response.mkdir()
+        (response / "response.json").write_text('{"late":true}\n', encoding="utf-8")
+        fact = effects.record_response(
+            intent.effect_id,
+            source="late-audit",
+            response_root=response,
+        )
+        self.assertEqual(fact.fact_type, "response")
+        self.assertEqual(
+            self._query(
+                "SELECT count(*), count(*) FILTER (WHERE closed_at IS NULL) "
+                "FROM execution_claim WHERE command_id = %s",
+                (command.command_id,),
+            ),
+            [(1, 0)],
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact "
+                "WHERE effect_id = %s AND fact_type = 'response'",
+                (intent.effect_id,),
+            ),
+            [(1,)],
+        )
 
     def test_platform_service_cannot_mutate_immutable_facts(self) -> None:
         with self._service_connect() as connection, connection.cursor() as cursor:

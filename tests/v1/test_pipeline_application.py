@@ -307,6 +307,18 @@ class _MemoryBackend:
         del command_id
         return {}
 
+    def pending_effect_for_command(self, command_id: str):
+        del command_id
+        return None
+
+    def verify_pending_effect(self, command, pending):
+        del command, pending
+        raise AssertionError("pending recovery is not expected")
+
+    def yield_claim_for_effect(self, command, claim, effect_id):
+        del command, claim, effect_id
+        raise AssertionError("effect deferral is not expected")
+
     def cancellation_for(self, command: StageCommand):
         del command
         return None

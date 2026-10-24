@@ -139,6 +139,7 @@ class ClaimTests(unittest.TestCase):
         return (
             self.command.command_id,
             self.command.run_id,
+            self.command.kind,
             self.command.stage,
             self.executor,
             self.command.predecessor_decision_id,
@@ -149,6 +150,7 @@ class ClaimTests(unittest.TestCase):
         connection = _Connection(
             [
                 self.command_row(),
+                [],
                 None,
                 ("claim-1", self.command.command_id, 1, self.owner, self.executor, None, expiry),
             ]
@@ -168,6 +170,7 @@ class ClaimTests(unittest.TestCase):
         connection = _Connection(
             [
                 self.command_row(),
+                [],
                 None,
                 (
                     "claim-1",
@@ -195,6 +198,7 @@ class ClaimTests(unittest.TestCase):
         connection = _Connection(
             [
                 self.command_row(),
+                [],
                 None,
                 (
                     "claim-1",
@@ -206,7 +210,6 @@ class ClaimTests(unittest.TestCase):
                     self.now - timedelta(seconds=1),
                 ),
                 None,
-                [],
                 (2,),
                 None,
             ]
@@ -227,16 +230,6 @@ class ClaimTests(unittest.TestCase):
         connection = _Connection(
             [
                 self.command_row(),
-                None,
-                (
-                    "claim-1",
-                    self.command.command_id,
-                    1,
-                    self.owner,
-                    self.executor,
-                    None,
-                    self.now - timedelta(seconds=1),
-                ),
                 [("effect-1",)],
                 (
                     "effect-1",
@@ -266,6 +259,17 @@ class ClaimTests(unittest.TestCase):
                         created,
                     )
                 ],
+                None,
+                (
+                    "claim-1",
+                    self.command.command_id,
+                    1,
+                    self.owner,
+                    self.executor,
+                    None,
+                    self.now - timedelta(seconds=1),
+                ),
+                None,
             ]
         )
         store = FactStore(lambda: connection, _Reader())
