@@ -22,6 +22,7 @@ from description_pipeline.orchestration.discover_protocol import (
 import description_pipeline.pipeline.discover as discover_module
 from description_pipeline.pipeline.contracts import (
     ArtifactRef,
+    DiagnosticReplayScope,
     ExecutionClaim,
     StageCandidate,
     StageCommand,
@@ -484,6 +485,64 @@ class DiscoverDomainTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertIn("spare/base.SLDPRT", result["selection"]["files"])
         self.assertNotIn("unused/base.SLDPRT", result["selection"]["files"])
+
+    def test_real_discover_handler_runs_as_one_diagnostic_stage(self) -> None:
+        scope = DiagnosticReplayScope.from_inputs(
+            "discover",
+            self.command.input_artifacts,
+        )
+        command = StageCommand.create(
+            command_id="diagnostic-discover",
+            run_id="diagnostic-discover-run",
+            stage="discover",
+            idempotency_key="diagnostic-discover/run",
+            request=self.command.to_record()["request"],
+            input_artifacts=self.command.input_artifacts,
+            config_snapshot_sha256=self.command.config_snapshot_sha256,
+            contract_sha256=self.command.contract_sha256,
+            policy_sha256=self.command.policy_sha256,
+            expected_executor_sha256=self.command.expected_executor_sha256,
+            predecessor_decision_id=None,
+            diagnostic_scope=scope,
+        )
+        claim, effects = self.harness.effect_port(command)
+        execution = DiscoverHandler(self.harness.port()).execute(
+            command,
+            claim,
+            self.harness.workspace(),
+            effects=effects,
+        )
+        self.assertEqual(execution.outcome, "completed")
+        self.assertEqual(command.diagnostic_scope, scope)
+
+    def test_formal_discover_requires_a_freeze_predecessor(self) -> None:
+        command = StageCommand.create(
+            command_id="discover-without-predecessor",
+            run_id="discover-without-predecessor-run",
+            stage="discover",
+            idempotency_key="discover-without-predecessor/run",
+            request=self.command.to_record()["request"],
+            input_artifacts=self.command.input_artifacts,
+            config_snapshot_sha256=self.command.config_snapshot_sha256,
+            contract_sha256=self.command.contract_sha256,
+            policy_sha256=self.command.policy_sha256,
+            expected_executor_sha256=self.command.expected_executor_sha256,
+            predecessor_decision_id=None,
+        )
+        port = self.harness.port()
+        claim, effects = self.harness.effect_port(command)
+        with self.assertRaises(StageFailure) as raised:
+            DiscoverHandler(port).execute(
+                command,
+                claim,
+                self.harness.workspace(),
+                effects=effects,
+            )
+        self.assertEqual(
+            raised.exception.reason_code,
+            "discover.predecessor_invalid",
+        )
+        self.assertFalse(port.invocations)
 
     def test_sealed_observation_round_trips_as_one_return_bundle(self) -> None:
         claim, effects = self.harness.effect_port(self.command)

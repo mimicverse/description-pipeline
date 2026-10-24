@@ -463,7 +463,6 @@ jobs:
         with:
           name: real-chain-evidence
           path: |
-            ${{ runner.temp }}/real-chain-report.json
             ${{ runner.temp }}/supervised-evidence
             ${{ runner.temp }}/reconcile-evidence
             ${{ runner.temp }}/supervised-test.log

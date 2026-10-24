@@ -11,6 +11,7 @@ from pathlib import Path
 from description_pipeline.io import digest, file_digest, read_data, write_json
 from description_pipeline.pipeline.contracts import (
     ArtifactRef,
+    DiagnosticReplayScope,
     ExecutionClaim,
     StageCandidate,
     StageCommand,
@@ -346,6 +347,7 @@ class _Services:
             checks_sha256=execution.checks_sha256,
             resources_settled=execution.resources_settled,
             reason_code=execution.reason_code,
+            diagnostic_scope=command.diagnostic_scope,
         )
         record_id = digest({"result_record": result.digest})
         result_record_artifact = ArtifactRef(
@@ -422,6 +424,36 @@ class FreezeEngineRecoveryTests(unittest.TestCase):
         self.assertEqual(self.handler.executions, 1)
         self.assertEqual(self.services.seals, 1)
         self.assertEqual(self.services.commits, 1)
+
+    def test_real_freeze_handler_runs_as_one_diagnostic_stage(self) -> None:
+        scope = DiagnosticReplayScope.from_inputs(
+            "freeze",
+            self.command.input_artifacts,
+        )
+        command = StageCommand.create(
+            command_id="diagnostic-freeze",
+            run_id="diagnostic-freeze-run",
+            stage="freeze",
+            idempotency_key="diagnostic-freeze/run",
+            request=self.command.to_record()["request"],
+            input_artifacts=self.command.input_artifacts,
+            config_snapshot_sha256=self.command.config_snapshot_sha256,
+            contract_sha256=self.command.contract_sha256,
+            policy_sha256=self.command.policy_sha256,
+            expected_executor_sha256=self.command.expected_executor_sha256,
+            predecessor_decision_id=None,
+            diagnostic_scope=scope,
+        )
+        self.services.add(command)
+        result = execute_stage(
+            command_id=command.command_id,
+            handler=self.handler,
+            services=self.services,
+        )
+        self.assertIsInstance(result, StageResult)
+        self.assertEqual(result.outcome, "completed")
+        self.assertEqual(result.diagnostic_scope, scope)
+        self.assertEqual(self.handler.executions, 1)
 
     def test_same_key_with_another_request_is_refused(self) -> None:
         alternate = self.harness.command(

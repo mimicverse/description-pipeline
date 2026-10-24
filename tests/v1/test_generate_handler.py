@@ -259,6 +259,35 @@ class GenerateHandlerTests(unittest.TestCase):
             self.handler.execute(self.command, claim, workspace, effects=object())
         self.assertFalse((workspace.root / "output").exists())
 
+    def test_formal_generate_requires_a_predecessor_before_output(self) -> None:
+        workspace, claim = self._workspace("generate-no-predecessor", 1)
+        command = StageCommand.create(
+            command_id="generate-without-predecessor",
+            run_id="generate-without-predecessor-run",
+            stage="generate",
+            idempotency_key="generate-without-predecessor/run",
+            request=self.command.to_record()["request"],
+            input_artifacts=self.command.input_artifacts,
+            config_snapshot_sha256=self.command.config_snapshot_sha256,
+            contract_sha256=self.command.contract_sha256,
+            policy_sha256=self.command.policy_sha256,
+            expected_executor_sha256=self.command.expected_executor_sha256,
+            predecessor_decision_id=None,
+        )
+        claim = replace(
+            claim,
+            claim_id="generate-no-predecessor",
+            command_id=command.command_id,
+        )
+        with self.assertRaisesRegex(PipelineError, "predecessor_missing"):
+            self.handler.execute(
+                command,
+                claim,
+                workspace,
+                effects=object(),
+            )
+        self.assertFalse((workspace.root / "output").exists())
+
 
 class ProductionWarningTests(unittest.TestCase):
     def test_production_projection_reads_native_records_independently(self) -> None:

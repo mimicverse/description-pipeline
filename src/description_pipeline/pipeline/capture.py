@@ -1328,6 +1328,14 @@ class CaptureHandler:
         *,
         effects: StageEffectPort,
     ) -> StageExecution:
+        if (
+            command.predecessor_decision_id is None
+            and command.diagnostic_scope is None
+        ):
+            raise ProtocolError(
+                "capture.predecessor_missing",
+                {"command_id": command.command_id},
+            )
         request = CaptureRequest.from_command(command)
         inputs = CaptureInputs.resolve(command, workspace, request)
         upstream = _upstream_records(inputs)

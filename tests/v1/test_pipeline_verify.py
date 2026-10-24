@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +24,7 @@ from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
 import description_pipeline.pipeline.verify as pipeline_verify
 from description_pipeline.pipeline.contracts import (
+    DiagnosticReplayScope,
     ExecutionClaim,
     StageCandidate,
     StageCommand,
@@ -242,6 +244,74 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertFalse((output / "model").exists())
         self.assertFalse((self.generate_root / "input").exists())
         self.assertFalse((self.generate_root / "evidence").exists())
+
+    def test_real_verify_handler_runs_as_one_diagnostic_stage(self) -> None:
+        command, claim, workspace = self._verify_request()
+        scope = DiagnosticReplayScope.from_inputs(
+            "verify",
+            command.input_artifacts,
+        )
+        diagnostic = StageCommand.create(
+            command_id="diagnostic-verify",
+            run_id="diagnostic-verify-run",
+            stage="verify",
+            idempotency_key="diagnostic-verify/run",
+            request=command.to_record()["request"],
+            input_artifacts=command.input_artifacts,
+            config_snapshot_sha256=command.config_snapshot_sha256,
+            contract_sha256=command.contract_sha256,
+            policy_sha256=command.policy_sha256,
+            expected_executor_sha256=command.expected_executor_sha256,
+            predecessor_decision_id=None,
+            diagnostic_scope=scope,
+        )
+        diagnostic_claim = replace(
+            claim,
+            claim_id="diagnostic-verify-claim",
+            command_id=diagnostic.command_id,
+        )
+        execution = VerifyHandler(
+            identity_provider=hermetic._portable_tool,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        ).execute(
+            diagnostic,
+            diagnostic_claim,
+            workspace,
+            effects=NoExternalEffects(),
+        )
+        self.assertEqual(execution.outcome, "completed")
+        self.assertEqual(diagnostic.diagnostic_scope, scope)
+
+    def test_formal_verify_requires_a_predecessor_before_evaluation(self) -> None:
+        command, claim, workspace = self._verify_request()
+        formal = StageCommand.create(
+            command_id="verify-without-predecessor",
+            run_id="verify-without-predecessor-run",
+            stage="verify",
+            idempotency_key="verify-without-predecessor/run",
+            request=command.to_record()["request"],
+            input_artifacts=command.input_artifacts,
+            config_snapshot_sha256=command.config_snapshot_sha256,
+            contract_sha256=command.contract_sha256,
+            policy_sha256=command.policy_sha256,
+            expected_executor_sha256=command.expected_executor_sha256,
+            predecessor_decision_id=None,
+        )
+        formal_claim = replace(
+            claim,
+            claim_id="verify-no-predecessor",
+            command_id=formal.command_id,
+        )
+        with self.assertRaisesRegex(PipelineError, "predecessor_missing"):
+            VerifyHandler(
+                identity_provider=hermetic._portable_tool,
+            ).execute(
+                formal,
+                formal_claim,
+                workspace,
+                effects=NoExternalEffects(),
+            )
+        self.assertFalse((workspace.root / "output").exists())
 
     def test_identity_provider_record_drift_is_rejected_after_source_match(self) -> None:
         initial = hermetic._portable_tool()

@@ -221,7 +221,13 @@ def _bound_artifacts(command: StageCommand, request: Mapping[str, Any]) -> dict[
             )
         bound[role] = artifact
     freeze = bound["freeze"]
-    if freeze.producer_run_id != command.run_id or freeze.producer_stage != "freeze":
+    if (
+        freeze.producer_stage != "freeze"
+        or (
+            command.diagnostic_scope is None
+            and freeze.producer_run_id != command.run_id
+        )
+    ):
         raise NativeDiscoverRefusal("discover.freeze_binding_mismatch", "Freeze artifact belongs to another run")
     if bound["ruleset"].set_sha256 != request["ruleset_catalog_sha256"]:
         raise NativeDiscoverRefusal("discover.ruleset_binding_mismatch", "Ruleset artifact differs from the request")
@@ -367,7 +373,10 @@ class DiscoverHandler:
         try:
             if command.stage != "discover" or command.kind != "stage":
                 raise NativeDiscoverRefusal("discover.stage_invalid", "Command does not authorize Discover")
-            if command.predecessor_decision_id is None:
+            if (
+                command.predecessor_decision_id is None
+                and command.diagnostic_scope is None
+            ):
                 raise NativeDiscoverRefusal("discover.predecessor_invalid", "Discover requires Freeze predecessor")
             if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
                 raise NativeDiscoverRefusal("discover.claim_invalid", "Claim does not own this Discover command")

@@ -631,6 +631,14 @@ class VerifyHandler:
         effects: StageEffectPort,
     ) -> StageExecution:
         del effects
+        if (
+            command.predecessor_decision_id is None
+            and command.diagnostic_scope is None
+        ):
+            raise ProtocolError(
+                "verify.predecessor_missing",
+                {"command_id": command.command_id},
+            )
         if claim.command_id != command.command_id:
             raise ProtocolError("verify.claim_mismatch", {"command_id": command.command_id})
         request, roots = self.request_from_command(command, workspace)

@@ -1277,6 +1277,31 @@ class CaptureHandlerTests(unittest.TestCase):
             )
         )
 
+    def test_formal_capture_requires_a_predecessor_before_native_work(self) -> None:
+        command = StageCommand.create(
+            command_id="capture-without-predecessor",
+            run_id=CHILD,
+            stage="capture",
+            idempotency_key="capture-without-predecessor",
+            request=self.command.to_record()["request"],
+            input_artifacts=self.command.input_artifacts,
+            config_snapshot_sha256=self.command.config_snapshot_sha256,
+            contract_sha256=self.command.contract_sha256,
+            policy_sha256=self.command.policy_sha256,
+            expected_executor_sha256=self.command.expected_executor_sha256,
+            predecessor_decision_id=None,
+        )
+        claim = self._claim(command, "claim-capture-no-predecessor", fence=1)
+        operation = Mock(side_effect=AssertionError("Capture must not run"))
+        with self.assertRaisesRegex(Exception, "predecessor_missing"):
+            self.handler(native_operation=operation).execute(
+                command,
+                claim,
+                self.workspace(),
+                effects=self.effects(command, claim),
+            )
+        operation.assert_not_called()
+
     def test_capture_cannot_rebind_the_discover_native_requirement(self) -> None:
         operation = Mock()
         request = {
