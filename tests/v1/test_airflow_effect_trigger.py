@@ -342,13 +342,10 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                 "materialize",
                 side_effect=AssertionError("materialize must not be called"),
             ):
-                content, member, _manifest = (
-                    airflow_effect_trigger._read_small_member(
-                        artifacts,
-                        artifact,
-                        "request.json",
-                        max_bytes=1024,
-                    )
+                content, member, _manifest = artifacts.read_metadata_member(
+                    artifact,
+                    "request.json",
+                    max_bytes=1024,
                 )
         self.assertEqual(content, b'{"command_id":"command-capture"}')
         self.assertEqual(member["path"], "request.json")

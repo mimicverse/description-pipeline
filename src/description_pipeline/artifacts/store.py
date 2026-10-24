@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat
@@ -119,12 +120,35 @@ class ArtifactStore:
         manifest_path = target / MANIFEST_NAME
         if not manifest_path.is_file() or manifest_path.is_symlink():
             raise ArtifactStoreError("The artifact manifest is missing")
+        raw = manifest_path.read_bytes()
         record = read_data(manifest_path)
+        members = record.get("members") if isinstance(record, dict) else None
         if (
             not isinstance(record, dict)
             or record.get("schema_version") != MANIFEST_SCHEMA
             or record.get("artifact_id") != (artifact_id or target.name)
-            or not isinstance(record.get("members"), list)
+            or raw != canonical(record) + b"\n"
+            or not isinstance(members, list)
+            or any(
+                not isinstance(member, dict)
+                or set(member) != {"bytes", "path", "sha256"}
+                or type(member["bytes"]) is not int
+                or member["bytes"] < 0
+                or not isinstance(member["path"], str)
+                or not member["path"]
+                or not isinstance(member["sha256"], str)
+                for member in members
+            )
+            or len({member["path"] for member in members}) != len(members)
+            or digest({"members": members}) != record.get("set_sha256")
+            or digest(
+                {
+                    key: value
+                    for key, value in record.items()
+                    if key != "artifact_id"
+                }
+            )
+            != record["artifact_id"]
         ):
             raise ArtifactStoreError("The artifact manifest is not canonical")
         return record
@@ -168,6 +192,73 @@ class ArtifactStore:
         if artifact.locator != f"{LOCATOR_PREFIX}{artifact.artifact_id}":
             raise ArtifactStoreError("The artifact locator differs from its immutable id")
         return self._verify_root(artifact, self.objects / artifact.artifact_id)
+
+    def read_metadata_member(
+        self,
+        artifact: ArtifactRef,
+        member: str,
+        *,
+        max_bytes: int,
+    ) -> tuple[bytes, dict, dict]:
+        """Read one manifest-bound member without verifying unrelated payload bytes."""
+
+        if (
+            not isinstance(artifact, ArtifactRef)
+            or artifact.locator != f"{LOCATOR_PREFIX}{artifact.artifact_id}"
+        ):
+            raise ArtifactStoreError("The metadata artifact reference is invalid")
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ArtifactStoreError("The metadata member size limit is invalid")
+        if (
+            not isinstance(member, str)
+            or member == MANIFEST_NAME
+        ):
+            raise ArtifactStoreError("The metadata member path is invalid")
+        relative = PurePosixPath(member)
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ArtifactStoreError("The metadata member path is invalid")
+
+        root = self.objects / artifact.artifact_id
+        if root.is_symlink() or not root.is_dir():
+            raise ArtifactStoreError("The metadata artifact object is absent")
+        manifest_path = root / MANIFEST_NAME
+        record = self._manifest_at(root, artifact_id=artifact.artifact_id)
+        if self._ref(record, manifest_path) != artifact:
+            raise ArtifactStoreError("The metadata artifact reference differs from its manifest")
+
+        matches = [item for item in record["members"] if item["path"] == member]
+        if len(matches) != 1:
+            raise ArtifactStoreError("The metadata artifact member is not unique")
+        declared = matches[0]
+        size = declared["bytes"]
+        if size > max_bytes:
+            raise ArtifactStoreError("The metadata artifact member exceeds its size limit")
+
+        current = root
+        for part in relative.parts[:-1]:
+            current = current / part
+            if current.is_symlink() or not current.is_dir():
+                raise ArtifactStoreError("The metadata artifact member path is invalid")
+        path = root.joinpath(*relative.parts)
+        if path.is_symlink():
+            raise ArtifactStoreError("The metadata artifact member may not be a symbolic link")
+        try:
+            mode = path.stat().st_mode
+        except OSError as error:
+            raise ArtifactStoreError("The metadata artifact member is absent") from error
+        if not stat.S_ISREG(mode) or path.stat().st_size != size:
+            raise ArtifactStoreError("The metadata artifact member differs from its manifest")
+        content = path.read_bytes()
+        if (
+            len(content) != size
+            or hashlib.sha256(content).hexdigest() != declared["sha256"]
+        ):
+            raise ArtifactStoreError("The metadata artifact member bytes differ from its manifest")
+        return content, dict(declared), dict(record)
 
     def import_object(self, source_store: ArtifactStore, artifact: ArtifactRef) -> ArtifactRef:
         """Copy one verified source object without changing its manifest or producer identity."""

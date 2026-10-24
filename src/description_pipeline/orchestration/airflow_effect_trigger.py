@@ -3,28 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
-import stat
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from airflow.triggers.base import BaseTrigger, TriggerEvent
 
 from ..artifacts import ArtifactStore
-from ..io import canonical, digest, file_digest, parse_data
+from ..io import canonical, digest, parse_data
 from ..pipeline.contracts import (
-    ArtifactRef,
     StageCommand,
     StageEffectWait,
     StagePending,
 )
 from ..pipeline.effects import EffectIntent, EffectSettlement
 from ..platform.facts import FactStore
-from ..schemas import ARTIFACT_MANIFEST_SCHEMA
 
 if TYPE_CHECKING:
     from ..pipeline.application import EffectWakeupHint
@@ -51,112 +47,11 @@ def _minimum_poll_interval(value: float) -> float:
     return interval
 
 
-def _manifest_record(
-    artifacts: ArtifactStore,
-    artifact: ArtifactRef,
-) -> tuple[dict[str, Any], Path]:
-    """Validate the artifact manifest without hashing its large payload members."""
-
-    if artifact.locator != f"cas://artifact/{artifact.artifact_id}":
-        raise ValueError("The pending outbound artifact locator is invalid")
-    root = artifacts.objects / artifact.artifact_id
-    if root.is_symlink() or not root.is_dir():
-        raise ValueError("The pending outbound artifact is absent")
-    manifest_path = root / "manifest.json"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise ValueError("The pending outbound artifact has no regular manifest")
-    raw = manifest_path.read_bytes()
-    record = parse_data(raw, Path("manifest.json"))
-    if (
-        not isinstance(record, dict)
-        or raw != canonical(record) + b"\n"
-        or record.get("schema_version") != ARTIFACT_MANIFEST_SCHEMA
-        or record.get("artifact_id") != artifact.artifact_id
-        or record.get("kind") != artifact.kind
-        or record.get("set_sha256") != artifact.set_sha256
-        or record.get("producer")
-        != {
-            "run_id": artifact.producer_run_id,
-            "stage": artifact.producer_stage,
-            "tool_sha256": artifact.producer_tool_sha256,
-        }
-        or file_digest(manifest_path) != artifact.manifest_sha256
-    ):
-        raise ValueError("The pending outbound artifact manifest is inconsistent")
-    base = {key: value for key, value in record.items() if key != "artifact_id"}
-    if digest(base) != artifact.artifact_id:
-        raise ValueError("The pending outbound artifact identity is invalid")
-    members = record.get("members")
-    if (
-        not isinstance(members, list)
-        or digest({"members": members}) != artifact.set_sha256
-        or any(
-            not isinstance(member, dict)
-            or set(member) != {"bytes", "path", "sha256"}
-            or type(member["bytes"]) is not int
-            or member["bytes"] <= 0
-            or not isinstance(member["path"], str)
-            or not isinstance(member["sha256"], str)
-            for member in members
-        )
-    ):
-        raise ValueError("The pending outbound artifact member manifest is invalid")
-    return record, root
-
-
-def _member_record(
-    manifest: Mapping[str, Any],
-    member: str,
-) -> dict[str, Any]:
-    members = manifest.get("members")
-    if not isinstance(members, list):
-        raise ValueError("The artifact member manifest is invalid")
-    matches = [item for item in members if item.get("path") == member]
+def _declared_member(manifest: Mapping[str, Any], member: str) -> dict[str, Any]:
+    matches = [item for item in manifest["members"] if item["path"] == member]
     if len(matches) != 1:
-        raise ValueError(f"The artifact member {member!r} is not unique")
+        raise ValueError(f"The pending outbound artifact lacks one {member}")
     return matches[0]
-
-
-def _read_small_member(
-    artifacts: ArtifactStore,
-    artifact: ArtifactRef,
-    member: str,
-    *,
-    max_bytes: int,
-) -> tuple[bytes, dict[str, Any], dict[str, Any]]:
-    """Read one hash-bound metadata member without materializing its artifact."""
-
-    relative = PurePosixPath(member)
-    if (
-        not relative.parts
-        or relative.is_absolute()
-        or any(part in {"", ".", ".."} for part in relative.parts)
-        or member == "manifest.json"
-    ):
-        raise ValueError("The requested artifact member path is invalid")
-    manifest, root = _manifest_record(artifacts, artifact)
-    declared = _member_record(manifest, member)
-    size = declared.get("bytes")
-    if type(size) is not int or size <= 0 or size > max_bytes:
-        raise ValueError("The requested artifact member exceeds its metadata limit")
-    path = root.joinpath(*relative.parts)
-    if any(parent.is_symlink() for parent in path.parents if parent != root) or (
-        path.is_symlink()
-    ):
-        raise ValueError("The requested artifact member traverses a link")
-    try:
-        mode = path.stat().st_mode
-    except OSError as error:
-        raise ValueError("The requested artifact member is absent") from error
-    if not stat.S_ISREG(mode) or path.stat().st_size != size:
-        raise ValueError("The requested artifact member differs from its manifest")
-    content = path.read_bytes()
-    if (
-        len(content) != size
-        or hashlib.sha256(content).hexdigest() != declared.get("sha256")
-    ):
-        raise ValueError("The requested artifact member bytes differ from its manifest")
-    return content, declared, manifest
 
 
 def _load_effect_evidence(wait: StageEffectWait) -> _EffectEvidence:
@@ -238,8 +133,7 @@ def _native_expectation(
         raise ValueError("The pending native effect has no outbound artifact")
     command = evidence.command
     if command.stage == "capture":
-        raw, outbound_member, manifest = _read_small_member(
-            evidence.artifacts,
+        raw, outbound_member, manifest = evidence.artifacts.read_metadata_member(
             outbound,
             "outbound.json",
             max_bytes=MAX_OPERATION_JSON_BYTES,
@@ -251,7 +145,7 @@ def _native_expectation(
             or raw != canonical(record)
         ):
             raise ValueError("The Capture pending outbound metadata is invalid")
-        archive_member = _member_record(manifest, CAPTURE_INPUT_ARCHIVE)
+        archive_member = _declared_member(manifest, CAPTURE_INPUT_ARCHIVE)
         if (
             record.get("input_archive_sha256") != archive_member.get("sha256")
             or record.get("input_archive_bytes") != archive_member.get("bytes")
@@ -296,8 +190,7 @@ def _native_expectation(
         return CAPTURE_KIND, _expectation_from_operation(operation)
 
     if command.stage == "discover":
-        request_raw, _, manifest = _read_small_member(
-            evidence.artifacts,
+        request_raw, _, manifest = evidence.artifacts.read_metadata_member(
             outbound,
             "request.json",
             max_bytes=MAX_OPERATION_JSON_BYTES,
@@ -307,14 +200,13 @@ def _native_expectation(
         )
         if request_raw != canonical(request.to_record()):
             raise ValueError("The Discover pending request is not canonical")
-        source_raw, _, _ = _read_small_member(
-            evidence.artifacts,
+        source_raw, _, _ = evidence.artifacts.read_metadata_member(
             outbound,
             "source.json",
             max_bytes=MAX_OPERATION_JSON_BYTES,
         )
         source = parse_data(source_raw, Path("source.json"))
-        archive_member = _member_record(manifest, SOURCE_ARCHIVE)
+        archive_member = _declared_member(manifest, SOURCE_ARCHIVE)
         if (
             source
             != {

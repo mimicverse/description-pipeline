@@ -92,6 +92,70 @@ class ArtifactStoreTests(unittest.TestCase):
         with self.assertRaises(ArtifactStoreError):
             self.store.verify(artifact)
 
+    def test_metadata_member_read_skips_unrelated_payload_bytes(self) -> None:
+        source = self.source("metadata-source")
+        (source / "request.json").write_bytes(b"{}")
+        artifact = self.seal(source)
+        with patch.object(
+            self.store,
+            "_verify_root",
+            side_effect=AssertionError("full verification is not permitted"),
+        ):
+            content, member, manifest = self.store.read_metadata_member(
+                artifact,
+                "request.json",
+                max_bytes=1024,
+            )
+        self.assertEqual(content, b"{}")
+        self.assertEqual(member["path"], "request.json")
+        self.assertIn("b.bin", {item["path"] for item in manifest["members"]})
+
+        (self.store.objects / artifact.artifact_id / "b.bin").write_bytes(
+            b"changed-large-payload"
+        )
+        self.assertEqual(
+            self.store.read_metadata_member(
+                artifact,
+                "request.json",
+                max_bytes=1024,
+            )[0],
+            b"{}",
+        )
+        with self.assertRaises(ArtifactStoreError):
+            self.store.verify(artifact)
+
+    def test_metadata_member_read_allows_an_empty_file(self) -> None:
+        source = self.source("empty-metadata-source")
+        (source / "empty.json").write_bytes(b"")
+        artifact = self.seal(source)
+        content, member, _manifest = self.store.read_metadata_member(
+            artifact,
+            "empty.json",
+            max_bytes=0,
+        )
+        self.assertEqual(content, b"")
+        self.assertEqual(member["bytes"], 0)
+
+    def test_metadata_member_read_rejects_unsafe_or_tampered_member(self) -> None:
+        source = self.source("unsafe-metadata-source")
+        (source / "request.json").write_bytes(b"{}")
+        artifact = self.seal(source)
+        for member in ("", ".", "../request.json", "/request.json", "manifest.json"):
+            with self.subTest(member=member), self.assertRaises(ArtifactStoreError):
+                self.store.read_metadata_member(
+                    artifact,
+                    member,
+                    max_bytes=1024,
+                )
+        request = self.store.objects / artifact.artifact_id / "request.json"
+        request.write_bytes(b'{"tampered":true}')
+        with self.assertRaises(ArtifactStoreError):
+            self.store.read_metadata_member(
+                artifact,
+                "request.json",
+                max_bytes=1024,
+            )
+
     def test_symlink_member_is_rejected(self) -> None:
         source = self.source("source")
         try:
