@@ -366,7 +366,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
         }
         session_paths = []
     preparation = {
-        "schema_version": "solidworks-to-urdf.capture-preparation/v2",
+        "schema_version": "solidworks-to-urdf.capture-preparation/v3",
         "used_api": "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
         "scope": "collected_copy_in_memory",
         "document": TOP,
@@ -623,6 +623,7 @@ def dynamic_child_payload() -> dict:
 def recovery_payload(
     *,
     before_configuration_needs_rebuild: bool = False,
+    dynamic_parent: bool = False,
 ) -> dict:
     """A real native recovery preparation consumed by the independent verifier."""
 
@@ -635,7 +636,26 @@ def recovery_payload(
 
     top_path = r"C:\capture\prepared\robot.SLDASM"
     child_path = r"C:\capture\prepared\child.SLDASM"
-    old_child = _Doc(child_path, needs_rebuild2=1)
+    grandchild_path = r"C:\capture\prepared\grandchild.SLDASM"
+    if dynamic_parent:
+        old_grandchild = _Doc(grandchild_path, needs_rebuild2=1)
+        old_child = _Doc(
+            child_path,
+            children=[_Component("child-1/grandchild-1", old_grandchild)],
+        )
+        old_grandchild._rebuild_callback = lambda: setattr(
+            old_child,
+            "needs_rebuild2",
+            1,
+        )
+        old_first_refresh = {
+            top_path: None,
+            child_path: old_child,
+            grandchild_path: old_grandchild,
+        }
+    else:
+        old_child = _Doc(child_path, needs_rebuild2=1)
+        old_first_refresh = {top_path: None, child_path: old_child}
     old_top = _Doc(
         top_path,
         configuration_needs_rebuild=before_configuration_needs_rebuild,
@@ -649,7 +669,25 @@ def recovery_payload(
             "_configuration_needs_rebuild",
             False,
         )
-    fresh_child = _Doc(child_path, needs_rebuild2=1)
+    if dynamic_parent:
+        fresh_grandchild = _Doc(grandchild_path, needs_rebuild2=1)
+        fresh_child = _Doc(
+            child_path,
+            children=[_Component("child-1/grandchild-1", fresh_grandchild)],
+        )
+        fresh_grandchild._rebuild_callback = lambda: setattr(
+            fresh_child,
+            "needs_rebuild2",
+            1,
+        )
+        fresh_second_refresh = {
+            top_path: None,
+            child_path: fresh_child,
+            grandchild_path: fresh_grandchild,
+        }
+    else:
+        fresh_child = _Doc(child_path, needs_rebuild2=1)
+        fresh_second_refresh = {top_path: None, child_path: fresh_child}
     fresh_top = _Doc(
         top_path,
         needs_rebuild2=1,
@@ -661,8 +699,8 @@ def recovery_payload(
         0,
     )
     backend = _RecoveryBackend(
-        {top_path: old_top, child_path: old_child},
-        {top_path: fresh_top, child_path: fresh_child},
+        {**old_first_refresh, top_path: old_top},
+        {**fresh_second_refresh, top_path: fresh_top},
     )
     with patch.object(native, "_hash", return_value="a" * 64):
         _, preparation = backend._rebuild_capture_copy(old_top, top_path)
@@ -699,6 +737,9 @@ def recovery_payload(
     preparation["session_recovery"]["fresh_session"][
         "identity"
     ] = copy.deepcopy(fresh_identity)
+    preparation["session_recovery"]["fresh_attempt"]["session"][
+        "identity"
+    ] = copy.deepcopy(fresh_identity)
     retirement = preparation["session_recovery"]["retirement"]
     retirement["before"] = copy.deepcopy(old_identity)
     retirement["after"] = recovery_identity(
@@ -713,17 +754,28 @@ def recovery_payload(
     for name in ("topology_before", "topology_after"):
         for row in preparation[name]:
             row["normalized_path"] = _normalized(row["document_path"])
-    first_attempt = preparation["session_recovery"]["first_attempt"]
-    for row in first_attempt["topology"]:
-        row["normalized_path"] = _normalized(row["document_path"])
-    first_attempt["source_files"] = {
-        _normalized(row["path"]): row
-        for row in first_attempt["source_files"].values()
-    }
-    first_attempt["loaded_documents"] = _loaded_document_signature(
-        first_attempt["topology"],
-        first_attempt["source_files"],
+    attempt_evidence = (
+        preparation["session_recovery"]["first_attempt"],
+        preparation["session_recovery"]["fresh_attempt"],
     )
+    for attempt in attempt_evidence:
+        for row in attempt["topology"]:
+            row["normalized_path"] = _normalized(row["document_path"])
+        attempt["source_files"] = {
+            _normalized(row["path"]): row
+            for row in attempt["source_files"].values()
+        }
+        attempt["loaded_documents"] = _loaded_document_signature(
+            attempt["topology"],
+            attempt["source_files"],
+        )
+        for row in attempt["assembly_states"]:
+            row["path"] = ntpath.abspath(row["path"])
+        for field in ("initial_pending", "rebuild_candidates"):
+            attempt[field] = sorted(
+                _normalized(path) for path in attempt[field]
+            )
+    first_attempt = attempt_evidence[0]
     for journal in (
         first_attempt["rebuild_calls"],
         preparation["rebuild_calls"],
@@ -786,6 +838,81 @@ def recovery_payload(
 
     before_recovery_environment = recovery_environment(old_identity)
     final_environment = recovery_environment(fresh_identity)
+    copy_files = {
+        "source/robot.SLDASM": source_hashes[_normalized(top_path)],
+        "source/child.SLDASM": source_hashes[_normalized(child_path)],
+    }
+    mapping = [
+        {
+            "instance": "top_level",
+            "source": r"C:\stage\cad\robot.SLDASM",
+            "copy": "source/robot.SLDASM",
+            "source_sha256": source_hashes[_normalized(top_path)],
+            "copy_sha256": source_hashes[_normalized(top_path)],
+        },
+        {
+            "instance": "child-1",
+            "source": r"C:\stage\cad\child.SLDASM",
+            "copy": "source/child.SLDASM",
+            "source_sha256": source_hashes[_normalized(child_path)],
+            "copy_sha256": source_hashes[_normalized(child_path)],
+        },
+    ]
+    components = [
+        {
+            "instance_id": "child-1",
+            "document": r"cad\child.SLDASM",
+            "configuration": "默认",
+            "suppressed": False,
+            "suppression_state": 2,
+        }
+    ]
+    selection_documents = {
+        "cad/robot.SLDASM": {
+            "resolved_edges": [
+                {
+                    "instance": "child-1",
+                    "resolved": r"cad\child.SLDASM",
+                    "configuration": "默认",
+                    "suppression_state": 2,
+                }
+            ]
+        },
+        "cad/child.SLDASM": {"resolved_edges": []},
+    }
+    if dynamic_parent:
+        copy_files["source/grandchild.SLDASM"] = source_hashes[
+            _normalized(grandchild_path)
+        ]
+        mapping.append(
+            {
+                "instance": "child-1/grandchild-1",
+                "source": r"C:\stage\cad\grandchild.SLDASM",
+                "copy": "source/grandchild.SLDASM",
+                "source_sha256": source_hashes[_normalized(grandchild_path)],
+                "copy_sha256": source_hashes[_normalized(grandchild_path)],
+            }
+        )
+        components.append(
+            {
+                "instance_id": "child-1/grandchild-1",
+                "document": r"cad\grandchild.SLDASM",
+                "configuration": "默认",
+                "suppressed": False,
+                "suppression_state": 2,
+            }
+        )
+        selection_documents["cad/child.SLDASM"]["resolved_edges"] = [
+            {
+                "instance": "child-1/grandchild-1",
+                "resolved": r"cad\grandchild.SLDASM",
+                "configuration": "默认",
+                "suppression_state": 2,
+            }
+        ]
+        selection_documents["cad/grandchild.SLDASM"] = {
+            "resolved_edges": []
+        }
     return {
         "environment": final_environment,
         "scene": {
@@ -796,55 +923,17 @@ def recovery_payload(
         "closure": {
             "top_level": top_path,
             "configuration": "默认",
-            "copy_files": {
-                "source/robot.SLDASM": source_hashes[_normalized(top_path)],
-                "source/child.SLDASM": source_hashes[_normalized(child_path)],
-            },
-            "mapping": [
-                {
-                    "instance": "top_level",
-                    "source": r"C:\stage\cad\robot.SLDASM",
-                    "copy": "source/robot.SLDASM",
-                    "source_sha256": source_hashes[_normalized(top_path)],
-                    "copy_sha256": source_hashes[_normalized(top_path)],
-                },
-                {
-                    "instance": "child-1",
-                    "source": r"C:\stage\cad\child.SLDASM",
-                    "copy": "source/child.SLDASM",
-                    "source_sha256": source_hashes[_normalized(child_path)],
-                    "copy_sha256": source_hashes[_normalized(child_path)],
-                },
-            ],
+            "copy_files": copy_files,
+            "mapping": mapping,
         },
         "discovery": {
             "raw": {
                 "identity": {"main_assembly": "cad/robot.SLDASM"},
-                "components": [
-                    {
-                        "instance_id": "child-1",
-                        "document": r"cad\child.SLDASM",
-                        "configuration": "默认",
-                        "suppressed": False,
-                        "suppression_state": 2,
-                    }
-                ],
+                "components": components,
                 "source_selection": {
                     "main_assembly": "cad/robot.SLDASM",
                     "closure": {
-                        "documents": {
-                            "cad/robot.SLDASM": {
-                                "resolved_edges": [
-                                    {
-                                        "instance": "child-1",
-                                        "resolved": r"cad\child.SLDASM",
-                                        "configuration": "默认",
-                                        "suppression_state": 2,
-                                    }
-                                ]
-                            },
-                            "cad/child.SLDASM": {"resolved_edges": []},
-                        },
+                        "documents": selection_documents,
                         "virtual_components": [],
                         "imports": [],
                         "suppressed": [],
@@ -1219,6 +1308,13 @@ class CapturePreparationTests(unittest.TestCase):
         value = recovery_payload()
         preparation = self.preparation(value)
         self.assertIsNotNone(preparation["session_recovery"])
+        self.assertIsNotNone(
+            preparation["session_recovery"]["fresh_attempt"]
+        )
+        self.assertEqual(
+            len(preparation["session_recovery"]["first_attempt"]["assembly_states"]),
+            2,
+        )
         result = self.validate(value)
         self.assertEqual(result["needs_rebuild2_after"], 0)
         self.assertEqual(result["final_document_count"], 2)
@@ -1260,6 +1356,36 @@ class CapturePreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "different source bytes"):
             self.validate(value)
 
+    def test_recovery_consumer_rejects_fresh_attempt_source_drift(self) -> None:
+        value = recovery_payload()
+        fresh_attempt = self.preparation(value)["session_recovery"][
+            "fresh_attempt"
+        ]
+        source = next(iter(fresh_attempt["source_files"].values()))
+        source["sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            PipelineError,
+            "fresh attempt changed the finalized source or graph",
+        ):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_fresh_attempt_topology_drift(self) -> None:
+        value = recovery_payload()
+        fresh_attempt = self.preparation(value)["session_recovery"][
+            "fresh_attempt"
+        ]
+        child = next(
+            row
+            for row in fresh_attempt["topology"]
+            if row["instance"] == "child-1"
+        )
+        child["instance"] = "child-other"
+        with self.assertRaisesRegex(
+            PipelineError,
+            "assembly state contradicts its topology",
+        ):
+            self.validate(value)
+
     def test_recovery_consumer_rejects_pre_environment_pid_drift(self) -> None:
         value = recovery_payload()
         before = value["document_states"][
@@ -1278,7 +1404,10 @@ class CapturePreparationTests(unittest.TestCase):
             if row["instance"] == "child-1"
         )
         child["instance"] = "child-other"
-        with self.assertRaisesRegex(PipelineError, "changed native topology"):
+        with self.assertRaisesRegex(
+            PipelineError,
+            "assembly state contradicts its topology",
+        ):
             self.validate(value)
 
     def test_recovery_consumer_rejects_first_attempt_loaded_drift(self) -> None:
@@ -1304,7 +1433,7 @@ class CapturePreparationTests(unittest.TestCase):
             (
                 "missing_candidate",
                 lambda journal: journal[0].update(rebuild_candidates=[]),
-                "exact dirty ancestor closure",
+                "no exact dirty closure",
             ),
             (
                 "extra_candidate",
@@ -1316,7 +1445,7 @@ class CapturePreparationTests(unittest.TestCase):
                         ]
                     )
                 ),
-                "exact dirty ancestor closure",
+                "no exact dirty closure",
             ),
             (
                 "top_initial_pending",
@@ -1336,7 +1465,7 @@ class CapturePreparationTests(unittest.TestCase):
                         ),
                     )
                 ),
-                "top cannot be an initial pending candidate",
+                "no exact dirty closure",
             ),
             (
                 "pending_decision",
@@ -1386,6 +1515,44 @@ class CapturePreparationTests(unittest.TestCase):
                 mutate(journal)
                 with self.assertRaisesRegex(PipelineError, pattern):
                     self.validate(value)
+
+    def test_recovery_consumer_rejects_a_premutation_state_change(self) -> None:
+        value = recovery_payload()
+        journal = self.preparation(value)["session_recovery"]["first_attempt"][
+            "rebuild_calls"
+        ]
+        journal[1]["decision"] = "skip_clean"
+        journal[1]["state"]["needs_rebuild2_value"] = 0
+        del journal[2]
+        journal[2]["sequence"] = 2
+        with self.assertRaisesRegex(
+            PipelineError,
+            "changed before the first child rebuild",
+        ):
+            self.validate(value)
+
+    def test_recovery_consumer_accepts_a_parent_dirtied_by_its_child(self) -> None:
+        value = recovery_payload(dynamic_parent=True)
+        result = self.validate(value)
+        self.assertEqual(result["rebuilt_document_count"], 3)
+        self.assertEqual(result["assembly_document_count"], 3)
+
+    def test_recovery_consumer_derives_first_dirty_closure_from_states(self) -> None:
+        value = recovery_payload()
+        first_attempt = self.preparation(value)["session_recovery"][
+            "first_attempt"
+        ]
+        child_state = next(
+            row
+            for row in first_attempt["assembly_states"]
+            if row["path"].casefold().endswith("child.sldasm")
+        )
+        child_state["state"]["needs_rebuild2_value"] = 0
+        with self.assertRaisesRegex(
+            PipelineError,
+            "initial_pending differs from its live assembly states",
+        ):
+            self.validate(value)
 
     def test_recovery_consumer_rejects_an_unclean_retirement(self) -> None:
         value = recovery_payload()
@@ -1500,6 +1667,20 @@ class CapturePreparationTests(unittest.TestCase):
         preparation["top_rebuild"] = None
         preparation["rebuild_calls"] = preparation["rebuild_calls"][:-1]
         with self.assertRaisesRegex(PipelineError, "Top state changed"):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_skipping_the_fresh_pending_child(self) -> None:
+        value = recovery_payload()
+        preparation = self.preparation(value)
+        preparation["rebuild_calls"][1]["decision"] = "skip_clean"
+        del preparation["rebuild_calls"][2]
+        preparation["child_rebuilds"] = []
+        preparation["top_rebuild"]["call_sequence"] = 2
+        preparation["rebuild_calls"][2]["sequence"] = 2
+        with self.assertRaisesRegex(
+            PipelineError,
+            "pending candidate has no recorded child-first rebuild",
+        ):
             self.validate(value)
 
     def test_windows_session_producer_crosses_the_linux_consumer_with_owned_rematerialization(self) -> None:

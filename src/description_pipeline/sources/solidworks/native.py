@@ -5735,6 +5735,89 @@ class SolidWorksBackend(CadBackend):
             "state_after": after,
         }
 
+    def _capture_rebuild_pending_children(self, graph, *, document):
+        """Rebuild one live dirty-ancestor pass and refresh the top handle."""
+
+        top = self._capture_graph_top_row(graph)
+        child_rebuilds = []
+        rebuild_candidates = set(graph["rebuild_candidates"])
+        for row in graph["assemblies"]:
+            # A sibling rebuild may dirty unrelated top-level assemblies. Those
+            # are outside the initial dirty-ancestor closure and belong to the
+            # bounded top pass rather than a repeatable child cascade.
+            if (
+                row is top
+                or row["normalized_path"] not in rebuild_candidates
+            ):
+                continue
+            child_doc, state_before = self._capture_rebuild_state(
+                row["path"],
+                phase="before_child",
+            )
+            row["state_before"] = state_before
+            self._capture_rebuild_journal.append(
+                {
+                    "sequence": len(self._capture_rebuild_journal),
+                    "kind": "candidate",
+                    "path": row["path"],
+                    "depth": row["depth"],
+                    "required_configurations": list(
+                        self._capture_required_configurations[
+                            row["normalized_path"]
+                        ]
+                    ),
+                    "state": copy.deepcopy(state_before),
+                    "decision": (
+                        "rebuild"
+                        if state_before["needs_rebuild2_value"] in (1, 2)
+                        else "skip_clean"
+                    ),
+                }
+            )
+            if state_before["needs_rebuild2_value"] not in (1, 2):
+                continue
+            _, after, evidence = self._rebuild_capture_document(
+                row,
+                phase="child",
+                document=child_doc,
+            )
+            row["state_after"] = after
+            child_rebuilds.append(evidence)
+
+        if child_rebuilds:
+            document, state_after_children = self._capture_rebuild_state(
+                top["path"],
+                phase="after_children",
+            )
+        else:
+            _, state_after_children = self._capture_rebuild_state(
+                top["path"],
+                document=document,
+                phase="after_children",
+            )
+        return document, state_after_children, child_rebuilds
+
+    def _capture_rebuild_attempt_evidence(self, graph, session):
+        """Freeze one session's graph, source bytes, and initial live states."""
+
+        return {
+            "session": copy.deepcopy(session),
+            "source_files": copy.deepcopy(graph["source_files"]),
+            "topology": copy.deepcopy(graph["topology"]),
+            "loaded_documents": self._capture_loaded_document_signature(graph),
+            "assembly_states": [
+                {
+                    "depth": row["depth"],
+                    "path": row["path"],
+                    "instances": list(row["instances"]),
+                    "state": copy.deepcopy(row["initial_state"]),
+                }
+                for row in graph["assemblies"]
+            ],
+            "initial_pending": list(graph["initial_pending_children"]),
+            "rebuild_candidates": list(graph["rebuild_candidates"]),
+        }
+
     @staticmethod
     def _capture_session_pid(identity, label):
         if (
@@ -5751,11 +5834,10 @@ class SolidWorksBackend(CadBackend):
         *,
         graph,
         path,
-        state_after_children,
         child_rebuilds,
         failure,
     ):
-        """Retry one sticky top rebuild in a proven fresh owned session."""
+        """Repeat one bounded live rebuild pass in a proven fresh session."""
 
         detail = failure.detail if isinstance(failure.detail, dict) else {}
         top = self._capture_graph_top_row(graph)
@@ -5782,19 +5864,18 @@ class SolidWorksBackend(CadBackend):
             old_session["identity"],
             "retired capture session",
         )
-        first_attempt = {
-            "session": old_session,
-            "rebuild_calls": first_journal,
-            "source_files": copy.deepcopy(graph["source_files"]),
-            "topology": copy.deepcopy(graph["topology"]),
-            "loaded_documents": self._capture_loaded_document_signature(graph),
-        }
+        first_attempt = self._capture_rebuild_attempt_evidence(
+            graph,
+            old_session,
+        )
+        first_attempt["rebuild_calls"] = first_journal
 
         recovery = {
             "schema_version": (
-                "solidworks-to-urdf.rebuild-session-recovery/v2"
+                "solidworks-to-urdf.rebuild-session-recovery/v3"
             ),
             "first_attempt": first_attempt,
+            "fresh_attempt": None,
             "retirement": None,
             "reopen": None,
             "fresh_session": None,
@@ -5829,8 +5910,34 @@ class SolidWorksBackend(CadBackend):
                 raise ValueError(
                     "the fresh capture session reused the retired process"
                 )
+            recovery["fresh_attempt"] = {
+                "session": copy.deepcopy(fresh_session),
+                "phase": "graph",
+                "loaded_inventory": None,
+                "error": None,
+            }
             fresh_document = self._document_handle_by_path(path)
-            fresh_graph = self._capture_rebuild_graph(fresh_document, path)
+            try:
+                recovery["fresh_attempt"]["loaded_inventory"] = [
+                    {
+                        "path": row["path"],
+                        "document_type": row["document_type"],
+                    }
+                    for row in self._capture_loaded_documents()
+                ]
+                fresh_graph = self._capture_rebuild_graph(fresh_document, path)
+            except Exception as error:
+                recovery["fresh_attempt"]["error"] = {
+                    "type": type(error).__name__,
+                    "code": str(getattr(error, "code", "") or ""),
+                    "message": str(
+                        getattr(error, "message", "") or str(error)
+                    )[:500],
+                    "detail": copy.deepcopy(
+                        getattr(error, "detail", None)
+                    ),
+                }
+                raise
             fresh_session = self._capture_session_evidence(path)
             recovery["fresh_session"] = fresh_session
             if fresh_session["identity"]["pid"] != fresh_pid:
@@ -5846,6 +5953,12 @@ class SolidWorksBackend(CadBackend):
                 )
             fresh_top = self._capture_graph_top_row(fresh_graph)
             fresh_state = fresh_top["initial_state"]
+            recovery["fresh_attempt"] = (
+                self._capture_rebuild_attempt_evidence(
+                    fresh_graph,
+                    fresh_session,
+                )
+            )
             source_unchanged = fresh_graph["source_files"] == graph["source_files"]
             topology_unchanged = (
                 self._capture_stable_topology(fresh_graph["topology"])
@@ -5867,18 +5980,30 @@ class SolidWorksBackend(CadBackend):
                 fresh_state.get("configuration")
                 == top["initial_state"].get("configuration")
             )
-            if (
-                fresh_state.get("read_only") is not True
-                or not source_unchanged
-                or not topology_unchanged
-                or not session_files_unchanged
-                or not loaded_documents_unchanged
-                or not configuration_unchanged
-                or fresh_graph["component_count"] != graph["component_count"]
-            ):
-                raise ValueError(
-                    "the fresh capture session changed source, topology, "
-                    "configuration, or read-only state"
+            invariants = {
+                "read_only": fresh_state.get("read_only") is True,
+                "source_unchanged": source_unchanged,
+                "topology_unchanged": topology_unchanged,
+                "session_files_unchanged": session_files_unchanged,
+                "loaded_documents_unchanged": loaded_documents_unchanged,
+                "configuration_unchanged": configuration_unchanged,
+                "component_count_unchanged": (
+                    fresh_graph["component_count"] == graph["component_count"]
+                ),
+            }
+            violations = sorted(
+                name for name, passed in invariants.items() if not passed
+            )
+            if violations:
+                raise CadError(
+                    "cad_rebuild_recovery_invariant",
+                    "The fresh rebuild session changed a required invariant",
+                    {
+                        "path": path,
+                        "violations": violations,
+                        "first_session": old_session["identity"],
+                        "fresh_session": fresh_session["identity"],
+                    },
                 )
 
             self._capture_bind_graph(fresh_graph, path)
@@ -5893,25 +6018,14 @@ class SolidWorksBackend(CadBackend):
                     ),
                 }
             ]
-            fresh_by_key = {
-                row["normalized_path"]: row
-                for row in fresh_graph["assemblies"]
-            }
-            for key in sorted(fresh_graph["rebuild_candidates"]):
-                row = fresh_by_key[key]
-                self._capture_rebuild_journal.append(
-                    {
-                        "sequence": len(self._capture_rebuild_journal),
-                        "kind": "candidate",
-                        "path": row["path"],
-                        "depth": row["depth"],
-                        "required_configurations": list(
-                            self._capture_required_configurations[key]
-                        ),
-                        "state": copy.deepcopy(row["initial_state"]),
-                        "decision": "recovery_defer_to_top",
-                    }
-                )
+            (
+                fresh_document,
+                fresh_state,
+                fresh_child_rebuilds,
+            ) = self._capture_rebuild_pending_children(
+                fresh_graph,
+                document=fresh_document,
+            )
 
             fresh_top_row = {
                 **fresh_top,
@@ -5958,7 +6072,14 @@ class SolidWorksBackend(CadBackend):
                 },
             ) from error
 
-        return fresh_document, fresh_graph, recovery, fresh_top_rebuild
+        return (
+            fresh_document,
+            fresh_graph,
+            recovery,
+            fresh_top_rebuild,
+            fresh_child_rebuilds,
+            fresh_state,
+        )
 
     def _rebuild_capture_copy(self, doc, path):
         self._capture_rebuild_journal = []
@@ -5984,49 +6105,12 @@ class SolidWorksBackend(CadBackend):
             )
         source_sha256_before = graph["source_files"][graph["normalized_top"]]["sha256"]
 
-        child_rebuilds = []
-        rebuild_candidates = set(graph["rebuild_candidates"])
-        for row in assemblies:
-            if row is top:
-                continue
-            if row["normalized_path"] not in rebuild_candidates:
-                # A sibling rebuild can dirty unrelated top-level assemblies.
-                # Those are not descendants of the initially dirty closure and
-                # must be cleared by the top rebuild instead of cascading.
-                continue
-            child_doc, state_before_child = self._capture_rebuild_state(row["path"], phase="before_child")
-            row["state_before"] = state_before_child
-            self._capture_rebuild_journal.append(
-                {
-                    "sequence": len(self._capture_rebuild_journal),
-                    "kind": "candidate",
-                    "path": row["path"],
-                    "depth": row["depth"],
-                    "required_configurations": list(self._capture_required_configurations[row["normalized_path"]]),
-                    "state": copy.deepcopy(state_before_child),
-                    "decision": (
-                        "rebuild" if state_before_child["needs_rebuild2_value"] in (1, 2) else "skip_clean"
-                    ),
-                }
-            )
-            if state_before_child["needs_rebuild2_value"] not in (1, 2):
-                continue
-            _, after, evidence = self._rebuild_capture_document(
-                row,
-                phase="child",
-                document=child_doc,
-            )
-            row["state_after"] = after
-            child_rebuilds.append(evidence)
-
-        if child_rebuilds:
-            doc, state_after_children = self._capture_rebuild_state(path, phase="after_children")
-        else:
-            _, state_after_children = self._capture_rebuild_state(
-                path,
+        doc, state_after_children, child_rebuilds = (
+            self._capture_rebuild_pending_children(
+                graph,
                 document=doc,
-                phase="after_children",
             )
+        )
         top_row = {**top, "state_before": state_after_children}
         top_rebuild = None
         recovery = None
@@ -6040,14 +6124,18 @@ class SolidWorksBackend(CadBackend):
                     )
                 )
             except CadError as error:
-                doc, graph, recovery, top_rebuild = (
-                    self._capture_recover_top_rebuild(
-                        graph=graph,
-                        path=path,
-                        state_after_children=state_after_children,
-                        child_rebuilds=child_rebuilds,
-                        failure=error,
-                    )
+                (
+                    doc,
+                    graph,
+                    recovery,
+                    top_rebuild,
+                    child_rebuilds,
+                    state_after_children,
+                ) = self._capture_recover_top_rebuild(
+                    graph=graph,
+                    path=path,
+                    child_rebuilds=child_rebuilds,
+                    failure=error,
                 )
                 assemblies = graph["assemblies"]
                 top = self._capture_graph_top_row(graph)
@@ -6057,10 +6145,6 @@ class SolidWorksBackend(CadBackend):
                 source_sha256_before = graph["source_files"][
                     graph["normalized_top"]
                 ]["sha256"]
-                child_rebuilds = []
-                state_after_children = copy.deepcopy(
-                    top["initial_state"]
-                )
         else:
             doc, _top_final_state = self._capture_rebuild_state(
                 path,
@@ -6234,7 +6318,7 @@ class SolidWorksBackend(CadBackend):
             or top_rebuild is not None
         )
         return doc, {
-            "schema_version": "solidworks-to-urdf.capture-preparation/v2",
+            "schema_version": "solidworks-to-urdf.capture-preparation/v3",
             "used_api": (
                 "IModelDocExtension.NeedsRebuild2/"
                 "IConfiguration.NeedsRebuild/"
