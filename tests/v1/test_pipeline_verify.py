@@ -62,7 +62,7 @@ PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / 
 
 class PipelineVerifyHandlerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = hermetic.HermeticSixStageTests(methodName="runTest")
+        self.fixture = hermetic.HermeticNativeFixture()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.directory = tempfile.TemporaryDirectory(prefix="verify-generate-pair-")
@@ -99,23 +99,19 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             expected_executor_sha256=self.generate_executor,
             predecessor_decision_id="capture-decision",
         )
-        with patch(
-            "description_pipeline.steps.generate_model",
-            side_effect=AssertionError("legacy Generate path must not run"),
-        ):
-            generated = GenerateHandler(self.store).execute(
+        generated = GenerateHandler(self.store).execute(
+            self.generator_command,
+            self._claim(
                 self.generator_command,
-                self._claim(
-                    self.generator_command,
-                    owner=digest({"process": "generate"}),
-                    executor=self.generate_executor,
-                ),
-                StageWorkspace(
-                    root=self.root / "generate-attempt",
-                    inputs={self.capture_ref.artifact_id: self.capture_root},
-                ),
-                effects=NoExternalEffects(),
-            )
+                owner=digest({"process": "generate"}),
+                executor=self.generate_executor,
+            ),
+            StageWorkspace(
+                root=self.root / "generate-attempt",
+                inputs={self.capture_ref.artifact_id: self.capture_root},
+            ),
+            effects=NoExternalEffects(),
+        )
         self.generate_source = Path(generated.candidate_root)
         self.generate_ref = self.store.seal_tree(
             self.generate_source,
@@ -192,16 +188,10 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
 
     def _run_verify(self, generate_ref=None):
         command, claim, workspace = self._verify_request(generate_ref)
-        with (
-            patch(
-                "description_pipeline.steps.verify_delivery",
-                side_effect=AssertionError("legacy Verify path must not run"),
-            ),
-        ):
-            execution = VerifyHandler(
-                identity_provider=hermetic._portable_tool,
-                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
-            ).execute(command, claim, workspace, effects=NoExternalEffects())
+        execution = VerifyHandler(
+            identity_provider=hermetic._portable_tool,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        ).execute(command, claim, workspace, effects=NoExternalEffects())
         output = Path(execution.candidate_root)
         return (
             command,

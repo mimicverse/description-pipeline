@@ -7,16 +7,10 @@ verifier retain their own rules. No step is an Airflow polling operation.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
 
-from .delivery import read_delivery_manifest, subject_digest, subject_inventory
 from .interface_records import PURPOSE_ENGINEERING, REQUEST_PURPOSES
-from .io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
-from .native_transfer import load_native_receipts
-from .runtime import tool_record
-from .sources.snapshot import verify_snapshot
+from .io import PipelineError, confined, digest, file_digest, inventory, read_data
 from .sources.solidworks.revision import package_inventory
 from .stages import checked
 
@@ -270,139 +264,4 @@ def inspect_prepared_input(package: Path) -> dict:
     report["input_receipt"] = {
         "inventory": dict(sorted(receipt.items())),
     }
-    return report
-
-
-def _snapshot_details(staging, manifest):
-    manifest_path = staging / "evidence/manifest.json"
-    raw = manifest_path.read_bytes()
-    try:
-        parsed = json.loads(raw)
-    except ValueError as error:
-        raise PipelineError(f"Evidence manifest is not readable JSON: {error}") from error
-    if parsed != manifest:
-        raise PipelineError("Evidence manifest changed after verification")
-    manifest_hash = hashlib.sha256(raw).hexdigest()
-    return {
-        "manifest_sha256": manifest_hash,
-        "files": {
-            "evidence/manifest.json": manifest_hash,
-            **{"evidence/" + path: checksum for path, checksum in manifest["files"].items()},
-        },
-    }
-
-
-def generate_model(staging: Path, definition: dict, input_report: dict, *, on_event=None) -> str:
-    """Generate one canonical model and bind every derived file before independent checking."""
-    from .model import EngineeringModel, compile, emit
-    from .sources.solidworks.captured import derive_engineering_input
-    from .sources.solidworks.generation_warnings import generation_value_warnings
-
-    _state(on_event, "generate", "running")
-    manifest = checked(
-        on_event,
-        "generate",
-        "input",
-        "generation.inputs",
-        lambda: verify_snapshot(staging / "evidence"),
-        describe=lambda value: _snapshot_details(staging, value),
-    )
-    write_json(staging / "tool.json", tool_record())
-    model_input = derive_engineering_input(staging / "evidence", manifest)
-    # URDF comments are written before the verify stage.  Derive their native
-    # geometry claims from evidence here; _value_warning_gate recomputes them
-    # independently and refuses any missing, forged, or stale model warning.
-    generation_warnings = generation_value_warnings(staging)
-    model = compile(model_input, native_warnings=generation_warnings)
-    if model.name != definition["source"]["robot_name"]:
-        raise PipelineError("Compiled model name differs from the frozen source identity")
-    emit(model, evidence_root=staging / "evidence", destination=staging)
-    from .delivery import write_delivery_manifest
-    from .interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
-    from .stages import CONTRACT, CONTRACT_SHA256
-
-    write_delivery_manifest(
-        staging,
-        contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
-        policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
-    )
-
-    def generated():
-        EngineeringModel.from_dict(read_data(staging / "model/robot.json"))
-        files = subject_inventory(staging)
-        return {"subject_sha256": digest(files), "files": files}
-
-    generated_subject = checked(on_event, "generate", "output", "generation.artifacts", generated)["subject_sha256"]
-    _state(on_event, "generate", "completed")
-    return generated_subject
-
-
-def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> dict:
-    """Reconstruct expectations from native evidence and inspect the actual delivery."""
-    from .verification.solidworks_urdf import (
-        check_bundle,
-        evaluate_bundle,
-        rebuilt_definition,
-        require_qualified_report,
-    )
-
-    _state(on_event, "verify", "running")
-
-    def verify_subject():
-        actual = subject_digest(staging)
-        if actual != generated_subject:
-            raise PipelineError("Generated files changed before independent verification")
-        return {"subject_sha256": actual}
-
-    checked(on_event, "verify", "input", "verification.subject", verify_subject)
-    receipts = load_native_receipts(staging)
-    report = evaluate_bundle(
-        staging,
-        native_receipts=receipts,
-        require_native_receipts=True,
-    )
-    write_json(staging / "reports/quality.json", report)
-    checked(
-        on_event,
-        "verify",
-        "output",
-        "verification.gates",
-        lambda: require_qualified_report(report, rebuilt_definition(staging), root=staging),
-    )
-    def replay_and_reread():
-        replayed = require_qualified_report(
-            check_bundle(
-                staging,
-                native_receipts=receipts,
-                require_native_receipts=True,
-            ),
-            rebuilt_definition(staging),
-            root=staging,
-        )
-        current_subject = subject_digest(staging)
-        current_receipts = load_native_receipts(staging)
-        if (
-            current_subject != generated_subject
-            or replayed.get("subject_sha256") != generated_subject
-            or current_receipts != receipts
-        ):
-            raise PipelineError("Verification inputs changed after the final report was replayed")
-        manifest = read_delivery_manifest(staging)
-        if manifest["subject"]["digest"] != generated_subject:
-            raise PipelineError("Verification inputs changed after the final report was replayed")
-        return replayed
-
-    report = checked(
-        on_event,
-        "verify",
-        "output",
-        "verification.report_binding",
-        replay_and_reread,
-        describe=lambda value: {
-            "passed": value.get("passed"),
-            "subject_sha256": value.get("subject_sha256"),
-            "report_sha256": file_digest(staging / "reports/quality.json"),
-        },
-    )
-    _state(on_event, "verify", "completed")
     return report

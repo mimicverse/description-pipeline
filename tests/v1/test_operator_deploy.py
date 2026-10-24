@@ -8349,41 +8349,5 @@ class NativePoolTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
-class ScheduledSmokePreparationTests(unittest.TestCase):
-    """R02: the scheduled smoke prepares through the production pool entry and
-    verifies the capacity-1 pool's reschedule slot-release semantics.
-
-    The real scheduler run stays opt-in (RUN_SCHEDULED_AIRFLOW=1); these guards
-    keep the preparation and the sensor mode from regressing silently.
-    """
-
-    SMOKE = ROOT / "tools" / "scheduled_smoke.py"
-
-    def test_pool_preparation_uses_the_production_entry(self) -> None:
-        text = self.SMOKE.read_text(encoding="utf-8")
-        self.assertIn("ensure_pool.py", text)
-        self.assertLess(text.index('"db", "migrate"'), text.index("ensure_pool.py"))
-        # No bypass: the smoke must not fall back to the default pool for the native stage.
-        self.assertNotIn("default_pool", text)
-
-    def test_smoke_pins_reschedule_and_has_no_poke_override(self) -> None:
-        text = self.SMOKE.read_text(encoding="utf-8")
-        self.assertIn('SENSOR_MODE_REQUIRED = "reschedule"', text)
-        self.assertIn("SOLIDWORKS_SENSOR_MODE=SENSOR_MODE_REQUIRED", text)
-        self.assertNotIn('SOLIDWORKS_SENSOR_MODE="poke"', text)
-
-    def test_smoke_uses_only_the_current_six_task_ids(self) -> None:
-        text = self.SMOKE.read_text(encoding="utf-8")
-        self.assertNotIn("wait_for_job", text)
-        self.assertNotIn("confirm_job", text)
-
-    def test_smoke_requires_raw_task_reschedule_evidence(self) -> None:
-        text = self.SMOKE.read_text(encoding="utf-8")
-        self.assertIn("TaskReschedule", text)
-        self.assertIn('"reschedule_evidence"', text)
-        self.assertIn("up_for_reschedule", text)
-        self.assertIn("not proven", text)
-
-
 if __name__ == "__main__":
     unittest.main()

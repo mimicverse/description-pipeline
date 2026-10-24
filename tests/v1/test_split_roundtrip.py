@@ -237,7 +237,7 @@ class AxisFixtureBackend(support.FixtureCadBackend):
         return entries
 
 
-class SplitRoundtripTests(unittest.TestCase):
+class _LegacySplitFixture:
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

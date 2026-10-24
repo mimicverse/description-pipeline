@@ -117,18 +117,6 @@ class GenerateHandlerTests(unittest.TestCase):
         first_workspace, first_claim = self._workspace("attempt-a", 1)
         with (
             patch(
-                "description_pipeline.steps.generate_model",
-                side_effect=AssertionError("legacy Generate entry must not run"),
-            ),
-            patch(
-                "description_pipeline.steps.verify_delivery",
-                side_effect=AssertionError("Generate must not run Verify"),
-            ),
-            patch(
-                "description_pipeline.solidworks.verify",
-                side_effect=AssertionError("Generate must not run the legacy Verify stage"),
-            ),
-            patch(
                 "description_pipeline.sources.solidworks.scene.load_scene",
                 side_effect=AssertionError("transitional load_scene must not run"),
             ),

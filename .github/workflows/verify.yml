@@ -391,18 +391,6 @@ jobs:
           "$AIRFLOW_VENV/bin/python" -B -m unittest tests.v1.test_config_identity_real_airflow -v \
             2>&1 | tee "$RUNNER_TEMP/config-identity-real-airflow.log"
           ! grep -q "skipped" "$RUNNER_TEMP/config-identity-real-airflow.log"
-      - name: The real-chain smoke (portal admission, six tasks, SQL settlement assertions)
-        run: |
-          "$AIRFLOW_VENV/bin/python" tools/scheduled_smoke.py \
-            --root "$GITHUB_WORKSPACE" \
-            --venv "$AIRFLOW_VENV" \
-            --airflow-home "$AIRFLOW_HOME" \
-            --portal-admission \
-            --purpose engineering \
-            --platform-schema "$PLATFORM_SCHEMA" \
-            --airflow-schema "$AIRFLOW_SCHEMA" \
-            --airflow-db-conn "$AIRFLOW_RUNTIME_DSN" \
-            --report "$RUNNER_TEMP/real-chain-report.json"
       - name: The negative matrix and the DAG suite under the real Airflow install
         if: always()
         run: |

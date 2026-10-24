@@ -34,9 +34,6 @@ from description_pipeline.interface_records import release_domain_identity
 from description_pipeline.runtime import LINUX_PLATFORMS, TARGET_ABI, TARGET_PYTHON, WINDOWS_PLATFORMS
 
 CI_ONLY_SCRIPTS = {
-    "deploy/airflow/scripts/scheduled_smoke.py",
-    "deploy/airflow/scripts/settlement_fixtures.py",
-    "tools/scheduled_smoke.py",
     "tools/settlement_fixtures.py",
 }
 

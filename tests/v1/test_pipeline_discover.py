@@ -671,7 +671,7 @@ class DiscoverDomainTests(unittest.TestCase):
 
     def test_no_capture_or_downstream_stage_is_invoked(self) -> None:
         with patch(
-            "description_pipeline.solidworks.capture",
+            "description_pipeline.pipeline.capture._capture_native_transaction",
             side_effect=AssertionError("Capture must not run from Discover"),
         ) as capture:
             claim, effects = self.harness.effect_port(self.command)

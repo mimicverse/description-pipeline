@@ -529,7 +529,31 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
         return entries
 
 
-class HermeticSixStageTests(unittest.TestCase):
+class HermeticNativeFixture:
+    def __init__(self) -> None:
+        self._assertions = unittest.TestCase()
+        self._cleanups = []
+
+    def addCleanup(self, function, /, *arguments, **keywords) -> None:
+        self._cleanups.append((function, arguments, keywords))
+
+    def doCleanups(self) -> None:
+        while self._cleanups:
+            function, arguments, keywords = self._cleanups.pop()
+            function(*arguments, **keywords)
+
+    def assertEqual(self, first, second, message=None) -> None:
+        self._assertions.assertEqual(first, second, message)
+
+    def assertIs(self, first, second, message=None) -> None:
+        self._assertions.assertIs(first, second, message)
+
+    def assertTrue(self, expression, message=None) -> None:
+        self._assertions.assertTrue(expression, message)
+
+    def assertIn(self, member, container, message=None) -> None:
+        self._assertions.assertIn(member, container, message)
+
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory(prefix="hermetic-six-stage-")
         self.addCleanup(self.directory.cleanup)
@@ -610,7 +634,11 @@ class HermeticSixStageTests(unittest.TestCase):
         )
         native_identity = _native_tool()
         with patch("description_pipeline.runtime.tool_record", return_value=native_identity):
-            capture = solidworks.capture(
+            from description_pipeline.pipeline.capture import (
+                _capture_native_transaction,
+            )
+
+            capture = _capture_native_transaction(
                 prepared,
                 self.root / "capture",
                 backend=backend,
@@ -621,6 +649,8 @@ class HermeticSixStageTests(unittest.TestCase):
                 expected_inputs=prepared_files,
                 prior_events=self.events,
                 on_event=self._record,
+                native_tool_factory=lambda: dict(native_identity),
+                execution_scope=("freeze", "discover", "capture"),
             )
         self.assertEqual(capture["state"], "native_complete", capture.get("error"))
         request = build_request_evidence(

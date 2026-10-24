@@ -1131,7 +1131,10 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         request = self.request("discover-operation-single")
         self.assertIsNone(port.observe(request))
 
-        with mock.patch("description_pipeline.solidworks.capture", capture):
+        with mock.patch(
+            "description_pipeline.pipeline.capture._capture_native_transaction",
+            capture,
+        ):
             observation = port.invoke(
                 archive,
                 request,

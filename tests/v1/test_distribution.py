@@ -427,7 +427,7 @@ class DistributionTests(unittest.TestCase):
 
     def test_deployment_rejects_ci_only_scripts_and_test_imports(self):
         for members in (
-            {"tools/scheduled_smoke.py": b"pass\n"},
+            {"tools/settlement_fixtures.py": b"pass\n"},
             {"deploy/example.py": b"from tests.v1 import fixture\n"},
             {"deploy/example.py": b"import tests.sources.support\n"},
         ):
