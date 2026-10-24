@@ -287,7 +287,11 @@ def _archive_input(package: Path, staging: Path) -> None:
     ``input/records``.  Nothing is duplicated.
     """
 
-    from .sources.solidworks.discovery import DISCOVERY_FILE, FINDINGS_FILE
+    from .sources.solidworks.discovery import (
+        DISCOVERY_FILE,
+        FINDINGS_FILE,
+        IDENTITY_FILE,
+    )
     from .interface_records import record_archive_path
 
     payload = read_data(package / DISCOVERY_FILE)
@@ -326,7 +330,10 @@ def _archive_input(package: Path, staging: Path) -> None:
     source_path = package / "source.json"
     if source_path.is_file():
         shutil.copyfile(source_path, destination / "source.json")
-    for relative in (DISCOVERY_FILE, FINDINGS_FILE):
+    sidecars = [DISCOVERY_FILE, FINDINGS_FILE]
+    if confined(package, IDENTITY_FILE, exists=False).is_file():
+        sidecars.append(IDENTITY_FILE)
+    for relative in sidecars:
         target = confined(destination, relative, exists=False)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(confined(package, relative), target)

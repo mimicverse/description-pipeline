@@ -98,6 +98,13 @@ class SmokeCaptureBoundaryTests(unittest.TestCase):
                         "run_id": run_id, "upload_files": upload, "upload_sha256": digest(upload),
                         "main_assembly": fixture["main_assembly"], "intake_dir": str(intake),
                         "purpose": "engineering", "conn_id": "mock", "platform_config_digest": "c" * 64,
+                        "identity": {
+                            "hardware_id": fixture["hardware_id"],
+                            "owner": "mechanical-team",
+                            "change_summary": "Control capture boundary",
+                            "parent_revision": "r0",
+                            "control_reference": digest(upload),
+                        },
                 }
                 original_capture = solidworks.capture
                 capture_results = []
