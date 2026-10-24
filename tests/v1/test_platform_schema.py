@@ -134,24 +134,28 @@ class SchemaQualifierTests(unittest.TestCase):
             "the platform-service reconcile reads the terminal attempt number",
         )
 
-    def test_lifecycle_uses_canonical_facts_and_real_airflow_keys(self) -> None:
+    def test_lifecycle_view_keeps_only_real_airflow_scheduling_evidence(self) -> None:
         text = (PLATFORM_DIR / "views.sql").read_text(encoding="utf-8")
         for token in (
-            ':"platform_schema".run_admission',
             ':"platform_schema".command',
             ':"platform_schema".execution_claim',
-            ':"platform_schema".stage_decision',
-            ':"platform_schema".effect_intent',
-            ':"platform_schema".effect_fact',
             ':"airflow_schema".task_instance',
             ':"airflow_schema".dag_run',
         ):
             with self.subTest(token=token):
                 self.assertIn(token, text)
-        self.assertIn("ti.dag_id = c.dag_id", text)
-        self.assertIn("ti.task_id = c.task_id", text)
-        self.assertIn("ti.run_id = c.dag_run_id", text)
-        self.assertIn("ti.map_index = c.map_index", text)
+        for token in (
+            ':"platform_schema".run_admission',
+            ':"platform_schema".stage_decision',
+            ':"platform_schema".effect_intent',
+            ':"platform_schema".effect_fact',
+        ):
+            with self.subTest(absent=token):
+                self.assertNotIn(token, text)
+        self.assertIn("task.dag_id = claim.dag_id", text)
+        self.assertIn("task.task_id = claim.task_id", text)
+        self.assertIn("task.run_id = claim.dag_run_id", text)
+        self.assertIn("task.map_index = claim.map_index", text)
 
     def test_operatorctl_uses_the_single_airflow_grants_owner(self) -> None:
         text = (ROOT / "deploy/operator/operatorctl.sh").read_text(encoding="utf-8")

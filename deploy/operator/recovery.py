@@ -65,6 +65,13 @@ from urllib.parse import parse_qs, unquote, urlsplit
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 sys.dont_write_bytecode = True
 
+RELEASE_SOURCE = Path(__file__).resolve().parents[2] / "src"
+if str(RELEASE_SOURCE) not in sys.path:
+    sys.path.insert(0, str(RELEASE_SOURCE))
+
+from description_pipeline.pipeline.contracts import RunStatus  # noqa: E402
+from description_pipeline.platform.facts import read_admitted_runs  # noqa: E402
+
 try:
     import backup
     import install_record
@@ -1389,16 +1396,6 @@ SELECT json_build_object(
     )
     FROM platform.admission
     WHERE id = 1
-  ),
-  'settled', NOT EXISTS (
-    SELECT 1
-    FROM platform.lifecycle_projection
-    WHERE bucket <> 'terminal'
-  ),
-  'unsettled_count', (
-    SELECT count(*)
-    FROM platform.lifecycle_projection
-    WHERE bucket <> 'terminal'
   )
 )
 """
@@ -1457,6 +1454,20 @@ def _roles_settings_snapshot(connection) -> dict:
 
 def _maintenance_probe(connection) -> dict:
     status = _connection_json(connection, MAINTENANCE_QUERY)
+    run_rows = read_admitted_runs(connection)
+    scheduling_rows = _connection_json(
+        connection,
+        """
+        SELECT COALESCE(json_agg(json_build_object(
+          'object_kind', object_kind,
+          'object_id', object_id,
+          'run_id', run_id,
+          'state', state,
+          'bucket', bucket
+        )), '[]'::json)
+        FROM platform.lifecycle_projection
+        """,
+    )
     sessions = _connection_json(
         connection,
         ACTIVE_APPLICATION_SESSIONS_QUERY,
@@ -1466,15 +1477,32 @@ def _maintenance_probe(connection) -> dict:
     require(
         isinstance(status, dict)
         and isinstance(status.get("admission"), dict)
-        and isinstance(status.get("settled"), bool)
-        and type(status.get("unsettled_count")) is int
+        and isinstance(scheduling_rows, list)
         and isinstance(sessions, list)
         and isinstance(wal_lsn, str),
         "recovery_database_readback_failed",
         "maintenance/read quiescence probe is malformed",
     )
+    terminal_runs = {
+        RunStatus.SUCCEEDED.value,
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+    }
+    unsettled = [
+        {"object_kind": "run", "object_id": run.run_id, "state": run.state}
+        for run in run_rows
+        if run.state not in terminal_runs
+    ]
+    unsettled.extend(
+        row
+        for row in scheduling_rows
+        if isinstance(row, dict) and row.get("bucket") != "terminal"
+    )
     return {
-        **status,
+        "admission": status["admission"],
+        "settled": not unsettled,
+        "unsettled_count": len(unsettled),
+        "unsettled": unsettled[:100],
         "active_application_sessions": sessions,
         "wal_lsn": wal_lsn,
     }

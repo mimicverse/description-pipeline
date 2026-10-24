@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 try:
     import pgserver
@@ -20,8 +22,21 @@ except ImportError:
     POSTGRES_BIN_PATH = None
 
 from description_pipeline.io import digest
-from description_pipeline.platform.facts import FactStoreError, RunControlStore
-from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
+from description_pipeline.orchestration.lifecycle_state import collect_projection
+from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.pipeline.diagnostic import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_run_admission,
+)
+from description_pipeline.platform.facts import (
+    FactStoreError,
+    RunControlStore,
+    read_admitted_runs,
+)
+from description_pipeline.schemas import (
+    AIRFLOW_DISPATCH_CONF_SCHEMA,
+    DIAGNOSTIC_ADMISSION_SCHEMA,
+)
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_DIR = Path(__file__).resolve().parents[2] / "deploy" / "platform"
@@ -390,12 +405,13 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                     outbound_digest, created_at
                 ) VALUES (
                     %s, %s, 'native', 'native_operation', '{}'::jsonb,
-                    '{}'::jsonb, %s, %s, %s, %s
+                    %s::jsonb, %s, %s, %s, %s
                 )
                 """,
                 (
                     effect_id,
                     command_id,
+                    json.dumps({"effect": effect_id}),
                     digest({"effect": effect_id}),
                     artifact_id,
                     digest({"outbound": artifact_id}),
@@ -593,10 +609,20 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
             "WHERE run_id = %s ORDER BY object_kind",
             (run_id,),
         )
-        self.assertIn(("run", "running", "in_flight"), rows)
-        self.assertIn(("stage", "running", "in_flight"), rows)
+        self.assertNotIn("run", {row[0] for row in rows})
+        self.assertNotIn("stage", {row[0] for row in rows})
         self.assertIn(("scheduling", "running", "in_flight"), rows)
         self.assertIn(("dag_run", "running", "in_flight"), rows)
+        self.assertEqual(
+            RunControlStore(self._connect).get_admitted_run(run_id).state,
+            "incomplete",
+        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SET ROLE operator_ro")
+            self.assertEqual(
+                read_admitted_runs(connection, run_id=run_id)[0].state,
+                "incomplete",
+            )
         self._query(
             "UPDATE execution_claim SET task_id = NULL "
             "WHERE claim_id = %s RETURNING claim_id",
@@ -619,7 +645,7 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                     f"{self.schema}.command",
                 ),
             ),
-            [(True, False)],
+            [(True, True)],
         )
 
     def test_legacy_cutover_requires_an_archive_receipt(self) -> None:
@@ -774,143 +800,19 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
             contradiction_command,
             fact_type="reconciled",
         )
+        for stage in ("discover", "capture", "generate", "verify", "publish"):
+            command_id = self._insert_stage_command(contradiction_run, stage)
+            self._insert_decision(contradiction_run, stage, command_id, outcome="completed")
 
-        complete_stages = dict(
-            self._query(
-                "SELECT split_part(object_id, ':', 2), state FROM lifecycle_projection "
-                "WHERE run_id = %s AND object_kind = 'stage'",
-                (artifact_run,),
-            )
-        )
-        self.assertEqual(
-            complete_stages,
-            {
-                "freeze": "completed",
-                "discover": "not_run",
-                "capture": "not_run",
-                "generate": "not_run",
-                "verify": "not_run",
-                "publish": "not_run",
-            },
-        )
-        self.assertEqual(
-            self._query(
-                "SELECT state, bucket FROM lifecycle_projection "
-                "WHERE object_kind = 'run' AND run_id = %s",
-                (artifact_run,),
-            ),
-            [("succeeded", "terminal")],
-        )
-        self.assertEqual(
-            self._query(
-                "SELECT state, bucket FROM lifecycle_projection "
-                "WHERE object_kind = 'run' AND run_id = %s",
-                (empty_run,),
-            ),
-            [("waiting", "unknown")],
-        )
-
-        for run_id, expected_stage, expected_run in (
-            ("run-freeze-failed", "failed", "failed"),
-            ("run-freeze-cancelled", "cancelled", "cancelled"),
-        ):
-            with self.subTest(run_id=run_id):
-                stages = dict(
-                    self._query(
-                        "SELECT split_part(object_id, ':', 2), state FROM lifecycle_projection "
-                        "WHERE run_id = %s AND object_kind = 'stage'",
-                        (run_id,),
-                    )
-                )
-                self.assertEqual(stages["freeze"], expected_stage)
-                self.assertEqual(
-                    {stages[stage] for stage in ("discover", "capture", "generate", "verify", "publish")},
-                    {"blocked"},
-                )
-                self.assertEqual(
-                    self._query(
-                        "SELECT state, bucket FROM lifecycle_projection "
-                        "WHERE object_kind = 'run' AND run_id = %s",
-                        (run_id,),
-                    ),
-                    [(expected_run, "terminal")],
-                )
-
-        self.assertEqual(
-            self._query(
-                "SELECT split_part(object_id, ':', 2), state, bucket "
-                "FROM lifecycle_projection "
-                "WHERE run_id = %s AND object_kind = 'stage' "
-                "AND object_id = %s || ':discover'",
-                (running_run, running_run),
-            ),
-            [("discover", "running", "in_flight")],
-        )
-        self.assertEqual(
-            self._query(
-                "SELECT state, bucket FROM lifecycle_projection "
-                "WHERE run_id = %s AND object_kind = 'run'",
-                (running_run,),
-            ),
-            [("running", "in_flight")],
-        )
-
-        for run_id, expected_effect in (
-            ("run-effect-unknown", "unknown"),
-            ("run-effect-conflict", "conflict"),
-        ):
-            with self.subTest(run_id=run_id):
-                self.assertEqual(
-                    self._query(
-                        "SELECT split_part(object_id, ':', 2), state, bucket "
-                        "FROM lifecycle_projection "
-                        "WHERE run_id = %s AND object_kind = 'stage' "
-                        "AND object_id = %s || ':discover'",
-                        (run_id, run_id),
-                    ),
-                    [("discover", "unresolved", "unresolved")],
-                )
-                self.assertEqual(
-                    self._query(
-                        "SELECT state, bucket FROM lifecycle_projection "
-                        "WHERE run_id = %s AND object_kind = 'effect'",
-                        (run_id,),
-                    ),
-                    [(expected_effect, "unresolved")],
-                )
-                self.assertEqual(
-                    self._query(
-                        "SELECT state, bucket FROM lifecycle_projection "
-                        "WHERE run_id = %s AND object_kind = 'run'",
-                        (run_id,),
-                    ),
-                    [("unresolved", "unresolved")],
-                )
-
-        self.assertEqual(
-            self._query(
-                "SELECT state, bucket FROM lifecycle_projection "
-                "WHERE run_id = %s AND object_kind = 'stage' AND object_id = %s || ':freeze'",
-                (contradiction_run, contradiction_run),
-            ),
-            [("unresolved", "unresolved")],
-        )
-        self.assertEqual(
-            self._query(
-                "SELECT state, bucket FROM lifecycle_projection "
-                "WHERE run_id = %s AND object_kind = 'effect'",
-                (contradiction_run,),
-            ),
-            [("definitely_failed", "terminal")],
-        )
-        self.assertEqual(
-            self._query(
-                "SELECT state, bucket FROM lifecycle_projection "
-                "WHERE run_id = %s AND object_kind = 'run'",
-                (contradiction_run,),
-            ),
-            [("unresolved", "unresolved")],
-        )
+        store = RunControlStore(self._connect)
+        self.assertEqual(store.get_admitted_run(artifact_run).state, "incomplete")
+        self.assertEqual(store.get_admitted_run(empty_run).state, "incomplete")
+        self.assertEqual(store.get_admitted_run("run-freeze-failed").state, "failed")
+        self.assertEqual(store.get_admitted_run("run-freeze-cancelled").state, "cancelled")
+        self.assertEqual(store.get_admitted_run(running_run).state, "incomplete")
+        self.assertEqual(store.get_admitted_run("run-effect-unknown").state, "unresolved")
+        self.assertEqual(store.get_admitted_run("run-effect-conflict").state, "unresolved")
+        self.assertEqual(store.get_admitted_run(contradiction_run).state, "unresolved")
 
     def test_canonical_checkpoint_query_emits_recovery_graph(self) -> None:
         import sys
@@ -1284,7 +1186,7 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
         self.assertEqual(set(summaries), {"run-parent", "run-child"})
         self.assertEqual(summaries["run-child"].parent_run_id, "run-parent")
         self.assertEqual(summaries["run-child"].from_stage, "freeze")
-        self.assertEqual(summaries["run-child"].state, "waiting")
+        self.assertEqual(summaries["run-child"].state, "incomplete")
         self.assertEqual(store.get_admitted_run("run-parent"), summaries["run-parent"])
         self.assertIsNone(store.get_admitted_run("run-missing"))
 
@@ -1311,6 +1213,212 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
             store.hide_run("run-missing", actor="operator")
         with self.assertRaisesRegex(FactStoreError, "not admitted"):
             store.restore_run("run-missing")
+
+    def test_run_control_uses_the_shared_projector_for_formal_runs(self) -> None:
+        self._install_canonical_schema()
+
+        self._insert_run("run-freeze-only")
+        freeze_command = self._insert_stage_command("run-freeze-only", "freeze")
+        self._insert_decision(
+            "run-freeze-only",
+            "freeze",
+            freeze_command,
+            outcome="completed",
+        )
+        store = RunControlStore(self._connect)
+        self.assertEqual(
+            store.get_admitted_run("run-freeze-only").state,
+            "incomplete",
+        )
+
+        run_id = "run-reconciled-effect"
+        self._insert_run(run_id)
+        commands = {}
+        for stage in ("freeze", "discover", "capture", "generate", "verify", "publish"):
+            command_id = self._insert_stage_command(run_id, stage)
+            commands[stage] = command_id
+            self._insert_decision(run_id, stage, command_id, outcome="completed")
+
+        claim_id = self._insert_open_claim(commands["discover"], stage="discover")
+        self._insert_artifact(
+            "reconciled-outbound",
+            run_id=run_id,
+            stage="discover",
+            kind="effect_outbound",
+        )
+        self._insert_artifact(
+            "reconciled-payload",
+            run_id=run_id,
+            stage="discover",
+            kind="effect_payload",
+        )
+        self._insert_artifact(
+            "reconciled-metadata",
+            run_id=run_id,
+            stage="discover",
+            kind="effect_reconciliation_metadata",
+        )
+        now = datetime(2026, 10, 25, tzinfo=UTC)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO effect_intent (
+                    effect_id, command_id, effect_key, effect_kind, target,
+                    expected_state, expected_state_digest, outbound_artifact_id,
+                    outbound_digest, created_at
+                ) VALUES (
+                    %s, %s, 'native-discover', 'native_operation', '{}'::jsonb,
+                    '{}'::jsonb, %s, %s, %s, %s
+                )
+                """,
+                (
+                    "effect-reconciled",
+                    commands["discover"],
+                    digest({}),
+                    "reconciled-outbound",
+                    digest({"outbound": "reconciled"}),
+                    now,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO effect_fact (
+                    fact_id, effect_id, seq, claim_id, fence, fact_type,
+                    source, state_class, payload_artifact_id, payload_digest,
+                    metadata_artifact_id, observed_at
+                ) VALUES
+                    ('fact-authorized', 'effect-reconciled', 1, %s, 1,
+                     'dispatch_authorized', 'fixture', NULL, NULL, %s, NULL, %s),
+                    ('fact-conflict', 'effect-reconciled', 2, NULL, NULL,
+                     'conflict', 'fixture', NULL, NULL, %s, NULL, %s),
+                    ('fact-reconciled', 'effect-reconciled', 3, NULL, NULL,
+                     'reconciled', 'effect-reconciler:' || %s, 'known', %s, %s, %s, %s),
+                    ('fact-old-fence', 'effect-reconciled', 4, %s, 1,
+                     'response', 'fixture', NULL, NULL, %s, NULL, %s)
+                """,
+                (
+                    claim_id,
+                    digest({"fact": "authorized"}),
+                    now,
+                    digest({"fact": "conflict"}),
+                    now + timedelta(seconds=1),
+                    "a" * 64,
+                    "reconciled-payload",
+                    digest({"fact": "reconciled"}),
+                    "reconciled-metadata",
+                    now + timedelta(seconds=2),
+                    claim_id,
+                    digest({"fact": "old-fence"}),
+                    now + timedelta(seconds=3),
+                ),
+            )
+
+        self.assertEqual(
+            store.get_admitted_run(run_id).state,
+            "succeeded",
+        )
+        self.assertEqual(
+            self._query(
+                """
+                SELECT object_kind, object_id
+                FROM lifecycle_projection
+                WHERE object_kind IN ('run', 'stage', 'effect')
+                """
+            ),
+            [],
+            "SQL must not carry a second business reducer",
+        )
+
+    def test_run_control_diagnostic_state_uses_only_the_unique_target_stage(self) -> None:
+        self._install_canonical_schema()
+        created_at = datetime(2026, 10, 25, tzinfo=UTC)
+        artifact = ArtifactRef(
+            artifact_id="diagnostic-input",
+            kind="diagnostic_input",
+            locator="cas://artifact/diagnostic-input",
+            manifest_sha256=digest({"diagnostic": "manifest"}),
+            set_sha256=digest({"diagnostic": "set"}),
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"diagnostic": "tool"}),
+        )
+        spec = DiagnosticAdmissionSpec(
+            schema_version=DIAGNOSTIC_ADMISSION_SCHEMA,
+            run_id="run-diagnostic",
+            request_id="request-diagnostic",
+            target_stage="verify",
+            request={"diagnostic": "verify"},
+            input_artifacts=(artifact,),
+            expected_executor_sha256=digest({"executor": "verify"}),
+            config_snapshot_sha256=digest({"config": 1}),
+            contract_sha256=digest({"contract": 1}),
+            policy_sha256=digest({"policy": 1}),
+            created_at=created_at,
+        )
+        admission = build_diagnostic_run_admission(spec)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO run_admission (
+                    run_id, request_id, parent_run_id, from_stage,
+                    request, request_digest, created_at
+                ) VALUES (%s, %s, NULL, %s, %s::jsonb, %s, %s)
+                """,
+                (
+                    admission.run_id,
+                    admission.request_id,
+                    admission.from_stage,
+                    json.dumps(spec.to_record()),
+                    admission.request_digest,
+                    admission.created_at,
+                ),
+            )
+        verify_command = self._insert_stage_command("run-diagnostic", "verify")
+        self._insert_decision(
+            "run-diagnostic",
+            "verify",
+            verify_command,
+            outcome="completed",
+        )
+        store = RunControlStore(self._connect)
+        self.assertEqual(store.get_admitted_run("run-diagnostic").state, "succeeded")
+
+        capture_command = self._insert_stage_command("run-diagnostic", "capture")
+        self._insert_decision(
+            "run-diagnostic",
+            "capture",
+            capture_command,
+            outcome="failed",
+        )
+        with self.assertRaisesRegex(FactStoreError, "unique target stage"):
+            store.get_admitted_run("run-diagnostic")
+
+    def test_lifecycle_gate_reads_shared_run_state_as_operator_ro(self) -> None:
+        self._install_canonical_schema()
+        self._insert_run("run-gate")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
+                    self.server.get_uri(),
+                    user="operator_ro",
+                )
+            },
+            clear=False,
+        ):
+            projection = collect_projection()
+        run_rows = [row for row in projection["rows"] if row["object_kind"] == "run"]
+        self.assertEqual(
+            [(row["run_id"], row["state"], row["bucket"]) for row in run_rows],
+            [("run-gate", "incomplete", "in_flight")],
+        )
+        self.assertIn(
+            ("request", "request-run-gate", None),
+            [
+                (row["object_kind"], row["object_id"], row["run_id"])
+                for row in projection["rows"]
+            ],
+        )
 
 
 if __name__ == "__main__":

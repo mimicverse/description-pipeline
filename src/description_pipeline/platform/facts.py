@@ -39,12 +39,16 @@ from ..pipeline.contracts import (
     FailureEnvelope,
     ProtocolError,
     RunAdmission,
+    RunStatus,
     StageCandidate,
     StageCommand,
     StageDecision,
     StageQualification,
     StageResult,
     STAGES,
+    StageStatus,
+    project_run_status,
+    project_stage_status,
     qualify_stage,
     require_formal_qualification,
 )
@@ -58,6 +62,7 @@ from ..pipeline.effects import (
 )
 from ..schemas import (
     AIRFLOW_DISPATCH_EFFECT_SCHEMA,
+    DIAGNOSTIC_ADMISSION_SCHEMA,
     DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
     RUN_ADMISSION_SCHEMA,
     STAGE_COMMAND_SCHEMA,
@@ -104,6 +109,232 @@ class AdmittedRunSummary:
     state: str
     created_at: datetime
     updated_at: datetime
+
+
+def _run_state_from_canonical_facts(
+    *,
+    request: Mapping[str, object],
+    stage_commands: tuple[str, ...],
+    decisions: Mapping[str, str],
+    effect_states: tuple[str, ...],
+) -> str:
+    """Consume the common stage/run projectors; this layer only loads raw DB facts."""
+
+    if request.get("schema_version") != DIAGNOSTIC_ADMISSION_SCHEMA:
+        outcomes = tuple(decisions.get(stage) for stage in STAGES)
+        return project_run_status(
+            stage_outcomes=outcomes,
+            effect_states=effect_states,
+        ).value
+
+    diagnostic = DiagnosticAdmissionSpec.from_record(request)
+    if (
+        len(stage_commands) > 1
+        or any(stage != diagnostic.target_stage for stage in stage_commands)
+        or any(stage != diagnostic.target_stage for stage in decisions)
+    ):
+        raise FactStoreError("A diagnostic run does not contain exactly its unique target stage")
+    status = project_stage_status(
+        decision_outcome=decisions.get(diagnostic.target_stage),
+        effect_states=effect_states,
+        predecessor_completed=True,
+        open_claim=False,
+    )
+    if status in {StageStatus.WAITING, StageStatus.ACTIVE, StageStatus.BLOCKED}:
+        return RunStatus.INCOMPLETE.value
+    return {
+        StageStatus.COMPLETED: RunStatus.SUCCEEDED,
+        StageStatus.FAILED: RunStatus.FAILED,
+        StageStatus.CANCELLED: RunStatus.CANCELLED,
+        StageStatus.UNRESOLVED: RunStatus.UNRESOLVED,
+    }[status].value
+
+
+def read_admitted_runs(
+    connection,
+    *,
+    run_id: str | None = None,
+) -> list[AdmittedRunSummary]:
+    """Project run state from canonical facts with the shared Python projectors."""
+
+    cursor = connection.cursor()
+    try:
+        if run_id is None:
+            cursor.execute(
+                """
+                SELECT run_id, request_id, parent_run_id, from_stage, request, created_at
+                FROM run_admission
+                ORDER BY created_at DESC, run_id
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT run_id, request_id, parent_run_id, from_stage, request, created_at
+                FROM run_admission
+                WHERE run_id = %s
+                """,
+                (run_id,),
+            )
+        admission_rows = cursor.fetchall()
+        if not admission_rows:
+            return []
+        run_ids = [row[0] for row in admission_rows]
+
+        cursor.execute(
+            """
+            SELECT command_id, run_id, kind, stage, created_at
+            FROM command
+            WHERE run_id = ANY(%s::text[])
+            ORDER BY run_id, command_id
+            """,
+            (run_ids,),
+        )
+        commands: dict[str, dict[str, object]] = {}
+        stages_by_run: dict[str, list[str]] = {run: [] for run in run_ids}
+        updated_at = {
+            row[0]: row[5]
+            for row in admission_rows
+        }
+        for command_id, command_run, kind, stage, created_at in cursor.fetchall():
+            if command_run not in stages_by_run:
+                raise FactStoreError("A command names an unselected run")
+            updated_at[command_run] = max(updated_at[command_run], created_at)
+            if kind != "stage":
+                continue
+            if not isinstance(stage, str):
+                raise FactStoreError("A stage command carries an invalid canonical stage")
+            commands[command_id] = {
+                "run_id": command_run,
+                "stage": stage,
+            }
+            stages_by_run[command_run].append(stage)
+
+        cursor.execute(
+            """
+            SELECT run_id, stage, command_id, outcome, decided_at
+            FROM stage_decision
+            WHERE run_id = ANY(%s::text[])
+            ORDER BY run_id, stage
+            """,
+            (run_ids,),
+        )
+        decisions: dict[str, dict[str, str]] = {run: {} for run in run_ids}
+        for decision_run, stage, command_id, outcome, decided_at in cursor.fetchall():
+            command = commands.get(command_id)
+            if (
+                command is None
+                or command["run_id"] != decision_run
+                or command["stage"] != stage
+            ):
+                raise FactStoreError("A stage decision differs from its canonical stage command")
+            decisions[decision_run][stage] = outcome
+            updated_at[decision_run] = max(updated_at[decision_run], decided_at)
+
+        cursor.execute(
+            """
+            SELECT effect.effect_id, effect.command_id, effect.effect_key,
+                   effect.effect_kind, effect.target, effect.expected_state,
+                   effect.expected_state_digest, effect.outbound_artifact_id,
+                   effect.outbound_digest, effect.created_at, command.run_id,
+                   fact.fact_id, fact.seq, fact.claim_id, fact.fence,
+                   fact.fact_type, fact.source, fact.state_class,
+                   fact.payload_artifact_id, fact.payload_digest,
+                   fact.metadata_artifact_id, fact.observed_at
+            FROM effect_intent AS effect
+            JOIN command ON command.command_id = effect.command_id
+            LEFT JOIN effect_fact AS fact ON fact.effect_id = effect.effect_id
+            WHERE command.run_id = ANY(%s::text[])
+            ORDER BY effect.effect_id, fact.seq
+            """,
+            (run_ids,),
+        )
+        effects: dict[str, tuple[str, EffectIntent, list[EffectFact]]] = {}
+        for row in cursor.fetchall():
+            effect_run = row[10]
+            record = effects.get(row[0])
+            if record is None:
+                intent = EffectIntent(
+                    effect_id=row[0],
+                    command_id=row[1],
+                    effect_key=row[2],
+                    effect_kind=row[3],
+                    target=row[4],
+                    expected_state=row[5],
+                    expected_state_digest=row[6],
+                    outbound_artifact_id=row[7],
+                    outbound_digest=row[8],
+                    created_at=row[9],
+                )
+                facts: list[EffectFact] = []
+                effects[row[0]] = (effect_run, intent, facts)
+                updated_at[effect_run] = max(updated_at[effect_run], row[9])
+            elif record[0] != effect_run or record[1].command_id != row[1]:
+                raise FactStoreError("An effect intent is bound to inconsistent commands")
+            if row[11] is not None:
+                fact = EffectFact(
+                    fact_id=row[11],
+                    effect_id=row[0],
+                    seq=row[12],
+                    claim_id=row[13],
+                    fence=row[14],
+                    fact_type=row[15],
+                    source=row[16],
+                    state_class=row[17],
+                    payload_artifact_id=row[18],
+                    payload_digest=row[19],
+                    observed_at=row[21],
+                    metadata_artifact_id=row[20],
+                )
+                effects[row[0]][2].append(fact)
+                updated_at[effect_run] = max(updated_at[effect_run], row[21])
+
+        effect_states: dict[str, list[str]] = {run: [] for run in run_ids}
+        for effect_run, intent, facts in effects.values():
+            effect_states[effect_run].append(
+                project_effect_state(intent, tuple(facts)).value
+            )
+
+        cursor.execute(
+            """
+            SELECT command.run_id, max(claim.last_seen_at)
+            FROM command
+            JOIN execution_claim AS claim ON claim.command_id = command.command_id
+            WHERE command.run_id = ANY(%s::text[])
+            GROUP BY command.run_id
+            """,
+            (run_ids,),
+        )
+        for claim_run, last_seen_at in cursor.fetchall():
+            updated_at[claim_run] = max(updated_at[claim_run], last_seen_at)
+    finally:
+        cursor.close()
+
+    summaries = [
+        AdmittedRunSummary(
+            run_id=admission_run,
+            request_id=request_id,
+            parent_run_id=parent_run_id,
+            from_stage=from_stage,
+            state=_run_state_from_canonical_facts(
+                request=request,
+                stage_commands=tuple(stages_by_run[admission_run]),
+                decisions=decisions[admission_run],
+                effect_states=tuple(effect_states[admission_run]),
+            ),
+            created_at=created_at,
+            updated_at=updated_at[admission_run],
+        )
+        for (
+            admission_run,
+            request_id,
+            parent_run_id,
+            from_stage,
+            request,
+            created_at,
+        ) in admission_rows
+    ]
+    return summaries
 
 
 def _stored_command_request(command: StageCommand) -> Mapping[str, object]:
@@ -323,39 +554,13 @@ class RunControlStore(AdmissionControlStore):
 
     def list_admitted_runs(self) -> list[AdmittedRunSummary]:
         with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute(
-                """
-                SELECT a.run_id, a.request_id, a.parent_run_id, a.from_stage,
-                       COALESCE(p.state, 'waiting'), a.created_at,
-                       COALESCE(p.updated_at, a.created_at)
-                FROM run_admission AS a
-                LEFT JOIN lifecycle_projection AS p
-                  ON p.object_kind = 'run' AND p.object_id = a.run_id
-                ORDER BY a.created_at DESC, a.run_id
-                """
-            )
-            rows = cursor.fetchall()
-        return [AdmittedRunSummary(*row) for row in rows]
+            return read_admitted_runs(connection)
 
     def get_admitted_run(self, run_id: str) -> AdmittedRunSummary | None:
         self._require_run_id(run_id)
         with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute(
-                """
-                SELECT a.run_id, a.request_id, a.parent_run_id, a.from_stage,
-                       COALESCE(p.state, 'waiting'), a.created_at,
-                       COALESCE(p.updated_at, a.created_at)
-                FROM run_admission AS a
-                LEFT JOIN lifecycle_projection AS p
-                  ON p.object_kind = 'run' AND p.object_id = a.run_id
-                WHERE a.run_id = %s
-                """,
-                (run_id,),
-            )
-            row = cursor.fetchone()
-        return AdmittedRunSummary(*row) if row is not None else None
+            rows = read_admitted_runs(connection, run_id=run_id)
+        return rows[0] if rows else None
 
     @staticmethod
     def _require_run_id(run_id: str) -> None:

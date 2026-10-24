@@ -1,11 +1,9 @@
 """Operational lifecycle projection for the drain/stop gates (C consumer).
 
-The platform views own the state vocabulary and the ``bucket`` classification; this consumer
-reads them once, in one REPEATABLE READ snapshot, through the operator_ro DSN
-(``PLATFORM_OPERATOR_DSN`` from the derived environment).  It never queries the scheduler and
-holds no enumeration copies: rows are consumed by their view-owned ``bucket``, and every
-unreadable authority (missing DSN, connection or query failure) refuses the gate - fail
-closed, no file or scheduler fallback.
+Business run state comes from the same Python projectors used by the stage engine. The SQL
+view contributes only raw Airflow scheduling and DagRun evidence. This consumer reads both in
+one REPEATABLE READ snapshot through the operator_ro DSN, and every unreadable authority
+refuses the gate with no file or scheduler fallback.
 
 ``request`` rows are accepted facts for reports only and never enter the activity gates.
 
@@ -19,12 +17,16 @@ import json
 import os
 import sys
 
+from ..pipeline.contracts import RunStatus
+from ..platform.facts import read_admitted_runs
+
 
 def classify(rows) -> dict:
-    """Split projection rows by their view-owned bucket (fail-closed, no local vocabulary).
+    """Split run and raw scheduling rows by their gate-only bucket.
 
     Request rows are reported separately - they are acceptance facts, not activity.  A row
-    without a recognized bucket is ``unknown`` and blocks both gates.
+    without a recognized bucket is ``unknown`` and blocks both gates. Run state itself is
+    never re-derived here; it is already the common contracts projection.
     """
 
     in_flight, unresolved, unknown, requests = [], [], [], []
@@ -51,7 +53,7 @@ def classify(rows) -> dict:
 
 
 def collect_projection() -> dict:
-    """Read the two platform views in one consistent snapshot as ``operator_ro``.
+    """Read canonical run facts and raw scheduling evidence in one snapshot as ``operator_ro``.
 
     The connection arrives through the platform.json-derived ``PLATFORM_OPERATOR_DSN``; the
     driver comes with the deployment interpreter (the gates run under the Airflow venv).
@@ -73,6 +75,39 @@ def collect_projection() -> dict:
             )
             columns = [description[0] for description in cursor.description]
             rows = [dict(zip(columns, values, strict=True)) for values in cursor.fetchall()]
+            for run in read_admitted_runs(connection):
+                bucket = (
+                    "unresolved"
+                    if run.state == RunStatus.UNRESOLVED.value
+                    else "terminal"
+                    if run.state
+                    in {
+                        RunStatus.SUCCEEDED.value,
+                        RunStatus.FAILED.value,
+                        RunStatus.CANCELLED.value,
+                    }
+                    else "in_flight"
+                )
+                rows.append(
+                    {
+                        "object_kind": "run",
+                        "object_id": run.run_id,
+                        "run_id": run.run_id,
+                        "state": run.state,
+                        "bucket": bucket,
+                        "updated_at": run.updated_at,
+                    }
+                )
+                rows.append(
+                    {
+                        "object_kind": "request",
+                        "object_id": run.request_id,
+                        "run_id": None,
+                        "state": "accepted",
+                        "bucket": "terminal",
+                        "updated_at": run.created_at,
+                    }
+                )
             cursor.execute("SELECT state, reason, actor, changed_at, revision FROM admission_projection")
             columns = [description[0] for description in cursor.description]
             current = cursor.fetchone()

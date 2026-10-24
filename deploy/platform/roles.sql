@@ -26,10 +26,19 @@ GRANT SELECT ON
     :"platform_schema".admission_projection
     TO platform_service;
 
--- operator_ro sees exactly the two read models and no base table.
+-- operator_ro reads the two operational views and the immutable canonical facts needed to
+-- run the shared Python state projector. It has no write grant and no Airflow schema access.
 REVOKE ALL ON SCHEMA :"platform_schema" FROM PUBLIC;
 GRANT USAGE ON SCHEMA :"platform_schema" TO operator_ro;
 GRANT SELECT ON
     :"platform_schema".lifecycle_projection,
     :"platform_schema".admission_projection
+    TO operator_ro;
+GRANT SELECT ON
+    :"platform_schema".run_admission,
+    :"platform_schema".command,
+    :"platform_schema".stage_decision,
+    :"platform_schema".effect_intent,
+    :"platform_schema".effect_fact,
+    :"platform_schema".execution_claim
     TO operator_ro;
