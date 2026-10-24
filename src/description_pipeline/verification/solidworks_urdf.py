@@ -2328,6 +2328,7 @@ def _xml(root, definition, model):
     robot_name = (definition.get("source") or {}).get("robot_name")
     _require(isinstance(robot_name, str) and bool(robot_name), "The input definition carries no robot label")
     _require(document.tag == "robot" and document.get("name") == robot_name, "Wrong URDF robot identity")
+    _require(model.get("name") == robot_name, "Canonical model robot name differs from the input definition")
     expected_comments = []
     for item in (model.get("provenance") or {}).get("value_warnings") or []:
         if not isinstance(item, dict) or not item.get("code"):
@@ -3456,9 +3457,9 @@ def _portable_details(value, root):
 
 
 def _model(root):
-    from ..model import Robot
+    from ..model import EngineeringModel
 
-    return Robot.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
+    return EngineeringModel.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
 
 
 #: The sealed records each qualification fact's conclusion is read from

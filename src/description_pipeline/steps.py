@@ -879,8 +879,7 @@ def capture_evidence(
 
 def generate_model(staging: Path, definition: dict, input_report: dict, *, on_event=None) -> str:
     """Generate one canonical model and bind every derived file before independent checking."""
-    from .backends.urdf import generate_urdf
-    from .model import Robot
+    from .model import EngineeringModel, compile, emit
     from .sources.solidworks.scene import load_scene
     from .verification.native_mesh_observations import (
         native_geometry_value_warnings,
@@ -895,21 +894,16 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
         lambda: verify_snapshot(staging / "evidence"),
         describe=lambda value: _snapshot_details(staging, value),
     )
-    name = definition["source"]["robot_name"]
     write_json(staging / "tool.json", tool_record())
-    scene = load_scene(staging / "evidence")
+    model_input = load_scene(staging / "evidence")
     # URDF comments are written before the verify stage.  Derive their native
     # geometry claims from evidence here; _value_warning_gate recomputes them
     # independently and refuses any missing, forged, or stale model warning.
     native_warnings = native_geometry_value_warnings(staging)
-    if native_warnings:
-        scene["provenance"]["value_warnings"] = [
-            *(scene["provenance"].get("value_warnings") or []),
-            *native_warnings,
-        ]
-    robot = Robot.from_dict(scene)
-    write_json(staging / "model/robot.json", robot.to_dict())
-    generate_urdf(robot, staging / "evidence", staging, name=name)
+    model = compile(model_input, native_warnings=native_warnings)
+    if model.name != definition["source"]["robot_name"]:
+        raise PipelineError("Compiled model name differs from the frozen source identity")
+    emit(model, evidence_root=staging / "evidence", destination=staging)
     from .delivery import write_delivery_manifest
     from .interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
     from .stages import CONTRACT, CONTRACT_SHA256
@@ -921,7 +915,7 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
     )
 
     def generated():
-        Robot.from_dict(read_data(staging / "model/robot.json"))
+        EngineeringModel.from_dict(read_data(staging / "model/robot.json"))
         files = subject_inventory(staging)
         return {"subject_sha256": digest(files), "files": files}
 

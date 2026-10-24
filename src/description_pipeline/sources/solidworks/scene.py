@@ -1,4 +1,4 @@
-"""Turn raw CAD readings into the shared ``solidworks-to-urdf.scene/v1`` structure.
+"""Turn raw CAD readings into the single engineering-model input structure.
 
 The adapter owns the *source-side* derivation: component placements, per-part
 mass properties and exported geometry are read from CAD, then expressed in the
@@ -25,15 +25,14 @@ from .naming import (
     visual_name,
 )
 from .native_limits import ENGINEERING_DEFAULT_POLICY_ID, PREVIEW_POLICY_ID
+from ...model import ENGINEERING_MODEL_SCHEMA
 from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
-SCENE_SCHEMA = "solidworks-to-urdf.scene/v1"
 
+def engineering_model_schema_supported(value: object) -> bool:
+    """Whether a payload declares the one current engineering model id."""
 
-def scene_schema_supported(value: object) -> bool:
-    """Whether a scene declares the one current schema id."""
-
-    return value == SCENE_SCHEMA
+    return value == ENGINEERING_MODEL_SCHEMA
 
 
 Matrix3 = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
@@ -735,7 +734,7 @@ def build_scene(
     if unverified_material:
         scene_provenance["warnings"] = _material_warnings(unverified_material, masses)
     return {
-        "schema_version": SCENE_SCHEMA,
+        "schema_version": ENGINEERING_MODEL_SCHEMA,
         "name": cfg.get("robot_name", "robot"),
         "units": "SI",
         "links": links,
@@ -1518,7 +1517,7 @@ def load_scene(snapshot_root: Path) -> dict[str, Any]:
     from .captured import derive_scene
 
     scene = derive_scene(root, manifest)
-    if not isinstance(scene, dict) or not scene_schema_supported(scene.get("schema_version")):
+    if not isinstance(scene, dict) or not engineering_model_schema_supported(scene.get("schema_version")):
         raise ConfigError("unexpected scene schema", {"snapshot": str(root)})
     if scene.get("units") != "SI":
         raise ConfigError("only SI scenes are supported", {"units": scene.get("units")})

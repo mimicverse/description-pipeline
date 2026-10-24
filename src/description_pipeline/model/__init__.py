@@ -1,4 +1,4 @@
-"""Canonical semantics with explicit units, tensor frames and identities."""
+"""One immutable engineering model and its deterministic projection boundary."""
 
 from __future__ import annotations
 
@@ -6,30 +6,42 @@ import copy
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import jsonschema
 import numpy as np
 
-from ..io import PipelineError, read_data
+from ..io import PipelineError, digest, file_digest, inventory, read_data, write_json
 from ..sources.solidworks.naming import fixed_joint_name
+
+ENGINEERING_MODEL_SCHEMA = "solidworks-to-urdf.engineering-model/v1"
 
 
 @dataclass(frozen=True)
-class Robot:
-    """The internal JSON is private; callers receive copies rather than shared mutation."""
+class EngineeringModel:
+    """The only canonical robot semantics; mutable callers receive copies."""
 
     _data: dict
 
     @classmethod
-    def from_dict(cls, data: dict) -> Robot:
-        validate_scene_schema(data)
-        robot = cls(copy.deepcopy(data))
-        robot._validate()
-        return robot
+    def from_dict(cls, data: dict) -> EngineeringModel:
+        validate_engineering_model(data)
+        model = cls(copy.deepcopy(data))
+        model._validate()
+        return model
 
     def to_dict(self) -> dict:
         return copy.deepcopy(self._data)
+
+    @property
+    def name(self) -> str:
+        return str(self._data["name"])
+
+    @property
+    def semantic_sha256(self) -> str:
+        """Digest the complete location-independent model payload."""
+
+        return digest(self._data)
 
     def _validate(self) -> None:
         data = self._data
@@ -112,14 +124,53 @@ class Robot:
                 raise PipelineError(f"Unknown frame parent: {frame['parent']}")
 
 
-def validate_scene_schema(data: dict) -> None:
-    """Frozen CAD assemblies may be forests; canonical Robot additionally enforces a tree."""
+def validate_engineering_model(data: dict) -> None:
+    """Validate the one canonical model."""
     schema = read_data(Path(__file__).with_name("schema.json"))
     try:
         jsonschema.Draft202012Validator(schema).validate(data)
     except jsonschema.ValidationError as error:
         raise PipelineError(f"Model contract {list(error.absolute_path)}: {error.message}") from error
     _finite(data)
+
+
+def compile(model_payload: dict, *, native_warnings: Iterable[dict] = ()) -> EngineeringModel:
+    """Pure conversion from loader output and derived facts to the canonical model."""
+
+    payload = copy.deepcopy(model_payload)
+    warnings = payload.setdefault("provenance", {}).setdefault("value_warnings", [])
+    if not isinstance(warnings, list):
+        raise PipelineError("Model value warnings must be a list")
+    warnings.extend(copy.deepcopy(list(native_warnings)))
+    return EngineeringModel.from_dict(payload)
+
+
+@dataclass(frozen=True)
+class EmissionReceipt:
+    """Digests of the deterministic projection emitted from one model."""
+
+    model_sha256: str
+    urdf_sha256: str
+    mesh_files: tuple[dict[str, str], ...]
+
+
+def emit(model: EngineeringModel, *, evidence_root: Path, destination: Path) -> EmissionReceipt:
+    """Write the model and target projection without introducing new semantics."""
+
+    from ..backends.urdf import generate_urdf
+
+    destination = Path(destination)
+    write_json(destination / "model/robot.json", model.to_dict())
+    urdf = generate_urdf(model, Path(evidence_root), destination)
+    meshes = tuple(
+        {"path": "meshes/" + path, "sha256": checksum}
+        for path, checksum in sorted(inventory(destination / "meshes").items())
+    )
+    return EmissionReceipt(
+        model_sha256=file_digest(destination / "model/robot.json"),
+        urdf_sha256=file_digest(urdf),
+        mesh_files=meshes,
+    )
 
 
 def _finite(value: Any) -> None:

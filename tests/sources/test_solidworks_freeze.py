@@ -821,7 +821,7 @@ class FreezeTests(unittest.TestCase):
         _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         before = inventory(self.destination)
         scene = load_scene(self.destination)
-        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
+        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.engineering-model/v1")
         self.assertEqual(inventory(self.destination), before)
         self.assertNotIn("scene.json", before)
 
@@ -978,7 +978,7 @@ class FreezeTests(unittest.TestCase):
         freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
         _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         scene = load_scene(self.destination)
-        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
+        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.engineering-model/v1")
         self.assertEqual(scene["units"], "SI")
         links = {link["name"]: link for link in scene["links"]}
         self.assertEqual(sorted(links), ["arm_link", "base_link"])
@@ -2026,9 +2026,9 @@ class SharedModelContractTests(unittest.TestCase):
     """The snapshot scene must satisfy the pipeline-wide model contract."""
 
     def setUp(self) -> None:
-        from description_pipeline.model import Robot
+        from description_pipeline.model import EngineeringModel
 
-        self.robot_cls = Robot
+        self.model_cls = EngineeringModel
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-contract-"))
         self.assembly = support.make_cad_tree(self.tmp / "cad")
         self.backend = _Backend(
@@ -2091,10 +2091,10 @@ class SharedModelContractTests(unittest.TestCase):
         _compose_scene_inputs(destination, self.tmp / "cad", with_arm=True, with_joint=True)
         scene = load_scene(destination)
 
-        robot = self.robot_cls.from_dict(scene)
+        model = self.model_cls.from_dict(scene)
 
-        payload = robot.to_dict()
-        self.assertEqual(payload["schema_version"], "solidworks-to-urdf.scene/v1")
+        payload = model.to_dict()
+        self.assertEqual(payload["schema_version"], "solidworks-to-urdf.engineering-model/v1")
         self.assertEqual(payload["units"], "SI")
         self.assertEqual({link["name"] for link in payload["links"]}, {"base_link", "arm_link"})
         self.assertEqual([joint["name"] for joint in payload["joints"]], ["hinge_joint"])

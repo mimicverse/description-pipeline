@@ -235,6 +235,12 @@
     }
   ],
   "name": "robot",
+  "semantic_identity": {
+    "capture_set_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_configuration": "Default",
+    "source_member": "input/cad/fixture_arm.SLDASM",
+    "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
   "provenance": {
     "expected_entities": [
       "base",
@@ -265,6 +271,6 @@
       }
     ]
   },
-  "schema_version": "solidworks-to-urdf.scene/v1",
+  "schema_version": "solidworks-to-urdf.engineering-model/v1",
   "units": "SI"
 }
