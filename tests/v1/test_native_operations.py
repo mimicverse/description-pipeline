@@ -46,6 +46,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     NativeOperationCreate,
     NativeOperationResult,
     NativeOperationRuntime,
+    NativeOperationUnresolved,
     build_operation_record,
 )
 from description_pipeline.pipeline.capture import CaptureEffectDispatch
@@ -763,6 +764,215 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(remote.actual_native_tool_sha256, digest(NATIVE_TOOL))
         handler = capture_handler_from_native_operation(client)
         self.assertEqual(handler._native_tool_factory(), NATIVE_TOOL)
+
+    def test_sealed_capture_dispatch_is_sent_once_without_rebuilding(self) -> None:
+        archive = self.root / "sealed-capture-input.zip"
+        archive.write_bytes(b"sealed capture input archive")
+        run_id = "run-sealed-capture"
+        command_id = "command-sealed-capture"
+        effect_key = "capture-native"
+        operation_id = native_capture_operation_id(
+            run_id=run_id,
+            command_id=command_id,
+            effect_key=effect_key,
+        )
+        sealed_execution = {
+            "claim_id": "claim-original",
+            "command_id": command_id,
+            "effect_key": effect_key,
+            "executor_sha256": digest({"executor": "original-platform"}),
+            "fence": 1,
+            "native_tool_sha256": digest(NATIVE_TOOL),
+            "owner_sha256": digest({"owner": "original-platform"}),
+            "run_id": run_id,
+        }
+        request = {
+            "schema_version": CAPTURE_OPERATION_SCHEMA,
+            "command_id": command_id,
+            "run_id": run_id,
+            "request_digest": digest({"request": run_id}),
+            "effect_key": effect_key,
+            "handoff_sha256": "b" * 64,
+            "upload_sha256": "c" * 64,
+            "prepared_sha256": digest(
+                {"cad/robot.SLDASM": "a" * 64}
+            ),
+            "main_assembly": "cad/robot.SLDASM",
+            "package_files": {"cad/robot.SLDASM": "a" * 64},
+            "upstream_artifacts": [
+                _artifact(stage, run_id)
+                for stage in ("freeze", "discover")
+            ],
+            "execution": sealed_execution,
+            "native_tool_source_sha256": NATIVE_TOOL["source_sha256"],
+            "request_evidence": REQUEST_EVIDENCE,
+        }
+        envelope = _operation(
+            operation_id,
+            archive,
+            request=request,
+        )
+        sealed_dispatch = SimpleNamespace(
+            operation=envelope,
+            input_archive=archive,
+            execution=sealed_execution,
+        )
+        observed = []
+
+        def executor(
+            received_request,
+            source_archive,
+            workspace,
+            native_tool,
+        ):
+            del native_tool
+            observed.append(
+                (
+                    copy.deepcopy(received_request),
+                    Path(source_archive).read_bytes(),
+                )
+            )
+            artifact = Path(workspace) / CAPTURE_ARCHIVE
+            artifact.write_bytes(b"sealed remote capture")
+            return NativeOperationResult(
+                artifact_path=artifact,
+                artifact_name=CAPTURE_ARCHIVE,
+                output_contract=CAPTURE_TRANSFER_SCHEMA,
+                resource_terminated=True,
+            )
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "sealed-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        client.create_operation = mock.Mock(
+            wraps=client.create_operation
+        )
+        client.upload_input = mock.Mock(
+            wraps=client.upload_input
+        )
+        port = NativeOperationCapturePort(
+            client,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        recovered_execution = {
+            **sealed_execution,
+            "claim_id": "claim-recovered",
+            "executor_sha256": digest({"executor": "recovered-platform"}),
+            "fence": 2,
+            "owner_sha256": digest({"owner": "recovered-platform"}),
+        }
+        common = {
+            "backend": None,
+            "run_id": run_id,
+            "request_digest": request["request_digest"],
+            "handoff_sha256": request["handoff_sha256"],
+            "upload_sha256": request["upload_sha256"],
+            "main_assembly": request["main_assembly"],
+            "upstream_artifacts": tuple(request["upstream_artifacts"]),
+            "execution": recovered_execution,
+            "native_tool": NATIVE_TOOL,
+            "sealed_dispatch": sealed_dispatch,
+        }
+
+        first = port(
+            None,
+            self.root / "sealed-output-1",
+            **common,
+        )
+        second = port(
+            None,
+            self.root / "sealed-output-2",
+            **common,
+        )
+
+        self.assertEqual(first.outcome, "completed")
+        self.assertEqual(second.outcome, "completed")
+        self.assertEqual(observed, [(request, archive.read_bytes())])
+        self.assertEqual(client.create_operation.call_count, 1)
+        self.assertEqual(client.upload_input.call_count, 1)
+        stored_intent = runtime._intent(operation_id)[1]
+        self.assertEqual(stored_intent.to_record(), envelope)
+
+    def test_unknown_sealed_capture_dispatch_is_never_resent(self) -> None:
+        archive = self.root / "unknown-capture-input.zip"
+        archive.write_bytes(b"unknown capture input archive")
+        operation_id = "operation-unknown-sealed-dispatch"
+
+        def executor(request, source_archive, workspace, native_tool):
+            del request, source_archive, workspace, native_tool
+            raise NativeOperationUnresolved(
+                "capture.native_unknown",
+                "native Capture result is unknown",
+                resource_terminated=True,
+            )
+
+        envelope = _operation(operation_id, archive)
+        sealed_dispatch = SimpleNamespace(
+            operation=envelope,
+            input_archive=archive,
+            execution=envelope["request"]["execution"],
+        )
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "unknown-sealed-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        client.create_operation = mock.Mock(
+            wraps=client.create_operation
+        )
+        client.upload_input = mock.Mock(
+            wraps=client.upload_input
+        )
+        port = NativeOperationCapturePort(
+            client,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        common = {
+            "backend": None,
+            "run_id": operation_id,
+            "request_digest": envelope["request"]["request_digest"],
+            "handoff_sha256": envelope["request"]["handoff_sha256"],
+            "upload_sha256": envelope["request"]["upload_sha256"],
+            "main_assembly": envelope["request"]["main_assembly"],
+            "upstream_artifacts": tuple(
+                envelope["request"]["upstream_artifacts"]
+            ),
+            "execution": {
+                **envelope["request"]["execution"],
+                "claim_id": "claim-recovered-unknown",
+                "fence": 2,
+            },
+            "native_tool": NATIVE_TOOL,
+            "sealed_dispatch": sealed_dispatch,
+        }
+
+        first = port(
+            None,
+            self.root / "unknown-sealed-output-1",
+            **common,
+        )
+        second = port(
+            None,
+            self.root / "unknown-sealed-output-2",
+            **common,
+        )
+
+        self.assertEqual(first.outcome, "unknown")
+        self.assertEqual(second.outcome, "unknown")
+        self.assertEqual(client.create_operation.call_count, 1)
+        self.assertEqual(client.upload_input.call_count, 1)
 
     def test_capture_transaction_failure_retains_diagnostic_bytes(self) -> None:
         package = self.root / "prepared-failure"
