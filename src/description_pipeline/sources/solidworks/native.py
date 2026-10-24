@@ -8319,15 +8319,22 @@ class SolidWorksBackend(CadBackend):
                     evidence["tolerant_edge_evidence"] is not None
                     for evidence in endpoint_evidence
                 )
+                uses_closest_fallback = any(
+                    evidence["parameter_u_source"] == "closest_point_fallback"
+                    for evidence in endpoint_evidence
+                )
                 row["open_edge_boundary_identity"] = None
-                if uses_tolerant_gap and not unique_topology_accepted:
-                    if (
-                        not endpoint_set_mode
-                        or not open_identity_candidate
-                    ):
+                requires_open_identity = (
+                    uses_tolerant_gap or uses_closest_fallback
+                ) and open_identity_candidate
+                if (
+                    requires_open_identity
+                    and not unique_topology_accepted
+                ):
+                    if not endpoint_set_mode:
                         raise CadError(
                             "cad_native_tessellation_unreadable",
-                            "tolerant gap use requires an open-edge endpoint identity",
+                            "ambiguous endpoint sets require an open-edge endpoint identity",
                             {
                                 **base,
                                 "edge_index": edge_row["index"],

@@ -3238,6 +3238,93 @@ class NativeFinCaptureTests(unittest.TestCase):
             {"start": "start", "end": "end"},
         )
 
+    def test_open_boundary_fallback_round_trips_through_producer_and_parser(self):
+        original_method = native_module._method
+
+        def fallback_method(obj, name, *args):
+            value = original_method(obj, name, *args)
+            if name == "GetParameter":
+                return [value[0], False]
+            return value
+
+        with patch.object(
+            native_module,
+            "_method",
+            side_effect=fallback_method,
+        ):
+            _body, _edge, entry, triangles = (
+                self.r3_open_tolerant_tessellation()
+            )
+        tessellation = entry["tessellation"]
+        fin = next(
+            row
+            for row in tessellation["itessellation"]["bodies"][0]["fins"]
+            if row["open_edge_boundary_identity"] is not None
+        )
+        self.assertIs(
+            fin["start_evidence"]["parameter_success_parsed"],
+            False,
+        )
+        self.assertIs(
+            fin["end_evidence"]["parameter_success_parsed"],
+            False,
+        )
+        self.assertEqual(
+            fin["open_edge_boundary_identity"]["identity_mode"],
+            "full_edge",
+        )
+        self.assertEqual(
+            len(
+                parse_native_tessellation(
+                    "part-1",
+                    tessellation,
+                    entry["bodies"],
+                    entry["triangles"],
+                    triangles,
+                    expected_source_scope=entry["source_scope"],
+                )
+            ),
+            1,
+        )
+
+        missing_closest = copy.deepcopy(entry)
+        missing_fin = next(
+            row
+            for row in missing_closest["tessellation"]["itessellation"][
+                "bodies"
+            ][0]["fins"]
+            if row["open_edge_boundary_identity"] is not None
+        )
+        missing_fin["start_evidence"]["closest_point_on_raw"] = []
+        with self.assertRaises(PipelineError):
+            parse_native_tessellation(
+                "part-1",
+                missing_closest["tessellation"],
+                missing_closest["bodies"],
+                missing_closest["triangles"],
+                triangles,
+                expected_source_scope=missing_closest["source_scope"],
+            )
+
+        missing_evaluate = copy.deepcopy(entry)
+        missing_fin = next(
+            row
+            for row in missing_evaluate["tessellation"]["itessellation"][
+                "bodies"
+            ][0]["fins"]
+            if row["open_edge_boundary_identity"] is not None
+        )
+        missing_fin["end_evidence"]["evaluate_payload"] = []
+        with self.assertRaises(PipelineError):
+            parse_native_tessellation(
+                "part-1",
+                missing_evaluate["tessellation"],
+                missing_evaluate["bodies"],
+                missing_evaluate["triangles"],
+                triangles,
+                expected_source_scope=missing_evaluate["source_scope"],
+            )
+
     def test_open_boundary_identity_rejects_wrong_segment_boundary(self):
         with self.assertRaisesRegex(
             ValueError,
