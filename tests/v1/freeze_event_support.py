@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import copy
 
+from description_pipeline.io import digest
+from description_pipeline.stages import validate_freeze_events
+
 FREEZE_RECEIPT_SHA256 = "a" * 64
+
+
+def freeze_request_fields(source: dict | None = None) -> dict:
+    events = validate_freeze_events(source["freeze_events"] if source is not None else freeze_events())
+    return {
+        "freeze_events": copy.deepcopy(events),
+        "freeze_events_sha256": digest(events),
+        "freeze_receipt_sha256": source["freeze_receipt_sha256"] if source is not None else FREEZE_RECEIPT_SHA256,
+    }
 
 
 def freeze_events() -> list[dict]:

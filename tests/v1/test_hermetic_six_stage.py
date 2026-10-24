@@ -302,6 +302,7 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
         )
         top_sha256 = source_files[normalize_document_path(os.path.abspath(doc_path))]["sha256"]
         scene.notes["capture_preparation"] = {
+            "session": {"role": "copy", "identity": self.environment()["sessions"]["copy"], "temp_root": None},
             "schema_version": "solidworks-to-urdf.capture-preparation/v1",
             "used_api": "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
             "scope": "collected_copy_in_memory",
@@ -429,6 +430,7 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
         ]
         return {
             "document_count": len(documents),
+            "session": {"role": "copy", "identity": self.environment()["sessions"]["copy"], "temp_root": None},
             "parts": sum(item["document_type"] == 1 for item in documents),
             "assemblies": sum(item["document_type"] == 2 for item in documents),
             "documents": documents,

@@ -402,10 +402,23 @@ class PublishTests(unittest.TestCase):
     def test_pr_actual_head_must_equal_verified_pushed_commit(self):
         self.gh_mode = "stale_head"
         result = self.submit()
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["error"], "pr_identity_mismatch")
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "pr_identity_mismatch_after_push")
         self.assertEqual(self.fx.remote_head(), result["commit"])
         self.assertTrue(result["detail"]["observed"]["url"])
+
+    def test_invalid_github_json_after_creation_preserves_reconciliation_identity(self):
+        original = urdf_pr._gh
+
+        def exchange(repository, *args):
+            return "{" if args[:2] == ("pr", "view") else original(repository, *args)
+
+        with mock.patch.object(urdf_pr, "_gh", side_effect=exchange):
+            result = self.submit()
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["commit"], self.fx.remote_head())
+        self.assertTrue(self.prs)
+        self.assertTrue(result["url"])
 
     def test_failure_after_pr_creation_preserves_url_and_pushed_commit(self):
         self.gh_mode = "fail_view"

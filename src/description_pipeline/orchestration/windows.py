@@ -77,7 +77,7 @@ from ..stages import (
     stage_view,
     validate_freeze_events,
 )
-from .stage_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
+from ..native_transfer import CAPTURE_MANIFEST as CAPTURE_MANIFEST_NAME
 from .selection_transport import StagedSelection
 from ..sources.solidworks.selection import validate_file_index, verify_selection
 from .recovery import stage_reruns, start_plan

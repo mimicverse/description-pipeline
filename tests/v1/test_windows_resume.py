@@ -13,6 +13,7 @@ from description_pipeline.io import PipelineError, write_json
 from description_pipeline.stages import WINDOWS_STAGES
 from description_pipeline.orchestration.windows import Jobs, RequestError
 from .endpoint_support import PART, EndpointFixture
+from .freeze_event_support import freeze_request_fields
 
 LINUX_STAGES = ("freeze", "generate", "verify", "publish")
 
@@ -32,6 +33,7 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
     @staticmethod
     def linked_request(parent: dict, stage: str) -> dict:
         return {
+            **freeze_request_fields(parent["request"]),
             "run_id": str(uuid.uuid4()),
             "upload_files": parent["request"]["upload_files"],
             "upload_sha256": parent["request"]["upload_sha256"],

@@ -19,7 +19,7 @@ from tests.v1.freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
 from description_pipeline.io import digest, file_digest
 from description_pipeline.orchestration.airflow_client import EndpointConfig
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
-from description_pipeline.schemas import NATIVE_DISCOVERY_FINDING_SCHEMA
+from description_pipeline.schemas import NATIVE_DISCOVERY_FINDING_SCHEMA, SOURCE_RECORD_SCHEMA
 
 ROOT = Path(__file__).resolve().parents[2]
 DAG_DIR = ROOT / "deploy/airflow/dags"
@@ -643,6 +643,17 @@ class DagTests(unittest.TestCase):
         text_rows.append(
             {
                 "seq": 5,
+                "at": local_start,
+                "kind": "binding",
+                "stage": "freeze",
+                "operation_id": "dispatch-1",
+                "payload": {"binding_kind": "dispatch"},
+            }
+        )
+        datetime_rows.append(text_rows[-1])
+        text_rows.append(
+            {
+                "seq": 6,
                 "at": local_start + timedelta(microseconds=500_000),
                 "kind": "stage",
                 "stage": "freeze",
@@ -2322,7 +2333,7 @@ class DagTests(unittest.TestCase):
         (source / "source.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "solidworks-to-urdf.source-record/v1",
+                    "schema_version": SOURCE_RECORD_SCHEMA,
                     "source_revision_id": digest(source_identity),
                     "identity": source_identity,
                     "selection": {
@@ -2628,6 +2639,31 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertEqual(self.calls[0]["state"], "unresolved")
         self.assertEqual(self.calls[0]["receipt"]["state"], "unresolved")
         self.assertEqual(self.calls[0]["receipt"]["submission"], receipt["submission"])
+
+    def test_a_report_error_after_publication_keeps_reconciliation_debt(self) -> None:
+        for state in ("unresolved", "published"):
+            with self.subTest(state=state):
+                tree = self._tree(run_id="report-" + state, stage="publish")
+                receipt = {
+                    "run_id": "run-1", "state": state, "passed": state == "published",
+                    "subject_sha256": "a" * 64,
+                    "submission": {"state": state, "commit": "b" * 40, "url": "https://example.test/pull/1"},
+                }
+                before = len(self.calls)
+                with (
+                    patch.object(self.module.flow, "run_stage", return_value=receipt),
+                    patch.object(self.module, "_portable_report", side_effect=RuntimeError("XCom unavailable")),
+                    self.assertRaisesRegex(RuntimeError, "XCom unavailable"),
+                ):
+                    self.module._portable_registered(
+                        "run-1", "publish", tree=tree, expected_subject="a" * 64, base="main",
+                        context={
+                            "dag_run": SimpleNamespace(run_id="portal-publish-1"),
+                            "ti": SimpleNamespace(task_id="publish", map_index=-1),
+                        },
+                    )
+                self.assertEqual([call["state"] for call in self.calls[before:]], ["unresolved"])
+                self.assertEqual(self.calls[-1]["receipt"]["submission"], receipt["submission"])
 
     def test_a_stage_failure_converges_with_the_actual_products(self) -> None:
         tree = self._tree(stage="generate")

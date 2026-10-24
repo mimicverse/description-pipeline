@@ -630,6 +630,28 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(backend.refresh_calls, [PATH])
 
+    def test_successful_rebuild_keeps_its_result_when_refresh_or_after_state_fails(self):
+        for resolved, error_phase, error_code in (
+            (CadError("document_not_open", "gone"), "refresh", "document_not_open"),
+            (_UnreadablePathDoc(PATH), "after_state", "cad_document_identity"),
+        ):
+            with self.subTest(phase=error_phase):
+                doc = _Doc(PATH, needs_rebuild2=1)
+                backend = _Backend(resolved)
+                with patch(
+                    "description_pipeline.sources.solidworks.native._hash",
+                    return_value="f" * 64,
+                ), self.assertRaises(CadError) as caught:
+                    backend._rebuild_capture_copy(doc, PATH)
+                self.assertEqual(doc.rebuild_calls, 1)
+                self.assertEqual(caught.exception.code, error_code)
+                journal = backend._capture_rebuild_journal[-1]
+                self.assertIs(journal["result"], True)
+                self.assertEqual(journal["error_code"], error_code)
+                self.assertEqual(journal["error_phase"], error_phase)
+                self.assertTrue(journal["error"])
+                self.assertNotIn("state_after", journal)
+
     def test_rebuild_cannot_change_source_bytes(self):
         backend = _Backend(lambda: _Doc(PATH))
         doc = _Doc(PATH, needs_rebuild2=1)

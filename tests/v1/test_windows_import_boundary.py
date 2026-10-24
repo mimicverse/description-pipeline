@@ -83,7 +83,9 @@ with tempfile.TemporaryDirectory(prefix="windows-runtime-") as root_text:
     config = windows.read_config(config_path)
     files = {"cad/robot.SLDASM": "ab" * 32}
     runtime_run = "00000000-0000-4000-8000-000000000001"
+    from tests.v1.freeze_event_support import freeze_request_fields
     request = {
+        **freeze_request_fields(),
         "run_id": runtime_run,
         "upload_files": files,
         "upload_sha256": windows.digest(files),

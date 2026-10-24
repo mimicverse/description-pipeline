@@ -383,7 +383,7 @@ class DiscoveryTests(unittest.TestCase):
         ]
         self.assertTrue(entries)
         package_file = str(entries[0]["package_file"])
-        record_path = delivery / "input/records" / package_file
+        record_path = delivery / "input" / package_file
         value = json.loads(record_path.read_text(encoding="utf-8"))
         mutate(value)
         content = json.dumps(value, indent=2).encode("utf-8")
@@ -1494,7 +1494,7 @@ class DiscoveryTests(unittest.TestCase):
             self._deliver(output),
             discovery_name="evidence/discovery.json",
             cad_prefix="input/cad/",
-            records_prefix="input/records/",
+            records_prefix="input/",
         )
         joint = definition["joints"][0]
         self.assertEqual(joint["limit_source"], "declared_author")

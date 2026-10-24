@@ -286,7 +286,7 @@ def _archive_input(package: Path, staging: Path) -> None:
     """
 
     from .sources.solidworks.discovery import DISCOVERY_FILE, FINDINGS_FILE
-    from .orchestration.stage_transfer import record_archive_path
+    from .interface_records import record_archive_path
 
     payload = read_data(package / DISCOVERY_FILE)
     native_files = payload.get("native_files") if isinstance(payload.get("native_files"), dict) else {}

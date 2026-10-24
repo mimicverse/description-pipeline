@@ -23,7 +23,8 @@ from description_pipeline.io import PipelineError, canonical, digest, file_diges
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
-from description_pipeline import steps
+from description_pipeline import steps, native_transfer
+from description_pipeline.interface_records import record_archive_path
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.stages import stage_view as rendered_stage_view
 
@@ -603,10 +604,10 @@ class StageTransferTests(unittest.TestCase):
 
     def test_complete_roundtrip_installs_the_closed_capture(self) -> None:
         manifest = seal(self.root, self.archive)
-        self.assertEqual(manifest["schema_version"], transfer.TRANSFER_SCHEMA)
+        self.assertEqual(manifest["schema_version"], native_transfer.TRANSFER_SCHEMA)
         self.assertEqual(manifest["run_id"], RUN_ID)
         self.assertEqual(manifest["file_count"], len(manifest["files"]))
-        self.assertEqual(manifest["native_stage_scope"], list(transfer.NATIVE_STAGE_SCOPE))
+        self.assertEqual(manifest["native_stage_scope"], list(native_transfer.NATIVE_STAGE_SCOPE))
         self.assertEqual(manifest["main_assembly_sha256"], manifest["files"]["input/cad/" + MAIN_ASSEMBLY])
 
         destination = self.base / "admitted"
@@ -640,7 +641,7 @@ class StageTransferTests(unittest.TestCase):
 
         destination = self.base / "separate-upload-admitted"
         admit(archive, destination, expected_upload_sha256=upload_sha256)
-        summary = transfer.verify_transfer(
+        summary = native_transfer.verify_transfer(
             destination,
             expected_upload_sha256=upload_sha256,
         )
@@ -651,24 +652,24 @@ class StageTransferTests(unittest.TestCase):
         manifest = seal(self.root, self.archive)
         destination = self.base / "admitted"
         admit(self.archive, destination)
-        summary = transfer.verify_transfer(destination)
+        summary = native_transfer.verify_transfer(destination)
         self.assertEqual(summary["files"], manifest["file_count"])
 
         # The admitted capture stays strict when the sealed report bytes change ...
         (destination / "reports/structural-team.md").write_text("# regenerated\n", encoding="utf-8")
         (destination / "reports/structural-team.json").write_text('{"findings": []}\n', encoding="utf-8")
         with self.assertRaisesRegex(PipelineError, "differs from the transfer manifest"):
-            transfer.verify_transfer(destination)
+            native_transfer.verify_transfer(destination)
         # ... while a delivery may carry its own regenerated copy ...
-        summary = transfer.verify_transfer(destination, regenerated=transfer.TEAM_REPORTS)
+        summary = native_transfer.verify_transfer(destination, regenerated=native_transfer.TEAM_REPORTS)
         self.assertEqual(summary["files"], manifest["file_count"])
         # ... or none at all before the report is stamped.
         (destination / "reports/structural-team.md").unlink()
         (destination / "reports/structural-team.json").unlink()
-        summary = transfer.verify_transfer(destination, regenerated=transfer.TEAM_REPORTS)
+        summary = native_transfer.verify_transfer(destination, regenerated=native_transfer.TEAM_REPORTS)
         self.assertEqual(summary["files"], manifest["file_count"])
         with self.assertRaises(PipelineError):
-            transfer.verify_transfer(destination)
+            native_transfer.verify_transfer(destination)
 
     def test_sealing_is_deterministic(self) -> None:
         first = self.base / "first.zip"
@@ -1251,7 +1252,7 @@ class StageTransferTests(unittest.TestCase):
         write_json(bundle / "reports/quality.json", {"passed": True})
         write_json(bundle / "reports/native-tool.json", native_tool())
         write_json(bundle / "reports/native-stages.json", stage_view())
-        write_json(bundle / "transfer-manifest.json", {"schema_version": transfer.TRANSFER_SCHEMA})
+        write_json(bundle / "transfer-manifest.json", {"schema_version": native_transfer.TRANSFER_SCHEMA})
 
         worktree = self.base / "publish-worktree"
         _copy_governed(bundle, worktree)
@@ -1286,7 +1287,7 @@ class StageTransferTests(unittest.TestCase):
 
         write_json(bundle / "reports/native-tool.json", native_tool())
         write_json(bundle / "reports/native-stages.json", stage_view())
-        write_json(bundle / transfer.CAPTURE_MANIFEST, {"schema_version": transfer.TRANSFER_SCHEMA})
+        write_json(bundle / transfer.CAPTURE_MANIFEST, {"schema_version": native_transfer.TRANSFER_SCHEMA})
         for name in ("reports/native-tool.json", "reports/native-stages.json", transfer.CAPTURE_MANIFEST):
             self.assertNotIn(name, subject)
         self.assertEqual(subject_inventory(bundle), subject)  # receipts never bind into the subject
@@ -1319,26 +1320,26 @@ class StageTransferTests(unittest.TestCase):
             manifest_path.write_bytes(canonical(manifest))
 
         clean = bundle("gate-clean")
-        self.assertEqual(transfer.verify_transfer(clean)["main_assembly"], MAIN_ASSEMBLY)
+        self.assertEqual(native_transfer.verify_transfer(clean)["main_assembly"], MAIN_ASSEMBLY)
 
         neutral = self.base / "gate-neutral"
         (neutral / "input").mkdir(parents=True)
         (neutral / "evidence").mkdir()
         write_json(neutral / "reports/tool.json", {"role": "portable"})
-        self.assertIsNone(transfer.verify_transfer(neutral))
+        self.assertIsNone(native_transfer.verify_transfer(neutral))
 
         staged = bundle("gate-stages")
         view = stage_view()
         next(stage for stage in view["stages"] if stage["id"] == "capture")["checks_passed"] = 0
         reseal(staged, {"reports/native-stages.json": canonical(view)})
         with self.assertRaisesRegex(PipelineError, "receipts are incomplete"):
-            transfer.verify_transfer(staged)
+            native_transfer.verify_transfer(staged)
 
         retooled = bundle("gate-tool")
         bumped = {**native_tool(), "version": "9.9.9"}
         reseal(retooled, {"reports/native-tool.json": canonical(bumped)})
         with self.assertRaisesRegex(PipelineError, "another release"):
-            transfer.verify_transfer(retooled)
+            native_transfer.verify_transfer(retooled)
 
         remade = bundle("gate-main")
         replacement = b"OTHER-BYTES"
@@ -1352,12 +1353,12 @@ class StageTransferTests(unittest.TestCase):
             },
         )
         with self.assertRaisesRegex(PipelineError, "Native discovery inventory"):
-            transfer.verify_transfer(remade)
+            native_transfer.verify_transfer(remade)
 
         removed = bundle("gate-removed")
         (removed / "reports/native-stages.json").unlink()
         with self.assertRaises(PipelineError):
-            transfer.verify_transfer(removed)
+            native_transfer.verify_transfer(removed)
 
     def test_immutable_receipts_cannot_hide_corrupt_disk_copies(self) -> None:
         seal(self.root, self.archive)
@@ -1375,12 +1376,12 @@ class StageTransferTests(unittest.TestCase):
             ).read_bytes(),
         }
         self.assertEqual(
-            transfer.verify_transfer(destination, native_receipts=receipts)["main_assembly"],
+            native_transfer.verify_transfer(destination, native_receipts=receipts)["main_assembly"],
             MAIN_ASSEMBLY,
         )
         (destination / "reports/native-tool.json").write_bytes(b'{"forged":true}\n')
         with self.assertRaisesRegex(PipelineError, "disk receipt differs"):
-            transfer.verify_transfer(destination, native_receipts=receipts)
+            native_transfer.verify_transfer(destination, native_receipts=receipts)
 
     def test_immutable_receipts_always_verify_the_complete_total_bytes(self) -> None:
         seal(self.root, self.archive)
@@ -1399,12 +1400,12 @@ class StageTransferTests(unittest.TestCase):
         manifest = read_data(destination / transfer.CAPTURE_MANIFEST)
         manifest["total_bytes"] += 1
         receipts["transfer_manifest_bytes"] = canonical(manifest)
-        for name in transfer.TEAM_REPORTS:
+        for name in native_transfer.TEAM_REPORTS:
             (destination / name).unlink()
         with self.assertRaisesRegex(PipelineError, "size differs"):
-            transfer.verify_transfer(
+            native_transfer.verify_transfer(
                 destination,
-                regenerated=transfer.TEAM_REPORTS,
+                regenerated=native_transfer.TEAM_REPORTS,
                 native_receipts=receipts,
             )
 
@@ -1545,7 +1546,7 @@ class StageTransferTests(unittest.TestCase):
                 seal(root, self.base / f"record-binding-{label}.zip")
 
     def test_controlled_record_archive_path_is_canonical_and_never_overwrites(self) -> None:
-        self.assertEqual(transfer.record_archive_path("records/record.txt"), "records/record.txt")
+        self.assertEqual(record_archive_path("records/record.txt"), "records/record.txt")
         for invalid in (
             "cad/robot.SLDASM",
             "../record.txt",
@@ -1554,7 +1555,7 @@ class StageTransferTests(unittest.TestCase):
             "records\\record.txt",
         ):
             with self.subTest(invalid=invalid), self.assertRaises(PipelineError):
-                transfer.record_archive_path(invalid)
+                record_archive_path(invalid)
 
         package = self.base / "record-package"
         (package / "discovery").mkdir(parents=True)
@@ -1926,7 +1927,7 @@ class StageTransferTests(unittest.TestCase):
         seal(root, archive)
         destination = self.base / "winpath-out"
         admit(archive, destination)
-        self.assertEqual(transfer.verify_transfer(destination)["main_assembly"], MAIN_ASSEMBLY)
+        self.assertEqual(native_transfer.verify_transfer(destination)["main_assembly"], MAIN_ASSEMBLY)
 
     def test_git_attributes_protect_the_delivered_bytes(self) -> None:
         from description_pipeline.repository.urdf_pr import GIT_ATTRIBUTES

@@ -41,11 +41,9 @@ from ..sources.solidworks.native_limits import (
     PREVIEW_WINDOW_RAD,
 )
 from ..sources.solidworks.session_artifacts import (
-    embedded_virtual_component_path,
-    embedded_virtual_component_root,
+    embedded_virtual_component_under_root,
     session_root_pid,
-    session_temp_root,
-    session_materialization_path,
+    session_materialization_under_root,
 )
 from ..sources.solidworks.evidence import (
     METADATA_WARNING_CODE,
@@ -586,6 +584,7 @@ def _native(root, manifest):
     collection = evidence.collection(root)
     _require(collection.get("identity") == manifest["identity"], "Collection and archived source identities differ")
     environment = evidence.runtime(root)
+    _require(isinstance(environment, dict), "Capture environment is unavailable")
     _require(environment == collection.get("environment"), "Environment evidence differs")
     revision = str(environment["solidworks"]["revision"])
     _require(revision.split(".")[0] == "34", "Native inertia API qualification currently covers SolidWorks 34 only")
@@ -630,6 +629,7 @@ def _capture_preparation(root, manifest):
         "child_rebuilds",
         "top_rebuild",
         "rebuild_calls",
+        "session",
         "needs_rebuild2_before",
         "needs_rebuild2_after",
         "configuration_needs_rebuild_before",
@@ -652,6 +652,33 @@ def _capture_preparation(root, manifest):
     }
     _require(set(preparation) == required, "Capture preparation fields are incomplete or unknown")
     _require(preparation["schema_version"] == schema, "Capture preparation schema changed")
+    environment = evidence.runtime(root)
+    copy_identity = ((environment.get("solidworks") or {}).get("sessions") or {}).get("copy")
+    _require(
+        isinstance(copy_identity, dict)
+        and type(copy_identity.get("pid")) is int
+        and copy_identity["pid"] > 0
+        and copy_identity.get("state") == "active",
+        "Capture environment has no active owned copy process",
+    )
+
+    def session_evidence(value, label):
+        _require(
+            isinstance(value, dict)
+            and set(value) == {"role", "identity", "temp_root"}
+            and value["role"] == "copy"
+            and value["identity"] == copy_identity,
+            f"{label} session differs from the captured owned process",
+        )
+        temp_root = value["temp_root"]
+        _require(
+            temp_root is None
+            or (isinstance(temp_root, str) and session_root_pid(temp_root) == copy_identity["pid"]),
+            f"{label} session root differs from the captured owned process",
+        )
+        return value
+
+    prepared_session = session_evidence(preparation["session"], "Capture preparation")
 
     raw = discovery.get("raw")
     _require(isinstance(raw, dict), "Native discovery has no raw capture record")
@@ -872,7 +899,7 @@ def _capture_preparation(root, manifest):
         "native_api_pid",
     }
 
-    def topology_row(value, label):
+    def topology_row(value, label, session):
         _require(
             isinstance(value, dict) and set(value) == topology_fields,
             f"{label} is malformed",
@@ -939,28 +966,24 @@ def _capture_preparation(root, manifest):
                     f"{label} session ownership evidence is incomplete",
                 )
                 _require(
-                    session_root_pid(
-                        session_temp_root(value["document_path"])
-                        or embedded_virtual_component_root(value["document_path"])
-                    )
-                    == value["native_api_pid"],
+                    value["native_api_pid"] == session["identity"]["pid"],
                     f"{label} session path is not owned by its recorded native process",
                 )
                 if value["provenance_state"] == "embedded_virtual_component":
                     _require(
-                        embedded_virtual_component_path(value["document_path"]),
+                        embedded_virtual_component_under_root(value["document_path"], session["temp_root"]),
                         f"{label} lacks a VC~~ controlled temp path",
                     )
                 else:
                     _require(
-                        session_materialization_path(value["document_path"]),
+                        session_materialization_under_root(value["document_path"], session["temp_root"]),
                         f"{label} lacks an IC~~ controlled temp path",
                     )
         return value
 
-    def topology_rows(value, label):
+    def topology_rows(value, label, session):
         _require(isinstance(value, list) and bool(value), f"{label} is missing")
-        rows = [topology_row(item, f"{label} row") for item in value]
+        rows = [topology_row(item, f"{label} row", session) for item in value]
         instances = [item["instance"] for item in rows]
         _require(len(instances) == len(set(instances)), f"{label} repeats an instance path")
         top_rows = [item for item in rows if item["instance"] == "top"]
@@ -979,6 +1002,11 @@ def _capture_preparation(root, manifest):
                     "storage_scope": row["storage_scope"],
                     "provenance_state": row["provenance_state"],
                     "owner_sha256": row["owner_sha256"],
+                    "owner_document_path": (
+                        normalized_path(row["owner_document_path"])
+                        if row["owner_document_path"] is not None
+                        else None
+                    ),
                     **(
                         {}
                         if row["storage_scope"] == "session"
@@ -1018,8 +1046,8 @@ def _capture_preparation(root, manifest):
         "capture state_after is not fully rebuilt",
     )
 
-    topology_before = topology_rows(preparation["topology_before"], "topology_before")
-    topology_after = topology_rows(preparation["topology_after"], "topology_after")
+    topology_before = topology_rows(preparation["topology_before"], "topology_before", prepared_session)
+    topology_after = topology_rows(preparation["topology_after"], "topology_after", prepared_session)
     _require(topology_before == topology_after, "Capture rebuild changed the final topology")
     _require(
         topology_before == sorted(
@@ -1209,6 +1237,46 @@ def _capture_preparation(root, manifest):
         set(before_sources) == file_document_paths | {top_key},
         "Source inventory differs from file-backed topology",
     )
+
+    def verify_occurrence_owners(rows, label):
+        by_instance = {item["instance"]: item for item in rows}
+        for row in rows:
+            if row["instance"] == "top":
+                continue
+            _require(
+                row["depth"] == row["instance"].count("/") + 1,
+                f"{label} occurrence depth differs from its instance path",
+            )
+            parent_instance = "top" if row["depth"] == 1 else row["instance"].rsplit("/", 1)[0]
+            parent = by_instance.get(parent_instance)
+            _require(
+                parent is not None
+                and parent["document_type"] == 2
+                and parent["depth"] == row["depth"] - 1,
+                f"{label} occurrence has no exact assembly parent: {row['instance']}",
+            )
+            if row["storage_scope"] != "session":
+                continue
+            while parent["storage_scope"] == "session":
+                ancestor = "top" if parent["depth"] == 1 else parent["instance"].rsplit("/", 1)[0]
+                ancestor_row = by_instance.get(ancestor)
+                _require(
+                    ancestor_row is not None
+                    and ancestor_row["document_type"] == 2
+                    and ancestor_row["depth"] == parent["depth"] - 1,
+                    f"{label} session occurrence has no file-backed owner",
+                )
+                parent = ancestor_row
+            owner_key = normalized_path(parent["document_path"])
+            _require(
+                parent["storage_scope"] == "file"
+                and owner_key in before_sources
+                and normalized_path(row["owner_document_path"]) == owner_key
+                and row["owner_sha256"] == before_sources[owner_key]["sha256"],
+                f"{label} session owner differs from its occurrence parent: {row['instance']}",
+            )
+
+    verify_occurrence_owners(topology_before, "Capture preparation")
     copied = closure.get("copy_files")
     mapping = closure.get("mapping")
     _require(isinstance(copied, dict) and bool(copied), "Dependency closure has no copied source inventory")
@@ -1437,7 +1505,7 @@ def _capture_preparation(root, manifest):
         payload = read_data(confined(root, "evidence/raw/" + relative))
         _require(
             isinstance(payload, dict)
-            and set(payload) == {"document_count", "parts", "assemblies", "documents", "topology"},
+            and set(payload) == {"document_count", "parts", "assemblies", "documents", "topology", "session"},
             f"{label} fields are incomplete or unknown",
         )
         documents = payload["documents"]
@@ -1445,7 +1513,10 @@ def _capture_preparation(root, manifest):
         _require(type(payload["document_count"]) is int and payload["document_count"] == len(documents), (
             f"{label} document count differs from its rows"
         ))
-        snapshot_topology = topology_rows(payload["topology"], f"{label} topology")
+        snapshot_session = session_evidence(payload["session"], label)
+        _require(snapshot_session == prepared_session, f"{label} changed the controlled capture session root")
+        snapshot_topology = topology_rows(payload["topology"], f"{label} topology", snapshot_session)
+        verify_occurrence_owners(snapshot_topology, label)
         _require(
             topology_semantic(snapshot_topology) == topology_semantic(topology_before),
             f"{label} changed the semantic native topology",
@@ -1541,6 +1612,7 @@ def _capture_preparation(root, manifest):
                     document_type,
                     tuple(sorted(item["instance"] for item in bound_rows)),
                     tuple(sorted(item["referenced_configuration"] for item in bound_rows)),
+                    tuple(sorted({normalized_path(item["owner_document_path"]) for item in bound_rows})),
                     next(iter(owners)),
                 )
                 for item in bound_rows:
@@ -1722,7 +1794,7 @@ def _capture_preparation(root, manifest):
     rebuild_calls = preparation["rebuild_calls"]
     _require(
         isinstance(rebuild_calls, list)
-        and len(rebuild_calls) == len(child_rebuilds) + int(top_rebuild is not None) + 1,
+        and len(rebuild_calls) == len(rebuild_candidates) + len(child_rebuilds) + int(top_rebuild is not None) + 1,
         "Rebuild call journal differs from the recorded native calls",
     )
     initial_call = rebuild_calls[0]
@@ -1734,17 +1806,13 @@ def _capture_preparation(root, manifest):
         and initial_call["rebuild_candidates"] == sorted(rebuild_candidates),
         "Rebuild journal does not bind the initial dirty ancestor closure",
     )
-    expected_calls = [*child_rebuilds, *([] if top_rebuild is None else [top_rebuild])]
-    for sequence, (call, recorded_call) in enumerate(
-        zip(rebuild_calls[1:], expected_calls, strict=True),
-        1,
-    ):
+    def verify_call(call, recorded_call, sequence, kind):
         _require(
             isinstance(call, dict)
             and set(call)
             == {"sequence", "kind", "path", "depth", "state_before", "result", "state_after"}
             and call["sequence"] == sequence
-            and call["kind"] == ("top" if recorded_call is top_rebuild else "child")
+            and call["kind"] == kind
             and call["path"] == recorded_call["path"]
             and call["depth"] == recorded_call["depth"]
             and call["state_before"] == recorded_call["state_before"]
@@ -1753,6 +1821,65 @@ def _capture_preparation(root, manifest):
             and recorded_call["call_sequence"] == sequence,
             "Rebuild call journal differs from its recorded evidence",
         )
+
+    child_calls = {normalized_path(item["path"]): item for item in child_rebuilds}
+
+    def journal_row(sequence):
+        _require(sequence < len(rebuild_calls), "Rebuild journal ended before its scheduled observation or call")
+        return rebuild_calls[sequence]
+
+    sequence = 1
+    for key in sorted(rebuild_candidates, key=lambda key: (-before_rows[key]["depth"], key)):
+        candidate = journal_row(sequence)
+        row = before_rows[key]
+        _require(
+            isinstance(candidate, dict)
+            and set(candidate)
+            == {"sequence", "kind", "path", "depth", "required_configurations", "state", "decision"}
+            and candidate["sequence"] == sequence
+            and candidate["kind"] == "candidate"
+            and _same_native_path(candidate["path"], row["path"])
+            and candidate["depth"] == row["depth"]
+            and candidate["required_configurations"] == sorted(groups[key]["configurations"]),
+            "Rebuild journal omits or reorders an initial dirty closure candidate",
+        )
+        fresh = state_row(candidate["state"], "Rebuild candidate state")
+        _require(
+            _same_native_path(fresh["path"], row["path"])
+            and fresh["configuration"] == row["state"]["configuration"],
+            "Rebuild candidate changed its document or configuration",
+        )
+        _require(
+            groups[key]["configurations"] <= {item["name"] for item in fresh["configurations"]},
+            "Rebuild candidate omits a required configuration",
+        )
+        sequence += 1
+        if fresh["needs_rebuild2_value"] in (1, 2):
+            _require(
+                candidate["decision"] == "rebuild"
+                and key in child_calls
+                and child_calls[key]["state_before"] == fresh,
+                "A pending candidate has no recorded child-first rebuild",
+            )
+            verify_call(journal_row(sequence), child_calls.pop(key), sequence, "child")
+            sequence += 1
+        else:
+            _require(
+                candidate["decision"] == "skip_clean"
+                and key not in child_calls
+                and fresh["configuration_needs_rebuild"] is False
+                and all(
+                    item["needs_rebuild"] is False
+                    for item in fresh["configurations"]
+                    if item["name"] in groups[key]["configurations"]
+                ),
+                "A skipped rebuild candidate was not observed clean",
+            )
+    _require(not child_calls, "Child rebuild has no corresponding candidate observation")
+    if top_rebuild is not None:
+        verify_call(journal_row(sequence), top_rebuild, sequence, "top")
+        sequence += 1
+    _require(sequence == len(rebuild_calls), "Rebuild journal contains an unscheduled native call")
 
     return {
         "schema_version": schema,
@@ -2144,7 +2271,7 @@ def _entities(source, raw, model):
 def _native_receipts_evidence(root, receipts):
     """Delegate immutable native receipts to the transfer semantic validator."""
 
-    from ..orchestration.stage_transfer import validate_native_receipts
+    from ..native_transfer import validate_native_receipts
 
     evidence = validate_native_receipts(Path(root), receipts)
     delivery = read_data(confined(root, "tool.json"))

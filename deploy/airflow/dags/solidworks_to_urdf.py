@@ -13,7 +13,6 @@ confirmed here before publication.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import logging
 import os
@@ -79,12 +78,10 @@ from description_pipeline.stages import (
     DELIVERY_STAGES,
     STAGE_IDS,
     compact_view,
-    canonical_freeze_timestamp,
     contract_markdown,
     require_complete,
     stage_log,
     stage_view,
-    validate_freeze_events,
 )
 from description_pipeline.io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence, read_request_evidence
@@ -655,23 +652,34 @@ def _portable_registered(
     unresolved_detected = False
     try:
         receipt = flow.run_stage(platform, store_root, run_id, stage, **kwargs)
+        unresolved_detected = stage == "publish" and (
+            receipt.get("state") == "unresolved" or receipt.get("passed") is True
+        )
         _portable_report(receipt, stage=stage, context=context)
         if stage == "publish" and receipt.get("state") == "unresolved":
-            unresolved_detected = True
-            try:
-                _register_unresolved_stage(platform, store_root, run_id, stage, receipt, tree)
-            except Exception:
-                log.exception(
-                    "unresolved publication registration unavailable run=%s; retaining reconciliation debt",
-                    run_id,
-                )
             raise _boundary_failure(
                 receipt.get("error") or "publish ended with an unresolved external side effect",
                 receipt,
             )
         _portable_summary(receipt, stage=stage)  # a non-confirmed receipt never reaches registration
     except Exception as error:
-        if not unresolved_detected:
+        if unresolved_detected:
+            try:
+                _register_unresolved_stage(
+                    platform,
+                    store_root,
+                    run_id,
+                    stage,
+                    receipt if receipt.get("state") == "unresolved" else {
+                        **receipt,
+                        "error": "publication_registration_unknown",
+                        "detail": f"{type(error).__name__}: {error}",
+                    },
+                    tree,
+                )
+            except Exception:
+                log.exception("publication side effect requires reconciliation run=%s", run_id)
+        else:
             _converge_failed_stage(
                 run_id,
                 stage,
@@ -901,26 +909,16 @@ def _prior_freeze_binding(
 ) -> tuple[list[dict], str]:
     """The immutable Linux freeze block a fresh native job must carry."""
 
-    events = []
-    for row in flow.recorded_events(platform, run_id):
-        if not isinstance(row, dict) or row.get("stage") != "freeze":
-            continue
-        payload = row.get("payload") if isinstance(row, dict) else None
-        if payload == {"state": "completed"}:
-            continue
-        if (
-            row.get("kind") != "stage"
-            or not isinstance(payload, dict)
-            or payload.get("stage") != "freeze"
-        ):
-            raise AirflowFailException("A freeze-stage row is not a raw protocol event")
-        events.append({"at": canonical_freeze_timestamp(row.get("at")), **copy.deepcopy(payload)})
+    try:
+        events = native_capture.registered_freeze_events(platform, run_id)
+    except PipelineError as error:
+        raise AirflowFailException(str(error)) from error
     receipt = receipt if receipt is not None else platform.confirmed_stage(run_id, "freeze")
     if not events or not isinstance(receipt, dict):
         raise AirflowFailException(
             "The registered Linux freeze stage has no immutable native prior-event binding"
         )
-    return validate_freeze_events(events), digest(receipt)
+    return events, digest(receipt)
 
 
 def _accepted_request_facts(request_row: dict) -> tuple[str, str]:

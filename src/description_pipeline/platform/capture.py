@@ -25,10 +25,11 @@ from ..orchestration.stage_transfer import (
     CAPTURE_MANIFEST,
     MAX_MANIFEST_BYTES,
     admit_capture,
-    verify_transfer,
 )
+from ..native_transfer import verify_transfer
 from ..stages import canonical_freeze_timestamp, validate_freeze_events
-from .flow import RunPaths, _registered_request_sha256, recorded_events
+from . import flow
+from .flow import RunPaths, _registered_request_sha256
 from .store import PlatformStore
 
 
@@ -79,22 +80,25 @@ def _check_selected_capture(capture: Path, selection: dict) -> None:
             raise PipelineError(f"The captured source differs from the selected bytes: {name}")
 
 
-def _registered_freeze_events(platform: PlatformStore, run_id: str) -> list[dict]:
+def registered_freeze_events(platform: PlatformStore, run_id: str) -> list[dict]:
     """Read the one registered Linux freeze block from platform rows."""
 
     events = []
-    for row in recorded_events(platform, run_id):
-        if not isinstance(row, dict) or row.get("stage") != "freeze":
+    for row in flow.recorded_events(platform, run_id):
+        if (
+            not isinstance(row, dict)
+            or row.get("stage") != "freeze"
+            or row.get("kind") != "stage"
+        ):
             continue
         payload = row.get("payload")
         if payload == {"state": "completed"}:
             continue
         if (
-            row.get("kind") != "stage"
-            or not isinstance(payload, dict)
+            not isinstance(payload, dict)
             or payload.get("stage") != "freeze"
         ):
-            raise PipelineError("A freeze-stage row is not a raw native-protocol event")
+            raise PipelineError("A freeze-stage row is not a raw protocol event")
         events.append({"at": canonical_freeze_timestamp(row.get("at")), **copy.deepcopy(payload)})
     return validate_freeze_events(events)
 
@@ -123,7 +127,7 @@ def _append_native_events(
     """Validate the carried Freeze block once, then mirror only new native events."""
 
     expected_freeze = validate_freeze_events(expected_freeze_events)
-    if _registered_freeze_events(platform, run_id) != expected_freeze:
+    if registered_freeze_events(platform, run_id) != expected_freeze:
         raise PipelineError("The native capture Freeze block differs from the registered platform facts")
     receipt = read_data(capture / "reports/native-stages.json")
     receipt_events = (receipt or {}).get("events") or []
@@ -143,7 +147,7 @@ def _append_native_events(
             kind=row.get("kind"),
             at=row.get("at"),
         )
-        for row in recorded_events(platform, run_id)
+        for row in flow.recorded_events(platform, run_id)
         for payload in [row.get("payload") if isinstance(row, dict) else None]
     }
     receipt_keys = set()

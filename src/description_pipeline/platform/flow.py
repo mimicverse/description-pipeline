@@ -18,7 +18,7 @@ from .. import solidworks
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, file_digest, read_data
 from ..orchestration.airflow_client import JOB_SCHEMA, validate_run_id
-from ..orchestration.stage_transfer import CAPTURE_MANIFEST, TEAM_REPORTS, verify_transfer
+from ..native_transfer import CAPTURE_MANIFEST, TEAM_REPORTS, verify_transfer
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..stages import (
     DELIVERY_STAGES,

@@ -6,6 +6,8 @@ they do not qualify native CAD behavior.
 
 from __future__ import annotations
 
+from tests.v1.freeze_event_support import freeze_request_fields
+
 import hashlib
 import json
 import unittest
@@ -133,6 +135,7 @@ class MainAssemblyResumeTests(EndpointFixture, unittest.TestCase):
     @staticmethod
     def linked_request(parent: dict, *, main_assembly: str | None = MAIN) -> dict:
         request = {
+            **freeze_request_fields(parent["request"]),
             "run_id": str(uuid.uuid4()),
             "upload_files": parent["request"]["upload_files"],
             "upload_sha256": parent["request"]["upload_sha256"],

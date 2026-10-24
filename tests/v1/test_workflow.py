@@ -178,6 +178,7 @@ class WorkflowTests(unittest.TestCase):
         }
         record_path = self.package / "discovery/native-discovery.json"
         write_json(record_path, record)
+        write_json(self.package / "discovery/findings.json", [])
         author["provenance"] = {
             "generator": "native-discovery", "generator_version": "1", "contract": record["contract"],
             "run_id": record["run_id"], "discovery_sha256": file_digest(record_path),
@@ -369,6 +370,8 @@ class WorkflowTests(unittest.TestCase):
             "cad/assembly.SLDASM": file_digest(self.package / "assembly.SLDASM"),
             "cad/part.SLDPRT": file_digest(self.package / "part.SLDPRT"),
             "source.json": file_digest(self.package / "source.json"),
+            "discovery/native-discovery.json": file_digest(self.package / "discovery/native-discovery.json"),
+            "discovery/findings.json": file_digest(self.package / "discovery/findings.json"),
         }
         self.assertEqual(check["details"]["files_sha256"], digest(delivered))
         self.assertEqual(check["details"]["files"], {"input/" + path: value for path, value in delivered.items()})

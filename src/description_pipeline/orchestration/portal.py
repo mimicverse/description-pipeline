@@ -83,7 +83,7 @@ from ..platform.store import (
 )
 from ..platform.storage import SEALED_URI_PREFIX, parse_sealed_uri
 from ..ports import PORTAL_HTTP_PORT
-from .stage_transfer import TEAM_REPORTS
+from ..native_transfer import TEAM_REPORTS
 from .freeze_retry import FreezeRetryRefusal, resolve_freeze_retry_identity
 from .feishu_oauth import (
     TRIGGERING_USER_NAME_DELIMITER,

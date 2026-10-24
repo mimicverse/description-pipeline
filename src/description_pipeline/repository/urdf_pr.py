@@ -1271,14 +1271,15 @@ def submit_bundle(
         return result
     except PrError as error:
         observed(phase, "failed", {"error": error.code, "detail": error.detail})
-        if error.code == "pr_ambiguous" and pushed:
+        if pushed:
             return _unresolved(
-                "pr_ambiguous_after_push",
+                error.code + "_after_push",
                 error.detail,
                 commit=pushed,
                 branch=branch,
                 subject=subject,
                 base=base,
+                url=getattr(error, "pr_url", ""),
             )
         return {
             "state": "failed",
@@ -1322,6 +1323,16 @@ def submit_bundle(
         }
     except Exception as error:  # noqa: BLE001 - receipts must never crash the caller
         observed(phase, "failed", {"error": type(error).__name__, "detail": str(error)[:300]})
+        if pushed:
+            return _unresolved(
+                "publication_unknown_after_push",
+                {"error": type(error).__name__, "detail": str(error)[:300]},
+                commit=pushed,
+                branch=branch,
+                subject=subject,
+                base=base,
+                url=getattr(error, "pr_url", ""),
+            )
         return {
             "state": "failed",
             "error": type(error).__name__,

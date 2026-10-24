@@ -136,6 +136,7 @@ def _document_state_snapshots(preparation: dict) -> dict[str, dict]:
         "assemblies": sum(item["document_type"] == 2 for item in documents),
         "documents": documents,
         "topology": copy.deepcopy(preparation["topology_after"]),
+        "session": copy.deepcopy(preparation["session"]),
     }
     return {
         "document_state_after_reads.json": copy.deepcopy(snapshot),
@@ -319,6 +320,11 @@ def payload(*, virtual_reuse: bool = False) -> dict:
         "read_only": True,
         "saved_to_disk": False,
         "rebuild_performed": False,
+        "session": {
+            "role": "copy",
+            "identity": {"pid": 21040, "state": "active"},
+            "temp_root": "/tmp/swx21040" if virtual_reuse else None,
+        },
         "component_count": len(topology) - 1,
         "assembly_document_count": 1,
         "child_rebuilds": [],
@@ -389,6 +395,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
             }
         ]
     return {
+        "environment": {"solidworks": {"sessions": {"copy": {"pid": 21040, "state": "active"}}}},
         "scene": {
             "document": TOP,
             "source_root": ntpath.dirname(TOP),
@@ -469,7 +476,7 @@ def dynamic_child_payload() -> dict:
             "instances": ["arm-1"],
             "elapsed_seconds": 0.1,
             "result": True,
-            "call_sequence": 1,
+            "call_sequence": 2,
             "state_before": fresh_before,
             "state_after": copy.deepcopy(child_state),
         }
@@ -482,6 +489,15 @@ def dynamic_child_payload() -> dict:
         },
         {
             "sequence": 1,
+            "kind": "candidate",
+            "path": CHILD_ASSEMBLY,
+            "depth": 1,
+            "required_configurations": ["Default"],
+            "state": copy.deepcopy(fresh_before),
+            "decision": "rebuild",
+        },
+        {
+            "sequence": 2,
             "kind": "child",
             "path": CHILD_ASSEMBLY,
             "depth": 1,
@@ -562,6 +578,10 @@ class CapturePreparationTests(unittest.TestCase):
             patch(
                 "description_pipeline.verification.solidworks_urdf.evidence.discovery",
                 return_value=value["discovery"],
+            ),
+            patch(
+                "description_pipeline.verification.solidworks_urdf.evidence.runtime",
+                return_value=value["environment"],
             ),
             patch(
                 "description_pipeline.verification.solidworks_urdf.confined",
@@ -704,7 +724,7 @@ class CapturePreparationTests(unittest.TestCase):
     def test_session_path_may_change_only_with_current_native_owner(self) -> None:
         value = payload(virtual_reuse=True)
         pristine = value["document_states"]["document_state_after_pristine_readout.json"]
-        changed = "/tmp/swx22000/VC~~/waist/virtual.SLDPRT"
+        changed = "/tmp/swx21040/VC~~/reopened/waist/virtual.SLDPRT"
         for document in pristine["documents"]:
             if document["path"] == VIRTUAL:
                 document["path"] = changed
@@ -713,7 +733,6 @@ class CapturePreparationTests(unittest.TestCase):
             if row["storage_scope"] == "session":
                 row["document_path"] = changed
                 row["normalized_path"] = _normalized(changed)
-                row["native_api_pid"] = 22000
         self.validate(value)
 
         foreign_owner = copy.deepcopy(value)
@@ -721,7 +740,7 @@ class CapturePreparationTests(unittest.TestCase):
         for row in pristine["topology"]:
             if row["storage_scope"] == "session":
                 row["owner_sha256"] = "f" * 64
-        with self.assertRaisesRegex(PipelineError, "semantic native topology"):
+        with self.assertRaisesRegex(PipelineError, "session owner differs"):
             self.validate(foreign_owner)
 
     def test_cached_materialization_reopen_uses_ic_owner_evidence(self) -> None:
@@ -753,7 +772,7 @@ class CapturePreparationTests(unittest.TestCase):
         value["document_states"] = _document_state_snapshots(preparation)
 
         pristine = value["document_states"]["document_state_after_pristine_readout.json"]
-        reopened = "/tmp/swx22000/IC~~/waist/imported.SLDPRT"
+        reopened = "/tmp/swx21040/IC~~/reopened/waist/imported.SLDPRT"
         for document in pristine["documents"]:
             if document["path"] == materialized:
                 document["path"] = reopened
@@ -762,7 +781,6 @@ class CapturePreparationTests(unittest.TestCase):
             if row["storage_scope"] == "session":
                 row["document_path"] = reopened
                 row["normalized_path"] = _normalized(reopened)
-                row["native_api_pid"] = 22000
         self.validate(value)
 
     def test_actual_rebuild_producer_feeds_the_independent_final_state_consumer(self) -> None:
@@ -800,6 +818,7 @@ class CapturePreparationTests(unittest.TestCase):
         }
         topology = copy.deepcopy(preparation["topology_after"])
         value = {
+            "environment": {"solidworks": {"sessions": {"copy": backend._sessions["copy"].identity()}}},
             "scene": {
                 "document": top_path,
                 "source_root": ntpath.dirname(top_path),
@@ -873,6 +892,119 @@ class CapturePreparationTests(unittest.TestCase):
         self.assertEqual({row["instance"] for row in topology}, {"top", "part-1"})
         result = self.validate(value)
         self.assertEqual(result["final_document_count"], 2)
+
+    def test_windows_session_producer_crosses_the_linux_consumer_with_owned_rematerialization(self) -> None:
+        from description_pipeline.sources.solidworks import native
+        from tests.sources.test_solidworks_rebuild_lifecycle import _Backend, _Component, _Doc
+
+        temp = r"C:\Users\operator\AppData\Local\Temp"
+        original_abspath = native.os.path.abspath
+
+        def absolute(path):
+            text = str(path)
+            return ntpath.abspath(text) if re.match(r"^[A-Za-z]:", text) else original_abspath(path)
+
+        for marker in ("IC~~", "VC~~"):
+            with self.subTest(marker=marker):
+                session_path = temp + rf"\swx21040\{marker}\waist\virtual.SLDPRT"
+                value = payload()
+                virtual = payload(virtual_reuse=True)
+                raw = value["discovery"]["raw"]
+                raw["components"].extend(copy.deepcopy(virtual["discovery"]["raw"]["components"]))
+                selected = raw["source_selection"]["closure"]
+                virtual_rows = copy.deepcopy(
+                    virtual["discovery"]["raw"]["source_selection"]["closure"]["virtual_components"]
+                )
+                if marker == "VC~~":
+                    selected["virtual_components"] = virtual_rows
+                else:
+                    selected["imports"] = [
+                        {"instance": row["instance"], "materialization": VIRTUAL, "configuration": "Default"}
+                        for row in virtual_rows
+                    ]
+
+                def replace_path(item, session_path=session_path):
+                    if isinstance(item, dict):
+                        return {key: replace_path(value) for key, value in item.items()}
+                    if isinstance(item, list):
+                        return [replace_path(value) for value in item]
+                    return session_path if item == VIRTUAL else item
+
+                value = replace_path(value)
+                part = _Doc(PART, configuration="Default", document_type=1)
+                cached = _Doc(session_path, configuration="Default", document_type=1)
+                top = _Doc(TOP, configuration="Default", children=[
+                    _Component("arm-1", part), _Component("arm-2", part),
+                    _Component("virtual-1", cached, is_virtual=marker == "VC~~"),
+                    _Component("virtual-2", cached, is_virtual=marker == "VC~~"),
+                ])
+                backend = _Backend({TOP: top, PART: part, session_path: cached}, session_pid=21040)
+                backend._capture_roots = [r"c:\capture"]
+                with (
+                    patch.object(native.os.path, "abspath", side_effect=absolute),
+                    patch("tempfile.gettempdir", return_value=temp),
+                    patch.object(native, "_hash", side_effect=lambda path: (
+                        "a" if str(path).endswith("robot.SLDASM") else "b"
+                    ) * 64),
+                ):
+                    _, preparation = backend._rebuild_capture_copy(top, TOP)
+                    after_reads = backend.verify_capture_documents_ready()
+                    reopened = session_path.replace("\\waist\\", "\\reopened\\waist\\")
+                    cached._path = reopened
+                    backend._refresh[reopened] = backend._refresh.pop(session_path)
+                    after_pristine = backend.verify_capture_documents_ready()
+                value["scene"]["notes"]["capture_preparation"] = preparation
+                value["document_states"] = {
+                    "document_state_after_reads.json": after_reads,
+                    "document_state_after_pristine_readout.json": after_pristine,
+                }
+                self.validate(value)
+
+                foreign = copy.deepcopy(value)
+                for snapshot in foreign["document_states"].values():
+                    for row in snapshot["topology"]:
+                        if row["storage_scope"] == "session":
+                            row["native_api_pid"] = 99999
+                            row["document_path"] = row["document_path"].replace("swx21040", "swx99999")
+                            row["normalized_path"] = _normalized(row["document_path"])
+                with self.assertRaisesRegex(PipelineError, "recorded native process"):
+                    self.validate(foreign)
+
+                for same_hash in (False, True):
+                    wrong_owner = copy.deepcopy(value)
+                    proof = self.preparation(wrong_owner)
+                    for rows in (proof["topology_before"], proof["topology_after"]):
+                        for row in rows:
+                            if row["storage_scope"] == "session":
+                                row["owner_document_path"] = _normalized(PART)
+                                row["owner_sha256"] = ("a" if same_hash else "b") * 64
+                    if same_hash:
+                        for name in ("source_files_before", "source_files_after"):
+                            proof[name][_normalized(PART)]["sha256"] = "a" * 64
+                    with self.assertRaisesRegex(PipelineError, "occurrence parent"):
+                        self.validate(wrong_owner)
+
+    def test_top_rebuild_cannot_replace_an_unexecuted_dirty_child(self) -> None:
+        value = dynamic_child_payload()
+        proof = self.preparation(value)
+        top_before = _state(TOP, needs_rebuild=1)
+        proof["state_before"] = copy.deepcopy(top_before)
+        proof["needs_rebuild2_before"] = 1
+        proof["assembly_states_before"][0]["state"] = copy.deepcopy(top_before)
+        proof["state_after_children"] = copy.deepcopy(top_before)
+        proof["child_rebuilds"] = []
+        proof["top_rebuild"] = {
+            "path": TOP, "depth": 0, "instances": ["top"], "elapsed_seconds": 0.1,
+            "result": True, "call_sequence": 2,
+            "state_before": copy.deepcopy(top_before), "state_after": copy.deepcopy(proof["state_after"]),
+        }
+        proof["rebuild_calls"][-1] = {
+            "sequence": 2, "kind": "top", "path": TOP, "depth": 0,
+            "state_before": copy.deepcopy(top_before), "result": True,
+            "state_after": copy.deepcopy(proof["state_after"]),
+        }
+        with self.assertRaisesRegex(PipelineError, "pending candidate"):
+            self.validate(value)
 
     def test_authored_suppressed_occurrence_is_preserved_and_bounded(self) -> None:
         def suppressed_row() -> dict:
@@ -1252,7 +1384,7 @@ class NativeReceiptTests(unittest.TestCase):
             _native_receipts_evidence(root, receipts)
         write_json(root / "transfer-manifest.json", transfer)
         with self.assertRaisesRegex(PipelineError, "omits required capture reports"):
-            from description_pipeline.orchestration.stage_transfer import verify_transfer
+            from description_pipeline.native_transfer import verify_transfer
 
             verify_transfer(root)
 

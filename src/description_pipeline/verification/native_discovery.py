@@ -2792,7 +2792,7 @@ def _close(left, right, tolerance: float = 1e-9) -> bool:
 
 
 def _record_value(package: Path, entry: dict, key: str):
-    from ..orchestration.stage_transfer import record_archive_path
+    from ..interface_records import record_archive_path
 
     relative = record_archive_path(str(entry.get("package_file") or ""))
     candidates = [package / relative, package / "input" / relative]

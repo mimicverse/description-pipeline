@@ -261,7 +261,7 @@ def _finish_native_capture(
 ):
     """Close a capture-only run: provenance reports, sealed transfer, native_complete."""
 
-    from .orchestration.stage_transfer import expected_native_check_details
+    from .native_transfer import expected_native_check_details
     upload_sha256 = upload_sha256 or handoff_sha256
     tool = _native_tool_record()
     write_json(staging / "reports/native-tool.json", tool)

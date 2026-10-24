@@ -4968,6 +4968,7 @@ class SolidWorksBackend(CadBackend):
                     "suppression_state",
                     "storage_scope",
                     "provenance_state",
+                    "owner_document_path",
                     "owner_sha256",
                 )
             }
@@ -4990,6 +4991,30 @@ class SolidWorksBackend(CadBackend):
                 )
             ),
         )
+
+    def _capture_session_evidence(self, path):
+        role = self._role_for_path(path)
+        session = self._sessions.get(role)
+        try:
+            identity = copy.deepcopy(session.identity()) if session is not None else None
+            if (
+                role != "copy"
+                or not isinstance(identity, dict)
+                or identity.get("state") != "active"
+                or type(identity.get("pid")) is not int
+                or identity["pid"] <= 0
+            ):
+                raise ValueError("capture has no active owned copy session")
+            root = self._session_artifact_roots.get(session)
+            if root is not None and session_root_pid(root) != identity["pid"]:
+                raise ValueError("capture session root differs from its process identity")
+        except Exception as error:
+            raise CadError(
+                "cad_capture_session_unbound",
+                "Capture read boundary has no owned process identity",
+                {"path": str(path), "error": str(error)[:300]},
+            ) from error
+        return {"role": role, "identity": identity, "temp_root": root}
 
     def verify_capture_documents_ready(self):
         """Fail closed unless every loaded document is clean at this read boundary."""
@@ -5044,6 +5069,7 @@ class SolidWorksBackend(CadBackend):
             "assemblies": sum(row["document_type"] == 2 for row in rows),
             "documents": rows,
             "topology": copy.deepcopy(graph["topology"]),
+            "session": self._capture_session_evidence(top_path),
         }
 
     def _capture_rebuild_graph(self, doc, path):
@@ -5446,9 +5472,11 @@ class SolidWorksBackend(CadBackend):
         }
         self._capture_rebuild_journal.append(journal)
         detail_phase = "child" if phase == "child" else "rebuild"
+        call_phase = "resolve_handle"
         try:
             dependency_doc = document or self._document_handle_by_path(path)
             extension = _member(dependency_doc, "Extension")
+            call_phase = "rebuild"
             started = time.monotonic()
             result = _member(extension, "Rebuild", REBUILD_OPTIONS_FORCE_ALL)
             elapsed = time.monotonic() - started
@@ -5456,6 +5484,7 @@ class SolidWorksBackend(CadBackend):
             journal.update(
                 {
                     "error_code": "cad_rebuild_failed",
+                    "error_phase": call_phase,
                     "error": f"{type(error).__name__}: {error}"[:300],
                 }
             )
@@ -5471,6 +5500,7 @@ class SolidWorksBackend(CadBackend):
                     "state_before": before,
                 },
             ) from error
+        journal["result"] = result
         if result is not True:
             journal.update({"result": result, "error_code": "cad_rebuild_failed"})
             raise CadError(
@@ -5491,13 +5521,15 @@ class SolidWorksBackend(CadBackend):
                 if detail_phase == "rebuild"
                 else self._document_handle_by_path(path)
             )
-        except CadError:
+        except CadError as error:
+            journal.update({"error_code": error.code, "error_phase": "refresh", "error": str(error)[:300]})
             raise
         except Exception as error:  # noqa: BLE001 - refresh failure keeps stable evidence
             journal.update(
                 {
                     "result": result,
                     "error_code": "cad_capture_refresh_failed",
+                    "error_phase": "refresh",
                     "error": f"{type(error).__name__}: {error}"[:300],
                 }
             )
@@ -5511,7 +5543,11 @@ class SolidWorksBackend(CadBackend):
                     "state_before": before,
                 },
             ) from error
-        _, after = self._capture_rebuild_state(path, document=refreshed, phase="after")
+        try:
+            _, after = self._capture_rebuild_state(path, document=refreshed, phase="after")
+        except CadError as error:
+            journal.update({"error_code": error.code, "error_phase": "after_state", "error": str(error)[:300]})
+            raise
         if after.get("configuration") != before.get("configuration"):
             journal.update(
                 {
@@ -5614,6 +5650,19 @@ class SolidWorksBackend(CadBackend):
                 continue
             child_doc, state_before_child = self._capture_rebuild_state(row["path"], phase="before_child")
             row["state_before"] = state_before_child
+            self._capture_rebuild_journal.append(
+                {
+                    "sequence": len(self._capture_rebuild_journal),
+                    "kind": "candidate",
+                    "path": row["path"],
+                    "depth": row["depth"],
+                    "required_configurations": list(self._capture_required_configurations[row["normalized_path"]]),
+                    "state": copy.deepcopy(state_before_child),
+                    "decision": (
+                        "rebuild" if state_before_child["needs_rebuild2_value"] in (1, 2) else "skip_clean"
+                    ),
+                }
+            )
             if state_before_child["needs_rebuild2_value"] not in (1, 2):
                 continue
             _, after, evidence = self._rebuild_capture_document(
@@ -5789,6 +5838,7 @@ class SolidWorksBackend(CadBackend):
             "child_rebuilds": child_rebuilds,
             "top_rebuild": top_rebuild,
             "rebuild_calls": copy.deepcopy(self._capture_rebuild_journal),
+            "session": self._capture_session_evidence(path),
             "needs_rebuild2_before": state_before.get("needs_rebuild2_value"),
             "needs_rebuild2_after": top_state.get("needs_rebuild2_value"),
             "configuration_needs_rebuild_before": state_before.get("configuration_needs_rebuild"),

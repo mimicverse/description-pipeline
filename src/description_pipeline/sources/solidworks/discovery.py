@@ -6125,7 +6125,7 @@ def source_definition(
     """
 
     import tempfile
-    from ...orchestration.stage_transfer import record_archive_path
+    from ...interface_records import record_archive_path
 
     package = Path(package)
     payload = read_data(package / discovery_name)

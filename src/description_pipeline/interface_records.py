@@ -1539,3 +1539,26 @@ def release_domain_identity() -> dict:
     """The domain block of the release manifest: contract digests + support matrix."""
 
     return {"contract": release_contract(), "support": release_support()}
+
+
+def record_archive_path(package_file: str) -> str:
+    """Validate the canonical embedded-record path used by every archive reader."""
+
+    from .io import PipelineError, artifact_path_parts
+
+    if not (
+        isinstance(package_file, str)
+        and package_file == package_file.replace("\\", "/")
+        and "//" not in package_file
+    ):
+        raise PipelineError("Controlled record path is not canonical POSIX text")
+    artifact_path_parts(package_file)
+    parts = package_file.split("/")
+    if not (
+        len(parts) == 2
+        and parts[0] == "records"
+        and bool(parts[1])
+        and parts[1] not in {".", ".."}
+    ):
+        raise PipelineError("Controlled record path must be records/<file>")
+    return package_file
