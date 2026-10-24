@@ -152,7 +152,17 @@ class ClaimTests(unittest.TestCase):
                 self.command_row(),
                 [],
                 None,
-                ("claim-1", self.command.command_id, 1, self.owner, self.executor, None, expiry),
+                (
+                    "claim-1",
+                    self.command.command_id,
+                    1,
+                    self.owner,
+                    self.executor,
+                    None,
+                    expiry,
+                    "execution",
+                    None,
+                ),
             ]
         )
         store = FactStore(lambda: connection, _Reader())
@@ -180,6 +190,8 @@ class ClaimTests(unittest.TestCase):
                     self.executor,
                     None,
                     self.now + timedelta(minutes=5),
+                    "execution",
+                    None,
                 ),
             ]
         )
@@ -208,6 +220,8 @@ class ClaimTests(unittest.TestCase):
                     self.executor,
                     None,
                     self.now - timedelta(seconds=1),
+                    "execution",
+                    None,
                 ),
                 None,
                 (2,),
@@ -269,6 +283,8 @@ class ClaimTests(unittest.TestCase):
                     self.executor,
                     None,
                     self.now - timedelta(seconds=1),
+                    "execution",
+                    None,
                 ),
                 None,
             ]

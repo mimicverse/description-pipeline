@@ -199,6 +199,8 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIn("UNIQUE (command_id, fence)", text)
         self.assertIn("executor_sha256 char(64) NOT NULL", text)
         self.assertIn("CHECK (owner_sha256 <> executor_sha256)", text)
+        self.assertIn("scope IN ('execution', 'transfer_resume')", text)
+        self.assertIn("execution_claim_effect_scope_id_fkey", text)
         self.assertIn("UNIQUE (effect_id, seq)", text)
         self.assertIn("yield_effect_id text", text)
         self.assertIn("closure_code IS NOT DISTINCT FROM 'yielded'", text)

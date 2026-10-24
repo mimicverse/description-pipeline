@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +29,12 @@ from .contracts import (
     StageFailure,
     effect_is_settled,
 )
-from .effects import EffectResumePhase, EffectState, StageEffectPort
+from .effects import (
+    EffectResumePhase,
+    EffectState,
+    StageEffectPort,
+    TransferResumeEffectPort,
+)
 from .reconciliation import EffectReconciliationResult
 
 
@@ -64,6 +70,12 @@ class StageServices(Protocol):
     def verify_decision(self, decision: StageDecision, result: StageResult) -> None: ...
 
     def acquire_claim(self, command: StageCommand) -> ExecutionClaim: ...
+
+    def acquire_transfer_resume_claim(
+        self,
+        command: StageCommand,
+        effect_id: str,
+    ) -> ExecutionClaim: ...
 
     def candidate_for(self, command: StageCommand, claim: ExecutionClaim) -> StageCandidate | None: ...
 
@@ -113,6 +125,19 @@ class StageServices(Protocol):
         workspace: StageWorkspace,
     ) -> StageEffectPort: ...
 
+    def transfer_effect_port(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+    ) -> TransferResumeEffectPort: ...
+
+    def transfer_resume_gate(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+    ) -> AbstractContextManager[None]: ...
+
     def commit_decision(
         self,
         command: StageCommand,
@@ -142,7 +167,6 @@ class StageHandler(Protocol):
         workspace: StageWorkspace,
         *,
         effects: StageEffectPort,
-        resume: StageEffectWait | None = None,
     ) -> StageExecution | StageDeferral: ...
 
     def validate_candidate(
@@ -153,6 +177,34 @@ class StageHandler(Protocol):
         *,
         effects: StageEffectPort,
     ) -> StageCandidate: ...
+
+
+class ResumeStageHandler(Protocol):
+    """Resume only from an already terminal canonical effect."""
+
+    def resume_stage(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
+        resume: StageEffectWait,
+    ) -> StageExecution | StageDeferral: ...
+
+
+class TransferResumeHandler(Protocol):
+    """Continue one existing native input transfer; never accept stage success."""
+
+    def resume_transfer(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: TransferResumeEffectPort,
+        resume: StageEffectWait,
+    ) -> StageDeferral: ...
 
 
 class EffectResumeReconciler(Protocol):
@@ -329,7 +381,7 @@ def execute_cancellation(
 def execute_stage(
     *,
     command_id: str,
-    handler: StageHandler,
+    handler: StageHandler | ResumeStageHandler | TransferResumeHandler,
     services: StageServices,
     resume: StageEffectWait | None = None,
     resume_reconciler: EffectResumeReconciler | None = None,
@@ -353,6 +405,7 @@ def execute_stage(
         return _confirmed_decision_record(services, command, confirmed)
 
     recovered_from_history = False
+    transfer_resume = False
     if resume is None:
         recovered = services.pending_effect_for_command(command.command_id)
         if recovered is not None:
@@ -412,26 +465,71 @@ def execute_stage(
                     "resume.effect_conflict",
                     {"command_id": command.command_id, "effect_id": resume.effect_id},
                 )
+            transfer_resume = (
+                state is EffectState.UNKNOWN
+                and reconciled.resume_phase is EffectResumePhase.INPUT_TRANSFER_PENDING
+            )
+
+        if transfer_resume:
+            if not callable(getattr(handler, "resume_transfer", None)):
+                raise ProtocolError(
+                    "resume.transfer_handler_missing",
+                    {"command_id": command.command_id},
+                )
+        elif resume is not None and not callable(getattr(handler, "resume_stage", None)):
+            raise ProtocolError(
+                "resume.stage_handler_missing",
+                {"command_id": command.command_id},
+            )
 
     cancel_command = services.cancellation_for(command)
     if cancel_command is not None:
         return _execute_requested_cancellation(command, cancel_command, services)
 
-    claim = services.acquire_claim(command)
+    claim = (
+        services.acquire_transfer_resume_claim(command, resume.effect_id)
+        if transfer_resume and resume is not None
+        else services.acquire_claim(command)
+    )
     if claim.command_id != command.command_id:
         raise ProtocolError("claim.command_mismatch", {"command_id": command.command_id})
 
-    candidate = services.candidate_for(command, claim)
+    candidate = None if transfer_resume else services.candidate_for(command, claim)
     workspace = services.materialize(command, claim, candidate=candidate)
     cleanup_workspace = False
     try:
-        effects = services.effect_port(command, claim, workspace)
         try:
+            if transfer_resume:
+                if resume is None:  # pragma: no cover - set only with resume
+                    raise ProtocolError("resume.wait_missing", {"command_id": command.command_id})
+                with services.transfer_resume_gate(command, claim):
+                    transfer_effects = services.transfer_effect_port(command, claim, workspace)
+                    execution = handler.resume_transfer(  # type: ignore[union-attr]
+                        command,
+                        claim,
+                        workspace,
+                        effects=transfer_effects,
+                        resume=resume,
+                    )
+                    if not isinstance(execution, StageDeferral):
+                        raise ProtocolError(
+                            "resume.transfer_result_invalid",
+                            {"command_id": command.command_id},
+                        )
+                    pending = services.yield_claim_for_effect(
+                        command,
+                        claim,
+                        execution.effect_id,
+                    )
+                cleanup_workspace = True
+                return pending
+
+            effects = services.effect_port(command, claim, workspace)
             if candidate is None:
                 if resume is None:
                     execution = handler.execute(command, claim, workspace, effects=effects)
                 else:
-                    execution = handler.execute(
+                    execution = handler.resume_stage(  # type: ignore[union-attr]
                         command,
                         claim,
                         workspace,

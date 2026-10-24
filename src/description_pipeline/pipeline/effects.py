@@ -152,6 +152,34 @@ class StageEffectPort(Protocol):
     def effect_settlement_for_key(self, effect_key: str) -> EffectSettlement | None: ...
 
 
+class TransferResumeEffectPort(Protocol):
+    """Restricted capability for one existing native input transfer."""
+
+    def authorize_resume(self, effect_id: str, *, source: str) -> EffectFact: ...
+
+    def record_response(
+        self,
+        effect_id: str,
+        *,
+        source: str,
+        response_root: str | Path,
+    ) -> EffectFact: ...
+
+    def record_timeout(
+        self,
+        effect_id: str,
+        *,
+        source: str,
+        detail_root: str | Path | None = None,
+    ) -> EffectFact: ...
+
+    def effect_state(self, effect_id: str) -> EffectState: ...
+
+    def effect_settlement(self, effect_id: str) -> EffectSettlement: ...
+
+    def effect_settlement_for_key(self, effect_key: str) -> EffectSettlement | None: ...
+
+
 def _mapping(value: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ProtocolError("effect.invalid", {"where": where})

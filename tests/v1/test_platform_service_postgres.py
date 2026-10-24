@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,6 +45,7 @@ from description_pipeline.pipeline.diagnostic import (
 )
 from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.effects import (
+    EffectIntent,
     EffectResumePhase,
     EffectState,
     native_transfer_target_digest,
@@ -193,7 +195,7 @@ class _ResumeHandler:
         self.executions = 0
         self.validations = 0
 
-    def execute(self, command, claim, workspace, *, effects, resume=None):
+    def resume_stage(self, command, claim, workspace, *, effects, resume):
         if not isinstance(resume, StageEffectWait):
             raise AssertionError("resume wait is required")
         settlement = effects.effect_settlement_for_key("native")
@@ -235,7 +237,7 @@ class _ResumeHandler:
 
 
 class _SequentialDeferralHandler:
-    def execute(self, command, claim, workspace, *, effects, resume=None):
+    def resume_stage(self, command, claim, workspace, *, effects, resume):
         if not isinstance(resume, StageEffectWait):
             raise AssertionError("resume wait is required")
         first = effects.effect_settlement_for_key("native")
@@ -301,10 +303,22 @@ class _TransferResumeHandler:
     def __init__(self) -> None:
         self.transfer_calls = 0
 
-    def execute(self, command, claim, workspace, *, effects, resume=None):
-        del command, claim, workspace
+    def resume_transfer(self, command, claim, workspace, *, effects, resume):
+        del command
         if not isinstance(resume, StageEffectWait):
             raise AssertionError("resume wait is required")
+        if claim.scope != "transfer_resume" or claim.effect_scope_id != resume.effect_id:
+            raise AssertionError("transfer resume claim is not narrowly scoped")
+        if any(
+            hasattr(effects, attribute)
+            for attribute in (
+                "prepare_effect",
+                "authorize_dispatch",
+                "record_observation",
+                "reconcile_effect",
+            )
+        ):
+            raise AssertionError("transfer capability exposes a general send path")
         settlement = effects.effect_settlement_for_key("native")
         if (
             settlement is None
@@ -313,6 +327,17 @@ class _TransferResumeHandler:
         ):
             raise AssertionError("transfer resume requires the canonical pending phase")
         effects.authorize_resume(resume.effect_id, source="transfer-resume")
+        acknowledgement = workspace.root / "resume-transfer-ack"
+        acknowledgement.mkdir()
+        (acknowledgement / "response.json").write_text(
+            '{"state":"accepted","input_transfer":"acknowledged"}\n',
+            encoding="utf-8",
+        )
+        effects.record_response(
+            resume.effect_id,
+            source="transfer-resume",
+            response_root=acknowledgement,
+        )
         self.transfer_calls += 1
         return StageDeferral(resume.effect_id)
 
@@ -708,6 +733,7 @@ class PlatformServicePostgresTests(unittest.TestCase):
         suffix: str,
         *,
         executor_sha256: str,
+        transfer_resume_gate=None,
     ) -> CanonicalStageServices:
         return CanonicalStageServices(
             facts=self.facts,
@@ -719,11 +745,24 @@ class PlatformServicePostgresTests(unittest.TestCase):
                 lease=timedelta(minutes=5),
             ),
             clock=lambda: self.now,
+            transfer_resume_gate=(
+                transfer_resume_gate
+                or (lambda _command, _claim: nullcontext())
+            ),
         )
 
-    def _prepared_pending_effect(self, suffix: str):
+    def _prepared_pending_effect(
+        self,
+        suffix: str,
+        *,
+        transfer_resume_gate=None,
+    ):
         spec, _admission, command = self._admit(suffix)
-        services = self._services(suffix, executor_sha256=spec.executors.freeze)
+        services = self._services(
+            suffix,
+            executor_sha256=spec.executors.freeze,
+            transfer_resume_gate=transfer_resume_gate,
+        )
         claim = services.acquire_claim(command)
         workspace = services.materialize(command, claim, candidate=None)
         self.addCleanup(services.discard_workspace, workspace)
@@ -1138,6 +1177,14 @@ class PlatformServicePostgresTests(unittest.TestCase):
         self.assertIsNone(services.pending_effect_for_command(command.command_id))
 
     def test_input_transfer_pending_resume_yields_the_same_effect_until_terminal(self) -> None:
+        gate_events = []
+
+        @contextmanager
+        def maintenance_gate(command, claim):
+            gate_events.append(("enter", command.command_id, claim.scope, claim.effect_scope_id))
+            yield
+            gate_events.append(("exit", command.command_id, claim.scope, claim.effect_scope_id))
+
         (
             _spec,
             command,
@@ -1148,7 +1195,10 @@ class PlatformServicePostgresTests(unittest.TestCase):
             intent,
             pending,
             _outbound,
-        ) = self._prepared_pending_effect("transfer-pending")
+        ) = self._prepared_pending_effect(
+            "transfer-pending",
+            transfer_resume_gate=maintenance_gate,
+        )
         reconciler = EffectReconciliationService(
             facts=self.facts,
             artifacts=self.artifacts,
@@ -1166,6 +1216,13 @@ class PlatformServicePostgresTests(unittest.TestCase):
         )
         self.assertEqual(transfer_pending, pending)
         self.assertEqual(transfer_handler.transfer_calls, 1)
+        self.assertEqual(
+            gate_events,
+            [
+                ("enter", command.command_id, "transfer_resume", intent.effect_id),
+                ("exit", command.command_id, "transfer_resume", intent.effect_id),
+            ],
+        )
         settlement = self.facts.effect_settlement_for_key(command.command_id, "native")
         self.assertEqual(settlement.state, EffectState.UNKNOWN)
         self.assertEqual(
@@ -1176,7 +1233,7 @@ class PlatformServicePostgresTests(unittest.TestCase):
         self.assertEqual(
             self._query(
                 """
-                SELECT fence, closure_code, yield_effect_id
+                SELECT fence, closure_code, yield_effect_id, scope, effect_scope_id
                 FROM execution_claim
                 WHERE command_id = %s
                 ORDER BY fence
@@ -1184,8 +1241,8 @@ class PlatformServicePostgresTests(unittest.TestCase):
                 (command.command_id,),
             ),
             [
-                (1, "yielded", intent.effect_id),
-                (2, "yielded", intent.effect_id),
+                (1, "yielded", intent.effect_id, "execution", None),
+                (2, "yielded", intent.effect_id, "transfer_resume", intent.effect_id),
             ],
         )
         self.assertEqual(
@@ -1202,6 +1259,7 @@ class PlatformServicePostgresTests(unittest.TestCase):
                 ("dispatch_authorized", None),
                 ("observation", "input_transfer_pending"),
                 ("resume_authorized", None),
+                ("response", None),
             ],
         )
 
@@ -1218,7 +1276,7 @@ class PlatformServicePostgresTests(unittest.TestCase):
         self.assertEqual(
             self._query(
                 """
-                SELECT fence, closure_code
+                SELECT fence, closure_code, scope, effect_scope_id
                 FROM execution_claim
                 WHERE command_id = %s
                 ORDER BY fence
@@ -1226,9 +1284,9 @@ class PlatformServicePostgresTests(unittest.TestCase):
                 (command.command_id,),
             ),
             [
-                (1, "yielded"),
-                (2, "yielded"),
-                (3, "completed"),
+                (1, "yielded", "execution", None),
+                (2, "yielded", "transfer_resume", intent.effect_id),
+                (3, "completed", "execution", None),
             ],
         )
 
@@ -1304,7 +1362,7 @@ class PlatformServicePostgresTests(unittest.TestCase):
             adapter=_TransferPendingReconciliationAdapter(),
         )
         self.assertEqual(resolved.resume_phase, EffectResumePhase.INPUT_TRANSFER_PENDING)
-        crashed_claim = services.acquire_claim(command)
+        crashed_claim = services.acquire_transfer_resume_claim(command, intent.effect_id)
         self.assertEqual(crashed_claim.fence, 2)
         with self.assertRaisesRegex(FactConflict, "live executor"):
             services.acquire_claim(command)
@@ -1320,6 +1378,7 @@ class PlatformServicePostgresTests(unittest.TestCase):
                 lease=timedelta(minutes=5),
             ),
             clock=lambda: later,
+            transfer_resume_gate=lambda _command, _claim: nullcontext(),
         )
         restarted_reconciler = EffectReconciliationService(
             facts=self.facts,
@@ -1341,7 +1400,7 @@ class PlatformServicePostgresTests(unittest.TestCase):
         self.assertEqual(
             self._query(
                 """
-                SELECT fence, closure_code, yield_effect_id
+                SELECT fence, closure_code, yield_effect_id, scope, effect_scope_id
                 FROM execution_claim
                 WHERE command_id = %s
                 ORDER BY fence
@@ -1349,10 +1408,213 @@ class PlatformServicePostgresTests(unittest.TestCase):
                 (command.command_id,),
             ),
             [
-                (1, "yielded", intent.effect_id),
-                (2, "reconciled", None),
-                (3, "yielded", intent.effect_id),
+                (1, "yielded", intent.effect_id, "execution", None),
+                (
+                    2,
+                    "reconciled",
+                    None,
+                    "transfer_resume",
+                    intent.effect_id,
+                ),
+                (3, "yielded", intent.effect_id, "transfer_resume", intent.effect_id),
             ],
+        )
+
+    def test_transfer_claim_rejects_general_send_and_terminal_paths(self) -> None:
+        spec, command, services, _claim, workspace, _effects, intent, _pending, _outbound = (
+            self._prepared_pending_effect("transfer-scope-boundary")
+        )
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "transfer-scope-boundary",
+            observer_tool_sha256=digest({"observer": "transfer-scope-boundary"}),
+            clock=lambda: self.now + timedelta(seconds=60),
+        )
+        reconciler.reconcile(
+            command_id=command.command_id,
+            effect_key="native",
+            adapter=_TransferPendingReconciliationAdapter(),
+        )
+        with self.assertRaisesRegex(FactConflict, "unresolved effect"):
+            services.acquire_claim(command)
+        transfer_claim = services.acquire_transfer_resume_claim(command, intent.effect_id)
+        self.assertEqual(transfer_claim.scope, "transfer_resume")
+        self.assertEqual(transfer_claim.effect_scope_id, intent.effect_id)
+
+        outbound = workspace.root / "new-general-effect"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"operation":"forbidden"}\n', encoding="utf-8")
+        new_outbound = self.artifacts.seal_tree(
+            outbound,
+            kind="effect_payload",
+            producer_run_id=command.run_id,
+            producer_stage=command.stage,
+            producer_tool_sha256=command.expected_executor_sha256,
+        )
+        native_target = NativeTargetIdentity.create(
+            install_id="test-native-install",
+            pipeline_id="solidworks-to-urdf",
+        )
+        target_identity = {
+            "operation": command.command_id,
+            "native_target_id": native_target.target_id,
+            "native_target_identity": native_target.to_record(),
+        }
+        new_intent = EffectIntent(
+            effect_id="effect-transfer-forbidden-create",
+            command_id=command.command_id,
+            effect_key="forbidden-new-effect",
+            effect_kind="native_operation",
+            target={
+                **target_identity,
+                "target_binding_digest": digest(target_identity),
+            },
+            expected_state={"operation": command.command_id, "state": "complete"},
+            expected_state_digest=digest(
+                {"operation": command.command_id, "state": "complete"}
+            ),
+            outbound_artifact_id=new_outbound.artifact_id,
+            outbound_digest=new_outbound.set_sha256,
+            created_at=self.now + timedelta(seconds=61),
+        )
+        expected = "general execution claim"
+        with self.assertRaisesRegex(FactConflict, expected):
+            self.facts.register_effect_intent(
+                new_intent,
+                claim=transfer_claim,
+                outbound_artifact=new_outbound,
+            )
+        with self.assertRaisesRegex(FactConflict, expected):
+            self.facts.authorize_effect_dispatch(
+                effect_id=intent.effect_id,
+                claim=transfer_claim,
+                source="forbidden-dispatch",
+                payload_digest=digest({"forbidden": "dispatch"}),
+                observed_at=self.now + timedelta(seconds=61),
+                fact_id="forbidden-transfer-dispatch",
+            )
+        with self.assertRaisesRegex(FactConflict, expected):
+            self.facts.append_effect_fact(
+                effect_id=intent.effect_id,
+                claim=transfer_claim,
+                fact_type="dispatch_authorized",
+                source="forbidden-dispatch",
+                state_class=None,
+                payload_artifact=None,
+                payload_digest=digest({"forbidden": "fact"}),
+                observed_at=self.now + timedelta(seconds=61),
+                fact_id="forbidden-transfer-fact",
+                expected_command_id=command.command_id,
+            )
+        with self.assertRaisesRegex(FactConflict, expected):
+            self.facts.register_candidate(
+                candidate_id="forbidden-candidate",
+                claim=transfer_claim,
+                output_artifact=None,
+                result_record_artifact=None,
+                result=None,
+                created_at=self.now + timedelta(seconds=61),
+            )
+        with self.assertRaisesRegex(FactConflict, expected):
+            self.facts.commit_decision(
+                decision_id="forbidden-decision",
+                command=command,
+                claim=transfer_claim,
+                candidate=None,
+                decided_at=self.now + timedelta(seconds=61),
+            )
+        with self.assertRaisesRegex(FactConflict, expected):
+            self.facts.commit_failure_envelope(
+                decision_id="forbidden-failure",
+                command=command,
+                claim=transfer_claim,
+                failure=None,
+            )
+        with self.assertRaisesRegex(FactConflict, expected):
+            self.facts.close_open_claim(
+                transfer_claim,
+                closure_code="completed",
+                closed_at=self.now + timedelta(seconds=61),
+            )
+        with self.assertRaisesRegex(ProtocolError, "scope_mismatch"):
+            services.effect_port(command, transfer_claim, workspace)
+        ungated = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "ungated-transfer",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"owner": "ungated-transfer"}),
+                executor_sha256=spec.executors.freeze,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now,
+        )
+        with self.assertRaisesRegex(ProtocolError, "maintenance_gate_missing"):
+            ungated.transfer_resume_gate(command, transfer_claim)
+        transfer_workspace = services.materialize(
+            command,
+            transfer_claim,
+            candidate=None,
+        )
+        self.addCleanup(services.discard_workspace, transfer_workspace)
+        transfer_effects = services.transfer_effect_port(
+            command,
+            transfer_claim,
+            transfer_workspace,
+        )
+        self.assertFalse(hasattr(transfer_effects, "prepare_effect"))
+        self.assertFalse(hasattr(transfer_effects, "authorize_dispatch"))
+        self.assertFalse(hasattr(transfer_effects, "record_observation"))
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_intent WHERE command_id = %s",
+                (command.command_id,),
+            ),
+            [(1,)],
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact WHERE effect_id = %s "
+                "AND fact_type = 'dispatch_authorized'",
+                (intent.effect_id,),
+            ),
+            [(1,)],
+        )
+
+    def test_transfer_resume_authorization_rejects_expired_clock_boundary(self) -> None:
+        _spec, command, services, _claim, _workspace, _effects, intent, _pending, _outbound = (
+            self._prepared_pending_effect("transfer-expiry")
+        )
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "transfer-expiry",
+            observer_tool_sha256=digest({"observer": "transfer-expiry"}),
+            clock=lambda: self.now + timedelta(seconds=70),
+        )
+        reconciler.reconcile(
+            command_id=command.command_id,
+            effect_key="native",
+            adapter=_TransferPendingReconciliationAdapter(),
+        )
+        transfer_claim = services.acquire_transfer_resume_claim(command, intent.effect_id)
+        with self.assertRaisesRegex(FactConflict, "Lease expiry"):
+            self.facts.authorize_effect_resume(
+                effect_id=intent.effect_id,
+                claim=transfer_claim,
+                source="expired-transfer",
+                payload_digest=digest({"expired": "transfer"}),
+                observed_at=transfer_claim.expires_at,
+                fact_id="expired-transfer-authorization",
+            )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact WHERE effect_id = %s "
+                "AND fact_type = 'resume_authorized'",
+                (intent.effect_id,),
+            ),
+            [(0,)],
         )
 
     def test_transfer_resume_rejects_target_drift_and_cancellation_before_grant(self) -> None:
@@ -1413,7 +1675,10 @@ class PlatformServicePostgresTests(unittest.TestCase):
             adapter=_TransferPendingReconciliationAdapter(),
         )
         self.assertEqual(reconciled.resume_phase, EffectResumePhase.INPUT_TRANSFER_PENDING)
-        resume_claim = cancel_services.acquire_claim(cancel_command)
+        resume_claim = cancel_services.acquire_transfer_resume_claim(
+            cancel_command,
+            cancel_intent.effect_id,
+        )
         self.facts.request_cancel(
             target_command_id=cancel_command.command_id,
             cancel_executor_sha256=digest({"executor": "cancel-transfer"}),

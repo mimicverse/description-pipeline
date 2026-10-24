@@ -1022,6 +1022,8 @@ class ExecutionClaim:
     executor_sha256: str
     lane_key: str | None
     expires_at: datetime
+    scope: Literal["execution", "transfer_resume"] = "execution"
+    effect_scope_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.claim_id, "claim.invalid", "claim_id")
@@ -1036,6 +1038,15 @@ class ExecutionClaim:
             _require_text(self.lane_key, "claim.invalid", "lane_key")
         if not isinstance(self.expires_at, datetime) or self.expires_at.tzinfo is None:
             raise ProtocolError("claim.invalid", {"where": "expires_at"})
+        if self.scope not in {"execution", "transfer_resume"}:
+            raise ProtocolError("claim.invalid", {"where": "scope"})
+        if self.effect_scope_id is not None:
+            _require_identifier(self.effect_scope_id, "claim.invalid", "effect_scope_id")
+        if (self.scope == "transfer_resume") != (self.effect_scope_id is not None):
+            raise ProtocolError(
+                "claim.invalid",
+                {"reason": "scope-effect-mismatch"},
+            )
 
 
 @dataclass(frozen=True, slots=True)

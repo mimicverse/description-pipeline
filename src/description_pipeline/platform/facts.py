@@ -1649,6 +1649,8 @@ class FactStore(RunControlStore):
         dag_run_id: str | None = None,
         task_id: str | None = None,
         map_index: int | None = None,
+        claim_scope: str = "execution",
+        effect_scope_id: str | None = None,
     ) -> ExecutionClaim:
         """Acquire one open fenced execution right without treating lease expiry as success."""
 
@@ -1656,6 +1658,10 @@ class FactStore(RunControlStore):
             raise FactStoreError("Claim time must be timezone-aware")
         if not isinstance(expires_at, datetime) or expires_at.tzinfo is None or expires_at <= now:
             raise FactStoreError("Claim expiry must be after a timezone-aware acquisition time")
+        if claim_scope not in {"execution", "transfer_resume"}:
+            raise FactStoreError("The execution claim scope is invalid")
+        if (claim_scope == "transfer_resume") != (effect_scope_id is not None):
+            raise FactStoreError("The execution claim scope and effect are inconsistent")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(
@@ -1691,6 +1697,38 @@ class FactStore(RunControlStore):
                 lock=False,
             )
             effect_states = {effect_id: item.state for effect_id, item in effect_settlements.items()}
+            if claim_scope == "transfer_resume":
+                scoped = effect_settlements.get(effect_scope_id)
+                if (
+                    scoped is None
+                    or scoped.state is not EffectState.UNKNOWN
+                    or scoped.resume_phase is not EffectResumePhase.INPUT_TRANSFER_PENDING
+                ):
+                    raise FactConflict(
+                        "A transfer resume claim requires its exact pending native effect"
+                    )
+                scoped_intent, _scoped_facts = self._effect_cursor(
+                    cursor,
+                    effect_scope_id,
+                    lock=False,
+                )
+                if scoped_intent.effect_kind != "native_operation":
+                    raise FactConflict(
+                        "A transfer resume claim is limited to native operation effects"
+                    )
+                require_native_transfer_target(scoped_intent.target)
+            unresolved = (
+                any(
+                    state in {EffectState.UNKNOWN, EffectState.CONFLICT}
+                    for effect_id, state in effect_states.items()
+                    if effect_id != effect_scope_id
+                )
+                if claim_scope == "transfer_resume"
+                else any(
+                    state in {EffectState.UNKNOWN, EffectState.CONFLICT}
+                    for state in effect_states.values()
+                )
+            )
             if command[4] != executor_sha256:
                 raise FactConflict("The claim executor identity differs from the command expectation")
             if (
@@ -1701,7 +1739,8 @@ class FactStore(RunControlStore):
                 raise FactConflict("A decided command cannot acquire a new execution claim")
             cursor.execute(
                 """
-                SELECT claim_id, command_id, fence, owner_sha256, executor_sha256, lane_key, expires_at
+                SELECT claim_id, command_id, fence, owner_sha256, executor_sha256,
+                       lane_key, expires_at, scope, effect_scope_id
                 FROM execution_claim
                 WHERE command_id = %s AND closed_at IS NULL
                 FOR UPDATE
@@ -1718,10 +1757,12 @@ class FactStore(RunControlStore):
                     executor_sha256=current[4],
                     lane_key=current[5],
                     expires_at=current[6],
+                    scope=current[7],
+                    effect_scope_id=current[8],
                 )
                 if claim.expires_at > now:
                     raise FactConflict("Another live executor owns the command")
-                if self._requires_reconciliation_cursor(effect_settlements):
+                if unresolved:
                     raise FactConflict("An expired claim carries an unresolved effect and requires reconciliation")
                 closure_code = (
                     "reconciled"
@@ -1736,7 +1777,7 @@ class FactStore(RunControlStore):
                     """,
                     (now, closure_code, claim.claim_id),
                 )
-            elif self._requires_reconciliation_cursor(effect_settlements):
+            elif unresolved:
                 raise FactConflict("The command carries an unresolved effect and requires reconciliation")
             cursor.execute(
                 "SELECT COALESCE(MAX(fence), 0) + 1 FROM execution_claim WHERE command_id = %s",
@@ -1747,10 +1788,10 @@ class FactStore(RunControlStore):
                 """
                 INSERT INTO execution_claim (
                     claim_id, command_id, fence, owner_sha256, executor_sha256,
-                    lane_key,
+                    lane_key, scope, effect_scope_id,
                     dag_id, dag_run_id, task_id, map_index,
                     issued_at, last_seen_at, expires_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     claim_id,
@@ -1759,6 +1800,8 @@ class FactStore(RunControlStore):
                     owner_sha256,
                     executor_sha256,
                     lane_key,
+                    claim_scope,
+                    effect_scope_id,
                     dag_id,
                     dag_run_id,
                     task_id,
@@ -1776,6 +1819,8 @@ class FactStore(RunControlStore):
                 executor_sha256=executor_sha256,
                 lane_key=lane_key,
                 expires_at=expires_at,
+                scope=claim_scope,
+                effect_scope_id=effect_scope_id,
             )
 
     def _effect_state_cursor(
@@ -2055,6 +2100,14 @@ class FactStore(RunControlStore):
             raise FactStoreError("A canonical stage command is required for deferral")
         if claim.command_id != command.command_id:
             raise FactConflict("The yielded claim names another command")
+        if claim.scope == "transfer_resume":
+            self._require_transfer_resume_claim(
+                claim,
+                effect_id,
+                "Transfer yield",
+            )
+        else:
+            self._require_execution_claim(claim, "Effect yield")
         if not isinstance(yielded_at, datetime) or yielded_at.tzinfo is None:
             raise FactStoreError("Effect yield time must be timezone-aware")
         verifier = getattr(self._result_reader, "verify", None)
@@ -2070,7 +2123,7 @@ class FactStore(RunControlStore):
             cursor.execute(
                 """
                 SELECT command_id, fence, owner_sha256, executor_sha256,
-                       closed_at, closure_code, yield_effect_id
+                       closed_at, closure_code, yield_effect_id, scope, effect_scope_id
                 FROM execution_claim
                 WHERE claim_id = %s
                 FOR UPDATE
@@ -2078,11 +2131,17 @@ class FactStore(RunControlStore):
                 (claim.claim_id,),
             )
             stored = cursor.fetchone()
-            if stored is None or stored[:4] != (
-                claim.command_id,
-                claim.fence,
-                claim.owner_sha256,
-                claim.executor_sha256,
+            if (
+                stored is None
+                or stored[:4]
+                != (
+                    claim.command_id,
+                    claim.fence,
+                    claim.owner_sha256,
+                    claim.executor_sha256,
+                )
+                or stored[7] != claim.scope
+                or stored[8] != claim.effect_scope_id
             ):
                 raise FactConflict("The deferred claim identity is stale or foreign")
             if stored[4] is not None:
@@ -2138,6 +2197,8 @@ class FactStore(RunControlStore):
                   AND fence = %s
                   AND owner_sha256 = %s
                   AND executor_sha256 = %s
+                  AND scope = %s
+                  AND effect_scope_id IS NOT DISTINCT FROM %s
                   AND closed_at IS NULL
                 RETURNING claim_id
                 """,
@@ -2150,6 +2211,8 @@ class FactStore(RunControlStore):
                     claim.fence,
                     claim.owner_sha256,
                     claim.executor_sha256,
+                    claim.scope,
+                    claim.effect_scope_id,
                 ),
             )
             if len(cursor.fetchall()) != 1:
@@ -2199,20 +2262,6 @@ class FactStore(RunControlStore):
             ).items()
         }
 
-    def _requires_reconciliation_cursor(
-        self,
-        effect_settlements: Mapping[str, EffectSettlement],
-    ) -> bool:
-        for settlement in effect_settlements.values():
-            if settlement.state is EffectState.CONFLICT:
-                return True
-            if (
-                settlement.state is EffectState.UNKNOWN
-                and settlement.resume_phase is not EffectResumePhase.INPUT_TRANSFER_PENDING
-            ):
-                return True
-        return False
-
     def effect_states_for_command(self, command_id: str) -> dict[str, EffectState]:
         with self._transaction() as connection:
             return self._effect_states_for_command_cursor(connection.cursor(), command_id)
@@ -2257,6 +2306,23 @@ class FactStore(RunControlStore):
         self._lock_effect_ledger_cursor(cursor, command_id)
         stored = None
         if claim is not None:
+            if fact_type == "resume_authorized":
+                self._require_transfer_resume_claim(
+                    claim,
+                    effect_id,
+                    "Resume authorization",
+                )
+            elif fact_type in {"response", "timeout"} and claim.scope == "transfer_resume":
+                self._require_transfer_resume_claim(
+                    claim,
+                    effect_id,
+                    f"Transfer {fact_type}",
+                )
+            else:
+                self._require_execution_claim(
+                    claim,
+                    f"{fact_type} fact",
+                )
             if fact_type in {"dispatch_authorized", "resume_authorized"}:
                 cursor.execute(
                     "SELECT command_id FROM command WHERE command_id = %s",
@@ -2310,7 +2376,13 @@ class FactStore(RunControlStore):
                 """,
                 (claim.command_id, effect_id),
             )
-            if cursor.fetchone() is not None and fact_type != "resume_authorized":
+            if (
+                cursor.fetchone() is not None
+                and not (
+                    claim.scope == "transfer_resume"
+                    and fact_type in {"resume_authorized", "response", "timeout"}
+                )
+            ):
                 raise FactConflict(
                     "A yielded effect accepts only claim-free reconciliation or a scoped resume authorization"
                 )
@@ -2435,6 +2507,7 @@ class FactStore(RunControlStore):
 
         if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
             raise FactStoreError("Effect dispatch time must be timezone-aware")
+        self._require_execution_claim(claim, "Effect dispatch")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(
@@ -2512,6 +2585,11 @@ class FactStore(RunControlStore):
 
         if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
             raise FactStoreError("Effect resume time must be timezone-aware")
+        self._require_transfer_resume_claim(
+            claim,
+            effect_id,
+            "Effect resume",
+        )
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(
@@ -2553,6 +2631,15 @@ class FactStore(RunControlStore):
             if not callable(verifier):
                 raise FactStoreError("The configured artifact reader cannot verify resumable outbound bytes")
             verifier(outbound)
+            cursor.execute(
+                "SELECT expires_at FROM execution_claim WHERE claim_id = %s FOR UPDATE",
+                (claim.claim_id,),
+            )
+            expiry = cursor.fetchone()
+            if expiry is None or observed_at >= expiry[0]:
+                raise FactConflict(
+                    "Lease expiry does not authorize an input transfer resume"
+                )
             if self._cancel_command_cursor(cursor, claim.command_id) is not None:
                 raise FactConflict("Cancellation was requested before effect resume")
             for fact in facts:
@@ -2585,6 +2672,7 @@ class FactStore(RunControlStore):
     ) -> EffectIntent:
         if intent.command_id != claim.command_id:
             raise FactConflict("The effect intent names another command than the claim")
+        self._require_execution_claim(claim, "Effect intent registration")
         with self._transaction() as connection:
             cursor = connection.cursor()
             command = self._load_command_cursor(cursor, intent.command_id)
@@ -2646,7 +2734,8 @@ class FactStore(RunControlStore):
     def _verify_open_claim_cursor(self, cursor, claim: ExecutionClaim) -> None:
         cursor.execute(
             """
-            SELECT command_id, fence, owner_sha256, executor_sha256, closed_at
+            SELECT command_id, fence, owner_sha256, executor_sha256, closed_at,
+                   scope, effect_scope_id
             FROM execution_claim
             WHERE claim_id = %s
             FOR UPDATE
@@ -2660,10 +2749,31 @@ class FactStore(RunControlStore):
             or row[1] != claim.fence
             or row[2] != claim.owner_sha256
             or row[3] != claim.executor_sha256
+            or row[5] != claim.scope
+            or row[6] != claim.effect_scope_id
         ):
             raise FactConflict("The execution claim identity is stale or foreign")
         if row[4] is not None:
             raise FactConflict("The execution claim is already closed")
+
+    @staticmethod
+    def _require_execution_claim(claim: ExecutionClaim, operation: str) -> None:
+        if claim.scope != "execution" or claim.effect_scope_id is not None:
+            raise FactConflict(f"{operation} requires a general execution claim")
+
+    @staticmethod
+    def _require_transfer_resume_claim(
+        claim: ExecutionClaim,
+        effect_id: str,
+        operation: str,
+    ) -> None:
+        if (
+            claim.scope != "transfer_resume"
+            or claim.effect_scope_id != effect_id
+        ):
+            raise FactConflict(
+                f"{operation} requires its matching restricted transfer claim"
+            )
 
     def close_open_claim(
         self,
@@ -2680,6 +2790,7 @@ class FactStore(RunControlStore):
             raise FactStoreError("A technical command closes only as completed or definite_failure")
         if not isinstance(closed_at, datetime) or closed_at.tzinfo is None:
             raise FactStoreError("Claim closure time must be timezone-aware")
+        self._require_execution_claim(claim, "General claim closure")
         with self._transaction() as connection:
             cursor = connection.cursor()
             command = self._lock_command_scope_cursor(
@@ -2861,6 +2972,7 @@ class FactStore(RunControlStore):
         result: StageResult,
         created_at: datetime,
     ) -> StageCandidate:
+        self._require_execution_claim(claim, "Candidate registration")
         if result.command_id != claim.command_id:
             raise FactConflict("The StageResult names another command than the claim")
         command = self.load_command(result.command_id)
@@ -2957,6 +3069,7 @@ class FactStore(RunControlStore):
     ) -> StageDecision:
         if command.stage is None:
             raise FactStoreError("Only a stage command can commit a decision")
+        self._require_execution_claim(claim, "Stage decision commit")
         if candidate.candidate_id is None or candidate.claim_id is None or candidate.fence is None:
             raise FactStoreError("Only a persisted candidate can be committed")
         if (
@@ -3102,6 +3215,7 @@ class FactStore(RunControlStore):
 
         if command.stage is None:
             raise FactStoreError("Only a stage command can commit a failure envelope")
+        self._require_execution_claim(claim, "Failure envelope commit")
         if (
             failure.command_id != command.command_id
             or failure.run_id != command.run_id

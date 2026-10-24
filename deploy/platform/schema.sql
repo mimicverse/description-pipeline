@@ -98,6 +98,10 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
     fence bigint NOT NULL CHECK (fence > 0),
     owner_sha256 char(64) NOT NULL CHECK (owner_sha256 ~ '^[0-9a-f]{64}$'),
     executor_sha256 char(64) NOT NULL CHECK (executor_sha256 ~ '^[0-9a-f]{64}$'),
+    scope text NOT NULL DEFAULT 'execution' CHECK (
+        scope IN ('execution', 'transfer_resume')
+    ),
+    effect_scope_id text,
     lane_key text,
     dag_id text,
     dag_run_id text,
@@ -121,6 +125,9 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
         OR (closed_at IS NOT NULL AND closure_code IS NOT NULL)
     ),
     CHECK (owner_sha256 <> executor_sha256),
+    CHECK (
+        (scope = 'transfer_resume') = (effect_scope_id IS NOT NULL)
+    ),
     CHECK (expires_at >= issued_at)
 );
 
@@ -270,6 +277,32 @@ ALTER TABLE :"platform_schema".effect_fact
         resume_phase IS NULL
         OR (fact_type = 'observation' AND state_class = 'unobservable')
     );
+
+ALTER TABLE :"platform_schema".execution_claim
+    ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'execution';
+ALTER TABLE :"platform_schema".execution_claim
+    ADD COLUMN IF NOT EXISTS effect_scope_id text;
+
+ALTER TABLE :"platform_schema".execution_claim
+    DROP CONSTRAINT IF EXISTS execution_claim_scope_check;
+ALTER TABLE :"platform_schema".execution_claim
+    ADD CONSTRAINT execution_claim_scope_check CHECK (
+        scope IN ('execution', 'transfer_resume')
+    );
+
+ALTER TABLE :"platform_schema".execution_claim
+    DROP CONSTRAINT IF EXISTS execution_claim_transfer_scope_check;
+ALTER TABLE :"platform_schema".execution_claim
+    ADD CONSTRAINT execution_claim_transfer_scope_check CHECK (
+        (scope = 'transfer_resume') = (effect_scope_id IS NOT NULL)
+    );
+
+ALTER TABLE :"platform_schema".execution_claim
+    DROP CONSTRAINT IF EXISTS execution_claim_effect_scope_id_fkey;
+ALTER TABLE :"platform_schema".execution_claim
+    ADD CONSTRAINT execution_claim_effect_scope_id_fkey
+    FOREIGN KEY (effect_scope_id)
+    REFERENCES :"platform_schema".effect_intent (effect_id);
 
 ALTER TABLE :"platform_schema".execution_claim
     ADD COLUMN IF NOT EXISTS yield_effect_id text;

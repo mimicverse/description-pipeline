@@ -7,6 +7,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,7 +29,15 @@ from .contracts import (
     StagePending,
     StageResult,
 )
-from .effects import EffectFact, EffectIntent, EffectKind, EffectSettlement, EffectState, StageEffectPort
+from .effects import (
+    EffectFact,
+    EffectIntent,
+    EffectKind,
+    EffectSettlement,
+    EffectState,
+    StageEffectPort,
+    TransferResumeEffectPort,
+)
 from .engine import StageWorkspace
 
 
@@ -79,6 +88,10 @@ class CanonicalStageServices:
         work_root: str | Path,
         claim_policy: ClaimPolicy,
         clock: Callable[[], datetime],
+        transfer_resume_gate: (
+            Callable[[StageCommand, ExecutionClaim], AbstractContextManager[None]]
+            | None
+        ) = None,
     ) -> None:
         self.facts = facts
         self.artifacts = artifacts
@@ -91,6 +104,12 @@ class CanonicalStageServices:
             raise ProtocolError("workspace.invalid", {"root": str(self.work_root), "reason": "symlink-parent"})
         self.claim_policy = claim_policy
         self.clock = clock
+        if transfer_resume_gate is not None and not callable(transfer_resume_gate):
+            raise ProtocolError(
+                "resume.maintenance_gate_invalid",
+                {"reason": "not-callable"},
+            )
+        self._transfer_resume_gate = transfer_resume_gate
         self._workspace_lock = threading.RLock()
         self._owned_workspaces: dict[Path, tuple[str, str, int]] = {}
 
@@ -114,6 +133,26 @@ class CanonicalStageServices:
             raise ProtocolError("decision.result_mismatch", {"decision_id": decision.decision_id})
 
     def acquire_claim(self, command: StageCommand) -> ExecutionClaim:
+        return self._acquire_claim(command)
+
+    def acquire_transfer_resume_claim(
+        self,
+        command: StageCommand,
+        effect_id: str,
+    ) -> ExecutionClaim:
+        return self._acquire_claim(
+            command,
+            claim_scope="transfer_resume",
+            effect_scope_id=effect_id,
+        )
+
+    def _acquire_claim(
+        self,
+        command: StageCommand,
+        *,
+        claim_scope: str = "execution",
+        effect_scope_id: str | None = None,
+    ) -> ExecutionClaim:
         now = self.clock()
         if not isinstance(now, datetime) or now.tzinfo is None:
             raise ProtocolError("clock.invalid", {"where": "acquire_claim"})
@@ -138,6 +177,8 @@ class CanonicalStageServices:
             dag_run_id=policy.dag_run_id,
             task_id=policy.task_id,
             map_index=policy.map_index,
+            claim_scope=claim_scope,
+            effect_scope_id=effect_scope_id,
         )
 
     def candidate_for(
@@ -382,6 +423,8 @@ class CanonicalStageServices:
     ) -> StageEffectPort:
         if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
             raise ProtocolError("claim.command_mismatch", {"command_id": command.command_id})
+        if claim.scope != "execution":
+            raise ProtocolError("claim.scope_mismatch", {"command_id": command.command_id})
         with self._workspace_lock:
             identity = self._owned_workspaces.get(workspace.root)
         if identity != (command.command_id, claim.claim_id, claim.fence):
@@ -394,6 +437,52 @@ class CanonicalStageServices:
             workspace_root=workspace.root,
             clock=self.clock,
         )
+
+    def transfer_effect_port(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+    ) -> TransferResumeEffectPort:
+        if (
+            claim.command_id != command.command_id
+            or claim.executor_sha256 != command.expected_executor_sha256
+            or claim.scope != "transfer_resume"
+            or claim.effect_scope_id is None
+        ):
+            raise ProtocolError("claim.transfer_scope_mismatch", {"command_id": command.command_id})
+        with self._workspace_lock:
+            identity = self._owned_workspaces.get(workspace.root)
+        if identity != (command.command_id, claim.claim_id, claim.fence):
+            raise ProtocolError("workspace.foreign_claim", {"command_id": command.command_id})
+        return BoundTransferResumeEffectPort(
+            BoundStageEffectPort(
+                facts=self.facts,
+                artifacts=self.artifacts,
+                command=command,
+                claim=claim,
+                workspace_root=workspace.root,
+                clock=self.clock,
+            )
+        )
+
+    def transfer_resume_gate(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+    ) -> AbstractContextManager[None]:
+        if self._transfer_resume_gate is None:
+            raise ProtocolError(
+                "resume.maintenance_gate_missing",
+                {"command_id": command.command_id},
+            )
+        gate = self._transfer_resume_gate(command, claim)
+        if not hasattr(gate, "__enter__") or not hasattr(gate, "__exit__"):
+            raise ProtocolError(
+                "resume.maintenance_gate_invalid",
+                {"reason": "not-context-manager"},
+            )
+        return gate
 
     def discard_workspace(self, workspace: StageWorkspace) -> None:
         """Delete only a workspace created by this service; it is never authority."""
@@ -623,3 +712,71 @@ class BoundStageEffectPort:
         if isinstance(value, (list, tuple)):
             return [self._plain(item) for item in value]
         return value
+
+
+class BoundTransferResumeEffectPort:
+    """Expose only reads and facts for one authorized native transfer continuation."""
+
+    def __init__(self, inner: BoundStageEffectPort) -> None:
+        if (
+            inner.claim.scope != "transfer_resume"
+            or inner.claim.effect_scope_id is None
+        ):
+            raise ProtocolError(
+                "claim.transfer_scope_mismatch",
+                {"command_id": inner.command.command_id},
+            )
+        self._inner = inner
+
+    def _require_scope(self, effect_id: str) -> None:
+        if effect_id != self._inner.claim.effect_scope_id:
+            raise ProtocolError(
+                "claim.transfer_effect_mismatch",
+                {"effect_id": effect_id},
+            )
+
+    def authorize_resume(self, effect_id: str, *, source: str) -> EffectFact:
+        self._require_scope(effect_id)
+        return self._inner.authorize_resume(effect_id, source=source)
+
+    def record_response(
+        self,
+        effect_id: str,
+        *,
+        source: str,
+        response_root: str | Path,
+    ) -> EffectFact:
+        self._require_scope(effect_id)
+        return self._inner.record_response(
+            effect_id,
+            source=source,
+            response_root=response_root,
+        )
+
+    def record_timeout(
+        self,
+        effect_id: str,
+        *,
+        source: str,
+        detail_root: str | Path | None = None,
+    ) -> EffectFact:
+        self._require_scope(effect_id)
+        return self._inner.record_timeout(
+            effect_id,
+            source=source,
+            detail_root=detail_root,
+        )
+
+    def effect_state(self, effect_id: str) -> EffectState:
+        self._require_scope(effect_id)
+        return self._inner.effect_state(effect_id)
+
+    def effect_settlement(self, effect_id: str) -> EffectSettlement:
+        self._require_scope(effect_id)
+        return self._inner.effect_settlement(effect_id)
+
+    def effect_settlement_for_key(self, effect_key: str) -> EffectSettlement | None:
+        settlement = self._inner.effect_settlement_for_key(effect_key)
+        if settlement is not None:
+            self._require_scope(settlement.effect_id)
+        return settlement
