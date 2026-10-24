@@ -32,14 +32,19 @@ from .freeze import (
 
 ADMISSION_SPEC_SCHEMA = "description-pipeline.admission-spec/v1"
 ARTIFACT_MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
-SUPPORTED_PROJECTION_STAGES = ("freeze", "discover")
+CAPTURE_ARTIFACT_KIND = "stage_output:capture"
+GENERATE_ARTIFACT_KIND = "stage_output:generate"
+GENERATE_REQUEST_SCHEMA = "description-pipeline.generate-request/v1"
+GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
+VERIFY_REQUEST_SCHEMA = "description-pipeline.verify-request/v1"
+VERIFY_OUTPUT_CONTRACT = "solidworks-to-urdf.verification-artifact/v1"
+SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _ADMISSION_FIELDS = frozenset(
     {
         "contract_sha256",
         "created_at",
-        "expected_executor_sha256",
-        "expected_native_tool_sha256",
+        "executors",
         "from_stage",
         "main_assembly",
         "originals",
@@ -204,6 +209,44 @@ class VerifiedArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class StageExecutors:
+    """The exact tool identity required by each canonical stage."""
+
+    freeze: str
+    discover: str
+    capture: str
+    generate: str
+    verify: str
+    publish: str
+
+    def __post_init__(self) -> None:
+        for name in ("freeze", "discover", "capture", "generate", "verify", "publish"):
+            _require_digest(getattr(self, name), "admission.invalid", f"executors.{name}")
+
+    def for_stage(self, stage: StageId) -> str:
+        if stage not in {"freeze", "discover", "capture", "generate", "verify", "publish"}:
+            raise ProtocolError("admission.invalid", {"where": "executors.stage", "value": stage})
+        return str(getattr(self, stage))
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "capture": self.capture,
+            "discover": self.discover,
+            "freeze": self.freeze,
+            "generate": self.generate,
+            "publish": self.publish,
+            "verify": self.verify,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> StageExecutors:
+        expected = {"freeze", "discover", "capture", "generate", "verify", "publish"}
+        if not isinstance(record, Mapping) or set(record) != expected:
+            raise ProtocolError("admission.invalid", {"where": "executors"})
+        return cls(**dict(record))
+
+
+@dataclass(frozen=True, slots=True)
 class VerifiedRuleset:
     """One ruleset artifact whose version came from its verified catalog bytes."""
 
@@ -270,10 +313,9 @@ class AdmissionSpec:
     originals: VerifiedArtifact
     ruleset: VerifiedRuleset
     configuration: VerifiedArtifact
-    expected_native_tool_sha256: str
+    executors: StageExecutors
     contract_sha256: str
     policy_sha256: str
-    expected_executor_sha256: str
     created_at: datetime
 
     def __post_init__(self) -> None:
@@ -285,7 +327,7 @@ class AdmissionSpec:
             _require_text(self.parent_run_id, "admission.invalid", "parent_run_id")
             if self.parent_run_id == self.run_id:
                 raise ProtocolError("admission.invalid", {"where": "parent_run_id", "reason": "self-reference"})
-        if self.from_stage not in {None, "freeze", "discover"}:
+        if self.from_stage not in {None, "freeze", "discover", "capture", "generate", "verify", "publish"}:
             raise ProtocolError("admission.invalid", {"where": "from_stage", "value": self.from_stage})
         if self.purpose not in REQUEST_PURPOSES:
             raise ProtocolError("admission.invalid", {"where": "purpose"})
@@ -302,12 +344,9 @@ class AdmissionSpec:
                 "admission.invalid",
                 {"where": "main_assembly", "reason": "absent-from-originals"},
             )
-        for field in (
-            "expected_native_tool_sha256",
-            "contract_sha256",
-            "policy_sha256",
-            "expected_executor_sha256",
-        ):
+        if not isinstance(self.executors, StageExecutors):
+            raise ProtocolError("admission.invalid", {"where": "executors"})
+        for field in ("contract_sha256", "policy_sha256"):
             _require_digest(getattr(self, field), "admission.invalid", field)
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise ProtocolError("admission.invalid", {"where": "created_at"})
@@ -322,8 +361,7 @@ class AdmissionSpec:
             "configuration": self.configuration.to_record(),
             "contract_sha256": self.contract_sha256,
             "created_at": self.created_at.isoformat(),
-            "expected_executor_sha256": self.expected_executor_sha256,
-            "expected_native_tool_sha256": self.expected_native_tool_sha256,
+            "executors": self.executors.to_record(),
             "from_stage": self.from_stage,
             "main_assembly": self.main_assembly,
             "originals": self.originals.to_record(),
@@ -373,10 +411,9 @@ class AdmissionSpec:
             originals=originals,
             ruleset=ruleset,
             configuration=configuration,
-            expected_native_tool_sha256=record["expected_native_tool_sha256"],
+            executors=StageExecutors.from_record(record["executors"]),
             contract_sha256=record["contract_sha256"],
             policy_sha256=record["policy_sha256"],
-            expected_executor_sha256=record["expected_executor_sha256"],
             created_at=datetime.fromisoformat(record["created_at"].replace("Z", "+00:00")),
         )
         if value.admission_sha256 != record["admission_sha256"]:
@@ -473,6 +510,92 @@ class VerifiedPredecessor:
             raise ProtocolError("admission.predecessor_invalid", {"stage": self.stage})
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedDiscoverResult:
+    """The sealed result fields required to project Capture."""
+
+    predecessor: VerifiedPredecessor
+    prepared_sha256: str
+    selected_files_sha256: str
+    upload_inventory_sha256: str
+    main_assembly: str
+    native_observation_sha256: str
+    source_set_artifact: ArtifactRef
+    ruleset_artifact: ArtifactRef
+    configuration_artifact: ArtifactRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.predecessor, VerifiedPredecessor) or self.predecessor.stage != "discover":
+            raise ProtocolError("admission.discover_result_invalid", {"where": "predecessor"})
+        for field in (
+            "prepared_sha256",
+            "selected_files_sha256",
+            "upload_inventory_sha256",
+            "native_observation_sha256",
+        ):
+            _require_digest(getattr(self, field), "admission.discover_result_invalid", field)
+        _require_text(self.main_assembly, "admission.discover_result_invalid", "main_assembly")
+        if (
+            not isinstance(self.source_set_artifact, ArtifactRef)
+            or self.source_set_artifact.kind != ORIGINALS_KIND
+            or not isinstance(self.ruleset_artifact, ArtifactRef)
+            or self.ruleset_artifact.kind != RULESET_KIND
+            or not isinstance(self.configuration_artifact, ArtifactRef)
+            or self.configuration_artifact.kind != CONFIGURATION_KIND
+        ):
+            raise ProtocolError("admission.discover_result_invalid", {"where": "source-artifacts"})
+
+    @classmethod
+    def from_record(cls, predecessor: VerifiedPredecessor, record: Mapping[str, Any]) -> VerifiedDiscoverResult:
+        required = {
+            "schema_version",
+            "command_id",
+            "run_id",
+            "request_digest",
+            "selection",
+            "prepared_sha256",
+            "native_observation_sha256",
+            "passed",
+            "source_set_artifact",
+            "ruleset_artifact",
+            "configuration_artifact",
+        }
+        if not isinstance(record, Mapping) or not required <= set(record):
+            raise ProtocolError("admission.discover_result_invalid", {"where": "record"})
+        if (
+            record["schema_version"] != "description-pipeline.discover-result/v1"
+            or record["command_id"] != predecessor.command.command_id
+            or record["run_id"] != predecessor.result.run_id
+            or record["request_digest"] != predecessor.command.request_digest
+            or record["passed"] is not True
+        ):
+            raise ProtocolError("admission.discover_result_invalid", {"where": "identity"})
+        selection = record["selection"]
+        if not isinstance(selection, Mapping):
+            raise ProtocolError("admission.discover_result_invalid", {"where": "selection"})
+        files = selection.get("files")
+        upload = selection.get("upload_sha256")
+        main = selection.get("main_assembly")
+        if not isinstance(files, Mapping) or not files:
+            raise ProtocolError("admission.discover_result_invalid", {"where": "selection.files"})
+        selected_files_sha256 = digest({str(path): str(checksum) for path, checksum in files.items()})
+        if selection.get("handoff_sha256") != selected_files_sha256:
+            raise ProtocolError("admission.discover_result_invalid", {"where": "selection.handoff_sha256"})
+        _require_digest(upload, "admission.discover_result_invalid", "selection.upload_sha256")
+        _require_text(main, "admission.discover_result_invalid", "selection.main_assembly")
+        return cls(
+            predecessor=predecessor,
+            prepared_sha256=record["prepared_sha256"],
+            selected_files_sha256=selected_files_sha256,
+            upload_inventory_sha256=upload,
+            main_assembly=main,
+            native_observation_sha256=record["native_observation_sha256"],
+            source_set_artifact=ArtifactRef.from_record(record["source_set_artifact"]),
+            ruleset_artifact=ArtifactRef.from_record(record["ruleset_artifact"]),
+            configuration_artifact=ArtifactRef.from_record(record["configuration_artifact"]),
+        )
+
+
 def _base_command(
     spec: AdmissionSpec,
     *,
@@ -498,7 +621,7 @@ def _base_command(
         config_snapshot_sha256=spec.configuration.ref.set_sha256,
         contract_sha256=spec.contract_sha256,
         policy_sha256=spec.policy_sha256,
-        expected_executor_sha256=spec.expected_executor_sha256,
+        expected_executor_sha256=spec.executors.for_stage(stage),
         predecessor_decision_id=predecessor_decision_id,
     )
 
@@ -572,7 +695,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         "ruleset_catalog_sha256": spec.ruleset.artifact.ref.set_sha256,
         "platform_config_sha256": spec.configuration.ref.set_sha256,
         "submission_identity": _submission_identity(spec),
-        "expected_native_tool_sha256": spec.expected_native_tool_sha256,
+        "expected_native_tool_sha256": spec.executors.discover,
     }
     return _base_command(
         spec,
@@ -585,6 +708,132 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
             spec.configuration.ref,
         ),
         predecessor_decision_id=predecessor.decision.decision_id,
+    )
+
+
+def _require_predecessor(
+    predecessor: VerifiedPredecessor,
+    *,
+    stage: StageId,
+    run_id: str,
+) -> VerifiedPredecessor:
+    if not isinstance(predecessor, VerifiedPredecessor) or predecessor.stage != stage:
+        raise ProtocolError("admission.predecessor_invalid", {"required_stage": stage})
+    if predecessor.command.run_id != run_id or predecessor.decision.run_id != run_id:
+        raise ProtocolError("admission.predecessor_invalid", {"reason": "run-mismatch", "stage": stage})
+    return predecessor
+
+
+def build_capture_command(
+    spec: AdmissionSpec,
+    freeze: VerifiedPredecessor,
+    discover: VerifiedPredecessor,
+    discover_result: VerifiedDiscoverResult,
+) -> StageCommand:
+    """Project Capture from the verified Freeze/Discover lineage and result."""
+
+    freeze = _require_predecessor(freeze, stage="freeze", run_id=spec.run_id)
+    discover = _require_predecessor(discover, stage="discover", run_id=spec.run_id)
+    if (
+        discover_result.predecessor != discover
+        or discover.command.request.get("freeze_artifact_id") != freeze.result.output_artifact.artifact_id
+        or discover_result.upload_inventory_sha256 != spec.originals.inventory_sha256
+        or discover_result.main_assembly != spec.main_assembly
+        or discover_result.source_set_artifact != spec.originals.ref
+        or discover_result.ruleset_artifact != spec.ruleset.artifact.ref
+        or discover_result.configuration_artifact != spec.configuration.ref
+    ):
+        raise ProtocolError("admission.lineage_mismatch", {"stage": "capture"})
+    effect_key = "native-capture:" + digest(
+        {
+            "admission_sha256": spec.admission_sha256,
+            "discover_decision_id": discover.decision.decision_id,
+            "freeze_artifact_id": freeze.result.output_artifact.artifact_id,
+        }
+    )
+    request = {
+        "effect_key": effect_key,
+        "handoff_sha256": discover_result.selected_files_sha256,
+        "upload_sha256": discover_result.upload_inventory_sha256,
+        "prepared_sha256": discover_result.prepared_sha256,
+        "main_assembly": discover_result.main_assembly,
+    }
+    return _base_command(
+        spec,
+        stage="capture",
+        request=request,
+        input_artifacts=(freeze.result.output_artifact, discover.result.output_artifact),
+        predecessor_decision_id=discover.decision.decision_id,
+    )
+
+
+def build_generate_command(spec: AdmissionSpec, capture: VerifiedPredecessor) -> StageCommand:
+    """Project Generate from the exact committed Capture output."""
+
+    capture = _require_predecessor(capture, stage="capture", run_id=spec.run_id)
+    request = {
+        "schema_version": GENERATE_REQUEST_SCHEMA,
+        "capture_artifact_id": capture.result.output_artifact.artifact_id,
+        "output_contract": GENERATE_OUTPUT_CONTRACT,
+    }
+    return _base_command(
+        spec,
+        stage="generate",
+        request=request,
+        input_artifacts=(capture.result.output_artifact,),
+        predecessor_decision_id=capture.decision.decision_id,
+    )
+
+
+def build_verify_command(
+    spec: AdmissionSpec,
+    generate: VerifiedPredecessor,
+    capture: VerifiedPredecessor,
+) -> StageCommand:
+    """Project Verify from the exact Generate/Capture artifact pair."""
+
+    generate = _require_predecessor(generate, stage="generate", run_id=spec.run_id)
+    capture = _require_predecessor(capture, stage="capture", run_id=spec.run_id)
+    if generate.command.request.get("capture_artifact_id") != capture.result.output_artifact.artifact_id:
+        raise ProtocolError("admission.lineage_mismatch", {"stage": "verify"})
+    request = {
+        "capture_artifact_id": capture.result.output_artifact.artifact_id,
+        "generate_artifact_id": generate.result.output_artifact.artifact_id,
+        "output_contract": VERIFY_OUTPUT_CONTRACT,
+        "purpose": spec.purpose,
+        "schema_version": VERIFY_REQUEST_SCHEMA,
+    }
+    return _base_command(
+        spec,
+        stage="verify",
+        request=request,
+        input_artifacts=(generate.result.output_artifact, capture.result.output_artifact),
+        predecessor_decision_id=generate.decision.decision_id,
+    )
+
+
+def build_publish_command(spec: AdmissionSpec, verify: VerifiedPredecessor) -> StageCommand:
+    """Reserve the static boundary until the Publish handler schema is fixed."""
+
+    _require_predecessor(verify, stage="verify", run_id=spec.run_id)
+    raise ProtocolError(
+        "admission.publish_contract_pending",
+        {
+            "required": [
+                "verify_output_artifact",
+                "generated_output_artifact",
+                "repository",
+                "base_ref",
+                "head_ref",
+                "expected_base_oid",
+                "expected_head_oid",
+                "candidate_commit",
+                "candidate_tree",
+                "title_digest",
+                "body_digest",
+                "expected_pr",
+            ]
+        },
     )
 
 
@@ -643,22 +892,69 @@ def validate_discover_command(
     return _validate(build_discover_command(spec, predecessor), command)
 
 
+def validate_capture_command(
+    spec: AdmissionSpec,
+    freeze: VerifiedPredecessor,
+    discover: VerifiedPredecessor,
+    discover_result: VerifiedDiscoverResult,
+    command: StageCommand,
+) -> StageCommand:
+    return _validate(build_capture_command(spec, freeze, discover, discover_result), command)
+
+
+def validate_generate_command(
+    spec: AdmissionSpec,
+    capture: VerifiedPredecessor,
+    command: StageCommand,
+) -> StageCommand:
+    return _validate(build_generate_command(spec, capture), command)
+
+
+def validate_verify_command(
+    spec: AdmissionSpec,
+    generate: VerifiedPredecessor,
+    capture: VerifiedPredecessor,
+    command: StageCommand,
+) -> StageCommand:
+    return _validate(build_verify_command(spec, generate, capture), command)
+
+
 def validate_stage_command(
     spec: AdmissionSpec,
     command: StageCommand,
     *,
     predecessor: VerifiedPredecessor | None = None,
+    supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
+    discover_result: VerifiedDiscoverResult | None = None,
 ) -> StageCommand:
     """The pure Store transaction hook; unsupported stages are explicit."""
 
     if command.stage == "freeze":
-        if predecessor is not None:
+        if predecessor is not None or supporting_predecessors or discover_result is not None:
             raise ProtocolError("admission.predecessor_invalid", {"stage": "freeze"})
         return validate_freeze_command(spec, command)
     if command.stage == "discover":
-        if predecessor is None:
+        if predecessor is None or supporting_predecessors or discover_result is not None:
             raise ProtocolError("admission.predecessor_required", {"stage": "discover"})
         return validate_discover_command(spec, predecessor, command)
+    if command.stage == "capture":
+        if predecessor is None or discover_result is None or len(supporting_predecessors) != 1:
+            raise ProtocolError("admission.predecessor_required", {"stage": "capture"})
+        return validate_capture_command(
+            spec,
+            supporting_predecessors[0],
+            predecessor,
+            discover_result,
+            command,
+        )
+    if command.stage == "generate":
+        if predecessor is None or supporting_predecessors or discover_result is not None:
+            raise ProtocolError("admission.predecessor_required", {"stage": "generate"})
+        return validate_generate_command(spec, predecessor, command)
+    if command.stage == "verify":
+        if predecessor is None or len(supporting_predecessors) != 1 or discover_result is not None:
+            raise ProtocolError("admission.predecessor_required", {"stage": "verify"})
+        return validate_verify_command(spec, predecessor, supporting_predecessors[0], command)
     raise ProtocolError("admission.stage_not_supported", {"stage": command.stage})
 
 
@@ -668,27 +964,50 @@ def validate_store_command(
     command: StageCommand,
     *,
     predecessor: VerifiedPredecessor | None = None,
+    supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
+    discover_result: VerifiedDiscoverResult | None = None,
 ) -> StageCommand:
     """Pure transaction hook for the common FactStore integration."""
 
     validate_run_admission(spec, admission)
-    return validate_stage_command(spec, command, predecessor=predecessor)
+    return validate_stage_command(
+        spec,
+        command,
+        predecessor=predecessor,
+        supporting_predecessors=supporting_predecessors,
+        discover_result=discover_result,
+    )
 
 
 __all__ = [
     "ADMISSION_SPEC_SCHEMA",
+    "CAPTURE_ARTIFACT_KIND",
+    "GENERATE_ARTIFACT_KIND",
+    "GENERATE_OUTPUT_CONTRACT",
+    "GENERATE_REQUEST_SCHEMA",
     "SUPPORTED_PROJECTION_STAGES",
+    "VERIFY_OUTPUT_CONTRACT",
+    "VERIFY_REQUEST_SCHEMA",
     "AdmissionSpec",
     "ArtifactMember",
+    "StageExecutors",
     "VerifiedArtifact",
+    "VerifiedDiscoverResult",
     "VerifiedPredecessor",
     "VerifiedRuleset",
+    "build_capture_command",
     "build_discover_command",
     "build_freeze_command",
+    "build_generate_command",
+    "build_publish_command",
     "build_run_admission",
+    "build_verify_command",
+    "validate_capture_command",
     "validate_discover_command",
     "validate_freeze_command",
+    "validate_generate_command",
     "validate_run_admission",
     "validate_stage_command",
     "validate_store_command",
+    "validate_verify_command",
 ]
