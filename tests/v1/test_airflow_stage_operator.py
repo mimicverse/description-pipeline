@@ -192,9 +192,13 @@ class StageTaskOperatorTests(unittest.TestCase):
             "_application_from_binding",
             factory,
         ):
-            output = operator.execute_complete(
+            output = operator.resume_execution(
+                "execute_complete",
+                {
+                    "wait": wait.to_record(),
+                    "event": {"wait": wait.to_record()},
+                },
                 _context(map_index=5),
-                {"wait": wait.to_record()},
             )
 
         binding = factory.call_args.args[0]
@@ -223,7 +227,8 @@ class StageTaskOperatorTests(unittest.TestCase):
         ), self.assertRaises(TaskDeferred) as caught:
             operator.execute_complete(
                 _context(),
-                {"wait": wait.to_record()},
+                wait=wait.to_record(),
+                event={"wait": wait.to_record()},
             )
 
         deferred = caught.exception
@@ -251,7 +256,8 @@ class StageTaskOperatorTests(unittest.TestCase):
                 ):
                     operator.execute_complete(
                         _context(),
-                        {"wait": wait_record},
+                        wait=wait.to_record(),
+                        event={"wait": wait_record},
                     )
         factory.assert_not_called()
 

@@ -73,17 +73,26 @@ def _application_from_binding(binding: AirflowTaskBinding) -> StageApplication:
         raise AirflowFailException(f"{error.code}: {error}") from error
 
 
-def _event_wait(event: object) -> StageEffectWait:
+def _wait_from_record(
+    record: object,
+    *,
+    message: str,
+) -> StageEffectWait:
     from ..pipeline.contracts import StageEffectWait
 
+    try:
+        return StageEffectWait.from_record(record)
+    except Exception as error:
+        raise AirflowFailException(message) from error
+
+
+def _event_wait(event: object) -> StageEffectWait:
     if not isinstance(event, Mapping) or set(event) != {"wait"}:
         raise AirflowFailException("The effect event is malformed")
-    try:
-        return StageEffectWait.from_record(event["wait"])
-    except Exception as error:
-        raise AirflowFailException(
-            "The effect event contains an invalid wait"
-        ) from error
+    return _wait_from_record(
+        event["wait"],
+        message="The effect event contains an invalid wait",
+    )
 
 
 class StageTaskOperator(BaseOperator):
@@ -154,22 +163,33 @@ class StageTaskOperator(BaseOperator):
     def execute_complete(
         self,
         context: Mapping[str, Any],
+        wait: object,
         event: object,
     ) -> dict[str, Any]:
+        """Resume from the persisted wait and require the event to match it."""
+
         binding, run_id = _binding_from_context(
             stage=self.stage,
             expected_task_id=self.task_id,
             context=context,
             fallback_dag_id=self.dag_id,
         )
-        wait = _event_wait(event)
-        if wait.run_id != run_id or wait.stage != self.stage:
+        expected = _wait_from_record(
+            wait,
+            message="The persisted effect wait is invalid",
+        )
+        hint = _event_wait(event)
+        if expected.digest != hint.digest:
+            raise AirflowFailException(
+                "The effect event names another persisted wait"
+            )
+        if expected.run_id != run_id or expected.stage != self.stage:
             raise AirflowFailException(
                 "The effect event names another run or stage"
             )
         application = _application_from_binding(binding)
         try:
-            result = application.resume_stage(wait, wakeup=None)
+            result = application.resume_stage(expected, wakeup=None)
         except ApplicationError as error:
             raise AirflowFailException(
                 json.dumps(

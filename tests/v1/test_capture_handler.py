@@ -66,6 +66,10 @@ from description_pipeline.orchestration.native_operation_runtime import (
     NativeOperationView,
     OPERATION_VIEW_SCHEMA,
 )
+from description_pipeline.orchestration.airflow_effect_trigger import (
+    _EffectEvidence,
+    _native_expectation,
+)
 from description_pipeline.orchestration.stage_transfer import (
     CAPTURE_ARCHIVE,
     admit_capture,
@@ -900,6 +904,50 @@ class CaptureHandlerTests(unittest.TestCase):
                 self.command,
             ),
             outbound,
+        )
+
+    def test_trigger_reads_capture_identity_without_materializing_archive(self) -> None:
+        effects = self.effects()
+        operation = Mock(side_effect=RuntimeError("transport stopped"))
+        with self.assertRaisesRegex(RuntimeError, "transport stopped"):
+            self.handler(native_operation=operation).execute(
+                self.command,
+                self.claim,
+                self.workspace(name="capture-trigger-small-identity"),
+                effects=effects,
+            )
+
+        intent = next(
+            item
+            for item in self.effect_ledger.intents.values()
+            if item.command_id == self.command.command_id
+        )
+        settlement = effects.effect_settlement(intent.effect_id)
+        evidence = _EffectEvidence(
+            artifacts=self.store,
+            command=self.command,
+            intent=intent,
+            settlement=settlement,
+        )
+        with patch.object(
+            self.store,
+            "materialize",
+            side_effect=AssertionError("trigger must not materialize"),
+        ):
+            kind, expected = _native_expectation(evidence)
+
+        self.assertEqual(kind, CAPTURE_KIND)
+        self.assertEqual(
+            expected.operation_id,
+            intent.expected_state["operation_id"],
+        )
+        self.assertEqual(
+            expected.input_archive_sha256,
+            intent.expected_state["input_archive_sha256"],
+        )
+        self.assertEqual(
+            expected.payload_sha256,
+            intent.expected_state["payload_sha256"],
         )
 
     def test_effect_outbound_rejects_changed_exact_input_archive(self) -> None:
