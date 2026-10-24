@@ -1,8 +1,8 @@
 """The delivery file boundary shared by verification and PR submission.
 
 Target tree (contracts delivery format and digest): the subject is ``input/``, ``evidence/``,
-``model/``, ``urdf/``, ``meshes/`` and ``tool.json``.  ``manifest.json`` and
-``reports/quality.json`` stay outside the subject; every other file is refused.
+``model/``, ``urdf/``, ``meshes/`` and ``tool.json``. The manifest and stage-owned report
+files stay outside that subject.
 """
 
 from __future__ import annotations
@@ -20,10 +20,7 @@ BUNDLE_SCHEMA = "solidworks-to-urdf.bundle/v1"
 
 SUBJECT_DIRECTORIES = ("input", "evidence", "model", "urdf", "meshes")
 SUBJECT_FILES = ("tool.json",)
-#: The only files a complete delivery may carry outside the subject.
-OUTSIDE_SUBJECT = ("manifest.json", "reports/quality.json")
 MANIFEST = "manifest.json"
-QUALITY_REPORT = "reports/quality.json"
 SOURCE_RECORD = "input/source.json"
 TOOL_RECORD = "tool.json"
 
@@ -104,26 +101,6 @@ def subject_records(root: Path) -> list[dict]:
         {"path": path, "bytes": (root / path).stat().st_size, "sha256": checksum}
         for path, checksum in subject_inventory(root).items()
     ]
-
-
-def check_layout(root: Path) -> None:
-    """Refuse unregistered files: subject, ``manifest.json``, ``reports/quality.json``."""
-
-    root = Path(root)
-    _reject_root_links(root)
-    allowed = set(SUBJECT_DIRECTORIES) | set(SUBJECT_FILES) | {"manifest.json", "reports"}
-    unknown = sorted(entry.name for entry in root.iterdir() if entry.name not in allowed)
-    if unknown:
-        raise PipelineError(f"Unregistered delivery entries: {unknown}")
-    reports = root / "reports"
-    if reports.exists():
-        extra = sorted(
-            path.relative_to(root).as_posix()
-            for path in reports.rglob("*")
-            if path.is_file() and path.relative_to(root).as_posix() != QUALITY_REPORT
-        )
-        if extra:
-            raise PipelineError(f"Unregistered delivery files: {extra}")
 
 
 def build_delivery_manifest(root: Path, *, contract: dict, policy: dict) -> dict:

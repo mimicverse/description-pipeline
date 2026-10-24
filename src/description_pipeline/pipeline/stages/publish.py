@@ -45,17 +45,21 @@ from ..contracts import (
 )
 from ..effects import EffectIntent, EffectSettlement, EffectState, StageEffectPort
 from ..engine import StageWorkspace
+from ..generate_contract import (
+    CAPTURE_ARTIFACT_KIND,
+    GENERATE_ARTIFACT_KIND,
+    GENERATE_RECEIPT,
+)
 from ..publish_contract import PUBLISH_OUTPUT_CONTRACT, REPOSITORY_SNAPSHOT_KIND
 from ..reconciliation import EffectReconciliationEvidence
 from ..verify import current_verifier_sha256
+from ..verify_contract import (
+    CERTIFICATE_FILENAME as VERIFY_CERTIFICATE,
+    EXECUTION_RECEIPT_FILENAME as VERIFY_EXECUTION,
+    VERIFY_ARTIFACT_KIND,
+)
 
 PUBLISH_RECEIPT_SCHEMA = PUBLICATION_RECEIPT_SCHEMA
-GENERATE_ARTIFACT_KIND = "stage_output:generate"
-CAPTURE_ARTIFACT_KIND = "stage_output:capture"
-VERIFY_ARTIFACT_KIND = "stage_output:verify"
-GENERATE_RECEIPT = "reports/generate.json"
-VERIFY_CERTIFICATE = "verification-certificate.json"
-VERIFY_EXECUTION = "verification-execution.json"
 PUBLICATION_RECEIPT = "publication-receipt.json"
 PUBLICATION_PLAN = "publication-plan.json"
 GIT_EFFECT_KEY = "publish.branch"
@@ -1184,33 +1188,7 @@ def _pr_effect(
         )
         return settlement.effect_id, pull_request, True
     if settlement is not None and settlement.state is EffectState.UNKNOWN:
-        observations = client.observe(
-            repository=request.repository_slug,
-            base_ref=request.base_ref,
-            head_ref=request.branch_ref,
-            candidate_commit=candidate.commit,
-        )
-        if len(observations) == 1:
-            _require_pr_match(
-                observations[0],
-                request=request,
-                candidate_commit=candidate.commit,
-                title=title,
-                body=body,
-            )
-            payload = {"action": "reconciled", "pull_request": observations[0].to_record()}
-            root = workspace.root / "effects/pr-reconcile"
-            root.mkdir(parents=True)
-            write_json(root / "observation.json", payload)
-            effects.record_observation(
-                settlement.effect_id,
-                source="publish.pr.reconcile",
-                state_class="known",
-                observation_root=root,
-            )
-            _require_satisfied(effects, key=PR_EFFECT_KEY, effect_id=settlement.effect_id)
-            return settlement.effect_id, observations[0], True
-        raise PublishIncomplete("publish.pr_effect_unknown", {"effect_id": settlement.effect_id})
+        raise PublicationError("publish.pr_recovery_required", {"effect_id": settlement.effect_id})
     if settlement is not None and settlement.state is EffectState.CONFLICT:
         raise StageFailure("publish_pr_effect_conflict", "The PR effect is conflicted")
     if settlement is not None and settlement.state is EffectState.DEFINITELY_FAILED:

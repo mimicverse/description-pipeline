@@ -1281,7 +1281,7 @@ class StageTransferTests(unittest.TestCase):
             support.cleanup(work)
 
     def test_transfer_receipts_never_enter_the_delivery_subject(self) -> None:
-        from description_pipeline.delivery import check_layout, subject_inventory
+        from description_pipeline.delivery import subject_inventory
 
         bundle = self.base / "subject-bundle"
         for name in ("input", "evidence", "model", "urdf", "meshes"):
@@ -1299,9 +1299,6 @@ class StageTransferTests(unittest.TestCase):
         for name in ("reports/native-tool.json", "reports/native-stages.json", transfer.CAPTURE_MANIFEST):
             self.assertNotIn(name, subject)
         self.assertEqual(subject_inventory(bundle), subject)  # receipts never bind into the subject
-        (bundle / "README.md").unlink()
-        with self.assertRaisesRegex(PipelineError, "Unregistered delivery"):
-            check_layout(bundle)
 
     def test_verify_transfer_gate_revalidates_resealed_deliveries(self) -> None:
         seal(self.root, self.archive)

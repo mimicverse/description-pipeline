@@ -1,15 +1,3 @@
-"""Concrete domain handlers for the shared stage engine."""
+"""Concrete stage implementations are imported from their owning modules."""
 
-from .generate import GenerateHandler
-from .publish import (
-    PublishGitReconciliationAdapter,
-    PublishHandler,
-    PublishPullRequestReconciliationAdapter,
-)
-
-__all__ = [
-    "GenerateHandler",
-    "PublishGitReconciliationAdapter",
-    "PublishHandler",
-    "PublishPullRequestReconciliationAdapter",
-]
+__all__: tuple[str, ...] = ()

@@ -7,10 +7,14 @@ from ..schemas import (
     VERIFICATION_EXECUTION_SCHEMA as RECEIPT_SCHEMA,
     VERIFY_REQUEST_SCHEMA as REQUEST_SCHEMA,
 )
+from .generate_contract import (
+    CAPTURE_ARTIFACT_KIND,
+    GENERATE_ARTIFACT_KIND,
+    GENERATE_RECEIPT,
+)
+
 OUTPUT_CONTRACT = "solidworks-to-urdf.verification-artifact/v1"
-GENERATE_ARTIFACT_KIND = "stage_output:generate"
-CAPTURE_ARTIFACT_KIND = "stage_output:capture"
-GENERATE_RECEIPT = "reports/generate.json"
+VERIFY_ARTIFACT_KIND = "stage_output:verify"
 CERTIFICATE_FILENAME = "verification-certificate.json"
 EXECUTION_RECEIPT_FILENAME = "verification-execution.json"
 
@@ -24,4 +28,5 @@ __all__ = [
     "OUTPUT_CONTRACT",
     "RECEIPT_SCHEMA",
     "REQUEST_SCHEMA",
+    "VERIFY_ARTIFACT_KIND",
 ]

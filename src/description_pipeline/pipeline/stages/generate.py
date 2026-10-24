@@ -26,10 +26,11 @@ from ..contracts import (
 )
 from ..effects import StageEffectPort
 from ..engine import StageWorkspace
-
-GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
-CAPTURE_ARTIFACT_KIND = "stage_output:capture"
-GENERATE_RECEIPT = "reports/generate.json"
+from ..generate_contract import (
+    CAPTURE_ARTIFACT_KIND,
+    GENERATE_OUTPUT_CONTRACT,
+    GENERATE_RECEIPT,
+)
 
 
 @dataclass(frozen=True, slots=True)

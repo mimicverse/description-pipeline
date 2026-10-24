@@ -38,6 +38,11 @@ from .freeze import (
     RulesetCatalog,
     RulesetRoot,
 )
+from .generate_contract import (
+    CAPTURE_ARTIFACT_KIND,
+    GENERATE_ARTIFACT_KIND,
+    GENERATE_OUTPUT_CONTRACT,
+)
 from .publish_contract import (
     PUBLISH_OUTPUT_CONTRACT,
     PUBLISH_REQUEST_SCHEMA,
@@ -54,9 +59,6 @@ from .verify_contract import (
     REQUEST_SCHEMA as VERIFY_REQUEST_SCHEMA,
 )
 
-CAPTURE_ARTIFACT_KIND = "stage_output:capture"
-GENERATE_ARTIFACT_KIND = "stage_output:generate"
-GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
 SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _OID40 = re.compile(r"\A[0-9a-f]{40}\Z")

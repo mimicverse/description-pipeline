@@ -16,6 +16,7 @@ from .pipeline.contracts import FailureEnvelope, StageResult
 from .runtime import tool_record
 
 ApplicationFactory = Callable[[], StageApplication]
+CLI_VERSION_PREFIX = "description-pipeline"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -23,7 +24,7 @@ def parser() -> argparse.ArgumentParser:
         prog="description",
         description="Run the canonical six-stage description pipeline.",
     )
-    commands.add_argument("--version", action="version", version=f"description-pipeline {__version__}")
+    commands.add_argument("--version", action="version", version=f"{CLI_VERSION_PREFIX} {__version__}")
     operations = commands.add_subparsers(dest="operation", required=True)
 
     admit = operations.add_parser("admit", help="admit one immutable AdmissionSpec")

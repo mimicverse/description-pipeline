@@ -1607,6 +1607,29 @@ else:
             1,
         )
 
+    def test_unknown_pr_effect_requires_the_claimless_reconciler(self) -> None:
+        self._run()
+        self.fixture.effects.force_unknown(publish_stage.PR_EFFECT_KEY)
+        workspace = StageWorkspace(
+            root=self.fixture.root / "unknown-pr-workspace",
+            inputs=self.fixture.workspace.inputs,
+        )
+        before = (
+            self.fixture.pr.observe_calls,
+            self.fixture.pr.create_calls,
+            self.fixture.pr.update_calls,
+        )
+        with self.assertRaisesRegex(PipelineError, "pr_recovery_required"):
+            self._run(workspace=workspace)
+        self.assertEqual(
+            (
+                self.fixture.pr.observe_calls,
+                self.fixture.pr.create_calls,
+                self.fixture.pr.update_calls,
+            ),
+            before,
+        )
+
     def test_unknown_effect_requires_claim_free_reconciliation_without_resend(self) -> None:
         self.fixture.effects.prepare_effect(
             effect_key=publish_stage.GIT_EFFECT_KEY,

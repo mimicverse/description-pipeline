@@ -43,13 +43,15 @@ from .contracts import (
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
-from .verify_contract import (
+from .generate_contract import (
     CAPTURE_ARTIFACT_KIND,
+    GENERATE_ARTIFACT_KIND,
+    GENERATE_RECEIPT,
+)
+from .verify_contract import (
     CERTIFICATE_FILENAME,
     CERTIFICATE_SCHEMA,
     EXECUTION_RECEIPT_FILENAME,
-    GENERATE_ARTIFACT_KIND,
-    GENERATE_RECEIPT,
     OUTPUT_CONTRACT,
     RECEIPT_SCHEMA,
     REQUEST_SCHEMA,

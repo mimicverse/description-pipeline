@@ -9,12 +9,12 @@
       "name": "Freeze inputs",
       "doc": {
         "input": "Completed upload, authenticated principal, main assembly, configuration target, purpose, and required change summary; paths, file types, sizes, and selection are valid",
-        "output": "Immutable request, upload inventory, and originals; the inventory is closed and byte/digest bound; CAD is not started"
+        "output": "Immutable stage request, canonical request evidence, closed input inventory, ruleset/configuration identities, and passing boundary checks; CAD is not started"
       },
       "inputs": [
         {
-          "label": "Saved SolidWorks folder",
-          "path": "handoff/",
+          "label": "Sealed originals, ruleset and platform configuration",
+          "path": "freeze_originals + freeze_ruleset + platform_config",
           "class": "native"
         }
       ],
@@ -26,8 +26,8 @@
       ],
       "outputs": [
         {
-          "label": "Frozen handoff, upload inventory and originals",
-          "path": "input/handoff.json + input/cad/",
+          "label": "Frozen request and evidence closure",
+          "path": "stage-request.json + request.json + inputs.json + ruleset.json + configuration.json + checks.json",
           "class": "frozen"
         }
       ],
@@ -38,9 +38,12 @@
         }
       ],
       "evidence": [
-        "handoff_sha256",
-        "package_files",
-        "input/handoff.json"
+        "stage-request.json",
+        "request.json",
+        "inputs.json",
+        "ruleset.json",
+        "configuration.json",
+        "checks.json"
       ]
     },
     {
@@ -49,13 +52,13 @@
       "host_text": "Windows native observation + Linux derivation",
       "name": "Discover structure",
       "doc": {
-        "input": "Frozen engineering folder and same-release tools; native discovery state and source binding are valid",
-        "output": "Raw discovery, controlled record snapshot, engineering content identity, and capture plan; the mode is explicit, the structure is resolvable, object references are unique, and the plan is bound to the raw observations"
+        "input": "Verified Freeze output, immutable SourceSet, ruleset/configuration identities, and admitted same-release native tool source/record identities; the artifact closure and native identities agree",
+        "output": "Raw native observation, Linux-derived prepared source package, request/check/result receipts, and the resolved engineering definition; native evidence, selection, ruleset and prepared bytes agree"
       },
       "inputs": [
         {
-          "label": "Frozen handoff and explicitly referenced component records",
-          "path": "input/handoff.json + input/cad/",
+          "label": "Verified Freeze and immutable derivation inputs",
+          "path": "stage_output:freeze + freeze_originals + freeze_ruleset + platform_config",
           "class": "frozen"
         }
       ],
@@ -67,23 +70,18 @@
       ],
       "outputs": [
         {
-          "label": "Raw discovery",
-          "path": "evidence/discovery.json",
+          "label": "Complete native operation observation",
+          "path": "native-observation/",
           "class": "frozen"
         },
         {
-          "label": "Controlled specification snapshot",
-          "path": "input/records/",
+          "label": "Linux-derived prepared source package",
+          "path": "prepared/",
           "class": "frozen"
         },
         {
-          "label": "Engineering content identity",
-          "path": "input/source.json",
-          "class": "derived"
-        },
-        {
-          "label": "Capture plan",
-          "path": "evidence/capture-plan.json",
+          "label": "Discover command and derivation receipts",
+          "path": "request.json + checks.json + result.json",
           "class": "derived"
         }
       ],
@@ -98,10 +96,11 @@
         }
       ],
       "evidence": [
-        "evidence/discovery.json",
-        "input/records/",
-        "input/source.json",
-        "evidence/capture-plan.json"
+        "native-observation/",
+        "prepared/",
+        "request.json",
+        "checks.json",
+        "result.json"
       ]
     },
     {
@@ -110,13 +109,13 @@
       "host_text": "Windows native read + Linux transfer verification",
       "name": "Capture evidence",
       "doc": {
-        "input": "Sealed plan and the same engineering-folder copy; tool, plan digest, saved configuration, and instance identities agree; identity is checked field by field without requiring every `dp.*` value",
-        "output": "Complete native evidence; reconstruction, native state reads, temporary selection/configuration restoration, geometry coverage, and source stability pass, and transfer is closed"
+        "input": "Verified Freeze and Discover outputs plus the same-release native tool requirement; prepared bytes, source inventory, native tool identities and object ownership agree",
+        "output": "Admitted capture tree with original inputs, complete native evidence and transfer receipts; reconstruction, native reads, temporary-state restoration, geometry coverage and resource settlement pass"
       },
       "inputs": [
         {
-          "label": "Sealed plan and the same unchanged project copy",
-          "path": "evidence/capture-plan.json + input/cad/",
+          "label": "Verified Freeze/Discover closure and native tool requirement",
+          "path": "stage_output:freeze + stage_output:discover + native_tool_requirement",
           "class": "prepared"
         }
       ],
@@ -132,18 +131,18 @@
       ],
       "outputs": [
         {
-          "label": "Captured instances, states and raw measurements",
-          "path": "evidence/capture.json",
+          "label": "Admitted delivery inputs and native evidence",
+          "path": "input/ + evidence/",
           "class": "frozen"
         },
         {
-          "label": "Native meshes",
-          "path": "evidence/geometry/",
+          "label": "Native execution identities and stage evidence",
+          "path": "reports/native-tool.json + reports/native-stages.json",
           "class": "frozen"
         },
         {
-          "label": "Native API, environment and session identity",
-          "path": "evidence/native-runtime.json",
+          "label": "Closed native transfer receipt",
+          "path": "transfer-manifest.json",
           "class": "frozen"
         }
       ],
@@ -158,9 +157,11 @@
         }
       ],
       "evidence": [
-        "evidence/capture.json",
-        "evidence/geometry/",
-        "evidence/native-runtime.json"
+        "input/",
+        "evidence/",
+        "reports/native-tool.json",
+        "reports/native-stages.json",
+        "transfer-manifest.json"
       ]
     },
     {
@@ -169,13 +170,13 @@
       "host_text": "Linux",
       "name": "Generate URDF",
       "doc": {
-        "input": "Complete sealed evidence; inventory, schema, provenance, and tool identity are valid",
-        "output": "Canonical model, URDF, meshes, and delivery subject; the model is valid, files are complete, and every artifact is bound to its source"
+        "input": "Exact committed Capture output; evidence snapshot, engineering model schema, provenance, source bindings and tool identity are valid",
+        "output": "Canonical model, URDF, meshes, tool record and Generate receipt; every file is deterministic, hashed, source-warning preserving and bound to the Capture artifact"
       },
       "inputs": [
         {
-          "label": "Frozen native evidence",
-          "path": "evidence/",
+          "label": "Committed Capture artifact",
+          "path": "stage_output:capture",
           "class": "frozen"
         }
       ],
@@ -197,8 +198,8 @@
           "class": "derived"
         },
         {
-          "label": "Tool identity and delivery subject",
-          "path": "tool.json + manifest.json",
+          "label": "Tool identity and Generate receipt",
+          "path": "tool.json + reports/generate.json",
           "class": "derived"
         }
       ],
@@ -213,7 +214,7 @@
         "urdf/robot.urdf",
         "meshes/",
         "tool.json",
-        "manifest.json"
+        "reports/generate.json"
       ]
     },
     {
@@ -222,13 +223,13 @@
       "host_text": "Linux",
       "name": "Independent verification",
       "doc": {
-        "input": "Raw evidence and actual artifacts; the delivery subject has not changed",
-        "output": "Deterministic quality report; every required applicable check passes and the report is bound to the subject and policy"
+        "input": "Exact committed Generate and Capture artifacts; source evidence and generated bytes remain unchanged and independently readable",
+        "output": "Verification certificate and execution receipt; every required applicable check passes and the certificate is bound to the Generate/Capture pair, verifier, contract, policy and subject"
       },
       "inputs": [
         {
-          "label": "Original evidence and actual generated files",
-          "path": "input/ + evidence/ + model/ + urdf/ + meshes/ + tool.json",
+          "label": "Committed Generate/Capture pair",
+          "path": "stage_output:generate + stage_output:capture",
           "class": "bound"
         }
       ],
@@ -240,8 +241,13 @@
       ],
       "outputs": [
         {
-          "label": "Deterministic per-object quality report",
-          "path": "reports/quality.json",
+          "label": "Independent verification certificate",
+          "path": "verification-certificate.json",
+          "class": "derived"
+        },
+        {
+          "label": "Verification execution receipt",
+          "path": "verification-execution.json",
           "class": "derived"
         }
       ],
@@ -256,7 +262,8 @@
         }
       ],
       "evidence": [
-        "reports/quality.json",
+        "verification-certificate.json",
+        "verification-execution.json",
         "subject_sha256"
       ]
     },
@@ -266,13 +273,13 @@
       "host_text": "Linux",
       "name": "Publish review PR",
       "doc": {
-        "input": "Complete reverification, configuration target, publication predecessor baseline, and clean workspace are valid",
-        "output": "Candidate commit and PR receipt; copied bytes, Git blobs, remote head/base, and verified subject agree"
+        "input": "Verified Generate/Capture/Verify artifacts and sealed repository snapshot; reverification, configured target, predecessor baseline and clean workspace are valid",
+        "output": "Publication receipt plus fenced Git/PR effects; copied bytes, committed tree, remote head/base, pull request and verified subject agree"
       },
       "inputs": [
         {
-          "label": "Verified delivery and configured model repository",
-          "path": "manifest.json + input/ + evidence/ + model/ + urdf/ + meshes/ + tool.json + reports/quality.json",
+          "label": "Verified pair, certificate and sealed repository target",
+          "path": "stage_output:generate + stage_output:capture + stage_output:verify + repository_snapshot",
           "class": "verified"
         }
       ],
@@ -284,8 +291,8 @@
       ],
       "outputs": [
         {
-          "label": "Candidate commit and PR receipt",
-          "path": "submission",
+          "label": "Publication receipt",
+          "path": "publication-receipt.json",
           "class": "receipt"
         }
       ],
@@ -300,9 +307,10 @@
         }
       ],
       "evidence": [
-        "submission",
-        "commit",
-        "url"
+        "publication-receipt.json",
+        "publication-plan.json",
+        "candidate.bundle",
+        "observation.json"
       ]
     }
   ],

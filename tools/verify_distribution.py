@@ -21,6 +21,7 @@ from pathlib import Path
 from packaging.tags import compatible_tags, cpython_tags
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
+from description_pipeline.cli import CLI_VERSION_PREFIX
 from description_pipeline.io import (
     PipelineError,
     artifact_path_parts,
@@ -311,7 +312,7 @@ def wheel_identity(wheel):
         return identity
 
 
-def verify(wheel, runtime_lock, *, wheelhouse=None, bundle=None):
+def verify(wheel, runtime_lock, *, wheelhouse=None):
     identity = wheel_identity(wheel)
     verify_release(wheel.parent, identity)
     with tempfile.TemporaryDirectory(prefix="description-installed-") as temporary:
@@ -336,25 +337,9 @@ def verify(wheel, runtime_lock, *, wheelhouse=None, bundle=None):
         version = subprocess.check_output(
             [str(python), "-I", "-m", "description_pipeline.cli", "--version"], cwd=root, text=True
         ).strip()
-        if version != "solidworks-to-urdf " + identity["version"]:
+        if version != f"{CLI_VERSION_PREFIX} {identity['version']}":
             raise PipelineError("Installed CLI version differs from wheel")
         checks = {"wheel_record": True, "source_identity": True, "installed_cli": True}
-        if bundle:
-            subprocess.run([str(python), "-I", "-m", "description_pipeline.cli", "check", str(bundle)], check=True)
-            subprocess.run(
-                [
-                    str(python),
-                    "-I",
-                    "-m",
-                    "description_pipeline.cli",
-                    "rebuild",
-                    str(bundle),
-                    "--output",
-                    str(root / "rebuilt"),
-                ],
-                check=True,
-            )
-            checks["native_bundle_replay"] = True
         return {
             "passed": True,
             "wheel_sha256": file_digest(wheel),
@@ -369,10 +354,9 @@ def main():
     parser.add_argument("wheel", type=Path)
     parser.add_argument("--runtime-lock", type=Path, required=True)
     parser.add_argument("--wheelhouse", type=Path)
-    parser.add_argument("--bundle", type=Path, help="optional actual passing native bundle to check and rebuild")
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    result = verify(args.wheel.resolve(), args.runtime_lock.resolve(), wheelhouse=args.wheelhouse, bundle=args.bundle)
+    result = verify(args.wheel.resolve(), args.runtime_lock.resolve(), wheelhouse=args.wheelhouse)
     if args.report:
         write_json(args.report, result)
     print(json.dumps(result, indent=2))
