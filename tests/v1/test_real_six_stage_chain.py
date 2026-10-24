@@ -931,5 +931,105 @@ class RealSixStageChainTests(unittest.TestCase):
                 ],
             )
 
+    def test_real_chain_cancels_verify_before_its_handler_runs(self) -> None:
+        application = self._application()
+        factory_work = self.root / "cancel-factory-work"
+        factory_work.mkdir()
+        load_production_admission(
+            application,
+            self._production_request(),
+            artifacts=self.store,
+            platform_snapshot=self._platform_snapshot(),
+            native_tool_provider=lambda: copy.deepcopy(self.native),
+            work_root=factory_work,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+            portable_tool_provider=lambda: copy.deepcopy(self.portable),
+        )
+        create_command = self.facts.create_command
+        cancel_request = None
+
+        def create_then_cancel(command, **kwargs):
+            nonlocal cancel_request
+            stored = create_command(command, **kwargs)
+            if command.stage == "verify":
+                cancel_request = self.facts.request_cancel(
+                    target_command_id=stored.command_id,
+                    cancel_executor_sha256=digest(
+                        {"tool": "verify-cancel"}
+                    ),
+                    reason_code="operator_cancelled",
+                    reason="Cancel verification before its handler starts",
+                    requested_by="cli:tenant:ou_operator",
+                    requested_at=datetime(
+                        2026,
+                        10,
+                        25,
+                        0,
+                        0,
+                        1,
+                        tzinfo=UTC,
+                    ),
+                )
+            return stored
+
+        with (
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=copy.deepcopy(self.native),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.generate.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.publish.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch.object(
+                self.facts,
+                "create_command",
+                side_effect=create_then_cancel,
+            ),
+            patch.object(
+                application.handlers["verify"],
+                "execute",
+                side_effect=AssertionError(
+                    "A requested cancellation must run before Verify"
+                ),
+            ) as verify_execute,
+        ):
+            generated = application.execute_run(
+                RUN_ID,
+                through="generate",
+            )
+            self.assertEqual(generated.outcome, "completed")
+            cancelled = application.run_stage(RUN_ID, "verify")
+
+        self.assertEqual(cancelled.outcome, "cancelled")
+        self.assertIsNotNone(cancel_request)
+        verify_execute.assert_not_called()
+        with (
+            self._connect() as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT stage, outcome FROM stage_decision "
+                "WHERE run_id = %s "
+                "ORDER BY array_position("
+                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                " stage)",
+                (RUN_ID,),
+            )
+            self.assertEqual(
+                cursor.fetchall(),
+                [
+                    ("freeze", "completed"),
+                    ("discover", "completed"),
+                    ("capture", "completed"),
+                    ("generate", "completed"),
+                    ("verify", "cancelled"),
+                ],
+            )
+
 if __name__ == "__main__":
     unittest.main()
