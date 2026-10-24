@@ -1,4 +1,4 @@
-"""Hermetic six-stage happy path: frozen evidence through a local Git publication.
+"""Hermetic native evidence fixture for Verify and end-to-end tests.
 
 The native-shaped backend exercises the production path; it is not physical CAD
 qualification or a claim about a licensed SolidWorks installation.
@@ -34,7 +34,7 @@ from description_pipeline.sources.solidworks.scene import combine_mass_propertie
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend
 from tests.v1 import workflow_fixture as steps
-from tests.v1.test_split_roundtrip import AxisFixtureBackend, capture_record
+from tests.v1.native_fixture_support import AxisFixtureBackend, capture_record
 from tests.v1.test_stage_transfer import native_tool
 
 RUN_ID = "3f2c1f7a-9d4e-4d0a-9f11-2b6c5a7e8d90"

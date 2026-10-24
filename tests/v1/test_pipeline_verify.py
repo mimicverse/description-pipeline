@@ -54,7 +54,7 @@ from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA, STAGE_RESULT_SCHEMA
 from description_pipeline.stages import CONTRACT_SHA256
 from description_pipeline.platform.facts import FactStore
-from tests.v1 import test_hermetic_six_stage as hermetic
+from tests.v1 import verification_fixture as hermetic
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / "schema.sql"

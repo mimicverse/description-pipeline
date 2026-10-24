@@ -73,7 +73,7 @@ from .test_pipeline_discover import (
     CountingBackend,
     DiscoverHarness,
 )
-from .test_split_roundtrip import capture_record
+from .native_fixture_support import capture_record
 from .test_stage_transfer import native_tool as build_capture_tool
 
 

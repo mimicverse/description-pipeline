@@ -1,4 +1,4 @@
-"""Control-fixture split roundtrip: real freeze → sealed transfer → real generate/verify.
+"""Native CAD and sealed-transfer fixtures shared by pipeline tests.
 
 This exercises the producer/consumer boundary end to end with the fixture CAD backend and
 the real generation and verification algorithms (including the MuJoCo consumer gate on the

@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.sources import support
-from tests.v1.test_split_roundtrip import AxisFixtureBackend, fixture_mass_payload
+from tests.v1.native_fixture_support import (
+    AxisFixtureBackend,
+    fixture_mass_payload,
+)
 
 
 def fixture_backend(

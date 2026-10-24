@@ -57,7 +57,8 @@ from description_pipeline.stages import CONTRACT_SHA256
 
 from tests.sources import support
 from tests.v1.test_capture_handler import _capture_component_closure
-from tests.v1.test_hermetic_six_stage import (
+from tests.v1.native_fixture_support import capture_record
+from tests.v1.verification_fixture import (
     MAIN_ASSEMBLY,
     QualifiedFixtureBackend,
     _mass_reading,
@@ -69,7 +70,6 @@ from tests.v1.test_pipeline_discover import (
     CountingBackend,
 )
 from tests.v1.test_pipeline_publish import PublishFixture, _PullRequests
-from tests.v1.test_split_roundtrip import capture_record
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_SCHEMA = (
