@@ -47,6 +47,7 @@ _ADMISSION_FIELDS = frozenset(
         "executors",
         "from_stage",
         "main_assembly",
+        "native_tool_sha256",
         "originals",
         "parent_run_id",
         "policy_sha256",
@@ -314,6 +315,7 @@ class AdmissionSpec:
     ruleset: VerifiedRuleset
     configuration: VerifiedArtifact
     executors: StageExecutors
+    native_tool_sha256: str
     contract_sha256: str
     policy_sha256: str
     created_at: datetime
@@ -346,8 +348,13 @@ class AdmissionSpec:
             )
         if not isinstance(self.executors, StageExecutors):
             raise ProtocolError("admission.invalid", {"where": "executors"})
-        for field in ("contract_sha256", "policy_sha256"):
+        for field in ("native_tool_sha256", "contract_sha256", "policy_sha256"):
             _require_digest(getattr(self, field), "admission.invalid", field)
+        if self.executors.capture != self.native_tool_sha256:
+            raise ProtocolError(
+                "admission.invalid",
+                {"where": "executors.capture", "reason": "native-tool-mismatch"},
+            )
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise ProtocolError("admission.invalid", {"where": "created_at"})
 
@@ -364,6 +371,7 @@ class AdmissionSpec:
             "executors": self.executors.to_record(),
             "from_stage": self.from_stage,
             "main_assembly": self.main_assembly,
+            "native_tool_sha256": self.native_tool_sha256,
             "originals": self.originals.to_record(),
             "parent_run_id": self.parent_run_id,
             "policy_sha256": self.policy_sha256,
@@ -412,6 +420,7 @@ class AdmissionSpec:
             ruleset=ruleset,
             configuration=configuration,
             executors=StageExecutors.from_record(record["executors"]),
+            native_tool_sha256=record["native_tool_sha256"],
             contract_sha256=record["contract_sha256"],
             policy_sha256=record["policy_sha256"],
             created_at=datetime.fromisoformat(record["created_at"].replace("Z", "+00:00")),
@@ -695,7 +704,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         "ruleset_catalog_sha256": spec.ruleset.artifact.ref.set_sha256,
         "platform_config_sha256": spec.configuration.ref.set_sha256,
         "submission_identity": _submission_identity(spec),
-        "expected_native_tool_sha256": spec.executors.discover,
+        "expected_native_tool_sha256": spec.native_tool_sha256,
     }
     return _base_command(
         spec,
