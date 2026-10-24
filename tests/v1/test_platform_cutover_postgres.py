@@ -20,6 +20,7 @@ except ImportError:
     POSTGRES_BIN_PATH = None
 
 from description_pipeline.io import digest
+from description_pipeline.platform.facts import FactStoreError, RunControlStore
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
@@ -1263,6 +1264,53 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                 recovery.checkpoint_index(restored_root, target_artifacts),
                 target_artifacts,
             )
+
+    def test_run_control_store_reads_canonical_runs_and_owns_display_metadata(self) -> None:
+        self._install_canonical_schema()
+        self._insert_run("run-parent")
+        self._insert_run("run-child")
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE run_admission
+                SET parent_run_id = %s, from_stage = 'freeze'
+                WHERE run_id = %s
+                """,
+                ("run-parent", "run-child"),
+            )
+        store = RunControlStore(self._connect)
+
+        summaries = {row.run_id: row for row in store.list_admitted_runs()}
+        self.assertEqual(set(summaries), {"run-parent", "run-child"})
+        self.assertEqual(summaries["run-child"].parent_run_id, "run-parent")
+        self.assertEqual(summaries["run-child"].from_stage, "freeze")
+        self.assertEqual(summaries["run-child"].state, "waiting")
+        self.assertEqual(store.get_admitted_run("run-parent"), summaries["run-parent"])
+        self.assertIsNone(store.get_admitted_run("run-missing"))
+
+        renamed = store.rename_run("run-child", "Custom title")
+        self.assertEqual(renamed.display_name, "Custom title")
+        self.assertIsNone(renamed.hidden_at)
+        hidden = store.hide_run("run-child", actor="operator")
+        self.assertEqual(hidden.hidden_reason, "operator")
+        repeat = store.hide_run("run-child", actor="another operator")
+        self.assertEqual(repeat.hidden_at, hidden.hidden_at)
+        self.assertEqual(repeat.hidden_reason, "operator")
+        renamed_while_hidden = store.rename_run("run-child", None)
+        self.assertTrue(renamed_while_hidden.hidden_at is not None)
+        self.assertIsNone(renamed_while_hidden.display_name)
+        restored = store.restore_run("run-child")
+        self.assertIsNone(restored.hidden_at)
+        self.assertIsNone(restored.hidden_reason)
+        self.assertEqual(store.get_run_display_metadata("run-child"), restored)
+        self.assertEqual(store.list_run_display_metadata(), {"run-child": restored})
+
+        with self.assertRaisesRegex(FactStoreError, "not admitted"):
+            store.rename_run("run-missing", "missing")
+        with self.assertRaisesRegex(FactStoreError, "not admitted"):
+            store.hide_run("run-missing", actor="operator")
+        with self.assertRaisesRegex(FactStoreError, "not admitted"):
+            store.restore_run("run-missing")
 
 
 if __name__ == "__main__":

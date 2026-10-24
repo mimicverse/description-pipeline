@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
@@ -80,6 +80,30 @@ class StageResultReader(Protocol):
     def read_result(self, artifact: ArtifactRef) -> StageResult: ...
 
     def read_dispatch_conf(self, artifact: ArtifactRef) -> DispatchConf: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunDisplayMetadata:
+    """The display-only name and reversible tombstone of one admitted run."""
+
+    run_id: str
+    display_name: str | None
+    hidden_at: datetime | None
+    hidden_reason: str | None
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedRunSummary:
+    """One admitted run identity with the canonical run and Airflow projection state."""
+
+    run_id: str
+    request_id: str
+    parent_run_id: str | None
+    from_stage: str | None
+    state: str
+    created_at: datetime
+    updated_at: datetime
 
 
 def _stored_command_request(command: StageCommand) -> Mapping[str, object]:
@@ -209,7 +233,150 @@ class AdmissionControlStore:
         return AdmissionControl(*updated)
 
 
-class FactStore(AdmissionControlStore):
+class RunControlStore(AdmissionControlStore):
+    """Read run identities and manage display-only metadata without old lifecycle rows."""
+
+    def list_run_display_metadata(self) -> dict[str, RunDisplayMetadata]:
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT run_id, display_name, hidden_at, hidden_reason, updated_at
+                FROM run_display_metadata
+                ORDER BY run_id
+                """
+            )
+            rows = cursor.fetchall()
+        return {row[0]: RunDisplayMetadata(*row) for row in rows}
+
+    def get_run_display_metadata(self, run_id: str) -> RunDisplayMetadata | None:
+        self._require_run_id(run_id)
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT run_id, display_name, hidden_at, hidden_reason, updated_at
+                FROM run_display_metadata
+                WHERE run_id = %s
+                """,
+                (run_id,),
+            )
+            row = cursor.fetchone()
+        return RunDisplayMetadata(*row) if row is not None else None
+
+    def rename_run(self, run_id: str, display_name: str | None) -> RunDisplayMetadata:
+        self._require_run_id(run_id)
+        if display_name is not None and (not isinstance(display_name, str) or "\x00" in display_name):
+            raise FactStoreError("The run display name is invalid")
+        return self._update_run_display_metadata(
+            """
+            INSERT INTO run_display_metadata (
+                run_id, display_name, hidden_at, hidden_reason, updated_at
+            )
+            SELECT run_id, %s, NULL, NULL, now()
+            FROM run_admission
+            WHERE run_id = %s
+            ON CONFLICT (run_id) DO UPDATE
+            SET display_name = EXCLUDED.display_name, updated_at = now()
+            RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at
+            """,
+            (display_name, run_id),
+        )
+
+    def hide_run(self, run_id: str, *, actor: str) -> RunDisplayMetadata:
+        self._require_run_id(run_id)
+        if not isinstance(actor, str) or not actor or "\x00" in actor:
+            raise FactStoreError("The run hide actor is invalid")
+        return self._update_run_display_metadata(
+            """
+            INSERT INTO run_display_metadata (
+                run_id, display_name, hidden_at, hidden_reason, updated_at
+            )
+            SELECT run_id, NULL, now(), %s, now()
+            FROM run_admission
+            WHERE run_id = %s
+            ON CONFLICT (run_id) DO UPDATE
+            SET hidden_at = COALESCE(run_display_metadata.hidden_at, now()),
+                hidden_reason = COALESCE(run_display_metadata.hidden_reason, EXCLUDED.hidden_reason),
+                updated_at = now()
+            RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at
+            """,
+            (actor, run_id),
+        )
+
+    def restore_run(self, run_id: str) -> RunDisplayMetadata:
+        self._require_run_id(run_id)
+        return self._update_run_display_metadata(
+            """
+            INSERT INTO run_display_metadata (
+                run_id, display_name, hidden_at, hidden_reason, updated_at
+            )
+            SELECT run_id, NULL, NULL, NULL, now()
+            FROM run_admission
+            WHERE run_id = %s
+            ON CONFLICT (run_id) DO UPDATE
+            SET hidden_at = NULL, hidden_reason = NULL, updated_at = now()
+            RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at
+            """,
+            (run_id,),
+        )
+
+    def list_admitted_runs(self) -> list[AdmittedRunSummary]:
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT a.run_id, a.request_id, a.parent_run_id, a.from_stage,
+                       COALESCE(p.state, 'waiting'), a.created_at,
+                       COALESCE(p.updated_at, a.created_at)
+                FROM run_admission AS a
+                LEFT JOIN lifecycle_projection AS p
+                  ON p.object_kind = 'run' AND p.object_id = a.run_id
+                ORDER BY a.created_at DESC, a.run_id
+                """
+            )
+            rows = cursor.fetchall()
+        return [AdmittedRunSummary(*row) for row in rows]
+
+    def get_admitted_run(self, run_id: str) -> AdmittedRunSummary | None:
+        self._require_run_id(run_id)
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT a.run_id, a.request_id, a.parent_run_id, a.from_stage,
+                       COALESCE(p.state, 'waiting'), a.created_at,
+                       COALESCE(p.updated_at, a.created_at)
+                FROM run_admission AS a
+                LEFT JOIN lifecycle_projection AS p
+                  ON p.object_kind = 'run' AND p.object_id = a.run_id
+                WHERE a.run_id = %s
+                """,
+                (run_id,),
+            )
+            row = cursor.fetchone()
+        return AdmittedRunSummary(*row) if row is not None else None
+
+    @staticmethod
+    def _require_run_id(run_id: str) -> None:
+        if not isinstance(run_id, str) or not run_id or "\x00" in run_id:
+            raise FactStoreError("The run id is invalid")
+
+    def _update_run_display_metadata(
+        self,
+        statement: str,
+        parameters: tuple[object, ...],
+    ) -> RunDisplayMetadata:
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(statement, parameters)
+            row = cursor.fetchone()
+        if row is None:
+            raise FactStoreError("The run is not admitted")
+        return RunDisplayMetadata(*row)
+
+
+class FactStore(RunControlStore):
     """Canonical fact persistence with injected connection and result reader."""
 
     def __init__(self, connect, result_reader: StageResultReader) -> None:
