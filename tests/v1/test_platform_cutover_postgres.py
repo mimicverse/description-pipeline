@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -12,9 +13,11 @@ from pathlib import Path
 try:
     import pgserver
     import psycopg2
+    from pgserver._commands import POSTGRES_BIN_PATH
 except ImportError:
     pgserver = None
     psycopg2 = None
+    POSTGRES_BIN_PATH = None
 
 from description_pipeline.io import digest
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
@@ -643,6 +646,47 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                 (f"{self.schema}.run", f"{self.schema}.legacy_run_dependency"),
             ),
             [("run", "legacy_run_dependency")],
+        )
+
+    def test_apply_script_binds_the_archive_receipt_to_the_schema_guard(self) -> None:
+        self._create_legacy_run_table()
+        self._create_airflow_tables()
+        with tempfile.TemporaryDirectory(prefix="schema-receipt-") as directory:
+            receipt = Path(directory) / "legacy-archive.json"
+            receipt.write_text('{"archive":"verified"}\n', encoding="utf-8")
+            postmaster = self.server.get_postmaster_info()
+            completed = subprocess.run(
+                [
+                    "bash",
+                    str(PLATFORM_DIR / "apply.sh"),
+                    "--psql",
+                    str(Path(POSTGRES_BIN_PATH) / "psql"),
+                    "--database",
+                    self.database,
+                    "--platform-schema",
+                    self.schema,
+                    "--airflow-schema",
+                    self.airflow_schema,
+                    "--socket",
+                    str(postmaster.socket_dir),
+                    "--port",
+                    str(postmaster.port),
+                    "--user",
+                    "postgres",
+                    "--legacy-archive-receipt",
+                    str(receipt),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            self._query(
+                "SELECT to_regclass(%s)::text",
+                (f"{self.schema}.run",),
+            ),
+            [(None,)],
         )
 
     def test_lifecycle_matrix_distinguishes_not_run_blocked_running_and_unresolved(self) -> None:
