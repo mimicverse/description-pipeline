@@ -37,6 +37,7 @@ from .contracts import (
     StageCandidate,
     StageCommand,
     StageExecution,
+    StageFailure,
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
@@ -269,10 +270,11 @@ def _generate_receipt(
         "capture_artifact",
         "config_snapshot_sha256",
         "contract_sha256",
-        "executor_sha256",
+        "actual_executor_sha256",
         "mesh_files",
         "model_sha256",
         "output_contract",
+        "required_executor_sha256",
         "schema_version",
         "semantic_identity",
         "urdf_sha256",
@@ -289,7 +291,8 @@ def _generate_receipt(
     if (
         receipt.get("config_snapshot_sha256") != command.config_snapshot_sha256
         or receipt.get("contract_sha256") != command.contract_sha256
-        or receipt.get("executor_sha256") != generate.artifact.producer_tool_sha256
+        or receipt.get("required_executor_sha256") != generate.artifact.producer_tool_sha256
+        or receipt.get("actual_executor_sha256") != generate.artifact.producer_tool_sha256
     ):
         raise PipelineError("Generate receipt command identity differs from the paired artifacts")
     model = read_data(root / "model/robot.json")
@@ -624,11 +627,25 @@ class VerifyHandler:
             command=command,
             claim=claim,
         )
+        if result.passed:
+            return StageExecution(
+                outcome="completed",
+                candidate_root=str(result.candidate_root),
+                checks_sha256=digest(result.certificate),
+                resources_settled=True,
+            )
+        failure = StageFailure(
+            "verification_failed",
+            "Independent verification failed",
+            evidence_artifacts=(),
+            retained_locations=(str(result.candidate_root),),
+        )
         return StageExecution(
-            outcome="completed" if result.passed else "failed",
+            outcome="failed",
             candidate_root=str(result.candidate_root),
             checks_sha256=digest(result.certificate),
-            reason_code=None if result.passed else "verification_failed",
+            resources_settled=True,
+            failure=failure,
         )
 
     def validate_candidate(

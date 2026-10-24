@@ -257,6 +257,7 @@ class GenerateHandler:
             outcome="completed",
             candidate_root=str(output),
             checks_sha256=checks_sha256,
+            resources_settled=True,
         )
 
     def validate_candidate(
@@ -275,7 +276,6 @@ class GenerateHandler:
             or candidate.result.run_id != command.run_id
             or candidate.result.request_digest != command.request_digest
             or candidate.result.outcome != "completed"
-            or candidate.result.required_effect_ids
             or candidate.result.output_artifact.kind != "stage_output:generate"
             or candidate.result.output_artifact.producer_run_id != command.run_id
             or candidate.result.output_artifact.producer_stage != "generate"

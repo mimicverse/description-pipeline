@@ -187,6 +187,7 @@ class AdmissionHarness:
             output_artifact=result_artifact,
             actual_executor_sha256=self.spec.expected_executor_sha256,
             checks_sha256=digest({"checks": "freeze"}),
+            resources_settled=True,
         )
         result_record_artifact = self.store.seal_stage_result(result)
         decision = StageDecision(

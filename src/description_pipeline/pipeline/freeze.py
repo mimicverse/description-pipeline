@@ -31,7 +31,6 @@ from .contracts import (
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
-from .effects import StageEffectPort
 
 FREEZE_REQUEST_SCHEMA = "description-pipeline.freeze-request/v1"
 FREEZE_CHECKS_SCHEMA = "description-pipeline.freeze-checks/v1"
@@ -399,6 +398,7 @@ class FreezeHandler:
                 outcome="completed",
                 candidate_root=str(output),
                 checks_sha256=digest(checks),
+                resources_settled=True,
             )
         except FreezeRefusal as refusal:
             raise StageFailure(refusal.code, refusal.message) from refusal

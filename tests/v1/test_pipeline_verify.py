@@ -37,6 +37,7 @@ from description_pipeline.pipeline.verify import (
     replay_verification,
     validate_verification_certificate,
 )
+from description_pipeline.runtime import tool_record
 from description_pipeline.stages import CONTRACT_SHA256
 from tests.v1 import test_hermetic_six_stage as hermetic
 
@@ -62,7 +63,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.capture_root = self.store.materialize(self.capture_ref, self.root / "capture")
         self.frozen_request = read_data(self.capture_root / "input/request.json")
         self.verify_attempt = 0
-        self.generate_executor = digest({"executor": "generate-tool"})
+        self.generate_executor = tool_record(role="portable")["source_sha256"]
         self.generator_command = StageCommand.create(
             command_id="generate-command",
             run_id="generate-run",
@@ -95,6 +96,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     root=self.root / "generate-attempt",
                     inputs={self.capture_ref.artifact_id: self.capture_root},
                 ),
+                effects=NoExternalEffects(),
             )
         self.generate_source = Path(generated.candidate_root)
         self.generate_ref = self.store.seal_tree(
@@ -253,6 +255,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             output_artifact=output_ref,
             actual_executor_sha256=claim.executor_sha256,
             checks_sha256=digest(certificate),
+            resources_settled=True,
         )
         candidate = StageCandidate(result=result)
         with patch.object(

@@ -38,7 +38,15 @@ from ..sources.solidworks.discovery import DISCOVERY_FILE, native_component_iden
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import selection_bindings
 from ..stages import stage_view
-from .contracts import ArtifactRef, ExecutionClaim, ProtocolError, StageCandidate, StageCommand, StageExecution
+from .contracts import (
+    ArtifactRef,
+    ExecutionClaim,
+    ProtocolError,
+    StageCandidate,
+    StageCommand,
+    StageExecution,
+    StageFailure,
+)
 from .effects import EffectSettlement, EffectState, StageEffectPort
 from .engine import StageWorkspace
 
@@ -353,6 +361,7 @@ class NativeCaptureResult:
     output: Path | None
     archive: Path | None
     receipt: Mapping[str, Any]
+    resources_settled: bool = False
     reason_code: str | None = None
 
     def __post_init__(self) -> None:
@@ -360,6 +369,10 @@ class NativeCaptureResult:
             raise ProtocolError("capture.native_outcome", {"outcome": self.outcome})
         if self.outcome in {"failed", "cancelled"} and not self.reason_code:
             raise ProtocolError("capture.native_reason", {"outcome": self.outcome})
+        if type(self.resources_settled) is not bool:
+            raise ProtocolError("capture.native_resources", {"outcome": self.outcome})
+        if self.outcome == "completed" and self.resources_settled is not True:
+            raise ProtocolError("capture.native_resources", {"reason": "completed-requires-exit-proof"})
 
 
 def _execution_record(
@@ -553,6 +566,10 @@ def _seal_native_capture_artifact(
         native_complete=True,
         native_tool=tool,
         stage="capture",
+        resource_settlement={
+            "settled": True,
+            "reason": "owned_native_sessions_released",
+        },
     )
     discovery = read_data(staging / "evidence/discovery.json")
     native_files = discovery.get("native_files") if isinstance(discovery, dict) else None
@@ -707,13 +724,26 @@ def _invoke_native_operation(
     if result.get("native_complete") is True:
         archive_receipt = result.get("capture_archive")
         archive = output / str((archive_receipt or {}).get("name") or "")
-        return NativeCaptureResult("completed", output, archive, result)
+        return NativeCaptureResult(
+            "completed",
+            output,
+            archive,
+            result,
+            result.get("resource_settlement", {}).get("settled") is True,
+        )
     if result.get("state") == "failed":
         reason = str(result.get("error_code") or "capture.native_failed")
         if reason in {"cad_process_cleanup_failed", "cad_session_cleanup_failed"}:
-            return NativeCaptureResult("unknown", None, None, result, reason)
-        return NativeCaptureResult("failed", Path(result["diagnostic_path"]), None, result, reason)
-    return NativeCaptureResult("unknown", None, None, result, "capture.native_unknown")
+            return NativeCaptureResult("unknown", None, None, result, False, reason)
+        return NativeCaptureResult(
+            "failed",
+            Path(result["diagnostic_path"]),
+            None,
+            result,
+            False,
+            reason,
+        )
+    return NativeCaptureResult("unknown", None, None, result, False, "capture.native_unknown")
 
 
 class CaptureHandler:
@@ -849,6 +879,7 @@ class CaptureHandler:
             outcome="completed",
             candidate_root=str(admitted),
             checks_sha256=checks,
+            resources_settled=True,
         )
 
     def _reuse_satisfied_effect(
@@ -929,7 +960,11 @@ class CaptureHandler:
                 outcome="failed",
                 candidate_root=str(root),
                 checks_sha256=digest(read_data(root / "failure.json")),
-                reason_code="capture.effect_definitely_failed",
+                resources_settled=True,
+                failure=StageFailure(
+                    "capture.effect_definitely_failed",
+                    "The Capture effect is definitely failed and will not be resent",
+                ),
             )
         backend = self._backend_factory(inputs.package) if self._backend_factory is not None else None
         output = workspace.root / "capture-native"
@@ -979,7 +1014,13 @@ class CaptureHandler:
                 outcome=native.outcome,
                 candidate_root=str(native.output),
                 checks_sha256=checks,
-                reason_code=native.reason_code,
+                resources_settled=native.resources_settled,
+                failure=StageFailure(
+                    native.reason_code or "capture.native_failed",
+                    f"Native Capture ended with {native.outcome}",
+                    outcome=native.outcome,
+                    retained_locations=(str(native.output),),
+                ),
             )
         if native.output is None or native.archive is None or not native.archive.is_file():
             raise ProtocolError("capture.native_artifact_missing", {"output": str(native.output)})

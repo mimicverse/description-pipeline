@@ -242,6 +242,7 @@ class CaptureHandlerTests(unittest.TestCase):
         self.store = ArtifactStore(self.root / "artifact-store")
         self.effect_ledger = _EffectLedger(self.store)
         self.stage_fixture = DiscoverHarness(self.root / "discover-source")
+        self.stage_fixture.store = self.store
         self.stage_fixture.record = capture_record()
         self.stage_fixture.record["files"] = {
             name: self.stage_fixture.source_files[name]
@@ -589,7 +590,9 @@ class CaptureHandlerTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "native_tool_mismatch"):
             handler.execute(command, claim, self.workspace(), effects=effects)
         operation.assert_not_called()
-        self.assertEqual(self.effect_ledger.intents, {})
+        self.assertFalse(
+            any(intent.command_id == command.command_id for intent in self.effect_ledger.intents.values())
+        )
 
     def test_unsettled_prior_effect_is_queried_before_native_operation(self) -> None:
         operation = Mock()
@@ -669,6 +672,7 @@ class CaptureHandlerTests(unittest.TestCase):
                 None,
                 None,
                 {"state": "unknown"},
+                False,
                 "cad_process_cleanup_failed",
             )
         )

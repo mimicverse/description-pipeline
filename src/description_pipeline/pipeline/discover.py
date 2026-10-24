@@ -37,7 +37,6 @@ from .contracts import (
 )
 from .effects import EffectState, StageEffectPort
 from .engine import StageWorkspace
-from .effects import StageEffectPort
 
 DISCOVER_REQUEST_SCHEMA = "description-pipeline.discover-request/v1"
 DISCOVER_RESULT_SCHEMA = "description-pipeline.discover-result/v1"
@@ -507,6 +506,7 @@ class DiscoverHandler:
                 outcome="completed",
                 candidate_root=str(output),
                 checks_sha256=digest(checks),
+                resources_settled=True,
             )
         except NativeDiscoverRefusal as refusal:
             raise StageFailure(refusal.code, refusal.message) from refusal

@@ -740,6 +740,7 @@ class _Services:
             output_artifact=output_artifact,
             actual_executor_sha256=command.expected_executor_sha256,
             checks_sha256=execution.checks_sha256,
+            resources_settled=execution.resources_settled,
             required_effect_ids=tuple(self.harness.effects.states_for_command(command.command_id)),
             reason_code=execution.reason_code,
         )
