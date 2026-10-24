@@ -191,6 +191,7 @@ class _PreparedInput:
     generate_receipt: dict[str, Any]
     verifier: dict[str, Any]
     verifier_sha256: str
+    verifier_record_sha256: str
     closure_sha256: str
 
 
@@ -415,6 +416,7 @@ def _prepare(
         raise PipelineError("Verify contract or policy differs from the current verifier")
     verifier = _json_object(identity_provider(), "verifier identity")
     verifier_sha256 = current_verifier_sha256(verifier)
+    verifier_record_sha256 = digest(verifier)
     if verifier_sha256 != request.expected_verifier_sha256:
         raise PipelineError("Actual verifier differs from the requested Verify executor")
     closure = digest(
@@ -430,6 +432,7 @@ def _prepare(
         generate_receipt=receipt,
         verifier=verifier,
         verifier_sha256=verifier_sha256,
+        verifier_record_sha256=verifier_record_sha256,
         closure_sha256=closure,
     )
 
@@ -583,8 +586,8 @@ class VerifyHandler:
         )
         if current_closure != prepared.closure_sha256 or receipt_again != prepared.generate_receipt:
             raise PipelineError("Generate/Capture artifact pair changed during Verify")
-        final_verifier = digest(_json_object(self.identity_provider(), "verifier identity"))
-        if final_verifier != prepared.verifier_sha256:
+        final_verifier_record = _json_object(self.identity_provider(), "verifier identity")
+        if digest(final_verifier_record) != prepared.verifier_record_sha256:
             raise PipelineError("Verifier identity changed during Verify")
 
         certificate = _certificate(prepared, report)

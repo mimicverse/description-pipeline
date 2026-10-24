@@ -6,9 +6,17 @@ import copy
 import shutil
 import tempfile
 import unittest
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+
+try:
+    import pgserver
+    import psycopg2
+except ImportError:
+    pgserver = None
+    psycopg2 = None
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.interface_records import check_policy_digest
@@ -21,6 +29,12 @@ from description_pipeline.pipeline.contracts import (
     StageResult,
 )
 from description_pipeline.pipeline.engine import StageWorkspace
+from description_pipeline.pipeline import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_command,
+    execute_stage,
+)
+from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.stages.generate import (
     GENERATE_OUTPUT_CONTRACT,
     GENERATE_REQUEST_SCHEMA,
@@ -38,9 +52,13 @@ from description_pipeline.pipeline.verify import (
     validate_verification_certificate,
 )
 from description_pipeline.runtime import tool_record
-from description_pipeline.schemas import STAGE_RESULT_SCHEMA
+from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA, STAGE_RESULT_SCHEMA
 from description_pipeline.stages import CONTRACT_SHA256
+from description_pipeline.platform.facts import FactStore
 from tests.v1 import test_hermetic_six_stage as hermetic
+
+PG_AVAILABLE = pgserver is not None and psycopg2 is not None
+PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / "schema.sql"
 
 
 class PipelineVerifyHandlerTests(unittest.TestCase):
@@ -133,7 +151,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
     ) -> tuple[StageCommand, ExecutionClaim, StageWorkspace]:
         generate_ref = generate_ref or self.generate_ref
         verifier = hermetic._portable_tool()
-        verifier_sha256 = digest(verifier)
+        verifier_sha256 = verifier["source_sha256"]
         command = StageCommand.create(
             command_id="verify-command",
             run_id="verify-run",
@@ -221,6 +239,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertFalse(hasattr(first_execution, "required_effect_ids"))
         self.assertEqual(first_certificate["actual_verifier_sha256"], first[6].executor_sha256)
         self.assertNotEqual(first_certificate["actual_verifier_sha256"], first[6].owner_sha256)
+        self.assertEqual(first_certificate["actual_verifier"], hermetic._portable_tool())
+        self.assertEqual(first[3]["actual_verifier"], hermetic._portable_tool())
+        self.assertEqual(first[3]["actual_verifier_sha256"], first[6].executor_sha256)
         self.assertEqual(first_certificate, second_certificate)
         self.assertEqual(first[4], second[4])
         self.assertNotEqual(first_receipt["execution_id"], second_receipt["execution_id"])
@@ -232,6 +253,31 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertFalse((output / "model").exists())
         self.assertFalse((self.generate_root / "input").exists())
         self.assertFalse((self.generate_root / "evidence").exists())
+
+    def test_identity_provider_record_drift_is_rejected_after_source_match(self) -> None:
+        initial = hermetic._portable_tool()
+        cases = (
+            (
+                "source",
+                {**initial, "source_sha256": "0" * 64},
+            ),
+            (
+                "runtime",
+                {**initial, "release": {"schema_version": "drifted", "version": "9"}},
+            ),
+        )
+        for name, final in cases:
+            with self.subTest(name=name):
+                command, claim, workspace = self._verify_request()
+                records = iter((initial, final))
+                with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+                    VerifyHandler(identity_provider=lambda records=records: next(records)).execute(
+                        command,
+                        claim,
+                        workspace,
+                        effects=NoExternalEffects(),
+                    )
+                self.assertFalse((workspace.root / "output").exists())
 
     def test_validate_candidate_only_checks_runtime_identity(self) -> None:
         command, execution, certificate, _receipt, _bytes, _generate_ref, claim = self._run_verify()
@@ -397,6 +443,116 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertEqual(replayed, certificate)
         self.assertGreaterEqual(evaluator.call_count, 1)
         self.assertFalse(hasattr(pipeline_verify, "publish"))
+
+
+@unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
+class VerifyIdentityPostgresTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server_root = tempfile.TemporaryDirectory(prefix="verify-identity-postgres-")
+        cls.server = pgserver.get_server(
+            Path(cls.server_root.name) / "pgdata",
+            cleanup_mode="delete",
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.cleanup()
+        cls.server_root.cleanup()
+
+    def setUp(self) -> None:
+        self.fixture = PipelineVerifyHandlerTests(methodName="runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.schema = "verify_identity_" + uuid.uuid4().hex
+        schema_sql = PLATFORM_SCHEMA.read_text(encoding="utf-8").replace(
+            ':"platform_schema"',
+            f'"{self.schema}"',
+        )
+        with psycopg2.connect(self.server.get_uri()) as connection, connection.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{self.schema}"')
+            cursor.execute(schema_sql)
+            cursor.execute(f'UPDATE "{self.schema}".admission SET state = %s WHERE id = 1', ("open",))
+
+        self.identity = hermetic._portable_tool()
+        self.executor = self.identity["source_sha256"]
+        base_command, _claim, _workspace = self.fixture._verify_request()
+        spec = DiagnosticAdmissionSpec(
+            schema_version=DIAGNOSTIC_ADMISSION_SCHEMA,
+            run_id="verify-identity-run",
+            request_id="verify-identity-request",
+            target_stage="verify",
+            request=base_command.to_record()["request"],
+            input_artifacts=(self.fixture.generate_ref, self.fixture.capture_ref),
+            expected_executor_sha256=self.executor,
+            config_snapshot_sha256=base_command.config_snapshot_sha256,
+            contract_sha256=base_command.contract_sha256,
+            policy_sha256=base_command.policy_sha256,
+            created_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        self.command = build_diagnostic_command(spec)
+        self.facts = FactStore(self._connect, self.fixture.store)
+        self.facts.admit_diagnostic(spec, self.command)
+        self.services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.fixture.store,
+            work_root=self.fixture.root / "verify-identity-work",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": uuid.uuid4().hex}),
+                executor_sha256=self.executor,
+                lease=timedelta(minutes=5),
+                claim_id_factory=lambda: "verify-identity-" + uuid.uuid4().hex,
+            ),
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+
+    def _connect(self):
+        return psycopg2.connect(
+            self.server.get_uri(),
+            options=f"-c search_path={self.schema},public",
+        )
+
+    def _execute(self, provider):
+        return execute_stage(
+            command_id=self.command.command_id,
+            handler=VerifyHandler(
+                identity_provider=provider,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+            ),
+            services=self.services,
+        )
+
+    def test_constant_provider_preserves_source_executor_and_full_record(self) -> None:
+        result = self._execute(lambda: self.identity)
+        self.assertIsInstance(result, StageResult)
+        self.assertEqual(result.actual_executor_sha256, self.executor)
+        output = self.fixture.store.materialize(
+            result.output_artifact,
+            self.fixture.root / "verify-pg-output",
+        )
+        certificate = read_data(output / CERTIFICATE_FILENAME)
+        receipt = read_data(output / EXECUTION_RECEIPT_FILENAME)
+        for value in (certificate, receipt):
+            self.assertEqual(value["actual_verifier"], self.identity)
+            self.assertEqual(value["actual_verifier_sha256"], self.executor)
+        self.assertIsNotNone(self.facts.decision_for(self.command))
+
+    def test_source_drift_is_rejected_after_initial_source_match(self) -> None:
+        changed = {**self.identity, "source_sha256": "0" * 64}
+        records = iter((self.identity, changed))
+        with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+            self._execute(lambda: next(records))
+        self.assertIsNone(self.facts.decision_for(self.command))
+
+    def test_full_record_drift_with_same_source_is_rejected(self) -> None:
+        changed = {
+            **self.identity,
+            "release": {"schema_version": "drifted-runtime/v1", "version": "9"},
+        }
+        records = iter((self.identity, changed))
+        with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+            self._execute(lambda: next(records))
+        self.assertIsNone(self.facts.decision_for(self.command))
 
 
 if __name__ == "__main__":
