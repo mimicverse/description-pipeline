@@ -279,3 +279,74 @@ diagnostic scope 不改变任何 effect authorization、资源排他或受控目
 诊断公共层不绕过这些检查。当前证据使用同一 engine/effect port 下、只读完整导入 closure
 的本地 fixture handler；真实领域 handler 须由 owner 按 diagnostic scope 和真实输入语义
 修正后接入。raw legacy 迁移仍应是外部显式工具，不进入正常 runtime 分支。
+
+## Effect 只读对账入口
+
+`EffectReconciliationService` 是无 claim 的应用入口，只接受原 command id、原 effect key
+和只读
+`EffectReconciliationAdapter.observe(command, intent, outbound_root, workspace_root)`。
+它加载原 effect intent；`EffectSettlement.outbound_artifact` 由 `FactStore` 从既有 intent
+直接解析，服务验证并物化这一个固定封存 bundle，不保留第二份 outbound 缓存。
+
+Adapter 返回 `EffectReconciliationEvidence`，其中必须有完整 `payload_root`，或已有且
+验证通过的 `payload_artifact`，并可选独立 metadata。Publish 返回包含
+`observation.json` 和 `publication-plan.json` 的真实目录，Capture 返回
+`execution.json`、`native-tool.json` 和 `native-evidence.zip` 的真实目录。Service 不再
+生成 `reconciliation.json` wrapper；它逐字节封存该 payload，另封存
+`effect_reconciliation_metadata`，`EffectFact.payload_artifact_id` 直接指向领域证据。
+handler 从 settlement 物化后可直接按原有布局复用，无需重跑算法。
+
+领域 adapter 的最小形状：
+
+```python
+class PublishObserver:
+    def observe(self, *, command, intent, outbound_root, workspace_root):
+        response_root = workspace_root / "publish-evidence"
+        response_root.mkdir()
+        # GET the fixed original operation here; never POST/authorize/send.
+        (response_root / "observation.json").write_bytes(observation_bytes)
+        (response_root / "publication-plan.json").write_bytes(
+            (outbound_root / "publication-plan.json").read_bytes()
+        )
+        return EffectReconciliationEvidence(
+            fact_type="reconciled",
+            state_class="known",
+            payload_root=response_root,
+            metadata={"http_status": 200, "fixed_operation_id": intent.effect_id},
+        )
+```
+
+已有完整 payload 时改为返回
+`EffectReconciliationEvidence(..., payload_artifact=verified_ref)`；`payload_root` 与
+`payload_artifact` 必须且只能提供一个。Windows/Capture observer 使用同一形状，只把
+`payload_root` 内容设为 `execution.json`、`native-tool.json` 和
+`native-evidence.zip`。adapter 只收到 GET/材料化权限，不获得 effect authorize、send 或
+事实写入端口。
+
+```python
+reconciler = EffectReconciliationService(
+    facts=facts,
+    artifacts=artifacts,
+    work_root=private_reconcile_work_root,
+    observer_tool_sha256=observer_tool_sha256,
+    clock=clock,
+)
+result = reconciler.reconcile(
+    command_id=command_id,
+    effect_key=effect_key,
+    adapter=read_only_domain_adapter,
+)
+# Only after a known/absent reconciliation settles the exact effect may the
+# original execute_stage acquire its next claim.
+```
+
+`observation absent` 只记录当前不可见，仍保持 `unknown`；只有
+`reconciled absent` 可终结为 `definitely_failed`。`reconciled unobservable` 仍是
+`unknown`。lease 到期从不是终态，也不授权发送。append 事务会在写入前重新投影原 effect；
+若已被另一只读路径解析则拒绝第二份终态，保持 append-only 单权威。
+
+adapter、payload 校验、seal 或 fact append 任一失败时，service 保留完整
+service-owned workspace 并写 `reconciliation-failure.json`；
+`EffectReconciliationFailure.retained_workspace` 指向原始下载证据。只有 payload、
+metadata 和 fact 全部持久化后才清理 workspace。迟到的旧 claim response/timeout 仍可追加
+作为原始证据，但不会再覆盖已由 exact observation/reconciliation 建立的终态。

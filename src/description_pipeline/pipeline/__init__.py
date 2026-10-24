@@ -65,6 +65,13 @@ from .engine import StageHandler, StageServices, StageWorkspace, execute_stage
 from .discover import DiscoverDomainAdapter, DiscoverHandler
 from .capture import CaptureHandler
 from .freeze import FreezeHandler, FreezeRefusal
+from .reconciliation import (
+    EffectReconciliationAdapter,
+    EffectReconciliationEvidence,
+    EffectReconciliationFailure,
+    EffectReconciliationResult,
+    EffectReconciliationService,
+)
 from .diagnostic import (
     DiagnosticAdmissionSpec,
     build_diagnostic_command,
@@ -88,6 +95,11 @@ __all__ = [
     "DispatchResult",
     "EffectFact",
     "EffectIntent",
+    "EffectReconciliationAdapter",
+    "EffectReconciliationEvidence",
+    "EffectReconciliationFailure",
+    "EffectReconciliationResult",
+    "EffectReconciliationService",
     "EffectSettlement",
     "EffectState",
     "ExecutionClaim",

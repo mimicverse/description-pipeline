@@ -141,6 +141,16 @@ class EffectProjectionTests(unittest.TestCase):
         )
         self.assertEqual(project_effect_state(self.intent, facts), EffectState.UNKNOWN)
 
+    def test_late_response_and_timeout_do_not_downgrade_a_terminal_observation(self) -> None:
+        facts = (
+            self.fact(1, "dispatch_authorized"),
+            self.fact(2, "observation", state_class="known"),
+            self.fact(3, "response"),
+            self.fact(4, "timeout"),
+        )
+        settlement = project_effect_state(self.intent, facts)
+        self.assertEqual(settlement, EffectState.SATISFIED)
+
     def test_absent_observation_after_send_is_not_definite_failure(self) -> None:
         facts = (
             self.fact(1, "dispatch_authorized"),

@@ -38,6 +38,7 @@ class EffectSettlement:
     state: EffectState
     decisive_fact: EffectFact | None
     payload_artifact: ArtifactRef | None = None
+    outbound_artifact: ArtifactRef | None = None
 
 
 class StageEffectPort(Protocol):
@@ -312,6 +313,7 @@ class EffectFact:
     payload_artifact_id: str | None
     payload_digest: str
     observed_at: datetime
+    metadata_artifact_id: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.fact_id, "fact_id")
@@ -338,6 +340,8 @@ class EffectFact:
             raise ProtocolError("effect.invalid", {"where": "state_class", "reason": "resolution-only"})
         if self.payload_artifact_id is not None:
             _identifier(self.payload_artifact_id, "payload_artifact_id")
+        if self.metadata_artifact_id is not None:
+            _identifier(self.metadata_artifact_id, "metadata_artifact_id")
         if self.fact_type in {"observation", "reconciled"} and self.payload_artifact_id is None:
             raise ProtocolError("effect.invalid", {"where": "payload_artifact_id", "reason": "resolution-required"})
         _digest(self.payload_digest, "payload_digest")
@@ -364,16 +368,28 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
     ordered = tuple(sorted(facts, key=lambda fact: fact.seq))
     state = EffectState.PREPARED
     decisive: EffectFact | None = None
+    terminal = False
     for fact in ordered:
-        if fact.fact_type in {"dispatch_authorized", "response", "timeout"}:
+        if fact.fact_type == "dispatch_authorized":
             # Every later send attempt is potentially in flight until a newer
             # exact observation or reconciliation settles it.
+            state = EffectState.UNKNOWN
+            decisive = fact
+            terminal = False
+            continue
+        if fact.fact_type in {"response", "timeout"}:
+            # A delayed technical event from an already settled attempt remains
+            # append-only evidence, but it cannot downgrade a newer terminal
+            # observation for that attempt.
+            if terminal:
+                continue
             state = EffectState.UNKNOWN
             decisive = fact
             continue
         if fact.fact_type == "conflict":
             state = EffectState.CONFLICT
             decisive = fact
+            terminal = True
             continue
         if fact.fact_type == "observation":
             if fact.state_class in {"known", "unobservable"}:
@@ -384,6 +400,7 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
                 # absence terminal.
                 state = EffectState.UNKNOWN
             decisive = fact
+            terminal = state is EffectState.SATISFIED
             continue
         if fact.fact_type == "reconciled":
             if fact.state_class == "known":
@@ -393,6 +410,7 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
             else:
                 state = EffectState.UNKNOWN
             decisive = fact
+            terminal = state in {EffectState.SATISFIED, EffectState.DEFINITELY_FAILED}
             continue
         raise ProtocolError("effect.invalid", {"where": "fact_type", "value": fact.fact_type})
     return EffectSettlement(

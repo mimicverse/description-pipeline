@@ -295,6 +295,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".effect_fact (
     ),
     payload_artifact_id text REFERENCES :"platform_schema".artifact (artifact_id),
     payload_digest char(64) NOT NULL CHECK (payload_digest ~ '^[0-9a-f]{64}$'),
+    metadata_artifact_id text REFERENCES :"platform_schema".artifact (artifact_id),
     observed_at timestamptz NOT NULL,
     UNIQUE (effect_id, seq),
     CHECK (

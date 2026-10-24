@@ -176,6 +176,7 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIn("CHECK (owner_sha256 <> executor_sha256)", text)
         self.assertIn("UNIQUE (effect_id, seq)", text)
         self.assertIn("state_class IN ('known', 'absent', 'unobservable')", text)
+        self.assertIn("metadata_artifact_id text REFERENCES", text)
         candidate = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate', 1)[1]
         candidate = candidate.split(");", 1)[0]
         self.assertIn("command_id text NOT NULL UNIQUE", candidate)

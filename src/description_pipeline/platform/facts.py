@@ -966,7 +966,7 @@ class FactStore:
         cursor.execute(
             """
             SELECT fact_id, effect_id, seq, claim_id, fence, fact_type, source,
-                   state_class, payload_artifact_id, payload_digest, observed_at
+                   state_class, payload_artifact_id, payload_digest, metadata_artifact_id, observed_at
             FROM effect_fact
             WHERE effect_id = %s
             ORDER BY seq
@@ -986,7 +986,8 @@ class FactStore:
                 state_class=item[7],
                 payload_artifact_id=item[8],
                 payload_digest=item[9],
-                observed_at=item[10],
+                metadata_artifact_id=item[10],
+                observed_at=item[11],
             )
             for item in cursor.fetchall()
         )
@@ -1011,10 +1012,15 @@ class FactStore:
         if expected_command_id is not None and intent.command_id != expected_command_id:
             raise FactConflict("The effect names another command")
         settlement = project_effect_settlement(intent, facts)
+        outbound_artifact = self._artifact_cursor(cursor, intent.outbound_artifact_id)
         artifact_id = settlement.decisive_fact.payload_artifact_id if settlement.decisive_fact else None
         if artifact_id is None:
-            return settlement
-        return replace(settlement, payload_artifact=self._artifact_cursor(cursor, artifact_id))
+            return replace(settlement, outbound_artifact=outbound_artifact)
+        return replace(
+            settlement,
+            payload_artifact=self._artifact_cursor(cursor, artifact_id),
+            outbound_artifact=outbound_artifact,
+        )
 
     def effect_settlement(self, effect_id: str, *, expected_command_id: str | None = None) -> EffectSettlement:
         with self._transaction() as connection:
@@ -1040,6 +1046,26 @@ class FactStore:
             if row is None:
                 return None
             return self._effect_settlement_cursor(cursor, row[0], expected_command_id=command_id)
+
+    def effect_intent_for_key(self, command_id: str, effect_key: str) -> EffectIntent | None:
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT effect_id
+                FROM effect_intent
+                WHERE command_id = %s AND effect_key = %s
+                FOR UPDATE
+                """,
+                (command_id, effect_key),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            intent, _ = self._effect_cursor(cursor, row[0], lock=True)
+            if intent.command_id != command_id:
+                raise FactConflict("The effect names another command")
+            return intent
 
     def _effect_states_for_command_cursor(
         self,
@@ -1091,6 +1117,7 @@ class FactStore:
         observed_at: datetime,
         fact_id: str,
         expected_command_id: str | None = None,
+        metadata_artifact: ArtifactRef | None = None,
     ) -> EffectFact:
         stored = None
         if claim is not None:
@@ -1140,6 +1167,8 @@ class FactStore:
                 raise FactConflict("The response/timeout has no matching dispatch authorization")
         if payload_artifact is not None:
             self._insert_artifact(cursor, payload_artifact)
+        if metadata_artifact is not None:
+            self._insert_artifact(cursor, metadata_artifact)
         cursor.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM effect_fact WHERE effect_id = %s",
             (effect_id,),
@@ -1157,13 +1186,14 @@ class FactStore:
             payload_artifact_id=None if payload_artifact is None else payload_artifact.artifact_id,
             payload_digest=payload_digest,
             observed_at=observed_at,
+            metadata_artifact_id=None if metadata_artifact is None else metadata_artifact.artifact_id,
         )
         cursor.execute(
             """
             INSERT INTO effect_fact (
                 fact_id, effect_id, seq, claim_id, fence, fact_type, source,
-                state_class, payload_artifact_id, payload_digest, observed_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                state_class, payload_artifact_id, payload_digest, metadata_artifact_id, observed_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 fact.fact_id,
@@ -1176,6 +1206,7 @@ class FactStore:
                 fact.state_class,
                 fact.payload_artifact_id,
                 fact.payload_digest,
+                fact.metadata_artifact_id,
                 fact.observed_at,
             ),
         )
@@ -1350,6 +1381,7 @@ class FactStore:
         observed_at: datetime,
         fact_id: str,
         expected_command_id: str | None = None,
+        metadata_artifact: ArtifactRef | None = None,
     ) -> EffectFact:
         with self._transaction() as connection:
             return self._append_effect_fact_cursor(
@@ -1364,6 +1396,48 @@ class FactStore:
                 observed_at=observed_at,
                 fact_id=fact_id,
                 expected_command_id=expected_command_id,
+                metadata_artifact=metadata_artifact,
+            )
+
+    def append_reconciliation_fact(
+        self,
+        *,
+        effect_id: str,
+        fact_type: str,
+        source: str,
+        state_class: str,
+        payload_artifact: ArtifactRef,
+        metadata_artifact: ArtifactRef,
+        payload_digest: str,
+        observed_at: datetime,
+        fact_id: str,
+        expected_command_id: str,
+    ) -> EffectFact:
+        """Append read-only reconciliation evidence without granting a claim."""
+
+        if fact_type not in {"observation", "reconciled"}:
+            raise FactStoreError("A reconciliation fact must be observation or reconciled")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            intent, facts = self._effect_cursor(cursor, effect_id, lock=True)
+            if intent.command_id != expected_command_id:
+                raise FactConflict("The reconciliation effect names another command")
+            state = project_effect_state(intent, facts)
+            if state is not EffectState.UNKNOWN:
+                raise FactConflict(f"The effect is {state.value}; read-only reconciliation is not applicable")
+            return self._append_effect_fact_cursor(
+                cursor,
+                effect_id=effect_id,
+                claim=None,
+                fact_type=fact_type,
+                source=source,
+                state_class=state_class,
+                payload_artifact=payload_artifact,
+                payload_digest=payload_digest,
+                observed_at=observed_at,
+                fact_id=fact_id,
+                expected_command_id=expected_command_id,
+                metadata_artifact=metadata_artifact,
             )
 
     def register_candidate(
