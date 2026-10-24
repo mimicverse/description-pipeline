@@ -1553,27 +1553,46 @@ class FactStore:
 
     def close_open_claim(
         self,
-        command_id: str,
+        claim: ExecutionClaim,
         *,
         closure_code: str,
         closed_at: datetime,
     ) -> None:
+        if not isinstance(claim, ExecutionClaim):
+            raise FactStoreError("A canonical execution claim is required for closure")
         if closure_code not in {"completed", "definite_failure"}:
             raise FactStoreError("A technical command closes only as completed or definite_failure")
         if not isinstance(closed_at, datetime) or closed_at.tzinfo is None:
             raise FactStoreError("Claim closure time must be timezone-aware")
         with self._transaction() as connection:
             cursor = connection.cursor()
+            self._verify_open_claim_cursor(cursor, claim)
             cursor.execute(
                 """
                 UPDATE execution_claim
                 SET closed_at = %s, closure_code = %s, last_seen_at = %s
-                WHERE command_id = %s AND closed_at IS NULL
+                WHERE claim_id = %s
+                  AND command_id = %s
+                  AND fence = %s
+                  AND owner_sha256 = %s
+                  AND executor_sha256 = %s
+                  AND closed_at IS NULL
                 RETURNING claim_id
                 """,
-                (closed_at, closure_code, closed_at, command_id),
+                (
+                    closed_at,
+                    closure_code,
+                    closed_at,
+                    claim.claim_id,
+                    claim.command_id,
+                    claim.fence,
+                    claim.owner_sha256,
+                    claim.executor_sha256,
+                ),
             )
-            cursor.fetchall()
+            closed_rows = cursor.fetchall()
+            if len(closed_rows) != 1:
+                raise FactConflict("The execution claim changed before closure")
 
     def append_effect_fact(
         self,

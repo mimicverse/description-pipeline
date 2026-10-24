@@ -113,122 +113,62 @@ class CancellationControlService:
 
         claim = self.services.acquire_claim(cancel_command)
         workspace = self.services.materialize(cancel_command, claim, candidate=None)
-        retained = False
-        try:
-            effects = self.services.effect_port(cancel_command, claim, workspace)
-            outbound = workspace.root / "cancel-request"
-            outbound.mkdir()
-            write_json(
-                outbound / "request.json",
-                {
-                    "cancel_request": request.to_record(),
-                    "schema_version": "description-pipeline.operation-cancel-effect/v1",
-                    "target_command": target_command.to_record(),
-                    "target_effect": target_effect.identity_record(),
-                },
-            )
-            expected_state = {
+        effects = self.services.effect_port(cancel_command, claim, workspace)
+        outbound = workspace.root / "cancel-request"
+        outbound.mkdir()
+        write_json(
+            outbound / "request.json",
+            {
+                "cancel_request": request.to_record(),
                 "schema_version": "description-pipeline.operation-cancel-effect/v1",
-                "cancel_request_accepted": True,
+                "target_command": target_command.to_record(),
+                "target_effect": target_effect.identity_record(),
+            },
+        )
+        expected_state = {
+            "schema_version": "description-pipeline.operation-cancel-effect/v1",
+            "cancel_request_accepted": True,
+            "target_command_id": target_command.command_id,
+            "target_effect_id": target_effect.effect_id,
+            "target_effect_digest": target_effect.identity_digest,
+        }
+        intent = effects.prepare_effect(
+            effect_key=effect_key,
+            effect_kind="native_operation",
+            target={
+                "operation": "cancel",
                 "target_command_id": target_command.command_id,
                 "target_effect_id": target_effect.effect_id,
-                "target_effect_digest": target_effect.identity_digest,
-            }
-            intent = effects.prepare_effect(
-                effect_key=effect_key,
-                effect_kind="native_operation",
-                target={
-                    "operation": "cancel",
-                    "target_command_id": target_command.command_id,
-                    "target_effect_id": target_effect.effect_id,
-                },
-                expected_state=expected_state,
-                outbound_root=outbound,
+            },
+            expected_state=expected_state,
+            outbound_root=outbound,
+        )
+        effects.authorize_dispatch(intent.effect_id, source="operation-cancel")
+        try:
+            response = self.adapter.send(
+                cancel_command,
+                target_command,
+                target_effect,
+                request,
             )
-            effects.authorize_dispatch(intent.effect_id, source="operation-cancel")
-            try:
-                response = self.adapter.send(
-                    cancel_command,
-                    target_command,
-                    target_effect,
-                    request,
-                )
-            except Exception as error:
-                response_root = workspace.root / "cancel-timeout"
-                response_root.mkdir()
-                write_json(
-                    response_root / "error.json",
-                    {
-                        "error_message": str(error)[:4096],
-                        "error_type": type(error).__name__,
-                    },
-                )
-                effects.record_timeout(
-                    intent.effect_id,
-                    source="operation-cancel",
-                    detail_root=response_root,
-                )
-                retained = True
-                settlement = self.facts.effect_settlement(
-                    intent.effect_id,
-                    expected_command_id=cancel_command.command_id,
-                )
-                return CancellationControlResult(
-                    cancel_command_id=cancel_command.command_id,
-                    target_command_id=target_command.command_id,
-                    target_effect_id=target_effect.effect_id,
-                    cancel_effect_id=intent.effect_id,
-                    target_effect_state=target_state,
-                    cancel_effect_state=settlement.state,
-                    sent=True,
-                    retained_workspace=str(workspace.root),
-                )
-            if not isinstance(response, Mapping):
-                raise ProtocolError("cancel.response_invalid", {"command_id": cancel_command.command_id})
-            response_root = workspace.root / "cancel-response"
+        except Exception as error:
+            response_root = workspace.root / "cancel-timeout"
             response_root.mkdir()
-            write_json(response_root / "response.json", dict(response))
-            effects.record_response(
+            write_json(
+                response_root / "error.json",
+                {
+                    "error_message": str(error)[:4096],
+                    "error_type": type(error).__name__,
+                },
+            )
+            effects.record_timeout(
                 intent.effect_id,
                 source="operation-cancel",
-                response_root=response_root,
-            )
-            accepted = (
-                response.get("accepted") is True
-                and response.get("cancel_command_id") == cancel_command.command_id
-                and response.get("target_effect_id") == target_effect.effect_id
-            )
-            effects.record_observation(
-                intent.effect_id,
-                source="operation-cancel",
-                state_class="known" if accepted else "unobservable",
-                observation_root=response_root,
+                detail_root=response_root,
             )
             settlement = self.facts.effect_settlement(
                 intent.effect_id,
                 expected_command_id=cancel_command.command_id,
-            )
-            if settlement.state is EffectState.UNKNOWN:
-                retained = True
-                return CancellationControlResult(
-                    cancel_command_id=cancel_command.command_id,
-                    target_command_id=target_command.command_id,
-                    target_effect_id=target_effect.effect_id,
-                    cancel_effect_id=intent.effect_id,
-                    target_effect_state=target_state,
-                    cancel_effect_state=settlement.state,
-                    sent=True,
-                    retained_workspace=str(workspace.root),
-                )
-            if settlement.state is not EffectState.SATISFIED:
-                raise ProtocolError(
-                    "cancel.response_unresolved",
-                    {"command_id": cancel_command.command_id, "state": settlement.state.value},
-                )
-            self.facts.close_open_claim(
-                cancel_command.command_id,
-                closure_code="completed",
-                closed_at=self._now(),
             )
             return CancellationControlResult(
                 cancel_command_id=cancel_command.command_id,
@@ -238,11 +178,87 @@ class CancellationControlService:
                 target_effect_state=target_state,
                 cancel_effect_state=settlement.state,
                 sent=True,
-                retained_workspace=None,
+                retained_workspace=str(workspace.root),
             )
-        finally:
-            if not retained:
-                self.services.discard_workspace(workspace)
+        if not isinstance(response, Mapping):
+            raw_root = workspace.root / "cancel-raw-response"
+            raw_root.mkdir()
+            if isinstance(response, (bytes, bytearray, memoryview)):
+                (raw_root / "response.bin").write_bytes(bytes(response))
+            else:
+                write_json(
+                    raw_root / "response.json",
+                    {
+                        "representation": repr(response)[:1_048_576],
+                        "type": type(response).__name__,
+                    },
+                )
+            raise ProtocolError("cancel.response_invalid", {"command_id": cancel_command.command_id})
+        response_root = workspace.root / "cancel-response"
+        response_root.mkdir()
+        try:
+            write_json(response_root / "response.json", dict(response))
+        except Exception:
+            write_json(
+                response_root / "response.repr.json",
+                {
+                    "representation": repr(response)[:1_048_576],
+                    "type": type(response).__name__,
+                },
+            )
+            raise
+        effects.record_response(
+            intent.effect_id,
+            source="operation-cancel",
+            response_root=response_root,
+        )
+        accepted = (
+            response.get("accepted") is True
+            and response.get("cancel_command_id") == cancel_command.command_id
+            and response.get("target_effect_id") == target_effect.effect_id
+        )
+        effects.record_observation(
+            intent.effect_id,
+            source="operation-cancel",
+            state_class="known" if accepted else "unobservable",
+            observation_root=response_root,
+        )
+        settlement = self.facts.effect_settlement(
+            intent.effect_id,
+            expected_command_id=cancel_command.command_id,
+        )
+        if settlement.state is EffectState.UNKNOWN:
+            return CancellationControlResult(
+                cancel_command_id=cancel_command.command_id,
+                target_command_id=target_command.command_id,
+                target_effect_id=target_effect.effect_id,
+                cancel_effect_id=intent.effect_id,
+                target_effect_state=target_state,
+                cancel_effect_state=settlement.state,
+                sent=True,
+                retained_workspace=str(workspace.root),
+            )
+        if settlement.state is not EffectState.SATISFIED:
+            raise ProtocolError(
+                "cancel.response_unresolved",
+                {"command_id": cancel_command.command_id, "state": settlement.state.value},
+            )
+        self.facts.close_open_claim(
+            claim,
+            closure_code="completed",
+            closed_at=self._now(),
+        )
+        self.services.discard_workspace(workspace)
+        return CancellationControlResult(
+            cancel_command_id=cancel_command.command_id,
+            target_command_id=target_command.command_id,
+            target_effect_id=target_effect.effect_id,
+            cancel_effect_id=intent.effect_id,
+            target_effect_state=target_state,
+            cancel_effect_state=settlement.state,
+            sent=True,
+            retained_workspace=None,
+        )
 
     def _now(self) -> datetime:
         value = self.clock()

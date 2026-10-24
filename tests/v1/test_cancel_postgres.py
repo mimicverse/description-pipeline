@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 try:
     import pgserver
@@ -210,6 +212,40 @@ class CancellationPostgresTests(unittest.TestCase):
             requested_at=self.now + timedelta(seconds=1) if requested_at is None else requested_at,
         )
 
+    def _unknown_target(self, suffix: str):
+        services = self._services(suffix)
+        claim = services.acquire_claim(self.command)
+        workspace = services.materialize(self.command, claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(self.command, claim, workspace)
+        outbound = workspace.root / "outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text('{"effect":"native"}\n', encoding="utf-8")
+        intent = effects.prepare_effect(
+            effect_key="native",
+            effect_kind="native_operation",
+            target={"endpoint": "loopback"},
+            expected_state={"state": "created"},
+            outbound_root=outbound,
+        )
+        effects.authorize_dispatch(intent.effect_id, source="executor")
+        return self._request_cancel(), intent
+
+    def _cancellation_control(self, suffix: str, adapter):
+        work_root = Path(self.directory.name) / f"cancel-control-{suffix}"
+        return CancellationControlService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=work_root,
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": f"cancel-control-{suffix}"}),
+                executor_sha256=self.cancel_executor,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now + timedelta(minutes=1),
+            adapter=adapter,
+        )
+
     def test_pre_send_cancel_is_idempotent_and_only_the_original_executor_decides(self) -> None:
         first = self._request_cancel()
         second = self._request_cancel(requested_at=self.now + timedelta(minutes=3))
@@ -394,7 +430,7 @@ class CancellationPostgresTests(unittest.TestCase):
             expected_command_id=self.command.command_id,
         )
         self.facts.close_open_claim(
-            self.command.command_id,
+            claim,
             closure_code="definite_failure",
             closed_at=self.now + timedelta(minutes=2),
         )
@@ -408,6 +444,82 @@ class CancellationPostgresTests(unittest.TestCase):
         self.assertEqual(
             self.facts.effect_state(intent.effect_id),
             EffectState.DEFINITELY_FAILED,
+        )
+
+    def test_cancel_control_preserves_raw_response_when_adapter_returns_non_mapping(self) -> None:
+        cancel_command, target_effect = self._unknown_target("raw-response")
+        adapter = mock.Mock()
+        adapter.send.return_value = b"\x00native-cancel-response\xff"
+        control = self._cancellation_control("raw-response", adapter)
+        with self.assertRaisesRegex(ProtocolError, "cancel.response_invalid"):
+            control.send(
+                cancel_command_id=cancel_command.command_id,
+                target_effect_id=target_effect.effect_id,
+            )
+        retained = control.services.work_root / cancel_command.command_id
+        raw = next(retained.glob("*/cancel-raw-response/response.bin"))
+        self.assertEqual(raw.read_bytes(), b"\x00native-cancel-response\xff")
+        self.assertEqual(self.facts.effect_state(target_effect.effect_id), EffectState.UNKNOWN)
+
+    def test_cancel_control_preserves_mapping_when_response_sealing_fails(self) -> None:
+        cancel_command, target_effect = self._unknown_target("seal-failure")
+        adapter = _CancelAdapter()
+        control = self._cancellation_control("seal-failure", adapter)
+        real_seal_tree = self.artifacts.seal_tree
+
+        def seal_tree(source, **kwargs):
+            if kwargs["kind"] == "effect_response":
+                raise OSError("controlled cancel response seal failure")
+            return real_seal_tree(source, **kwargs)
+
+        with (
+            mock.patch.object(self.artifacts, "seal_tree", side_effect=seal_tree),
+            self.assertRaisesRegex(OSError, "controlled cancel response seal failure"),
+        ):
+            control.send(
+                cancel_command_id=cancel_command.command_id,
+                target_effect_id=target_effect.effect_id,
+            )
+        retained = control.services.work_root / cancel_command.command_id
+        response = next(retained.glob("*/cancel-response/response.json"))
+        self.assertEqual(
+            json.loads(response.read_text(encoding="utf-8")),
+            {
+                "accepted": True,
+                "cancel_command_id": cancel_command.command_id,
+                "target_effect_id": target_effect.effect_id,
+            },
+        )
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(self.facts.effect_state(target_effect.effect_id), EffectState.UNKNOWN)
+
+    def test_old_expired_claim_cannot_close_the_new_fenced_owner(self) -> None:
+        old_claim = self._services("old-owner").acquire_claim(self.command)
+        new_services = self._services("new-owner", now=self.now + timedelta(minutes=6))
+        new_claim = new_services.acquire_claim(self.command)
+        self.assertGreater(new_claim.fence, old_claim.fence)
+        with self.assertRaisesRegex(FactConflict, "already closed"):
+            self.facts.close_open_claim(
+                old_claim,
+                closure_code="completed",
+                closed_at=self.now + timedelta(minutes=7),
+            )
+        rows = self._query(
+            "SELECT claim_id, fence, closed_at IS NULL "
+            "FROM execution_claim WHERE command_id = %s ORDER BY fence",
+            (self.command.command_id,),
+        )
+        self.assertEqual(
+            rows,
+            [
+                (old_claim.claim_id, old_claim.fence, False),
+                (new_claim.claim_id, new_claim.fence, True),
+            ],
+        )
+        self.facts.close_open_claim(
+            new_claim,
+            closure_code="completed",
+            closed_at=self.now + timedelta(minutes=7),
         )
 
     def test_satisfied_effect_is_preserved_in_a_cancelled_envelope(self) -> None:
@@ -438,7 +550,7 @@ class CancellationPostgresTests(unittest.TestCase):
         )
         self._request_cancel()
         self.facts.close_open_claim(
-            self.command.command_id,
+            claim,
             closure_code="completed",
             closed_at=self.now + timedelta(seconds=2),
         )
@@ -543,7 +655,7 @@ class CancellationPostgresTests(unittest.TestCase):
                 decided_at=self.now + timedelta(seconds=2),
             )
         self.facts.close_open_claim(
-            self.command.command_id,
+            claim,
             closure_code="completed",
             closed_at=self.now + timedelta(seconds=3),
         )

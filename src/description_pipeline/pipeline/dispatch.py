@@ -247,15 +247,15 @@ class TechnicalDispatchService:
             settlement.effect_id,
             expected_command_id=command.command_id,
         )
-        if final.state is EffectState.SATISFIED:
+        if claim is not None and final.state is EffectState.SATISFIED:
             self.facts.close_open_claim(
-                command.command_id,
+                claim,
                 closure_code="completed",
                 closed_at=self._now(),
             )
-        elif final.state is EffectState.DEFINITELY_FAILED:
+        elif claim is not None and final.state is EffectState.DEFINITELY_FAILED:
             self.facts.close_open_claim(
-                command.command_id,
+                claim,
                 closure_code="definite_failure",
                 closed_at=self._now(),
             )
