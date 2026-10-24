@@ -23,6 +23,7 @@ from description_pipeline.pipeline.contracts import (
 )
 from description_pipeline.pipeline.engine import StageWorkspace
 from description_pipeline.runtime import tool_record
+from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 from description_pipeline.pipeline.stages.generate import (
     CAPTURE_ARTIFACT_KIND,
     GENERATE_OUTPUT_CONTRACT,
@@ -149,7 +150,7 @@ class GenerateHandlerTests(unittest.TestCase):
 
     def _candidate(self, output_artifact, *, checks_sha256: str) -> StageCandidate:
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=self.command.command_id,
             run_id=self.command.run_id,
             stage="generate",

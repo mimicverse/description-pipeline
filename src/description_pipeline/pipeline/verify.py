@@ -24,6 +24,7 @@ from ..interface_records import (
 from ..io import PipelineError, canonical, digest, file_digest, inventory, read_data, write_json
 from ..request_evidence import read_request_evidence
 from ..runtime import tool_record
+from ..schemas import GENERATE_RESULT_SCHEMA
 from ..stages import CONTRACT, CONTRACT_SHA256
 from ..verification.solidworks_urdf import (
     evaluate_bundle,
@@ -283,7 +284,7 @@ def _generate_receipt(
     if not isinstance(receipt, dict) or set(receipt) != expected:
         raise PipelineError("Generate receipt fields are incomplete or unknown")
     if (
-        receipt.get("schema_version") != "description-pipeline.generate-result/v1"
+        receipt.get("schema_version") != GENERATE_RESULT_SCHEMA
         or receipt.get("output_contract") != "solidworks-to-urdf.generated-artifact/v1"
     ):
         raise PipelineError("Generate receipt uses an unknown contract")

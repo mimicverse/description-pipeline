@@ -13,6 +13,7 @@ from typing import Any
 from ..interface_records import REQUEST_PURPOSES
 from ..io import PipelineError, artifact_path_parts, digest, parse_data
 from ..repository.publish import CommitSpec
+from ..schemas import ADMISSION_SPEC_SCHEMA, ARTIFACT_MANIFEST_SCHEMA, DISCOVER_RESULT_SCHEMA, GENERATE_REQUEST_SCHEMA
 from .contracts import (
     ArtifactRef,
     ProtocolError,
@@ -46,11 +47,8 @@ from .verify_contract import (
     REQUEST_SCHEMA as VERIFY_REQUEST_SCHEMA,
 )
 
-ADMISSION_SPEC_SCHEMA = "description-pipeline.admission-spec/v2"
-ARTIFACT_MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
-GENERATE_REQUEST_SCHEMA = "description-pipeline.generate-request/v1"
 GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
 SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -587,7 +585,7 @@ class VerifiedDiscoverResult:
         if not isinstance(record, Mapping) or not required <= set(record):
             raise ProtocolError("admission.discover_result_invalid", {"where": "record"})
         if (
-            record["schema_version"] != "description-pipeline.discover-result/v1"
+            record["schema_version"] != DISCOVER_RESULT_SCHEMA
             or record["command_id"] != predecessor.command.command_id
             or record["run_id"] != predecessor.result.run_id
             or record["request_digest"] != predecessor.command.request_digest

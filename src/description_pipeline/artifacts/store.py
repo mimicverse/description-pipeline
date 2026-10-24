@@ -10,9 +10,10 @@ from pathlib import Path, PurePosixPath
 
 from ..io import PipelineError, canonical, digest, file_digest, read_data
 from ..pipeline.contracts import ArtifactRef, DispatchConf, StageId, StageResult
+from ..schemas import ARTIFACT_MANIFEST_SCHEMA
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
+MANIFEST_SCHEMA = ARTIFACT_MANIFEST_SCHEMA
 LOCATOR_PREFIX = "cas://artifact/"
 
 

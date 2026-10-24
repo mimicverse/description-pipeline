@@ -7,8 +7,8 @@ from ..repository.publish import (
     REPOSITORY_SNAPSHOT_METADATA,
     REPOSITORY_SNAPSHOT_SCHEMA,
 )
+from ..schemas import PUBLISH_REQUEST_SCHEMA
 
-PUBLISH_REQUEST_SCHEMA = "description-pipeline.publish-request/v1"
 PUBLISH_OUTPUT_CONTRACT = "solidworks-to-urdf.publication-artifact/v1"
 REPOSITORY_SNAPSHOT_KIND = "repository_snapshot"
 

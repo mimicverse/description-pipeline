@@ -61,6 +61,13 @@ from description_pipeline.pipeline.publish_contract import (
     REPOSITORY_SNAPSHOT_SCHEMA,
 )
 from description_pipeline.repository.publish import CommitSpec
+from description_pipeline.schemas import (
+    DISCOVER_RESULT_SCHEMA,
+    GENERATE_REQUEST_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+    VERIFICATION_CERTIFICATE_SCHEMA,
+    VERIFY_REQUEST_SCHEMA,
+)
 from description_pipeline.pipeline.verify_contract import (
     CERTIFICATE_FILENAME,
     EXECUTION_RECEIPT_FILENAME,
@@ -233,7 +240,7 @@ class AdmissionHarness:
             producer_tool_sha256=self.spec.executors.for_stage(stage),
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=command.command_id,
             run_id=self.spec.run_id,
             stage=stage,
@@ -431,7 +438,7 @@ class AdmissionProjectionTests(unittest.TestCase):
         freeze = self.harness.freeze_result(self.command)
         discover_command = build_discover_command(self.harness.spec, freeze)
         discover_payload = {
-            "schema_version": "description-pipeline.discover-result/v1",
+            "schema_version": DISCOVER_RESULT_SCHEMA,
             "command_id": discover_command.command_id,
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
@@ -526,7 +533,7 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(
             generate_command.request,
             {
-                "schema_version": "description-pipeline.generate-request/v1",
+                "schema_version": GENERATE_REQUEST_SCHEMA,
                 "capture_artifact_id": capture.result.output_artifact.artifact_id,
                 "output_contract": "solidworks-to-urdf.generated-artifact/v1",
             },
@@ -683,7 +690,7 @@ class AdmissionProjectionTests(unittest.TestCase):
         freeze = self.harness.freeze_result(self.command)
         discover_command = build_discover_command(self.harness.spec, freeze)
         discover_payload = {
-            "schema_version": "description-pipeline.discover-result/v1",
+            "schema_version": DISCOVER_RESULT_SCHEMA,
             "command_id": discover_command.command_id,
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
@@ -719,7 +726,7 @@ class AdmissionProjectionTests(unittest.TestCase):
         freeze = self.harness.freeze_result(self.command)
         discover_command = build_discover_command(self.harness.spec, freeze)
         discover_payload = {
-            "schema_version": "description-pipeline.discover-result/v1",
+            "schema_version": DISCOVER_RESULT_SCHEMA,
             "command_id": discover_command.command_id,
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
@@ -756,7 +763,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "output_contract": "solidworks-to-urdf.verification-artifact/v1",
             "policy_sha256": self.harness.spec.policy_sha256,
             "purpose": self.harness.spec.purpose,
-            "schema_version": "description-pipeline.verify-request/v1",
+            "schema_version": VERIFY_REQUEST_SCHEMA,
         }
         certificate = {
             "actual_verifier": {"executor": "verify"},
@@ -771,7 +778,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "purpose": self.harness.spec.purpose,
             "request": verify_request,
             "request_sha256": digest(verify_request),
-            "schema_version": "description-pipeline.verification-certificate/v1",
+            "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
             "subject_sha256": generate.result.output_artifact.set_sha256,
         }
         certificate["verification_key"] = digest(certificate)

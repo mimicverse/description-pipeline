@@ -37,6 +37,7 @@ from .discover import (
 from ..sources.solidworks.discovery import DISCOVERY_FILE, native_component_identity
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import selection_bindings
+from ..schemas import CAPTURE_EFFECT_FAILURE_SCHEMA, NATIVE_CAPTURE_EFFECT_SCHEMA
 from ..stages import stage_view
 from .contracts import (
     ArtifactRef,
@@ -833,7 +834,7 @@ class CaptureHandler:
             "object_set_sha256": digest(list(inputs.object_names)),
             "prepared_sha256": request.prepared_sha256,
             "request_digest": command.request_digest,
-            "schema_version": "description-pipeline.native-capture-effect/v1",
+            "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
         }
         outbound_root.mkdir(parents=True, exist_ok=False)
         write_json(outbound_root / "outbound.json", outbound)
@@ -938,7 +939,7 @@ class CaptureHandler:
         payload = {
             "effect_id": settlement.effect_id,
             "reason_code": reason_code,
-            "schema_version": "description-pipeline.capture-effect-failure/v1",
+            "schema_version": CAPTURE_EFFECT_FAILURE_SCHEMA,
             "state": settlement.state.value,
         }
         write_json(root / "failure.json", payload)

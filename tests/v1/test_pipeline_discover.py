@@ -42,6 +42,12 @@ from description_pipeline.pipeline.discover import (
     DiscoverHandler,
 )
 from description_pipeline.pipeline.effects import EffectSettlement, EffectState
+from description_pipeline.schemas import (
+    NATIVE_DISCOVER_EFFECT_SCHEMA,
+    NATIVE_DISCOVER_REQUEST_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+    TOOL_SCHEMA,
+)
 from description_pipeline.sources.solidworks.discover_stage import (
     NativeDiscoverRefusal,
     NativeDiscoverRequest,
@@ -59,7 +65,7 @@ SELECTED_EDGES = {
 }
 TOOL_SHA256 = "ab" * 32
 NATIVE_TOOL = {
-    "schema_version": "solidworks-to-urdf.tool/v1",
+    "schema_version": TOOL_SCHEMA,
     "pipeline_id": "fixture",
     "source_sha256": TOOL_SHA256,
     "runtime": {"role": "native"},
@@ -399,7 +405,7 @@ class DiscoverHarness:
     def native_request(self, command, *, request=None) -> NativeDiscoverRequest:
         value = self.request() if request is None else request
         return NativeDiscoverRequest(
-            schema_version="description-pipeline.native-discover-request/v1",
+            schema_version=NATIVE_DISCOVER_REQUEST_SCHEMA,
             operation_id=command.command_id,
             command_id=command.command_id,
             run_id=command.run_id,
@@ -527,7 +533,7 @@ class DiscoverDomainTests(unittest.TestCase):
                 "native_tool_sha256": TOOL_SHA256,
             },
             expected_state={
-                "schema_version": "description-pipeline.native-discover-effect/v1",
+                "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
                 "operation_id": self.command.command_id,
                 "request_digest": self.command.request_digest,
                 "source_inventory_sha256": digest(self.harness.source_files),
@@ -732,7 +738,7 @@ class _Services:
             producer_tool_sha256=command.expected_executor_sha256,
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=command.command_id,
             run_id=command.run_id,
             stage="discover",

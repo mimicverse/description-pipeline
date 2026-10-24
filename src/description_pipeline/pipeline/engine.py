@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ..io import canonical
+from ..schemas import UNHANDLED_STAGE_FAILURE_SCHEMA
 from .contracts import (
     ExecutionClaim,
     FailureEnvelope,
@@ -276,7 +277,7 @@ def execute_stage(
             stream.write(
                 canonical(
                     {
-                        "schema_version": "description-pipeline.unhandled-stage-failure/v1",
+                        "schema_version": UNHANDLED_STAGE_FAILURE_SCHEMA,
                         "command_id": command.command_id,
                         "run_id": command.run_id,
                         "stage": command.stage,

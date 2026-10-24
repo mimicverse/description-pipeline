@@ -12,6 +12,15 @@ from typing import Any, Protocol
 from ..interface_records import REQUEST_PURPOSES
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
 from ..orchestration.discover_protocol import SOURCE_ARCHIVE, seal_source_archive
+from ..schemas import (
+    ARTIFACT_MANIFEST_SCHEMA,
+    DISCOVER_CHECKS_SCHEMA,
+    DISCOVER_REQUEST_SCHEMA,
+    DISCOVER_RESULT_SCHEMA,
+    NATIVE_DISCOVER_EFFECT_SCHEMA,
+    NATIVE_DISCOVER_REQUEST_SCHEMA,
+    RULESET_CATALOG_SCHEMA,
+)
 from ..sources.solidworks.discover_stage import (
     NativeDiscoverRefusal,
     NativeDiscoverRequest,
@@ -37,12 +46,6 @@ from .contracts import (
 )
 from .effects import EffectState, StageEffectPort
 from .engine import StageWorkspace
-
-DISCOVER_REQUEST_SCHEMA = "description-pipeline.discover-request/v1"
-DISCOVER_RESULT_SCHEMA = "description-pipeline.discover-result/v1"
-DISCOVER_CHECKS_SCHEMA = "description-pipeline.discover-checks/v1"
-RULESET_CATALOG_SCHEMA = "description-pipeline.ruleset-catalog/v1"
-ARTIFACT_MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
 
 FREEZE_RESULT_KIND = "stage_output:freeze"
 SOURCE_SET_KIND = "freeze_originals"
@@ -364,7 +367,7 @@ class DiscoverHandler:
             _artifact_files(roots["configuration"], bound["configuration"], role="configuration")
             _artifact_files(roots["freeze"], bound["freeze"], role="freeze")
             native_request = NativeDiscoverRequest(
-                schema_version="description-pipeline.native-discover-request/v1",
+                schema_version=NATIVE_DISCOVER_REQUEST_SCHEMA,
                 operation_id=command.command_id,
                 command_id=command.command_id,
                 run_id=command.run_id,
@@ -560,7 +563,7 @@ class DiscoverHandler:
                 "native_tool_sha256": request["expected_native_tool_sha256"],
             },
             expected_state={
-                "schema_version": "description-pipeline.native-discover-effect/v1",
+                "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
                 "operation_id": command.command_id,
                 "request_digest": command.request_digest,
                 "source_inventory_sha256": request["source_inventory_sha256"],

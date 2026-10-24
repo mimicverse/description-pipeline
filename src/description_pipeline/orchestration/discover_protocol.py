@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from ..build.archive import ZIP_EPOCH
 from ..io import PipelineError, artifact_path_parts, confined, digest, file_digest, read_data
+from ..schemas import ARTIFACT_MANIFEST_SCHEMA
 from ..sources.solidworks.discover_stage import (
     OBSERVATION_MANIFEST,
     NativeDiscoverRefusal,
@@ -46,7 +47,7 @@ def seal_source_archive(source_root: Path, files: Mapping[str, str], destination
             manifest = None
         if (
             isinstance(manifest, dict)
-            and manifest.get("schema_version") == "description-pipeline.artifact-manifest/v1"
+            and manifest.get("schema_version") == ARTIFACT_MANIFEST_SCHEMA
             and isinstance(manifest.get("members"), list)
         ):
             members = manifest["members"]

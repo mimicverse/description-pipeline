@@ -14,6 +14,7 @@ from pathlib import Path
 from ..artifacts import ArtifactStore
 from ..io import digest
 from ..platform.facts import FactStore
+from ..schemas import FAILURE_ENVELOPE_SCHEMA, STAGE_RESULT_SCHEMA
 from .contracts import (
     ArtifactRef,
     ExecutionClaim,
@@ -218,7 +219,7 @@ class CanonicalStageServices:
             producer_tool_sha256=claim.executor_sha256,
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=command.command_id,
             run_id=command.run_id,
             stage=command.stage,
@@ -317,7 +318,7 @@ class CanonicalStageServices:
                 continue
             verified_evidence.append(artifact)
         envelope = FailureEnvelope(
-            schema_version="description-pipeline.failure-envelope/v1",
+            schema_version=FAILURE_ENVELOPE_SCHEMA,
             command_id=command.command_id,
             run_id=command.run_id,
             stage=command.stage,

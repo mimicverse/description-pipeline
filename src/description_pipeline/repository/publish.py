@@ -16,6 +16,7 @@ from typing import Any, Protocol
 
 from ..delivery import subject_digest
 from ..io import PipelineError, digest, inventory, read_data, write_json
+from ..schemas import REPOSITORY_SNAPSHOT_SCHEMA
 
 GOVERNED_PATHS = (
     "manifest.json",
@@ -38,7 +39,6 @@ GIT_ATTRIBUTES = (
 ).encode("ascii")
 _OID = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
-REPOSITORY_SNAPSHOT_SCHEMA = "description-pipeline.repository-snapshot/v1"
 REPOSITORY_SNAPSHOT_FILE = "repository.bundle"
 REPOSITORY_SNAPSHOT_METADATA = "snapshot.json"
 

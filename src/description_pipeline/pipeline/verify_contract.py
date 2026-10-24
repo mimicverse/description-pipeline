@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-REQUEST_SCHEMA = "description-pipeline.verify-request/v1"
-CERTIFICATE_SCHEMA = "description-pipeline.verification-certificate/v1"
-RECEIPT_SCHEMA = "description-pipeline.verification-execution/v1"
+from ..schemas import (
+    VERIFICATION_CERTIFICATE_SCHEMA as CERTIFICATE_SCHEMA,
+    VERIFICATION_EXECUTION_SCHEMA as RECEIPT_SCHEMA,
+    VERIFY_REQUEST_SCHEMA as REQUEST_SCHEMA,
+)
 OUTPUT_CONTRACT = "solidworks-to-urdf.verification-artifact/v1"
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"

@@ -25,6 +25,7 @@ from ...repository.publish import (
     materialize_repository_snapshot,
 )
 from ...runtime import tool_record
+from ...schemas import PUBLICATION_PLAN_SCHEMA, PUBLICATION_RECEIPT_SCHEMA, VERIFICATION_CERTIFICATE_SCHEMA
 from ...stages import CONTRACT
 from ..contracts import (
     ArtifactRef,
@@ -43,7 +44,7 @@ from ..publish_contract import (
     REPOSITORY_SNAPSHOT_KIND,
 )
 
-PUBLISH_RECEIPT_SCHEMA = "description-pipeline.publication-receipt/v1"
+PUBLISH_RECEIPT_SCHEMA = PUBLICATION_RECEIPT_SCHEMA
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 VERIFY_ARTIFACT_KIND = "stage_output:verify"
@@ -341,7 +342,7 @@ def _certificate(
     if (
         certificate["capture_artifact"] != request.capture_artifact.to_record()
         or certificate["generate_artifact"] != request.generate_artifact.to_record()
-        or certificate["schema_version"] != "description-pipeline.verification-certificate/v1"
+        or certificate["schema_version"] != VERIFICATION_CERTIFICATE_SCHEMA
         or not isinstance(certificate["request"], dict)
         or digest(certificate["request"]) != certificate["request_sha256"]
         or certificate["subject_sha256"] != request.verified_subject_sha256
@@ -441,7 +442,7 @@ def _write_publication_plan(
     candidate: PreparedCandidate,
 ) -> tuple[Path, dict]:
     plan = {
-        "schema_version": "description-pipeline.publication-plan/v1",
+        "schema_version": PUBLICATION_PLAN_SCHEMA,
         "capture_artifact": inputs.request.capture_artifact.to_record(),
         "generate_artifact": inputs.request.generate_artifact.to_record(),
         "verify_artifact": inputs.request.verify_artifact.to_record(),

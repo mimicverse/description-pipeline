@@ -11,6 +11,7 @@ from pathlib import Path
 from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline.io import digest
 from description_pipeline.pipeline import DispatchConf, StageResult
+from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA, STAGE_RESULT_SCHEMA
 
 
 class ArtifactStoreTests(unittest.TestCase):
@@ -82,7 +83,7 @@ class ArtifactStoreTests(unittest.TestCase):
     def test_stage_result_record_roundtrip_is_byte_verified(self) -> None:
         output = self.seal(self.source("output"))
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id="command-1",
             run_id="run-1",
             stage="generate",
@@ -103,7 +104,7 @@ class ArtifactStoreTests(unittest.TestCase):
 
     def test_dispatch_conf_is_a_separate_reference_only_artifact(self) -> None:
         conf = DispatchConf(
-            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id="run-1",
             freeze_command_id="command-freeze",
         )

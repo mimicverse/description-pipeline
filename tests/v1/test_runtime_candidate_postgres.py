@@ -70,6 +70,13 @@ from description_pipeline.pipeline.verify_contract import (
 )
 from description_pipeline.platform.facts import FactConflict, FactStore, FactStoreError
 from description_pipeline.repository.publish import CommitSpec
+from description_pipeline.schemas import (
+    AIRFLOW_DISPATCH_CONF_SCHEMA,
+    DISCOVER_RESULT_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+    VERIFICATION_CERTIFICATE_SCHEMA,
+    VERIFY_REQUEST_SCHEMA,
+)
 from tests.v1.test_pipeline_admission import AdmissionHarness
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
@@ -335,7 +342,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.command = build_freeze_command(self.admission_harness.spec)
         self.dispatch_executor = digest({"tool": "portal-dispatch"})
         self.dispatch_conf = DispatchConf(
-            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=self.admission.run_id,
             freeze_command_id=self.command.command_id,
         )
@@ -430,7 +437,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
 
     def _dispatch_for(self, admission, command, *, conf_freeze_id=None):
         conf = DispatchConf(
-            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=admission.run_id,
             freeze_command_id=conf_freeze_id or command.command_id,
         )
@@ -491,7 +498,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
     def _discover_payload(self, command: StageCommand) -> dict[str, object]:
         files = {"cad/robot.SLDASM": self.admission_harness.originals.inventory["cad/robot.SLDASM"]}
         return {
-            "schema_version": "description-pipeline.discover-result/v1",
+            "schema_version": DISCOVER_RESULT_SCHEMA,
             "command_id": command.command_id,
             "run_id": self.admission_harness.spec.run_id,
             "request_digest": command.request_digest,
@@ -714,7 +721,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "output_contract": "solidworks-to-urdf.verification-artifact/v1",
             "policy_sha256": self.admission_harness.spec.policy_sha256,
             "purpose": self.admission_harness.spec.purpose,
-            "schema_version": "description-pipeline.verify-request/v1",
+            "schema_version": VERIFY_REQUEST_SCHEMA,
         }
         certificate = {
             "actual_verifier": {"executor": "verify"},
@@ -729,7 +736,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "purpose": self.admission_harness.spec.purpose,
             "request": verify_request,
             "request_sha256": digest(verify_request),
-            "schema_version": "description-pipeline.verification-certificate/v1",
+            "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
             "subject_sha256": generate.result.output_artifact.set_sha256,
         }
         certificate["verification_key"] = digest(certificate)
@@ -1167,7 +1174,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             producer_tool_sha256=self.executor,
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=self.command.command_id,
             run_id=self.command.run_id,
             stage=self.command.stage,

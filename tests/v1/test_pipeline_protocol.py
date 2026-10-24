@@ -31,6 +31,7 @@ from description_pipeline.pipeline import (
     project_stage_status,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
+from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA, STAGE_RESULT_SCHEMA
 
 
 def artifact(name: str, *, stage="generate") -> ArtifactRef:
@@ -374,7 +375,7 @@ class CommandIdentityTests(unittest.TestCase):
         )
         self.assertEqual(DispatchCommand.from_record(command.to_record()), command)
         conf = DispatchConf(
-            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id="run-1",
             freeze_command_id="command-freeze",
         )
@@ -471,7 +472,7 @@ class _Services:
             producer_tool_sha256=command_value.expected_executor_sha256,
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=command_value.command_id,
             run_id=command_value.run_id,
             stage=command_value.stage,

@@ -16,6 +16,14 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from ..io import PipelineError, canonical, digest
+from ..schemas import (
+    AIRFLOW_DISPATCH_CONF_SCHEMA,
+    DISPATCH_COMMAND_SCHEMA,
+    FAILURE_ENVELOPE_SCHEMA,
+    RUN_ADMISSION_SCHEMA,
+    STAGE_COMMAND_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+)
 
 STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 StageId = Literal["freeze", "discover", "capture", "generate", "verify", "publish"]
@@ -50,7 +58,7 @@ class RunAdmission:
     created_at: datetime
 
     def __post_init__(self) -> None:
-        if self.schema_version != "description-pipeline.run-admission/v1":
+        if self.schema_version != RUN_ADMISSION_SCHEMA:
             raise ProtocolError("admission.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.run_id, "admission.invalid", "run_id")
         _require_identifier(self.request_id, "admission.invalid", "request_id")
@@ -89,7 +97,7 @@ class RunAdmission:
         created_at: datetime,
     ) -> RunAdmission:
         values = {
-            "schema_version": "description-pipeline.run-admission/v1",
+            "schema_version": RUN_ADMISSION_SCHEMA,
             "run_id": run_id,
             "request_id": request_id,
             "parent_run_id": parent_run_id,
@@ -263,7 +271,7 @@ class StageCommand:
     predecessor_decision_id: str | None
 
     def __post_init__(self) -> None:
-        if self.schema_version != "description-pipeline.stage-command/v1":
+        if self.schema_version != STAGE_COMMAND_SCHEMA:
             raise ProtocolError("command.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.command_id, "command.invalid", "command_id")
         _require_identifier(self.run_id, "command.invalid", "run_id")
@@ -323,7 +331,7 @@ class StageCommand:
         predecessor_decision_id: str | None,
     ) -> StageCommand:
         values = {
-            "schema_version": "description-pipeline.stage-command/v1",
+            "schema_version": STAGE_COMMAND_SCHEMA,
             "command_id": command_id,
             "run_id": run_id,
             "kind": "stage",
@@ -372,7 +380,7 @@ class DispatchConf:
     freeze_command_id: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != "description-pipeline.airflow-dispatch-conf/v1":
+        if self.schema_version != AIRFLOW_DISPATCH_CONF_SCHEMA:
             raise ProtocolError("dispatch_conf.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.run_id, "dispatch_conf.invalid", "run_id")
         _require_identifier(self.freeze_command_id, "dispatch_conf.invalid", "freeze_command_id")
@@ -413,7 +421,7 @@ class DispatchCommand:
     expected_executor_sha256: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != "description-pipeline.dispatch-command/v1":
+        if self.schema_version != DISPATCH_COMMAND_SCHEMA:
             raise ProtocolError("dispatch.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.command_id, "dispatch.invalid", "command_id")
         _require_identifier(self.run_id, "dispatch.invalid", "run_id")
@@ -466,7 +474,7 @@ class DispatchCommand:
         expected_executor_sha256: str,
     ) -> DispatchCommand:
         values = {
-            "schema_version": "description-pipeline.dispatch-command/v1",
+            "schema_version": DISPATCH_COMMAND_SCHEMA,
             "command_id": command_id,
             "run_id": run_id,
             "freeze_command_id": freeze_command_id,
@@ -538,7 +546,7 @@ class StageResult:
     reason_code: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != "description-pipeline.stage-result/v1":
+        if self.schema_version != STAGE_RESULT_SCHEMA:
             raise ProtocolError("result.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.command_id, "result.invalid", "command_id")
         _require_identifier(self.run_id, "result.invalid", "run_id")
@@ -726,7 +734,7 @@ class FailureEnvelope:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
-        if self.schema_version != "description-pipeline.failure-envelope/v1":
+        if self.schema_version != FAILURE_ENVELOPE_SCHEMA:
             raise ProtocolError("failure.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.command_id, "failure.invalid", "command_id")
         _require_identifier(self.run_id, "failure.invalid", "run_id")

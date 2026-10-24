@@ -38,6 +38,7 @@ from description_pipeline.pipeline.verify import (
     validate_verification_certificate,
 )
 from description_pipeline.runtime import tool_record
+from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 from description_pipeline.stages import CONTRACT_SHA256
 from tests.v1 import test_hermetic_six_stage as hermetic
 
@@ -246,7 +247,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             producer_tool_sha256=claim.executor_sha256,
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=command.command_id,
             run_id=command.run_id,
             stage="verify",

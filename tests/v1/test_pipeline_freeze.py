@@ -30,6 +30,7 @@ from description_pipeline.pipeline.freeze import (
     RULESET_CATALOG_SCHEMA,
     RULESET_KIND,
 )
+from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 
 
 def _members(root: Path) -> list[dict]:
@@ -319,7 +320,7 @@ class _Services:
             producer_tool_sha256=command.expected_executor_sha256,
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=command.command_id,
             run_id=command.run_id,
             stage="freeze",

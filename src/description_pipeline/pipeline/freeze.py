@@ -20,6 +20,7 @@ from ..io import (
 )
 from ..sources.solidworks.handoff import describe_handoff
 from ..sources.solidworks.revision import package_inventory
+from ..schemas import ARTIFACT_MANIFEST_SCHEMA, FREEZE_CHECKS_SCHEMA, FREEZE_REQUEST_SCHEMA, RULESET_CATALOG_SCHEMA
 from .contracts import (
     ArtifactRef,
     ExecutionClaim,
@@ -31,11 +32,6 @@ from .contracts import (
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
-
-FREEZE_REQUEST_SCHEMA = "description-pipeline.freeze-request/v1"
-FREEZE_CHECKS_SCHEMA = "description-pipeline.freeze-checks/v1"
-RULESET_CATALOG_SCHEMA = "description-pipeline.ruleset-catalog/v1"
-ARTIFACT_MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
 
 ORIGINALS_KIND = "freeze_originals"
 RULESET_KIND = "freeze_ruleset"

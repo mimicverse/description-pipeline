@@ -11,7 +11,7 @@ from ...artifacts import ArtifactStore
 from ...io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from ...model import EngineeringModel, compile, emit
 from ...runtime import tool_record
-from ...schemas import ENGINEERING_MODEL_SCHEMA, TOOL_SCHEMA
+from ...schemas import ENGINEERING_MODEL_SCHEMA, GENERATE_REQUEST_SCHEMA, GENERATE_RESULT_SCHEMA, TOOL_SCHEMA
 from ...sources.snapshot import verify_snapshot
 from ...sources.solidworks.captured import derive_engineering_input
 from ...sources.solidworks.generation_warnings import generation_value_warnings
@@ -27,8 +27,6 @@ from ..contracts import (
 from ..effects import StageEffectPort
 from ..engine import StageWorkspace
 
-GENERATE_REQUEST_SCHEMA = "description-pipeline.generate-request/v1"
-GENERATE_RESULT_SCHEMA = "description-pipeline.generate-result/v1"
 GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 GENERATE_RECEIPT = "reports/generate.json"

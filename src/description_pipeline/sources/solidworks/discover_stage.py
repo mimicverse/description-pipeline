@@ -12,12 +12,12 @@ from typing import Any
 
 from ...io import PipelineError, canonical, confined, digest, file_digest, read_data
 from ...interface_records import REQUEST_PURPOSES
+from ...schemas import ARTIFACT_MANIFEST_SCHEMA, NATIVE_OBSERVATION_SCHEMA, NATIVE_SOURCE_SET_SCHEMA
+from ...schemas import NATIVE_DISCOVER_REQUEST_SCHEMA as NATIVE_REQUEST_SCHEMA
 from .discovery import DISCOVERY_SCHEMA, DiscoverySettings, read_native_record
 from .revision import package_inventory
 from .selection import selection_bindings, validate_file_index
 
-NATIVE_REQUEST_SCHEMA = "description-pipeline.native-discover-request/v1"
-NATIVE_OBSERVATION_SCHEMA = "description-pipeline.native-observation/v1"
 OBSERVATION_MANIFEST = "observation.json"
 OBSERVATION_MEMBERS = frozenset({"request.json", "source.json", "selection.json", "record.json", "tool.json"})
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -229,7 +229,7 @@ def observe_native_record(
     output.mkdir(parents=True)
     request_record = request.to_record()
     source_record = {
-        "schema_version": "description-pipeline.native-source-set/v1",
+        "schema_version": NATIVE_SOURCE_SET_SCHEMA,
         "source_files": dict(request.source_files),
         "source_inventory_sha256": request.source_inventory_sha256,
     }
@@ -346,7 +346,7 @@ def admit_native_observation(
             ) from error
         if (
             isinstance(cas_record, dict)
-            and cas_record.get("schema_version") == "description-pipeline.artifact-manifest/v1"
+            and cas_record.get("schema_version") == ARTIFACT_MANIFEST_SCHEMA
         ):
             if artifact_ref is not None and cas_record.get("artifact_id") != artifact_ref.artifact_id:
                 raise NativeDiscoverRefusal(

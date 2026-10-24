@@ -45,7 +45,13 @@ from description_pipeline.repository.publish import (
     seal_repository_snapshot,
 )
 from description_pipeline.runtime import tool_record
-from description_pipeline.schemas import ENGINEERING_MODEL_SCHEMA
+from description_pipeline.schemas import (
+    ENGINEERING_MODEL_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+    VERIFICATION_CERTIFICATE_SCHEMA,
+    VERIFICATION_EXECUTION_SCHEMA,
+    VERIFY_REQUEST_SCHEMA,
+)
 from description_pipeline.stages import CONTRACT_SHA256
 
 VERIFY_IDENTITY = {"role": "verify-fixture", "version": "1"}
@@ -557,7 +563,7 @@ class PublishFixture:
             "policy_sha256": POLICY_SHA,
             "config_snapshot_sha256": CONFIG_SHA,
             "purpose": "engineering",
-            "schema_version": "description-pipeline.verify-request/v1",
+            "schema_version": VERIFY_REQUEST_SCHEMA,
             "output_contract": "solidworks-to-urdf.verification-artifact/v1",
         }
         proof = {
@@ -586,7 +592,7 @@ class PublishFixture:
             "request": verify_request,
             "request_sha256": digest(verify_request),
             "required_checks": ["fixture"],
-            "schema_version": "description-pipeline.verification-certificate/v1",
+            "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
             "subject_sha256": self.generate_ref.set_sha256,
             "subject_status": "bound",
         }
@@ -609,7 +615,7 @@ class PublishFixture:
                 "request": verify_request,
                 "request_sha256": digest(verify_request),
                 "run_id": "verify-run",
-                "schema_version": "description-pipeline.verification-execution/v1",
+                "schema_version": VERIFICATION_EXECUTION_SCHEMA,
                 "stage": "verify",
                 "started_at": "2026-10-25T00:00:00+00:00",
                 "execution_id": "verify-execution",
@@ -746,7 +752,7 @@ class PublishHandlerTests(unittest.TestCase):
             producer_tool_sha256=self.fixture.executor,
         )
         result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
+            schema_version=STAGE_RESULT_SCHEMA,
             command_id=self.fixture.command.command_id,
             run_id=self.fixture.command.run_id,
             stage="publish",

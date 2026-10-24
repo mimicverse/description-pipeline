@@ -44,6 +44,7 @@ from ..pipeline.effects import (
     project_effect_settlement,
     project_effect_state,
 )
+from ..schemas import AIRFLOW_DISPATCH_EFFECT_SCHEMA, RUN_ADMISSION_SCHEMA, STAGE_COMMAND_SCHEMA
 
 
 class FactStoreError(PipelineError):
@@ -200,7 +201,7 @@ class FactStore:
         if row is None:
             return None
         return RunAdmission(
-            schema_version="description-pipeline.run-admission/v1",
+            schema_version=RUN_ADMISSION_SCHEMA,
             run_id=row[0],
             request_id=row[1],
             parent_run_id=row[2],
@@ -309,7 +310,7 @@ class FactStore:
         command: DispatchCommand,
     ) -> EffectIntent:
         expected = {
-            "schema_version": "description-pipeline.airflow-dispatch-effect/v1",
+            "schema_version": AIRFLOW_DISPATCH_EFFECT_SCHEMA,
             "conf_artifact_id": command.conf_artifact.artifact_id,
             "conf_set_sha256": command.conf_artifact.set_sha256,
             "dag_id": command.dag_id,
@@ -363,7 +364,7 @@ class FactStore:
         )
         inputs = tuple(_artifact_from_row(item) for item in cursor.fetchall())
         return StageCommand(
-            schema_version="description-pipeline.stage-command/v1",
+            schema_version=STAGE_COMMAND_SCHEMA,
             command_id=row[0],
             run_id=row[1],
             kind=row[2],
