@@ -269,6 +269,9 @@ class CaptureHandlerTests(unittest.TestCase):
             producer_stage=None,
             producer_tool_sha256=digest({"producer": CONFIGURATION_KIND}),
         )
+        self.capture_tool = build_capture_tool()
+        self.expected_native_tool_sha256 = self.capture_tool["source_sha256"]
+        self.native_tool_sha256 = digest(self.capture_tool)
         freeze_request = {
             "schema_version": FREEZE_REQUEST_SCHEMA,
             "request_id": "request-capture-boundary",
@@ -325,6 +328,7 @@ class CaptureHandlerTests(unittest.TestCase):
             configuration_artifact_id=self.configuration_ref.artifact_id,
             ruleset_catalog_sha256=self.ruleset_ref.set_sha256,
             platform_config_sha256=self.configuration_ref.set_sha256,
+            expected_native_tool_sha256=self.expected_native_tool_sha256,
         )
         discover_command = StageCommand.create(
             command_id="discover-command",
@@ -356,8 +360,12 @@ class CaptureHandlerTests(unittest.TestCase):
         )
         discover_execution = DiscoverHandler(
             self.stage_fixture.port(
-                reader=ClosureReader(transform=_capture_component_closure),
-                backend=CountingBackend(copy.deepcopy(self.stage_fixture.record))
+                reader=ClosureReader(
+                    transform=_capture_component_closure,
+                    reader_sha256=self.expected_native_tool_sha256,
+                ),
+                backend=CountingBackend(copy.deepcopy(self.stage_fixture.record)),
+                native_tool=self.capture_tool,
             )
         ).execute(
             discover_command,
@@ -385,7 +393,7 @@ class CaptureHandlerTests(unittest.TestCase):
         }
         self.handoff_sha256 = digest(self.discover_result["selection"]["files"])
         self.upload_sha256 = digest(self.stage_fixture.source_files)
-        self.capture_tool = build_capture_tool()
+        self.stage_executor = digest({"executor": "linux-capture-orchestrator"})
         self.command = self._command()
         self.claim = ExecutionClaim(
             claim_id="claim-capture",
@@ -438,6 +446,7 @@ class CaptureHandlerTests(unittest.TestCase):
             request=request
             or {
                 "effect_key": "capture-native",
+                "expected_native_tool_sha256": self.expected_native_tool_sha256,
                 "handoff_sha256": self.handoff_sha256,
                 "main_assembly": MAIN,
                 "prepared_sha256": digest(self.prepared_files),
@@ -447,7 +456,7 @@ class CaptureHandlerTests(unittest.TestCase):
             config_snapshot_sha256=digest({"config": "capture"}),
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": "capture"}),
-            expected_executor_sha256=expected_executor or digest(self.capture_tool),
+            expected_executor_sha256=expected_executor or self.stage_executor,
             predecessor_decision_id="discover-decision",
         )
 
@@ -517,13 +526,20 @@ class CaptureHandlerTests(unittest.TestCase):
         self.assertEqual(execution.outcome, "completed")
         admitted = Path(execution.candidate_root)
         manifest = json.loads((admitted / "transfer-manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], "solidworks-to-urdf.capture-transfer/v2")
+        self.assertEqual(manifest["schema_version"], "solidworks-to-urdf.capture-transfer/v3")
         self.assertEqual(manifest["run_id"], CHILD)
         self.assertEqual(manifest["native_stage_scope"], ["capture"])
         self.assertEqual(manifest["execution"]["effect_key"], "capture-native")
+        self.assertEqual(manifest["execution"]["executor_sha256"], self.stage_executor)
+        self.assertEqual(manifest["execution"]["native_tool_sha256"], self.native_tool_sha256)
+        self.assertEqual(manifest["native_tool_sha256"], self.native_tool_sha256)
         self.assertNotEqual(
             manifest["execution"]["owner_sha256"],
             manifest["execution"]["executor_sha256"],
+        )
+        self.assertNotEqual(
+            manifest["execution"]["executor_sha256"],
+            manifest["execution"]["native_tool_sha256"],
         )
         self.assertEqual(
             {
@@ -576,22 +592,64 @@ class CaptureHandlerTests(unittest.TestCase):
 
     def test_native_tool_mismatch_is_rejected_before_effect_or_native_operation(self) -> None:
         operation = Mock()
-        command = self._command(
-            expected_executor="f" * 64,
-        )
-        claim = self._claim(command, "claim-tool-mismatch", fence=1)
-        effects = self.effects(command, claim)
+        drifted_tool = {**self.capture_tool, "source_sha256": "e" * 64}
+        effects = self.effects()
         handler = CaptureHandler(
             artifact_store=self.store,
             backend_factory=lambda package: fixture_backend(package, MAIN),
-            native_tool_factory=lambda: self.capture_tool,
+            native_tool_factory=lambda: drifted_tool,
             native_operation=operation,
         )
         with self.assertRaisesRegex(Exception, "native_tool_mismatch"):
-            handler.execute(command, claim, self.workspace(), effects=effects)
+            handler.execute(self.command, self.claim, self.workspace(), effects=effects)
+        operation.assert_not_called()
+        self.assertFalse(
+            any(intent.command_id == self.command.command_id for intent in self.effect_ledger.intents.values())
+        )
+
+    def test_capture_cannot_rebind_the_discover_native_requirement(self) -> None:
+        operation = Mock()
+        request = {
+            **self.command.to_record()["request"],
+            "expected_native_tool_sha256": "d" * 64,
+        }
+        command = self._command(request=request)
+        claim = self._claim(command, "claim-native-rebind", fence=1)
+        effects = self.effects(command, claim)
+        with self.assertRaisesRegex(Exception, "native_requirement_binding"):
+            self.handler(native_operation=operation).execute(
+                command,
+                claim,
+                self.workspace(name="workspace-native-rebind"),
+                effects=effects,
+            )
         operation.assert_not_called()
         self.assertFalse(
             any(intent.command_id == command.command_id for intent in self.effect_ledger.intents.values())
+        )
+
+    def test_executor_mismatch_is_rejected_before_effect_or_native_operation(self) -> None:
+        operation = Mock()
+        claim = ExecutionClaim(
+            claim_id="claim-executor-mismatch",
+            command_id=self.command.command_id,
+            fence=1,
+            owner_sha256=digest({"owner": "capture-executor-mismatch"}),
+            executor_sha256="f" * 64,
+            lane_key="native",
+            expires_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        effects = self.effects(self.command, claim)
+        with self.assertRaisesRegex(Exception, "claim_mismatch"):
+            self.handler(native_operation=operation).execute(
+                self.command,
+                claim,
+                self.workspace(),
+                effects=effects,
+            )
+        operation.assert_not_called()
+        self.assertFalse(
+            any(intent.command_id == self.command.command_id for intent in self.effect_ledger.intents.values())
         )
 
     def test_unsettled_prior_effect_is_queried_before_native_operation(self) -> None:
@@ -712,8 +770,9 @@ class CaptureHandlerTests(unittest.TestCase):
             "claim_id": self.claim.claim_id,
             "command_id": self.command.command_id,
             "effect_key": "capture-native",
-            "executor_sha256": digest(self.capture_tool),
+            "executor_sha256": self.stage_executor,
             "fence": self.claim.fence,
+            "native_tool_sha256": self.native_tool_sha256,
             "owner_sha256": self.claim.owner_sha256,
             "run_id": self.command.run_id,
         }
@@ -729,6 +788,44 @@ class CaptureHandlerTests(unittest.TestCase):
                 expected_prepared_dir=str(self.package),
                 expected_prepared_files=self.prepared_files,
                 expected_upstream_artifacts=expected_upstream,
+                expected_execution=execution_record,
+            )
+        self.assertFalse(destination.exists())
+
+    def test_admission_rejects_native_execution_identity_drift(self) -> None:
+        workspace = self.workspace()
+        with patch("description_pipeline.runtime.tool_record", return_value=self.capture_tool):
+            execution = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=self.effects(),
+            )
+        self.assertEqual(execution.outcome, "completed")
+        archive = workspace.root / "capture-native" / "native-evidence.zip"
+        execution_record = {
+            "claim_id": self.claim.claim_id,
+            "command_id": self.command.command_id,
+            "effect_key": "capture-native",
+            "executor_sha256": self.stage_executor,
+            "fence": self.claim.fence,
+            "native_tool_sha256": "e" * 64,
+            "owner_sha256": self.claim.owner_sha256,
+            "run_id": self.command.run_id,
+        }
+        destination = self.root / "rejected-native-execution"
+        with self.assertRaisesRegex(Exception, "execution identity"):
+            admit_capture(
+                archive,
+                destination,
+                expected_run_id=self.command.run_id,
+                expected_handoff_sha256=self.handoff_sha256,
+                expected_upload_sha256=self.upload_sha256,
+                expected_main_assembly=MAIN,
+                expected_native_tool=self.capture_tool,
+                expected_prepared_dir=None,
+                expected_prepared_files=self.prepared_files,
+                expected_upstream_artifacts=(self.freeze_ref.to_record(), self.discover_ref.to_record()),
                 expected_execution=execution_record,
             )
         self.assertFalse(destination.exists())

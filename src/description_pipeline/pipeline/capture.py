@@ -104,6 +104,7 @@ def _artifact_files(root: Path, artifact: ArtifactRef, *, role: str) -> dict[str
 class CaptureRequest:
     """The Capture-specific part of one immutable StageCommand request."""
 
+    expected_native_tool_sha256: str
     handoff_sha256: str
     upload_sha256: str
     prepared_sha256: str
@@ -117,6 +118,7 @@ class CaptureRequest:
         request = command.request
         required = {
             "effect_key",
+            "expected_native_tool_sha256",
             "handoff_sha256",
             "main_assembly",
             "prepared_sha256",
@@ -130,7 +132,12 @@ class CaptureRequest:
         values = {key: request[key] for key in required}
         if not all(isinstance(value, str) and value and "\x00" not in value for value in values.values()):
             raise ProtocolError("capture.request_invalid", {"where": "text-fields"})
-        for key in ("handoff_sha256", "prepared_sha256", "upload_sha256"):
+        for key in (
+            "expected_native_tool_sha256",
+            "handoff_sha256",
+            "prepared_sha256",
+            "upload_sha256",
+        ):
             value = values[key]
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ProtocolError("capture.request_invalid", {"where": key})
@@ -228,6 +235,16 @@ class CaptureInputs:
             or discover_result.get("request_digest") != discover_checks.get("request_digest")
         ):
             raise ProtocolError("capture.discover_result_identity", {"where": "result.json"})
+        native_tool = discover_result.get("native_tool")
+        if (
+            discover_request.get("expected_native_tool_sha256") != request.expected_native_tool_sha256
+            or not isinstance(native_tool, dict)
+            or native_tool.get("source_sha256") != request.expected_native_tool_sha256
+        ):
+            raise ProtocolError(
+                "capture.native_requirement_binding",
+                {"expected": request.expected_native_tool_sha256},
+            )
         if (
             discover_request.get("freeze_artifact_id") != freeze.artifact_id
             or discover_request.get("main_assembly") != request.main_assembly
@@ -383,18 +400,21 @@ def _execution_record(
 ) -> dict[str, Any]:
     if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
         raise ProtocolError("capture.claim_mismatch", {"command_id": command.command_id})
-    native_tool_sha256 = digest(native_tool)
-    if native_tool_sha256 != claim.executor_sha256:
+    if native_tool.get("source_sha256") != request.expected_native_tool_sha256:
         raise ProtocolError(
             "capture.native_tool_mismatch",
-            {"expected": claim.executor_sha256, "actual": native_tool_sha256},
+            {
+                "expected": request.expected_native_tool_sha256,
+                "actual": native_tool.get("source_sha256"),
+            },
         )
     return {
         "claim_id": claim.claim_id,
         "command_id": command.command_id,
         "effect_key": request.effect_key,
-        "executor_sha256": native_tool_sha256,
+        "executor_sha256": claim.executor_sha256,
         "fence": claim.fence,
+        "native_tool_sha256": digest(native_tool),
         "owner_sha256": claim.owner_sha256,
         "run_id": command.run_id,
     }
@@ -850,9 +870,10 @@ class CaptureHandler:
             execution_record.get("command_id") != command.command_id
             or execution_record.get("run_id") != command.run_id
             or execution_record.get("executor_sha256") != claim.executor_sha256
-            or digest(tool) != claim.executor_sha256
+            or tool.get("source_sha256") != request.expected_native_tool_sha256
+            or execution_record.get("native_tool_sha256") != digest(tool)
         ):
-            raise ProtocolError("capture.effect_executor", {"effect_key": request.effect_key})
+            raise ProtocolError("capture.effect_identity", {"effect_key": request.effect_key})
         admitted = payload_root / "admitted"
         manifest = self._admitter(
             archive,

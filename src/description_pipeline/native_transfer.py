@@ -37,7 +37,7 @@ from .sources.solidworks.revision import package_inventory
 from .stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA, stage_view
 
 TRANSFER_SCHEMA = "solidworks-to-urdf.transfer/v1"
-CAPTURE_TRANSFER_SCHEMA = "solidworks-to-urdf.capture-transfer/v2"
+CAPTURE_TRANSFER_SCHEMA = "solidworks-to-urdf.capture-transfer/v3"
 
 
 NATIVE_STAGE_SCOPE = ("freeze", "discover", "capture")
@@ -130,6 +130,7 @@ def _capture_execution(value, *, run_id: str) -> dict:
         "effect_key",
         "executor_sha256",
         "fence",
+        "native_tool_sha256",
         "owner_sha256",
         "run_id",
     }
@@ -150,7 +151,15 @@ def _capture_execution(value, *, run_id: str) -> dict:
     )
     _require(type(value.get("fence")) is int and value["fence"] > 0, "Capture execution fence is invalid")
     _require(_is_sha256(value.get("owner_sha256")), "Capture execution owner digest is invalid")
-    _require(_is_sha256(value.get("executor_sha256")), "Capture execution tool digest is invalid")
+    _require(_is_sha256(value.get("executor_sha256")), "Capture execution executor digest is invalid")
+    _require(
+        _is_sha256(value.get("native_tool_sha256")),
+        "Capture execution native tool digest is invalid",
+    )
+    _require(
+        value["owner_sha256"] != value["executor_sha256"],
+        "Capture execution owner and executor identities are mixed",
+    )
     return dict(value)
 
 
@@ -1256,7 +1265,7 @@ def capture_manifest(
         manifest["upstream_artifacts"] = _capture_upstream(upstream_artifacts)
         manifest["execution"] = _capture_execution(execution, run_id=run_id)
         _require(
-            manifest["execution"]["executor_sha256"] == manifest["native_tool_sha256"],
+            manifest["execution"]["native_tool_sha256"] == manifest["native_tool_sha256"],
             "Capture execution native tool differs from the transfer tool",
         )
     verify_transfer(
@@ -1533,7 +1542,7 @@ def verify_transfer(
     )
     if capture_only_scope:
         _require(
-            execution["executor_sha256"] == manifest.get("native_tool_sha256"),
+            execution["native_tool_sha256"] == manifest.get("native_tool_sha256"),
             "Capture execution native tool differs from the transfer tool",
         )
     _validate_native_tool(manifest.get("native_tool"))
