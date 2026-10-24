@@ -431,7 +431,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         """The child's own executed-and-failed verify stage, registered through the writer."""
         tree = platform.sealed(f"store://sealed/{child}/verify")
         tree.mkdir(parents=True)
-        build_sealed_delivery(tree)
+        build_sealed_delivery(tree, run_id=child)
         manifest = read_delivery_manifest(tree)
         write_json(
             tree / "reports/quality.json",

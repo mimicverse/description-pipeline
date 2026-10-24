@@ -164,7 +164,10 @@ class RegisteredPlatform:
             return str((registered.get("receipt") or {}).get("subject_sha256") or "")
         source = Path(tempfile.mkdtemp(prefix="publish-seal-", dir=self.root))
         try:
-            subject, artifacts, _handoff_full, handoff_native = build_sealed_delivery(source)
+            subject, artifacts, _handoff_full, handoff_native = build_sealed_delivery(
+                source,
+                run_id=run_id,
+            )
             checks = [
                 {"id": name, "state": "passed", "passed": True, "details": {}} for name in required_checks(DEFINITION)
             ]

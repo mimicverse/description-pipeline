@@ -15,12 +15,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from description_pipeline.io import PipelineError
 from description_pipeline.orchestration import portal as portal_module
-from description_pipeline.orchestration.airflow_client import EndpointError, native_run_id
+from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
-from description_pipeline.platform import flow
-from description_pipeline.stages import STAGE_IDS, require_complete, stage_view
+from description_pipeline.stages import STAGE_IDS
 
 from .portal_read_support import RegisteredPlatform
 from .protocol_support import protocol_events
@@ -79,116 +77,6 @@ def _register_delivery(
     platform.events(run_id, protocol_events(subject=SUBJECT))
 
 
-class RegisteredDeliveryTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="registered-delivery-"))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.platform = RegisteredPlatform(self.tmp / "platform")
-
-    def test_snapshot_reads_the_registered_records_only(self) -> None:
-        _register_delivery(self.platform)
-        self.platform.conclude(RUN, "succeeded")
-        snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
-        self.assertEqual(snapshot["run_id"], RUN)
-        self.assertEqual(snapshot["status"], "passed")
-        self.assertEqual(snapshot["result"]["passed"], True)
-        self.assertEqual(snapshot["result"]["quality"]["subject_sha256"], SUBJECT)
-        self.assertEqual(snapshot["result"]["submission"]["state"], "published")
-        self.assertEqual(snapshot["request"]["handoff_sha256"], HANDOFF)
-        # The registered capture tree binds hardware/revision; no chain is consulted here.
-        self.assertEqual((snapshot["hardware_id"], snapshot["revision"]), ("robot", "r1"))
-        # Check observations and the stage outcomes both came off the recorded stream.
-        stages = {stage["id"]: stage for stage in stage_view(snapshot)["stages"]}
-        self.assertEqual({stage["state"] for stage in stages.values()}, {"completed"})
-        self.assertEqual(stages["verify"]["checks_passed"], stages["verify"]["checks_total"])
-        require_complete(stage_view(snapshot))
-
-    def test_confirmation_rows_render_as_stage_state_events(self) -> None:
-        """A stage confirmation row without a stage key renders as its stage's state event."""
-        _register_delivery(self.platform)
-        self.platform.world.events.append((RUN, 999, "stage", "freeze", None, json.dumps({"state": "completed"})))
-        events = flow.registered_delivery_events(self.platform.store, RUN)
-        freeze = [event for event in events if event.get("stage") == "freeze"]
-        self.assertTrue(freeze)
-        self.assertEqual(freeze[-1]["state"], "completed")
-        self.assertIsInstance(freeze[-1].get("at"), str)
-        self.assertTrue(all(event.get("stage") for event in events))
-
-    def test_an_incomplete_registration_is_refused(self) -> None:
-        self.platform.admit(RUN)
-        _ = self.platform.tree(RUN, "capture")
-        for stage in ("freeze", "discover", "capture"):
-            self.platform.stage(RUN, stage)
-        snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
-        with self.assertRaises(PipelineError):
-            require_complete(stage_view(snapshot))
-
-    def test_a_run_without_registration_is_refused(self) -> None:
-        with self.assertRaisesRegex(PipelineError, "no platform registration"):
-            flow.registered_delivery_snapshot(self.platform.store, RUN)
-
-    def test_the_bound_submission_chain_decides_the_result(self) -> None:
-        _register_delivery(self.platform, submission_state="failed")
-        self.platform.conclude(RUN, "succeeded")
-        snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
-        self.assertEqual(snapshot["result"]["passed"], False)
-        _register_delivery(self.platform, quality_subject="f" * 64)
-        self.platform.conclude(RUN, "succeeded")
-        snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
-        self.assertEqual(snapshot["result"]["passed"], False)
-
-    def test_a_long_recorded_history_is_read_whole(self) -> None:
-        """The reader pages the full recorded history: a fixed page never truncates it."""
-        _register_delivery(self.platform)
-        self.platform.conclude(RUN, "succeeded")
-        protocol = list(self.platform.world.events)
-        prefix = [
-            (RUN, index, "activity", "capture", None, json.dumps({"stage": "capture", "state": "running"}))
-            for index in range(1, 251)
-        ]
-        self.platform.world.events = prefix + [
-            (run, seq + len(prefix), kind, stage, op, payload) for run, seq, kind, stage, op, payload in protocol
-        ]
-        events = flow.registered_delivery_events(self.platform.store, RUN)
-        self.assertEqual(len(events), len(self.platform.world.events))
-        snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
-        self.assertEqual(len(snapshot["events"]), len(self.platform.world.events))
-        require_complete(stage_view(snapshot))
-
-    def test_the_registered_run_outcome_is_authoritative(self) -> None:
-        """A passing receipt never flips a non-succeeded registered outcome."""
-        for state, expected_status in (
-            ("failed", "failed"),
-            ("cancelled", "failed"),
-            ("unresolved", "failed"),
-            ("running", "running"),
-        ):
-            with self.subTest(state=state):
-                platform = RegisteredPlatform(self.tmp / f"outcome-{state}")
-                _register_delivery(platform)
-                platform.conclude(RUN, state)
-                snapshot = flow.registered_delivery_snapshot(platform.store, RUN)
-                self.assertEqual(snapshot["result"]["passed"], False)
-                self.assertEqual(snapshot["status"], expected_status)
-
-    def test_a_damaged_sealed_capture_withholds_identity(self) -> None:
-        """The identity is consumed only through the sealed rebinding: forged bytes
-        grant nothing, and restoring the registered bytes restores the identity."""
-        _register_delivery(self.platform)
-        self.platform.conclude(RUN, "succeeded")
-        source = self.platform.sealed(f"store://sealed/{RUN}/capture") / "input/source.json"
-        original = source.read_bytes()
-        snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
-        self.assertEqual((snapshot["hardware_id"], snapshot["revision"]), ("robot", "r1"))
-        source.write_bytes(
-            json.dumps({"identity": {"hardware_id": "forged"}, "metadata": {"revision": "forged"}}).encode()
-        )
-        snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
-        self.assertEqual((snapshot["hardware_id"], snapshot["revision"]), (None, None))
-        source.write_bytes(original)
-        snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
-        self.assertEqual((snapshot["hardware_id"], snapshot["revision"]), ("robot", "r1"))
-
 DAG = "portal-20261016T000002-feedcafe"
 WSGI_RUN = native_run_id(DAG)
 
@@ -217,17 +105,6 @@ class _PermissiveAirflow:
             {"task_id": stage, "state": "failed" if stage in {"freeze", "capture"} else "upstream_failed"}
             for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")
         ]
-
-
-class _Endpoint:
-    def __init__(self, error):
-        self.error = error
-
-    def get_job(self, run_id):
-        assert run_id == WSGI_RUN
-        if self.error is None:
-            raise EndpointError("local unavailable Windows observation")
-        return {"run_id": run_id, "status": "failed", "error": self.error}
 
 
 class RegisteredFailureReadoutTests(unittest.TestCase):
@@ -264,12 +141,11 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
             platform.store.confirm_stage(run_id=WSGI_RUN, stage=later, state="blocked")
         return platform, original
 
-    def _get(self, platform: RegisteredPlatform, endpoint) -> tuple[int, bytes]:
+    def _get(self, platform: RegisteredPlatform) -> tuple[int, bytes]:
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: endpoint,
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
                 config_identity_provider=lambda: "c" * 64,
             )
         )
@@ -293,29 +169,23 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
         return response["status"], body
 
     def test_the_registered_failure_is_the_readout_authority(self) -> None:
-        """Windows-down, matching-native and stale-native all read the registration."""
+        """The registered failure and its failed stage own the run-page readout."""
         for stage in ("freeze", "generate"):
-            for mode in ("down", "matching", "stale"):
-                with self.subTest(stage=stage, mode=mode):
-                    platform, original = self._failed_platform(stage)
-                    native_error = {
-                        "down": None,
-                        "matching": original,
-                        "stale": "RuntimeError: stale native failure",
-                    }[mode]
-                    status, body = self._get(platform, _Endpoint(native_error))
-                    payload = json.loads(body)
-                    self.assertEqual(status, 200)
-                    self.assertEqual(payload["job"]["error"], original)
-                    self.assertIn(original, body.decode("utf-8"))
-                    finding = next(
-                        row for row in payload["findings"] if original in str(row.get("message", ""))
-                    )
-                    self.assertEqual(
-                        finding["stage"],
-                        stage,
-                        "the registered failed stage owns the error; a later blocked event never does",
-                    )
+            with self.subTest(stage=stage):
+                platform, original = self._failed_platform(stage)
+                status, body = self._get(platform)
+                payload = json.loads(body)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["job"]["error"], original)
+                self.assertIn(original, body.decode("utf-8"))
+                finding = next(
+                    row for row in payload["findings"] if original in str(row.get("message", ""))
+                )
+                self.assertEqual(
+                    finding["stage"],
+                    stage,
+                    "the registered failed stage owns the error; a later blocked event never does",
+                )
 
     def test_registered_failure_preserves_string_detail_and_diagnostic_identity(self) -> None:
         diagnostic = {"path": "diagnostic.json", "sha256": "d" * 64}
@@ -323,7 +193,7 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
             "publish", detail="remote: denied", diagnostic_path="failure/retained",
             failure_diagnostics=diagnostic,
         )
-        status, body = self._get(platform, _Endpoint(None))
+        status, body = self._get(platform)
         self.assertEqual(status, 200)
         payload = json.loads(body)
         self.assertEqual(payload["job"]["detail"], "remote: denied")
@@ -332,21 +202,15 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
         self.assertEqual(payload["report"]["failure"]["evidence_path"], "failure/retained")
         self.assertEqual(payload["report"]["failure"]["cause"], "remote: denied")
 
-    def test_a_registered_success_keeps_its_closure_and_observes_the_native_error(self) -> None:
+    def test_a_registered_success_keeps_its_canonical_closure(self) -> None:
         platform = RegisteredPlatform(self.tmp / "success")
         _register_delivery(platform, run_id=WSGI_RUN)
         platform.conclude(WSGI_RUN, "succeeded")
-        status, body = self._get(platform, _Endpoint(None))
+        status, body = self._get(platform)
         payload = json.loads(body)
         self.assertEqual(status, 200)
         self.assertEqual(payload["job"]["status"], "passed")
         self.assertIsNone(payload["job"]["error"])
-        self.assertEqual(payload["pr"]["url"], "https://github.com/example/robot/pull/1")
-        # A stale native error stays an observation and never flips the outcome.
-        status, body = self._get(platform, _Endpoint("RuntimeError: stale native failure"))
-        payload = json.loads(body)
-        self.assertEqual(payload["job"]["status"], "passed")
-        self.assertEqual(payload["job"]["error"], "RuntimeError: stale native failure")
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/robot/pull/1")
 
 
@@ -391,12 +255,6 @@ class _RetryAirflow(_PermissiveAirflow):
         }
 
 
-class _RunningEndpoint:
-    def get_job(self, run_id):
-        assert run_id == WSGI_RUN
-        return {"run_id": run_id, "status": "running", "events": []}
-
-
 class RegisteredRetryAuthorityTests(unittest.TestCase):
     """The registered terminal outcome owns the retry decision before any clear."""
 
@@ -409,8 +267,7 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=airflow,
-                endpoint=_RunningEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
                 config_identity_provider=lambda: "c" * 64,
             )
         )
@@ -490,8 +347,7 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
             app = portal_module.PortalApp(
                 portal_module.PortalConfig(
                     airflow=airflow,
-                    endpoint=_RunningEndpoint(),
-                    platform_store=platform.store,
+                    run_control_store=platform.run_control,
                     config_identity_provider=lambda: "c" * 64,
                 )
             )
