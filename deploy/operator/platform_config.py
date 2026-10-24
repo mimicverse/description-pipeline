@@ -317,6 +317,8 @@ CLOSURE_MEMBERS = (
     "model/schema.json",
     "stage-contract.json",
     "interface_records.py",
+    "pipeline/__init__.py",
+    "pipeline/contracts.py",
 )
 
 

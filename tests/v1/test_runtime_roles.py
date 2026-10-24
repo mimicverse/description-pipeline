@@ -205,18 +205,21 @@ class RuntimeRoleTests(unittest.TestCase):
                     "model/schema.json": file_digest(package / "model/schema.json"),
                     "schemas.py": file_digest(package / "schemas.py"),
                     "interface_records.py": file_digest(package / "interface_records.py"),
+                    "pipeline/contracts.py": file_digest(package / "pipeline/contracts.py"),
                 }
             ),
         )
         with tempfile.TemporaryDirectory() as directory:
             copy = Path(directory)
             (copy / "model").mkdir()
+            (copy / "pipeline").mkdir()
             model = (package / "model/schema.json").read_text()
             flipped = model.replace('"additionalProperties": false', '"additionalProperties": true', 1)
             self.assertNotEqual(flipped, model, "the model schema pins additionalProperties")
             (copy / "model/schema.json").write_text(flipped, encoding="utf-8")
             (copy / "schemas.py").write_bytes((package / "schemas.py").read_bytes())
             (copy / "interface_records.py").write_bytes((package / "interface_records.py").read_bytes())
+            (copy / "pipeline/contracts.py").write_bytes((package / "pipeline/contracts.py").read_bytes())
             self.assertNotEqual(interface_records.schema_definition_digest(Path(directory)), baseline)
             records = (package / "interface_records.py").read_text()
             renamed = records.replace('"ready"', '"readiness_flag"', 1)

@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from cryptography.fernet import Fernet
+from description_pipeline.pipeline.contracts import NativeTargetIdentity
 from description_pipeline.schemas import (
     INSTALL_RECORD_SCHEMA,
     STAGE_RESULT_SCHEMA,
@@ -166,6 +167,10 @@ def install_record_fixture(state: Path, install_id: str, snapshot: Path) -> dict
                 "install_id": "win-" + "a" * 32,
                 "config_digest": "a" * 64,
                 "release": {**triple, "role": "native"},
+                "target_identity": NativeTargetIdentity.create(
+                    install_id="win-" + "a" * 32,
+                    pipeline_id="solidworks-to-urdf",
+                ).to_record(),
             },
         },
         "previous": None,

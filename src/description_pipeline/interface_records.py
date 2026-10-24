@@ -58,7 +58,12 @@ KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
 #: owner modules whose machine key sets and field rules define every boundary
 #: record (health, policies, snapshots, receipts, ...).  The digest is over these
 #: definitions, never over the id strings.
-SCHEMA_DEFINITION_FILES = ("model/schema.json", "schemas.py", "interface_records.py")
+SCHEMA_DEFINITION_FILES = (
+    "model/schema.json",
+    "schemas.py",
+    "interface_records.py",
+    "pipeline/contracts.py",
+)
 
 
 def schema_definition_digest(definition_root=None) -> str:
@@ -1137,9 +1142,38 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
     _exact_keys(record["ends"], {"linux", "windows"}, code, "ends")
     for side, role in END_ROLES:
         end = record["ends"][side]
-        _exact_keys(end, {"install_id", "config_digest", "release"}, code, f"ends.{side}")
+        expected_end_keys = {"install_id", "config_digest", "release"}
+        if side == "windows":
+            expected_end_keys.add("target_identity")
+        _exact_keys(end, expected_end_keys, code, f"ends.{side}")
         _text(end["install_id"], code, f"ends.{side}.install_id")
         _hex64(end["config_digest"], code, f"ends.{side}.config_digest")
+        if side == "windows":
+            target = end["target_identity"]
+            try:
+                from .pipeline.contracts import NativeTargetIdentity  # noqa: PLC0415
+
+                normalized_target = NativeTargetIdentity.from_record(target).to_record()
+            except Exception as error:
+                raise InterfaceRecordError(
+                    code,
+                    {"where": "ends.windows.target_identity", "reason": str(error)},
+                ) from error
+            _require(
+                normalized_target == target,
+                code,
+                {"where": "ends.windows.target_identity"},
+            )
+            _require(
+                target["install_id"] == end["install_id"],
+                code,
+                {"rule": "windows runtime target install_id equals Windows end install_id"},
+            )
+            _require(
+                target["pipeline_id"] == PIPELINE_ID,
+                code,
+                {"where": "ends.windows.target_identity.pipeline_id"},
+            )
         validate_release_identity(end["release"], role=role, code=code)
     require_same_release_identity(record["release"], record["ends"]["linux"]["release"])
     # The common release identity spans both ends (same source release); the
@@ -1209,6 +1243,11 @@ def require_endpoint_matches_install_record(health, record) -> None:
     validate_health(health)
     validate_install_record(record)
     end = record["ends"]["windows"]
+    _require(
+        health["pipeline_id"] == end["target_identity"]["pipeline_id"],
+        "endpoint_end_mismatch",
+        {"field": "pipeline_id"},
+    )
     require_same_release_identity(end["release"], health["release"])
     _require(
         end["install_id"] == health["install"]["install_id"],

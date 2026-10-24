@@ -22,12 +22,20 @@ from pathlib import Path
 
 from description_pipeline import schemas
 from description_pipeline import interface_records as ir
+from description_pipeline.pipeline.contracts import NativeTargetIdentity
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
 from .contract_wheel import write_contract_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
+
+
+def native_target_identity(install_id: str) -> dict:
+    return NativeTargetIdentity.create(
+        install_id=install_id,
+        pipeline_id=ir.PIPELINE_ID,
+    ).to_record()
 
 
 _RENDER_MODULE: object | None = None
@@ -366,6 +374,7 @@ PY
             {
                 "install_id": "win-" + "1" * 32,
                 "config_digest": "d" * 64,
+                "target_identity": native_target_identity("win-" + "1" * 32),
                 "release": {
                     "version": release_document["version"],
                     "source_commit": release_document["source_commit"],
@@ -3728,6 +3737,7 @@ class InstallOrderingTests(unittest.TestCase):
                 {
                     "install_id": "ep-7",
                     "config_digest": "d" * 64,
+                    "target_identity": native_target_identity("ep-7"),
                     "release": {
                         "version": "1.4.0",
                         "source_commit": "c" * 40,

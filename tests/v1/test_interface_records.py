@@ -13,6 +13,7 @@ from unittest import mock
 
 from description_pipeline import interface_records as ir
 from description_pipeline.io import PipelineError, digest
+from description_pipeline.pipeline.contracts import NativeTargetIdentity
 from description_pipeline.schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CACHE_RELEASE_RECEIPT_SCHEMA,
@@ -202,7 +203,15 @@ def install_record(*, previous: bool = False, journal: list | None = None) -> di
         },
         "ends": {
             "linux": {"install_id": generation, "config_digest": snapshot_digest, "release": release("portable")},
-            "windows": {"install_id": "ep-7", "config_digest": OTHER_HEX, "release": release("native")},
+            "windows": {
+                "install_id": "ep-7",
+                "config_digest": OTHER_HEX,
+                "release": release("native"),
+                "target_identity": NativeTargetIdentity.create(
+                    install_id="ep-7",
+                    pipeline_id="solidworks-to-urdf",
+                ).to_record(),
+            },
         },
         "previous": None
         if not previous
@@ -853,6 +862,21 @@ class InterfaceRecordTests(unittest.TestCase):
         bad = install_record()
         bad["ends"]["windows"]["release"]["source_commit"] = OTHER_COMMIT
         self.reject("release_identity_mismatch", lambda: ir.validate_install_record(bad))
+        bad = install_record()
+        bad["ends"]["windows"]["target_identity"] = NativeTargetIdentity.create(
+            install_id="ep-other",
+            pipeline_id="solidworks-to-urdf",
+        ).to_record()
+        self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
+        bad = install_record()
+        bad["ends"]["windows"]["target_identity"] = NativeTargetIdentity.create(
+            install_id="ep-7",
+            pipeline_id="other-pipeline",
+        ).to_record()
+        self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
+        bad = install_record()
+        bad["ends"]["windows"]["target_identity"]["target_id"] = OTHER_HEX
+        self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
         bad = install_record()
         bad["snapshot"]["install_id"] = "gen-9"
         self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))

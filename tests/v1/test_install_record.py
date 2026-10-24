@@ -20,6 +20,7 @@ import unittest
 from pathlib import Path
 
 from description_pipeline import io as pipeline_io
+from description_pipeline.pipeline.contracts import NativeTargetIdentity
 
 from .contract_wheel import write_contract_wheel
 
@@ -42,6 +43,13 @@ COMMIT = "c" * 40
 SOURCE_SHA = "a" * 64
 WHEEL_NAME = "mimicverse_description-1.4.0-py3-none-any.whl"
 SERVICES = ["description-postgres", "description-airflow-scheduler", "description-operator-proxy"]
+
+
+def native_target(install_id: str = "ep-7") -> dict:
+    return NativeTargetIdentity.create(
+        install_id=install_id,
+        pipeline_id="solidworks-to-urdf",
+    ).to_record()
 
 
 def platform_document(root: Path) -> dict:
@@ -136,6 +144,7 @@ def make_endpoint_identity(root: Path) -> Path:
         "install_id": "ep-7",
         "config_digest": "d" * 64,
         "release": {"version": "1.4.0", "source_commit": COMMIT, "source_sha256": SOURCE_SHA, "role": "native"},
+        "target_identity": native_target(),
     }
     path = root / "endpoint-identity.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -185,6 +194,10 @@ class InstallRecordTests(unittest.TestCase):
         ir.validate_install_record(record)
         self.assertEqual(record["ends"]["linux"]["install_id"], "gen-1")
         self.assertEqual(record["ends"]["windows"]["install_id"], "ep-7")
+        self.assertEqual(
+            record["ends"]["windows"]["target_identity"],
+            native_target(),
+        )
         self.assertEqual(record["ends"]["windows"]["release"]["role"], "native")
         self.assertEqual(record["ends"]["linux"]["release"]["role"], "portable")
         snapshot_digest = hashlib.sha256((self.root / "state" / "snapshots" / "gen-1.json").read_bytes()).hexdigest()
@@ -193,6 +206,70 @@ class InstallRecordTests(unittest.TestCase):
         self.assertEqual(record["paths"]["state_root"], str(self.root / "state"))
         self.assertEqual(record["previous"], None)
         self.assertEqual(record["journal"], [])
+
+    def test_endpoint_target_identity_is_canonical_and_bound_to_runtime_install(self):
+        base = json.loads((self.root / "endpoint-identity.json").read_text(encoding="utf-8"))
+        variants = []
+        wrong_install = copy.deepcopy(base)
+        wrong_install["target_identity"]["install_id"] = "ep-other"
+        variants.append(wrong_install)
+        wrong_pipeline = copy.deepcopy(base)
+        wrong_pipeline["target_identity"]["pipeline_id"] = "other-pipeline"
+        variants.append(wrong_pipeline)
+        wrong_digest = copy.deepcopy(base)
+        wrong_digest["target_identity"]["target_id"] = "0" * 64
+        variants.append(wrong_digest)
+        for document in variants:
+            with self.subTest(document=document["target_identity"]), self.assertRaises(SystemExit):
+                install_record.endpoint_identity(document)
+
+    def test_endpoint_identity_cli_copies_the_registered_target_instead_of_current_health(self):
+        from .test_interface_records import health
+
+        record = build_record(self.root)
+        record_path = self.root / "state" / "install-record.json"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        health_path = self.root / "endpoint-health.json"
+        matching = health()
+        matching["install"] = {"config_digest": "d" * 64, "install_id": "ep-7"}
+        matching["endpoint"] = {"port": 9765}
+        health_path.write_text(json.dumps(matching), encoding="utf-8")
+        out = self.root / "verified-endpoint-identity.json"
+        result = install_record.main(
+            [
+                "endpoint-identity",
+                "--health",
+                str(health_path),
+                "--release-file",
+                str(self.root / "distribution" / "release.json"),
+                "--record",
+                str(record_path),
+                "--out",
+                str(out),
+            ]
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(out.read_text(encoding="utf-8"))["target_identity"],
+            record["ends"]["windows"]["target_identity"],
+        )
+        forged = matching
+        forged["install"]["install_id"] = "ep-other"
+        health_path.write_text(json.dumps(forged), encoding="utf-8")
+        with self.assertRaisesRegex(SystemExit, "does not match the active record"):
+            install_record.main(
+                [
+                    "endpoint-identity",
+                    "--health",
+                    str(health_path),
+                    "--release-file",
+                    str(self.root / "distribution" / "release.json"),
+                    "--record",
+                    str(record_path),
+                    "--out",
+                    str(out),
+                ]
+            )
 
     def test_dag_must_be_the_current_release_member(self):
         record = build_record(self.root)
@@ -355,7 +432,11 @@ class InstallRecordTests(unittest.TestCase):
                 lambda i, r: i["endpoint"]["release"].__setitem__("source_commit", "d" * 40),
                 "identity mismatch",
             ),
-            ("endpoint extra key", lambda i, r: i["endpoint"].__setitem__("profile", "x"), "exactly install_id"),
+            (
+                "endpoint extra key",
+                lambda i, r: i["endpoint"].__setitem__("profile", "x"),
+                "exactly install_id, config_digest, release, target_identity",
+            ),
             ("endpoint bad digest", lambda i, r: i["endpoint"].__setitem__("config_digest", "short"), "sha256 hex"),
             (
                 "snapshot without storage",
