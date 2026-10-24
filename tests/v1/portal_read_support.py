@@ -122,6 +122,7 @@ class RegisteredPlatform:
             capture,
             hardware_id=hardware_id,
             revision=revision,
+            run_id=run_id,
         )
         manifest = read_delivery_manifest(capture)
         handoff = read_data(capture / "input/handoff.json")

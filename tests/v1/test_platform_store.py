@@ -40,10 +40,11 @@ from description_pipeline.platform.store import (
 )
 from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import TOOL_SCHEMA
-from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, stage_view
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.solidworks_urdf import required_checks
 from tests.v1.source_record_support import source_record
+from tests.v1.protocol_support import protocol_events
 
 NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
 CHECKPOINT = "store://sealed/run-r-1"
@@ -55,6 +56,7 @@ def build_sealed_delivery(
     *,
     hardware_id: str = "nd",
     revision: str | None = None,
+    run_id: str = "fixture-sealed-delivery",
 ) -> tuple[str, list[dict], str, str]:
     """One real sealed delivery: manifest record-for-record plus its digests.
 
@@ -69,6 +71,17 @@ def build_sealed_delivery(
         (root / name).mkdir(parents=True)
     (root / "input" / "records").mkdir()
     (root / "evidence" / "geometry").mkdir()
+    (root / "native-observation").mkdir()
+    (root / "prepared").mkdir()
+    write_json(root / "stage-request.json", {"fixture": "freeze-stage-request"})
+    write_json(root / "request.json", {"fixture": "stage-request"})
+    write_json(root / "inputs.json", {"fixture": "freeze-inputs"})
+    write_json(root / "ruleset.json", {"fixture": "freeze-ruleset"})
+    write_json(root / "configuration.json", {"fixture": "freeze-configuration"})
+    write_json(root / "checks.json", {"fixture": "stage-checks"})
+    write_json(root / "result.json", {"fixture": "discover-result"})
+    write_json(root / "native-observation" / "observation.json", {"fixture": "native-observation"})
+    write_json(root / "prepared" / "request.json", {"fixture": "prepared-request"})
     write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
     (root / "input" / "cad" / "cad").mkdir(parents=True)
     (root / "input" / "cad" / "cad" / "robot.SLDASM").write_bytes(b"fixture-native")
@@ -121,6 +134,7 @@ def build_sealed_delivery(
     (root / "meshes" / "part.stl").write_bytes(b"mesh-stl")
     write_json(root / "tool.json", tool_record())
     write_json(root / "reports" / "quality.json", {"quality": "fixture"})
+    write_json(root / "reports" / "generate.json", {"fixture": "generate-receipt"})
     write_json(
         root / "reports" / "native-tool.json",
         {
@@ -131,7 +145,24 @@ def build_sealed_delivery(
             "runtime": {"role": "native"},
         },
     )
+    native_events = protocol_events(stages=("freeze", "discover", "capture"))
+    native_stages = stage_view(
+        {
+            "run_id": run_id,
+            "request": {"handoff_sha256": digest(native_inventory)},
+            "result": {"execution_scope": ["freeze", "discover", "capture"]},
+            "events": native_events,
+        }
+    )
+    native_stages["events"] = native_events
+    write_json(root / "reports" / "native-stages.json", native_stages)
     write_json(root / "transfer-manifest.json", {"handoff_sha256": digest(native_inventory)})
+    write_json(root / "verification-certificate.json", {"fixture": "verification-certificate"})
+    write_json(root / "verification-execution.json", {"fixture": "verification-execution"})
+    write_json(root / "publication-receipt.json", {"fixture": "publication-receipt"})
+    write_json(root / "publication-plan.json", {"fixture": "publication-plan"})
+    write_json(root / "observation.json", {"fixture": "publication-observation"})
+    (root / "candidate.bundle").write_bytes(b"fixture-candidate\n")
     from description_pipeline.request_evidence import build_request_evidence, write_request_evidence
 
     write_request_evidence(
@@ -2289,7 +2320,7 @@ class PlatformStoreTests(unittest.TestCase):
                 "subject_sha256": self.subject,
             },
         )
-        self.assertIn("submission", store_module.STAGE_EVIDENCE["publish"])
+        self.assertNotIn("submission", store_module.STAGE_EVIDENCE["publish"])
         self.assertFalse(store_module._evidence_path("submission"))
         self.assertTrue(store_module._evidence_path("reports/absent.json"))
         self.assertTrue(store_module._evidence_path("reports/中文.json"))
