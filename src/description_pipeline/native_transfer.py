@@ -1493,10 +1493,11 @@ def validate_native_receipts(
         raise PipelineError("Native receipts are not UTF-8 JSON") from error
     request_path = confined(root, "input/request.json", exists=False)
     carried = {"input/request.json": file_digest(request_path)} if request_path.is_file() else {}
-    team_reports_present = all((Path(root) / name).is_file() for name in TEAM_REPORTS)
     summary = verify_transfer(
         root,
-        regenerated=() if team_reports_present else TEAM_REPORTS,
+        # These reports are presentation projections of the receiving stage.
+        # Their presence or absence cannot change the native evidence class.
+        regenerated=TEAM_REPORTS,
         carried=carried,
         native_receipts=blobs,
         expected_upload_sha256=expected_upload_sha256,
