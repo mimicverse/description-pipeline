@@ -113,7 +113,7 @@ class AdmissionHarness:
             executors=StageExecutors(
                 freeze=digest({"executor": "freeze"}),
                 discover=digest({"executor": "discover"}),
-                capture=digest({"executor": "native"}),
+                capture=digest({"executor": "capture-linux"}),
                 generate=digest({"executor": "generate"}),
                 verify=digest({"executor": "verify"}),
                 publish=digest({"executor": "publish"}),
@@ -161,6 +161,7 @@ class AdmissionHarness:
         stage=None,
         input_artifacts=None,
         config_snapshot_sha256=None,
+        expected_executor_sha256=...,
         predecessor_decision_id=...,
     ) -> StageCommand:
         return StageCommand.create(
@@ -175,7 +176,9 @@ class AdmissionHarness:
             ),
             contract_sha256=command.contract_sha256,
             policy_sha256=command.policy_sha256,
-            expected_executor_sha256=command.expected_executor_sha256,
+            expected_executor_sha256=(
+                command.expected_executor_sha256 if expected_executor_sha256 is ... else expected_executor_sha256
+            ),
             predecessor_decision_id=(
                 command.predecessor_decision_id if predecessor_decision_id is ... else predecessor_decision_id
             ),
@@ -405,6 +408,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
+            "native_tool": {"executor": "native"},
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
@@ -424,7 +428,14 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(capture_command.stage, "capture")
         self.assertEqual(
             set(capture_command.request),
-            {"effect_key", "handoff_sha256", "main_assembly", "prepared_sha256", "upload_sha256"},
+            {
+                "effect_key",
+                "handoff_sha256",
+                "main_assembly",
+                "native_tool_sha256",
+                "prepared_sha256",
+                "upload_sha256",
+            },
         )
         self.assertEqual(capture_command.predecessor_decision_id, discover.decision.decision_id)
         self.assertEqual(
@@ -435,6 +446,10 @@ class AdmissionProjectionTests(unittest.TestCase):
             ),
         )
         self.assertEqual(capture_command.request["prepared_sha256"], discover_result.prepared_sha256)
+        self.assertNotEqual(
+            capture_command.expected_executor_sha256,
+            capture_command.request["native_tool_sha256"],
+        )
         self.assertEqual(
             generate_command.request,
             {
@@ -513,6 +528,50 @@ class AdmissionProjectionTests(unittest.TestCase):
             validate_verify_command(self.harness.spec, generate, capture, wrong_verify)
         self.assertIn("request.capture_artifact_id", verify_error.exception.detail["fields"])
 
+        wrong_native_record = {
+            **discover_payload,
+            "native_tool": {"executor": "different-native"},
+        }
+        wrong_native_result = VerifiedDiscoverResult.from_record(discover, wrong_native_record)
+        sends: list[str] = []
+        with self.assertRaises(ProtocolError):
+            build_capture_command(self.harness.spec, freeze, discover, wrong_native_result)
+            sends.append("native")
+        self.assertEqual(sends, [])
+
+        wrong_native_request = AdmissionHarness.manual(
+            capture_command,
+            request={
+                **_request(capture_command),
+                "native_tool_sha256": digest({"executor": "wrong-native-requirement"}),
+            },
+        )
+        with self.assertRaises(ProtocolError):
+            validate_capture_command(
+                self.harness.spec,
+                freeze,
+                discover,
+                discover_result,
+                wrong_native_request,
+            )
+            sends.append("native")
+        self.assertEqual(sends, [])
+
+        wrong_executor = AdmissionHarness.manual(
+            capture_command,
+            expected_executor_sha256=digest({"executor": "wrong-linux-capture"}),
+        )
+        with self.assertRaises(ProtocolError):
+            validate_capture_command(
+                self.harness.spec,
+                freeze,
+                discover,
+                discover_result,
+                wrong_executor,
+            )
+            sends.append("native")
+        self.assertEqual(sends, [])
+
     def test_wrong_capture_prepared_digest_is_rejected(self) -> None:
         freeze = self.harness.freeze_result(self.command)
         discover_command = build_discover_command(self.harness.spec, freeze)
@@ -531,6 +590,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
+            "native_tool": {"executor": "native"},
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
@@ -563,6 +623,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
+            "native_tool": {"executor": "native"},
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
