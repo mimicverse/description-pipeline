@@ -321,7 +321,7 @@ class CaptureHandlerTests(unittest.TestCase):
             "configuration_artifact_id": self.configuration_ref.artifact_id,
             "upload_inventory_sha256": digest(self.stage_fixture.source_files),
             "ruleset_catalog_sha256": self.ruleset_ref.set_sha256,
-            "platform_config_sha256": self.configuration_ref.set_sha256,
+            "platform_config_sha256": self.stage_fixture.platform_config_sha256,
         }
         freeze_command = StageCommand.create(
             command_id="freeze-command",
@@ -330,7 +330,7 @@ class CaptureHandlerTests(unittest.TestCase):
             idempotency_key=f"{PARENT}/freeze",
             request=freeze_request,
             input_artifacts=(self.source_ref, self.ruleset_ref, self.configuration_ref),
-            config_snapshot_sha256=self.configuration_ref.set_sha256,
+            config_snapshot_sha256=self.stage_fixture.platform_config_sha256,
             contract_sha256=digest({"contract": "freeze"}),
             policy_sha256=digest({"policy": "freeze"}),
             expected_executor_sha256=digest({"executor": "freeze"}),
@@ -362,7 +362,7 @@ class CaptureHandlerTests(unittest.TestCase):
             ruleset_artifact_id=self.ruleset_ref.artifact_id,
             configuration_artifact_id=self.configuration_ref.artifact_id,
             ruleset_catalog_sha256=self.ruleset_ref.set_sha256,
-            platform_config_sha256=self.configuration_ref.set_sha256,
+            platform_config_sha256=self.stage_fixture.platform_config_sha256,
             expected_native_tool_sha256=self.expected_native_tool_sha256,
             expected_native_tool_record_sha256=(
                 self.native_tool_sha256
@@ -383,7 +383,7 @@ class CaptureHandlerTests(unittest.TestCase):
                 self.ruleset_ref,
                 self.configuration_ref,
             ),
-            config_snapshot_sha256=self.configuration_ref.set_sha256,
+            config_snapshot_sha256=self.stage_fixture.platform_config_sha256,
             contract_sha256=digest({"contract": "discover"}),
             policy_sha256=digest({"policy": "discover"}),
             expected_executor_sha256=digest({"executor": "discover"}),
