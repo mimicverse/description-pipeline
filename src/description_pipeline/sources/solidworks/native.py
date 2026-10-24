@@ -4905,6 +4905,12 @@ class SolidWorksBackend(CadBackend):
                             },
                         )
                     storage_scope = "session"
+                    role = self._role_for_path(document_path)
+                    self._bind_session_document(
+                        role,
+                        self._sessions.get(role),
+                        document_path,
+                    )
                     session_files.append(document_path)
                 topology.append(
                     {

@@ -200,11 +200,24 @@ class _Doc:
         raise AssertionError("capture rebuild must use IModelDocExtension.Rebuild")
 
 
+class _Session:
+    def __init__(self, pid, *, state="active"):
+        self._pid = pid
+        self.closed = state == "closed"
+
+    def identity(self):
+        return {"pid": self._pid, "state": "closed" if self.closed else "active"}
+
+
 class _Backend(SolidWorksBackend):
-    def __init__(self, refresh):
+    def __init__(self, refresh, *, session_pid=1234, extra_sessions=None):
+        super().__init__()
         self._capture_roots = [CAPTURE_ROOT]
         self._refresh = refresh
         self.refresh_calls = []
+        self._sessions = {"copy": _Session(session_pid)}
+        if extra_sessions:
+            self._sessions.update(extra_sessions)
 
     def _document_handle_by_path(self, path):
         self.refresh_calls.append(str(path))
@@ -849,6 +862,56 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             _, preparation = backend._rebuild_capture_copy(top, PATH)
         self.assertEqual([row["path"] for row in preparation["child_rebuilds"]], [VIRTUAL_ASSEMBLY])
         self.assertEqual(virtual.rebuild_calls, 1)
+        self.assertEqual(top.rebuild_calls, 0)
+
+    def test_virtual_assembly_session_pid_mismatch_blocks_before_rebuild(self):
+        virtual = _Doc(VIRTUAL_ASSEMBLY, needs_rebuild2=1)
+        top = _Doc(
+            PATH,
+            children=[
+                _Component(
+                    "virtual-1",
+                    virtual,
+                    is_virtual=True,
+                )
+            ],
+        )
+        backend = _Backend(
+            {PATH: top, VIRTUAL_ASSEMBLY: virtual},
+            session_pid=4321,
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_materialization_session_mismatch")
+        self.assertEqual(virtual.rebuild_calls, 0)
+        self.assertEqual(top.rebuild_calls, 0)
+
+    def test_virtual_assembly_with_ambiguous_session_blocks_before_rebuild(self):
+        virtual = _Doc(VIRTUAL_ASSEMBLY, needs_rebuild2=1)
+        top = _Doc(
+            PATH,
+            children=[
+                _Component(
+                    "virtual-1",
+                    virtual,
+                    is_virtual=True,
+                )
+            ],
+        )
+        backend = _Backend(
+            {PATH: top, VIRTUAL_ASSEMBLY: virtual},
+            extra_sessions={"source": _Session(4321)},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="e" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_materialization_session_ambiguous")
+        self.assertEqual(virtual.rebuild_calls, 0)
         self.assertEqual(top.rebuild_calls, 0)
 
     def test_file_backed_dependency_outside_the_copy_is_rejected(self):
