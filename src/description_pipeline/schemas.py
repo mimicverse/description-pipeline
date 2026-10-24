@@ -53,6 +53,10 @@ VERIFICATION_EXECUTION_SCHEMA = "solidworks-to-urdf.verification-execution/v1"
 VERIFY_REQUEST_SCHEMA = "solidworks-to-urdf.verify-request/v1"
 DISPATCH_CONF_SCHEMA = AIRFLOW_DISPATCH_CONF_SCHEMA
 DISPATCH_EFFECT_SCHEMA = AIRFLOW_DISPATCH_EFFECT_SCHEMA
+DIAGNOSTIC_ADMISSION_SCHEMA = "solidworks-to-urdf.diagnostic-admission-spec/v1"
+DIAGNOSTIC_SCOPE_SCHEMA = "solidworks-to-urdf.diagnostic-replay-scope/v1"
+DIAGNOSTIC_COMMAND_REQUEST_SCHEMA = "solidworks-to-urdf.diagnostic-command-request/v1"
+STAGE_QUALIFICATION_SCHEMA = "solidworks-to-urdf.stage-qualification/v1"
 
 #: W1 machine schemas for records crossing the platform / endpoint boundary
 #: (frozen-interfaces-v1.1 IF-04/09/10/11/16).  One owner module; consumers

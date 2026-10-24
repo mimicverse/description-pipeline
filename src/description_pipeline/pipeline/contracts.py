@@ -18,10 +18,12 @@ from typing import Any, Literal
 from ..io import PipelineError, canonical, digest
 from ..schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
+    DIAGNOSTIC_SCOPE_SCHEMA,
     DISPATCH_COMMAND_SCHEMA,
     FAILURE_ENVELOPE_SCHEMA,
     RUN_ADMISSION_SCHEMA,
     STAGE_COMMAND_SCHEMA,
+    STAGE_QUALIFICATION_SCHEMA,
     STAGE_RESULT_SCHEMA,
 )
 
@@ -29,6 +31,7 @@ STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 StageId = Literal["freeze", "discover", "capture", "generate", "verify", "publish"]
 Outcome = Literal["completed", "failed", "cancelled"]
 EffectKind = Literal["airflow_dispatch", "native_operation", "git_ref_update", "pr_upsert"]
+QUALIFICATION_SCHEMA = STAGE_QUALIFICATION_SCHEMA
 
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -251,6 +254,70 @@ class ArtifactRef:
         return cls(**dict(record))
 
 
+def artifact_closure_sha256(artifacts: tuple[ArtifactRef, ...]) -> str:
+    """Digest one ordered complete input artifact closure."""
+
+    if not isinstance(artifacts, tuple):
+        raise ProtocolError("artifact.closure_invalid", {"reason": "tuple-required"})
+    if not all(isinstance(item, ArtifactRef) for item in artifacts):
+        raise ProtocolError("artifact.closure_invalid", {"reason": "artifact-ref-required"})
+    return digest([item.to_record() for item in artifacts])
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticReplayScope:
+    """The immutable single-stage diagnostic replay identity."""
+
+    schema_version: str
+    target_stage: StageId
+    input_closure_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != DIAGNOSTIC_SCOPE_SCHEMA:
+            raise ProtocolError("diagnostic.schema_unsupported", {"value": self.schema_version})
+        _require_stage(self.target_stage, "diagnostic.invalid", "target_stage")
+        _require_digest(self.input_closure_sha256, "diagnostic.invalid", "input_closure_sha256")
+
+    @classmethod
+    def from_inputs(
+        cls,
+        target_stage: StageId,
+        input_artifacts: tuple[ArtifactRef, ...],
+    ) -> DiagnosticReplayScope:
+        return cls(
+            schema_version=DIAGNOSTIC_SCOPE_SCHEMA,
+            target_stage=target_stage,
+            input_closure_sha256=artifact_closure_sha256(input_artifacts),
+        )
+
+    def validate_for(self, stage: StageId, input_artifacts: tuple[ArtifactRef, ...]) -> None:
+        if self.target_stage != stage or self.input_closure_sha256 != artifact_closure_sha256(input_artifacts):
+            raise ProtocolError("diagnostic.command_mismatch", {"stage": stage})
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "schema_version": self.schema_version,
+            "target_stage": self.target_stage,
+            "input_closure_sha256": self.input_closure_sha256,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> DiagnosticReplayScope:
+        if not isinstance(record, Mapping):
+            raise ProtocolError("diagnostic.invalid", {"reason": "not-an-object"})
+        expected = {"schema_version", "target_stage", "input_closure_sha256"}
+        if set(record) != expected:
+            raise ProtocolError(
+                "diagnostic.invalid",
+                {"missing": sorted(expected - set(record)), "unknown": sorted(set(record) - expected)},
+            )
+        return cls(**dict(record))
+
+    @property
+    def digest(self) -> str:
+        return digest(self.to_record())
+
+
 @dataclass(frozen=True, slots=True)
 class StageCommand:
     """The complete non-secret request that authorizes one stage execution."""
@@ -269,6 +336,7 @@ class StageCommand:
     policy_sha256: str
     expected_executor_sha256: str
     predecessor_decision_id: str | None
+    diagnostic_scope: DiagnosticReplayScope | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != STAGE_COMMAND_SCHEMA:
@@ -294,11 +362,20 @@ class StageCommand:
         _require_digest(self.expected_executor_sha256, "command.invalid", "expected_executor_sha256")
         if self.predecessor_decision_id is not None:
             _require_text(self.predecessor_decision_id, "command.invalid", "predecessor_decision_id")
+        if self.diagnostic_scope is not None:
+            if not isinstance(self.diagnostic_scope, DiagnosticReplayScope):
+                raise ProtocolError("command.invalid", {"where": "diagnostic_scope"})
+            self.diagnostic_scope.validate_for(self.stage, self.input_artifacts)
+            if self.predecessor_decision_id is not None:
+                raise ProtocolError(
+                    "command.invalid",
+                    {"where": "predecessor_decision_id", "reason": "diagnostic"},
+                )
         if digest(self.identity_record()) != self.request_digest:
             raise ProtocolError("command.digest_mismatch", {"command_id": self.command_id})
 
     def identity_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "command_id": self.command_id,
             "config_snapshot_sha256": self.config_snapshot_sha256,
             "contract_sha256": self.contract_sha256,
@@ -313,6 +390,9 @@ class StageCommand:
             "schema_version": self.schema_version,
             "stage": self.stage,
         }
+        if self.diagnostic_scope is not None:
+            record["diagnostic_scope"] = self.diagnostic_scope.to_record()
+        return record
 
     @classmethod
     def create(
@@ -329,6 +409,7 @@ class StageCommand:
         policy_sha256: str,
         expected_executor_sha256: str,
         predecessor_decision_id: str | None,
+        diagnostic_scope: DiagnosticReplayScope | None = None,
     ) -> StageCommand:
         values = {
             "schema_version": STAGE_COMMAND_SCHEMA,
@@ -344,24 +425,26 @@ class StageCommand:
             "policy_sha256": policy_sha256,
             "expected_executor_sha256": expected_executor_sha256,
             "predecessor_decision_id": predecessor_decision_id,
+            "diagnostic_scope": diagnostic_scope,
         }
-        request_digest = digest(
-            {
-                "command_id": command_id,
-                "idempotency_key": idempotency_key,
-                "kind": values["kind"],
-                "request": values["request"],
-                "schema_version": values["schema_version"],
-                "stage": values["stage"],
-                "run_id": values["run_id"],
-                "input_artifacts": [item.to_record() for item in input_artifacts],
-                "config_snapshot_sha256": config_snapshot_sha256,
-                "contract_sha256": contract_sha256,
-                "policy_sha256": policy_sha256,
-                "expected_executor_sha256": expected_executor_sha256,
-                "predecessor_decision_id": predecessor_decision_id,
-            }
-        )
+        identity = {
+            "command_id": command_id,
+            "idempotency_key": idempotency_key,
+            "kind": values["kind"],
+            "request": values["request"],
+            "schema_version": values["schema_version"],
+            "stage": values["stage"],
+            "run_id": run_id,
+            "input_artifacts": [item.to_record() for item in input_artifacts],
+            "config_snapshot_sha256": config_snapshot_sha256,
+            "contract_sha256": contract_sha256,
+            "policy_sha256": policy_sha256,
+            "expected_executor_sha256": expected_executor_sha256,
+            "predecessor_decision_id": predecessor_decision_id,
+        }
+        if diagnostic_scope is not None:
+            identity["diagnostic_scope"] = diagnostic_scope.to_record()
+        request_digest = digest(identity)
         return cls(request_digest=request_digest, **values)
 
     def to_record(self) -> dict[str, Any]:
@@ -369,6 +452,57 @@ class StageCommand:
             **self.identity_record(),
             "request_digest": self.request_digest,
         }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> StageCommand:
+        if not isinstance(record, Mapping):
+            raise ProtocolError("command.invalid", {"reason": "not-an-object"})
+        required = {
+            "command_id",
+            "config_snapshot_sha256",
+            "contract_sha256",
+            "expected_executor_sha256",
+            "idempotency_key",
+            "input_artifacts",
+            "kind",
+            "policy_sha256",
+            "predecessor_decision_id",
+            "request",
+            "request_digest",
+            "run_id",
+            "schema_version",
+            "stage",
+        }
+        expected = required | ({"diagnostic_scope"} if "diagnostic_scope" in record else set())
+        if set(record) != expected:
+            raise ProtocolError(
+                "command.invalid",
+                {"missing": sorted(required - set(record)), "unknown": sorted(set(record) - expected)},
+            )
+        inputs = record["input_artifacts"]
+        if not isinstance(inputs, (list, tuple)):
+            raise ProtocolError("command.invalid", {"where": "input_artifacts"})
+        return cls(
+            schema_version=record["schema_version"],
+            command_id=record["command_id"],
+            run_id=record["run_id"],
+            kind=record["kind"],
+            stage=record["stage"],
+            idempotency_key=record["idempotency_key"],
+            request=record["request"],
+            request_digest=record["request_digest"],
+            input_artifacts=tuple(ArtifactRef.from_record(item) for item in inputs),
+            config_snapshot_sha256=record["config_snapshot_sha256"],
+            contract_sha256=record["contract_sha256"],
+            policy_sha256=record["policy_sha256"],
+            expected_executor_sha256=record["expected_executor_sha256"],
+            predecessor_decision_id=record["predecessor_decision_id"],
+            diagnostic_scope=(
+                DiagnosticReplayScope.from_record(record["diagnostic_scope"])
+                if "diagnostic_scope" in record
+                else None
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,6 +678,7 @@ class StageResult:
     resources_settled: bool
     required_effect_ids: tuple[str, ...] = ()
     reason_code: str | None = None
+    diagnostic_scope: DiagnosticReplayScope | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != STAGE_RESULT_SCHEMA:
@@ -580,9 +715,14 @@ class StageResult:
             raise ProtocolError("result.invalid", {"where": "reason_code", "reason": "completed"})
         if self.outcome == "completed" and self.resources_settled is not True:
             raise ProtocolError("result.invalid", {"where": "resources_settled", "reason": "completed"})
+        if self.diagnostic_scope is not None:
+            if not isinstance(self.diagnostic_scope, DiagnosticReplayScope):
+                raise ProtocolError("result.invalid", {"where": "diagnostic_scope"})
+            if self.diagnostic_scope.target_stage != self.stage:
+                raise ProtocolError("result.invalid", {"where": "diagnostic_scope", "reason": "stage"})
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "actual_executor_sha256": self.actual_executor_sha256,
             "checks_sha256": self.checks_sha256,
             "command_id": self.command_id,
@@ -596,12 +736,15 @@ class StageResult:
             "schema_version": self.schema_version,
             "stage": self.stage,
         }
+        if self.diagnostic_scope is not None:
+            record["diagnostic_scope"] = self.diagnostic_scope.to_record()
+        return record
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> StageResult:
         if not isinstance(record, Mapping):
             raise ProtocolError("result.invalid", {"reason": "not-an-object"})
-        expected = {
+        required = {
             "actual_executor_sha256",
             "checks_sha256",
             "command_id",
@@ -615,10 +758,11 @@ class StageResult:
             "schema_version",
             "stage",
         }
+        expected = required | ({"diagnostic_scope"} if "diagnostic_scope" in record else set())
         if set(record) != expected:
             raise ProtocolError(
                 "result.invalid",
-                {"missing": sorted(expected - set(record)), "unknown": sorted(set(record) - expected)},
+                {"missing": sorted(required - set(record)), "unknown": sorted(set(record) - expected)},
             )
         required_effects = record["required_effect_ids"]
         if not isinstance(required_effects, list):
@@ -636,6 +780,11 @@ class StageResult:
             resources_settled=record["resources_settled"],
             required_effect_ids=tuple(required_effects),
             reason_code=record["reason_code"],
+            diagnostic_scope=(
+                DiagnosticReplayScope.from_record(record["diagnostic_scope"])
+                if "diagnostic_scope" in record
+                else None
+            ),
         )
 
     @property
@@ -732,6 +881,7 @@ class FailureEnvelope:
     retained_locations: tuple[str, ...]
     unavailable_reason: str | None
     occurred_at: datetime
+    diagnostic_scope: DiagnosticReplayScope | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != FAILURE_ENVELOPE_SCHEMA:
@@ -785,9 +935,14 @@ class FailureEnvelope:
             _require_text(self.unavailable_reason, "failure.invalid", "unavailable_reason")
         if not isinstance(self.occurred_at, datetime) or self.occurred_at.tzinfo is None:
             raise ProtocolError("failure.invalid", {"where": "occurred_at"})
+        if self.diagnostic_scope is not None:
+            if not isinstance(self.diagnostic_scope, DiagnosticReplayScope):
+                raise ProtocolError("failure.invalid", {"where": "diagnostic_scope"})
+            if self.diagnostic_scope.target_stage != self.stage:
+                raise ProtocolError("failure.invalid", {"where": "diagnostic_scope", "reason": "stage"})
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "actual_executor_sha256": self.actual_executor_sha256,
             "command_id": self.command_id,
             "effect_states": [list(row) for row in self.effect_states],
@@ -805,12 +960,15 @@ class FailureEnvelope:
             "stage": self.stage,
             "unavailable_reason": self.unavailable_reason,
         }
+        if self.diagnostic_scope is not None:
+            record["diagnostic_scope"] = self.diagnostic_scope.to_record()
+        return record
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> FailureEnvelope:
         if not isinstance(record, Mapping):
             raise ProtocolError("failure.invalid", {"reason": "not-an-object"})
-        expected = {
+        required = {
             "actual_executor_sha256",
             "command_id",
             "effect_states",
@@ -828,10 +986,11 @@ class FailureEnvelope:
             "stage",
             "unavailable_reason",
         }
+        expected = required | ({"diagnostic_scope"} if "diagnostic_scope" in record else set())
         if set(record) != expected:
             raise ProtocolError(
                 "failure.invalid",
-                {"missing": sorted(expected - set(record)), "unknown": sorted(set(record) - expected)},
+                {"missing": sorted(required - set(record)), "unknown": sorted(set(record) - expected)},
             )
         effect_rows = record["effect_states"]
         evidence = record["evidence_artifacts"]
@@ -862,11 +1021,184 @@ class FailureEnvelope:
             retained_locations=tuple(retained),
             unavailable_reason=record["unavailable_reason"],
             occurred_at=occurred_at,
+            diagnostic_scope=(
+                DiagnosticReplayScope.from_record(record["diagnostic_scope"])
+                if "diagnostic_scope" in record
+                else None
+            ),
         )
 
     @property
     def digest(self) -> str:
         return digest(self.to_record())
+
+
+@dataclass(frozen=True, slots=True)
+class StageQualification:
+    """The certificate-facing qualification derived from one committed record."""
+
+    schema_version: str
+    command_id: str
+    run_id: str
+    stage: StageId
+    admission_request_digest: str
+    request_digest: str
+    command_digest: str
+    record_digest: str
+    outcome: Outcome
+    diagnostic_scope: DiagnosticReplayScope | None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != QUALIFICATION_SCHEMA:
+            raise ProtocolError("qualification.schema_unsupported", {"value": self.schema_version})
+        _require_identifier(self.command_id, "qualification.invalid", "command_id")
+        _require_identifier(self.run_id, "qualification.invalid", "run_id")
+        _require_stage(self.stage, "qualification.invalid", "stage")
+        _require_digest(self.admission_request_digest, "qualification.invalid", "admission_request_digest")
+        _require_digest(self.request_digest, "qualification.invalid", "request_digest")
+        _require_digest(self.command_digest, "qualification.invalid", "command_digest")
+        _require_digest(self.record_digest, "qualification.invalid", "record_digest")
+        if self.outcome not in {"completed", "failed", "cancelled"}:
+            raise ProtocolError("qualification.invalid", {"where": "outcome"})
+        if self.diagnostic_scope is not None:
+            if not isinstance(self.diagnostic_scope, DiagnosticReplayScope):
+                raise ProtocolError("qualification.invalid", {"where": "diagnostic_scope"})
+            if self.diagnostic_scope.target_stage != self.stage:
+                raise ProtocolError("qualification.invalid", {"where": "diagnostic_scope", "reason": "stage"})
+
+    @property
+    def scope_kind(self) -> Literal["formal", "diagnostic"]:
+        return "formal" if self.diagnostic_scope is None else "diagnostic"
+
+    @property
+    def formal_eligible(self) -> bool:
+        return self.scope_kind == "formal" and self.outcome == "completed"
+
+    def identity_record(self) -> dict[str, Any]:
+        return {
+            "admission_request_digest": self.admission_request_digest,
+            "command_digest": self.command_digest,
+            "command_id": self.command_id,
+            "diagnostic_scope": self.diagnostic_scope.to_record() if self.diagnostic_scope is not None else None,
+            "formal_eligible": self.formal_eligible,
+            "outcome": self.outcome,
+            "record_digest": self.record_digest,
+            "request_digest": self.request_digest,
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+            "scope_kind": self.scope_kind,
+            "stage": self.stage,
+        }
+
+    @property
+    def digest(self) -> str:
+        return digest(self.identity_record())
+
+    def to_record(self) -> dict[str, Any]:
+        return {**self.identity_record(), "qualification_digest": self.digest}
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> StageQualification:
+        expected = {
+            "admission_request_digest",
+            "command_digest",
+            "command_id",
+            "diagnostic_scope",
+            "formal_eligible",
+            "outcome",
+            "qualification_digest",
+            "record_digest",
+            "request_digest",
+            "run_id",
+            "schema_version",
+            "scope_kind",
+            "stage",
+        }
+        if not isinstance(record, Mapping) or set(record) != expected:
+            raise ProtocolError("qualification.invalid", {"where": "record"})
+        scope = (
+            DiagnosticReplayScope.from_record(record["diagnostic_scope"])
+            if record["diagnostic_scope"] is not None
+            else None
+        )
+        value = cls(
+            schema_version=record["schema_version"],
+            command_id=record["command_id"],
+            run_id=record["run_id"],
+            stage=record["stage"],
+            admission_request_digest=record["admission_request_digest"],
+            request_digest=record["request_digest"],
+            command_digest=record["command_digest"],
+            record_digest=record["record_digest"],
+            outcome=record["outcome"],
+            diagnostic_scope=scope,
+        )
+        if (
+            record["scope_kind"] != value.scope_kind
+            or record["formal_eligible"] is not value.formal_eligible
+            or record["qualification_digest"] != value.digest
+        ):
+            raise ProtocolError("qualification.invalid", {"reason": "derived-fields"})
+        return value
+
+
+def qualify_stage(
+    admission: RunAdmission,
+    command: StageCommand,
+    *,
+    result: StageResult | None = None,
+    failure: FailureEnvelope | None = None,
+) -> StageQualification:
+    """Derive formal/diagnostic certificate eligibility from immutable records."""
+
+    if command.stage is None:
+        raise ProtocolError("qualification.invalid", {"where": "command.stage"})
+    if not isinstance(admission, RunAdmission) or admission.run_id != command.run_id:
+        raise ProtocolError("qualification.admission_mismatch", {"run_id": command.run_id})
+    if command.diagnostic_scope is not None and admission.from_stage != command.stage:
+        raise ProtocolError("qualification.admission_mismatch", {"where": "from_stage"})
+    if (result is None) == (failure is None):
+        raise ProtocolError("qualification.invalid", {"reason": "one-record-required"})
+    record = result if result is not None else failure
+    if (
+        record.command_id != command.command_id
+        or record.run_id != command.run_id
+        or record.stage != command.stage
+        or record.request_digest != command.request_digest
+        or record.actual_executor_sha256 != command.expected_executor_sha256
+        or record.diagnostic_scope != command.diagnostic_scope
+    ):
+        raise ProtocolError("qualification.record_mismatch", {"command_id": command.command_id})
+    return StageQualification(
+        schema_version=QUALIFICATION_SCHEMA,
+        command_id=command.command_id,
+        run_id=command.run_id,
+        stage=command.stage,
+        admission_request_digest=admission.request_digest,
+        request_digest=command.request_digest,
+        command_digest=digest(command.to_record()),
+        record_digest=record.digest,
+        outcome=record.outcome,
+        diagnostic_scope=command.diagnostic_scope,
+    )
+
+
+def require_formal_qualification(
+    qualification: StageQualification,
+    admission: RunAdmission,
+    command: StageCommand,
+    *,
+    result: StageResult | None = None,
+    failure: FailureEnvelope | None = None,
+) -> StageQualification:
+    """Recompute and require one formal, same-admission, same-record qualification."""
+
+    if not isinstance(qualification, StageQualification):
+        raise ProtocolError("qualification.invalid", {"where": "qualification"})
+    expected = qualify_stage(admission, command, result=result, failure=failure)
+    if expected != qualification or not expected.formal_eligible:
+        raise ProtocolError("qualification.formal_ineligible", {"command_id": command.command_id})
+    return expected
 
 
 @dataclass(frozen=True, slots=True)

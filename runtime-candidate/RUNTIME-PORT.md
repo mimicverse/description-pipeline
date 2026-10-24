@@ -168,3 +168,114 @@ commit 元数据；builder 不读取当前 Git、scratch 或未封存配置。
 本候选只完成共享运行时与 PostgreSQL 组合验证。Portal/handler 的最终接线由主架构
 统一组合；本轮未连接真实 Airflow、Portal、现场、Windows 或 CAD，也不构成任何部署或
 Capture 阶段通过声明。
+
+## 单阶段 diagnostic replay
+
+诊断入口使用显式的 `DiagnosticAdmissionSpec`：
+
+```text
+DiagnosticAdmissionSpec:
+  schema_version, run_id, request_id
+  target_stage
+  request
+  input_artifacts
+  expected_executor_sha256
+  config_snapshot_sha256, contract_sha256, policy_sha256
+  created_at
+```
+
+`build_diagnostic_command` 从有序 `ArtifactRef` closure 生成唯一的
+`DiagnosticReplayScope`，并创建 `predecessor_decision_id=None` 的单个 target-stage
+command。`FactStore.admit_diagnostic` 只写该 run 和这一条 command，不写任何上游
+`StageDecision`。同一 target 的重复接纳返回相同事实。
+
+`DiagnosticReplayScope` 只包含 `target_stage` 和完整输入 closure 摘要，并条件性绑定在
+`StageCommand`、`StageResult` 和 `FailureEnvelope` 中。formal 记录不写该字段，因此现有
+v1 序列化形状不变。`StageQualification` 同时绑定 admission request digest、command
+digest、result/failure record digest 和 diagnostic scope。formal 消费者必须用同一
+Admission、command 与封存结果调用 `require_formal_qualification` 重算，不能只信任
+`formal_eligible` 布尔；删除 scope、替换 record 或换用另一 admission 都会失败。
+`VerifiedPredecessor` 另拒绝所有 diagnostic command 或 result。
+
+入口适配步骤：
+
+1. 通过 `DiagnosticRuntimeConfig(database_dsn=..., artifact_root=..., database_options=...)`
+   显式打开私有 `DiagnosticStores`，不存在生产环境变量回退。
+2. 用 `ArtifactStore.import_object(source_store, ref)` 导入封存对象。该操作验证源
+   manifest/member closure，逐字节复制原 object，保留 creator producer、tool、摘要和
+   artifact id；不调用 `seal_tree`。
+3. 构造 `DiagnosticAdmissionSpec`，调用 `build_diagnostic_command` 和
+   `FactStore.admit_diagnostic`。
+4. 用现有 `CanonicalStageServices` 与 `execute_stage` 注入单一 handler 和现有 effect
+   port。不得根据 scope 开放新的远端目标；native/Publish 仍走原 claim、effect
+   authorization 和资源唯一规则。
+
+入口 actor 的最小调用形状：
+
+```python
+config = DiagnosticRuntimeConfig(
+    database_dsn=explicit_private_dsn,
+    artifact_root=explicit_private_artifact_root,
+    database_options=explicit_private_database_options,
+)
+stores = open_diagnostic_stores(config)
+imported = stores.artifacts.import_object(source_artifact_store, sealed_input_ref)
+spec = DiagnosticAdmissionSpec(
+    schema_version="description-pipeline.diagnostic-admission-spec/v1",
+    run_id=diagnostic_run_id,
+    request_id=diagnostic_request_id,
+    target_stage=target_stage,
+    request=complete_stage_request,
+    input_artifacts=(imported,),
+    expected_executor_sha256=actual_handler_sha256,
+    config_snapshot_sha256=config_sha256,
+    contract_sha256=contract_sha256,
+    policy_sha256=policy_sha256,
+    created_at=created_at,
+)
+command = build_diagnostic_command(spec)
+stores.facts.admit_diagnostic(spec, command)
+services = CanonicalStageServices(
+    facts=stores.facts,
+    artifacts=stores.artifacts,
+    work_root=private_work_root,
+    claim_policy=ClaimPolicy(
+        owner_sha256=concrete_process_sha256,
+        executor_sha256=actual_handler_sha256,
+        lease=timedelta(minutes=5),
+    ),
+    clock=clock,
+)
+result = execute_stage(command_id=command.command_id, handler=single_handler, services=services)
+```
+
+formal predecessor 消费不得直接检查 `formal_eligible` 字段；必须取得同一
+`RunAdmission`、command 和 sealed result/failure，再调用
+`require_formal_qualification` 重算完整绑定。
+
+真实 domain handler 当前仍有待 owner 修正的输入绑定。最小 predicate 只允许
+diagnostic scope 改变“前任资格来源”，不得放松 request、artifact kind、identity 或
+effect 字段：
+
+- `pipeline/freeze.py`：`FreezeHandler.execute` 未接收 engine 注入的 `effects`；line
+  345 把 process `claim.owner_sha256` 与 tool `expected_executor_sha256` 比较。正确条件
+  始终是 `claim.command_id == command.command_id` 与
+  `claim.executor_sha256 == command.expected_executor_sha256`。
+- `pipeline/discover.py` line 200 强制 Freeze artifact 的
+  `producer_run_id == command.run_id`。diagnostic 分支只可允许该 producer 是历史身份，
+  仍须精确匹配 request 的 `freeze_artifact_id`、artifact kind、set/digest 和 scope
+  input closure。
+- `pipeline/discover.py` line 385 强制非空 predecessor；line 387 混用 owner/executor。
+  diagnostic 分支只可在 `command.diagnostic_scope.target_stage == "discover"` 时允许
+  `predecessor_decision_id is None`，其余 Freeze request/input 校验保持原样。
+- `pipeline/stages/generate.py` line 126 强制非空 predecessor。同样的单一 predicate 可
+  允许 diagnostic Generate，Capture artifact binding、request schema 和 output contract
+  不得放宽。
+
+主分支另报的 Publish `execute` 非空 predecessor 检查与 Verify 临时命令也要使用同一
+predicate；这两个 handler 不存在于当前公共层检出，公共层没有自行复制或绕过。
+diagnostic scope 不改变任何 effect authorization、资源排他或受控目标检查。
+
+诊断公共层不绕过这些检查。当前证据使用同一 engine/effect port 下、只读完整导入 closure
+的本地 fixture handler；真实领域 handler 须由 owner 按 diagnostic scope 和真实输入语义
+修正后接入。raw legacy 迁移仍应是外部显式工具，不进入正常 runtime 分支。

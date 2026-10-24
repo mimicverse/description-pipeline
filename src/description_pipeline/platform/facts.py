@@ -21,7 +21,13 @@ from ..pipeline.admission import (
     VerifiedPublishIntent,
     VerifiedPredecessor,
     VerifiedVerifyResult,
+    validate_run_admission,
     validate_store_command,
+)
+from ..pipeline.diagnostic import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_run_admission,
+    validate_diagnostic_command,
 )
 from ..pipeline.contracts import (
     ArtifactRef,
@@ -34,7 +40,10 @@ from ..pipeline.contracts import (
     StageCandidate,
     StageCommand,
     StageDecision,
+    StageQualification,
     StageResult,
+    qualify_stage,
+    require_formal_qualification,
 )
 from ..pipeline.effects import (
     EffectFact,
@@ -44,7 +53,12 @@ from ..pipeline.effects import (
     project_effect_settlement,
     project_effect_state,
 )
-from ..schemas import AIRFLOW_DISPATCH_EFFECT_SCHEMA, RUN_ADMISSION_SCHEMA, STAGE_COMMAND_SCHEMA
+from ..schemas import (
+    AIRFLOW_DISPATCH_EFFECT_SCHEMA,
+    DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
+    RUN_ADMISSION_SCHEMA,
+    STAGE_COMMAND_SCHEMA,
+)
 
 
 class FactStoreError(PipelineError):
@@ -63,6 +77,18 @@ class StageResultReader(Protocol):
     def read_result(self, artifact: ArtifactRef) -> StageResult: ...
 
     def read_dispatch_conf(self, artifact: ArtifactRef) -> DispatchConf: ...
+
+
+_DIAGNOSTIC_COMMAND_REQUEST_SCHEMA = DIAGNOSTIC_COMMAND_REQUEST_SCHEMA
+
+
+def _stored_command_request(command: StageCommand) -> Mapping[str, object]:
+    if command.diagnostic_scope is None:
+        return command.request
+    return {
+        "schema_version": _DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
+        "command": command.to_record(),
+    }
 
 
 def _plain(value):
@@ -215,6 +241,57 @@ class FactStore:
         with self._transaction() as connection:
             return self._load_admission_cursor(connection.cursor(), run_id)
 
+    def admit_diagnostic(
+        self,
+        spec: DiagnosticAdmissionSpec,
+        command: StageCommand,
+    ) -> tuple[RunAdmission, StageCommand]:
+        """Admit exactly one diagnostic target command in the caller's private store."""
+
+        if not isinstance(spec, DiagnosticAdmissionSpec):
+            raise FactStoreError("A DiagnosticAdmissionSpec is required")
+        admission = build_diagnostic_run_admission(spec)
+        try:
+            validate_diagnostic_command(spec, admission, command)
+        except ProtocolError as error:
+            raise FactStoreError("The diagnostic command fails typed validation") from error
+        artifact_verifier = getattr(self._result_reader, "verify", None)
+        if not callable(artifact_verifier):
+            raise FactStoreError("The configured artifact reader cannot verify diagnostic inputs")
+        for artifact in command.input_artifacts:
+            artifact_verifier(artifact)
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            _require_open(cursor)
+            existing = self._load_admission_cursor(cursor, admission.run_id)
+            if existing is not None:
+                if existing != admission:
+                    raise FactConflict("The diagnostic run is already admitted with different facts")
+                stored = self._load_command_cursor(cursor, command.command_id)
+                if stored != command:
+                    raise FactConflict("The diagnostic run carries a different target command")
+                return existing, stored
+            cursor.execute("SELECT run_id FROM run_admission WHERE request_id = %s", (admission.request_id,))
+            if cursor.fetchone() is not None:
+                raise FactConflict("The diagnostic request is already admitted")
+            cursor.execute(
+                """
+                INSERT INTO run_admission (
+                    run_id, request_id, parent_run_id, from_stage, request, request_digest, created_at
+                ) VALUES (%s, %s, NULL, %s, %s::jsonb, %s, %s)
+                """,
+                (
+                    admission.run_id,
+                    admission.request_id,
+                    admission.from_stage,
+                    _json(admission.request),
+                    admission.request_digest,
+                    admission.created_at,
+                ),
+            )
+            self._insert_command_cursor(cursor, command)
+            return admission, command
+
     def admit_run(
         self,
         admission: RunAdmission,
@@ -363,6 +440,34 @@ class FactStore:
             (command_id,),
         )
         inputs = tuple(_artifact_from_row(item) for item in cursor.fetchall())
+        stored_request = row[5]
+        if (
+            isinstance(stored_request, Mapping)
+            and stored_request.get("schema_version") == _DIAGNOSTIC_COMMAND_REQUEST_SCHEMA
+        ):
+            if set(stored_request) != {"schema_version", "command"} or not isinstance(
+                stored_request["command"],
+                Mapping,
+            ):
+                raise FactStoreError("The diagnostic command envelope is invalid")
+            command = StageCommand.from_record(stored_request["command"])
+            if (
+                command.command_id != row[0]
+                or command.run_id != row[1]
+                or command.kind != row[2]
+                or command.stage != row[3]
+                or command.idempotency_key != row[4]
+                or command.request_digest != row[6]
+                or command.input_artifacts != inputs
+                or command.config_snapshot_sha256 != row[7]
+                or command.contract_sha256 != row[8]
+                or command.policy_sha256 != row[9]
+                or command.expected_executor_sha256 != row[10]
+                or command.predecessor_decision_id != row[11]
+                or command.diagnostic_scope is None
+            ):
+                raise FactStoreError("The diagnostic command row differs from its sealed request")
+            return command
         return StageCommand(
             schema_version=STAGE_COMMAND_SCHEMA,
             command_id=row[0],
@@ -435,7 +540,7 @@ class FactStore:
                 command.kind,
                 command.stage,
                 command.idempotency_key,
-                _json(command.request),
+                _json(_stored_command_request(command)),
                 command.request_digest,
                 command.config_snapshot_sha256,
                 command.contract_sha256,
@@ -552,7 +657,7 @@ class FactStore:
             if stored_admission != admission:
                 raise FactConflict("The supplied admission differs from the registered admission")
             for verified in predecessors:
-                self._verify_registered_predecessor_cursor(cursor, verified)
+                self._verify_registered_predecessor_cursor(cursor, admission, verified)
             if discover_result is not None:
                 for artifact in (
                     discover_result.source_set_artifact,
@@ -569,7 +674,12 @@ class FactStore:
             self._insert_command_cursor(cursor, command)
             return command
 
-    def _verify_registered_predecessor_cursor(self, cursor, predecessor: VerifiedPredecessor) -> None:
+    def _verify_registered_predecessor_cursor(
+        self,
+        cursor,
+        admission: RunAdmission,
+        predecessor: VerifiedPredecessor,
+    ) -> None:
         stored_command = self._load_command_cursor(cursor, predecessor.command.command_id)
         if stored_command != predecessor.command:
             raise FactConflict("A predecessor command differs from its registered command")
@@ -592,6 +702,13 @@ class FactStore:
             != predecessor.decision.result_record_artifact
         ):
             raise FactConflict("Predecessor artifacts differ from their verified facts")
+        qualification = qualify_stage(admission, stored_command, result=predecessor.result)
+        require_formal_qualification(
+            qualification,
+            admission,
+            stored_command,
+            result=predecessor.result,
+        )
 
     def _decision_row(self, cursor, *, run_id: str, stage: str):
         cursor.execute(
@@ -662,6 +779,23 @@ class FactStore:
         ):
             raise FactStoreError("The sealed StageResult differs from its registered decision")
         return result
+
+    def qualification_for(self, decision: StageDecision) -> StageQualification:
+        command = self.load_command(decision.command_id)
+        admission = self.load_admission(decision.run_id)
+        if admission is None:
+            raise FactStoreError("The decision run has no admission")
+        if command.diagnostic_scope is not None:
+            spec = DiagnosticAdmissionSpec.from_record(admission.request)
+            validate_diagnostic_command(spec, admission, command)
+        else:
+            spec = AdmissionSpec.from_record(admission.request)
+            validate_run_admission(spec, admission)
+        if decision.result_record_artifact is not None:
+            return qualify_stage(admission, command, result=self.load_result(decision))
+        if decision.failure_envelope is None:
+            raise FactStoreError("The decision carries neither a StageResult nor a FailureEnvelope")
+        return qualify_stage(admission, command, failure=decision.failure_envelope)
 
     def acquire_claim(
         self,
@@ -1244,6 +1378,9 @@ class FactStore:
     ) -> StageCandidate:
         if result.command_id != claim.command_id:
             raise FactConflict("The StageResult names another command than the claim")
+        command = self.load_command(result.command_id)
+        if result.diagnostic_scope != command.diagnostic_scope:
+            raise FactConflict("The StageResult diagnostic scope differs from its command")
         if result.output_artifact != output_artifact:
             raise FactStoreError("The StageResult does not carry its declared output artifact")
         if result_record_artifact.kind != "stage_result":
@@ -1338,6 +1475,7 @@ class FactStore:
             or candidate.result.run_id != command.run_id
             or candidate.result.stage != command.stage
             or candidate.result.request_digest != command.request_digest
+            or candidate.result.diagnostic_scope != command.diagnostic_scope
         ):
             raise FactStoreError("The candidate does not belong to the command")
         if candidate.result.actual_executor_sha256 != claim.executor_sha256:
@@ -1450,6 +1588,7 @@ class FactStore:
             or failure.run_id != command.run_id
             or failure.stage != command.stage
             or failure.request_digest != command.request_digest
+            or failure.diagnostic_scope != command.diagnostic_scope
         ):
             raise FactConflict("The failure envelope names another command")
         if failure.actual_executor_sha256 != claim.executor_sha256:

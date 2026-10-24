@@ -231,6 +231,7 @@ class CanonicalStageServices:
             resources_settled=execution.resources_settled,
             required_effect_ids=self.facts.effect_ids_for_command(command.command_id),
             reason_code=execution.reason_code,
+            diagnostic_scope=command.diagnostic_scope,
         )
         result_record = self.artifacts.seal_stage_result(result)
         candidate_id = f"candidate-{result.digest}"
@@ -334,6 +335,7 @@ class CanonicalStageServices:
             retained_locations=tuple(dict.fromkeys(retained_locations)),
             unavailable_reason=unavailable_reason,
             occurred_at=now,
+            diagnostic_scope=command.diagnostic_scope,
         )
         return self.facts.commit_failure_envelope(
             decision_id=f"decision-{command.command_id}",

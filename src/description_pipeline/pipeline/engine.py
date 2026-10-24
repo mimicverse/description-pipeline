@@ -138,6 +138,7 @@ def _validate_result_identity(command: StageCommand, result: StageResult) -> Non
         or result.stage != command.stage
         or result.request_digest != command.request_digest
         or result.actual_executor_sha256 != command.expected_executor_sha256
+        or result.diagnostic_scope != command.diagnostic_scope
     ):
         raise ProtocolError("result.command_mismatch", {"command_id": command.command_id})
 
@@ -270,27 +271,25 @@ def execute_stage(
         cleanup_workspace = candidate.result.outcome == "completed" and candidate.result.resources_settled is True
         return candidate.result
     except Exception as error:
+        failure_record = {
+            "schema_version": UNHANDLED_STAGE_FAILURE_SCHEMA,
+            "command_id": command.command_id,
+            "run_id": command.run_id,
+            "stage": command.stage,
+            "claim_id": claim.claim_id,
+            "fence": claim.fence,
+            "error_type": type(error).__name__,
+            "error_message": str(error)[:4096],
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "workspace": str(workspace.root.resolve()),
+        }
+        if command.diagnostic_scope is not None:
+            failure_record["diagnostic_scope"] = command.diagnostic_scope.to_record()
         with (
             contextlib.suppress(Exception),
             (workspace.root / "engine-unhandled-failure.json").open("xb") as stream,
         ):
-            stream.write(
-                canonical(
-                    {
-                        "schema_version": UNHANDLED_STAGE_FAILURE_SCHEMA,
-                        "command_id": command.command_id,
-                        "run_id": command.run_id,
-                        "stage": command.stage,
-                        "claim_id": claim.claim_id,
-                        "fence": claim.fence,
-                        "error_type": type(error).__name__,
-                        "error_message": str(error)[:4096],
-                        "recorded_at": datetime.now(UTC).isoformat(),
-                        "workspace": str(workspace.root.resolve()),
-                    }
-                )
-                + b"\n"
-            )
+            stream.write(canonical(failure_record) + b"\n")
         raise
     finally:
         if cleanup_workspace:

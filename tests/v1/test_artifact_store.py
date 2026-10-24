@@ -119,6 +119,30 @@ class ArtifactStoreTests(unittest.TestCase):
         records = json.loads((self.store.objects / artifact.artifact_id / "conf.json").read_text(encoding="utf-8"))
         self.assertEqual(set(records), {"schema_version", "run_id", "freeze_command_id"})
 
+    def test_import_object_preserves_manifest_bytes_and_historical_producer(self) -> None:
+        artifact = self.seal(self.source("historical-source"))
+        destination = ArtifactStore(self.root / "private-diagnostic-cas")
+        source_manifest = (self.store.objects / artifact.artifact_id / "manifest.json").read_bytes()
+        source_members = {
+            path.relative_to(self.store.objects / artifact.artifact_id).as_posix(): path.read_bytes()
+            for path in (self.store.objects / artifact.artifact_id).rglob("*")
+            if path.is_file() and path.name != "manifest.json"
+        }
+        imported = destination.import_object(self.store, artifact)
+        self.assertEqual(imported, artifact)
+        self.assertEqual(imported.producer_run_id, "run-1")
+        self.assertEqual(imported.producer_tool_sha256, self.tool)
+        self.assertEqual((destination.objects / artifact.artifact_id / "manifest.json").read_bytes(), source_manifest)
+        self.assertEqual(
+            {
+                path.relative_to(destination.objects / artifact.artifact_id).as_posix(): path.read_bytes()
+                for path in (destination.objects / artifact.artifact_id).rglob("*")
+                if path.is_file() and path.name != "manifest.json"
+            },
+            source_members,
+        )
+        self.store.verify(artifact)
+
 
 if __name__ == "__main__":
     unittest.main()

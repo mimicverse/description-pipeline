@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".artifact (
     locator text NOT NULL UNIQUE,
     manifest_sha256 char(64) NOT NULL CHECK (manifest_sha256 ~ '^[0-9a-f]{64}$'),
     set_sha256 char(64) NOT NULL CHECK (set_sha256 ~ '^[0-9a-f]{64}$'),
-    producer_run_id text REFERENCES :"platform_schema".run_admission (run_id),
+    producer_run_id text,
     producer_stage text CHECK (
         producer_stage IS NULL
         OR producer_stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'publish')
