@@ -227,6 +227,7 @@ class CanonicalStageServices:
             output_artifact=output,
             actual_executor_sha256=claim.executor_sha256,
             checks_sha256=execution.checks_sha256,
+            resources_settled=execution.resources_settled,
             required_effect_ids=self.facts.effect_ids_for_command(command.command_id),
             reason_code=execution.reason_code,
         )
@@ -284,6 +285,8 @@ class CanonicalStageServices:
         command: StageCommand,
         claim: ExecutionClaim,
         failure: StageFailure,
+        *,
+        workspace_root: str | Path,
     ) -> FailureEnvelope:
         states = self.facts.effect_states_for_command(command.command_id)
         if any(state in {EffectState.UNKNOWN, EffectState.CONFLICT} for state in states.values()):
@@ -297,6 +300,13 @@ class CanonicalStageServices:
         now = self.clock()
         if not isinstance(now, datetime) or now.tzinfo is None:
             raise ProtocolError("clock.invalid", {"where": "commit_failure"})
+        workspace = Path(workspace_root).resolve()
+        retained_locations = [str(workspace)]
+        for locator in failure.retained_locations:
+            path = Path(locator).resolve()
+            if not path.is_relative_to(workspace):
+                raise ProtocolError("failure.retained_path_escape", {"locator": locator})
+            retained_locations.append(str(path))
         verified_evidence = []
         unavailable_reason = failure.unavailable_reason
         for artifact in failure.evidence_artifacts:
@@ -315,10 +325,12 @@ class CanonicalStageServices:
             outcome=failure.outcome,
             actual_executor_sha256=claim.executor_sha256,
             reason_code=failure.reason_code,
-            error_type=type(failure).__name__,
+            error_type=failure.error_type,
             error_message=str(failure)[:4096],
+            error_detail=failure.detail,
             effect_states=tuple((effect_id, state.value) for effect_id, state in sorted(states.items())),
             evidence_artifacts=tuple(verified_evidence),
+            retained_locations=tuple(dict.fromkeys(retained_locations)),
             unavailable_reason=unavailable_reason,
             occurred_at=now,
         )

@@ -376,6 +376,7 @@ class StageResult:
     output_artifact: ArtifactRef
     actual_executor_sha256: str
     checks_sha256: str
+    resources_settled: bool
     required_effect_ids: tuple[str, ...] = ()
     reason_code: str | None = None
 
@@ -400,6 +401,8 @@ class StageResult:
         ):
             raise ProtocolError("result.invalid", {"where": "output_artifact", "reason": "producer-mismatch"})
         _require_digest(self.checks_sha256, "result.invalid", "checks_sha256")
+        if type(self.resources_settled) is not bool:
+            raise ProtocolError("result.invalid", {"where": "resources_settled"})
         if not isinstance(self.required_effect_ids, tuple) or not all(
             isinstance(value, str) and value for value in self.required_effect_ids
         ):
@@ -410,6 +413,8 @@ class StageResult:
             raise ProtocolError("result.invalid", {"where": "reason_code"})
         if self.outcome == "completed" and self.reason_code is not None:
             raise ProtocolError("result.invalid", {"where": "reason_code", "reason": "completed"})
+        if self.outcome == "completed" and self.resources_settled is not True:
+            raise ProtocolError("result.invalid", {"where": "resources_settled", "reason": "completed"})
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -419,6 +424,7 @@ class StageResult:
             "outcome": self.outcome,
             "reason_code": self.reason_code,
             "request_digest": self.request_digest,
+            "resources_settled": self.resources_settled,
             "required_effect_ids": list(self.required_effect_ids),
             "output_artifact": self.output_artifact.to_record(),
             "run_id": self.run_id,
@@ -437,6 +443,7 @@ class StageResult:
             "outcome",
             "reason_code",
             "request_digest",
+            "resources_settled",
             "required_effect_ids",
             "output_artifact",
             "run_id",
@@ -461,6 +468,7 @@ class StageResult:
             output_artifact=ArtifactRef.from_record(record["output_artifact"]),
             actual_executor_sha256=record["actual_executor_sha256"],
             checks_sha256=record["checks_sha256"],
+            resources_settled=record["resources_settled"],
             required_effect_ids=tuple(required_effects),
             reason_code=record["reason_code"],
         )
@@ -508,6 +516,9 @@ class StageFailure(RuntimeError):
         outcome: Outcome = "failed",
         evidence_artifacts: tuple[ArtifactRef, ...] = (),
         unavailable_reason: str | None = None,
+        error_type: str | None = None,
+        detail: Mapping[str, Any] | None = None,
+        retained_locations: tuple[str, ...] = (),
     ) -> None:
         _require_text(reason_code, "failure.invalid", "reason_code")
         _require_text(message, "failure.invalid", "message")
@@ -519,11 +530,21 @@ class StageFailure(RuntimeError):
             raise ProtocolError("failure.invalid", {"where": "evidence_artifacts"})
         if unavailable_reason is not None:
             _require_text(unavailable_reason, "failure.invalid", "unavailable_reason")
+        error_type = error_type or type(self).__name__
+        _require_text(error_type, "failure.invalid", "error_type")
+        frozen_detail = None if detail is None else _freeze_mapping(detail, "failure.invalid", "detail")
+        if not isinstance(retained_locations, tuple) or not all(
+            isinstance(item, str) and item and "\x00" not in item for item in retained_locations
+        ):
+            raise ProtocolError("failure.invalid", {"where": "retained_locations"})
         super().__init__(message)
         self.reason_code = reason_code
         self.outcome = outcome
         self.evidence_artifacts = evidence_artifacts
         self.unavailable_reason = unavailable_reason
+        self.error_type = error_type
+        self.detail = frozen_detail
+        self.retained_locations = retained_locations
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,8 +561,10 @@ class FailureEnvelope:
     reason_code: str
     error_type: str
     error_message: str
+    error_detail: Mapping[str, Any] | None
     effect_states: tuple[tuple[str, str], ...]
     evidence_artifacts: tuple[ArtifactRef, ...]
+    retained_locations: tuple[str, ...]
     unavailable_reason: str | None
     occurred_at: datetime
 
@@ -558,6 +581,12 @@ class FailureEnvelope:
         _require_text(self.reason_code, "failure.invalid", "reason_code")
         _require_text(self.error_type, "failure.invalid", "error_type")
         _require_text(self.error_message, "failure.invalid", "error_message")
+        if self.error_detail is not None:
+            object.__setattr__(
+                self,
+                "error_detail",
+                _freeze_mapping(self.error_detail, "failure.invalid", "error_detail"),
+            )
         if len(self.error_message) > 4096:
             raise ProtocolError("failure.invalid", {"where": "error_message", "reason": "too-long"})
         if not isinstance(self.effect_states, tuple):
@@ -581,6 +610,12 @@ class FailureEnvelope:
             raise ProtocolError("failure.invalid", {"where": "evidence_artifacts"})
         if len({item.artifact_id for item in self.evidence_artifacts}) != len(self.evidence_artifacts):
             raise ProtocolError("failure.invalid", {"where": "evidence_artifacts", "reason": "duplicate"})
+        if not isinstance(self.retained_locations, tuple) or not all(
+            isinstance(item, str) and item and "\x00" not in item for item in self.retained_locations
+        ):
+            raise ProtocolError("failure.invalid", {"where": "retained_locations"})
+        if len(set(self.retained_locations)) != len(self.retained_locations):
+            raise ProtocolError("failure.invalid", {"where": "retained_locations", "reason": "duplicate"})
         if self.unavailable_reason is not None:
             _require_text(self.unavailable_reason, "failure.invalid", "unavailable_reason")
         if not isinstance(self.occurred_at, datetime) or self.occurred_at.tzinfo is None:
@@ -592,12 +627,14 @@ class FailureEnvelope:
             "command_id": self.command_id,
             "effect_states": [list(row) for row in self.effect_states],
             "error_message": self.error_message,
+            "error_detail": _json_value(self.error_detail) if self.error_detail is not None else None,
             "error_type": self.error_type,
             "evidence_artifacts": [item.to_record() for item in self.evidence_artifacts],
             "occurred_at": self.occurred_at.isoformat(),
             "outcome": self.outcome,
             "reason_code": self.reason_code,
             "request_digest": self.request_digest,
+            "retained_locations": list(self.retained_locations),
             "run_id": self.run_id,
             "schema_version": self.schema_version,
             "stage": self.stage,
@@ -613,12 +650,14 @@ class FailureEnvelope:
             "command_id",
             "effect_states",
             "error_message",
+            "error_detail",
             "error_type",
             "evidence_artifacts",
             "occurred_at",
             "outcome",
             "reason_code",
             "request_digest",
+            "retained_locations",
             "run_id",
             "schema_version",
             "stage",
@@ -631,7 +670,8 @@ class FailureEnvelope:
             )
         effect_rows = record["effect_states"]
         evidence = record["evidence_artifacts"]
-        if not isinstance(effect_rows, list) or not isinstance(evidence, list):
+        retained = record["retained_locations"]
+        if not isinstance(effect_rows, list) or not isinstance(evidence, list) or not isinstance(retained, list):
             raise ProtocolError("failure.invalid", {"where": "record-arrays"})
         occurred_raw = record["occurred_at"]
         if not isinstance(occurred_raw, str):
@@ -651,8 +691,10 @@ class FailureEnvelope:
             reason_code=record["reason_code"],
             error_type=record["error_type"],
             error_message=record["error_message"],
+            error_detail=record["error_detail"],
             effect_states=tuple(tuple(row) for row in effect_rows),
             evidence_artifacts=tuple(ArtifactRef.from_record(item) for item in evidence),
+            retained_locations=tuple(retained),
             unavailable_reason=record["unavailable_reason"],
             occurred_at=occurred_at,
         )
@@ -669,17 +711,27 @@ class StageExecution:
     outcome: Outcome
     candidate_root: str
     checks_sha256: str
-    reason_code: str | None = None
+    resources_settled: bool
+    failure: StageFailure | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in {"completed", "failed", "cancelled"}:
             raise ProtocolError("execution.invalid", {"where": "outcome", "value": self.outcome})
         _require_text(self.candidate_root, "execution.invalid", "candidate_root")
         _require_digest(self.checks_sha256, "execution.invalid", "checks_sha256")
-        if self.outcome in {"failed", "cancelled"} and not self.reason_code:
-            raise ProtocolError("execution.invalid", {"where": "reason_code"})
-        if self.outcome == "completed" and self.reason_code is not None:
-            raise ProtocolError("execution.invalid", {"where": "reason_code", "reason": "completed"})
+        if type(self.resources_settled) is not bool:
+            raise ProtocolError("execution.invalid", {"where": "resources_settled"})
+        if self.outcome == "completed":
+            if self.failure is not None:
+                raise ProtocolError("execution.invalid", {"where": "failure", "reason": "completed"})
+            if self.resources_settled is not True:
+                raise ProtocolError("execution.invalid", {"where": "resources_settled", "reason": "completed"})
+        elif not isinstance(self.failure, StageFailure) or self.failure.outcome != self.outcome:
+            raise ProtocolError("execution.invalid", {"where": "failure", "reason": "required"})
+
+    @property
+    def reason_code(self) -> str | None:
+        return None if self.failure is None else self.failure.reason_code
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from ..io import write_json
 from .contracts import (
     ExecutionClaim,
     FailureEnvelope,
@@ -98,6 +101,8 @@ class StageServices(Protocol):
         command: StageCommand,
         claim: ExecutionClaim,
         failure: StageFailure,
+        *,
+        workspace_root: str | Path,
     ) -> FailureEnvelope: ...
 
     def discard_workspace(self, workspace: StageWorkspace) -> None: ...
@@ -202,6 +207,7 @@ def execute_stage(
 
     candidate = services.candidate_for(command, claim)
     workspace = services.materialize(command, claim, candidate=candidate)
+    cleanup_workspace = False
     try:
         effects = services.effect_port(command, claim, workspace)
         try:
@@ -212,17 +218,28 @@ def execute_stage(
                 except Exception as error:
                     if execution.outcome not in {"failed", "cancelled"}:
                         raise
+                    original = execution.failure
                     failure = StageFailure(
-                        execution.reason_code or "failure_envelope_required",
-                        f"Failure result artifact unavailable: {type(error).__name__}: {error}"[:4096],
+                        (original.reason_code if original is not None else None) or "failure_envelope_required",
+                        str(original) if original is not None else f"{type(error).__name__}: {error}"[:4096],
                         outcome=execution.outcome,
-                        unavailable_reason="diagnostic_or_result_seal_failed",
+                        evidence_artifacts=(original.evidence_artifacts if original is not None else ()),
+                        unavailable_reason=(
+                            f"diagnostic_or_result_seal_failed: {type(error).__name__}: {error}"[:4096]
+                        ),
+                        error_type=original.error_type if original is not None else None,
+                        detail=original.detail if original is not None else None,
+                        retained_locations=(
+                            *(original.retained_locations if original is not None else ()),
+                            str(Path(execution.candidate_root).resolve()),
+                        ),
                     )
                     try:
                         return services.commit_failure(
                             command,
                             claim,
                             failure,
+                            workspace_root=workspace.root,
                         )
                     except Exception as envelope_error:
                         raise failure from envelope_error
@@ -230,10 +247,14 @@ def execute_stage(
             candidate = services.verify_candidate(command, claim, candidate)
         except StageFailure as failure:
             try:
-                return services.commit_failure(command, claim, failure)
+                return services.commit_failure(
+                    command,
+                    claim,
+                    failure,
+                    workspace_root=workspace.root,
+                )
             except Exception as error:
                 raise failure from error
-
         _validate_result_identity(command, candidate.result)
         _validate_effect_settlement(services, command, candidate.result)
         decision = services.commit_decision(command, claim, candidate)
@@ -245,6 +266,26 @@ def execute_stage(
             or decision.outcome != candidate.result.outcome
         ):
             raise ProtocolError("decision.command_mismatch", {"command_id": command.command_id})
+        cleanup_workspace = candidate.result.outcome == "completed" and candidate.result.resources_settled is True
         return candidate.result
+    except Exception as error:
+        with contextlib.suppress(Exception):
+            write_json(
+                workspace.root / "failure.json",
+                {
+                    "schema_version": "description-pipeline.unhandled-stage-failure/v1",
+                    "command_id": command.command_id,
+                    "run_id": command.run_id,
+                    "stage": command.stage,
+                    "claim_id": claim.claim_id,
+                    "fence": claim.fence,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error)[:4096],
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                    "workspace": str(workspace.root.resolve()),
+                },
+            )
+        raise
     finally:
-        services.discard_workspace(workspace)
+        if cleanup_workspace:
+            services.discard_workspace(workspace)

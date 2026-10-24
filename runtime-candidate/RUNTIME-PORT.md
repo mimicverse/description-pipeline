@@ -68,6 +68,23 @@ The actual native, Git or HTTP call occurs after `authorize_dispatch` commits. R
 and remote observations are appended under the same effect identity. Current absence is not
 terminal until reconciliation proves that an earlier request can no longer arrive.
 
+## Workspace retention
+
+The stage workspace is cleanup-eligible only after a completed StageResult and its independent
+record artifact are sealed and reverified, all command effects are satisfied, the result proves
+resource termination, and the unique decision has committed.
+
+A completed `StageExecution` therefore requires `resources_settled=True`. A failed or cancelled
+execution carries a `StageFailure` with original error identity, message/detail and evidence
+references; its reason code is not a substitute for the error.
+
+Unhandled errors, unknown native/resource state, definite failures, diagnostic or result seal
+failures, and a lost decision-commit response retain the claim-owned workspace. Local
+`failure.json` preserves an unhandled error without becoming business authority. A minimal
+FailureEnvelope records original error identity/message/detail, sealed evidence refs and actual
+retained locators; diagnostic failure is an additional unavailable reason and never replaces
+the original domain failure.
+
 ## Identity fields
 
 - `ExecutionClaim.owner_sha256`: one concrete process/entry identity; never the tool release.

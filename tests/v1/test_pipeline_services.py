@@ -128,6 +128,7 @@ class _Handler:
             outcome="completed",
             candidate_root=str(output),
             checks_sha256=digest({"checks": 1}),
+            resources_settled=True,
         )
 
     def validate_candidate(self, command, claim, candidate, *, effects):

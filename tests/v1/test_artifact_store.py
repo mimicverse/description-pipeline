@@ -90,6 +90,7 @@ class ArtifactStoreTests(unittest.TestCase):
             output_artifact=output,
             actual_executor_sha256=self.tool,
             checks_sha256=digest({"checks": 1}),
+            resources_settled=True,
             required_effect_ids=(),
         )
         sealed = self.store.seal_stage_result(result)

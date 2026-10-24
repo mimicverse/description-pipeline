@@ -14,6 +14,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 try:
     import pgserver
@@ -83,6 +84,7 @@ class _EffectHandler:
             outcome="completed",
             candidate_root=str(output),
             checks_sha256=digest({"checks": "passed"}),
+            resources_settled=True,
         )
 
     def validate_candidate(self, command, claim, candidate, *, effects):
@@ -104,15 +106,34 @@ class _FailureHandler:
 
 class _UnsealedFailureHandler:
     def execute(self, command, claim, workspace, *, effects):
+        diagnostics = workspace.root / "missing-diagnostics"
+        diagnostics.mkdir()
+        (diagnostics / "diagnostic.txt").write_text("raw native failure\n", encoding="utf-8")
+        (diagnostics / "manifest.json").write_text("{}\n", encoding="utf-8")
         return StageExecution(
             outcome="failed",
-            candidate_root=str(workspace.root / "missing-diagnostics"),
+            candidate_root=str(diagnostics),
             checks_sha256=digest({"checks": "failed"}),
-            reason_code="domain_failed",
+            resources_settled=False,
+            failure=StageFailure(
+                "domain_failed",
+                "The original domain failure",
+                detail={"field": "assembly", "value": "missing"},
+                retained_locations=(str(diagnostics),),
+            ),
         )
 
     def validate_candidate(self, command, claim, candidate, *, effects):
         raise AssertionError("An unsealed failure has no candidate")
+
+
+class _UnexpectedFailureHandler:
+    def execute(self, command, claim, workspace, *, effects):
+        (workspace.root / "native-attempt.txt").write_text("in-flight native state\n", encoding="utf-8")
+        raise RuntimeError("unexpected native state")
+
+    def validate_candidate(self, command, claim, candidate, *, effects):
+        raise AssertionError("An unhandled failure has no candidate")
 
 
 @unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
@@ -308,6 +329,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 self.command,
                 claim,
                 StageFailure("native_unknown", "The native result remains unknown"),
+                workspace_root=workspace.root,
             )
         decision_count = self._query(
             "SELECT count(*) FROM stage_decision WHERE command_id = %s",
@@ -480,6 +502,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             output_artifact=output,
             actual_executor_sha256=self.executor,
             checks_sha256=digest({"checks": 1}),
+            resources_settled=True,
             required_effect_ids=(),
         )
         record = self.artifacts.seal_stage_result(result)
@@ -523,15 +546,64 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertIsNone(rows[0][0])
         self.assertIsNotNone(rows[0][1])
         self.assertIsNotNone(rows[0][2])
+        self.assertTrue(result.retained_locations)
+        self.assertTrue(Path(result.retained_locations[0]).is_dir())
 
     def test_unsealable_failed_execution_falls_back_to_failure_envelope(self) -> None:
         result = self._execute(_UnsealedFailureHandler())
         self.assertNotIsInstance(result, StageResult)
         self.assertEqual(result.reason_code, "domain_failed")
-        self.assertEqual(result.unavailable_reason, "diagnostic_or_result_seal_failed")
+        self.assertEqual(result.error_message, "The original domain failure")
+        self.assertEqual(dict(result.error_detail), {"field": "assembly", "value": "missing"})
+        self.assertTrue(result.unavailable_reason.startswith("diagnostic_or_result_seal_failed:"))
+        retained_workspace = Path(result.retained_locations[0])
+        retained_diagnostics = Path(result.retained_locations[1])
+        self.assertTrue((retained_workspace / "missing-diagnostics" / "diagnostic.txt").is_file())
+        self.assertTrue((retained_diagnostics / "diagnostic.txt").is_file())
         decision = self.facts.decision_for(self.command)
         self.assertIsNone(decision.result_record_artifact)
         self.assertEqual(decision.failure_envelope, result)
+
+    def test_unhandled_exception_retains_workspace_and_raw_failure_marker(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "unexpected native state"):
+            self._execute(_UnexpectedFailureHandler())
+        command_root = self.services.work_root / self.command.command_id
+        workspaces = [item for item in command_root.iterdir() if item.is_dir()]
+        self.assertEqual(len(workspaces), 1)
+        workspace = workspaces[0]
+        self.assertTrue((workspace / "native-attempt.txt").is_file())
+        marker = workspace / "failure.json"
+        self.assertTrue(marker.is_file())
+        self.assertEqual(
+            __import__("json").loads(marker.read_text(encoding="utf-8"))["error_type"],
+            "RuntimeError",
+        )
+
+    def test_lost_decision_commit_response_retains_sealed_workspace(self) -> None:
+        commit = self.services.commit_decision
+        calls = 0
+
+        def commit_then_lose_response(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            decision = commit(*args, **kwargs)
+            self.assertIsNotNone(decision)
+            raise TimeoutError("decision commit response lost")
+
+        with (
+            mock.patch.object(self.services, "commit_decision", side_effect=commit_then_lose_response),
+            self.assertRaisesRegex(TimeoutError, "response lost"),
+        ):
+            self._execute(_EffectHandler())
+        self.assertEqual(calls, 1)
+        self.assertIsNotNone(self.facts.decision_for(self.command))
+        command_root = self.services.work_root / self.command.command_id
+        workspaces = [item for item in command_root.iterdir() if item.is_dir()]
+        self.assertEqual(len(workspaces), 1)
+        self.assertIn(
+            "decision commit response lost",
+            (workspaces[0] / "failure.json").read_text(encoding="utf-8"),
+        )
 
     def test_expected_executor_drift_stops_before_handler_execution(self) -> None:
         wrong_tool = digest({"tool": "other-release"})

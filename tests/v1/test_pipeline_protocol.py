@@ -325,6 +325,17 @@ class CommandIdentityTests(unittest.TestCase):
                 expected_executor_sha256=digest({"executor": "freeze"}),
                 predecessor_decision_id=None,
             )
+
+    def test_completed_execution_requires_resource_termination(self) -> None:
+        with self.assertRaises(ProtocolError):
+            StageExecution(
+                outcome="completed",
+                candidate_root="candidate",
+                checks_sha256=digest({"checks": 1}),
+                resources_settled=False,
+            )
+
+    def test_artifact_locator_must_match_its_immutable_id(self) -> None:
         with self.assertRaises(ProtocolError):
             ArtifactRef(
                 artifact_id="artifact-1",
@@ -349,6 +360,7 @@ class _Handler:
             outcome="completed",
             candidate_root=str(workspace.root / "generated"),
             checks_sha256=digest({"checks": 1}),
+            resources_settled=True,
         )
 
     def validate_candidate(self, command_value, claim, candidate, *, effects):
@@ -432,6 +444,7 @@ class _Services:
             output_artifact=output_artifact,
             actual_executor_sha256=command_value.expected_executor_sha256,
             checks_sha256=execution.checks_sha256,
+            resources_settled=execution.resources_settled,
             required_effect_ids=("native-effect",),
             reason_code=execution.reason_code,
         )
