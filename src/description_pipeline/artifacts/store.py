@@ -259,7 +259,26 @@ class ArtifactStore:
             ):
                 _fsync_dir(directory)
             _fsync_dir(temporary)
-            os.replace(temporary, target)
+            try:
+                os.replace(temporary, target)
+            except OSError as error:
+                if not target.exists():
+                    raise
+                published = self.verify(
+                    self._ref(
+                        self._manifest(artifact_id),
+                        target / MANIFEST_NAME,
+                    )
+                )
+                if published != record:
+                    raise ArtifactStoreError(
+                        "A concurrently published artifact differs from its source"
+                    ) from error
+                shutil.rmtree(temporary, ignore_errors=True)
+                return self._ref(
+                    self._manifest(artifact_id),
+                    target / MANIFEST_NAME,
+                )
             _fsync_dir(self.objects)
         except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)

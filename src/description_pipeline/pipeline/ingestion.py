@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..artifacts import ArtifactStore
+from ..artifacts import ArtifactStore, ArtifactStoreError
 from ..interface_records import (
     REQUEST_PURPOSES,
     check_policy_digest,
@@ -91,6 +91,18 @@ _REQUEST_FIELDS = frozenset(
         "principal",
         "parent_run_id",
         "from_stage",
+    }
+)
+_FREEZE_SUCCESSOR_REQUEST_FIELDS = frozenset(
+    {
+        "run_id",
+        "request_id",
+        "parent_run_id",
+        "main_assembly",
+        "target_hardware",
+        "purpose",
+        "change_summary",
+        "principal",
     }
 )
 
@@ -388,14 +400,13 @@ class ProductionAdmissionRequest:
                     "admission_ingestion.invalid",
                     {"where": "parent_run_id", "reason": "self-reference"},
                 )
+            raise ProtocolError(
+                "admission_ingestion.freeze_successor_required",
+                {"where": "parent_run_id"},
+            )
         if self.from_stage not in {
             None,
             "freeze",
-            "discover",
-            "capture",
-            "generate",
-            "verify",
-            "publish",
         }:
             raise ProtocolError("admission_ingestion.invalid", {"where": "from_stage"})
         if (
@@ -447,6 +458,74 @@ class ProductionAdmissionRequest:
             "principal": self.principal,
             "parent_run_id": self.parent_run_id,
             "from_stage": self.from_stage,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionFreezeSuccessorRequest:
+    """One new run that reuses a parent's committed Freeze originals."""
+
+    run_id: str
+    request_id: str
+    parent_run_id: str
+    main_assembly: str
+    target_hardware: str
+    purpose: str
+    change_summary: str
+    principal: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.run_id, "run_id")
+        _identifier(self.request_id, "request_id")
+        _identifier(self.parent_run_id, "parent_run_id")
+        if self.parent_run_id == self.run_id:
+            raise ProtocolError(
+                "admission_ingestion.invalid",
+                {"where": "parent_run_id", "reason": "self-reference"},
+            )
+        _text(self.main_assembly, "main_assembly")
+        if not _TARGET.fullmatch(self.target_hardware):
+            raise ProtocolError("admission_ingestion.invalid", {"where": "target_hardware"})
+        if self.purpose not in REQUEST_PURPOSES:
+            raise ProtocolError("admission_ingestion.invalid", {"where": "purpose"})
+        object.__setattr__(
+            self,
+            "change_summary",
+            _multiline(self.change_summary, "change_summary"),
+        )
+        _text(self.principal, "principal")
+        if not valid_actor_principal(self.principal):
+            raise ProtocolError(
+                "admission_ingestion.invalid",
+                {"where": "principal", "reason": "feishu-principal"},
+            )
+
+    @property
+    def from_stage(self) -> str:
+        return "freeze"
+
+    @classmethod
+    def from_record(
+        cls,
+        record: Mapping[str, Any],
+    ) -> ProductionFreezeSuccessorRequest:
+        if not isinstance(record, Mapping) or set(record) != _FREEZE_SUCCESSOR_REQUEST_FIELDS:
+            raise ProtocolError(
+                "admission_ingestion.invalid",
+                {"where": "freeze_successor_request", "reason": "fields"},
+            )
+        return cls(**dict(record))
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "request_id": self.request_id,
+            "parent_run_id": self.parent_run_id,
+            "main_assembly": self.main_assembly,
+            "target_hardware": self.target_hardware,
+            "purpose": self.purpose,
+            "change_summary": self.change_summary,
+            "principal": self.principal,
         }
 
 
@@ -516,6 +595,51 @@ def _spec_administrative_intent(spec: AdmissionSpec) -> dict[str, Any]:
     }
 
 
+def _freeze_successor_request_intent(
+    request: ProductionFreezeSuccessorRequest,
+    originals: VerifiedArtifact,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _ADMINISTRATIVE_INTENT_SCHEMA,
+        "run_id": request.run_id,
+        "request_id": request.request_id,
+        "parent_run_id": request.parent_run_id,
+        "from_stage": request.from_stage,
+        "principal": request.principal,
+        "target_hardware": request.target_hardware,
+        "purpose": request.purpose,
+        "change_summary": request.change_summary,
+        "main_assembly": request.main_assembly,
+        "originals": {
+            "artifact": originals.ref.to_record(),
+            "files": len(originals.members),
+            "bytes": sum(member.bytes for member in originals.members),
+            "inventory_sha256": originals.inventory_sha256,
+        },
+    }
+
+
+def _freeze_successor_spec_intent(spec: AdmissionSpec) -> dict[str, Any]:
+    return {
+        "schema_version": _ADMINISTRATIVE_INTENT_SCHEMA,
+        "run_id": spec.run_id,
+        "request_id": spec.request_id,
+        "parent_run_id": spec.parent_run_id,
+        "from_stage": spec.from_stage,
+        "principal": spec.principal,
+        "target_hardware": spec.target_hardware,
+        "purpose": spec.purpose,
+        "change_summary": spec.change_summary,
+        "main_assembly": spec.main_assembly,
+        "originals": {
+            "artifact": spec.originals.ref.to_record(),
+            "files": len(spec.originals.members),
+            "bytes": sum(member.bytes for member in spec.originals.members),
+            "inventory_sha256": spec.originals.inventory_sha256,
+        },
+    }
+
+
 class AdmissionApplication(Protocol):
     """The one atomic admission write consumed by the loader."""
 
@@ -525,6 +649,11 @@ class AdmissionApplication(Protocol):
         self,
         run_id: str,
     ) -> AdmissionOutcomePort | None: ...
+
+    def load_verified_freeze_origins(
+        self,
+        run_id: str,
+    ) -> VerifiedArtifact: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -926,7 +1055,7 @@ class ProductionAdmissionFactory:
 
     def _publication(
         self,
-        request: ProductionAdmissionRequest,
+        request: ProductionAdmissionRequest | ProductionFreezeSuccessorRequest,
         resolved: Mapping[str, Any],
         created_at: datetime,
         ingestion_executor_sha256: str,
@@ -1056,17 +1185,55 @@ class ProductionAdmissionFactory:
         )
         return VerifiedPublishIntent(repository=repository, commit=commit)
 
-    def prepare(self, request: ProductionAdmissionRequest) -> PreparedAdmission:
-        if not isinstance(request, ProductionAdmissionRequest):
-            raise TypeError("request must be a ProductionAdmissionRequest")
-        upload_root = request.upload_dir.resolve()
-        if (
-            self.work_root.is_relative_to(upload_root)
-            or upload_root.is_relative_to(self.work_root)
-        ):
+    def _required_origins(
+        self,
+        parent_run_id: str,
+        originals: object,
+        main_assembly: str,
+    ) -> VerifiedArtifact:
+        if not isinstance(originals, VerifiedArtifact):
             raise ProtocolError(
-                "admission_ingestion.invalid",
-                {"where": "work_root", "reason": "upload-root-overlap"},
+                "admission_ingestion.freeze_origin_invalid",
+                {"parent_run_id": parent_run_id, "reason": "type"},
+            )
+        try:
+            record = self.artifacts.verify(originals.ref)
+            actual = VerifiedArtifact.from_store_record(originals.ref, record)
+        except (ArtifactStoreError, PipelineError, TypeError, ValueError, OSError) as error:
+            raise ProtocolError(
+                "admission_ingestion.freeze_origin_invalid",
+                {
+                    "parent_run_id": parent_run_id,
+                    "reason": str(error)[:1024],
+                },
+            ) from error
+        if actual != originals or actual.ref.kind != SOURCE_SET_KIND:
+            raise ProtocolError(
+                "admission_ingestion.freeze_origin_invalid",
+                {"parent_run_id": parent_run_id, "reason": "artifact"},
+            )
+        if main_assembly not in actual.inventory:
+            raise ProtocolError(
+                "admission_ingestion.freeze_origin_invalid",
+                {
+                    "parent_run_id": parent_run_id,
+                    "reason": "main-assembly",
+                },
+            )
+        return actual
+
+    def _prepare(
+        self,
+        request: ProductionAdmissionRequest | ProductionFreezeSuccessorRequest,
+        *,
+        originals: VerifiedArtifact | None = None,
+    ) -> PreparedAdmission:
+        if not isinstance(
+            request,
+            (ProductionAdmissionRequest, ProductionFreezeSuccessorRequest),
+        ):
+            raise TypeError(
+                "request must be a production admission request",
             )
         resolved, platform_config_sha256, snapshot_bytes = self._load_platform()
         (
@@ -1082,11 +1249,16 @@ class ProductionAdmissionFactory:
             )
         )
         created_at = self._now()
-        originals = self._seal_upload(
-            request,
-            resolved,
-            ingestion_executor_sha256,
-        )
+        if originals is None:
+            if not isinstance(request, ProductionAdmissionRequest):
+                raise TypeError(
+                    "a Freeze successor request requires verified originals",
+                )
+            originals = self._seal_upload(
+                request,
+                resolved,
+                ingestion_executor_sha256,
+            )
         ruleset = self._seal_ruleset(resolved, ingestion_executor_sha256)
         configuration = self._seal_configuration(
             resolved,
@@ -1129,6 +1301,20 @@ class ProductionAdmissionFactory:
             run_admission=build_run_admission(spec),
         )
 
+    def prepare(self, request: ProductionAdmissionRequest) -> PreparedAdmission:
+        if not isinstance(request, ProductionAdmissionRequest):
+            raise TypeError("request must be a ProductionAdmissionRequest")
+        upload_root = request.upload_dir.resolve()
+        if (
+            self.work_root.is_relative_to(upload_root)
+            or upload_root.is_relative_to(self.work_root)
+        ):
+            raise ProtocolError(
+                "admission_ingestion.invalid",
+                {"where": "work_root", "reason": "upload-root-overlap"},
+            )
+        return self._prepare(request)
+
     def admit(
         self,
         application: AdmissionApplication,
@@ -1170,6 +1356,70 @@ class ProductionAdmissionFactory:
             return existing
         return self.prepare(request).register(application)
 
+    def admit_from_frozen_freeze(
+        self,
+        application: AdmissionApplication,
+        request: ProductionFreezeSuccessorRequest,
+    ) -> AdmissionOutcomePort:
+        """Admit one current run from a parent's verified Freeze CAD bytes."""
+
+        if not isinstance(request, ProductionFreezeSuccessorRequest):
+            raise TypeError(
+                "request must be a ProductionFreezeSuccessorRequest",
+            )
+        if not callable(getattr(application, "load_admission_outcome", None)):
+            raise TypeError(
+                "application must provide load_admission_outcome(run_id)",
+            )
+        load_origins = getattr(
+            application,
+            "load_verified_freeze_origins",
+            None,
+        )
+        if not callable(load_origins):
+            raise TypeError(
+                "application must provide load_verified_freeze_origins(run_id)",
+            )
+        originals = self._required_origins(
+            request.parent_run_id,
+            load_origins(request.parent_run_id),
+            request.main_assembly,
+        )
+        existing = application.load_admission_outcome(request.run_id)
+        if existing is not None:
+            if (
+                not isinstance(existing.admission, RunAdmission)
+                or not isinstance(existing.admission.request, Mapping)
+            ):
+                raise ProtocolError(
+                    "admission_ingestion.outcome_invalid",
+                    {"run_id": request.run_id, "reason": "admission"},
+                )
+            existing_spec = AdmissionSpec.from_record(
+                existing.admission.request
+            )
+            differences = _intent_differences(
+                _freeze_successor_request_intent(request, originals),
+                _freeze_successor_spec_intent(existing_spec),
+            )
+            if differences:
+                raise ProtocolError(
+                    "admission_ingestion.intent_conflict",
+                    {
+                        "run_id": request.run_id,
+                        "fields": differences,
+                    },
+                )
+            PreparedAdmission(
+                spec=existing_spec,
+                run_admission=build_run_admission(existing_spec),
+            ).validate_outcome(existing)
+            return existing
+        return self._prepare(
+            request,
+            originals=originals,
+        ).register(application)
+
 
 def load_production_admission(
     application: AdmissionApplication,
@@ -1194,12 +1444,37 @@ def load_production_admission(
     ).admit(application, request)
 
 
+def load_production_freeze_successor(
+    application: AdmissionApplication,
+    request: ProductionFreezeSuccessorRequest,
+    *,
+    artifacts: ArtifactStore,
+    platform_snapshot: Path,
+    native_tool_provider: Callable[[], Mapping[str, Any]],
+    work_root: Path,
+    clock: Callable[[], datetime] | None = None,
+    portable_tool_provider: Callable[[], Mapping[str, Any]] | None = None,
+) -> AdmissionOutcomePort:
+    """Admit one Freeze-only successor through the production factory."""
+
+    return ProductionAdmissionFactory(
+        artifacts=artifacts,
+        platform_snapshot=platform_snapshot,
+        native_tool_provider=native_tool_provider,
+        work_root=work_root,
+        clock=clock,
+        portable_tool_provider=portable_tool_provider,
+    ).admit_from_frozen_freeze(application, request)
+
+
 __all__ = [
     "AdmissionApplication",
     "AdmissionOutcomePort",
     "PreparedAdmission",
     "ProductionAdmissionFactory",
     "ProductionAdmissionRequest",
+    "ProductionFreezeSuccessorRequest",
     "ReceivedUploadReceipt",
     "load_production_admission",
+    "load_production_freeze_successor",
 ]

@@ -9,7 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..interface_records import REQUEST_PURPOSES
+from ..interface_records import (
+    REQUEST_PURPOSES,
+    config_snapshot_digest as _config_snapshot_digest,
+    validate_config_snapshot,
+)
 from ..io import (
     PipelineError,
     artifact_path_parts,
@@ -74,6 +78,20 @@ _ARTIFACT_FIELDS = (
     ("configuration", CONFIGURATION_KIND, "configuration_artifact_id"),
 )
 _TERMINAL_REASON_PREFIX = "freeze."
+
+
+def configuration_snapshot_digest(root: Path) -> str:
+    """Return the canonical digest of one materialized config artifact."""
+
+    path = root / "config-snapshot.json"
+    if not path.is_file() or path.is_symlink():
+        raise PipelineError("The configuration artifact carries no config snapshot")
+    try:
+        snapshot = read_data(path)
+        validate_config_snapshot(snapshot)
+    except (PipelineError, TypeError, ValueError) as error:
+        raise PipelineError(f"The configuration snapshot is invalid: {error}") from error
+    return _config_snapshot_digest(snapshot)
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,11 +327,6 @@ def _bound_artifacts(command: StageCommand, request: Mapping[str, Any]) -> dict[
             "freeze.configuration_binding_mismatch",
             "The command configuration identity differs from the frozen request",
         )
-    if bound["configuration"].set_sha256 != request["platform_config_sha256"]:
-        raise FreezeRefusal(
-            "freeze.configuration_binding_mismatch",
-            "The configuration artifact content differs from the frozen request",
-        )
     if bound["ruleset"].set_sha256 != request["ruleset_catalog_sha256"]:
         raise FreezeRefusal(
             "freeze.ruleset_binding_mismatch",
@@ -462,7 +475,27 @@ class FreezeHandler:
             roots = _input_roots(command, workspace, bound)
             originals = _artifact_files(roots["originals"], bound["originals"], role="originals")
             _artifact_files(roots["ruleset"], bound["ruleset"], role="ruleset")
-            _artifact_files(roots["configuration"], bound["configuration"], role="configuration")
+            configuration_files = _artifact_files(
+                roots["configuration"],
+                bound["configuration"],
+                role="configuration",
+            )
+            if set(configuration_files) != {"config-snapshot.json"}:
+                raise FreezeRefusal(
+                    "freeze.configuration_binding_mismatch",
+                    "The configuration artifact must carry exactly one config snapshot",
+                )
+            configuration_snapshot_sha256 = configuration_snapshot_digest(
+                roots["configuration"]
+            )
+            if (
+                configuration_snapshot_sha256
+                != request["platform_config_sha256"]
+            ):
+                raise FreezeRefusal(
+                    "freeze.configuration_binding_mismatch",
+                    "The configuration snapshot differs from the frozen request",
+                )
             ruleset = _ruleset_record(roots["ruleset"], request["ruleset_version"])
 
             validation = workspace.root / f"freeze-originals-{claim.fence}"
@@ -520,7 +553,10 @@ class FreezeHandler:
                     {
                         "id": "configuration.snapshot",
                         "state": "passed",
-                        "details": {"set_sha256": bound["configuration"].set_sha256},
+                        "details": {
+                            "artifact_set_sha256": bound["configuration"].set_sha256,
+                            "snapshot_sha256": configuration_snapshot_sha256,
+                        },
                     },
                 ],
             }
@@ -557,7 +593,10 @@ class FreezeHandler:
             )
             _write_canonical(
                 output / "configuration.json",
-                {"artifact": bound["configuration"].to_record()},
+                {
+                    "artifact": bound["configuration"].to_record(),
+                    "snapshot_sha256": configuration_snapshot_sha256,
+                },
             )
             _write_canonical(output / "checks.json", checks)
             return StageExecution(
@@ -610,6 +649,7 @@ __all__ = [
     "FreezeRefusal",
     "RulesetCatalog",
     "RulesetRoot",
+    "configuration_snapshot_digest",
     "read_ruleset_catalog",
     "ruleset_record_roots",
 ]

@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import description_pipeline.artifacts.store as store_module
 from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline.io import digest
 from description_pipeline.pipeline.contracts import DispatchConf, StageResult
@@ -47,6 +50,40 @@ class ArtifactStoreTests(unittest.TestCase):
         self.store.materialize(first, destination)
         self.assertEqual((destination / "nested" / "a.txt").read_text(encoding="utf-8"), "alpha\n")
         self.assertEqual((destination / "b.bin").read_bytes(), b"\x00\x01\x02")
+
+    def test_concurrent_identical_seals_publish_one_verified_artifact(self) -> None:
+        sources = (self.source("first"), self.source("second"))
+        barrier = threading.Barrier(2)
+        original_replace = os.replace
+        results = []
+        errors = []
+
+        def racing_replace(source, destination):
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                source_path.parent == self.store.objects
+                and destination_path.parent == self.store.objects
+            ):
+                barrier.wait(timeout=5)
+            return original_replace(source, destination)
+
+        def seal(source):
+            try:
+                results.append(self.seal(source))
+            except BaseException as error:  # noqa: BLE001 - retained for the test thread
+                errors.append(error)
+
+        with patch.object(store_module.os, "replace", side_effect=racing_replace):
+            threads = [threading.Thread(target=seal, args=(source,)) for source in sources]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1])
+        self.store.verify(results[0])
 
     def test_tampered_member_is_rejected(self) -> None:
         artifact = self.seal(self.source("source"))

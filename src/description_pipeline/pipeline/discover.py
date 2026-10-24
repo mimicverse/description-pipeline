@@ -48,6 +48,7 @@ from .effects import EffectState, StageEffectPort
 from .engine import StageWorkspace
 from .freeze import (
     RulesetCatalog,
+    configuration_snapshot_digest,
     read_ruleset_catalog,
     ruleset_record_roots,
 )
@@ -231,13 +232,10 @@ def _bound_artifacts(command: StageCommand, request: Mapping[str, Any]) -> dict[
         raise NativeDiscoverRefusal("discover.freeze_binding_mismatch", "Freeze artifact belongs to another run")
     if bound["ruleset"].set_sha256 != request["ruleset_catalog_sha256"]:
         raise NativeDiscoverRefusal("discover.ruleset_binding_mismatch", "Ruleset artifact differs from the request")
-    if (
-        bound["configuration"].set_sha256 != request["platform_config_sha256"]
-        or command.config_snapshot_sha256 != request["platform_config_sha256"]
-    ):
+    if command.config_snapshot_sha256 != request["platform_config_sha256"]:
         raise NativeDiscoverRefusal(
             "discover.configuration_binding_mismatch",
-            "Configuration artifact differs from the command snapshot",
+            "Configuration identity differs from the command snapshot",
         )
     return bound
 
@@ -391,7 +389,33 @@ class DiscoverHandler:
                 )
             _artifact_files(roots["ruleset"], bound["ruleset"], role="ruleset")
             ruleset = _ruleset_version(roots["ruleset"], request["ruleset_version"])
-            _artifact_files(roots["configuration"], bound["configuration"], role="configuration")
+            configuration_files = _artifact_files(
+                roots["configuration"],
+                bound["configuration"],
+                role="configuration",
+            )
+            if set(configuration_files) != {"config-snapshot.json"}:
+                raise NativeDiscoverRefusal(
+                    "discover.configuration_binding_mismatch",
+                    "The configuration artifact must carry exactly one config snapshot",
+                )
+            try:
+                configuration_snapshot_sha256 = configuration_snapshot_digest(
+                    roots["configuration"]
+                )
+            except PipelineError as error:
+                raise NativeDiscoverRefusal(
+                    "discover.configuration_binding_mismatch",
+                    str(error),
+                ) from error
+            if (
+                configuration_snapshot_sha256
+                != request["platform_config_sha256"]
+            ):
+                raise NativeDiscoverRefusal(
+                    "discover.configuration_binding_mismatch",
+                    "The configuration snapshot differs from the request",
+                )
             _artifact_files(roots["freeze"], bound["freeze"], role="freeze")
             native_request = NativeDiscoverRequest(
                 schema_version=NATIVE_DISCOVER_REQUEST_SCHEMA,

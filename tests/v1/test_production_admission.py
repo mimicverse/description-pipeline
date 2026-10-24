@@ -12,7 +12,7 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -24,7 +24,7 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
-from description_pipeline.artifacts import ArtifactStore
+from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline import __version__
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.interface_records import config_snapshot_digest
@@ -37,6 +37,7 @@ from description_pipeline.pipeline.admission import (
 )
 from description_pipeline.pipeline.application import (
     AdmissionOutcome,
+    ApplicationError,
     StageApplication,
 )
 from description_pipeline.pipeline.contracts import (
@@ -48,6 +49,7 @@ from description_pipeline.pipeline.contracts import (
 import description_pipeline.pipeline.discover as discover_module
 from description_pipeline.pipeline.freeze import (
     RULESET_CATALOG_SCHEMA,
+    FreezeHandler,
     RulesetCatalog,
     RulesetRoot,
     ruleset_record_roots,
@@ -55,9 +57,12 @@ from description_pipeline.pipeline.freeze import (
 from description_pipeline.pipeline.ingestion import (
     ProductionAdmissionFactory,
     ProductionAdmissionRequest,
+    ProductionFreezeSuccessorRequest,
     ReceivedUploadReceipt,
     load_production_admission,
+    load_production_freeze_successor,
 )
+from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.publish_contract import REPOSITORY_SNAPSHOT_FILE
 from description_pipeline.pipeline.stages.generate import GenerateHandler
 from description_pipeline.pipeline.stages.publish import PublishHandler
@@ -371,6 +376,29 @@ class ProductionAdmissionTests(unittest.TestCase):
             portable_tool_provider=lambda: self.portable_tool,
         )
 
+    def _tool_variant(
+        self,
+        *,
+        source_commit: str,
+        source_tree: str,
+        seed: str,
+    ) -> tuple[dict, dict]:
+        portable = copy.deepcopy(self.portable_tool)
+        native = copy.deepcopy(self.native_tool)
+        for role, tool in (("portable", portable), ("native", native)):
+            package_files = {
+                f"description_pipeline/{role}_{seed}.py": digest(
+                    {"release-file": role, "seed": seed}
+                )
+            }
+            source = digest(package_files)
+            tool["source_sha256"] = source
+            tool["release"]["source_sha256"] = source
+            tool["release"]["source_commit"] = source_commit
+            tool["release"]["source_tree"] = source_tree
+            tool["release"]["package_files"] = package_files
+        return portable, native
+
     @unittest.skipUnless(
         PG_AVAILABLE,
         "pgserver/psycopg2 are not installed",
@@ -579,14 +607,6 @@ class ProductionAdmissionTests(unittest.TestCase):
             ),
             replace(
                 self.request,
-                parent_run_id="another-parent",
-            ),
-            replace(
-                self.request,
-                from_stage="discover",
-            ),
-            replace(
-                self.request,
                 main_assembly="other.SLDASM",
                 receipt=replace(
                     self.receipt,
@@ -657,6 +677,314 @@ class ProductionAdmissionTests(unittest.TestCase):
                     raised.exception.code,
                     "admission_ingestion.intent_conflict",
                 )
+
+    @unittest.skipUnless(
+        PG_AVAILABLE,
+        "pgserver/psycopg2 are not installed",
+    )
+    def test_real_pg_freeze_successor_reuses_frozen_bytes_and_current_inputs(
+        self,
+    ) -> None:
+        server_root = tempfile.TemporaryDirectory(
+            prefix="freeze-successor-postgres-"
+        )
+        self.addCleanup(server_root.cleanup)
+        server = pgserver.get_server(
+            Path(server_root.name) / "pgdata",
+            cleanup_mode="delete",
+        )
+        self.addCleanup(server.cleanup)
+        schema = "freeze_successor_" + uuid.uuid4().hex
+        schema_sql = PLATFORM_SCHEMA.read_text(encoding="utf-8").replace(
+            ':"platform_schema"',
+            f'"{schema}"',
+        )
+        with (
+            psycopg2.connect(server.get_uri()) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(schema_sql)
+            cursor.execute(
+                f'UPDATE "{schema}".admission SET state = %s WHERE id = 1',
+                ("open",),
+            )
+
+        def connect():
+            return psycopg2.connect(
+                server.get_uri(),
+                options=f"-c search_path={schema},public",
+            )
+
+        def query(statement, parameters=()):
+            with connect() as connection, connection.cursor() as cursor:
+                cursor.execute(statement, parameters)
+                return cursor.fetchall()
+
+        now = datetime(2026, 10, 25, 10, tzinfo=UTC)
+        facts = FactStore(connect, self.artifacts)
+        parent_work = self.root / "parent-work"
+        parent_work.mkdir()
+        services = CanonicalStageServices(
+            facts=facts,
+            artifacts=self.artifacts,
+            work_root=parent_work,
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": "freeze-successor-test"}),
+                executor_sha256=self.portable_tool["source_sha256"],
+                lease=timedelta(minutes=5),
+                claim_id_factory=lambda: "claim-" + uuid.uuid4().hex,
+            ),
+            clock=lambda: now,
+        )
+        application = StageApplication(
+            services=services,
+            facts=facts,
+            artifacts=self.artifacts,
+            handlers={"freeze": FreezeHandler()},
+            builders={},
+        )
+        parent_work_root = self.root / "parent-admission-work"
+        parent_work_root.mkdir()
+        parent = load_production_admission(
+            application,
+            self.request,
+            artifacts=self.artifacts,
+            platform_snapshot=self.snapshot_path,
+            native_tool_provider=lambda: self.native_tool,
+            work_root=parent_work_root,
+            clock=lambda: now,
+            portable_tool_provider=lambda: self.portable_tool,
+        )
+        freeze_result = application.execute_registered_command(
+            parent.freeze_command.command_id
+        )
+        self.assertEqual(freeze_result.outcome, "completed")
+        parent_spec = AdmissionSpec.from_record(parent.admission.request)
+        self.assertEqual(
+            application.load_verified_freeze_origins(parent_spec.run_id),
+            parent_spec.originals,
+        )
+        shutil.rmtree(self.upload)
+        shutil.rmtree(parent_work)
+
+        self.record_file.write_text(
+            '{"limits":{"lower":-3,"upper":3}}\n',
+            encoding="utf-8",
+        )
+        current_snapshot = self._config_snapshot()
+        current_snapshot["generated_at"] = "2026-10-25T01:00:00Z"
+        current_snapshot["resolved"]["targets"]["m3.1"] = {
+            "repository_slug": "mimicverse/robot",
+            "base": "main",
+        }
+        self.snapshot_path.write_bytes(canonical(current_snapshot))
+        (self.checkout / "README.md").write_text(
+            "fixture\nsuccessor-current-generation\n",
+            encoding="utf-8",
+        )
+        _git(self.checkout, "add", "README.md")
+        _git(self.checkout, "commit", "-m", "successor current generation")
+        _git(self.checkout, "push", "origin", "main")
+        self.portable_tool, self.native_tool = self._tool_variant(
+            source_commit="b" * 40,
+            source_tree="c" * 40,
+            seed="current",
+        )
+        provider_calls = {"native": 0, "portable": 0}
+
+        def native_provider():
+            provider_calls["native"] += 1
+            return self.native_tool
+
+        def portable_provider():
+            provider_calls["portable"] += 1
+            return self.portable_tool
+
+        def child_factory(work_root):
+            return ProductionAdmissionFactory(
+                artifacts=self.artifacts,
+                platform_snapshot=self.snapshot_path,
+                native_tool_provider=native_provider,
+                work_root=work_root,
+                clock=lambda: datetime(
+                    2026,
+                    10,
+                    25,
+                    11,
+                    tzinfo=UTC,
+                ),
+                portable_tool_provider=portable_provider,
+            )
+
+        child_request = ProductionFreezeSuccessorRequest(
+            run_id="run-freeze-successor-pg",
+            request_id="request-freeze-successor-pg",
+            parent_run_id=parent_spec.run_id,
+            main_assembly="robot.SLDASM",
+            target_hardware="m3.1",
+            purpose="engineering",
+            change_summary="Recreate the current generation from frozen CAD",
+            principal="cli:tenant:ou_successor",
+        )
+        child_work = self.root / "child-work"
+        child_work.mkdir()
+        admitted = child_factory(child_work).admit_from_frozen_freeze(
+            application,
+            child_request,
+        )
+        child_spec = AdmissionSpec.from_record(admitted.admission.request)
+        self.assertEqual(child_spec.originals, parent_spec.originals)
+        self.assertEqual(child_spec.from_stage, "freeze")
+        self.assertEqual(child_spec.parent_run_id, parent_spec.run_id)
+        self.assertEqual(
+            child_spec.originals.ref.producer_tool_sha256,
+            parent_spec.executors.freeze,
+        )
+        for artifact in (
+            child_spec.ruleset.artifact.ref,
+            child_spec.configuration.ref,
+            child_spec.native_tool_requirement.ref,
+            child_spec.publish_intent.repository.artifact.ref,
+        ):
+            self.assertEqual(
+                artifact.producer_tool_sha256,
+                self.portable_tool["source_sha256"],
+            )
+            self.assertNotEqual(
+                artifact.producer_tool_sha256,
+                parent_spec.executors.freeze,
+            )
+        self.assertEqual(
+            query(
+                """
+                SELECT count(*)
+                FROM command
+                WHERE run_id = %s
+                """,
+                (child_spec.run_id,),
+            )[0][0],
+            2,
+        )
+        self.assertEqual(
+            query(
+                """
+                SELECT count(*)
+                FROM command
+                WHERE run_id = %s AND stage <> 'freeze'
+                """,
+                (child_spec.run_id,),
+            )[0][0],
+            0,
+        )
+        self.assertEqual(
+            query(
+                """
+                SELECT count(*)
+                FROM stage_decision
+                WHERE run_id = %s
+                """,
+                (child_spec.run_id,),
+            )[0][0],
+            0,
+        )
+
+        before_retry = dict(provider_calls)
+        artifact_rows = query("SELECT count(*) FROM artifact")[0][0]
+
+        def unavailable_provider():
+            raise AssertionError("an existing admission must not reread current tools")
+
+        retry_work = self.root / "retry-work"
+        retry_work.mkdir()
+        retried = ProductionAdmissionFactory(
+            artifacts=self.artifacts,
+            platform_snapshot=self.snapshot_path,
+            native_tool_provider=unavailable_provider,
+            work_root=retry_work,
+            clock=lambda: datetime(
+                2026,
+                10,
+                25,
+                12,
+                tzinfo=UTC,
+            ),
+            portable_tool_provider=unavailable_provider,
+        ).admit_from_frozen_freeze(application, child_request)
+        self.assertEqual(retried, admitted)
+        self.assertEqual(provider_calls, before_retry)
+        self.assertEqual(query("SELECT count(*) FROM artifact")[0][0], artifact_rows)
+
+        changed = replace(
+            child_request,
+            target_hardware="m3.0",
+            change_summary="A different meaning under the same request key",
+        )
+        with self.assertRaises(ProtocolError) as conflict:
+            child_factory(child_work).admit_from_frozen_freeze(
+                application,
+                changed,
+            )
+        self.assertEqual(
+            conflict.exception.code,
+            "admission_ingestion.intent_conflict",
+        )
+        self.assertEqual(provider_calls, before_retry)
+
+        concurrent_request = replace(
+            child_request,
+            run_id="run-freeze-successor-concurrent",
+            request_id="request-freeze-successor-concurrent",
+            change_summary="Admit the same successor through a lost response",
+        )
+        concurrent_a = self.root / "concurrent-a"
+        concurrent_b = self.root / "concurrent-b"
+        concurrent_a.mkdir()
+        concurrent_b.mkdir()
+        barrier = threading.Barrier(2)
+
+        def concurrent_admit(work_root):
+            factory = child_factory(work_root)
+            barrier.wait(timeout=5)
+            return factory.admit_from_frozen_freeze(
+                application,
+                concurrent_request,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(concurrent_admit, concurrent_a)
+            second = executor.submit(concurrent_admit, concurrent_b)
+            outcome_a = first.result(timeout=30)
+            outcome_b = second.result(timeout=30)
+        self.assertEqual(outcome_a, outcome_b)
+        self.assertEqual(
+            query(
+                """
+                SELECT count(*)
+                FROM run_admission
+                WHERE run_id = %s
+                """,
+                (concurrent_request.run_id,),
+            )[0][0],
+            1,
+        )
+
+        original = (
+            self.artifacts.objects
+            / parent_spec.originals.ref.artifact_id
+            / parent_spec.originals.members[0].path
+        )
+        original.write_bytes(b"tampered Freeze origin")
+        tampered_request = replace(
+            child_request,
+            run_id="run-freeze-successor-tampered",
+            request_id="request-freeze-successor-tampered",
+        )
+        with self.assertRaises((ApplicationError, ArtifactStoreError)):
+            child_factory(child_work).admit_from_frozen_freeze(
+                application,
+                tampered_request,
+            )
 
     def test_real_inputs_are_sealed_and_admission_keeps_no_checkout_path(self) -> None:
         work = self.root / "work"
@@ -764,6 +1092,217 @@ class ProductionAdmissionTests(unittest.TestCase):
         )
         self.assertTrue((clone / "README.md").is_file())
         self.assertTrue(originals.is_dir())
+
+    def test_freeze_successor_reuses_only_parent_originals_and_current_inputs(self) -> None:
+        parent_work = self.root / "parent-work"
+        parent_work.mkdir()
+        parent = self._factory(work_root=parent_work).prepare(self.request)
+        parent_portable = self.portable_tool["source_sha256"]
+        shutil.rmtree(self.upload)
+
+        self.record_file.write_text(
+            '{"limits":{"lower":-2,"upper":2}}\n',
+            encoding="utf-8",
+        )
+        current_snapshot = self._config_snapshot()
+        current_snapshot["generated_at"] = "2026-10-25T01:00:00Z"
+        current_snapshot["resolved"]["targets"]["m3.1"] = {
+            "repository_slug": "mimicverse/robot",
+            "base": "main",
+        }
+        self.snapshot_path.write_bytes(canonical(current_snapshot))
+        (self.checkout / "README.md").write_text(
+            "fixture\nsuccessor\n",
+            encoding="utf-8",
+        )
+        _git(self.checkout, "add", "README.md")
+        _git(self.checkout, "commit", "-m", "successor fixture")
+        _git(self.checkout, "push", "origin", "main")
+        self.portable_tool, self.native_tool = self._tool_variant(
+            source_commit="b" * 40,
+            source_tree="c" * 40,
+            seed="b",
+        )
+
+        child = ProductionFreezeSuccessorRequest(
+            run_id="run-freeze-successor",
+            request_id="request-freeze-successor",
+            parent_run_id=self.request.run_id,
+            main_assembly="robot.SLDASM",
+            target_hardware="m3.1",
+            purpose="engineering",
+            change_summary="Freeze the retained CAD closure under current inputs",
+            principal="cli:tenant:ou_successor",
+        )
+        admitted = []
+        artifacts = self.artifacts
+
+        class Application:
+            def load_verified_freeze_origins(self, run_id):
+                return parent.spec.originals
+
+            def load_admission_outcome(self, run_id):
+                return None
+
+            def admit(self, spec):
+                admitted.append(spec)
+                return _admission_outcome(artifacts, spec)
+
+        child_work = self.root / "child-work"
+        child_work.mkdir()
+        outcome = load_production_freeze_successor(
+            Application(),
+            child,
+            artifacts=self.artifacts,
+            platform_snapshot=self.snapshot_path,
+            native_tool_provider=lambda: self.native_tool,
+            work_root=child_work,
+            clock=lambda: datetime(
+                2026,
+                10,
+                25,
+                10,
+                tzinfo=UTC,
+            ),
+            portable_tool_provider=lambda: self.portable_tool,
+        )
+        spec = AdmissionSpec.from_record(outcome.admission.request)
+        self.assertEqual(spec.parent_run_id, self.request.run_id)
+        self.assertEqual(spec.from_stage, "freeze")
+        self.assertEqual(spec.target_hardware, "m3.1")
+        self.assertEqual(spec.originals, parent.spec.originals)
+        self.assertEqual(spec.originals.ref.producer_tool_sha256, parent_portable)
+        self.assertNotEqual(spec.originals.ref.producer_tool_sha256, self.portable_tool["source_sha256"])
+        for artifact in (
+            spec.ruleset.artifact.ref,
+            spec.configuration.ref,
+            spec.native_tool_requirement.ref,
+            spec.publish_intent.repository.artifact.ref,
+        ):
+            self.assertEqual(
+                artifact.producer_tool_sha256,
+                self.portable_tool["source_sha256"],
+            )
+        self.assertNotEqual(spec.ruleset.version, parent.spec.ruleset.version)
+        self.assertNotEqual(spec.platform_config_sha256, parent.spec.platform_config_sha256)
+        self.assertNotEqual(
+            spec.publish_intent.repository.artifact.ref,
+            parent.spec.publish_intent.repository.artifact.ref,
+        )
+        self.assertEqual(
+            spec.native_tool_source_sha256,
+            self.native_tool["source_sha256"],
+        )
+        self.assertEqual(parent.spec.from_stage, "freeze")
+        self.assertEqual(len(admitted), 1)
+
+    def test_freeze_successor_rejects_old_upload_and_unverified_origins(self) -> None:
+        with self.assertRaises(ProtocolError) as linked_upload:
+            replace(
+                self.request,
+                parent_run_id="run-parent",
+            )
+        self.assertEqual(
+            linked_upload.exception.code,
+            "admission_ingestion.freeze_successor_required",
+        )
+        with self.assertRaises(ProtocolError):
+            replace(self.request, from_stage="discover")
+
+        source_work = self.root / "source-work"
+        source_work.mkdir()
+        parent = self._factory(work_root=source_work).prepare(self.request)
+        child_work = self.root / "source-child-work"
+        child_work.mkdir()
+        child = ProductionFreezeSuccessorRequest(
+            run_id="run-child",
+            request_id="request-child",
+            parent_run_id=self.request.run_id,
+            main_assembly="missing.SLDASM",
+            target_hardware="m3.0",
+            purpose="engineering",
+            change_summary="Use one verified parent closure",
+            principal="cli:tenant:ou_child",
+        )
+        artifacts = self.artifacts
+
+        class WrongMain:
+            def load_verified_freeze_origins(self, run_id):
+                return parent.spec.originals
+
+            def load_admission_outcome(self, run_id):
+                return None
+
+            def admit(self, spec):
+                return _admission_outcome(artifacts, spec)
+
+        with self.assertRaises(ProtocolError) as missing_main:
+            self._factory(work_root=child_work).admit_from_frozen_freeze(WrongMain(), child)
+        self.assertEqual(
+            missing_main.exception.code,
+            "admission_ingestion.freeze_origin_invalid",
+        )
+
+        artifact_root = (
+            self.artifacts.objects
+            / parent.spec.originals.ref.artifact_id
+            / parent.spec.originals.members[0].path
+        )
+        artifact_root.write_bytes(b"tampered")
+
+        class Tampered:
+            def load_verified_freeze_origins(self, run_id):
+                return parent.spec.originals
+
+            def load_admission_outcome(self, run_id):
+                return None
+
+            def admit(self, spec):
+                return _admission_outcome(artifacts, spec)
+
+        valid = replace(child, main_assembly="robot.SLDASM")
+        with self.assertRaises(ProtocolError) as tampered:
+            self._factory(work_root=child_work).admit_from_frozen_freeze(Tampered(), valid)
+        self.assertEqual(
+            tampered.exception.code,
+            "admission_ingestion.freeze_origin_invalid",
+        )
+
+    def test_freeze_successor_requires_current_dual_end_release(self) -> None:
+        source_work = self.root / "release-source-work"
+        source_work.mkdir()
+        parent = self._factory(work_root=source_work).prepare(self.request)
+        child_work = self.root / "release-child-work"
+        child_work.mkdir()
+        self.native_tool = copy.deepcopy(self.native_tool)
+        self.native_tool["release"]["source_commit"] = "f" * 40
+        child = ProductionFreezeSuccessorRequest(
+            run_id="run-release-child",
+            request_id="request-release-child",
+            parent_run_id=self.request.run_id,
+            main_assembly="robot.SLDASM",
+            target_hardware="m3.0",
+            purpose="engineering",
+            change_summary="Use the current dual-end release",
+            principal="cli:tenant:ou_release",
+        )
+
+        class Application:
+            def load_verified_freeze_origins(self, run_id):
+                return parent.spec.originals
+
+            def load_admission_outcome(self, run_id):
+                return None
+
+            def admit(self, spec):
+                raise AssertionError("mismatched releases must not reach admission")
+
+        with self.assertRaises(ProtocolError) as mismatch:
+            self._factory(work_root=child_work).admit_from_frozen_freeze(Application(), child)
+        self.assertEqual(
+            mismatch.exception.code,
+            "admission_ingestion.release_mismatch",
+        )
 
     def test_sealed_ruleset_roots_drive_discover_and_preserve_ambiguity(self) -> None:
         work = self.root / "work"

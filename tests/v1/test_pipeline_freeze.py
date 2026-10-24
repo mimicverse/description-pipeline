@@ -8,6 +8,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from description_pipeline.interface_records import config_snapshot_digest
 from description_pipeline.io import digest, file_digest, read_data, write_json
 from description_pipeline.pipeline.contracts import (
     ArtifactRef,
@@ -31,7 +32,11 @@ from description_pipeline.pipeline.freeze import (
     RulesetCatalog,
     RulesetRoot,
 )
-from description_pipeline.schemas import STAGE_RESULT_SCHEMA
+from description_pipeline.schemas import (
+    CONFIG_SNAPSHOT_SCHEMA,
+    PLATFORM_CONFIG_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+)
 
 
 def _members(root: Path) -> list[dict]:
@@ -102,7 +107,92 @@ class FreezeHarness:
         )
         self.ruleset_version = catalog.version
         write_json(self.ruleset / "catalog.json", catalog.to_record())
-        write_json(self.configuration / "config.json", {"snapshot": "config-1"})
+        self.state = root / "state"
+        self.handoff = root / "handoff"
+        self.artifact_root = root / "artifacts"
+        self.workspace_root = root / "workspace"
+        self.release = root / "release"
+        self.records = root / "records"
+        self.checkout = self.workspace_root / "robot"
+        for path in (
+            self.state,
+            self.handoff,
+            self.artifact_root,
+            self.workspace_root,
+            self.release,
+            self.records,
+            self.checkout,
+        ):
+            path.mkdir(exist_ok=True)
+        self.token = root / "token"
+        self.secret = root / "secret"
+        self.certificate = root / "certificate.pem"
+        self.private_key = root / "private-key.pem"
+        self.dsn = root / "database-dsn"
+        for path, value in (
+            (self.token, "t" * 64),
+            (self.secret, "s" * 64),
+            (self.certificate, "certificate"),
+            (self.private_key, "key"),
+            (self.dsn, "postgresql://fixture"),
+        ):
+            path.write_text(value, encoding="utf-8")
+        self.snapshot = {
+            "schema_version": CONFIG_SNAPSHOT_SCHEMA,
+            "install_id": "install-fixture",
+            "generated_at": "2026-10-25T00:00:00Z",
+            "resolved": {
+                "schema_version": PLATFORM_CONFIG_SCHEMA,
+                "operator": {
+                    "origin": "https://operator.example.test",
+                    "certificate_file": str(self.certificate),
+                    "private_key_file": str(self.private_key),
+                },
+                "storage": {
+                    "state_root": str(self.state),
+                    "handoff_root": str(self.handoff),
+                    "artifact_root": str(self.artifact_root),
+                    "workspace_root": str(self.workspace_root),
+                    "release_root": str(self.release),
+                },
+                "database": {"dsn_file": str(self.dsn)},
+                "windows": {
+                    "ssh_host": "windows-fixture",
+                    "endpoint_port": 8765,
+                    "token_file": str(self.token),
+                    "tunnel_loopback_port": 18765,
+                    "instance": {
+                        "task_name": "description-native",
+                        "package_root": "C:/payloads/packages",
+                        "output_root": "C:/payloads/outputs",
+                        "state_root": "C:/payloads/state",
+                    },
+                },
+                "auth": {
+                    "feishu_secret_file": str(self.secret),
+                    "tenant_keys": ["tenant"],
+                    "admin_open_ids": [],
+                },
+                "targets": {
+                    "m3.0": {
+                        "repository_slug": "mimicverse/robot",
+                        "base": "main",
+                    }
+                },
+                "specifications": {"record_roots": [str(self.records)]},
+                "retention": {"unreferenced_evidence_days": None},
+                "derived": {
+                    "store_root": str(self.state / "runs"),
+                    "repositories": {
+                        "mimicverse/robot": str(self.checkout),
+                    },
+                    "discovery": {"record_roots": [str(self.records)]},
+                },
+            },
+            "sources": {"platform_json_sha256": "a" * 64},
+        }
+        write_json(self.configuration / "config-snapshot.json", self.snapshot)
+        self.platform_config_sha256 = config_snapshot_digest(self.snapshot)
         self.originals_ref = _artifact(ORIGINALS_KIND, self.originals)
         self.ruleset_ref = _artifact(RULESET_KIND, self.ruleset)
         self.configuration_ref = _artifact(CONFIGURATION_KIND, self.configuration)
@@ -127,7 +217,7 @@ class FreezeHarness:
             "configuration_artifact_id": self.configuration_ref.artifact_id,
             "upload_inventory_sha256": digest(self.upload_files),
             "ruleset_catalog_sha256": self.ruleset_ref.set_sha256,
-            "platform_config_sha256": self.configuration_ref.set_sha256,
+            "platform_config_sha256": self.platform_config_sha256,
         }
         record.update(overrides)
         return record
@@ -140,7 +230,7 @@ class FreezeHarness:
             idempotency_key=idempotency_key,
             request=self.request() if request is None else request,
             input_artifacts=(self.originals_ref, self.ruleset_ref, self.configuration_ref),
-            config_snapshot_sha256=self.configuration_ref.set_sha256,
+            config_snapshot_sha256=self.platform_config_sha256,
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": 1}),
             expected_executor_sha256=digest({"executor": "freeze"}),
