@@ -261,7 +261,14 @@ class ProductionAdmissionTests(unittest.TestCase):
         catalog = json.loads((ruleset_root / "catalog.json").read_text(encoding="utf-8"))
         self.assertEqual(spec.ruleset.version, "records-" + digest(catalog["records"]))
         self.assertEqual(spec.platform_config_sha256, self._config_digest())
-        self.assertEqual(spec.native_tool, self.native_tool)
+        native_tool_root = self.artifacts.materialize(
+            spec.native_tool_requirement.ref,
+            work / "sealed-native-tool",
+        )
+        self.assertEqual(
+            json.loads((native_tool_root / "tool.json").read_text(encoding="utf-8")),
+            self.native_tool,
+        )
         self.assertEqual(spec.native_tool_source_sha256, self.native_tool["source_sha256"])
         self.assertEqual(spec.native_tool_record_sha256, digest(self.native_tool))
         self.assertEqual(self.native_reads, 1)

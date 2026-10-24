@@ -18,7 +18,6 @@ from ..schemas import (
     ARTIFACT_MANIFEST_SCHEMA,
     DISCOVER_RESULT_SCHEMA,
     GENERATE_REQUEST_SCHEMA,
-    TOOL_SCHEMA,
 )
 from .contracts import (
     ArtifactRef,
@@ -55,6 +54,7 @@ from .verify_contract import (
 
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
+NATIVE_TOOL_REQUIREMENT_KIND = "native_tool_requirement"
 GENERATE_OUTPUT_CONTRACT = "solidworks-to-urdf.generated-artifact/v1"
 SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -68,7 +68,7 @@ _ADMISSION_FIELDS = frozenset(
         "main_assembly",
         "native_tool_source_sha256",
         "native_tool_record_sha256",
-        "native_tool",
+        "native_tool_requirement",
         "originals",
         "parent_run_id",
         "policy_sha256",
@@ -104,14 +104,6 @@ def _require_safe_multiline(value: object, code: str, where: str) -> str:
     if not text.strip() or any((ord(char) < 32 and char != "\n") or ord(char) == 127 for char in text):
         raise ProtocolError(code, {"where": where})
     return text
-
-
-def _plain_value(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {str(key): _plain_value(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_plain_value(item) for item in value]
-    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,7 +340,7 @@ class AdmissionSpec:
     executors: StageExecutors
     native_tool_source_sha256: str
     native_tool_record_sha256: str
-    native_tool: Mapping[str, Any]
+    native_tool_requirement: VerifiedArtifact
     contract_sha256: str
     policy_sha256: str
     platform_config_sha256: str
@@ -391,19 +383,18 @@ class AdmissionSpec:
             "platform_config_sha256",
         ):
             _require_digest(getattr(self, field), "admission.invalid", field)
-        native_tool = _plain_value(self.native_tool)
-        if not isinstance(native_tool, dict):
-            raise ProtocolError("admission.invalid", {"where": "native_tool"})
         if (
-            native_tool.get("schema_version") != TOOL_SCHEMA
-            or native_tool.get("source_sha256") != self.native_tool_source_sha256
-            or digest(native_tool) != self.native_tool_record_sha256
+            not isinstance(self.native_tool_requirement, VerifiedArtifact)
+            or self.native_tool_requirement.ref.kind
+            != NATIVE_TOOL_REQUIREMENT_KIND
+            or set(self.native_tool_requirement.inventory) != {"tool.json"}
+            or self.native_tool_requirement.inventory["tool.json"]
+            != self.native_tool_record_sha256
         ):
             raise ProtocolError(
                 "admission.invalid",
-                {"where": "native_tool", "reason": "identity-mismatch"},
+                {"where": "native_tool_requirement", "reason": "identity-mismatch"},
             )
-        object.__setattr__(self, "native_tool", native_tool)
         if not isinstance(self.publish_intent, VerifiedPublishIntent):
             raise ProtocolError("admission.invalid", {"where": "publish_intent"})
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
@@ -424,7 +415,7 @@ class AdmissionSpec:
             "main_assembly": self.main_assembly,
             "native_tool_source_sha256": self.native_tool_source_sha256,
             "native_tool_record_sha256": self.native_tool_record_sha256,
-            "native_tool": _plain_value(self.native_tool),
+            "native_tool_requirement": self.native_tool_requirement.to_record(),
             "originals": self.originals.to_record(),
             "parent_run_id": self.parent_run_id,
             "policy_sha256": self.policy_sha256,
@@ -477,7 +468,9 @@ class AdmissionSpec:
             executors=StageExecutors.from_record(record["executors"]),
             native_tool_source_sha256=record["native_tool_source_sha256"],
             native_tool_record_sha256=record["native_tool_record_sha256"],
-            native_tool=record["native_tool"],
+            native_tool_requirement=_verified_from_record(
+                record["native_tool_requirement"]
+            ),
             contract_sha256=record["contract_sha256"],
             policy_sha256=record["policy_sha256"],
             platform_config_sha256=record["platform_config_sha256"],
@@ -1179,12 +1172,17 @@ def build_capture_command(
         "main_assembly": discover_result.main_assembly,
         "native_tool_source_sha256": discover_result.native_tool_source_sha256,
         "native_tool_record_sha256": discover_result.native_tool_record_sha256,
+        "native_tool_requirement_artifact_id": spec.native_tool_requirement.ref.artifact_id,
     }
     return _base_command(
         spec,
         stage="capture",
         request=request,
-        input_artifacts=(freeze.result.output_artifact, discover.result.output_artifact),
+        input_artifacts=(
+            freeze.result.output_artifact,
+            discover.result.output_artifact,
+            spec.native_tool_requirement.ref,
+        ),
         predecessor_decision_id=discover.decision.decision_id,
     )
 

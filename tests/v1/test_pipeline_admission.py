@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import shutil
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -43,7 +44,10 @@ from description_pipeline.pipeline import (
     validate_verify_command,
     validate_store_command,
 )
-from description_pipeline.pipeline.admission import ADMISSION_SPEC_SCHEMA
+from description_pipeline.pipeline.admission import (
+    ADMISSION_SPEC_SCHEMA,
+    NATIVE_TOOL_REQUIREMENT_KIND,
+)
 from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.schemas import (
     DISCOVER_RESULT_SCHEMA,
@@ -127,6 +131,13 @@ class AdmissionHarness:
             "release": None,
             "runtime": {"role": "native"},
         }
+        self.native_tool_requirement = self._verified(
+            self._seal_source(
+                NATIVE_TOOL_REQUIREMENT_KIND,
+                root / "native-tool",
+                {"tool.json": canonical(self.native_tool)},
+            )
+        )
         self.verified_ruleset = VerifiedRuleset.from_catalog_bytes(
             self.ruleset,
             (root / "rules/catalog.json").read_bytes(),
@@ -156,7 +167,7 @@ class AdmissionHarness:
             ),
             native_tool_source_sha256=self.native_tool["source_sha256"],
             native_tool_record_sha256=digest(self.native_tool),
-            native_tool=self.native_tool,
+            native_tool_requirement=self.native_tool_requirement,
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": 1}),
             platform_config_sha256=digest({"platform-config": 1}),
@@ -568,6 +579,7 @@ class AdmissionProjectionTests(unittest.TestCase):
                 "main_assembly",
                 "native_tool_source_sha256",
                 "native_tool_record_sha256",
+                "native_tool_requirement_artifact_id",
                 "prepared_sha256",
                 "upload_sha256",
             },
@@ -578,6 +590,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             (
                 freeze.result.output_artifact,
                 discover.result.output_artifact,
+                self.harness.spec.native_tool_requirement.ref,
             ),
         )
         self.assertEqual(capture_command.request["prepared_sha256"], discover_result.prepared_sha256)
@@ -588,6 +601,10 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(
             capture_command.request["native_tool_record_sha256"],
             discover_result.native_tool_record_sha256,
+        )
+        self.assertEqual(
+            capture_command.request["native_tool_requirement_artifact_id"],
+            self.harness.spec.native_tool_requirement.ref.artifact_id,
         )
         self.assertNotEqual(
             capture_command.expected_executor_sha256,
@@ -781,6 +798,43 @@ class AdmissionProjectionTests(unittest.TestCase):
         with self.assertRaises(ProtocolError) as raised:
             validate_capture_command(self.harness.spec, freeze, discover, discover_result, forged)
         self.assertIn("request.prepared_sha256", raised.exception.detail["fields"])
+
+    def test_current_native_requirement_is_independent_from_discover_producer(self) -> None:
+        producer_tool = self.harness.native_tool
+        current_tool = {
+            **producer_tool,
+            "version": "current-replay-tool",
+            "runtime": {
+                "role": "native",
+                "system": "Windows",
+                "variant": "B",
+            },
+        }
+        current_record = digest(current_tool)
+        current_ref = self.harness._seal_source(
+            NATIVE_TOOL_REQUIREMENT_KIND,
+            self.harness.root / "current-native-tool",
+            {"tool.json": canonical(current_tool)},
+        )
+        current_requirement = self.harness._verified(current_ref)
+        diagnostic_spec = replace(
+            self.harness.spec,
+            native_tool_source_sha256=current_tool["source_sha256"],
+            native_tool_record_sha256=current_record,
+            native_tool_requirement=current_requirement,
+        )
+        self.assertNotEqual(
+            digest(producer_tool),
+            diagnostic_spec.native_tool_record_sha256,
+        )
+        self.assertEqual(
+            diagnostic_spec.native_tool_requirement.inventory["tool.json"],
+            current_record,
+        )
+        self.assertEqual(
+            self.harness.spec.native_tool_requirement.inventory["tool.json"],
+            digest(producer_tool),
+        )
 
     def test_publish_projects_only_verified_certificate_and_sealed_repository(self) -> None:
         freeze = self.harness.freeze_result(self.command)

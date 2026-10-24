@@ -35,6 +35,7 @@ from ..sources.solidworks.handoff import describe_handoff
 from ..stages import CONTRACT_SHA256
 from .admission import (
     ADMISSION_SPEC_SCHEMA,
+    NATIVE_TOOL_REQUIREMENT_KIND,
     AdmissionSpec,
     StageExecutors,
     VerifiedArtifact,
@@ -454,7 +455,10 @@ class ProductionAdmissionFactory:
         )
         return executors, ingestion
 
-    def _native_requirement(self) -> tuple[dict[str, Any], str, str]:
+    def _native_requirement(
+        self,
+        ingestion_tool_sha256: str,
+    ) -> tuple[VerifiedArtifact, str, str]:
         tool = _canonical_mapping(
             self.native_tool_provider(),
             "native_tool",
@@ -471,7 +475,27 @@ class ProductionAdmissionFactory:
                 "admission_ingestion.native_tool_invalid",
                 {"reason": "release-source-mismatch"},
             )
-        return tool, source, digest(tool)
+        record_sha256 = digest(tool)
+        with tempfile.TemporaryDirectory(
+            prefix="admission-native-tool-",
+            dir=self.work_root,
+        ) as directory:
+            root = Path(directory)
+            (root / "tool.json").write_bytes(canonical(tool))
+            artifact = self.artifacts.seal_tree(
+                root,
+                kind=NATIVE_TOOL_REQUIREMENT_KIND,
+                producer_run_id=None,
+                producer_stage=None,
+                producer_tool_sha256=ingestion_tool_sha256,
+            )
+        requirement = self._verified(artifact)
+        if requirement.inventory != {"tool.json": record_sha256}:
+            raise ProtocolError(
+                "admission_ingestion.native_tool_invalid",
+                {"reason": "artifact-identity"},
+            )
+        return requirement, source, record_sha256
 
     def _verified(self, artifact) -> VerifiedArtifact:
         return VerifiedArtifact.from_store_record(
@@ -770,8 +794,8 @@ class ProductionAdmissionFactory:
             )
         resolved, platform_config_sha256, snapshot_bytes = self._load_platform()
         executors, ingestion_tool_sha256 = self._installed()
-        native_tool, native_source_sha256, native_record_sha256 = (
-            self._native_requirement()
+        native_tool_requirement, native_source_sha256, native_record_sha256 = (
+            self._native_requirement(ingestion_tool_sha256)
         )
         created_at = self._now()
         originals = self._seal_upload(
@@ -808,7 +832,7 @@ class ProductionAdmissionFactory:
             executors=executors,
             native_tool_source_sha256=native_source_sha256,
             native_tool_record_sha256=native_record_sha256,
-            native_tool=native_tool,
+            native_tool_requirement=native_tool_requirement,
             contract_sha256=CONTRACT_SHA256,
             policy_sha256=check_policy_digest(),
             platform_config_sha256=platform_config_sha256,
