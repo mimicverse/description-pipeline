@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import shutil
 import tempfile
@@ -556,11 +554,10 @@ class WorkflowTests(unittest.TestCase):
             solidworks.capture(self.package, self.package / "output")
         self.assertEqual(before, (self.package / "robot.yaml").read_bytes())
 
-    def test_report_option_cannot_overwrite_delivery_input(self):
+    def test_legacy_check_command_cannot_overwrite_delivery_input(self):
         before = (self.package / "robot.yaml").read_bytes()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = main(["check", str(self.package), "--report", str(self.package / "robot.yaml")])
-        self.assertEqual(1, result)
+        with self.assertRaises(SystemExit):
+            main(["check", str(self.package), "--report", str(self.package / "robot.yaml")])
         self.assertEqual(before, (self.package / "robot.yaml").read_bytes())
 
     def test_original_cad_is_archived_without_editing(self):
