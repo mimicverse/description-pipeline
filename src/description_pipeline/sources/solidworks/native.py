@@ -4805,7 +4805,7 @@ class SolidWorksBackend(CadBackend):
             )
         return doc, state
 
-    def _capture_loaded_documents(self, known_documents=None):
+    def _capture_loaded_documents(self):
         """Return every loaded capture-role document without inventing paths."""
 
         app = self._app_obj()
@@ -5023,7 +5023,6 @@ class SolidWorksBackend(CadBackend):
             }
         }
         part_documents = {}
-        known_documents = {normalized_top: doc}
         source_files = {normalized_top: {"path": path, "sha256": self._capture_source_digest(path)}}
         session_files = []
         topology = [
@@ -5152,7 +5151,6 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
                 if document_type == 2:
-                    known_documents[normalized] = model
                     row = assemblies.setdefault(
                         normalized,
                         {
@@ -5171,7 +5169,6 @@ class SolidWorksBackend(CadBackend):
                     if name:
                         row["instances"].append(name)
                 elif document_type == 1:
-                    known_documents[normalized] = model
                     row = part_documents.setdefault(
                         normalized,
                         {
@@ -5197,7 +5194,7 @@ class SolidWorksBackend(CadBackend):
                 ) from error
 
         expected_documents = set(assemblies) | set(part_documents)
-        loaded_documents = self._capture_loaded_documents(known_documents)
+        loaded_documents = self._capture_loaded_documents()
         self._require_loaded_document_set(loaded_documents, expected_documents)
         loaded_by_path = {
             row["normalized_path"]: row for row in loaded_documents
