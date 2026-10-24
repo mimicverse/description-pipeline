@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -632,12 +633,30 @@ class PublishHandlerTests(unittest.TestCase):
         self.fixture = PublishFixture()
         self.addCleanup(self.fixture.close)
 
-    def _run(self, *, workspace=None, claim=None, effects=None, handler=None):
+    def _run(self, *, command=None, workspace=None, claim=None, effects=None, handler=None):
         return (handler or self.fixture.handler).execute(
-            self.fixture.command,
+            command or self.fixture.command,
             claim or self.fixture.claim,
             workspace or self.fixture.workspace,
             effects=effects or self.fixture.effects,
+        )
+
+    def _command_with_target(self, *, base_ref: str, branch_ref: str) -> StageCommand:
+        request = self.fixture.command.to_record()["request"]
+        request.update({"base_ref": base_ref, "branch_ref": branch_ref})
+        command = self.fixture.command
+        return StageCommand.create(
+            command_id=command.command_id,
+            run_id=command.run_id,
+            stage=command.stage,
+            idempotency_key=command.idempotency_key,
+            request=request,
+            input_artifacts=command.input_artifacts,
+            config_snapshot_sha256=command.config_snapshot_sha256,
+            contract_sha256=command.contract_sha256,
+            policy_sha256=command.policy_sha256,
+            expected_executor_sha256=command.expected_executor_sha256,
+            predecessor_decision_id=command.predecessor_decision_id,
         )
 
     def test_publish_prepares_commits_and_satisfies_two_effects(self) -> None:
@@ -691,6 +710,235 @@ class PublishHandlerTests(unittest.TestCase):
         self.assertEqual(len(service.rows), 1)
         receipt = read_data(Path(execution.candidate_root) / "publication-receipt.json")
         self.assertEqual(service.rows[0]["head_oid"], receipt["candidate_commit"])
+
+    def test_publish_rejects_non_pr_and_protected_targets_before_external_effects(self) -> None:
+        remote_before = git(
+            None,
+            "--git-dir",
+            str(self.fixture.remote),
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+        ).stdout
+        cases = (
+            ("main", "main", "same-as-base"),
+            ("release", "main", "protected-main"),
+            ("main", "refs/heads/main", "protected-main"),
+            ("main", "feature/robot", "not-review-branch"),
+            (
+                "work/solidworks/robot/engineering",
+                "work/solidworks/robot/engineering",
+                "same-as-base",
+            ),
+        )
+        with patch.object(PublicationRepository, "push", side_effect=AssertionError("must not push")):
+            for base_ref, branch_ref, reason in cases:
+                with self.subTest(base_ref=base_ref, branch_ref=branch_ref):
+                    with self.assertRaises(PipelineError) as raised:
+                        self._run(
+                            command=self._command_with_target(
+                                base_ref=base_ref,
+                                branch_ref=branch_ref,
+                            )
+                        )
+                    self.assertEqual(raised.exception.code, "publish.target_forbidden")
+                    self.assertEqual(raised.exception.detail["reason"], reason)
+        remote_after = git(
+            None,
+            "--git-dir",
+            str(self.fixture.remote),
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+        ).stdout
+        self.assertEqual(remote_after, remote_before)
+        self.assertEqual(self.fixture.effects.intents, {})
+        self.assertEqual(self.fixture.effects.authorizations, 0)
+        self.assertEqual(self.fixture.pr.observe_calls, 0)
+        self.assertEqual(self.fixture.pr.create_calls, 0)
+        self.assertEqual(self.fixture.pr.update_calls, 0)
+
+    def test_repository_prepare_and_push_revalidate_target_before_git(self) -> None:
+        repository = PublicationRepository(self.fixture.repo, expected_origin=str(self.fixture.remote))
+        candidate = SimpleNamespace(worktree=self.fixture.repo)
+        with patch(
+            "description_pipeline.repository.publish._run",
+            side_effect=AssertionError("must not run Git"),
+        ):
+            with self.assertRaises(PipelineError) as prepared:
+                repository.candidate(
+                    publication_root=self.fixture.root / "publication",
+                    base_ref="main",
+                    expected_base_oid=self.fixture.base_oid,
+                    branch_ref="main",
+                    expected_head_oid=None,
+                    commit_spec=None,
+                    staging_root=self.fixture.root / "candidate",
+                )
+            with self.assertRaises(PipelineError) as pushed:
+                repository.push(
+                    candidate,
+                    base_ref="main",
+                    branch_ref="main",
+                    expected_head_oid=None,
+                )
+        self.assertEqual(prepared.exception.code, "publish.target_forbidden")
+        self.assertEqual(pushed.exception.code, "publish.target_forbidden")
+
+    def test_default_pull_request_client_is_scoped_to_each_claim_workspace(self) -> None:
+        bin_root = self.fixture.root / "fake-bin"
+        bin_root.mkdir()
+        gh = bin_root / "gh"
+        gh.write_text(
+            """#!/usr/bin/python3
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+with Path(os.environ["GH_TEST_LOG"]).open("a", encoding="utf-8") as stream:
+    stream.write(str(Path.cwd()) + "\\n")
+
+args = sys.argv[1:]
+if args[:2] == ["pr", "list"]:
+    state = Path(os.environ["GH_TEST_STATE"])
+    if state.exists():
+        print(json.dumps([json.loads(state.read_text(encoding="utf-8"))]))
+    else:
+        print("[]")
+elif args[:2] == ["pr", "create"]:
+    base = args[args.index("--base") + 1]
+    head = args[args.index("--head") + 1]
+    title = args[args.index("--title") + 1]
+    body = args[args.index("--body") + 1]
+    listing = subprocess.check_output(
+        ["git", "ls-remote", "origin", f"refs/heads/{head}"],
+        text=True,
+    ).strip()
+    commit = listing.split()[0]
+    row = {
+        "baseRefName": base,
+        "body": body,
+        "headRefName": head,
+        "headRefOid": commit,
+        "number": 1,
+        "state": "OPEN",
+        "title": title,
+        "url": "https://github.com/example/robot/pull/1",
+    }
+    Path(os.environ["GH_TEST_STATE"]).write_text(json.dumps(row), encoding="utf-8")
+    print(row["url"])
+elif args[:2] == ["pr", "view"]:
+    print(Path(os.environ["GH_TEST_STATE"]).read_text(encoding="utf-8"))
+else:
+    raise SystemExit(f"unexpected gh invocation: {args!r}")
+""",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
+        log_path = self.fixture.root / "gh-cwd.log"
+        state_path = self.fixture.root / "gh-state.json"
+        handler = PublishHandler(self.fixture.store)
+        first_root = self.fixture.workspace.root
+        with patch.dict(
+            os.environ,
+            {
+                "GH_TEST_LOG": str(log_path),
+                "GH_TEST_STATE": str(state_path),
+                "PATH": str(bin_root) + os.pathsep + os.environ["PATH"],
+            },
+        ):
+            first = handler.execute(
+                self.fixture.command,
+                self.fixture.claim,
+                self.fixture.workspace,
+                effects=self.fixture.effects,
+            )
+            first_calls = log_path.read_text(encoding="utf-8").splitlines()
+            shutil.rmtree(first_root)
+            state_path.unlink()
+
+            second_branch = "work/solidworks/robot2/engineering"
+            snapshot_root = self.fixture.root / "repository-snapshot-2"
+            seal_repository_snapshot(
+                self.fixture.repo,
+                snapshot_root,
+                repository_slug="example/robot",
+                origin_url=str(self.fixture.remote),
+                base_ref="main",
+                base_oid=self.fixture.base_oid,
+                branch_ref=second_branch,
+                head_oid=None,
+            )
+            snapshot_ref = self.fixture.store.seal_tree(
+                snapshot_root,
+                kind=publish_stage.REPOSITORY_SNAPSHOT_KIND,
+                producer_run_id=None,
+                producer_stage=None,
+                producer_tool_sha256=digest({"tool": "snapshot-builder-2"}),
+            )
+            request = self.fixture.command.to_record()["request"]
+            request.update(
+                {
+                    "branch_ref": second_branch,
+                    "repository_snapshot_artifact_id": snapshot_ref.artifact_id,
+                }
+            )
+            command = StageCommand.create(
+                command_id="publish-command-2",
+                run_id=self.fixture.command.run_id,
+                stage="publish",
+                idempotency_key="publish-run/publish-2",
+                request=request,
+                input_artifacts=(
+                    self.fixture.capture_ref,
+                    self.fixture.generate_ref,
+                    self.fixture.verify_ref,
+                    snapshot_ref,
+                ),
+                config_snapshot_sha256=self.fixture.command.config_snapshot_sha256,
+                contract_sha256=self.fixture.command.contract_sha256,
+                policy_sha256=self.fixture.command.policy_sha256,
+                expected_executor_sha256=self.fixture.executor,
+                predecessor_decision_id="verify-decision",
+            )
+            claim = replace(
+                self.fixture.claim,
+                claim_id="publish-claim-2",
+                command_id=command.command_id,
+                fence=2,
+                owner_sha256=digest({"process": "publish-2"}),
+                lane_key="example/robot:robot2:engineering",
+            )
+            second_root = self.fixture.root / "second-workspace"
+            workspace = StageWorkspace(
+                root=second_root,
+                inputs={
+                    ref.artifact_id: self.fixture.store.materialize(
+                        ref,
+                        second_root / "inputs" / ref.artifact_id,
+                    )
+                    for ref in command.input_artifacts
+                },
+            )
+            effects = _MemoryEffects(
+                self.fixture.store,
+                command_id=command.command_id,
+                executor=self.fixture.executor,
+            )
+            second = handler.execute(command, claim, workspace, effects=effects)
+            all_calls = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(first.outcome, "completed")
+        self.assertEqual(second.outcome, "completed")
+        self.assertFalse(first_root.exists())
+        self.assertTrue(all(Path(path).is_relative_to(first_root) for path in first_calls))
+        second_calls = all_calls[len(first_calls) :]
+        self.assertTrue(second_calls)
+        self.assertTrue(all(Path(path).is_relative_to(second_root) for path in second_calls))
+        self.assertFalse(any(Path(path).is_relative_to(first_root) for path in second_calls))
+        self.assertIsNone(handler.pull_requests)
+        self.assertEqual(effects.authorizations, 2)
+        self.assertTrue(all(state is EffectState.SATISFIED for state in effects.states.values()))
 
     def test_second_run_reuses_satisfied_effects_without_external_calls(self) -> None:
         first = self._run()
@@ -825,14 +1073,20 @@ class PublishHandlerTests(unittest.TestCase):
         branch_ref = self.fixture.command.request["branch_ref"]
         seed = self.fixture.root / "seed"
 
-        def race_then_push(self, candidate, *, branch_ref, expected_head_oid):
+        def race_then_push(self, candidate, *, base_ref, branch_ref, expected_head_oid):
             git(seed, "checkout", "main")
             git(seed, "checkout", "-b", "racing")
             (seed / "race.txt").write_text("racing\n", encoding="utf-8")
             git(seed, "add", "race.txt")
             git(seed, "commit", "-m", "racing head")
             git(seed, "push", "origin", f"HEAD:{branch_ref}")
-            original(self, candidate, branch_ref=branch_ref, expected_head_oid=expected_head_oid)
+            original(
+                self,
+                candidate,
+                base_ref=base_ref,
+                branch_ref=branch_ref,
+                expected_head_oid=expected_head_oid,
+            )
 
         original = PublicationRepository.push
         with (
@@ -897,8 +1151,14 @@ class PublishHandlerTests(unittest.TestCase):
     def test_lost_git_response_reconciles_same_effect(self) -> None:
         original = PublicationRepository.push
 
-        def push_then_lose(self, candidate, *, branch_ref, expected_head_oid):
-            original(self, candidate, branch_ref=branch_ref, expected_head_oid=expected_head_oid)
+        def push_then_lose(self, candidate, *, base_ref, branch_ref, expected_head_oid):
+            original(
+                self,
+                candidate,
+                base_ref=base_ref,
+                branch_ref=branch_ref,
+                expected_head_oid=expected_head_oid,
+            )
             raise RuntimeError("response lost")
 
         with patch.object(PublicationRepository, "push", push_then_lose):

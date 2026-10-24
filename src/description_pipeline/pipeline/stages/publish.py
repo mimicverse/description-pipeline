@@ -23,6 +23,7 @@ from ...repository.publish import (
     PullRequestClient,
     PullRequestObservation,
     materialize_repository_snapshot,
+    validate_publication_target,
 )
 from ...runtime import tool_record
 from ...schemas import PUBLICATION_PLAN_SCHEMA, PUBLICATION_RECEIPT_SCHEMA, VERIFICATION_CERTIFICATE_SCHEMA
@@ -111,6 +112,10 @@ class PublishDomainRequest:
             value = getattr(self, name)
             if not isinstance(value, str) or not value or value.startswith("-") or ".." in value:
                 raise ProtocolError("publish.ref", {"field": name, "value": value})
+        try:
+            validate_publication_target(base_ref=self.base_ref, branch_ref=self.branch_ref)
+        except PublicationError as error:
+            raise ProtocolError(error.code, error.detail) from error
         if _HEX40.fullmatch(self.expected_base_oid) is None:
             raise ProtocolError("publish.base_oid", {"value": self.expected_base_oid})
         if self.expected_head_oid is not None and _HEX40.fullmatch(self.expected_head_oid) is None:
@@ -615,6 +620,7 @@ def _git_effect(
     try:
         repository.push(
             candidate,
+            base_ref=request.base_ref,
             branch_ref=request.branch_ref,
             expected_head_oid=request.expected_head_oid,
         )
@@ -1252,6 +1258,10 @@ def validate_publication_receipt(
         or artifact.producer_tool_sha256 != receipt["actual_executor_sha256"]
     ):
         raise PipelineError("Publication receipt is incomplete or bound to another command")
+    try:
+        validate_publication_target(base_ref=receipt["base_ref"], branch_ref=receipt["branch_ref"])
+    except PublicationError as error:
+        raise ProtocolError(error.code, error.detail) from error
     git_effect = receipt["git_effect"]
     pr_effect = receipt["pr_effect"]
     if (

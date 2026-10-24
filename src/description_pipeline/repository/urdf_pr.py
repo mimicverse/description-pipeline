@@ -121,6 +121,20 @@ def review_branch(hardware: str, purpose: str) -> str:
     return REVIEW_BRANCH.format(hardware=_slug_hardware(hardware), purpose=purpose)
 
 
+def is_review_branch(value: object) -> bool:
+    """Whether ``value`` is the canonical review branch of a declared purpose."""
+
+    if not isinstance(value, str):
+        return False
+    parts = value.split("/")
+    if len(parts) != 4 or parts[:2] != ["work", "solidworks"]:
+        return False
+    try:
+        return review_branch(parts[2], parts[3]) == value
+    except PrError:
+        return False
+
+
 def _origin_slug(repository: Path) -> str:
     url = _git(repository, "remote", "get-url", "origin").stdout.strip()
     match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?", url)

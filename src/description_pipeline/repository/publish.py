@@ -17,6 +17,7 @@ from typing import Any, Protocol
 from ..delivery import subject_digest
 from ..io import PipelineError, digest, inventory, read_data, write_json
 from ..schemas import REPOSITORY_SNAPSHOT_SCHEMA
+from .urdf_pr import is_review_branch
 
 GOVERNED_PATHS = (
     "manifest.json",
@@ -41,6 +42,7 @@ _OID = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 REPOSITORY_SNAPSHOT_FILE = "repository.bundle"
 REPOSITORY_SNAPSHOT_METADATA = "snapshot.json"
+PROTECTED_PUBLICATION_BRANCHES = frozenset({"main", "refs/heads/main"})
 
 
 class PublicationError(PipelineError):
@@ -48,6 +50,23 @@ class PublicationError(PipelineError):
         super().__init__(code)
         self.code = code
         self.detail = detail
+
+
+def validate_publication_target(*, base_ref: str, branch_ref: str) -> None:
+    """Require one non-base update to the existing deterministic PR branch."""
+
+    reason = None
+    if branch_ref == base_ref:
+        reason = "same-as-base"
+    elif branch_ref in PROTECTED_PUBLICATION_BRANCHES:
+        reason = "protected-main"
+    elif not is_review_branch(branch_ref):
+        reason = "not-review-branch"
+    if reason is not None:
+        raise PublicationError(
+            "publish.target_forbidden",
+            {"base_ref": base_ref, "branch_ref": branch_ref, "reason": reason},
+        )
 
 
 def _run(repository: Path, *args: str, check: bool = True, env=None) -> subprocess.CompletedProcess:
@@ -172,6 +191,7 @@ def seal_repository_snapshot(
 ) -> RepositorySnapshot:
     """Persist every Git object required to rebuild a Publish checkout."""
 
+    validate_publication_target(base_ref=base_ref, branch_ref=branch_ref)
     source = Path(repository).resolve()
     actual_origin = _text_run(source, "remote", "get-url", "origin")
     if actual_origin != origin_url:
@@ -222,6 +242,7 @@ def materialize_repository_snapshot(
 ) -> RepositorySnapshot:
     """Reconstruct a local checkout only from the sealed snapshot artifact."""
 
+    validate_publication_target(base_ref=expected_base_ref, branch_ref=expected_branch_ref)
     source = Path(source)
     payload = read_data(source / REPOSITORY_SNAPSHOT_METADATA)
     expected_fields = {
@@ -603,6 +624,7 @@ class PublicationRepository:
         commit_spec: CommitSpec,
         staging_root: Path,
     ) -> PreparedCandidate:
+        validate_publication_target(base_ref=base_ref, branch_ref=branch_ref)
         self.validate()
         self.fetch_expected(base_ref, expected_base_oid)
         observed_head = self.observe(branch_ref)
@@ -769,7 +791,15 @@ class PublicationRepository:
                     {"path": _path, "attribute": attribute, "value": value},
                 )
 
-    def push(self, candidate: PreparedCandidate, *, branch_ref: str, expected_head_oid: str | None) -> None:
+    def push(
+        self,
+        candidate: PreparedCandidate,
+        *,
+        base_ref: str,
+        branch_ref: str,
+        expected_head_oid: str | None,
+    ) -> None:
+        validate_publication_target(base_ref=base_ref, branch_ref=branch_ref)
         lease = f"--force-with-lease=refs/heads/{branch_ref}:{expected_head_oid or ''}"
         _run(
             candidate.worktree,
