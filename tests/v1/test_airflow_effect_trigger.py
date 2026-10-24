@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -17,19 +16,17 @@ from description_pipeline.io import digest
 from description_pipeline.orchestration import airflow_effect_trigger
 from description_pipeline.orchestration.airflow_effect_trigger import (
     EffectPollTrigger,
-    _GitProbeTarget,
-    _PullRequestProbeTarget,
     _native_wakeable,
     probe_effect_wait,
 )
 from description_pipeline.pipeline.application import EffectWakeupHint
 from description_pipeline.pipeline.contracts import (
+    ArtifactRef,
     ProtocolError,
     StageEffectWait,
 )
-from description_pipeline.pipeline.effects import EffectSettlement, EffectState
-from description_pipeline.repository.publish import PullRequestObservation
 from description_pipeline.schemas import STAGE_EFFECT_WAIT_SCHEMA
+import description_pipeline.pipeline.stages.publish as publish_stage
 
 
 def _wait(
@@ -250,94 +247,76 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(hint.changed)
                 dispatcher.assert_awaited_once_with(wait)
 
-    def test_git_observation_is_read_only_and_requires_exact_head(self) -> None:
-        target = _GitProbeTarget(
-            origin_url="https://example.test/example/robot.git",
-            branch_ref="review/run-1",
-            candidate_commit="a" * 40,
-        )
-        exact = subprocess.CompletedProcess(
-            [],
-            0,
-            stdout=f"{'a' * 40}\trefs/heads/review/run-1\n",
-            stderr="",
-        )
-        with patch.object(
-            airflow_effect_trigger.subprocess,
-            "run",
-            return_value=exact,
-        ) as run:
-            self.assertTrue(airflow_effect_trigger._observe_git_branch(target))
-        command = run.call_args.args[0]
-        self.assertEqual(command[:2], ["git", "ls-remote"])
-        self.assertNotIn("push", command)
-
-        for output in ("", f"{'b' * 40}\trefs/heads/review/run-1\n"):
-            with self.subTest(output=output), patch.object(
-                airflow_effect_trigger.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess(
-                    [],
-                    0,
-                    stdout=output,
-                    stderr="",
-                ),
-            ):
-                self.assertFalse(
-                    airflow_effect_trigger._observe_git_branch(target)
-                )
-
-    def test_pull_request_observation_requires_one_exact_open_request(self) -> None:
-        target = _PullRequestProbeTarget(
-            repository="example/robot",
-            base_ref="main",
-            head_ref="review/run-1",
-            candidate_commit="a" * 40,
-            title="Ship robot",
-            body="Evidence",
-            expected_pr=None,
-        )
-        exact = PullRequestObservation(
-            number=7,
-            url="https://example.test/example/robot/pull/7",
-            state="OPEN",
-            base_ref="main",
-            head_ref="review/run-1",
-            head_oid="a" * 40,
-            title="Ship robot",
-            body="Evidence",
-        )
-        client = Mock()
-        client.observe.return_value = (exact,)
-        with patch(
-            "description_pipeline.repository.publish."
-            "GitHubCliPullRequestClient",
-            return_value=client,
+    async def test_publish_probes_use_direct_cas_root_without_materializing(self) -> None:
+        for kind, probe_name in (
+            ("git_ref_update", "PublishGitStatusProbe"),
+            ("pr_upsert", "PublishPullRequestStatusProbe"),
         ):
-            self.assertTrue(
-                airflow_effect_trigger._observe_pull_request(target)
-            )
-        client.observe.assert_called_once_with(
-            repository="example/robot",
-            base_ref="main",
-            head_ref="review/run-1",
-            candidate_commit="a" * 40,
-        )
-        client.create.assert_not_called()
-        client.update.assert_not_called()
-
-        for observations in ((), (exact, exact), (replace(exact, title="other"),)):
-            with self.subTest(observations=observations):
-                client = Mock()
-                client.observe.return_value = observations
-                with patch(
-                    "description_pipeline.repository.publish."
-                    "GitHubCliPullRequestClient",
-                    return_value=client,
-                ):
-                    self.assertFalse(
-                        airflow_effect_trigger._observe_pull_request(target)
+            with self.subTest(kind=kind):
+                wait = replace(
+                    _wait(),
+                    effect_kind=kind,
+                    stage="publish",
+                )
+                outbound = ArtifactRef(
+                    artifact_id="publish-outbound",
+                    kind="effect_outbound",
+                    locator="cas://artifact/publish-outbound",
+                    manifest_sha256=digest({"manifest": kind}),
+                    set_sha256=digest({"set": kind}),
+                    producer_run_id="run-1",
+                    producer_stage="publish",
+                    producer_tool_sha256=digest({"tool": "publish"}),
+                )
+                artifacts = SimpleNamespace(
+                    objects=Path("/isolated/cas/objects"),
+                    materialize=Mock(
+                        side_effect=AssertionError(
+                            "trigger must not materialize"
+                        )
+                    ),
+                )
+                evidence = SimpleNamespace(
+                    artifacts=artifacts,
+                    settlement=SimpleNamespace(outbound_artifact=outbound),
+                )
+                status_probe = SimpleNamespace(
+                    observe=AsyncMock(
+                        return_value=EffectWakeupHint(
+                            wait_digest=wait.digest,
+                            observed_at=datetime(
+                                2026,
+                                10,
+                                25,
+                                tzinfo=UTC,
+                            ),
+                            changed=True,
+                        )
                     )
+                )
+                factory = Mock(return_value=status_probe)
+                with (
+                    patch.object(
+                        airflow_effect_trigger,
+                        "_load_effect_evidence",
+                        return_value=evidence,
+                    ),
+                    patch.object(
+                        publish_stage,
+                        probe_name,
+                        SimpleNamespace(from_sealed_outbound=factory),
+                    ),
+                ):
+                    hint = await probe_effect_wait(wait)
+                self.assertTrue(hint.changed)
+                factory.assert_called_once_with(
+                    wait=wait,
+                    outbound=outbound,
+                    outbound_root=(
+                        artifacts.objects / outbound.artifact_id
+                    ),
+                )
+                artifacts.materialize.assert_not_called()
 
     def test_small_member_read_does_not_materialize_or_hash_large_payload(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -373,124 +352,6 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(content, b'{"command_id":"command-capture"}')
         self.assertEqual(member["path"], "request.json")
-
-    def test_git_and_pull_request_targets_come_from_small_canonical_requests(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="publish-probe-identity-"
-        ) as directory:
-            root = Path(directory)
-            artifacts = ArtifactStore(root / "cas")
-            source = root / "source"
-            source.mkdir()
-
-            git_state = {
-                "schema_version": "solidworks-to-urdf.git-ref-update/v1",
-                "repository": "example/robot",
-                "base_ref": "main",
-                "expected_base_oid": "a" * 40,
-                "branch_ref": "review/run-1",
-                "expected_head_oid": None,
-                "candidate_commit": "b" * 40,
-                "candidate_tree": "c" * 40,
-                "subject_sha256": digest({"subject": "git"}),
-            }
-            (source / "request.json").write_bytes(
-                json.dumps(
-                    {**git_state, "parents": ["a" * 40]},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-            )
-            git_outbound = artifacts.seal_tree(
-                source,
-                kind="effect_outbound",
-                producer_run_id="run-1",
-                producer_stage="publish",
-                producer_tool_sha256=digest({"tool": "publish"}),
-            )
-            git_evidence = SimpleNamespace(
-                artifacts=artifacts,
-                command=SimpleNamespace(
-                    request={"origin_url": "https://example.test/example/robot.git"}
-                ),
-                intent=SimpleNamespace(
-                    effect_kind="git_ref_update",
-                    target={
-                        "repository": "example/robot",
-                        "branch_ref": "review/run-1",
-                    },
-                    expected_state=git_state,
-                ),
-                settlement=EffectSettlement(
-                    effect_id="effect-git",
-                    state=EffectState.UNKNOWN,
-                    decisive_fact=None,
-                    outbound_artifact=git_outbound,
-                ),
-            )
-            git_target = airflow_effect_trigger._git_probe_target(git_evidence)
-            self.assertEqual(git_target.branch_ref, "review/run-1")
-            self.assertEqual(git_target.candidate_commit, "b" * 40)
-
-            (source / "request.json").unlink()
-            pr_state = {
-                "schema_version": "solidworks-to-urdf.pr-upsert/v1",
-                "repository": "example/robot",
-                "base_ref": "main",
-                "head_ref": "review/run-1",
-                "candidate_commit": "b" * 40,
-                "subject_sha256": digest({"subject": "pr"}),
-                "title_digest": digest({"title": "Ship robot"}),
-                "body_digest": digest({"body": "Evidence"}),
-                "expected_pr": None,
-            }
-            (source / "request.json").write_bytes(
-                json.dumps(
-                    {
-                        **pr_state,
-                        "title": "Ship robot",
-                        "body": "Evidence",
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-            )
-            pr_outbound = artifacts.seal_tree(
-                source,
-                kind="effect_outbound",
-                producer_run_id="run-1",
-                producer_stage="publish",
-                producer_tool_sha256=digest({"tool": "publish"}),
-            )
-            pr_evidence = SimpleNamespace(
-                artifacts=artifacts,
-                command=SimpleNamespace(request={}),
-                intent=SimpleNamespace(
-                    effect_kind="pr_upsert",
-                    target={
-                        "repository": "example/robot",
-                        "base_ref": "main",
-                        "head_ref": "review/run-1",
-                    },
-                    expected_state=pr_state,
-                ),
-                settlement=EffectSettlement(
-                    effect_id="effect-pr",
-                    state=EffectState.UNKNOWN,
-                    decisive_fact=None,
-                    outbound_artifact=pr_outbound,
-                ),
-            )
-            with patch.object(
-                artifacts,
-                "materialize",
-                side_effect=AssertionError("materialize must not be called"),
-            ):
-                pr_target = airflow_effect_trigger._pull_request_probe_target(
-                    pr_evidence
-                )
-            self.assertEqual(pr_target.title, "Ship robot")
-            self.assertEqual(pr_target.head_ref, "review/run-1")
 
     def test_serialization_excludes_locator_claim_and_fence(self) -> None:
         wait = _wait()

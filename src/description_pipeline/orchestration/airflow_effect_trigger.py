@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import os
 import stat
-import subprocess
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -41,24 +40,6 @@ class _EffectEvidence:
     command: StageCommand
     intent: EffectIntent
     settlement: EffectSettlement
-
-
-@dataclass(frozen=True, slots=True)
-class _GitProbeTarget:
-    origin_url: str
-    branch_ref: str
-    candidate_commit: str
-
-
-@dataclass(frozen=True, slots=True)
-class _PullRequestProbeTarget:
-    repository: str
-    base_ref: str
-    head_ref: str
-    candidate_commit: str
-    title: str
-    body: str
-    expected_pr: dict[str, Any] | None
 
 
 def _minimum_poll_interval(value: float) -> float:
@@ -413,196 +394,6 @@ def _native_wakeable(view: object | None) -> bool:
     }
 
 
-def _git_probe_target(evidence: _EffectEvidence) -> _GitProbeTarget:
-    from .native_operation_client import MAX_OPERATION_JSON_BYTES
-
-    outbound = evidence.settlement.outbound_artifact
-    if outbound is None:
-        raise ValueError("The pending Git effect has no outbound artifact")
-    raw, _, _ = _read_small_member(
-        evidence.artifacts,
-        outbound,
-        "request.json",
-        max_bytes=MAX_OPERATION_JSON_BYTES,
-    )
-    request = parse_data(raw, Path("request.json"))
-    expected = dict(evidence.intent.expected_state)
-    if not isinstance(request, dict):
-        raise ValueError("The pending Git request is malformed")
-    parents = request.pop("parents", None)
-    if (
-        raw != canonical({**request, "parents": parents})
-        or request != expected
-        or not isinstance(parents, list)
-        or not parents
-        or dict(evidence.intent.target)
-        != {
-            "repository": request.get("repository"),
-            "branch_ref": request.get("branch_ref"),
-        }
-    ):
-        raise ValueError("The pending Git request differs from its intent")
-    origin_url = evidence.command.request.get("origin_url")
-    branch_ref = request.get("branch_ref")
-    candidate_commit = request.get("candidate_commit")
-    if (
-        not isinstance(origin_url, str)
-        or not origin_url
-        or "\x00" in origin_url
-        or not isinstance(branch_ref, str)
-        or not isinstance(candidate_commit, str)
-    ):
-        raise ValueError("The pending Git target is invalid")
-    return _GitProbeTarget(origin_url, branch_ref, candidate_commit)
-
-
-def _observe_git_branch(target: _GitProbeTarget) -> bool:
-    """Read the exact remote review branch without cloning or writing a workspace."""
-
-    if (
-        not target.branch_ref
-        or target.branch_ref.startswith("-")
-        or ".." in target.branch_ref
-        or target.branch_ref.endswith(".lock")
-    ):
-        return False
-    env = {
-        **os.environ,
-        "GIT_TERMINAL_PROMPT": "0",
-        "LC_ALL": "C",
-    }
-    try:
-        result = subprocess.run(
-            [
-                "git",
-                "ls-remote",
-                "--heads",
-                target.origin_url,
-                f"refs/heads/{target.branch_ref}",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return False
-    if result.returncode != 0:
-        return False
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != 1:
-        return False
-    fields = lines[0].split()
-    return (
-        len(fields) == 2
-        and fields[1] == f"refs/heads/{target.branch_ref}"
-        and fields[0] == target.candidate_commit
-    )
-
-
-def _pull_request_probe_target(
-    evidence: _EffectEvidence,
-) -> _PullRequestProbeTarget:
-    from .native_operation_client import MAX_OPERATION_JSON_BYTES
-
-    outbound = evidence.settlement.outbound_artifact
-    if outbound is None:
-        raise ValueError("The pending pull request effect has no outbound artifact")
-    raw, _, _ = _read_small_member(
-        evidence.artifacts,
-        outbound,
-        "request.json",
-        max_bytes=MAX_OPERATION_JSON_BYTES,
-    )
-    request = parse_data(raw, Path("request.json"))
-    expected = dict(evidence.intent.expected_state)
-    if (
-        not isinstance(request, dict)
-        or raw != canonical(request)
-        or {key: request.get(key) for key in expected} != expected
-        or any(key not in request for key in ("title", "body"))
-    ):
-        raise ValueError("The pending pull request differs from its intent")
-    title = request["title"]
-    body = request["body"]
-    if (
-        not isinstance(title, str)
-        or not isinstance(body, str)
-        or request.get("title_digest") != digest({"title": title})
-        or request.get("body_digest") != digest({"body": body})
-    ):
-        raise ValueError("The pending pull request text identity is invalid")
-    target = {
-        "repository": request.get("repository"),
-        "base_ref": request.get("base_ref"),
-        "head_ref": request.get("head_ref"),
-    }
-    if dict(evidence.intent.target) != target:
-        raise ValueError("The pending pull request target differs from its intent")
-    expected_pr = request.get("expected_pr")
-    if expected_pr is not None and not isinstance(expected_pr, dict):
-        raise ValueError("The pending pull request expectation is invalid")
-    values = (
-        target["repository"],
-        target["base_ref"],
-        target["head_ref"],
-        request.get("candidate_commit"),
-    )
-    if not all(isinstance(value, str) and value for value in values):
-        raise ValueError("The pending pull request target value is invalid")
-    return _PullRequestProbeTarget(
-        repository=target["repository"],
-        base_ref=target["base_ref"],
-        head_ref=target["head_ref"],
-        candidate_commit=request["candidate_commit"],
-        title=title,
-        body=body,
-        expected_pr=expected_pr,
-    )
-
-
-def _observe_pull_request(target: _PullRequestProbeTarget) -> bool:
-    from ..repository.publish import (
-        GitHubCliPullRequestClient,
-        PublicationError,
-    )
-
-    try:
-        observations = GitHubCliPullRequestClient(Path.cwd()).observe(
-            repository=target.repository,
-            base_ref=target.base_ref,
-            head_ref=target.head_ref,
-            candidate_commit=target.candidate_commit,
-        )
-    except (
-        OSError,
-        subprocess.SubprocessError,
-        UnicodeError,
-        ValueError,
-        PublicationError,
-    ):
-        return False
-    if len(observations) != 1:
-        return False
-    observation = observations[0]
-    if (
-        observation.state != "OPEN"
-        or observation.base_ref != target.base_ref
-        or observation.head_ref != target.head_ref
-        or observation.head_oid != target.candidate_commit
-        or observation.title != target.title
-        or observation.body != target.body
-    ):
-        return False
-    expected = target.expected_pr
-    return expected is None or (
-        observation.number == expected.get("number")
-        and observation.url == expected.get("url")
-        and observation.head_oid == expected.get("head_oid")
-    )
-
-
 def _wakeup(wait: StageEffectWait, changed: bool) -> EffectWakeupHint:
     from ..pipeline.application import EffectWakeupHint
 
@@ -640,36 +431,43 @@ async def _prepare_native_effect_probe(
     return probe
 
 
-async def _prepare_git_effect_probe(
+async def _prepare_publish_effect_probe(
     wait: StageEffectWait,
 ) -> EffectWaitProbe:
+    from ..pipeline.stages.publish import (
+        PublishGitStatusProbe,
+        PublishPullRequestStatusProbe,
+    )
+
     evidence = await asyncio.to_thread(_load_effect_evidence, wait)
-    if evidence.intent.effect_kind != "git_ref_update":
-        raise ValueError("The pending effect is not a Git ref update")
-    target = await asyncio.to_thread(_git_probe_target, evidence)
+    outbound = evidence.settlement.outbound_artifact
+    if outbound is None:
+        raise ValueError("The pending Publish effect has no outbound artifact")
+    outbound_root = evidence.artifacts.objects / outbound.artifact_id
+    if wait.effect_kind == "git_ref_update":
+        status_probe = await asyncio.to_thread(
+            PublishGitStatusProbe.from_sealed_outbound,
+            wait=wait,
+            outbound=outbound,
+            outbound_root=outbound_root,
+        )
+    elif wait.effect_kind == "pr_upsert":
+        status_probe = await asyncio.to_thread(
+            PublishPullRequestStatusProbe.from_sealed_outbound,
+            wait=wait,
+            outbound=outbound,
+            outbound_root=outbound_root,
+        )
+    else:
+        raise ValueError("The pending effect is not a Publish operation")
 
     async def probe(value: StageEffectWait) -> EffectWakeupHint:
         if value != wait:
             raise ValueError("effect status probe names a different wait")
-        changed = await asyncio.to_thread(_observe_git_branch, target)
-        return _wakeup(wait, changed)
-
-    return probe
-
-
-async def _prepare_pull_request_effect_probe(
-    wait: StageEffectWait,
-) -> EffectWaitProbe:
-    evidence = await asyncio.to_thread(_load_effect_evidence, wait)
-    if evidence.intent.effect_kind != "pr_upsert":
-        raise ValueError("The pending effect is not a pull request upsert")
-    target = await asyncio.to_thread(_pull_request_probe_target, evidence)
-
-    async def probe(value: StageEffectWait) -> EffectWakeupHint:
-        if value != wait:
-            raise ValueError("effect status probe names a different wait")
-        changed = await asyncio.to_thread(_observe_pull_request, target)
-        return _wakeup(wait, changed)
+        hint = await status_probe.observe()
+        if hint.wait_digest != wait.digest:
+            raise ValueError("Publish status probe returned another wait")
+        return _wakeup(wait, hint.changed)
 
     return probe
 
@@ -677,10 +475,8 @@ async def _prepare_pull_request_effect_probe(
 async def _prepare_effect_probe(wait: StageEffectWait) -> EffectWaitProbe:
     if wait.effect_kind == "native_operation":
         return await _prepare_native_effect_probe(wait)
-    if wait.effect_kind == "git_ref_update":
-        return await _prepare_git_effect_probe(wait)
-    if wait.effect_kind == "pr_upsert":
-        return await _prepare_pull_request_effect_probe(wait)
+    if wait.effect_kind in {"git_ref_update", "pr_upsert"}:
+        return await _prepare_publish_effect_probe(wait)
     raise ValueError(
         "The pending effect kind has no read-only wake-up observer"
     )
