@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import shutil
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -32,8 +33,10 @@ from description_pipeline.pipeline.freeze import (
 )
 from description_pipeline.pipeline.ingestion import (
     ProductionAdmissionRequest,
+    ProductionFreezeSuccessorRequest,
     ReceivedUploadReceipt,
     load_production_admission,
+    load_production_freeze_successor,
 )
 from description_pipeline.pipeline.services import (
     CanonicalStageServices,
@@ -74,6 +77,7 @@ PLATFORM_SCHEMA = (
     / "schema.sql"
 )
 RUN_ID = "b9b65805-7c8e-4ae3-90ef-a4d99f0ef963"
+SUCCESSOR_RUN_ID = "53d6bf77-6d98-40cb-a20b-6c127e36c041"
 RECORDS = {
     "budget.json": {
         "robot": {
@@ -214,6 +218,9 @@ class RealSixStageChainTests(unittest.TestCase):
             write_json(logical_root / relative, payload)
 
         self.facts = FactStore(self._connect, self.store)
+        self._bind_services()
+
+    def _bind_services(self) -> None:
         self.services = CanonicalStageServices(
             facts=self.facts,
             artifacts=self.store,
@@ -233,7 +240,13 @@ class RealSixStageChainTests(unittest.TestCase):
             options=f"-c search_path={self.schema},public",
         )
 
-    def _production_request(self) -> ProductionAdmissionRequest:
+    def _production_request(
+        self,
+        *,
+        run_id: str = RUN_ID,
+        request_id: str = "real-six-stage-request",
+        principal: str = "cli:tenant:ou_chain",
+    ) -> ProductionAdmissionRequest:
         identity = describe_handoff(self.source_root)
         receipt = ReceivedUploadReceipt(
             folder="CAD",
@@ -249,18 +262,22 @@ class RealSixStageChainTests(unittest.TestCase):
             purpose="engineering",
         )
         return ProductionAdmissionRequest(
-            run_id=RUN_ID,
-            request_id="real-six-stage-request",
+            run_id=run_id,
+            request_id=request_id,
             upload_dir=self.upload_root,
             receipt=receipt,
             main_assembly=MAIN_ASSEMBLY,
             target_hardware="nd_fixture",
             purpose="engineering",
             change_summary=receipt.change_summary,
-            principal="cli:tenant:ou_chain",
+            principal=principal,
         )
 
-    def _platform_snapshot(self) -> Path:
+    def _platform_snapshot(
+        self,
+        *,
+        generated_at: str = "2026-10-25T00:00:00Z",
+    ) -> Path:
         token = self.root / "endpoint-token"
         secret = self.root / "feishu-secret"
         certificate = self.root / "operator-certificate.pem"
@@ -280,14 +297,15 @@ class RealSixStageChainTests(unittest.TestCase):
             path.mkdir(exist_ok=True)
             paths[name] = path
         derived_runs = paths["state"] / "runs"
-        derived_runs.mkdir()
+        derived_runs.mkdir(exist_ok=True)
         repository = paths["workspace-root"] / "robot"
         if not repository.exists():
             shutil.copytree(self.publish.repo, repository)
+        self.production_repository = repository
         snapshot = {
             "schema_version": CONFIG_SNAPSHOT_SCHEMA,
             "install_id": "real-six-stage",
-            "generated_at": "2026-10-25T00:00:00Z",
+            "generated_at": generated_at,
             "resolved": {
                 "schema_version": PLATFORM_CONFIG_SCHEMA,
                 "operator": {
@@ -344,7 +362,51 @@ class RealSixStageChainTests(unittest.TestCase):
         }
         path = self.root / "config-snapshot.json"
         write_json(path, snapshot)
+        self.platform_snapshot_path = path
         return path
+
+    def _install_current_tools(
+        self,
+        *,
+        source_commit: str,
+        source_tree: str,
+        seed: str,
+    ) -> None:
+        portable = copy.deepcopy(self.portable)
+        native = copy.deepcopy(self.native)
+        for role, tool in (("portable", portable), ("native", native)):
+            package_files = {
+                f"description_pipeline/{role}_{seed}.py": digest(
+                    {"release-file": role, "seed": seed}
+                )
+            }
+            source_sha256 = digest(package_files)
+            tool["source_sha256"] = source_sha256
+            tool["release"]["source_sha256"] = source_sha256
+            tool["release"]["source_commit"] = source_commit
+            tool["release"]["source_tree"] = source_tree
+            tool["release"]["package_files"] = package_files
+        self.portable = portable
+        self.native = native
+        self._bind_services()
+
+    def _advance_production_repository(self, generation: str) -> None:
+        target = self.production_repository / "README.md"
+        target.write_text(
+            f"fixture\nsuccessor generation {generation}\n",
+            encoding="utf-8",
+        )
+        for command in (
+            ("add", "README.md"),
+            ("commit", "-m", f"successor generation {generation}"),
+            ("push", "origin", "main"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(self.production_repository), *command],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
     def _application(self) -> StageApplication:
         self.pull_requests = _PullRequests()
@@ -452,6 +514,167 @@ class RealSixStageChainTests(unittest.TestCase):
                 "ARRAY['freeze','discover','capture','generate','verify','publish'],"
                 " stage)",
                 (RUN_ID,),
+            )
+            stages = cursor.fetchall()
+        self.assertEqual(
+            stages,
+            [
+                ("freeze", "completed"),
+                ("discover", "completed"),
+                ("capture", "completed"),
+                ("generate", "completed"),
+                ("verify", "completed"),
+                ("publish", "completed"),
+            ],
+        )
+
+    def test_freeze_successor_reuses_originals_and_runs_all_six_stages(self) -> None:
+        parent_application = self._application()
+        parent_work = self.root / "parent-factory-work"
+        parent_work.mkdir()
+        parent_request = self._production_request()
+        parent_snapshot = self._platform_snapshot()
+        with (
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=copy.deepcopy(self.native),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.generate.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.publish.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+        ):
+            parent = load_production_admission(
+                parent_application,
+                parent_request,
+                artifacts=self.store,
+                platform_snapshot=parent_snapshot,
+                native_tool_provider=lambda: copy.deepcopy(self.native),
+                work_root=parent_work,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+                portable_tool_provider=lambda: copy.deepcopy(self.portable),
+            )
+            freeze = parent_application.execute_registered_command(
+                parent.freeze_command.command_id
+            )
+        self.assertEqual(freeze.outcome, "completed")
+        parent_spec = AdmissionSpec.from_record(parent.admission.request)
+        parent_executor = parent_spec.executors.freeze
+
+        shutil.rmtree(self.upload_root)
+        shutil.rmtree(parent_work)
+        self.assertFalse(self.upload_root.exists())
+        self.assertFalse(parent_work.exists())
+
+        write_json(
+            self.rules_root / "root-000" / "budget.json",
+            {
+                **RECORDS["budget.json"],
+                "robot": {
+                    "expected_mass_kg": [0.29, 0.31],
+                    "expected_extent_m": [0.35, 0.5],
+                },
+            },
+        )
+        self._advance_production_repository("successor")
+        current_snapshot = self._platform_snapshot(
+            generated_at="2026-10-25T01:00:00Z"
+        )
+        self._install_current_tools(
+            source_commit="d" * 40,
+            source_tree="e" * 40,
+            seed="successor",
+        )
+        self.assertNotEqual(
+            self.portable["source_sha256"],
+            parent_executor,
+        )
+
+        successor = ProductionFreezeSuccessorRequest(
+            run_id=SUCCESSOR_RUN_ID,
+            request_id="real-six-stage-successor-request",
+            parent_run_id=RUN_ID,
+            main_assembly=MAIN_ASSEMBLY,
+            target_hardware="nd_fixture",
+            purpose="engineering",
+            change_summary="Reuse sealed CAD bytes under current production inputs",
+            principal="cli:tenant:ou_successor",
+        )
+        successor_work = self.root / "successor-factory-work"
+        successor_work.mkdir()
+        application = self._application()
+        with (
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=copy.deepcopy(self.native),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.generate.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.publish.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+        ):
+            child = load_production_freeze_successor(
+                application,
+                successor,
+                artifacts=self.store,
+                platform_snapshot=current_snapshot,
+                native_tool_provider=lambda: copy.deepcopy(self.native),
+                work_root=successor_work,
+                clock=lambda: datetime(2026, 10, 25, 1, tzinfo=UTC),
+                portable_tool_provider=lambda: copy.deepcopy(self.portable),
+            )
+            child_spec = AdmissionSpec.from_record(child.admission.request)
+            self.assertEqual(child_spec.originals, parent_spec.originals)
+            self.assertEqual(
+                child_spec.originals.ref.producer_tool_sha256,
+                parent_executor,
+            )
+            self.assertNotEqual(
+                child_spec.platform_config_sha256,
+                parent_spec.platform_config_sha256,
+            )
+            for artifact in (
+                child_spec.ruleset.artifact.ref,
+                child_spec.configuration.ref,
+                child_spec.native_tool_requirement.ref,
+                child_spec.publish_intent.repository.artifact.ref,
+            ):
+                self.assertEqual(
+                    artifact.producer_tool_sha256,
+                    self.portable["source_sha256"],
+                )
+                self.assertNotEqual(
+                    artifact.producer_tool_sha256,
+                    parent_executor,
+                )
+            outcome = application.execute_run(SUCCESSOR_RUN_ID)
+
+        self.assertEqual(outcome.outcome, "completed", repr(outcome))
+        self.assertEqual(outcome.stage, "publish")
+        self.assertEqual(len(self.pull_requests.rows), 1)
+        self.assertEqual(
+            self.pull_requests.rows[0].head_ref,
+            child_spec.publish_intent.repository.branch_ref,
+        )
+        with (
+            self._connect() as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                "SELECT stage, outcome FROM stage_decision "
+                "WHERE run_id = %s "
+                "ORDER BY array_position("
+                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                " stage)",
+                (SUCCESSOR_RUN_ID,),
             )
             stages = cursor.fetchall()
         self.assertEqual(
