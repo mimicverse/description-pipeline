@@ -51,6 +51,12 @@ from ..pipeline.effects import (
     project_effect_settlement,
     project_effect_state,
 )
+from ..schemas import (
+    AIRFLOW_DISPATCH_EFFECT_SCHEMA,
+    DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
+    RUN_ADMISSION_SCHEMA,
+    STAGE_COMMAND_SCHEMA,
+)
 
 
 class FactStoreError(PipelineError):
@@ -71,14 +77,11 @@ class StageResultReader(Protocol):
     def read_dispatch_conf(self, artifact: ArtifactRef) -> DispatchConf: ...
 
 
-_DIAGNOSTIC_COMMAND_REQUEST_SCHEMA = "description-pipeline.diagnostic-command-request/v1"
-
-
 def _stored_command_request(command: StageCommand) -> Mapping[str, object]:
     if command.diagnostic_scope is None:
         return command.request
     return {
-        "schema_version": _DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
+        "schema_version": DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
         "command": command.to_record(),
     }
 
@@ -219,7 +222,7 @@ class FactStore:
         if row is None:
             return None
         return RunAdmission(
-            schema_version="description-pipeline.run-admission/v1",
+            schema_version=RUN_ADMISSION_SCHEMA,
             run_id=row[0],
             request_id=row[1],
             parent_run_id=row[2],
@@ -379,7 +382,7 @@ class FactStore:
         command: DispatchCommand,
     ) -> EffectIntent:
         expected = {
-            "schema_version": "description-pipeline.airflow-dispatch-effect/v1",
+            "schema_version": AIRFLOW_DISPATCH_EFFECT_SCHEMA,
             "conf_artifact_id": command.conf_artifact.artifact_id,
             "conf_set_sha256": command.conf_artifact.set_sha256,
             "dag_id": command.dag_id,
@@ -435,7 +438,7 @@ class FactStore:
         stored_request = row[5]
         if (
             isinstance(stored_request, Mapping)
-            and stored_request.get("schema_version") == _DIAGNOSTIC_COMMAND_REQUEST_SCHEMA
+                and stored_request.get("schema_version") == DIAGNOSTIC_COMMAND_REQUEST_SCHEMA
         ):
             if set(stored_request) != {"schema_version", "command"} or not isinstance(
                 stored_request["command"],
@@ -461,7 +464,7 @@ class FactStore:
                 raise FactStoreError("The diagnostic command row differs from its sealed request")
             return command
         return StageCommand(
-            schema_version="description-pipeline.stage-command/v1",
+            schema_version=STAGE_COMMAND_SCHEMA,
             command_id=row[0],
             run_id=row[1],
             kind=row[2],

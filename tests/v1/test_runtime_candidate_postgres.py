@@ -872,7 +872,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
     def test_transport_identity_is_independent_from_stage_executors(self) -> None:
         admission, freeze_command = self._new_admission("same-transport")
         conf = DispatchConf(
-            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=admission.run_id,
             freeze_command_id=freeze_command.command_id,
         )
