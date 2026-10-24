@@ -6,6 +6,7 @@ qualification or a claim about a licensed SolidWorks installation.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -301,9 +302,25 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
             )
         )
         top_sha256 = source_files[normalize_document_path(os.path.abspath(doc_path))]["sha256"]
+        loaded_types = {}
+        for row in topology:
+            if row["storage_scope"] == "suppressed":
+                continue
+            path = normalize_document_path(os.path.abspath(row["document_path"]))
+            prior = loaded_types.setdefault(path, row["document_type"])
+            if prior != row["document_type"]:
+                raise AssertionError("fixture loaded document type changed")
+        loaded_documents = {
+            "file_paths": sorted(loaded_types),
+            "session_paths": [],
+            "document_types": [
+                {"path": path, "document_type": document_type}
+                for path, document_type in sorted(loaded_types.items())
+            ],
+        }
         scene.notes["capture_preparation"] = {
             "session": {"role": "copy", "identity": self.environment()["sessions"]["copy"], "temp_root": None},
-            "schema_version": "solidworks-to-urdf.capture-preparation/v1",
+            "schema_version": "solidworks-to-urdf.capture-preparation/v2",
             "used_api": "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
             "scope": "collected_copy_in_memory",
             "document": str(doc_path),
@@ -376,6 +393,9 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
             "session_dependency_paths": [],
             "topology_before": topology,
             "topology_after": [dict(row) for row in topology],
+            "loaded_documents_before": copy.deepcopy(loaded_documents),
+            "loaded_documents_after": copy.deepcopy(loaded_documents),
+            "session_recovery": None,
         }
         return scene
 

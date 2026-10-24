@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline.io import PipelineError, canonical, digest, write_json
+from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.verification.solidworks_urdf import (
     _capture_preparation,
     _native_receipts_evidence,
@@ -36,6 +37,9 @@ SOURCE_PART = r"C:\stage\cad\arm.SLDPRT"
 
 
 def _normalized(path: str) -> str:
+    embedded_drive = re.search(r"[A-Za-z]:[\\/]", path)
+    if embedded_drive is not None and embedded_drive.start() != 0:
+        path = path[embedded_drive.start() :]
     module = ntpath if re.match(r"^[A-Za-z]:", path) or "\\" in path else posixpath
     return module.abspath(path).replace("/", "\\").strip().lower()
 
@@ -142,6 +146,56 @@ def _document_state_snapshots(preparation: dict) -> dict[str, dict]:
         "document_state_after_reads.json": copy.deepcopy(snapshot),
         "document_state_after_pristine_readout.json": copy.deepcopy(snapshot),
     }
+
+
+def _loaded_document_signature(topology, source_files):
+    files = sorted(source_files)
+    sessions = set()
+    document_types = {}
+    for row in topology:
+        if row["storage_scope"] == "suppressed":
+            continue
+        if row["storage_scope"] == "session":
+            parts = [
+                part.casefold()
+                for part in re.split(r"[\\/]", row["document_path"])
+                if part
+            ]
+            markers = [
+                marker
+                for marker in ("ic~~", "vc~~")
+                if marker in parts
+            ]
+            if len(markers) != 1:
+                raise AssertionError("fixture session path has no unique marker")
+            marker = markers[0]
+            suffix = parts[parts.index(marker) + 1 :]
+            identity = marker + "/" + "/".join(suffix)
+            sessions.add(identity)
+        else:
+            identity = _normalized(row["document_path"])
+        prior = document_types.setdefault(identity, row["document_type"])
+        if prior != row["document_type"]:
+            raise AssertionError("fixture document type changed")
+    return {
+        "file_paths": files,
+        "session_paths": sorted(sessions),
+        "document_types": [
+            {"path": path, "document_type": document_type}
+            for path, document_type in sorted(document_types.items())
+        ],
+    }
+
+
+def _refresh_loaded_documents(preparation):
+    preparation["loaded_documents_before"] = _loaded_document_signature(
+        preparation["topology_before"],
+        preparation["source_files_before"],
+    )
+    preparation["loaded_documents_after"] = _loaded_document_signature(
+        preparation["topology_after"],
+        preparation["source_files_after"],
+    )
 
 
 def payload(*, virtual_reuse: bool = False) -> dict:
@@ -312,7 +366,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
         }
         session_paths = []
     preparation = {
-        "schema_version": "solidworks-to-urdf.capture-preparation/v1",
+        "schema_version": "solidworks-to-urdf.capture-preparation/v2",
         "used_api": "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
         "scope": "collected_copy_in_memory",
         "document": TOP,
@@ -369,7 +423,11 @@ def payload(*, virtual_reuse: bool = False) -> dict:
         "session_dependency_paths": session_paths,
         "topology_before": copy.deepcopy(topology),
         "topology_after": copy.deepcopy(topology),
+        "loaded_documents_before": None,
+        "loaded_documents_after": None,
+        "session_recovery": None,
     }
+    _refresh_loaded_documents(preparation)
     if virtual_reuse:
         preparation["part_states_after"] = [
             {
@@ -471,6 +529,7 @@ def dynamic_child_payload() -> dict:
     fresh_before = copy.deepcopy(child_before)
     preparation["child_rebuilds"] = [
         {
+            "phase": "child",
             "path": CHILD_ASSEMBLY,
             "depth": 1,
             "instances": ["arm-1"],
@@ -499,17 +558,20 @@ def dynamic_child_payload() -> dict:
         {
             "sequence": 2,
             "kind": "child",
+            "phase": "child",
             "path": CHILD_ASSEMBLY,
             "depth": 1,
             "state_before": copy.deepcopy(fresh_before),
             "result": True,
             "state_after": copy.deepcopy(child_state),
+            "elapsed_seconds": 0.1,
         },
     ]
     source_files = preparation["source_files_before"]
     source_files.pop(_normalized(PART))
     source_files[child_key] = {"path": CHILD_ASSEMBLY, "sha256": "b" * 64}
     preparation["source_files_after"] = copy.deepcopy(source_files)
+    _refresh_loaded_documents(preparation)
     value["document_states"] = _document_state_snapshots(preparation)
     raw = value["discovery"]["raw"]
     raw["components"] = [
@@ -556,6 +618,249 @@ def dynamic_child_payload() -> dict:
         },
     ]
     return value
+
+
+def recovery_payload(
+    *,
+    before_configuration_needs_rebuild: bool = False,
+) -> dict:
+    """A real native recovery preparation consumed by the independent verifier."""
+
+    from description_pipeline.sources.solidworks import native
+    from tests.sources.test_solidworks_rebuild_lifecycle import (
+        _Component,
+        _Doc,
+        _RecoveryBackend,
+    )
+
+    top_path = r"C:\capture\prepared\robot.SLDASM"
+    child_path = r"C:\capture\prepared\child.SLDASM"
+    old_child = _Doc(child_path, needs_rebuild2=1)
+    old_top = _Doc(
+        top_path,
+        configuration_needs_rebuild=before_configuration_needs_rebuild,
+        needs_rebuild2=1,
+        rebuild_clears=False,
+        children=[_Component("child-1", old_child)],
+    )
+    if before_configuration_needs_rebuild:
+        old_top._rebuild_callback = lambda: setattr(
+            old_top,
+            "_configuration_needs_rebuild",
+            False,
+        )
+    fresh_child = _Doc(child_path, needs_rebuild2=1)
+    fresh_top = _Doc(
+        top_path,
+        needs_rebuild2=1,
+        children=[_Component("child-1", fresh_child)],
+    )
+    fresh_top._rebuild_callback = lambda: setattr(
+        fresh_child,
+        "needs_rebuild2",
+        0,
+    )
+    backend = _RecoveryBackend(
+        {top_path: old_top, child_path: old_child},
+        {top_path: fresh_top, child_path: fresh_child},
+    )
+    with patch.object(native, "_hash", return_value="a" * 64):
+        _, preparation = backend._rebuild_capture_copy(old_top, top_path)
+        documents = backend.verify_capture_documents_ready()
+    lease_path = r"C:\state\cad.lease"
+    executable = r"C:\Program Files\SOLIDWORKS\SLDWORKS.exe"
+
+    def recovery_identity(identity, *, state):
+        identity.update(
+            executable=executable,
+            ownership="windows_job",
+            lease={
+                "path": lease_path,
+                "held": state == "active",
+                "holder_pid": 600 if state == "active" else None,
+            },
+        )
+        return identity
+
+    source_identity = recovery_identity(
+        {"pid": 900, "state": "closed"},
+        state="closed",
+    )
+    old_identity = recovery_identity(
+        preparation["session_recovery"]["first_attempt"]["session"][
+            "identity"
+        ],
+        state="active",
+    )
+    fresh_identity = recovery_identity(
+        preparation["session"]["identity"],
+        state="active",
+    )
+    preparation["session_recovery"]["fresh_session"][
+        "identity"
+    ] = copy.deepcopy(fresh_identity)
+    retirement = preparation["session_recovery"]["retirement"]
+    retirement["before"] = copy.deepcopy(old_identity)
+    retirement["after"] = recovery_identity(
+        {
+            "pid": old_identity["pid"],
+            "state": "closed",
+        },
+        state="closed",
+    )
+    retirement["after"]["lease"]["path"] = lease_path
+    documents["session"]["identity"] = copy.deepcopy(fresh_identity)
+    for name in ("topology_before", "topology_after"):
+        for row in preparation[name]:
+            row["normalized_path"] = _normalized(row["document_path"])
+    first_attempt = preparation["session_recovery"]["first_attempt"]
+    for row in first_attempt["topology"]:
+        row["normalized_path"] = _normalized(row["document_path"])
+    first_attempt["source_files"] = {
+        _normalized(row["path"]): row
+        for row in first_attempt["source_files"].values()
+    }
+    first_attempt["loaded_documents"] = _loaded_document_signature(
+        first_attempt["topology"],
+        first_attempt["source_files"],
+    )
+    for journal in (
+        first_attempt["rebuild_calls"],
+        preparation["rebuild_calls"],
+    ):
+        for row in journal:
+            if isinstance(row.get("path"), str):
+                row["path"] = ntpath.abspath(row["path"])
+            for field in ("initial_pending", "rebuild_candidates"):
+                if isinstance(row.get(field), list):
+                    row[field] = sorted(
+                        _normalized(path) for path in row[field]
+                    )
+    for row in documents["topology"]:
+        row["normalized_path"] = _normalized(row["document_path"])
+    for name in ("source_files_before", "source_files_after"):
+        preparation[name] = {
+            _normalized(row["path"]): row
+            for row in preparation[name].values()
+        }
+    _refresh_loaded_documents(preparation)
+    source_hashes = {
+        _normalized(row["path"]): row["sha256"]
+        for row in preparation["source_files_after"].values()
+    }
+    toolchain = {
+        "schema_version": TOOL_SCHEMA,
+        "pipeline_id": "solidworks-to-urdf",
+        "version": "1.5.0",
+        "source_sha256": "a" * 64,
+        "release": {"package_files": {"worker.py": "b" * 64}},
+        "runtime": {
+            "role": "native",
+            "python": "3.12.14",
+            "system": "Windows",
+            "machine": "AMD64",
+            "packages": {"packaging": "26.3", "pywin32": "311"},
+        },
+    }
+
+    def recovery_environment(copy_identity):
+        return {
+            "captured_at": "2026-10-25T00:00:00Z",
+            "platform": "Windows-11",
+            "python": "3.12.14",
+            "worker_version": "1.5.0",
+            "toolchain": copy.deepcopy(toolchain),
+            "solidworks": {
+                "revision": "34.4.1",
+                "input_mode": "saved_documents",
+                "sessions": {
+                    "source": copy.deepcopy(source_identity),
+                    "copy": copy.deepcopy(copy_identity),
+                },
+                "build": "2026.1",
+                "license": 1,
+                "visible": False,
+                "unavailable": {},
+            },
+        }
+
+    before_recovery_environment = recovery_environment(old_identity)
+    final_environment = recovery_environment(fresh_identity)
+    return {
+        "environment": final_environment,
+        "scene": {
+            "document": top_path,
+            "source_root": ntpath.dirname(top_path),
+            "notes": {"capture_preparation": preparation},
+        },
+        "closure": {
+            "top_level": top_path,
+            "configuration": "默认",
+            "copy_files": {
+                "source/robot.SLDASM": source_hashes[_normalized(top_path)],
+                "source/child.SLDASM": source_hashes[_normalized(child_path)],
+            },
+            "mapping": [
+                {
+                    "instance": "top_level",
+                    "source": r"C:\stage\cad\robot.SLDASM",
+                    "copy": "source/robot.SLDASM",
+                    "source_sha256": source_hashes[_normalized(top_path)],
+                    "copy_sha256": source_hashes[_normalized(top_path)],
+                },
+                {
+                    "instance": "child-1",
+                    "source": r"C:\stage\cad\child.SLDASM",
+                    "copy": "source/child.SLDASM",
+                    "source_sha256": source_hashes[_normalized(child_path)],
+                    "copy_sha256": source_hashes[_normalized(child_path)],
+                },
+            ],
+        },
+        "discovery": {
+            "raw": {
+                "identity": {"main_assembly": "cad/robot.SLDASM"},
+                "components": [
+                    {
+                        "instance_id": "child-1",
+                        "document": r"cad\child.SLDASM",
+                        "configuration": "默认",
+                        "suppressed": False,
+                        "suppression_state": 2,
+                    }
+                ],
+                "source_selection": {
+                    "main_assembly": "cad/robot.SLDASM",
+                    "closure": {
+                        "documents": {
+                            "cad/robot.SLDASM": {
+                                "resolved_edges": [
+                                    {
+                                        "instance": "child-1",
+                                        "resolved": r"cad\child.SLDASM",
+                                        "configuration": "默认",
+                                        "suppression_state": 2,
+                                    }
+                                ]
+                            },
+                            "cad/child.SLDASM": {"resolved_edges": []},
+                        },
+                        "virtual_components": [],
+                        "imports": [],
+                        "suppressed": [],
+                    },
+                },
+            }
+        },
+        "document_states": {
+            "document_state_after_reads.json": documents,
+            "document_state_after_pristine_readout.json": copy.deepcopy(documents),
+            "capture-environment-before-recovery.json": (
+                before_recovery_environment
+            ),
+        },
+        "manifest": {"identity": {"configuration": "默认"}},
+    }
 
 
 class CapturePreparationTests(unittest.TestCase):
@@ -783,6 +1088,7 @@ class CapturePreparationTests(unittest.TestCase):
             for instance in ("virtual-1", "virtual-2")
         ]
         preparation["session_dependency_paths"] = [materialized]
+        _refresh_loaded_documents(preparation)
         value["closure"]["copy_files"] = {"source/robot.SLDASM": "a" * 64}
         value["document_states"] = _document_state_snapshots(preparation)
 
@@ -826,6 +1132,7 @@ class CapturePreparationTests(unittest.TestCase):
                 _normalized(row["path"]): row
                 for row in preparation[name].values()
             }
+        _refresh_loaded_documents(preparation)
         source_files = copy.deepcopy(preparation["source_files_after"])
         source_hashes = {
             _normalized(row["path"]): row["sha256"]
@@ -907,6 +1214,293 @@ class CapturePreparationTests(unittest.TestCase):
         self.assertEqual({row["instance"] for row in topology}, {"top", "part-1"})
         result = self.validate(value)
         self.assertEqual(result["final_document_count"], 2)
+
+    def test_recovery_producer_feeds_the_independent_consumer(self) -> None:
+        value = recovery_payload()
+        preparation = self.preparation(value)
+        self.assertIsNotNone(preparation["session_recovery"])
+        result = self.validate(value)
+        self.assertEqual(result["needs_rebuild2_after"], 0)
+        self.assertEqual(result["final_document_count"], 2)
+        self.assertEqual(result["assembly_document_count"], 2)
+
+    def test_recovery_accepts_top_rebuild_that_clears_configuration_pending(self) -> None:
+        value = recovery_payload(
+            before_configuration_needs_rebuild=True
+        )
+        recovery = self.preparation(value)["session_recovery"]
+        failed_top = recovery["first_attempt"]["rebuild_calls"][-1]
+        self.assertIs(
+            failed_top["state_before"]["configuration_needs_rebuild"],
+            True,
+        )
+        self.assertIs(
+            failed_top["state_after"]["configuration_needs_rebuild"],
+            False,
+        )
+        result = self.validate(value)
+        self.assertEqual(result["needs_rebuild2_after"], 0)
+
+    def test_recovery_consumer_rejects_a_missing_first_attempt(self) -> None:
+        value = recovery_payload()
+        recovery = self.preparation(value)["session_recovery"]
+        recovery["first_attempt"]["rebuild_calls"] = recovery["first_attempt"][
+            "rebuild_calls"
+        ][:-1]
+        with self.assertRaisesRegex(PipelineError, "first-attempt"):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_first_attempt_source_drift(self) -> None:
+        value = recovery_payload()
+        recovery = self.preparation(value)["session_recovery"]
+        first_source = next(
+            iter(recovery["first_attempt"]["source_files"].values())
+        )
+        first_source["sha256"] = "f" * 64
+        with self.assertRaisesRegex(PipelineError, "different source bytes"):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_pre_environment_pid_drift(self) -> None:
+        value = recovery_payload()
+        before = value["document_states"][
+            "capture-environment-before-recovery.json"
+        ]
+        before["solidworks"]["sessions"]["copy"]["pid"] = 999
+        with self.assertRaisesRegex(PipelineError, "pre-recovery environment"):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_first_attempt_topology_drift(self) -> None:
+        value = recovery_payload()
+        recovery = self.preparation(value)["session_recovery"]
+        child = next(
+            row
+            for row in recovery["first_attempt"]["topology"]
+            if row["instance"] == "child-1"
+        )
+        child["instance"] = "child-other"
+        with self.assertRaisesRegex(PipelineError, "changed native topology"):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_first_attempt_loaded_drift(self) -> None:
+        value = recovery_payload()
+        recovery = self.preparation(value)["session_recovery"]
+        loaded = recovery["first_attempt"]["loaded_documents"]
+        loaded["file_paths"] = loaded["file_paths"][:-1]
+        loaded["document_types"] = loaded["document_types"][:-1]
+        with self.assertRaisesRegex(PipelineError, "loaded_documents"):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_an_extra_first_attempt_call(self) -> None:
+        value = recovery_payload()
+        recovery = self.preparation(value)["session_recovery"]
+        recovery["first_attempt"]["rebuild_calls"].append(
+            copy.deepcopy(recovery["first_attempt"]["rebuild_calls"][-1])
+        )
+        with self.assertRaisesRegex(PipelineError, "extra native calls"):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_first_attempt_journal_state_drift(self) -> None:
+        cases = (
+            (
+                "missing_candidate",
+                lambda journal: journal[0].update(rebuild_candidates=[]),
+                "exact dirty ancestor closure",
+            ),
+            (
+                "extra_candidate",
+                lambda journal: journal[0].update(
+                    rebuild_candidates=sorted(
+                        [
+                            *journal[0]["rebuild_candidates"],
+                            journal[3]["path"],
+                        ]
+                    )
+                ),
+                "exact dirty ancestor closure",
+            ),
+            (
+                "top_initial_pending",
+                lambda journal: (
+                    journal[0].update(
+                        initial_pending=sorted(
+                            [
+                                *journal[0]["initial_pending"],
+                                journal[3]["path"],
+                            ]
+                        ),
+                        rebuild_candidates=sorted(
+                            [
+                                *journal[0]["rebuild_candidates"],
+                                journal[3]["path"],
+                            ]
+                        ),
+                    )
+                ),
+                "top cannot be an initial pending candidate",
+            ),
+            (
+                "pending_decision",
+                lambda journal: journal[1].update(decision="skip_clean"),
+                "pending candidate was not rebuilt",
+            ),
+            (
+                "child_read_only",
+                lambda journal: journal[2]["state_after"].update(
+                    read_only=False
+                ),
+                "child rebuild changed state",
+            ),
+            (
+                "child_configuration",
+                lambda journal: (
+                    journal[2]["state_after"].update(configuration="Other"),
+                    journal[2]["state_after"]["configurations"].append(
+                        {
+                            "name": "Other",
+                            "needs_rebuild": False,
+                            "add_rebuild_save_mark": False,
+                        }
+                    ),
+                ),
+                "child rebuild changed state",
+            ),
+            (
+                "failed_top_before_identity",
+                lambda journal: journal[3]["state_before"].update(path=PART),
+                "top failure lacks the sticky state",
+            ),
+            (
+                "failed_top_before_pending",
+                lambda journal: journal[3]["state_before"].update(
+                    needs_rebuild2_value=0
+                ),
+                "top failure lacks the sticky state",
+            ),
+        )
+        for label, mutate, pattern in cases:
+            with self.subTest(case=label):
+                value = recovery_payload()
+                journal = self.preparation(value)["session_recovery"][
+                    "first_attempt"
+                ]["rebuild_calls"]
+                mutate(journal)
+                with self.assertRaisesRegex(PipelineError, pattern):
+                    self.validate(value)
+
+    def test_recovery_consumer_rejects_an_unclean_retirement(self) -> None:
+        value = recovery_payload()
+        recovery = self.preparation(value)["session_recovery"]
+        recovery["retirement"]["after"]["state"] = "active"
+        with self.assertRaisesRegex(PipelineError, "retired-session identity"):
+            self.validate(value)
+
+    def test_recovery_rejects_incomplete_retirement_and_reopen_evidence(self) -> None:
+        cases = (
+            (
+                "lease_still_held",
+                lambda value: self.preparation(value)["session_recovery"][
+                    "retirement"
+                ]["after"]["lease"].update(held=True),
+                "lease identity",
+            ),
+            (
+                "boolean_errors",
+                lambda value: self.preparation(value)["session_recovery"][
+                    "reopen"
+                ].update(errors=False),
+                "reopen the exact top",
+            ),
+            (
+                "numeric_opened",
+                lambda value: self.preparation(value)["session_recovery"][
+                    "reopen"
+                ].update(opened=7),
+                "reopen the exact top",
+            ),
+            (
+                "text_warnings",
+                lambda value: self.preparation(value)["session_recovery"][
+                    "reopen"
+                ].update(warnings="none"),
+                "warnings are invalid",
+            ),
+        )
+        for label, mutate, pattern in cases:
+            with self.subTest(case=label):
+                value = recovery_payload()
+                mutate(value)
+                with self.assertRaisesRegex(PipelineError, pattern):
+                    self.validate(value)
+
+    def test_recovery_rejects_native_environment_drift(self) -> None:
+        cases = (
+            (
+                "revision",
+                lambda value: value["environment"]["solidworks"].update(
+                    revision="34.9.0"
+                ),
+                "SolidWorks field: revision",
+            ),
+            (
+                "build",
+                lambda value: value["environment"]["solidworks"].update(
+                    build="other-build"
+                ),
+                "SolidWorks field: build",
+            ),
+            (
+                "toolchain",
+                lambda value: value[
+                    "document_states"
+                ]["capture-environment-before-recovery.json"][
+                    "toolchain"
+                ].update(version="other-tool"),
+                "runtime field: toolchain",
+            ),
+        )
+        for label, mutate, pattern in cases:
+            with self.subTest(case=label):
+                value = recovery_payload()
+                mutate(value)
+                with self.assertRaisesRegex(PipelineError, pattern):
+                    self.validate(value)
+
+        executable_drift = recovery_payload()
+        recovery = self.preparation(executable_drift)["session_recovery"]
+        old_executable = r"C:\Program Files\SOLIDWORKS-A\SLDWORKS.exe"
+        recovery["first_attempt"]["session"]["identity"][
+            "executable"
+        ] = old_executable
+        recovery["retirement"]["before"]["executable"] = old_executable
+        recovery["retirement"]["after"]["executable"] = old_executable
+        executable_drift["document_states"][
+            "capture-environment-before-recovery.json"
+        ]["solidworks"]["sessions"]["copy"][
+            "executable"
+        ] = old_executable
+        with self.assertRaisesRegex(
+            PipelineError,
+            "native executable or lease domain",
+        ):
+            self.validate(executable_drift)
+
+    def test_recovery_consumer_rejects_a_reused_process_identity(self) -> None:
+        value = recovery_payload()
+        recovery = self.preparation(value)["session_recovery"]
+        old_pid = recovery["first_attempt"]["session"]["identity"]["pid"]
+        recovery["fresh_session"]["identity"]["pid"] = old_pid
+        self.preparation(value)["session"]["identity"]["pid"] = old_pid
+        value["environment"]["solidworks"]["sessions"]["copy"]["pid"] = old_pid
+        with self.assertRaisesRegex(PipelineError, "independently owned"):
+            self.validate(value)
+
+    def test_recovery_consumer_rejects_fresh_top_without_convergence(self) -> None:
+        value = recovery_payload()
+        preparation = self.preparation(value)
+        preparation["top_rebuild"] = None
+        preparation["rebuild_calls"] = preparation["rebuild_calls"][:-1]
+        with self.assertRaisesRegex(PipelineError, "Top state changed"):
+            self.validate(value)
 
     def test_windows_session_producer_crosses_the_linux_consumer_with_owned_rematerialization(self) -> None:
         from description_pipeline.sources.solidworks import native
@@ -1009,14 +1603,15 @@ class CapturePreparationTests(unittest.TestCase):
         proof["state_after_children"] = copy.deepcopy(top_before)
         proof["child_rebuilds"] = []
         proof["top_rebuild"] = {
-            "path": TOP, "depth": 0, "instances": ["top"], "elapsed_seconds": 0.1,
+            "path": TOP, "depth": 0, "phase": "top", "instances": ["top"], "elapsed_seconds": 0.1,
             "result": True, "call_sequence": 2,
             "state_before": copy.deepcopy(top_before), "state_after": copy.deepcopy(proof["state_after"]),
         }
         proof["rebuild_calls"][-1] = {
-            "sequence": 2, "kind": "top", "path": TOP, "depth": 0,
+            "sequence": 2, "kind": "top", "phase": "top", "path": TOP, "depth": 0,
             "state_before": copy.deepcopy(top_before), "result": True,
             "state_after": copy.deepcopy(proof["state_after"]),
+            "elapsed_seconds": 0.1,
         }
         with self.assertRaisesRegex(PipelineError, "pending candidate"):
             self.validate(value)
@@ -1187,6 +1782,23 @@ class CapturePreparationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(PipelineError, "unique sorted list"):
             self.validate(mapping)
+
+    def test_session_owner_is_validated_as_a_file_identity(self) -> None:
+        value = payload(virtual_reuse=True)
+        self.validate(value)
+
+        wrong_owner = payload(virtual_reuse=True)
+        preparation = self.preparation(wrong_owner)
+        for topology_name in ("topology_before", "topology_after"):
+            for row in preparation[topology_name]:
+                if row["storage_scope"] == "session":
+                    row["owner_document_path"] = _normalized(PART)
+                    break
+        with self.assertRaisesRegex(
+            PipelineError,
+            "owner differs from its occurrence parent",
+        ):
+            self.validate(wrong_owner)
 
     def test_schema_state_and_source_mutations_are_rejected(self) -> None:
         cases = (

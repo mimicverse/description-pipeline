@@ -8,7 +8,9 @@ automation handle, while the same owned session can re-resolve it by path.
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline.sources.solidworks.errors import CadError
@@ -213,6 +215,9 @@ class _Session:
             identity["pid"] = self._pid
         return identity
 
+    def close(self):
+        self.closed = True
+
 
 class _Backend(SolidWorksBackend):
     def __init__(self, refresh, *, session_pid=1234, extra_sessions=None):
@@ -281,6 +286,42 @@ class _Backend(SolidWorksBackend):
         raise AssertionError("OpenDoc6 must never be used after a rebuild")
 
 
+class _RecoveryBackend(_Backend):
+    def __init__(
+        self,
+        first_refresh,
+        fresh_refresh,
+        *,
+        old_pid=1234,
+        new_pid=5678,
+    ):
+        super().__init__(first_refresh, session_pid=old_pid)
+        self._fresh_refresh = fresh_refresh
+        self._new_pid = new_pid
+        self.open_calls = []
+
+    def open_document(self, path):
+        self.open_calls.append(str(path))
+        if "copy" in self._sessions:
+            raise AssertionError("the prior copy session was not retired")
+        self._sessions["copy"] = _Session(self._new_pid)
+        self._refresh = self._fresh_refresh
+        if isinstance(self._fresh_refresh, dict):
+            value = self._fresh_refresh[path]
+            self._current_document = (
+                value[0] if isinstance(value, list) else value
+            )
+        else:
+            self._current_document = self._fresh_refresh
+        return {
+            "opened": "robot",
+            "path": path,
+            "read_only": True,
+            "errors": 0,
+            "warnings": 0,
+        }
+
+
 class _UnreadablePathDoc(_Doc):
     @property
     def GetPathName(self):
@@ -303,6 +344,96 @@ class _RaisingRebuildDoc(_Doc):
 
 
 class RebuildDocumentLifecycleTests(unittest.TestCase):
+    def test_session_path_signature_requires_a_controlled_owned_root(self) -> None:
+        temp_root = Path(tempfile.gettempdir())
+        first = temp_root / "swx111" / "IC~~" / "import" / "part.SLDASM"
+        second = temp_root / "swx222" / "IC~~" / "import" / "part.SLDASM"
+        self.assertEqual(
+            SolidWorksBackend._capture_session_path_signature(str(first)),
+            SolidWorksBackend._capture_session_path_signature(str(second)),
+        )
+        for value in (
+            temp_root / "foreign" / "IC~~" / "import" / "part.SLDASM",
+            r"C:\outside\IC~~\import\part.SLDASM",
+            temp_root / "swx111" / "IC~~" / ".." / "part.SLDASM",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                SolidWorksBackend._capture_session_path_signature(str(value))
+
+    def test_session_child_uses_its_file_backed_owner_identity(self) -> None:
+        session_path = (
+            r"C:\Users\solid\AppData\Local\Temp\swx8108\VC~~\waist"
+            r"\Copy of 复件 (2) 零件10^waist.SLDPRT"
+        )
+        owner_path = (
+            r"c:\description-v1-review\endpoint-deliveries"
+            r"\.a8eabd2a-57f0-5928-914b-2a6803a71005-capture-r6jieh8j"
+            r"\evidence.partial\source\waist.sldasm"
+        )
+        row = {
+            "depth": 2,
+            "document_path": session_path,
+            "normalized_path": normalize_document_path(session_path),
+            "document_type": 1,
+            "instance": "waist-1/Copy of 复件 (2) 零件10^waist-1",
+            "native_api_pid": 8108,
+            "owner_document_path": owner_path,
+            "owner_sha256": (
+                "5b9ab6263b6a8a7ff5ab821614225ea9"
+                "fc1325b59fc3c7a7e0916d08b70caf37"
+            ),
+            "provenance_state": "embedded_virtual_component",
+            "referenced_configuration": "默认",
+            "storage_scope": "session",
+            "suppression_state": 2,
+        }
+        with patch(
+            "description_pipeline.sources.solidworks.native."
+            "embedded_virtual_component_root",
+            return_value=r"C:\Users\solid\AppData\Local\Temp\swx8108",
+        ):
+            stable = SolidWorksBackend._capture_stable_topology([row])
+
+        self.assertEqual(
+            stable[0]["owner_identity"],
+            normalize_document_path(os.path.abspath(owner_path)),
+        )
+        self.assertEqual(stable[0]["owner_sha256"], row["owner_sha256"])
+        self.assertEqual(
+            stable[0]["session_path"],
+            "vc~~/waist/copy of 复件 (2) 零件10^waist.sldprt",
+        )
+        self.assertNotIn("normalized_path", stable[0])
+
+    def test_loaded_document_signature_rejects_extra_and_missing_documents(self) -> None:
+        top_key = normalize_document_path(os.path.abspath(PATH))
+        part_key = normalize_document_path(os.path.abspath(PART))
+        base = {
+            "loaded_documents": [
+                {"path": PATH, "document_type": 2},
+                {"path": PART, "document_type": 1},
+            ],
+            "source_files": {top_key: {}, part_key: {}},
+            "session_files": [],
+        }
+        expected = SolidWorksBackend._capture_loaded_document_signature(base)
+        extra = {
+            **base,
+            "loaded_documents": [
+                *base["loaded_documents"],
+                {"path": CHILD, "document_type": 2},
+            ],
+        }
+        missing = {
+            **base,
+            "loaded_documents": base["loaded_documents"][:1],
+        }
+        self.assertEqual(expected["file_paths"], sorted([top_key, part_key]))
+        with self.assertRaises(ValueError):
+            SolidWorksBackend._capture_loaded_document_signature(extra)
+        with self.assertRaises(ValueError):
+            SolidWorksBackend._capture_loaded_document_signature(missing)
+
     def test_rebuild_refreshes_the_document_handle_in_the_owned_session(self):
         refreshed = _Doc(PATH)
         backend = _Backend(lambda: refreshed)
@@ -682,6 +813,379 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertEqual(preparation["needs_rebuild2_after"], 0)
         self.assertIs(preparation["state_after"]["read_only"], True)
         self.assertFalse(preparation["state_after"]["controls"]["enable_assembly_rebuild"])
+
+    def test_sticky_top_rebuild_recovers_once_in_a_fresh_owned_session(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_child = _Doc(CHILD, needs_rebuild2=1)
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("child-1", fresh_child)],
+        )
+        fresh_top._rebuild_callback = lambda: setattr(
+            fresh_child,
+            "needs_rebuild2",
+            0,
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top, CHILD: fresh_child},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ):
+            returned, preparation = backend._rebuild_capture_copy(
+                old_top,
+                PATH,
+            )
+        self.assertIs(returned, fresh_top)
+        self.assertEqual([old_top.rebuild_calls, fresh_top.rebuild_calls], [1, 1])
+        self.assertEqual([old_child.rebuild_calls, fresh_child.rebuild_calls], [1, 0])
+        self.assertEqual(backend.open_calls, [PATH])
+        self.assertEqual(
+            backend._sessions["copy"].identity(),
+            {"state": "active", "pid": 5678},
+        )
+        self.assertEqual(
+            preparation["schema_version"],
+            "solidworks-to-urdf.capture-preparation/v2",
+        )
+        recovery = preparation["session_recovery"]
+        self.assertEqual(
+            recovery["first_attempt"]["rebuild_calls"][-1]["error_code"],
+            "cad_rebuild_incomplete",
+        )
+        self.assertEqual(
+            recovery["first_attempt"]["rebuild_calls"][-1][
+                "error_message"
+            ],
+            "Assembly rebuild did not end in a fully rebuilt configuration",
+        )
+        self.assertEqual(recovery["retirement"]["before"]["pid"], 1234)
+        self.assertEqual(recovery["retirement"]["after"]["state"], "closed")
+        self.assertEqual(recovery["fresh_session"]["identity"]["pid"], 5678)
+        self.assertEqual(
+            recovery["first_attempt"]["rebuild_calls"][2]["path"],
+            CHILD,
+        )
+        self.assertEqual(preparation["child_rebuilds"], [])
+        self.assertEqual(preparation["top_rebuild"]["phase"], "top_recovery")
+        self.assertEqual(preparation["needs_rebuild2_after"], 0)
+        self.assertEqual(
+            [row["kind"] for row in preparation["rebuild_calls"]],
+            ["recovery_initial", "candidate", "top_recovery"],
+        )
+        self.assertFalse(old_top.save_calls or old_child.save_calls)
+        self.assertFalse(fresh_top.save_calls or fresh_child.save_calls)
+
+    def test_recovery_rebinds_a_fresh_virtual_session_dependency(self):
+        old_virtual = _Doc(
+            "/tmp/swx1234/VC~~/robot/virtual_assembly.SLDASM",
+            read_only=False,
+        )
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[
+                _Component("child-1", old_child),
+                _Component("virtual-1", old_virtual, is_virtual=True),
+            ],
+        )
+        fresh_virtual = _Doc(
+            "/tmp/swx5678/VC~~/robot/virtual_assembly.SLDASM",
+            read_only=False,
+        )
+        fresh_child = _Doc(CHILD, needs_rebuild2=1)
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[
+                _Component("child-1", fresh_child),
+                _Component("virtual-1", fresh_virtual, is_virtual=True),
+            ],
+        )
+        fresh_top._rebuild_callback = lambda: setattr(
+            fresh_child,
+            "needs_rebuild2",
+            0,
+        )
+        backend = _RecoveryBackend(
+            {
+                PATH: old_top,
+                CHILD: old_child,
+                old_virtual.GetPathName: old_virtual,
+            },
+            {
+                PATH: fresh_top,
+                CHILD: fresh_child,
+                fresh_virtual.GetPathName: fresh_virtual,
+            },
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="8" * 64,
+        ):
+            returned, preparation = backend._rebuild_capture_copy(
+                old_top,
+                PATH,
+            )
+
+        self.assertIs(returned, fresh_top)
+        self.assertEqual(fresh_top.rebuild_calls, 1)
+        self.assertEqual(fresh_virtual.rebuild_calls, 0)
+        self.assertEqual(
+            preparation["session_dependency_paths"],
+            [fresh_virtual.GetPathName],
+        )
+        recovery = preparation["session_recovery"]
+        self.assertEqual(
+            recovery["fresh_session"],
+            preparation["session"],
+        )
+        self.assertEqual(
+            recovery["fresh_session"]["temp_root"],
+            "/tmp/swx5678",
+        )
+        self.assertEqual(
+            recovery["retirement"]["after"],
+            {"state": "closed", "pid": 1234},
+        )
+
+    def test_fresh_session_already_clean_does_not_rebuild_top_again(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_child = _Doc(CHILD)
+        fresh_top = _Doc(
+            PATH,
+            children=[_Component("child-1", fresh_child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top, CHILD: fresh_child},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(fresh_top.rebuild_calls, 0)
+        self.assertIsNone(preparation["top_rebuild"])
+        self.assertEqual(preparation["needs_rebuild2_after"], 0)
+
+    def test_fresh_session_second_incomplete_top_rebuild_is_rejected(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_child = _Doc(CHILD, needs_rebuild2=1)
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", fresh_child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top, CHILD: fresh_child},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="c" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        recovery = caught.exception.detail["session_recovery"]
+        self.assertEqual(
+            recovery["fresh_session"]["identity"]["pid"],
+            5678,
+        )
+        self.assertEqual(
+            backend._capture_rebuild_journal[-1]["error_code"],
+            "cad_rebuild_incomplete",
+        )
+        self.assertEqual([old_top.rebuild_calls, fresh_top.rebuild_calls], [1, 1])
+        self.assertEqual(backend.open_calls, [PATH])
+
+    def test_recovery_rejects_a_reused_owned_process_id(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("child-1", _Doc(CHILD, needs_rebuild2=1))],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top, CHILD: fresh_top._children[0]._document},
+            new_pid=1234,
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_recovery_failed")
+        self.assertIn("reused", caught.exception.detail["error"])
+        self.assertEqual(fresh_top.rebuild_calls, 0)
+
+    def test_recovery_rejects_an_unreadable_old_process_identity(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: _Doc(PATH)},
+        )
+        backend._sessions["copy"]._include_pid = False
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_session_unbound")
+        self.assertEqual(backend.open_calls, [])
+        self.assertFalse(backend._sessions["copy"].closed)
+
+    def test_recovery_rejects_an_unconfirmed_old_process_close(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: _Doc(PATH)},
+        )
+
+        def close_failure():
+            raise RuntimeError("close could not be proven")
+
+        backend._sessions["copy"].close = close_failure
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_recovery_failed")
+        self.assertIn("close could not be proven", caught.exception.detail["error"])
+        self.assertEqual(backend.open_calls, [])
+        self.assertFalse(backend._sessions["copy"].closed)
+
+    def test_recovery_rejects_non_read_only_fresh_top_without_rebuild(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_child = _Doc(CHILD, needs_rebuild2=1)
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            read_only=False,
+            children=[_Component("child-1", fresh_child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top, CHILD: fresh_child},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="e" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_recovery_failed")
+        self.assertEqual(fresh_top.rebuild_calls, 0)
+
+    def test_recovery_rejects_topology_drift_without_rebuild(self):
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[_Component("child-1", old_child)],
+        )
+        fresh_top = _Doc(PATH, needs_rebuild2=1)
+        backend = _RecoveryBackend(
+            {PATH: old_top, CHILD: old_child},
+            {PATH: fresh_top},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(old_top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_recovery_failed")
+        self.assertEqual(fresh_top.rebuild_calls, 0)
+
+    def test_child_failure_never_opens_a_recovery_session(self):
+        child = _Doc(CHILD, needs_rebuild2=1, rebuild_clears=False)
+        top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("child-1", child)],
+        )
+        backend = _RecoveryBackend(
+            {PATH: top, CHILD: child},
+            {PATH: _Doc(PATH)},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["phase"], "child")
+        self.assertEqual(backend.open_calls, [])
+        self.assertFalse(backend._sessions["copy"].closed)
+
+    def test_top_failure_without_child_rebuild_never_reopens(self):
+        top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+        )
+        backend = _RecoveryBackend(
+            {PATH: top},
+            {PATH: _Doc(PATH)},
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(backend.open_calls, [])
+        self.assertFalse(backend._sessions["copy"].closed)
 
     def test_deepest_child_rebuilds_before_its_parent(self):
         grandchild = _Doc(GRANDCHILD, needs_rebuild2=1)
