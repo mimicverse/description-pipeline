@@ -969,6 +969,20 @@ def _method(obj, name, *args):
     raise CadError("cad_member_not_callable", name)
 
 
+_CURVE_END_PARAMS_FIELDS = frozenset(
+    {
+        "call_form",
+        "success",
+        "error",
+        "start",
+        "end",
+        "is_closed",
+        "is_periodic",
+        "raw_outputs",
+    }
+)
+
+
 def _read_curve_end_params(
     curve,
     *,
@@ -6617,6 +6631,19 @@ class SolidWorksBackend(CadBackend):
                 if read_end_params is not None
                 else _read_curve_end_params(curve)
             )
+            if (
+                not isinstance(end_params, dict)
+                or set(end_params) != _CURVE_END_PARAMS_FIELDS
+            ):
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "a native edge curve-end record is incomplete or unknown",
+                    {
+                        **base,
+                        "edge_index": edge_row["index"],
+                        "curve_end_params": end_params,
+                    },
+                )
             edge_row["curve_end_params"] = end_params
             try:
                 curve_domain_transform = native_curve_domain_transform(

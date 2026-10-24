@@ -2607,6 +2607,38 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertIs(caught.exception.detail["curve_periodic"], False)
         self.assertIsInstance(caught.exception.__cause__, ValueError)
 
+    def test_malformed_curve_end_params_raise_a_stable_cad_error(self):
+        body, _face_10, _face_20, _edge, _tessellation, extension = (
+            self.fixture()
+        )
+        malformed = {
+            "call_form": "pywin32-byref-variant",
+            "success": False,
+            "error": "GetEndParams returned false",
+            "start": None,
+            "end": None,
+            "is_periodic": None,
+            "raw_outputs": [],
+        }
+        with (
+            patch(
+                "tests.sources.test_solidworks_native_fin_capture.fake_read_end_params",
+                return_value=malformed,
+            ),
+            self.assertRaises(CadError) as caught,
+        ):
+            self.capture(body, extension)
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn("curve-end record", caught.exception.message)
+        self.assertEqual(
+            caught.exception.detail["curve_end_params"],
+            malformed,
+        )
+
     def test_segmented_open_edge_identity_reaches_parser(self):
         entry, triangles = self.segmented_open_tolerant_tessellation()
         body = entry["itessellation"]["bodies"][0]
