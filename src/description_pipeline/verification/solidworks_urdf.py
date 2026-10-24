@@ -1657,15 +1657,65 @@ def _capture_preparation(root, manifest):
             "Capture session recovery fields are incomplete or unknown",
         )
 
+        def recovery_identity(value, label, *, required_state):
+            _require(
+                isinstance(value, dict)
+                and set(value)
+                == {
+                    "pid",
+                    "state",
+                    "executable",
+                    "ownership",
+                    "lease",
+                },
+                f"{label} fields are incomplete or unknown",
+            )
+            _require(
+                type(value["pid"]) is int
+                and value["pid"] > 0
+                and value["state"] == required_state
+                and isinstance(value["executable"], str)
+                and bool(value["executable"])
+                and value["ownership"] == "windows_job",
+                f"{label} process identity is invalid",
+            )
+            lease = value["lease"]
+            _require(
+                isinstance(lease, dict)
+                and set(lease) == {"path", "held", "holder_pid"}
+                and isinstance(lease["path"], str)
+                and bool(lease["path"])
+                and type(lease["held"]) is bool
+                and (
+                    (
+                        required_state == "active"
+                        and lease["held"] is True
+                        and type(lease["holder_pid"]) is int
+                        and lease["holder_pid"] > 0
+                    )
+                    or (
+                        required_state == "closed"
+                        and lease["held"] is False
+                        and lease["holder_pid"] is None
+                    )
+                ),
+                f"{label} lease identity contradicts its process state",
+            )
+            return value
+
         def attempt_session(value, label):
             _require(
                 isinstance(value, dict)
-                and set(value) == {"role", "identity", "temp_root"}
-                and value["role"] == "copy"
-                and isinstance(value["identity"], dict)
-                and value["identity"].get("state") == "active"
-                and type(value["identity"].get("pid")) is int
-                and value["identity"]["pid"] > 0,
+                and set(value) == {"role", "identity", "temp_root"},
+                f"{label} fields are incomplete or unknown",
+            )
+            identity = recovery_identity(
+                value["identity"],
+                f"{label} identity",
+                required_state="active",
+            )
+            _require(
+                value["role"] == "copy",
                 f"{label} is not an active owned copy process",
             )
             temp_root = value["temp_root"]
@@ -1673,7 +1723,7 @@ def _capture_preparation(root, manifest):
                 temp_root is None
                 or (
                     isinstance(temp_root, str)
-                    and session_root_pid(temp_root) == value["identity"]["pid"]
+                    and session_root_pid(temp_root) == identity["pid"]
                 ),
                 f"{label} temp root differs from its process",
             )
@@ -1710,11 +1760,26 @@ def _capture_preparation(root, manifest):
             session_recovery["fresh_session"],
             "Capture fresh-session identity",
         )
+        final_identity = recovery_identity(
+            prepared_session["identity"],
+            "Capture prepared-session identity",
+            required_state="active",
+        )
         _require(
             final_session == prepared_session
+            and final_identity == final_session["identity"]
             and old_session["identity"]["pid"]
             != final_session["identity"]["pid"],
             "Capture fresh session is not independently owned",
+        )
+        _require(
+            old_session["identity"]["executable"]
+            == final_session["identity"]["executable"]
+            and old_session["identity"]["ownership"]
+            == final_session["identity"]["ownership"]
+            and old_session["identity"]["lease"]
+            == final_session["identity"]["lease"],
+            "Capture recovery changed the native executable or lease domain",
         )
         retirement = session_recovery["retirement"]
         _require(
@@ -1724,10 +1789,20 @@ def _capture_preparation(root, manifest):
             and retirement["role"] == "copy"
             and retirement["retired"] is True
             and retirement["before"] == old_session["identity"]
-            and isinstance(retirement["after"], dict)
-            and retirement["after"].get("state") == "closed"
-            and retirement["after"].get("pid")
-            == old_session["identity"]["pid"],
+            and recovery_identity(
+                retirement["after"],
+                "Capture retired-session identity",
+                required_state="closed",
+            )
+            == retirement["after"]
+            and retirement["after"]["pid"]
+            == old_session["identity"]["pid"]
+            and retirement["after"]["executable"]
+            == old_session["identity"]["executable"]
+            and retirement["after"]["ownership"]
+            == old_session["identity"]["ownership"]
+            and retirement["after"]["lease"]["path"]
+            == old_session["identity"]["lease"]["path"],
             "Capture old session retirement is not proven",
         )
         reopened = session_recovery["reopen"]
@@ -1735,10 +1810,57 @@ def _capture_preparation(root, manifest):
             isinstance(reopened, dict)
             and set(reopened)
             == {"opened", "path", "read_only", "errors", "warnings"}
+            and isinstance(reopened["opened"], str)
+            and bool(reopened["opened"])
             and _same_native_path(reopened["path"], top_path)
             and reopened["read_only"] is True
+            and type(reopened["errors"]) is int
             and reopened["errors"] == 0,
             "Capture recovery did not reopen the exact top read-only",
+        )
+        _require(
+            type(reopened["warnings"]) is int and reopened["warnings"] >= 0,
+            "Capture recovery reopen warnings are invalid",
+        )
+        _require(
+            isinstance(environment, dict)
+            and isinstance(before_recovery_environment, dict),
+            "Capture recovery environment evidence is malformed",
+        )
+        for field in ("platform", "python", "worker_version", "toolchain"):
+            _require(
+                before_recovery_environment.get(field) == environment.get(field),
+                f"Capture recovery changed native runtime field: {field}",
+            )
+        before_solidworks = before_recovery_environment["solidworks"]
+        final_solidworks = environment["solidworks"]
+        for field in (
+            "revision",
+            "input_mode",
+            "build",
+            "license",
+            "visible",
+            "unavailable",
+        ):
+            _require(
+                before_solidworks.get(field)
+                == final_solidworks.get(field),
+                f"Capture recovery changed SolidWorks field: {field}",
+            )
+        before_native_sessions = before_solidworks.get("sessions")
+        final_native_sessions = final_solidworks.get("sessions")
+        _require(
+            isinstance(before_native_sessions, dict)
+            and set(before_native_sessions) == {"source", "copy"}
+            and isinstance(final_native_sessions, dict)
+            and set(final_native_sessions) == {"source", "copy"}
+            and before_native_sessions["source"]
+            == final_native_sessions["source"]
+            and before_native_sessions["copy"]
+            == old_session["identity"]
+            and final_native_sessions["copy"]
+            == final_session["identity"],
+            "Capture recovery changed native session continuity",
         )
         first_topology = topology_rows(
             first_attempt["topology"],

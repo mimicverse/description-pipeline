@@ -666,6 +666,49 @@ def recovery_payload(
     with patch.object(native, "_hash", return_value="a" * 64):
         _, preparation = backend._rebuild_capture_copy(old_top, top_path)
         documents = backend.verify_capture_documents_ready()
+    lease_path = r"C:\state\cad.lease"
+    executable = r"C:\Program Files\SOLIDWORKS\SLDWORKS.exe"
+
+    def recovery_identity(identity, *, state):
+        identity.update(
+            executable=executable,
+            ownership="windows_job",
+            lease={
+                "path": lease_path,
+                "held": state == "active",
+                "holder_pid": 600 if state == "active" else None,
+            },
+        )
+        return identity
+
+    source_identity = recovery_identity(
+        {"pid": 900, "state": "closed"},
+        state="closed",
+    )
+    old_identity = recovery_identity(
+        preparation["session_recovery"]["first_attempt"]["session"][
+            "identity"
+        ],
+        state="active",
+    )
+    fresh_identity = recovery_identity(
+        preparation["session"]["identity"],
+        state="active",
+    )
+    preparation["session_recovery"]["fresh_session"][
+        "identity"
+    ] = copy.deepcopy(fresh_identity)
+    retirement = preparation["session_recovery"]["retirement"]
+    retirement["before"] = copy.deepcopy(old_identity)
+    retirement["after"] = recovery_identity(
+        {
+            "pid": old_identity["pid"],
+            "state": "closed",
+        },
+        state="closed",
+    )
+    retirement["after"]["lease"]["path"] = lease_path
+    documents["session"]["identity"] = copy.deepcopy(fresh_identity)
     for name in ("topology_before", "topology_after"):
         for row in preparation[name]:
             row["normalized_path"] = _normalized(row["document_path"])
@@ -704,26 +747,46 @@ def recovery_payload(
         _normalized(row["path"]): row["sha256"]
         for row in preparation["source_files_after"].values()
     }
-    before_recovery_environment = {
-        "solidworks": {
-            "sessions": {
-                "source": {"pid": 900, "state": "closed"},
-                "copy": copy.deepcopy(
-                    preparation["session_recovery"]["first_attempt"][
-                        "session"
-                    ]["identity"]
-                ),
-            }
-        }
-    }
-    return {
-        "environment": {
-            "solidworks": {
-                "sessions": {
-                    "copy": backend._sessions["copy"].identity(),
-                }
-            }
+    toolchain = {
+        "schema_version": "solidworks-to-urdf.tool/v1",
+        "pipeline_id": "solidworks-to-urdf",
+        "version": "1.5.0",
+        "source_sha256": "a" * 64,
+        "release": {"package_files": {"worker.py": "b" * 64}},
+        "runtime": {
+            "role": "native",
+            "python": "3.12.14",
+            "system": "Windows",
+            "machine": "AMD64",
+            "packages": {"packaging": "26.3", "pywin32": "311"},
         },
+    }
+
+    def recovery_environment(copy_identity):
+        return {
+            "captured_at": "2026-10-25T00:00:00Z",
+            "platform": "Windows-11",
+            "python": "3.12.14",
+            "worker_version": "1.5.0",
+            "toolchain": copy.deepcopy(toolchain),
+            "solidworks": {
+                "revision": "34.4.1",
+                "input_mode": "saved_documents",
+                "sessions": {
+                    "source": copy.deepcopy(source_identity),
+                    "copy": copy.deepcopy(copy_identity),
+                },
+                "build": "2026.1",
+                "license": 1,
+                "visible": False,
+                "unavailable": {},
+            },
+        }
+
+    before_recovery_environment = recovery_environment(old_identity)
+    final_environment = recovery_environment(fresh_identity)
+    return {
+        "environment": final_environment,
         "scene": {
             "document": top_path,
             "source_root": ntpath.dirname(top_path),
@@ -1327,8 +1390,98 @@ class CapturePreparationTests(unittest.TestCase):
         value = recovery_payload()
         recovery = self.preparation(value)["session_recovery"]
         recovery["retirement"]["after"]["state"] = "active"
-        with self.assertRaisesRegex(PipelineError, "retirement"):
+        with self.assertRaisesRegex(PipelineError, "retired-session identity"):
             self.validate(value)
+
+    def test_recovery_rejects_incomplete_retirement_and_reopen_evidence(self) -> None:
+        cases = (
+            (
+                "lease_still_held",
+                lambda value: self.preparation(value)["session_recovery"][
+                    "retirement"
+                ]["after"]["lease"].update(held=True),
+                "lease identity",
+            ),
+            (
+                "boolean_errors",
+                lambda value: self.preparation(value)["session_recovery"][
+                    "reopen"
+                ].update(errors=False),
+                "reopen the exact top",
+            ),
+            (
+                "numeric_opened",
+                lambda value: self.preparation(value)["session_recovery"][
+                    "reopen"
+                ].update(opened=7),
+                "reopen the exact top",
+            ),
+            (
+                "text_warnings",
+                lambda value: self.preparation(value)["session_recovery"][
+                    "reopen"
+                ].update(warnings="none"),
+                "warnings are invalid",
+            ),
+        )
+        for label, mutate, pattern in cases:
+            with self.subTest(case=label):
+                value = recovery_payload()
+                mutate(value)
+                with self.assertRaisesRegex(PipelineError, pattern):
+                    self.validate(value)
+
+    def test_recovery_rejects_native_environment_drift(self) -> None:
+        cases = (
+            (
+                "revision",
+                lambda value: value["environment"]["solidworks"].update(
+                    revision="34.9.0"
+                ),
+                "SolidWorks field: revision",
+            ),
+            (
+                "build",
+                lambda value: value["environment"]["solidworks"].update(
+                    build="other-build"
+                ),
+                "SolidWorks field: build",
+            ),
+            (
+                "toolchain",
+                lambda value: value[
+                    "document_states"
+                ]["capture-environment-before-recovery.json"][
+                    "toolchain"
+                ].update(version="other-tool"),
+                "runtime field: toolchain",
+            ),
+        )
+        for label, mutate, pattern in cases:
+            with self.subTest(case=label):
+                value = recovery_payload()
+                mutate(value)
+                with self.assertRaisesRegex(PipelineError, pattern):
+                    self.validate(value)
+
+        executable_drift = recovery_payload()
+        recovery = self.preparation(executable_drift)["session_recovery"]
+        old_executable = r"C:\Program Files\SOLIDWORKS-A\SLDWORKS.exe"
+        recovery["first_attempt"]["session"]["identity"][
+            "executable"
+        ] = old_executable
+        recovery["retirement"]["before"]["executable"] = old_executable
+        recovery["retirement"]["after"]["executable"] = old_executable
+        executable_drift["document_states"][
+            "capture-environment-before-recovery.json"
+        ]["solidworks"]["sessions"]["copy"][
+            "executable"
+        ] = old_executable
+        with self.assertRaisesRegex(
+            PipelineError,
+            "native executable or lease domain",
+        ):
+            self.validate(executable_drift)
 
     def test_recovery_consumer_rejects_a_reused_process_identity(self) -> None:
         value = recovery_payload()
