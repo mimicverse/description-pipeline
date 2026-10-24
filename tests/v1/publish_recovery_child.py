@@ -12,8 +12,8 @@ from unittest.mock import patch
 import psycopg2
 
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.engine import execute_stage
+from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.reconciliation import EffectReconciliationService
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.stages import publish as publish_stage

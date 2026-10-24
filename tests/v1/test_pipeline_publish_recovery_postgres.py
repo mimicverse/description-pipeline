@@ -21,7 +21,10 @@ except ImportError:
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import digest, file_digest, inventory
-from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
+from description_pipeline.pipeline.diagnostic import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_command,
+)
 from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.stages import publish as publish_stage
 from description_pipeline.platform.facts import FactConflict, FactStore
