@@ -1962,6 +1962,51 @@ class NativeOperationDiscoverPort:
             if error.status is None or error.status >= 500:
                 return None
             raise
+        return self._observation_from_view(
+            view,
+            request,
+            workspace,
+        )
+
+    def resume_transfer(
+        self,
+        source_archive: Path,
+        request,
+        workspace: Path,
+    ) -> NativeObservation | None:
+        """Continue only the original operation's unadmitted input transfer."""
+
+        archive = Path(source_archive)
+        workspace = Path(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        if not archive.is_file() or archive.is_symlink():
+            raise NativeOperationProtocolError(
+                "Discover requires the complete sealed SourceSet archive"
+            )
+        envelope = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=file_digest(archive),
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=digest(self._tool()),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+        )
+        view = self.client.resume_input_transfer(envelope, archive)
+        if view is None:
+            return None
+        return self._observation_from_view(
+            view,
+            request,
+            workspace,
+        )
+
+    def _observation_from_view(
+        self,
+        view: NativeOperationView,
+        request: NativeDiscoverRequest,
+        workspace: Path,
+    ) -> NativeObservation | None:
         self._validate_existing(view, request)
         if view.state in {"failed", "cancelled"}:
             failure = view.failure
@@ -2011,6 +2056,14 @@ class NativeRemoteDiscoverAdapter:
         workspace: Path,
     ) -> NativeObservation | None:
         return self.port.submit(source_archive, request, workspace)
+
+    def resume_transfer(
+        self,
+        source_archive: Path,
+        request,
+        workspace: Path,
+    ) -> NativeObservation | None:
+        return self.port.resume_transfer(source_archive, request, workspace)
 
     def materialize(
         self,

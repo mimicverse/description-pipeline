@@ -336,6 +336,14 @@ class ArchiveDiscoverAdapter:
             on_activity=self.on_activity,
         )
 
+    def resume_transfer(
+        self,
+        source_archive: Path,
+        request: NativeDiscoverRequest,
+        workspace: Path,
+    ) -> NativeObservation | None:
+        return self.submit(source_archive, request, workspace)
+
     def materialize(
         self,
         artifact,

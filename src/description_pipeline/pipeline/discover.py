@@ -108,6 +108,13 @@ class DiscoverDomainAdapter(Protocol):
         workspace: Path,
     ) -> NativeObservation | None: ...
 
+    def resume_transfer(
+        self,
+        source_archive: Path,
+        request: NativeDiscoverRequest,
+        workspace: Path,
+    ) -> NativeObservation | None: ...
+
     def materialize(
         self,
         artifact,

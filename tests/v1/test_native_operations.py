@@ -1857,6 +1857,93 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.assertEqual(client.create_operation.call_count, 1)
         self.assertEqual(client.upload_input.call_count, 1)
 
+    def test_discover_transfer_resume_uses_only_the_original_operation(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class GatedBackend(_CountingBackend):
+            def discover_native(
+                self,
+                frozen_source,
+                settings,
+                *,
+                on_activity=None,
+            ):
+                del frozen_source, settings, on_activity
+                self.calls += 1
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("native Discover was not released")
+                return copy.deepcopy(self.payload)
+
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = GatedBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        port = NativeOperationDiscoverPort(
+            client,
+            NATIVE_TOOL,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        workspace = self.root / "workspace-transfer-resume"
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        request = self.request("discover-operation-transfer-resume")
+        envelope = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=file_digest(archive),
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=digest(NATIVE_TOOL),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+        )
+        self.assertEqual(
+            client.create_operation(envelope).state,
+            "accepted",
+        )
+        client.create_operation = mock.Mock(
+            wraps=client.create_operation
+        )
+        client.upload_input = mock.Mock(
+            wraps=client.upload_input
+        )
+
+        self.assertIsNone(
+            port.resume_transfer(
+                archive,
+                request,
+                workspace / "operation",
+            )
+        )
+        self.assertTrue(entered.wait(5))
+        self.assertEqual(backend.calls, 1)
+        self.assertIsNone(
+            port.resume_transfer(
+                archive,
+                request,
+                workspace / "operation",
+            )
+        )
+        self.assertEqual(client.create_operation.call_count, 0)
+        self.assertEqual(client.upload_input.call_count, 1)
+
+        release.set()
+        client.wait_for_terminal(request.operation_id, timeout=5)
+        observation = port.resume_transfer(
+            archive,
+            request,
+            workspace / "operation",
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(client.create_operation.call_count, 0)
+        self.assertEqual(client.upload_input.call_count, 1)
+
     def test_effect_observer_downloads_satisfied_discover_without_posting(self) -> None:
         reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
