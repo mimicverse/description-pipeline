@@ -295,6 +295,10 @@ class _MemoryBackend:
         del command_id
         return {}
 
+    def cancellation_for(self, command: StageCommand):
+        del command
+        return None
+
     def effect_port(self, command: StageCommand, claim: ExecutionClaim, workspace: StageWorkspace):
         del command, claim, workspace
         return NoExternalEffects()
