@@ -27,13 +27,13 @@ from .effects import (
     project_effect_state,
 )
 from .engine import StageHandler, StageServices, StageWorkspace, execute_stage
-from .discover import DiscoverHandler, DiscoverNativePort
+from .discover import DiscoverDomainAdapter, DiscoverHandler
 from .freeze import FreezeHandler, FreezeRefusal
 
 __all__ = [
     "ArtifactRef",
+    "DiscoverDomainAdapter",
     "DiscoverHandler",
-    "DiscoverNativePort",
     "EffectFact",
     "EffectIntent",
     "EffectSettlement",

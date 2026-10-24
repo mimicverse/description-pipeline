@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import zipfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..build.archive import ZIP_EPOCH
 from ..io import PipelineError, artifact_path_parts, confined, file_digest, read_data
@@ -19,29 +19,15 @@ from ..sources.solidworks.discover_stage import (
     observe_native_record,
 )
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
-from ..sources.solidworks.revision import package_inventory
 from .selection_transport import StagedSelection
+
+if TYPE_CHECKING:
+    from ..artifacts import ArtifactStore
 
 SOURCE_ARCHIVE = "source-set.zip"
 OBSERVATION_ARCHIVE = "native-observation.zip"
 MAX_OBSERVATION_BYTES = 512 * 1024 * 1024
 _READ_CHUNK = 1024 * 1024
-
-
-@dataclass(frozen=True, slots=True)
-class NativeDiscoverExecution:
-    """One satisfied native effect and its sealed observation."""
-
-    effect_id: str
-    observation: NativeObservation
-
-
-class NativeDiscoverFailure(NativeDiscoverRefusal):
-    """A definite native refusal after the effect was authorized."""
-
-    def __init__(self, effect_id: str, code: str, message: str, detail: Mapping[str, object] | None = None):
-        super().__init__(code, message, detail)
-        self.effect_id = effect_id
 
 
 def seal_source_archive(source_root: Path, files: Mapping[str, str], destination: Path) -> Path:
@@ -50,11 +36,13 @@ def seal_source_archive(source_root: Path, files: Mapping[str, str], destination
     root = Path(source_root)
     destination = Path(destination)
     expected = dict(files)
-    if package_inventory(root) != expected:
-        raise NativeDiscoverRefusal(
-            "discover.source_set_changed",
-            "The full SourceSet differs from the registered discover request",
-        )
+    for name in expected:
+        if not confined(root, name).is_file():
+            raise NativeDiscoverRefusal(
+                "discover.source_set_changed",
+                "The full SourceSet differs from the registered discover request",
+                {"path": name},
+            )
     destination.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     try:
@@ -270,8 +258,8 @@ def run_windows_discover(
         ) from error
 
 
-class LocalArchiveDiscoverPort:
-    """Adapter that exercises the exact Windows protocol without a live endpoint.
+class ArchiveDiscoverAdapter:
+    """In-process native adapter; authorization is owned by ``StageEffectPort``.
 
     The production HTTP adapter must accept the same sealed source archive once
     and invoke :func:`run_windows_discover`; it must not add a definition
@@ -281,65 +269,60 @@ class LocalArchiveDiscoverPort:
     def __init__(
         self,
         *,
+        artifacts: ArtifactStore,
         native_tool: Mapping[str, object],
         selection_reader_factory: Callable | None = None,
         backend_factory: Callable | None = None,
         cad_ownership_file: Path | None = None,
         on_activity=None,
     ) -> None:
+        self.artifacts = artifacts
         self.native_tool = dict(native_tool)
         self.selection_reader_factory = selection_reader_factory
         self.backend_factory = backend_factory
         self.cad_ownership_file = cad_ownership_file
         self.on_activity = on_activity
-        self.transfers: list[dict] = []
+        self.invocations: list[dict] = []
 
-    def discover(
+    def invoke(
         self,
+        source_archive: Path,
         request: NativeDiscoverRequest,
-        source_root: Path,
         workspace: Path,
-    ) -> NativeDiscoverExecution:
-        effect_id = f"native-discover:{request.operation_id}"
-        archive = seal_source_archive(source_root, request.source_files, Path(workspace) / SOURCE_ARCHIVE)
-        self.transfers.append(
+    ) -> NativeObservation:
+        self.invocations.append(
             {
                 "operation_id": request.operation_id,
-                "archive_sha256": file_digest(archive),
+                "archive_sha256": file_digest(Path(source_archive)),
                 "source_inventory_sha256": request.source_inventory_sha256,
             }
         )
-        try:
-            observation = run_windows_discover(
-                archive,
-                request,
-                Path(workspace) / "windows",
-                native_tool=self.native_tool,
-                selection_reader_factory=self.selection_reader_factory,
-                backend_factory=self.backend_factory,
-                cad_ownership_file=self.cad_ownership_file,
-                on_activity=self.on_activity,
-            )
-        except NativeDiscoverRefusal as refusal:
-            raise NativeDiscoverFailure(
-                effect_id,
-                refusal.code,
-                refusal.message,
-                refusal.detail,
-            ) from refusal
-        return NativeDiscoverExecution(
-            effect_id=effect_id,
-            observation=observation,
+        return run_windows_discover(
+            source_archive,
+            request,
+            Path(workspace),
+            native_tool=self.native_tool,
+            selection_reader_factory=self.selection_reader_factory,
+            backend_factory=self.backend_factory,
+            cad_ownership_file=self.cad_ownership_file,
+            on_activity=self.on_activity,
         )
+
+    def materialize(
+        self,
+        artifact,
+        request: NativeDiscoverRequest,
+        destination: Path,
+    ) -> NativeObservation:
+        root = self.artifacts.materialize(artifact, destination)
+        return admit_native_observation(root, request=request, artifact_ref=artifact)
 
 
 __all__ = [
     "MAX_OBSERVATION_BYTES",
     "OBSERVATION_ARCHIVE",
     "SOURCE_ARCHIVE",
-    "LocalArchiveDiscoverPort",
-    "NativeDiscoverExecution",
-    "NativeDiscoverFailure",
+    "ArchiveDiscoverAdapter",
     "admit_observation_bundle",
     "run_windows_discover",
     "seal_observation_bundle",
