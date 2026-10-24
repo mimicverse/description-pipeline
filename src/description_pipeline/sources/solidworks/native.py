@@ -4970,11 +4970,12 @@ class SolidWorksBackend(CadBackend):
             graph["loaded_documents"],
             phase="capture_final",
         )
+        normalized_top = normalize_document_path(os.path.abspath(top_path))
         top = next(
             row
-            for row in graph["loaded_documents"]
-            if row["normalized_path"]
-            == normalize_document_path(os.path.abspath(top_path))
+            for row in rows
+            if normalize_document_path(os.path.abspath(row["path"]))
+            == normalized_top
         )
         top_state = top["state"]
         if top_state.get("read_only") is not True:
