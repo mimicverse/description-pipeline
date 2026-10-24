@@ -1314,6 +1314,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
             component="validator",
             edge=edge,
             edge_fins=[1],
+            incident_face_facet_counts=[1],
             fins_by_id={1: fin},
             vertices_by_id=vertices,
         )
@@ -1322,6 +1323,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                 component="validator",
                 edge=edge,
                 edge_fins=[True],
+                incident_face_facet_counts=[1],
                 fins_by_id={1: fin},
                 vertices_by_id=vertices,
             )
@@ -1331,8 +1333,43 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                 component="validator",
                 edge=bool_body_edge,
                 edge_fins=[1],
+                incident_face_facet_counts=[1],
                 fins_by_id={1: fin},
                 vertices_by_id=vertices,
+            )
+        empty_edge = {**edge, "fin_ids": []}
+        relation = validate_native_edge_fin_relations(
+            component="validator",
+            edge=empty_edge,
+            edge_fins=[],
+            incident_face_facet_counts=[0],
+            fins_by_id={},
+            vertices_by_id={},
+        )
+        self.assertEqual(relation["collapsed_pairs"], [])
+        with self.assertRaisesRegex(
+            NativeFinRelationError,
+            "did not return any fins",
+        ):
+            validate_native_edge_fin_relations(
+                component="validator",
+                edge=empty_edge,
+                edge_fins=[],
+                incident_face_facet_counts=[1],
+                fins_by_id={},
+                vertices_by_id={},
+            )
+        with self.assertRaisesRegex(
+            NativeFinRelationError,
+            "did not return any fins",
+        ):
+            validate_native_edge_fin_relations(
+                component="validator",
+                edge={**empty_edge, "body_type": 0},
+                edge_fins=[],
+                incident_face_facet_counts=[0],
+                fins_by_id={},
+                vertices_by_id={},
             )
 
     def test_parser_and_summary_reject_boolean_native_identity_fields(self):

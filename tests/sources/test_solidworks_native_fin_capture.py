@@ -2333,11 +2333,90 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         tessellation.GetEdgeFins = lambda _edge: []
 
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension, body_type=1)
+        self.assertIn("native edge did not return any fins", str(caught.exception))
+        detail = caught.exception.detail
+        self.assertEqual(detail["raw_edge_fins"], "[]")
+        self.assertEqual(detail["raw_edge_fins_type"], "list")
+        self.assertEqual(detail["native_totals"]["fins"], 3)
+        self.assertEqual(detail["captured_facet_count"], 1)
+        self.assertEqual(detail["captured_fin_count"], 3)
+        self.assertEqual(detail["face_count"], 1)
+        self.assertEqual(detail["edge_count"], 1)
+        self.assertEqual(
+            detail["face_incidence"][0]["facet_count"],
+            1,
+        )
+        self.assertIs(detail["tessellate_result"], True)
+        self.assertEqual(tessellation.tessellate_calls, 1)
+
+    def test_native_edge_distinguishes_null_from_empty_fin_set(self):
+        body, face_10, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.face_facets = {id(face_10): []}
+        tessellation.native_totals = {
+            "GetFacetCount": 0,
+            "GetFinCount": 0,
+            "GetVertexCount": 0,
+        }
+        tessellation.GetEdgeFins = lambda _edge: None
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension, body_type=1)
+        self.assertIn(
+            "invalid container type",
+            str(caught.exception),
+        )
+        self.assertEqual(
+            caught.exception.detail["raw_edge_fins"],
+            "None",
+        )
+        self.assertEqual(
+            caught.exception.detail["raw_edge_fins_type"],
+            "NoneType",
+        )
+        self.assertEqual(tessellation.tessellate_calls, 1)
+
+    def test_untessellated_sheet_edge_may_have_no_fins(self):
+        body, face, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.face_facets = {id(face): []}
+        tessellation.native_totals = {
+            "GetFacetCount": 0,
+            "GetFinCount": 0,
+            "GetVertexCount": 0,
+        }
+        tessellation.GetEdgeFins = lambda _edge: []
+
+        captured = self.capture(body, extension, body_type=1)
+
+        self.assertEqual(captured["faces"][0]["facet_ids"], ())
+        self.assertEqual(captured["edges"][0]["fin_ids"], ())
+        self.assertEqual(captured["counts"]["fins"], 0)
+        self.assertEqual(tessellation.tessellate_calls, 1)
+
+    def test_untessellated_solid_edge_cannot_have_no_fins(self):
+        body, face_10, face_20, _edge, tessellation, extension = self.fixture()
+        tessellation.face_facets = {
+            id(face_10): [],
+            id(face_20): [],
+        }
+        tessellation.native_totals = {
+            "GetFacetCount": 0,
+            "GetFinCount": 0,
+            "GetVertexCount": 0,
+        }
+        tessellation.GetEdgeFins = lambda _edge: []
+
         with self.assertRaisesRegex(
             CadError,
             "native edge did not return any fins",
         ):
-            self.capture(body, extension, body_type=1)
+            self.capture(body, extension, body_type=0)
+        self.assertEqual(tessellation.tessellate_calls, 1)
 
     def test_edge_fin_ids_are_canonicalized_after_native_read(self):
         body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
@@ -3565,10 +3644,10 @@ class NativeFinCaptureTests(unittest.TestCase):
 
 
 
-    def test_v8_parser_rejects_previous_tessellation_schema(self):
+    def test_v9_parser_rejects_previous_tessellation_schema(self):
         evidence, triangles = self.group_333_tessellation()
         evidence["schema_version"] = (
-            "solidworks-to-urdf.native-tessellation/v6"
+            "solidworks-to-urdf.native-tessellation/v8"
         )
 
         with self.assertRaisesRegex(

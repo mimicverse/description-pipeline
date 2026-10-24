@@ -7687,15 +7687,99 @@ class SolidWorksBackend(CadBackend):
             ] = face_rows[-1]["reference"]["typed_sha256"]
 
         fin_ids_by_edge_index = {}
+
+        def reference_evidence(reference):
+            if not isinstance(reference, dict):
+                return None
+            return {
+                "raw_sha256": reference.get("raw_sha256"),
+                "typed_sha256": reference.get("typed_sha256"),
+            }
+
+        def edge_failure_context(
+            edge_row,
+            raw_edge_fins,
+            face_incidence,
+        ):
+            return {
+                "raw_edge_fins": repr(raw_edge_fins)[:1000],
+                "raw_edge_fins_type": type(raw_edge_fins).__name__,
+                "edge_reference": reference_evidence(
+                    edge_row["reference"]
+                ),
+                "owner_body_reference": reference_evidence(
+                    edge_row["owner_body_reference"]
+                ),
+                "face_incidence": copy.deepcopy(face_incidence),
+                "edge_endpoints": {
+                    name: {
+                        "state": endpoint.get("state"),
+                        "point_m": copy.deepcopy(
+                            endpoint.get("point_m")
+                        ),
+                        "reference": reference_evidence(
+                            endpoint.get("reference")
+                        ),
+                        "vertex_error": endpoint.get("vertex_error"),
+                        "point_error": endpoint.get("point_error"),
+                        "reference_error": endpoint.get(
+                            "reference_error"
+                        ),
+                        "object_pointer": endpoint.get("object_pointer"),
+                    }
+                    for name, endpoint in edge_row["endpoints"].items()
+                },
+                "curve": copy.deepcopy(edge_row["curve"]),
+                "curve_end_params": copy.deepcopy(
+                    edge_row["curve_end_params"]
+                ),
+                "tessellation_properties": copy.deepcopy(
+                    tessellation_properties
+                ),
+                "tessellate_result": tessellate_result,
+                "native_totals": copy.deepcopy(native_totals),
+                "captured_facet_count": len(facets),
+                "captured_fin_count": len(fins_by_id),
+                "face_count": len(face_rows),
+                "edge_count": len(edge_rows),
+            }
+
         for edge_row in edge_rows:
             edge_index = edge_row["index"]
-            edge_fins = call(
+            raw_edge_fins = call(
                 "ITessellation.GetEdgeFins",
-                lambda edge=edge_row["object"]: _as_list(
-                    _member(tessellation, "GetEdgeFins", edge)
+                lambda edge=edge_row["object"]: _member(
+                    tessellation,
+                    "GetEdgeFins",
+                    edge,
                 ),
                 edge_index=edge_index,
             )
+            face_incidence = [
+                {
+                    "face_index": face_index,
+                    "facet_count": len(face_rows[face_index]["facet_ids"]),
+                    "face_reference": reference_evidence(
+                        face_rows[face_index]["reference"]
+                    ),
+                }
+                for face_index in edge_row["face_indices"]
+            ]
+            if not isinstance(raw_edge_fins, (tuple, list)):
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "GetEdgeFins returned an invalid container type",
+                    {
+                        **base,
+                        "edge_index": edge_index,
+                        **edge_failure_context(
+                            edge_row,
+                            raw_edge_fins,
+                            face_incidence,
+                        ),
+                    },
+                )
+            edge_fins = _as_list(raw_edge_fins)
             normalized = []
             seen = set()
             for fin_id in edge_fins:
@@ -7743,12 +7827,24 @@ class SolidWorksBackend(CadBackend):
                     },
                 )
             if not normalized:
+                if all(
+                    row["facet_count"] == 0 for row in face_incidence
+                ) and body_type == 1 and tessellate_result is True:
+                    # A sheet edge is allowed to have no fins only when every
+                    # incident face produced no facets in this Tessellate pass.
+                    # The edge itself remains in native topology.
+                    continue
                 raise CadError(
                     "cad_native_tessellation_unreadable",
                     "a native edge did not return any fins",
                     {
                         **base,
                         "edge_index": edge_index,
+                        **edge_failure_context(
+                            edge_row,
+                            raw_edge_fins,
+                            face_incidence,
+                        ),
                     },
                 )
         try:
@@ -8718,6 +8814,10 @@ class SolidWorksBackend(CadBackend):
                         "face_senses": edge_row["face_senses"],
                     },
                     edge_fins=edge_row["fin_ids"],
+                    incident_face_facet_counts=[
+                        len(face_rows[face_index]["facet_ids"])
+                        for face_index in edge_row["face_indices"]
+                    ],
                     fins_by_id=relation_fins,
                     vertices_by_id=vertex_points_binary64,
                 )
