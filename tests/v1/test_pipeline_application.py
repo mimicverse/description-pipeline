@@ -36,7 +36,11 @@ from description_pipeline.pipeline.contracts import (
     StageResult,
 )
 from description_pipeline.pipeline.engine import StageWorkspace
+from description_pipeline.pipeline.reconciliation import EffectReconciliationService
 from description_pipeline.pipeline.verify import NoExternalEffects
+from description_pipeline.orchestration.native_operation_client import (
+    NativeOperationEffectObserver,
+)
 from description_pipeline.schemas import (
     DISCOVER_RESULT_SCHEMA,
     STAGE_RESULT_SCHEMA,
@@ -413,6 +417,10 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail["stage"], "capture")
         self.assertIn("capture", self.application.missing_capabilities()["handlers"])
         self.assertEqual(self.application.missing_capabilities()["builders"], [])
+        self.assertEqual(
+            self.application.missing_capabilities()["reconciliation"],
+            ["native"],
+        )
 
     def test_verified_discover_result_projects_capture_through_the_same_engine(self):
         capture = _CompletingHandler()
@@ -547,6 +555,12 @@ class StageApplicationTests(unittest.TestCase):
         self.assertIn("capture", application.handlers)
         self.assertIn("discover", application.handlers)
         self.assertIsInstance(application.handlers["publish"], PublishHandler)
+        self.assertIsInstance(application.reconciler, EffectReconciliationService)
+        self.assertIsInstance(
+            application.reconciliation_adapter,
+            NativeOperationEffectObserver,
+        )
+        self.assertEqual(application.missing_capabilities()["reconciliation"], [])
 
 
 if __name__ == "__main__":

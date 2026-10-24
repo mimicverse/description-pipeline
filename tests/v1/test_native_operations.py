@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,13 +15,14 @@ from unittest import mock
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from description_pipeline.io import digest, file_digest
+from description_pipeline.io import digest, file_digest, write_json
 from description_pipeline.native_transfer import CAPTURE_TRANSFER_SCHEMA
 from description_pipeline.orchestration.native_operation_client import (
     NativeOperationCapturePort,
     NativeOperationClient,
     NativeOperationClientConflict,
     NativeOperationDiscoverPort,
+    NativeOperationEffectObserver,
     NativeOperationEndpoint,
     NativeOperationNotFound,
     NativeOperationProtocolError,
@@ -42,6 +44,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     build_operation_record,
 )
 from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.pipeline.reconciliation import EffectReconciliationEvidence
 from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
@@ -1058,6 +1061,56 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         return server.client()
 
+    def observer_fixture(
+        self,
+        operation_id: str,
+        workspace: Path,
+        *,
+        archive: Path | None = None,
+    ):
+        if archive is None:
+            archive = seal_source_archive(
+                self.source,
+                self.inventory,
+                workspace / "input-source-set.zip",
+            )
+        request = self.request(operation_id)
+        outbound = workspace / "outbound"
+        outbound.mkdir()
+        write_json(outbound / "request.json", request.to_record())
+        write_json(
+            outbound / "source.json",
+            {
+                "source_files": dict(request.source_files),
+                "source_inventory_sha256": request.source_inventory_sha256,
+            },
+        )
+        (outbound / "source-set.zip").write_bytes(archive.read_bytes())
+        command = SimpleNamespace(
+            stage="discover",
+            command_id=operation_id,
+            run_id=request.run_id,
+            request_digest=request.request_digest,
+            request=request.to_record(),
+        )
+        intent = SimpleNamespace(
+            effect_kind="native_operation",
+            command_id=operation_id,
+            effect_key=f"native-discover:{operation_id}",
+            target={"operation_id": operation_id},
+            expected_state={
+                "request_digest": request.request_digest,
+                "source_archive_sha256": file_digest(archive),
+                "native_tool_record_sha256": (
+                    request.expected_native_tool_record_sha256
+                ),
+                "native_tool_requirement_artifact_id": (
+                    request.native_tool_requirement_artifact_id
+                ),
+            },
+        )
+        return command, intent, outbound
+
     def test_single_discover_operation_selects_full_bound_archive_and_stops(self) -> None:
         reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
@@ -1110,6 +1163,227 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         )
         self.assertEqual(reader.calls, 1)
         self.assertEqual(backend.calls, 1)
+
+    def test_effect_observer_downloads_satisfied_discover_without_posting(self) -> None:
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = _CountingBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        port = NativeOperationDiscoverPort(
+            client,
+            NATIVE_TOOL,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        workspace = self.root / "workspace-observer"
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        request = self.request("discover-operation-observer")
+        port.invoke(archive, request, workspace / "operation")
+        command, intent, outbound = self.observer_fixture(
+            request.operation_id,
+            workspace,
+            archive=archive,
+        )
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError("observer must not create")
+        )
+        client.upload_input = mock.Mock(
+            side_effect=AssertionError("observer must not upload")
+        )
+        client.cancel_operation = mock.Mock(
+            side_effect=AssertionError("observer must not cancel")
+        )
+
+        evidence = NativeOperationEffectObserver(client).observe(
+            command=command,
+            intent=intent,
+            outbound_root=outbound,
+            workspace_root=workspace,
+        )
+
+        self.assertIsInstance(evidence, EffectReconciliationEvidence)
+        self.assertEqual(evidence.fact_type, "reconciled")
+        self.assertEqual(evidence.state_class, "known")
+        self.assertIsNotNone(evidence.payload_root)
+        self.assertEqual(
+            {path.name for path in evidence.payload_root.iterdir()},
+            {
+                "observation.json",
+                "record.json",
+                "request.json",
+                "selection.json",
+                "source.json",
+                "tool.json",
+            },
+        )
+        self.assertEqual(
+            evidence.metadata["actual_native_tool_sha256"],
+            digest(NATIVE_TOOL),
+        )
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(backend.calls, 1)
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
+        client.cancel_operation.assert_not_called()
+
+    def test_download_identity_recheck_rejects_a_changed_operation(self) -> None:
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = _CountingBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        port = NativeOperationDiscoverPort(
+            client,
+            NATIVE_TOOL,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        workspace = self.root / "workspace-observer-changed"
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        request = self.request("discover-operation-observer-changed")
+        port.invoke(archive, request, workspace / "operation")
+        command, intent, outbound = self.observer_fixture(
+            request.operation_id,
+            workspace,
+            archive=archive,
+        )
+        observed = client.get_operation(request.operation_id)
+        changed = replace(observed, payload_sha256=digest({"changed": True}))
+        client.get_operation = mock.Mock(
+            side_effect=[observed, observed, changed]
+        )
+
+        with self.assertRaisesRegex(
+            NativeOperationClientConflict,
+            "changed while its artifact was observed",
+        ):
+            NativeOperationEffectObserver(client).observe(
+                command=command,
+                intent=intent,
+                outbound_root=outbound,
+                workspace_root=workspace,
+            )
+
+    def test_missing_or_unreachable_operation_stays_an_observation(self) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "missing-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        missing_workspace = self.root / "missing-workspace"
+        missing_workspace.mkdir()
+        missing_command, missing_intent, missing_outbound = (
+            self.observer_fixture(
+                "discover-operation-missing",
+                missing_workspace,
+            )
+        )
+        missing_client = server.client()
+        missing = NativeOperationEffectObserver(missing_client).observe(
+            command=missing_command,
+            intent=missing_intent,
+            outbound_root=missing_outbound,
+            workspace_root=missing_workspace,
+        )
+        self.assertEqual(missing.fact_type, "observation")
+        self.assertEqual(missing.state_class, "absent")
+        self.assertEqual(missing.metadata["http_status"], 404)
+
+        timeout_workspace = self.root / "timeout-workspace"
+        timeout_workspace.mkdir()
+        timeout_command, timeout_intent, timeout_outbound = (
+            self.observer_fixture(
+                "discover-operation-timeout",
+                timeout_workspace,
+            )
+        )
+
+        def timeout_opener(_request, *, timeout):
+            del timeout
+            raise urlerror.URLError(TimeoutError("timeout"))
+
+        timeout_client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN),
+            opener=timeout_opener,
+        )
+        unobservable = NativeOperationEffectObserver(timeout_client).observe(
+            command=timeout_command,
+            intent=timeout_intent,
+            outbound_root=timeout_outbound,
+            workspace_root=timeout_workspace,
+        )
+        self.assertEqual(unobservable.fact_type, "observation")
+        self.assertEqual(unobservable.state_class, "unobservable")
+
+    def test_only_verified_resource_termination_without_output_is_absent(self) -> None:
+        def unknown_executor(request, source_archive, workspace, native_tool):
+            del request, source_archive, workspace, native_tool
+            raise RuntimeError("native result is unknown")
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "terminal-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={DISCOVER_KIND: unknown_executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        workspace = self.root / "terminal-workspace"
+        workspace.mkdir()
+        command, intent, outbound = self.observer_fixture(
+            "discover-operation-terminal",
+            workspace,
+        )
+        request = NativeDiscoverRequest.from_record(command.request)
+        archive = outbound / "source-set.zip"
+        client = server.client()
+        envelope = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=file_digest(archive),
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=(
+                request.expected_native_tool_record_sha256
+            ),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+        )
+        client.create_operation(envelope)
+        client.upload_input(request.operation_id, archive)
+        operation = client.wait_for_terminal(request.operation_id)
+        self.assertEqual(operation.state, "unknown")
+        self.assertFalse(operation.resource_terminated)
+        observer = NativeOperationEffectObserver(client)
+        unresolved = observer.observe(
+            command=command,
+            intent=intent,
+            outbound_root=outbound,
+            workspace_root=workspace,
+        )
+        self.assertEqual(unresolved.fact_type, "observation")
+        self.assertEqual(unresolved.state_class, "unobservable")
+
+        runtime.reconcile_resource_termination(
+            request.operation_id,
+            evidence_sha256=digest({"process": "terminated"}),
+            reason="native_external_process_gone",
+        )
+        reconciled = observer.observe(
+            command=command,
+            intent=intent,
+            outbound_root=outbound,
+            workspace_root=workspace,
+        )
+        self.assertEqual(reconciled.fact_type, "reconciled")
+        self.assertEqual(reconciled.state_class, "absent")
 
     def test_tool_refusal_is_terminal_and_never_reads_native_record(self) -> None:
         refused_tool_sha256 = "cd" * 32

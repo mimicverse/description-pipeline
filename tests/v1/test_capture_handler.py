@@ -45,7 +45,25 @@ from description_pipeline.pipeline.freeze import FREEZE_REQUEST_SCHEMA
 from description_pipeline.pipeline.discover import DiscoverHandler
 from description_pipeline.pipeline.engine import StageWorkspace
 from description_pipeline.pipeline.freeze import FreezeHandler
-from description_pipeline.orchestration.stage_transfer import admit_capture
+from description_pipeline.orchestration.native_operation_client import (
+    ArtifactDownload,
+    NativeOperationClient,
+    NativeOperationEffectObserver,
+    NativeOperationEndpoint,
+    native_capture_operation_id,
+)
+from description_pipeline.orchestration.native_operation_runtime import (
+    CAPTURE_KIND,
+    CAPTURE_OPERATION_SCHEMA,
+    CaptureOperationRequest,
+    NativeArtifactView,
+    NativeOperationView,
+    OPERATION_VIEW_SCHEMA,
+)
+from description_pipeline.orchestration.stage_transfer import (
+    CAPTURE_ARCHIVE,
+    admit_capture,
+)
 from description_pipeline.sources.solidworks.discovery import PLAN_FILE
 from description_pipeline.schemas import NATIVE_TOOL_REQUIREMENT_KIND
 
@@ -762,6 +780,170 @@ class CaptureHandlerTests(unittest.TestCase):
                 changed,
                 self.capture_tool,
                 effects,
+            )
+
+    def test_native_effect_observer_returns_capture_payload_without_posting(self) -> None:
+        effects = self.effects()
+        workspace = self.workspace()
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.current_native_tool,
+        ):
+            completed = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(completed.outcome, "completed")
+        payload = workspace.root / "capture-effect-payload"
+        archive = payload / "native-evidence.zip"
+        outbound_root = workspace.root / "capture-effect-outbound"
+        outbound = read_data(outbound_root / "outbound.json")
+        intent = next(
+            item
+            for item in self.effect_ledger.intents.values()
+            if item.command_id == self.command.command_id
+        )
+        operation_id = native_capture_operation_id(
+            run_id=self.command.run_id,
+            command_id=self.command.command_id,
+            effect_key="capture-native",
+        )
+        request = CaptureOperationRequest.from_record(
+            {
+                "schema_version": CAPTURE_OPERATION_SCHEMA,
+                "command_id": self.command.command_id,
+                "run_id": self.command.run_id,
+                "request_digest": self.command.request_digest,
+                "effect_key": "capture-native",
+                "handoff_sha256": outbound["handoff_sha256"],
+                "upload_sha256": outbound["upload_sha256"],
+                "prepared_sha256": outbound["prepared_sha256"],
+                "main_assembly": outbound["main_assembly"],
+                "package_files": outbound["prepared_files"],
+                "upstream_artifacts": outbound["upstream_artifacts"],
+                "execution": outbound["execution"],
+                "native_tool_source_sha256": (
+                    outbound["native_tool_source_sha256"]
+                ),
+                "request_evidence": outbound["request_evidence"],
+            }
+        )
+        native_tool = read_data(payload / "native-tool.json")
+        artifact = NativeArtifactView(
+            name=CAPTURE_ARCHIVE,
+            bytes=archive.stat().st_size,
+            sha256=file_digest(archive),
+            media_type="application/zip",
+        )
+        now = datetime.now(UTC).isoformat()
+        view = NativeOperationView(
+            schema_version=OPERATION_VIEW_SCHEMA,
+            operation_id=operation_id,
+            kind=CAPTURE_KIND,
+            payload_sha256=digest({"operation": operation_id}),
+            state="satisfied",
+            request_sha256=digest(request.to_record()),
+            input_archive_sha256=digest({"input": operation_id}),
+            native_tool_requirement_sha256=digest(native_tool),
+            actual_native_tool_sha256=digest(native_tool),
+            owner_sha256=self.claim.owner_sha256,
+            executor_sha256=self.stage_executor,
+            resource_terminated=True,
+            artifact=artifact,
+            failure=None,
+            created_at=now,
+            started_at=now,
+            finished_at=now,
+        )
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32)
+        )
+        client.get_operation = Mock(return_value=view)
+
+        def download(_operation_id, destination):
+            target = Path(destination)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.read_bytes())
+            return ArtifactDownload(
+                operation_id=operation_id,
+                path=target,
+                name=CAPTURE_ARCHIVE,
+                bytes=target.stat().st_size,
+                sha256=file_digest(target),
+                media_type="application/zip",
+            )
+
+        client.download_artifact = Mock(side_effect=download)
+        client.create_operation = Mock(
+            side_effect=AssertionError("observer must not create")
+        )
+        client.upload_input = Mock(
+            side_effect=AssertionError("observer must not upload")
+        )
+        client.cancel_operation = Mock(
+            side_effect=AssertionError("observer must not cancel")
+        )
+        observer_root = self.root / "capture-observer-work"
+        observer_root.mkdir()
+        evidence = NativeOperationEffectObserver(client).observe(
+            command=self.command,
+            intent=intent,
+            outbound_root=outbound_root,
+            workspace_root=observer_root,
+        )
+        self.assertEqual(evidence.fact_type, "reconciled")
+        self.assertEqual(evidence.state_class, "known")
+        self.assertEqual(
+            {path.name for path in evidence.payload_root.iterdir()},
+            {"execution.json", "native-evidence.zip", "native-tool.json"},
+        )
+        self.assertEqual(
+            evidence.metadata["request_sha256"],
+            digest(request.to_record()),
+        )
+        self.assertEqual(client.get_operation.call_count, 2)
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
+        client.cancel_operation.assert_not_called()
+
+    def test_native_effect_observer_rejects_missing_request_evidence(self) -> None:
+        effects = self.effects()
+        workspace = self.workspace()
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.current_native_tool,
+        ):
+            completed = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(completed.outcome, "completed")
+        outbound_root = workspace.root / "capture-effect-outbound"
+        outbound = read_data(outbound_root / "outbound.json")
+        outbound.pop("request_evidence")
+        outbound_root.joinpath("outbound.json").write_bytes(
+            canonical(outbound)
+        )
+        intent = next(
+            item
+            for item in self.effect_ledger.intents.values()
+            if item.command_id == self.command.command_id
+        )
+        observer_root = self.root / "capture-observer-missing-evidence"
+        observer_root.mkdir()
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32)
+        )
+        with self.assertRaisesRegex(Exception, "effect_outbound"):
+            NativeOperationEffectObserver(client).observe(
+                command=self.command,
+                intent=intent,
+                outbound_root=outbound_root,
+                workspace_root=observer_root,
             )
 
     def test_producer_identity_is_rejected_before_native_operation(self) -> None:

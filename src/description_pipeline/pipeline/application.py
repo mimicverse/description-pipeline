@@ -20,6 +20,7 @@ from ..platform.facts import FactConflict, FactStore
 from ..orchestration.native_operation_client import (
     NativeOperationClient,
     NativeOperationDiscoverPort,
+    NativeOperationEffectObserver,
     NativeOperationEndpoint,
     NativeOperationToolProvider,
     NativeRemoteDiscoverAdapter,
@@ -63,6 +64,11 @@ from .discover import DiscoverDomainAdapter, DiscoverHandler
 from .effects import EffectIntent
 from .engine import StageHandler, StageServices, execute_stage
 from .freeze import FreezeHandler
+from .reconciliation import (
+    EffectReconciliationAdapter,
+    EffectReconciliationResult,
+    EffectReconciliationService,
+)
 from .services import CanonicalStageServices, ClaimPolicy
 from .stages.generate import GenerateHandler
 from .stages.publish import PublishHandler
@@ -349,6 +355,8 @@ class StageApplication:
         handlers: Mapping[StageId, StageHandler],
         builders: Mapping[StageId, CommandBuilder],
         clock: Callable[[], datetime] = _utc_now,
+        reconciler: EffectReconciliationService | None = None,
+        reconciliation_adapter: EffectReconciliationAdapter | None = None,
     ) -> None:
         if getattr(services, "facts", facts) is not facts:
             raise ApplicationError("application.store_identity_mismatch", "Stage services use another fact store")
@@ -358,6 +366,21 @@ class StageApplication:
         self.facts = facts
         self.artifacts = artifacts
         self.clock = clock
+        if (reconciler is None) != (reconciliation_adapter is None):
+            raise ApplicationError(
+                "application.reconciliation_incomplete",
+                "Reconciliation requires both its service and read-only adapter",
+            )
+        if reconciler is not None and (
+            reconciler.facts is not facts
+            or reconciler.artifacts is not artifacts
+        ):
+            raise ApplicationError(
+                "application.reconciliation_store_mismatch",
+                "Reconciliation uses another fact or artifact store",
+            )
+        self.reconciler = reconciler
+        self.reconciliation_adapter = reconciliation_adapter
         for name, values in (("handlers", handlers), ("builders", builders)):
             unknown = set(values) - set(STAGES)
             if unknown:
@@ -375,7 +398,32 @@ class StageApplication:
         return {
             "handlers": [stage for stage in STAGES if stage not in self.handlers],
             "builders": [stage for stage in STAGES if stage not in self.builders],
+            "reconciliation": (
+                []
+                if self.reconciler is not None
+                and self.reconciliation_adapter is not None
+                else ["native"]
+            ),
         }
+
+    def reconcile_effect(
+        self,
+        *,
+        command_id: str,
+        effect_key: str,
+    ) -> EffectReconciliationResult:
+        """Observe one unresolved effect without acquiring or resending it."""
+
+        if self.reconciler is None or self.reconciliation_adapter is None:
+            raise ApplicationPortMissing(
+                "application.reconciliation_missing",
+                "The read-only effect observer is not installed",
+            )
+        return self.reconciler.reconcile(
+            command_id=command_id,
+            effect_key=effect_key,
+            adapter=self.reconciliation_adapter,
+        )
 
     def _require_handler(self, stage: StageId) -> StageHandler:
         handler = self.handlers.get(stage)
@@ -885,6 +933,8 @@ def build_stage_application(
     handlers: Mapping[StageId, StageHandler],
     builders: Mapping[StageId, CommandBuilder] | None = None,
     clock: Callable[[], datetime] = _utc_now,
+    reconciler: EffectReconciliationService | None = None,
+    reconciliation_adapter: EffectReconciliationAdapter | None = None,
 ) -> StageApplication:
     """Construct one immutable application from explicit ports; no hidden fallback exists."""
 
@@ -895,6 +945,8 @@ def build_stage_application(
         handlers=handlers,
         builders=builders or {},
         clock=clock,
+        reconciler=reconciler,
+        reconciliation_adapter=reconciliation_adapter,
     )
 
 
@@ -907,6 +959,7 @@ def application_from_environment(
     handlers: Mapping[StageId, StageHandler] | None = None,
     builders: Mapping[StageId, CommandBuilder] | None = None,
     native_operation_client: NativeOperationClient | None = None,
+    reconciliation_adapter: EffectReconciliationAdapter | None = None,
     clock: Callable[[], datetime] = _utc_now,
 ) -> StageApplication:
     """Compose implemented handlers; missing runtime capabilities remain explicit."""
@@ -931,6 +984,7 @@ def application_from_environment(
         ),
         clock=clock,
     )
+    client = native_operation_client
     if discover_adapter is None or capture_handler is None:
         client = (
             native_operation_client
@@ -953,6 +1007,19 @@ def application_from_environment(
                 artifact_store=artifacts,
                 tool_provider=tool_provider,
             )
+    if reconciliation_adapter is None and client is not None:
+        reconciliation_adapter = NativeOperationEffectObserver(client)
+    reconciler = (
+        EffectReconciliationService(
+            facts=facts,
+            artifacts=artifacts,
+            work_root=Path(work_root) / "reconciliation",
+            observer_tool_sha256=executor_sha256,
+            clock=clock,
+        )
+        if reconciliation_adapter is not None
+        else None
+    )
     installed: dict[StageId, StageHandler] = {
         "freeze": FreezeHandler(),
         "generate": GenerateHandler(artifacts),
@@ -980,6 +1047,8 @@ def application_from_environment(
         handlers=installed,
         builders=builders or {},
         clock=clock,
+        reconciler=reconciler,
+        reconciliation_adapter=reconciliation_adapter,
     )
 __all__ = [
     "STAGES",
