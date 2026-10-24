@@ -782,7 +782,8 @@ class VerifiedVerifyResult:
             or certificate.get("passed") is not True
             or digest(proof) != certificate.get("verification_key")
             or not isinstance(certificate.get("actual_verifier"), Mapping)
-            or digest(certificate["actual_verifier"]) != certificate.get("actual_verifier_sha256")
+            or certificate["actual_verifier"].get("source_sha256")
+            != certificate.get("actual_verifier_sha256")
             or certificate.get("actual_verifier_sha256") != predecessor.result.actual_executor_sha256
             or certificate.get("actual_verifier_sha256") != predecessor.decision.actual_executor_sha256
         ):

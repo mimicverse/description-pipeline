@@ -42,6 +42,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     build_operation_record,
 )
 from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
 from description_pipeline.orchestration.windows import handler as windows_handler
@@ -63,6 +64,15 @@ NATIVE_TOOL = {
     "runtime": {"role": "native"},
 }
 OUTPUT_CONTRACT = CAPTURE_TRANSFER_SCHEMA
+REQUEST_EVIDENCE = build_request_evidence(
+    purpose="engineering",
+    request_id="native-operation-request",
+    target_hardware="native_operation_test",
+    change_summary="Exercise the native operation transport",
+    main_assembly="cad/robot.SLDASM",
+    handoff_digest="b" * 64,
+    platform_config_digest="c" * 64,
+)
 
 
 def _wait_for(predicate, *, timeout: float = 5.0):
@@ -115,6 +125,7 @@ def _operation(
                 ],
                 "execution": execution,
                 "native_tool_source_sha256": tool["source_sha256"],
+                "request_evidence": REQUEST_EVIDENCE,
             }
         else:
             request = {"marker": operation_id}
@@ -425,6 +436,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         inputs = SimpleNamespace(
             package=package,
             prepared_files=prepared_files,
+            request_evidence=REQUEST_EVIDENCE,
             historical_native_tool={
                 "schema_version": TOOL_SCHEMA,
                 "pipeline_id": "historical-native-operation-test",

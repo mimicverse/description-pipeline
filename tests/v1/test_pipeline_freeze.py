@@ -185,7 +185,14 @@ class FreezeDomainTests(unittest.TestCase):
         root = Path(execution.candidate_root)
         self.assertEqual(
             {path.name for path in root.iterdir()},
-            {"checks.json", "configuration.json", "inputs.json", "request.json", "ruleset.json"},
+            {
+                "checks.json",
+                "configuration.json",
+                "inputs.json",
+                "request.json",
+                "ruleset.json",
+                "stage-request.json",
+            },
         )
         checks = read_data(root / "checks.json")
         self.assertEqual(execution.checks_sha256, digest(checks))

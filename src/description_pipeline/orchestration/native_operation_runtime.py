@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ..io import acquire_process_lock, canonical, digest, file_digest
+from ..interface_records import validate_request_record
 from ..native_transfer import CAPTURE_TRANSFER_SCHEMA, MAX_TRANSFER_BYTES
 from ..pipeline.contracts import ArtifactRef, ProtocolError
 from ..schemas import (
@@ -78,6 +79,7 @@ _CAPTURE_REQUEST_FIELDS = frozenset(
         "upstream_artifacts",
         "execution",
         "native_tool_source_sha256",
+        "request_evidence",
     }
 )
 _CAPTURE_EXECUTION_FIELDS = frozenset(
@@ -496,6 +498,7 @@ class CaptureOperationRequest:
     upstream_artifacts: tuple[Mapping[str, object], ...]
     execution: Mapping[str, object]
     native_tool_source_sha256: str
+    request_evidence: Mapping[str, object]
 
     def __post_init__(self) -> None:
         if self.schema_version != CAPTURE_OPERATION_SCHEMA:
@@ -587,6 +590,14 @@ class CaptureOperationRequest:
                 "Native Capture execution identity differs from its request"
             )
         object.__setattr__(self, "execution", execution)
+        request_evidence = copy.deepcopy(dict(self.request_evidence))
+        try:
+            validate_request_record(request_evidence)
+        except Exception as error:
+            raise NativeOperationError(
+                "Native Capture request evidence is invalid"
+            ) from error
+        object.__setattr__(self, "request_evidence", request_evidence)
 
     @classmethod
     def from_record(cls, record: Mapping[str, object]) -> CaptureOperationRequest:
@@ -625,6 +636,9 @@ class CaptureOperationRequest:
             ],
             "execution": copy.deepcopy(dict(self.execution)),
             "native_tool_source_sha256": self.native_tool_source_sha256,
+            "request_evidence": copy.deepcopy(
+                dict(self.request_evidence)
+            ),
         }
 
 
@@ -969,6 +983,7 @@ class CaptureOperationExecutor:
                     execution=dict(capture.execution),
                     native_tool_factory=lambda: dict(native_tool),
                     execution_scope=("capture",),
+                    request_evidence=dict(capture.request_evidence),
                 )
             )
         except Exception as error:

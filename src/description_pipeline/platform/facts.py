@@ -19,6 +19,8 @@ from ..pipeline.admission import (
     AdmissionSpec,
     VerifiedDiscoverResult,
     VerifiedPredecessor,
+    VerifiedPublishIntent,
+    VerifiedVerifyResult,
     validate_run_admission,
     validate_store_command,
 )
@@ -597,6 +599,8 @@ class FactStore:
         predecessor: VerifiedPredecessor,
         supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
         discover_result: VerifiedDiscoverResult | None = None,
+        verify_result: VerifiedVerifyResult | None = None,
+        publish_intent: VerifiedPublishIntent | None = None,
     ) -> StageCommand:
         """Validate and register one successor command after its predecessor decision."""
 
@@ -610,6 +614,16 @@ class FactStore:
             raise FactStoreError("Supporting predecessors must be verified immutable facts")
         if discover_result is not None and not isinstance(discover_result, VerifiedDiscoverResult):
             raise FactStoreError("A verified Discover result is required")
+        if verify_result is not None and not isinstance(
+            verify_result,
+            VerifiedVerifyResult,
+        ):
+            raise FactStoreError("A verified Verify result is required")
+        if publish_intent is not None and not isinstance(
+            publish_intent,
+            VerifiedPublishIntent,
+        ):
+            raise FactStoreError("A verified publication intent is required")
         if not isinstance(command, StageCommand) or command.kind != "stage" or command.stage is None:
             raise FactStoreError("A successor stage command is required")
         try:
@@ -621,6 +635,8 @@ class FactStore:
                 predecessor=predecessor,
                 supporting_predecessors=supporting_predecessors,
                 discover_result=discover_result,
+                verify_result=verify_result,
+                publish_intent=publish_intent,
             )
         except ProtocolError as error:
             raise FactStoreError("The successor command fails typed semantic validation") from error

@@ -705,6 +705,9 @@ class NativeOperationCapturePort:
             ],
             "execution": copy.deepcopy(dict(execution)),
             "native_tool_source_sha256": source_sha256,
+            "request_evidence": copy.deepcopy(
+                dict(inputs.request_evidence)
+            ),
         }
         request = CaptureOperationRequest.from_record(record)
         return request, current_tool

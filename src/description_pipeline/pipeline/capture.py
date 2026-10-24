@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, writable_output
+from ..interface_records import validate_request_record
 from ..io import (
     PipelineError,
     acquire_process_lock,
@@ -169,6 +170,7 @@ class CaptureInputs:
     prepared_files: Mapping[str, str]
     plan: Mapping[str, Any]
     object_names: tuple[str, ...]
+    request_evidence: Mapping[str, Any]
     historical_native_tool: Mapping[str, Any]
     current_native_tool: Mapping[str, Any]
     native_tool_requirement: ArtifactRef
@@ -258,7 +260,12 @@ class CaptureInputs:
                 "capture.native_requirement_artifact",
                 {"files": sorted(requirement_files)},
             )
-        for name in ("request.json", "inputs.json", "checks.json"):
+        for name in (
+            "request.json",
+            "stage-request.json",
+            "inputs.json",
+            "checks.json",
+        ):
             if name not in freeze_files:
                 raise ProtocolError("capture.freeze_incomplete", {"missing": name})
         for name in ("request.json", "result.json", "checks.json", "native-observation/observation.json"):
@@ -286,16 +293,35 @@ class CaptureInputs:
                 {"where": "tool.json"},
             )
 
-        freeze_request = read_data(roots[freeze.artifact_id] / "request.json")
+        freeze_request = read_data(
+            roots[freeze.artifact_id] / "stage-request.json"
+        )
+        request_evidence = read_data(
+            roots[freeze.artifact_id] / "request.json"
+        )
         freeze_inputs = read_data(roots[freeze.artifact_id] / "inputs.json")
         discover_request = read_data(roots[discover.artifact_id] / "request.json")
         discover_checks = read_data(roots[discover.artifact_id] / "checks.json")
         discover_result = read_data(roots[discover.artifact_id] / "result.json")
         if not all(
             isinstance(record, dict)
-            for record in (freeze_request, freeze_inputs, discover_request, discover_checks, discover_result)
+            for record in (
+                freeze_request,
+                request_evidence,
+                freeze_inputs,
+                discover_request,
+                discover_checks,
+                discover_result,
+            )
         ):
             raise ProtocolError("capture.adjacent_record_invalid", {"where": "freeze-or-discover"})
+        try:
+            validate_request_record(request_evidence)
+        except PipelineError as error:
+            raise ProtocolError(
+                "capture.request_evidence_invalid",
+                {"where": "freeze/request.json"},
+            ) from error
         if discover_request.get("schema_version") != DISCOVER_REQUEST_SCHEMA:
             raise ProtocolError("capture.discover_request_schema", {"where": "request.json"})
         if discover_checks.get("schema_version") != DISCOVER_CHECKS_SCHEMA:
@@ -370,6 +396,18 @@ class CaptureInputs:
         if (
             freeze_request.get("main_assembly") != request.main_assembly
             or freeze_request.get("upload_inventory_sha256") != request.upload_sha256
+            or request_evidence.get("main_assembly")
+            != request.main_assembly
+            or request_evidence.get("handoff_digest")
+            != request.upload_sha256
+            or request_evidence.get("request_id")
+            != freeze_request.get("request_id")
+            or request_evidence.get("purpose")
+            != freeze_request.get("purpose")
+            or request_evidence.get("target_hardware")
+            != freeze_request.get("target_hardware")
+            or request_evidence.get("platform_config_digest")
+            != freeze_request.get("platform_config_sha256")
         ):
             raise ProtocolError("capture.freeze_request_binding", {"where": "freeze request"})
         freeze_artifacts = freeze_inputs.get("artifacts")
@@ -481,6 +519,7 @@ class CaptureInputs:
             prepared_files=prepared_files,
             plan=plan,
             object_names=tuple(sorted(active)),
+            request_evidence=dict(request_evidence),
             historical_native_tool=dict(native_tool),
             current_native_tool=dict(current_native_tool),
             native_tool_requirement=requirement,
@@ -774,6 +813,7 @@ def _capture_native_transaction(
     execution: Mapping[str, Any] | None = None,
     native_tool_factory: Callable[[], dict[str, Any]] | None = None,
     execution_scope: tuple[str, ...] = ("capture",),
+    request_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the real native Capture transaction and seal its artifact.
 
@@ -801,6 +841,13 @@ def _capture_native_transaction(
         )
         event = _capture_event_sink(receipt, on_event)
         try:
+            if request_evidence is not None:
+                validate_request_record(request_evidence)
+                request_path = staging / "input/request.json"
+                request_path.parent.mkdir(parents=True, exist_ok=True)
+                request_path.write_bytes(
+                    canonical(dict(request_evidence))
+                )
             _, input_report = capture_native_package(
                 package,
                 staging,
@@ -858,6 +905,7 @@ def _invoke_native_operation(
         upstream_artifacts=upstream_artifacts,
         execution=execution,
         native_tool_factory=lambda: native_tool,
+        request_evidence=inputs.request_evidence,
     )
     if result.get("native_complete") is True:
         archive_receipt = result.get("capture_archive")

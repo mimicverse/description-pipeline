@@ -24,6 +24,10 @@ from ..schemas import (
     FREEZE_REQUEST_SCHEMA,
     RULESET_CATALOG_SCHEMA,
 )
+from ..request_evidence import (
+    build_request_evidence,
+    request_evidence_bytes,
+)
 from ..sources.solidworks.handoff import describe_handoff
 from ..sources.solidworks.revision import package_inventory
 from .contracts import (
@@ -378,7 +382,20 @@ class FreezeHandler:
             output = workspace.root / f"freeze-result-{claim.fence}"
             if output.exists():
                 raise ProtocolError("freeze.candidate_conflict", {"candidate": str(output)})
-            _write_canonical(output / "request.json", request)
+            _write_canonical(output / "stage-request.json", request)
+            output.mkdir(parents=True, exist_ok=True)
+            request_evidence = build_request_evidence(
+                purpose=request["purpose"],
+                request_id=request["request_id"],
+                target_hardware=request["target_hardware"],
+                change_summary=request["change_summary"],
+                main_assembly=request["main_assembly"],
+                handoff_digest=request["upload_inventory_sha256"],
+                platform_config_digest=request["platform_config_sha256"],
+            )
+            (output / "request.json").write_bytes(
+                request_evidence_bytes(request_evidence)
+            )
             _write_canonical(
                 output / "inputs.json",
                 {
