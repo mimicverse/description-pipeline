@@ -8,7 +8,6 @@ throwaway cluster and never contacts an existing platform or Airflow service.
 from __future__ import annotations
 
 import json
-import hashlib
 import tempfile
 import threading
 import unittest
@@ -29,7 +28,7 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
-from description_pipeline.io import canonical, digest, read_data, write_json
+from description_pipeline.io import canonical, digest, read_data
 from description_pipeline.pipeline import (
     DispatchCommand,
     DispatchConf,
@@ -43,9 +42,7 @@ from description_pipeline.pipeline import (
     TechnicalDispatchService,
     VerifiedArtifact,
     VerifiedDiscoverResult,
-    VerifiedPublishIntent,
     VerifiedPredecessor,
-    VerifiedRepositorySnapshot,
     VerifiedVerifyResult,
     build_capture_command,
     build_discover_command,
@@ -57,19 +54,12 @@ from description_pipeline.pipeline import (
     execute_stage,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
-from description_pipeline.pipeline.publish_contract import (
-    REPOSITORY_SNAPSHOT_FILE,
-    REPOSITORY_SNAPSHOT_KIND,
-    REPOSITORY_SNAPSHOT_METADATA,
-    REPOSITORY_SNAPSHOT_SCHEMA,
-)
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.verify_contract import (
     CERTIFICATE_FILENAME,
     EXECUTION_RECEIPT_FILENAME,
 )
 from description_pipeline.platform.facts import FactConflict, FactStore, FactStoreError
-from description_pipeline.repository.publish import CommitSpec
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     DISCOVER_RESULT_SCHEMA,
@@ -713,7 +703,9 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         verify_request = {
             "capture_artifact": capture.result.output_artifact.to_record(),
-            "config_snapshot_sha256": self.admission_harness.configuration_ref.set_sha256,
+            "config_snapshot_sha256": (
+                self.admission_harness.spec.platform_config_sha256
+            ),
             "contract_sha256": self.admission_harness.spec.contract_sha256,
             "expected_verifier_sha256": self.admission_harness.spec.executors.verify,
             "generate_artifact": generate.result.output_artifact.to_record(),
@@ -723,10 +715,17 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "schema_version": VERIFY_REQUEST_SCHEMA,
         }
         certificate = {
-            "actual_verifier": {"executor": "verify"},
+            "actual_verifier": {
+                "executor": "verify",
+                "source_sha256": (
+                    self.admission_harness.spec.executors.verify
+                ),
+            },
             "actual_verifier_sha256": self.admission_harness.spec.executors.verify,
             "capture_artifact": capture.result.output_artifact.to_record(),
-            "config_snapshot_sha256": self.admission_harness.configuration_ref.set_sha256,
+            "config_snapshot_sha256": (
+                self.admission_harness.spec.platform_config_sha256
+            ),
             "contract_sha256": self.admission_harness.spec.contract_sha256,
             "decision": "PASS",
             "generate_artifact": generate.result.output_artifact.to_record(),
@@ -759,49 +758,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             certificate_bytes,
         )
 
-        snapshot_root = Path(self.directory.name) / "publish-snapshot"
-        bundle_bytes = b"repository snapshot"
-        snapshot_metadata = {
-            "schema_version": REPOSITORY_SNAPSHOT_SCHEMA,
-            "repository": "example/robot",
-            "origin_url": "https://example.test/example/robot.git",
-            "base_ref": "main",
-            "base_oid": "1" * 40,
-            "branch_ref": (
-                "work/description/robot/0123456789abcdef01234567"
-            ),
-            "head_oid": None,
-            "bundle_sha256": digest({"unused": "replaced below"}),
-        }
-        snapshot_metadata["bundle_sha256"] = hashlib.sha256(bundle_bytes).hexdigest()
-        write_json(snapshot_root / REPOSITORY_SNAPSHOT_METADATA, snapshot_metadata)
-        (snapshot_root / REPOSITORY_SNAPSHOT_FILE).write_bytes(bundle_bytes)
-        snapshot_ref = self.artifacts.seal_tree(
-            snapshot_root,
-            kind=REPOSITORY_SNAPSHOT_KIND,
-            producer_run_id=None,
-            producer_stage=None,
-            producer_tool_sha256=digest({"tool": "snapshot"}),
-        )
-        publish_intent = VerifiedPublishIntent(
-            repository=VerifiedRepositorySnapshot.from_metadata_bytes(
-                VerifiedArtifact.from_store_record(
-                    snapshot_ref,
-                    self.artifacts.verify(snapshot_ref),
-                ),
-                (snapshot_root / REPOSITORY_SNAPSHOT_METADATA).read_bytes(),
-            ),
-            commit=CommitSpec(
-                author_name="Publish Bot",
-                author_email="publish@example.test",
-                authored_at="2026-10-25T00:00:00+00:00",
-                committer_name="Publish Bot",
-                committer_email="publish@example.test",
-                committed_at="2026-10-25T00:00:00+00:00",
-                subject="feat(robot): publish URDF",
-                body="verified publication",
-            ),
-        )
+        publish_intent = self.admission_harness.spec.publish_intent
         publish_command = build_publish_command(
             self.admission_harness.spec,
             verify_result,

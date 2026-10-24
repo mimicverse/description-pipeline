@@ -87,8 +87,11 @@ class _CompletingHandler:
         elif command.stage == "verify":
             generate = artifacts["stage_output:generate"]
             capture = artifacts["stage_output:capture"]
-            verifier = {"executor": "verify"}
-            verifier_sha256 = digest(verifier)
+            verifier = {
+                "executor": "verify",
+                "source_sha256": command.expected_executor_sha256,
+            }
+            verifier_sha256 = verifier["source_sha256"]
             request = {
                 "capture_artifact": capture.to_record(),
                 "config_snapshot_sha256": command.config_snapshot_sha256,

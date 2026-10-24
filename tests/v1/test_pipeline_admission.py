@@ -880,7 +880,10 @@ class AdmissionProjectionTests(unittest.TestCase):
             "schema_version": VERIFY_REQUEST_SCHEMA,
         }
         certificate = {
-            "actual_verifier": {"executor": "verify"},
+            "actual_verifier": {
+                "executor": "verify",
+                "source_sha256": self.harness.spec.executors.verify,
+            },
             "actual_verifier_sha256": self.harness.spec.executors.verify,
             "capture_artifact": capture.result.output_artifact.to_record(),
             "config_snapshot_sha256": self.harness.spec.platform_config_sha256,
