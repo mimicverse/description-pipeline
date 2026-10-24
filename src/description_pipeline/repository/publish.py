@@ -285,6 +285,17 @@ def materialize_repository_snapshot(
     return snapshot
 
 
+def clone_publication_repository(origin_url: str, destination: Path) -> PublicationRepository:
+    """Create a fresh checkout for read-only reconciliation of one configured origin."""
+
+    destination = Path(destination)
+    if destination.exists():
+        raise PublicationError("publish.reconciliation_destination", {"path": str(destination)})
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _run(destination.parent, "clone", "--quiet", origin_url, str(destination), check=True)
+    return PublicationRepository(destination, expected_origin=origin_url)
+
+
 @dataclass(frozen=True, slots=True)
 class CommitSpec:
     author_name: str
@@ -612,6 +623,40 @@ class PublicationRepository:
         if not _OID.fullmatch(oid):
             raise PublicationError("publish.remote_oid", {"value": oid})
         return oid
+
+    def verify_candidate_bundle(
+        self,
+        bundle: Path,
+        *,
+        commit: str,
+        tree: str,
+        parents: tuple[str, ...],
+    ) -> None:
+        """Import one sealed candidate bundle into this fresh checkout and verify its exact facts."""
+
+        heads = _text_run(self.path, "bundle", "list-heads", str(bundle)).splitlines()
+        if heads != [f"{commit} HEAD"]:
+            raise PublicationError("publish.candidate_bundle_head", {"heads": heads})
+        _run(self.path, "bundle", "verify", str(bundle))
+        _run(
+            self.path,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            str(bundle),
+            "+HEAD:refs/publish-recovery/head",
+        )
+        recovered = _text_run(self.path, "rev-parse", "refs/publish-recovery/head")
+        facts = _text_run(self.path, "show", "-s", "--format=%T%n%P", recovered).splitlines()
+        if recovered != commit or facts != [tree, *parents]:
+            raise PublicationError(
+                "publish.candidate_bundle_facts",
+                {
+                    "commit": recovered,
+                    "tree": facts[0] if facts else "",
+                    "parents": facts[1:] if len(facts) > 1 else [],
+                },
+            )
 
     def candidate(
         self,

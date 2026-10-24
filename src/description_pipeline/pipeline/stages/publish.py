@@ -22,11 +22,17 @@ from ...repository.publish import (
     PublicationRepository,
     PullRequestClient,
     PullRequestObservation,
+    clone_publication_repository,
     materialize_repository_snapshot,
     validate_publication_target,
 )
 from ...runtime import tool_record
-from ...schemas import PUBLICATION_PLAN_SCHEMA, PUBLICATION_RECEIPT_SCHEMA, VERIFICATION_CERTIFICATE_SCHEMA
+from ...schemas import (
+    PUBLICATION_PLAN_SCHEMA,
+    PUBLICATION_RECEIPT_SCHEMA,
+    PUBLISH_REQUEST_SCHEMA,
+    VERIFICATION_CERTIFICATE_SCHEMA,
+)
 from ...stages import CONTRACT
 from ..contracts import (
     ArtifactRef,
@@ -37,13 +43,11 @@ from ..contracts import (
     StageExecution,
     StageFailure,
 )
-from ..effects import EffectSettlement, EffectState, StageEffectPort
+from ..effects import EffectIntent, EffectSettlement, EffectState, StageEffectPort
 from ..engine import StageWorkspace
-from ..publish_contract import (
-    PUBLISH_OUTPUT_CONTRACT,
-    PUBLISH_REQUEST_SCHEMA,
-    REPOSITORY_SNAPSHOT_KIND,
-)
+from ..publish_contract import PUBLISH_OUTPUT_CONTRACT, REPOSITORY_SNAPSHOT_KIND
+from ..reconciliation import EffectReconciliationEvidence
+from ..verify import current_verifier_sha256
 
 PUBLISH_RECEIPT_SCHEMA = PUBLICATION_RECEIPT_SCHEMA
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
@@ -58,6 +62,29 @@ GIT_EFFECT_KEY = "publish.branch"
 PR_EFFECT_KEY = "publish.pull-request"
 _HEX40 = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+_GIT_OUTBOUND_FILES = frozenset({"candidate.bundle", PUBLICATION_PLAN, "request.json"})
+_PUBLICATION_PLAN_FIELDS = frozenset(
+    {
+        "base_ref",
+        "branch_ref",
+        "candidate_commit",
+        "candidate_parents",
+        "candidate_tree",
+        "capture_artifact",
+        "expected_base_oid",
+        "expected_head_oid",
+        "generate_artifact",
+        "origin_url",
+        "pr_body_sha256",
+        "pr_title_sha256",
+        "publication_subject_sha256",
+        "repository",
+        "repository_snapshot_artifact",
+        "schema_version",
+        "verification_certificate_sha256",
+        "verify_artifact",
+    }
+)
 
 
 class PublishIncomplete(PipelineError):
@@ -175,7 +202,7 @@ class _PublishedCandidate:
     subject_sha256: str
 
 
-def _request(command: StageCommand, workspace: StageWorkspace) -> PublishDomainRequest:
+def _request_contract(command: StageCommand) -> PublishDomainRequest:
     request = dict(command.request)
     required = {
         "base_ref",
@@ -210,8 +237,6 @@ def _request(command: StageCommand, workspace: StageWorkspace) -> PublishDomainR
         repository_snapshot = by_id[request["repository_snapshot_artifact_id"]]
     except (KeyError, TypeError) as error:
         raise ProtocolError("publish.input_closure", {"command_id": command.command_id}) from error
-    if set(workspace.inputs) != set(by_id):
-        raise ProtocolError("publish.input_closure", {"command_id": command.command_id})
     commit = request["commit"]
     commit_fields = {
         "author_email",
@@ -241,10 +266,38 @@ def _request(command: StageCommand, workspace: StageWorkspace) -> PublishDomainR
     )
 
 
+def _request(command: StageCommand, workspace: StageWorkspace) -> PublishDomainRequest:
+    request = _request_contract(command)
+    if set(workspace.inputs) != {item.artifact_id for item in command.input_artifacts}:
+        raise ProtocolError("publish.input_closure", {"command_id": command.command_id})
+    return request
+
+
 def _require_object(value: object, label: str) -> dict:
     if not isinstance(value, dict):
         raise PipelineError(f"{label} must be an object")
     return value
+
+
+def _executor_identity(
+    command: StageCommand,
+    claim: ExecutionClaim,
+) -> tuple[dict[str, Any], str]:
+    if claim.executor_sha256 != command.expected_executor_sha256:
+        raise ProtocolError("publish.executor_mismatch", {"command_id": command.command_id})
+    publisher_tool = tool_record(role="portable")
+    actual_executor = publisher_tool.get("source_sha256")
+    if actual_executor != claim.executor_sha256:
+        raise ProtocolError(
+            "publish.executor_mismatch",
+            {"actual": actual_executor, "claimed": claim.executor_sha256},
+        )
+    if actual_executor != command.expected_executor_sha256:
+        raise ProtocolError(
+            "publish.executor_mismatch",
+            {"actual": actual_executor, "expected": command.expected_executor_sha256},
+        )
+    return publisher_tool, actual_executor
 
 
 def _pair_subject(generate_root: Path, capture_root: Path) -> str:
@@ -325,7 +378,11 @@ def _certificate(
     if digest(proof) != verification_key:
         raise PipelineError("Verification certificate proof digest differs")
     verifier = _require_object(certificate["actual_verifier"], "actual verifier")
-    if digest(verifier) != certificate["actual_verifier_sha256"]:
+    verifier_sha256 = current_verifier_sha256(verifier)
+    if (
+        verifier_sha256 != certificate["actual_verifier_sha256"]
+        or request.verify_artifact.producer_tool_sha256 != verifier_sha256
+    ):
         raise PipelineError("Verification certificate verifier identity differs")
     if certificate["decision"] != "PASS" or certificate["passed"] is not True:
         raise PipelineError("Publish requires a passing verification certificate")
@@ -511,7 +568,7 @@ def _require_satisfied(effects: StageEffectPort, *, key: str, effect_id: str) ->
 def _observe_git_exact(
     repository: PublicationRepository,
     request: PublishDomainRequest,
-    candidate: PreparedCandidate,
+    candidate: PreparedCandidate | _PublishedCandidate,
 ) -> dict:
     observed_head = repository.observe(request.branch_ref)
     observed_base = repository.fetch_expected(request.base_ref, request.expected_base_oid) or request.expected_base_oid
@@ -525,6 +582,218 @@ def _observe_git_exact(
         "candidate_parents": list(candidate.parents),
         "subject_sha256": candidate.subject_sha256,
     }
+
+
+@dataclass(frozen=True, slots=True)
+class _SealedGit:
+    outbound_root: Path
+    candidate: _PublishedCandidate
+    plan: dict[str, Any]
+    plan_sha256: str
+    title: str
+    body: str
+
+
+def _recovery_text(request: PublishDomainRequest, plan: dict[str, Any]) -> tuple[str, str]:
+    title = request.commit.subject
+    body = (
+        request.commit.body.rstrip()
+        + "\n\n"
+        + f"Verification-Certificate-SHA256: {plan['verification_certificate_sha256']}\n"
+        + f"Publication-Subject-SHA256: {plan['publication_subject_sha256']}\n"
+        + f"Repository: {request.repository_slug}\n"
+    )
+    return title, body
+
+
+def _read_sealed_git_outbound_root(
+    *,
+    repository: PublicationRepository,
+    request: PublishDomainRequest,
+    outbound_root: Path,
+) -> _SealedGit:
+    """Read the sole candidate authority from one materialized Git-effect outbound."""
+
+    if set(inventory(outbound_root, exclude=("manifest.json",))) != _GIT_OUTBOUND_FILES:
+        raise PublicationError("publish.git_recovery_inventory", {"root": str(outbound_root)})
+
+    plan_path = outbound_root / PUBLICATION_PLAN
+    plan = _require_object(read_data(plan_path), "sealed publication plan")
+    if plan_path.read_bytes() != canonical(plan) or set(plan) != _PUBLICATION_PLAN_FIELDS:
+        raise PublicationError("publish.git_recovery_plan")
+    if plan["schema_version"] != PUBLICATION_PLAN_SCHEMA:
+        raise PublicationError("publish.git_recovery_plan", {"reason": "schema"})
+
+    artifact_values = (
+        ("capture_artifact", request.capture_artifact.to_record()),
+        ("generate_artifact", request.generate_artifact.to_record()),
+        ("verify_artifact", request.verify_artifact.to_record()),
+        ("repository_snapshot_artifact", request.repository_snapshot.to_record()),
+    )
+    request_values = {
+        "base_ref": request.base_ref,
+        "branch_ref": request.branch_ref,
+        "expected_base_oid": request.expected_base_oid,
+        "expected_head_oid": request.expected_head_oid,
+        "origin_url": request.origin_url,
+        "repository": request.repository_slug,
+    }
+    if any(plan.get(name) != value for name, value in artifact_values) or any(
+        plan.get(name) != value for name, value in request_values.items()
+    ):
+        raise PublicationError("publish.git_recovery_binding")
+
+    commit = plan["candidate_commit"]
+    tree = plan["candidate_tree"]
+    parents = plan["candidate_parents"]
+    subject = plan["publication_subject_sha256"]
+    if (
+        not isinstance(commit, str)
+        or _HEX40.fullmatch(commit) is None
+        or not isinstance(tree, str)
+        or _HEX40.fullmatch(tree) is None
+        or not isinstance(parents, list)
+        or not parents
+        or any(not isinstance(parent, str) or _HEX40.fullmatch(parent) is None for parent in parents)
+        or not isinstance(subject, str)
+        or _HEX64.fullmatch(subject) is None
+        or not isinstance(plan["verification_certificate_sha256"], str)
+        or _HEX64.fullmatch(plan["verification_certificate_sha256"]) is None
+    ):
+        raise PublicationError("publish.git_recovery_plan", {"reason": "value"})
+    expected_parent = request.expected_head_oid or request.expected_base_oid
+    if parents != [expected_parent]:
+        raise PublicationError("publish.git_recovery_parent", {"expected": expected_parent, "actual": parents})
+
+    outbound_request_path = outbound_root / "request.json"
+    outbound_request = _require_object(read_data(outbound_request_path), "sealed Git effect request")
+    if outbound_request_path.read_bytes() != canonical(outbound_request):
+        raise PublicationError("publish.git_recovery_request")
+    expected_outbound = {
+        "schema_version": "solidworks-to-urdf.git-ref-update/v1",
+        "repository": request.repository_slug,
+        "base_ref": request.base_ref,
+        "expected_base_oid": request.expected_base_oid,
+        "branch_ref": request.branch_ref,
+        "expected_head_oid": request.expected_head_oid,
+        "candidate_commit": commit,
+        "candidate_tree": tree,
+        "subject_sha256": subject,
+        "parents": parents,
+    }
+    if outbound_request != expected_outbound:
+        raise PublicationError("publish.git_recovery_request")
+
+    title, body = _recovery_text(request, plan)
+    if plan["pr_title_sha256"] != digest({"title": title}) or plan["pr_body_sha256"] != digest({"body": body}):
+        raise PublicationError("publish.git_recovery_pr_text")
+
+    repository.verify_candidate_bundle(
+        outbound_root / "candidate.bundle",
+        commit=commit,
+        tree=tree,
+        parents=tuple(parents),
+    )
+    return _SealedGit(
+        outbound_root=Path(outbound_root),
+        candidate=_PublishedCandidate(
+            commit=commit,
+            tree=tree,
+            parents=tuple(parents),
+            subject_sha256=subject,
+        ),
+        plan=plan,
+        plan_sha256=file_digest(plan_path),
+        title=title,
+        body=body,
+    )
+
+
+def _read_sealed_git_outbound(
+    *,
+    artifacts: ArtifactStore,
+    repository: PublicationRepository,
+    request: PublishDomainRequest,
+    workspace: StageWorkspace,
+    settlement: EffectSettlement,
+) -> _SealedGit:
+    """Materialize and verify one settlement's immutable Git-effect outbound."""
+
+    if settlement.state not in {EffectState.PREPARED, EffectState.UNKNOWN, EffectState.SATISFIED}:
+        raise PublicationError("publish.git_recovery_state", {"state": settlement.state.value})
+    if settlement.outbound_artifact is None:
+        raise PublicationError("publish.git_recovery_outbound", {"effect_id": settlement.effect_id})
+    artifacts.verify(settlement.outbound_artifact)
+    outbound_root = artifacts.materialize(
+        settlement.outbound_artifact,
+        workspace.root / "effects/git-recovery/outbound",
+    )
+    return _read_sealed_git_outbound_root(
+        repository=repository,
+        request=request,
+        outbound_root=Path(outbound_root),
+    )
+
+
+class PublishGitReconciliationAdapter:
+    """Read-only observer for one unresolved Publish review-branch effect."""
+
+    def observe(
+        self,
+        *,
+        command: StageCommand,
+        intent: EffectIntent,
+        outbound_root: Path,
+        workspace_root: Path,
+    ) -> EffectReconciliationEvidence:
+        if intent.effect_key != GIT_EFFECT_KEY or intent.effect_kind != "git_ref_update":
+            raise PublicationError(
+                "publish.git_recovery_effect",
+                {"effect_id": intent.effect_id, "effect_key": intent.effect_key},
+            )
+        request = _request_contract(command)
+        repository = clone_publication_repository(
+            request.origin_url,
+            Path(workspace_root) / "repository",
+        )
+        sealed = _read_sealed_git_outbound_root(
+            repository=repository,
+            request=request,
+            outbound_root=Path(outbound_root),
+        )
+        observed_head = repository.observe(request.branch_ref)
+        observed_base = (
+            repository.fetch_expected(request.base_ref, request.expected_base_oid)
+            or request.expected_base_oid
+        )
+        exact = observed_head == sealed.candidate.commit and observed_base == request.expected_base_oid
+        state = "known" if exact else ("absent" if not observed_head else "unobservable")
+        observation = {
+            "state": "known" if exact else ("absent" if not observed_head else "conflict"),
+            "base_oid": observed_base,
+            "head_oid": observed_head,
+            "candidate_commit": sealed.candidate.commit,
+            "candidate_tree": sealed.candidate.tree,
+            "candidate_parents": list(sealed.candidate.parents),
+            "subject_sha256": sealed.candidate.subject_sha256,
+            "publication_plan_sha256": sealed.plan_sha256,
+            "recovered": exact,
+        }
+        payload_root = Path(workspace_root) / "publish-evidence"
+        payload_root.mkdir()
+        write_json(payload_root / "observation.json", observation)
+        shutil.copyfile(sealed.outbound_root / PUBLICATION_PLAN, payload_root / PUBLICATION_PLAN)
+        shutil.copyfile(sealed.outbound_root / "request.json", payload_root / "request.json")
+        return EffectReconciliationEvidence(
+            fact_type="reconciled" if exact else "observation",
+            state_class=state,
+            payload_root=payload_root,
+            metadata={
+                "effect_id": intent.effect_id,
+                "head_oid": observed_head,
+                "base_oid": observed_base,
+            },
+        )
 
 
 def _git_effect(
@@ -554,32 +823,7 @@ def _git_effect(
             raise PublicationError("publish.git_effect_mismatch")
         return settlement.effect_id, observation, True
     if settlement is not None and settlement.state is EffectState.UNKNOWN:
-        observed = repository.observe(request.branch_ref)
-        if observed == candidate.commit:
-            observation = {
-                "state": "known",
-                "base_oid": request.expected_base_oid,
-                "head_oid": observed,
-                "candidate_commit": candidate.commit,
-                "candidate_tree": candidate.tree,
-                "candidate_parents": list(candidate.parents),
-                "subject_sha256": candidate.subject_sha256,
-                "publication_plan_sha256": plan_sha256,
-                "reconciled": True,
-            }
-            root = workspace.root / "effects/git-reconcile"
-            root.mkdir(parents=True)
-            write_json(root / "observation.json", observation)
-            shutil.copyfile(plan_path, root / PUBLICATION_PLAN)
-            effects.record_observation(
-                settlement.effect_id,
-                source="publish.git.reconcile",
-                state_class="known",
-                observation_root=root,
-            )
-            _require_satisfied(effects, key=GIT_EFFECT_KEY, effect_id=settlement.effect_id)
-            return settlement.effect_id, observation, True
-        raise PublishIncomplete("publish.git_effect_unknown", {"effect_id": settlement.effect_id})
+        raise PublicationError("publish.git_recovery_required", {"effect_id": settlement.effect_id})
     if settlement is not None and settlement.state is EffectState.CONFLICT:
         raise StageFailure("publish_git_effect_conflict", "The Git effect is conflicted")
     if settlement is not None and settlement.state is EffectState.DEFINITELY_FAILED:
@@ -899,13 +1143,7 @@ class PublishHandler:
         self.artifacts = artifacts
         self.pull_requests = pull_requests
 
-    def _prepare(
-        self,
-        command: StageCommand,
-        claim: ExecutionClaim,
-        workspace: StageWorkspace,
-    ) -> _Inputs:
-        request = _request(command, workspace)
+    def _verify_inputs(self, request: PublishDomainRequest) -> None:
         for artifact in (
             request.generate_artifact,
             request.capture_artifact,
@@ -913,6 +1151,19 @@ class PublishHandler:
             request.repository_snapshot,
         ):
             self.artifacts.verify(artifact)
+
+    def _prepare(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        request: PublishDomainRequest | None = None,
+        verify_inputs: bool = True,
+    ) -> _Inputs:
+        request = _request(command, workspace) if request is None else request
+        if verify_inputs:
+            self._verify_inputs(request)
         generate_root = Path(workspace.inputs[request.generate_artifact.artifact_id])
         capture_root = Path(workspace.inputs[request.capture_artifact.artifact_id])
         verify_root = Path(workspace.inputs[request.verify_artifact.artifact_id])
@@ -931,20 +1182,7 @@ class PublishHandler:
             verify_root=verify_root,
             destination=workspace.root / "publication",
         )
-        if claim.executor_sha256 != command.expected_executor_sha256:
-            raise ProtocolError("publish.executor_mismatch", {"command_id": command.command_id})
-        publisher_tool = tool_record(role="portable")
-        actual_executor = publisher_tool.get("source_sha256")
-        if actual_executor != claim.executor_sha256:
-            raise ProtocolError(
-                "publish.executor_mismatch",
-                {"actual": actual_executor, "claimed": claim.executor_sha256},
-            )
-        if actual_executor != command.expected_executor_sha256:
-            raise ProtocolError(
-                "publish.executor_mismatch",
-                {"actual": actual_executor, "expected": command.expected_executor_sha256},
-            )
+        publisher_tool, actual_executor = _executor_identity(command, claim)
         return _Inputs(
             request=request,
             generate_root=generate_root,
@@ -970,67 +1208,89 @@ class PublishHandler:
     ) -> StageExecution:
         if command.stage != "publish" or command.predecessor_decision_id is None:
             raise ProtocolError("publish.command", {"command_id": command.command_id})
-        inputs = self._prepare(command, claim, workspace)
+        request = _request(command, workspace)
+        self._verify_inputs(request)
         repository_root = workspace.root / "repository"
+        workspace.root.mkdir(parents=True, exist_ok=True)
         materialize_repository_snapshot(
-            workspace.inputs[inputs.request.repository_snapshot.artifact_id],
+            workspace.inputs[request.repository_snapshot.artifact_id],
             repository_root,
-            expected_repository=inputs.request.repository_slug,
-            expected_origin_url=inputs.request.origin_url,
-            expected_base_ref=inputs.request.base_ref,
-            expected_base_oid=inputs.request.expected_base_oid,
-            expected_branch_ref=inputs.request.branch_ref,
-            expected_head_oid=inputs.request.expected_head_oid,
+            expected_repository=request.repository_slug,
+            expected_origin_url=request.origin_url,
+            expected_base_ref=request.base_ref,
+            expected_base_oid=request.expected_base_oid,
+            expected_branch_ref=request.branch_ref,
+            expected_head_oid=request.expected_head_oid,
         )
-        pull_requests = self.pull_requests
-        if pull_requests is None:
-            pull_requests = GitHubCliPullRequestClient(repository_root)
+        pull_requests = (
+            self.pull_requests
+            if self.pull_requests is not None
+            else GitHubCliPullRequestClient(repository_root)
+        )
         repository = PublicationRepository(
             repository_root,
-            expected_origin=inputs.request.origin_url,
+            expected_origin=request.origin_url,
         )
         git_settlement = effects.effect_settlement_for_key(GIT_EFFECT_KEY)
         candidate: PreparedCandidate | None = None
-        if git_settlement is not None and git_settlement.state is EffectState.SATISFIED:
+        if git_settlement is not None and git_settlement.state is EffectState.UNKNOWN:
+            raise PublishIncomplete(
+                "publish.git_effect_unknown",
+                {"effect_id": git_settlement.effect_id},
+            )
+        elif git_settlement is not None and git_settlement.state is EffectState.SATISFIED:
+            sealed = _read_sealed_git_outbound(
+                artifacts=self.artifacts,
+                repository=repository,
+                request=request,
+                workspace=workspace,
+                settlement=git_settlement,
+            )
             git_observation, observation_root = _effect_observation(
                 artifacts=self.artifacts,
                 settlement=git_settlement,
                 root=workspace.root / "effect-readback-git",
             )
-            plan = _require_object(read_data(observation_root / PUBLICATION_PLAN), "publication plan")
-            plan_sha256 = file_digest(observation_root / PUBLICATION_PLAN)
-            try:
-                candidate_facts = _PublishedCandidate(
-                    commit=str(git_observation["candidate_commit"]),
-                    tree=str(git_observation["candidate_tree"]),
-                    parents=tuple(str(item) for item in git_observation["candidate_parents"]),
-                    subject_sha256=str(git_observation["subject_sha256"]),
-                )
-            except (KeyError, TypeError) as error:
-                raise PublicationError("publish.git_effect_observation") from error
+            plan_path = Path(observation_root) / PUBLICATION_PLAN
             if (
-                git_observation.get("state") != "known"
-                or git_observation.get("head_oid") != candidate_facts.commit
-                or candidate_facts.subject_sha256 != inputs.publication_subject_sha256
-                or plan.get("candidate_commit") != candidate_facts.commit
-                or plan.get("candidate_tree") != candidate_facts.tree
-                or plan.get("candidate_parents") != list(candidate_facts.parents)
-                or plan.get("publication_subject_sha256") != candidate_facts.subject_sha256
-                or git_observation.get("publication_plan_sha256") != plan_sha256
+                not plan_path.is_file()
+                or file_digest(plan_path) != sealed.plan_sha256
+                or git_observation.get("state") != "known"
+                or git_observation.get("base_oid") != request.expected_base_oid
+                or git_observation.get("head_oid") != sealed.candidate.commit
+                or git_observation.get("candidate_commit") != sealed.candidate.commit
+                or git_observation.get("candidate_tree") != sealed.candidate.tree
+                or git_observation.get("candidate_parents") != list(sealed.candidate.parents)
+                or git_observation.get("subject_sha256") != sealed.candidate.subject_sha256
+                or git_observation.get("publication_plan_sha256") != sealed.plan_sha256
             ):
                 raise PublicationError("publish.git_effect_mismatch")
+            candidate_facts = sealed.candidate
+            plan_sha256 = sealed.plan_sha256
+            publication_subject_sha256 = sealed.candidate.subject_sha256
+            verification_certificate_sha256 = sealed.plan["verification_certificate_sha256"]
+            pr_title = sealed.title
+            pr_body = sealed.body
+            publisher_tool, actual_executor = _executor_identity(command, claim)
             git_effect_id = git_settlement.effect_id
             git_reused = True
-        else:
+        elif git_settlement is None or git_settlement.state is EffectState.PREPARED:
+            inputs = self._prepare(
+                command,
+                claim,
+                workspace,
+                request=request,
+                verify_inputs=False,
+            )
             staging = workspace.root / "candidate"
             staging.mkdir()
             candidate = repository.candidate(
                 publication_root=inputs.publication_root,
-                base_ref=inputs.request.base_ref,
-                expected_base_oid=inputs.request.expected_base_oid,
-                branch_ref=inputs.request.branch_ref,
-                expected_head_oid=inputs.request.expected_head_oid,
-                commit_spec=replace(inputs.request.commit, body=inputs.pr_body),
+                base_ref=request.base_ref,
+                expected_base_oid=request.expected_base_oid,
+                branch_ref=request.branch_ref,
+                expected_head_oid=request.expected_head_oid,
+                commit_spec=replace(request.commit, body=inputs.pr_body),
                 staging_root=staging,
             )
             candidate_facts = _PublishedCandidate(
@@ -1045,62 +1305,72 @@ class PublishHandler:
                 candidate=candidate,
             )
             plan_sha256 = file_digest(plan_path)
+            publication_subject_sha256 = inputs.publication_subject_sha256
+            verification_certificate_sha256 = digest(inputs.certificate)
+            pr_title = inputs.pr_title
+            pr_body = inputs.pr_body
+            publisher_tool = inputs.publisher_tool
+            actual_executor = inputs.actual_executor_sha256
             git_effect_id, git_observation, git_reused = _git_effect(
                 effects=effects,
                 artifacts=self.artifacts,
                 repository=repository,
-                request=inputs.request,
+                request=request,
                 candidate=candidate,
                 workspace=workspace,
                 settlement=git_settlement,
                 plan_path=plan_path,
                 plan_sha256=plan_sha256,
             )
+        elif git_settlement.state is EffectState.CONFLICT:
+            raise StageFailure("publish_git_effect_conflict", "The Git effect is conflicted")
+        elif git_settlement.state is EffectState.DEFINITELY_FAILED:
+            raise StageFailure("publish_git_effect_failed", "The Git effect is definitively failed")
         try:
             pr_effect_id, pr_observation, pr_reused = _pr_effect(
                 effects=effects,
                 artifacts=self.artifacts,
                 client=pull_requests,
-                request=inputs.request,
+                request=request,
                 candidate=candidate_facts,
                 workspace=workspace,
-                title=inputs.pr_title,
-                body=inputs.pr_body,
+                title=pr_title,
+                body=pr_body,
             )
             if not (git_reused and pr_reused):
-                if repository.observe(inputs.request.branch_ref) != candidate_facts.commit:
+                if repository.observe(request.branch_ref) != candidate_facts.commit:
                     raise StageFailure("publish_remote_drift", "Published branch changed before stage completion")
-                repository.fetch_expected(inputs.request.base_ref, inputs.request.expected_base_oid)
+                repository.fetch_expected(request.base_ref, request.expected_base_oid)
             receipt = {
                 "schema_version": PUBLISH_RECEIPT_SCHEMA,
                 "command_id": command.command_id,
                 "run_id": command.run_id,
                 "request_digest": command.request_digest,
-                "repository": inputs.request.repository_slug,
-                "origin_url": inputs.request.origin_url,
-                "base_ref": inputs.request.base_ref,
-                "expected_base_oid": inputs.request.expected_base_oid,
-                "branch_ref": inputs.request.branch_ref,
-                "expected_head_oid": inputs.request.expected_head_oid,
+                "repository": request.repository_slug,
+                "origin_url": request.origin_url,
+                "base_ref": request.base_ref,
+                "expected_base_oid": request.expected_base_oid,
+                "branch_ref": request.branch_ref,
+                "expected_head_oid": request.expected_head_oid,
                 "candidate_commit": candidate_facts.commit,
                 "candidate_tree": candidate_facts.tree,
                 "candidate_parents": list(candidate_facts.parents),
-                "publication_subject_sha256": inputs.publication_subject_sha256,
-                "verification_certificate_sha256": digest(inputs.certificate),
+                "publication_subject_sha256": publication_subject_sha256,
+                "verification_certificate_sha256": verification_certificate_sha256,
                 "publication_plan_sha256": plan_sha256,
-                "generate_artifact": inputs.request.generate_artifact.to_record(),
-                "capture_artifact": inputs.request.capture_artifact.to_record(),
-                "verify_artifact": inputs.request.verify_artifact.to_record(),
-                "repository_snapshot_artifact": inputs.request.repository_snapshot.to_record(),
+                "generate_artifact": request.generate_artifact.to_record(),
+                "capture_artifact": request.capture_artifact.to_record(),
+                "verify_artifact": request.verify_artifact.to_record(),
+                "repository_snapshot_artifact": request.repository_snapshot.to_record(),
                 "git_effect": {"effect_id": git_effect_id, "observation": git_observation},
                 "pr_effect": {
                     "effect_id": pr_effect_id,
                     "observation": pr_observation.to_record(),
                 },
-                "pr_title_sha256": digest({"title": inputs.pr_title}),
-                "pr_body_sha256": digest({"body": inputs.pr_body}),
-                "publisher_tool": inputs.publisher_tool,
-                "actual_executor_sha256": inputs.actual_executor_sha256,
+                "pr_title_sha256": digest({"title": pr_title}),
+                "pr_body_sha256": digest({"body": pr_body}),
+                "publisher_tool": publisher_tool,
+                "actual_executor_sha256": actual_executor,
                 "required_executor_sha256": command.expected_executor_sha256,
             }
             output = workspace.root / "output"

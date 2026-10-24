@@ -32,7 +32,7 @@ class EffectState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class EffectSettlement:
-    """The projected state plus the decisive append-only fact."""
+    """The projected state plus the decisive fact and immutable outbound."""
 
     effect_id: str
     state: EffectState

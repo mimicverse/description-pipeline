@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,7 +56,12 @@ from description_pipeline.schemas import (
 )
 from description_pipeline.stages import CONTRACT_SHA256
 
-VERIFY_IDENTITY = {"role": "verify-fixture", "version": "1"}
+VERIFY_SHA256 = "a" * 64
+VERIFY_IDENTITY = {
+    "role": "verify-fixture",
+    "source_sha256": VERIFY_SHA256,
+    "version": "1",
+}
 POLICY_SHA = check_policy_digest()
 CONTRACT_SHA = CONTRACT_SHA256
 CONFIG_SHA = digest({"config": "fixture"})
@@ -79,6 +85,7 @@ class _MemoryEffects:
         self.by_key: dict[str, str] = {}
         self.states: dict[str, EffectState] = {}
         self.payloads: dict[str, object] = {}
+        self.outbound: dict[str, object] = {}
         self.authorizations = 0
 
     def prepare_effect(self, *, effect_key, effect_kind, target, expected_state, outbound_root):
@@ -111,6 +118,7 @@ class _MemoryEffects:
             created_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
         self.intents[intent.effect_id] = intent
+        self.outbound[intent.effect_id] = outbound
         self.by_key[effect_key] = intent.effect_id
         self.states[intent.effect_id] = EffectState.PREPARED
         return intent
@@ -162,6 +170,7 @@ class _MemoryEffects:
             state=self.states[effect_id],
             decisive_fact=None,
             payload_artifact=self.payloads.get(effect_id),
+            outbound_artifact=self.outbound[effect_id],
         )
 
     def effect_settlement_for_key(self, effect_key):
@@ -439,7 +448,7 @@ class PublishFixture:
             kind=VERIFY_ARTIFACT_KIND,
             producer_run_id="verify-run",
             producer_stage="verify",
-            producer_tool_sha256=digest(VERIFY_IDENTITY),
+            producer_tool_sha256=VERIFY_SHA256,
         )
         snapshot_root = self.root / "repository-snapshot"
         self.snapshot = seal_repository_snapshot(
@@ -559,7 +568,7 @@ class PublishFixture:
         verify_request = {
             "capture_artifact": self.capture_ref.to_record(),
             "generate_artifact": self.generate_ref.to_record(),
-            "expected_verifier_sha256": digest(VERIFY_IDENTITY),
+            "expected_verifier_sha256": VERIFY_SHA256,
             "contract_sha256": CONTRACT_SHA,
             "policy_sha256": POLICY_SHA,
             "config_snapshot_sha256": CONFIG_SHA,
@@ -569,7 +578,7 @@ class PublishFixture:
         }
         proof = {
             "actual_verifier": VERIFY_IDENTITY,
-            "actual_verifier_sha256": digest(VERIFY_IDENTITY),
+            "actual_verifier_sha256": VERIFY_SHA256,
             "capture_artifact": self.capture_ref.to_record(),
             "checks": [{"id": "fixture", "state": "passed", "passed": True}],
             "closure_sha256": digest(
@@ -604,7 +613,7 @@ class PublishFixture:
             verify_root / "verification-execution.json",
             {
                 "actual_verifier": VERIFY_IDENTITY,
-                "actual_verifier_sha256": digest(VERIFY_IDENTITY),
+                "actual_verifier_sha256": VERIFY_SHA256,
                 "certificate_sha256": digest(certificate),
                 "claim_id": "verify-claim",
                 "closure_sha256": proof["closure_sha256"],
@@ -940,6 +949,217 @@ else:
         self.assertEqual(effects.authorizations, 2)
         self.assertTrue(all(state is EffectState.SATISFIED for state in effects.states.values()))
 
+    def test_concurrent_claims_use_distinct_default_pull_request_client_cwds(self) -> None:
+        bin_root = self.fixture.root / "concurrent-fake-bin"
+        bin_root.mkdir()
+        gh = bin_root / "gh"
+        gh.write_text(
+            """#!/usr/bin/python3
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+args = sys.argv[1:]
+repository = args[args.index("--repo") + 1]
+state_root = Path(os.environ["GH_TEST_STATE_DIR"])
+state_root.mkdir(parents=True, exist_ok=True)
+with Path(os.environ["GH_TEST_LOG"]).open("a", encoding="utf-8") as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX)
+    stream.write(repository + "\\t" + str(Path.cwd()) + "\\n")
+if args[:2] == ["pr", "list"]:
+    marker = state_root / (repository.replace("/", "__") + ".marker")
+    marker.write_text("ready\\n", encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while len(list(state_root.glob("*.marker"))) < 2:
+        if time.monotonic() >= deadline:
+            raise SystemExit("concurrent gh barrier timed out")
+        time.sleep(0.02)
+    state = state_root / (repository.replace("/", "__") + ".json")
+    print(json.dumps([json.loads(state.read_text(encoding="utf-8"))]) if state.exists() else "[]")
+elif args[:2] == ["pr", "create"]:
+    base = args[args.index("--base") + 1]
+    head = args[args.index("--head") + 1]
+    title = args[args.index("--title") + 1]
+    body = args[args.index("--body") + 1]
+    listing = subprocess.check_output(
+        ["git", "ls-remote", "origin", f"refs/heads/{head}"],
+        text=True,
+    ).strip()
+    commit = listing.split()[0]
+    row = {
+        "baseRefName": base,
+        "body": body,
+        "headRefName": head,
+        "headRefOid": commit,
+        "number": 1,
+        "state": "OPEN",
+        "title": title,
+        "url": f"https://github.com/{repository}/pull/1",
+    }
+    (state_root / (repository.replace("/", "__") + ".json")).write_text(
+        json.dumps(row),
+        encoding="utf-8",
+    )
+    print(row["url"])
+elif args[:2] == ["pr", "view"]:
+    state = state_root / (repository.replace("/", "__") + ".json")
+    print(state.read_text(encoding="utf-8"))
+else:
+    raise SystemExit(f"unexpected gh invocation: {args!r}")
+""",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
+        log_path = self.fixture.root / "concurrent-gh-cwd.log"
+        state_root = self.fixture.root / "concurrent-gh-state"
+
+        second_remote = self.fixture.root / "remote-2.git"
+        second_seed = self.fixture.root / "seed-2"
+        second_repo = self.fixture.root / "repo-2"
+        git(None, "init", "--bare", "-b", "main", str(second_remote))
+        second_seed.mkdir()
+        git(None, "init", "-b", "main", str(second_seed))
+        git(second_seed, "config", "user.name", "Seed")
+        git(second_seed, "config", "user.email", "seed@example.test")
+        (second_seed / "README.md").write_text("second base\n", encoding="utf-8")
+        git(second_seed, "add", "README.md")
+        git(second_seed, "commit", "-m", "second base")
+        git(second_seed, "remote", "add", "origin", str(second_remote))
+        git(second_seed, "push", "-u", "origin", "main")
+        second_base_oid = git(second_seed, "rev-parse", "HEAD").stdout.strip()
+        git(None, "clone", str(second_remote), str(second_repo))
+        git(second_repo, "config", "user.name", "Seed")
+        git(second_repo, "config", "user.email", "seed@example.test")
+        second_branch = "work/solidworks/robot2/engineering"
+        snapshot_root = self.fixture.root / "concurrent-repository-snapshot-2"
+        seal_repository_snapshot(
+            second_repo,
+            snapshot_root,
+            repository_slug="example/robot2",
+            origin_url=str(second_remote),
+            base_ref="main",
+            base_oid=second_base_oid,
+            branch_ref=second_branch,
+            head_oid=None,
+        )
+        snapshot_ref = self.fixture.store.seal_tree(
+            snapshot_root,
+            kind=publish_stage.REPOSITORY_SNAPSHOT_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"tool": "snapshot-builder-2"}),
+        )
+        request = self.fixture.command.to_record()["request"]
+        request.update(
+            {
+                "branch_ref": second_branch,
+                "expected_base_oid": second_base_oid,
+                "origin_url": str(second_remote),
+                "repository_slug": "example/robot2",
+                "repository_snapshot_artifact_id": snapshot_ref.artifact_id,
+            }
+        )
+        second_command = StageCommand.create(
+            command_id="publish-command-2",
+            run_id=self.fixture.command.run_id,
+            stage="publish",
+            idempotency_key="publish-run/publish-2",
+            request=request,
+            input_artifacts=(
+                self.fixture.capture_ref,
+                self.fixture.generate_ref,
+                self.fixture.verify_ref,
+                snapshot_ref,
+            ),
+            config_snapshot_sha256=self.fixture.command.config_snapshot_sha256,
+            contract_sha256=self.fixture.command.contract_sha256,
+            policy_sha256=self.fixture.command.policy_sha256,
+            expected_executor_sha256=self.fixture.executor,
+            predecessor_decision_id="verify-decision",
+        )
+        second_claim = replace(
+            self.fixture.claim,
+            claim_id="publish-claim-2",
+            command_id=second_command.command_id,
+            fence=2,
+            owner_sha256=digest({"process": "publish-2"}),
+            lane_key="example/robot2:robot2:engineering",
+        )
+        second_workspace = StageWorkspace(
+            root=self.fixture.root / "concurrent-workspace-2",
+            inputs={
+                ref.artifact_id: self.fixture.store.materialize(
+                    ref,
+                    self.fixture.root / "concurrent-workspace-2/inputs" / ref.artifact_id,
+                )
+                for ref in second_command.input_artifacts
+            },
+        )
+        second_effects = _MemoryEffects(
+            self.fixture.store,
+            command_id=second_command.command_id,
+            executor=self.fixture.executor,
+        )
+        handler = PublishHandler(self.fixture.store)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GH_TEST_LOG": str(log_path),
+                    "GH_TEST_STATE_DIR": str(state_root),
+                    "PATH": str(bin_root) + os.pathsep + os.environ["PATH"],
+                },
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            first_future = executor.submit(
+                handler.execute,
+                self.fixture.command,
+                self.fixture.claim,
+                self.fixture.workspace,
+                effects=self.fixture.effects,
+            )
+            second_future = executor.submit(
+                handler.execute,
+                second_command,
+                second_claim,
+                second_workspace,
+                effects=second_effects,
+            )
+            first = first_future.result(timeout=30)
+            second = second_future.result(timeout=30)
+
+        self.assertEqual(first.outcome, "completed")
+        self.assertEqual(second.outcome, "completed")
+        self.assertIsNone(handler.pull_requests)
+        cwd_by_repository: dict[str, set[Path]] = {}
+        for row in log_path.read_text(encoding="utf-8").splitlines():
+            repository, cwd = row.split("\t", 1)
+            cwd_by_repository.setdefault(repository, set()).add(Path(cwd))
+        self.assertEqual(
+            cwd_by_repository["example/robot"],
+            {(self.fixture.workspace.root / "repository").resolve()},
+        )
+        self.assertEqual(
+            cwd_by_repository["example/robot2"],
+            {(second_workspace.root / "repository").resolve()},
+        )
+        self.assertEqual(
+            git(
+                None,
+                "--git-dir",
+                str(second_remote),
+                "rev-parse",
+                f"refs/heads/{second_branch}",
+            ).stdout.strip(),
+            read_data(Path(second.candidate_root) / "publication-receipt.json")["candidate_commit"],
+        )
+        self.assertEqual(second_effects.authorizations, 2)
+
     def test_second_run_reuses_satisfied_effects_without_external_calls(self) -> None:
         first = self._run()
         before = (self.fixture.pr.observe_calls, self.fixture.pr.create_calls, self.fixture.pr.update_calls)
@@ -953,7 +1173,10 @@ else:
             fence=2,
             owner_sha256=digest({"process": "publish-2"}),
         )
-        with patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")):
+        with (
+            patch.object(PublishHandler, "_prepare", side_effect=AssertionError("must not rebuild publication")),
+            patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")),
+        ):
             second = self._run(workspace=second_workspace, claim=second_claim)
         after = (self.fixture.pr.observe_calls, self.fixture.pr.create_calls, self.fixture.pr.update_calls)
         self.assertEqual(first.checks_sha256, second.checks_sha256)
@@ -981,6 +1204,7 @@ else:
             owner_sha256=digest({"process": "publish-fresh"}),
         )
         with (
+            patch.object(PublishHandler, "_prepare", side_effect=AssertionError("must not rebuild publication")),
             patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")),
             patch.object(self.fixture.pr, "create", side_effect=AssertionError("must not recreate PR")),
             patch.object(self.fixture.pr, "update", side_effect=AssertionError("must not update PR")),
@@ -1184,7 +1408,7 @@ else:
             1,
         )
 
-    def test_unknown_effect_never_resends_git(self) -> None:
+    def test_unknown_effect_requires_claim_free_reconciliation_without_resend(self) -> None:
         self.fixture.effects.prepare_effect(
             effect_key=publish_stage.GIT_EFFECT_KEY,
             effect_kind="git_ref_update",
@@ -1211,6 +1435,9 @@ else:
             self.assertRaises(publish_stage.PublishIncomplete),
         ):
             self._run()
+        self.assertEqual(self.fixture.pr.observe_calls, 0)
+        self.assertEqual(self.fixture.pr.create_calls, 0)
+        self.assertEqual(self.fixture.pr.update_calls, 0)
 
     def _root_with_file(self, name: str) -> Path:
         root = self.fixture.root / name
