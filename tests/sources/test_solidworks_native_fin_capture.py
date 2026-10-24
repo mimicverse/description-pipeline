@@ -2366,7 +2366,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         with self.assertRaises(CadError) as caught:
             self.capture(body, extension, body_type=1)
         self.assertIn(
-            "invalid container type",
+            "invalid fin ID array",
             str(caught.exception),
         )
         self.assertEqual(
@@ -2418,6 +2418,25 @@ class NativeFinCaptureTests(unittest.TestCase):
             self.capture(body, extension, body_type=0)
         self.assertEqual(tessellation.tessellate_calls, 1)
 
+    def test_face_facet_read_requires_a_flat_native_integer_array(self):
+        for value in (None, [[]], [()], [None]):
+            with self.subTest(value=value):
+                body, face, _edge, tessellation, extension = (
+                    self.open_boundary_fixture()
+                )
+                tessellation.face_facets = {id(face): value}
+                with self.assertRaises(CadError) as caught:
+                    self.capture(body, extension, body_type=1)
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_native_tessellation_unreadable",
+                )
+                self.assertIn(
+                    "invalid facet ID array",
+                    str(caught.exception),
+                )
+                self.assertEqual(tessellation.tessellate_calls, 1)
+
     def test_edge_fin_ids_are_canonicalized_after_native_read(self):
         body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
         tessellation.GetEdgeFins = lambda _edge: [200, 100]
@@ -2432,6 +2451,9 @@ class NativeFinCaptureTests(unittest.TestCase):
             ("float", [100.0], "invalid fin ID"),
             ("outside", [999], "outside the captured facets"),
             ("duplicate", [100, 100], "repeats a fin ID"),
+            ("nested-list", [[]], "invalid fin ID"),
+            ("nested-tuple", [()], "invalid fin ID"),
+            ("nested-null", [None], "invalid fin ID"),
         )
         for label, fin_ids, message in cases:
             with self.subTest(label=label):

@@ -6722,6 +6722,33 @@ class SolidWorksBackend(CadBackend):
                     {**base, **where, "api": api, "error": str(error)[:300]},
                 ) from error
 
+        def native_id_array(
+            value,
+            *,
+            api,
+            label,
+            extra_detail=None,
+            **where,
+        ):
+            if not isinstance(value, (tuple, list)) or any(
+                type(item) is not int or item < 0 for item in value
+            ):
+                detail = {
+                    **base,
+                    **where,
+                    "api": api,
+                    "raw_ids": repr(value)[:1000],
+                    "raw_ids_type": type(value).__name__,
+                }
+                if extra_detail:
+                    detail.update(extra_detail)
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    f"{api} returned an invalid {label} ID array",
+                    detail,
+                )
+            return list(value)
+
         registry = reference_registry or _NativeReferenceRegistry()
 
         def persistent(
@@ -7485,11 +7512,19 @@ class SolidWorksBackend(CadBackend):
         fins_by_id = {}
         for face_row in face_rows:
             face_index = face_row["index"]
-            facet_ids = call(
+            raw_facet_ids = call(
                 "ITessellation.GetFaceFacets",
-                lambda face=face_row["object"]: _as_list(
-                    _member(tessellation, "GetFaceFacets", face)
+                lambda face=face_row["object"]: _member(
+                    tessellation,
+                    "GetFaceFacets",
+                    face,
                 ),
+                face_index=face_index,
+            )
+            facet_ids = native_id_array(
+                raw_facet_ids,
+                api="ITessellation.GetFaceFacets",
+                label="facet",
                 face_index=face_index,
             )
             normalized_facets = []
@@ -7765,30 +7800,20 @@ class SolidWorksBackend(CadBackend):
                 }
                 for face_index in edge_row["face_indices"]
             ]
-            if not isinstance(raw_edge_fins, (tuple, list)):
-                raise CadError(
-                    "cad_native_tessellation_unreadable",
-                    "GetEdgeFins returned an invalid container type",
-                    {
-                        **base,
-                        "edge_index": edge_index,
-                        **edge_failure_context(
-                            edge_row,
-                            raw_edge_fins,
-                            face_incidence,
-                        ),
-                    },
-                )
-            edge_fins = _as_list(raw_edge_fins)
+            edge_fins = native_id_array(
+                raw_edge_fins,
+                api="ITessellation.GetEdgeFins",
+                label="fin",
+                extra_detail=edge_failure_context(
+                    edge_row,
+                    raw_edge_fins,
+                    face_incidence,
+                ),
+                edge_index=edge_index,
+            )
             normalized = []
             seen = set()
             for fin_id in edge_fins:
-                if type(fin_id) is not int or fin_id < 0:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "GetEdgeFins returned an invalid fin ID",
-                        {**base, "edge_index": edge_index, "fin_id": repr(fin_id)[:60]},
-                    )
                 if fin_id not in fins_by_id:
                     raise CadError(
                         "cad_native_tessellation_unreadable",
