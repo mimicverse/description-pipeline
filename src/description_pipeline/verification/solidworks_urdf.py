@@ -152,7 +152,9 @@ class _Gates:
 
     def add(self, identifier, callback):
         try:
-            details = callback() or {}
+            details = callback()
+            if details is None:
+                details = {}
             self.checks.append({"id": identifier, "state": "passed", "passed": True, "details": details})
             return details
         except Exception as error:
