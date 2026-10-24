@@ -730,11 +730,17 @@ def _mesh_body(faces, key: str):
                 ]
             return list(values)
 
+        def IGetFaceFacetsCount2(self, face):  # noqa: N802 - SolidWorks API name
+            return len(self.GetFaceFacets(face))
+
         def GetFacetFins(self, facet_id):  # noqa: N802 - SolidWorks API name
             return list(fins_by_facet[facet_id])
 
         def GetEdgeFins(self, _edge):  # noqa: N802 - SolidWorks API name
             return []
+
+        def IGetEdgeFinsCount(self, _edge):  # noqa: N802 - SolidWorks API name
+            return 0
 
         def GetFinVertices(self, fin_id):  # noqa: N802 - SolidWorks API name
             return list(fin_vertices[fin_id])

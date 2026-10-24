@@ -18,6 +18,7 @@ from . import support
 
 from description_pipeline.geometry.stl import read as read_stl  # noqa: E402
 from description_pipeline.geometry.stl import vertices as stl_vertices  # noqa: E402
+from description_pipeline.schemas import NATIVE_FACETLESS_EVIDENCE_API  # noqa: E402
 from description_pipeline.sources.solidworks import native as native_module  # noqa: E402
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import SolidWorksBackend  # noqa: E402
@@ -395,6 +396,17 @@ class FakeTessellation:
             return list(values)
         return list(range(1, int(self._facets or 0) + 1))
 
+    def IGetFaceFacetsCount2(self, face):  # noqa: N802 - SolidWorks API name
+        if self._graph is not None:
+            values = self._facets_by_face.get(id(face))
+            if values is None:
+                reference = getattr(face, "_persist_reference", b"")
+                values = self._facets_by_reference[
+                    hashlib.sha256(reference).hexdigest()
+                ]
+            return len(values)
+        return int(self._facets or 0)
+
     def GetFacetFins(self, facet_id):  # noqa: N802 - SolidWorks API name
         if self._graph is not None:
             return list(self._fins_by_facet[facet_id])
@@ -410,6 +422,16 @@ class FakeTessellation:
                 (),
             )
         return list(values)
+
+    def IGetEdgeFinsCount(self, edge):  # noqa: N802 - SolidWorks API name
+        values = self._fins_by_edge.get(id(edge))
+        if values is None:
+            reference = getattr(edge, "_persist_reference", b"")
+            values = self._fins_by_edge_reference.get(
+                hashlib.sha256(reference).hexdigest(),
+                (),
+            )
+        return len(values)
 
     def GetFinVertices(self, fin_id):  # noqa: N802 - SolidWorks API name
         if self._graph is not None:
@@ -916,7 +938,7 @@ class ComponentMeshExportTests(unittest.TestCase):
                     "facet_count": 0,
                     "area_m2": 1.871564249915375e-13,
                     "tessellate_result": True,
-                    "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                    "used_api": NATIVE_FACETLESS_EVIDENCE_API,
                 }
             ],
         )

@@ -8,7 +8,11 @@ import struct
 from collections import defaultdict
 
 from ..io import PipelineError
-from ..schemas import NATIVE_TESSELLATION_SCHEMA
+from ..schemas import (
+    NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from .native_fin_topology import (
     NativeFinRelationError,
     validate_native_edge_fin_relations,
@@ -1005,6 +1009,9 @@ def parse_native_tessellation(
         "end_reference_error",
         "face_indices",
         "fin_ids",
+        "native_fin_count",
+        "fin_ids_source",
+        "raw_fin_ids",
         "u_min",
         "u_max",
         "curve_start_point_m",
@@ -1137,6 +1144,33 @@ def parse_native_tessellation(
             and isinstance(edge["fin_ids"], list)
             and edge["fin_ids"] == sorted(set(edge["fin_ids"]))
             and all(_integer(value) and value >= 0 for value in edge["fin_ids"])
+            and _integer(edge["native_fin_count"])
+            and edge["native_fin_count"] >= 0
+            and edge["native_fin_count"] == len(edge["fin_ids"])
+            and edge["fin_ids_source"]
+            in {
+                NATIVE_ID_ARRAY_SOURCE_FLAT,
+                NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+            }
+            and (
+                (
+                    edge["fin_ids_source"] == NATIVE_ID_ARRAY_SOURCE_FLAT
+                    and isinstance(edge["raw_fin_ids"], list)
+                    and all(
+                        _integer(value) and value >= 0
+                        for value in edge["raw_fin_ids"]
+                    )
+                    and sorted(edge["raw_fin_ids"]) == edge["fin_ids"]
+                    and len(edge["raw_fin_ids"]) == edge["native_fin_count"]
+                )
+                or (
+                    edge["fin_ids_source"]
+                    == NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT
+                    and edge["native_fin_count"] == 0
+                    and edge["fin_ids"] == []
+                    and edge["raw_fin_ids"] is None
+                )
+            )
             and type(edge["u_min"]) in (int, float)
             and type(edge["u_max"]) in (int, float)
             and math.isfinite(edge["u_min"])
@@ -3053,18 +3087,49 @@ def _parse_itessellation_body(
             == {
                 "face_index",
                 "facet_ids",
+                "facet_count",
+                "facet_ids_source",
+                "raw_facet_ids",
                 "face_identity_sha256",
             },
             component + f": native tessellation face {index} has an unknown shape",
         )
         face_index = face["face_index"]
         facet_ids = face["facet_ids"]
+        facet_count = face["facet_count"]
         _require(
             _integer(face_index)
             and face_index in face_spans
             and isinstance(facet_ids, list)
             and facet_ids == sorted(set(facet_ids))
             and all(_integer(facet_id) and facet_id >= 0 for facet_id in facet_ids)
+            and _integer(facet_count)
+            and facet_count >= 0
+            and facet_count == len(facet_ids)
+            and face["facet_ids_source"]
+            in {
+                NATIVE_ID_ARRAY_SOURCE_FLAT,
+                NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+            }
+            and (
+                (
+                    face["facet_ids_source"] == NATIVE_ID_ARRAY_SOURCE_FLAT
+                    and isinstance(face["raw_facet_ids"], list)
+                    and all(
+                        _integer(value) and value >= 0
+                        for value in face["raw_facet_ids"]
+                    )
+                    and sorted(face["raw_facet_ids"]) == facet_ids
+                    and len(face["raw_facet_ids"]) == facet_count
+                )
+                or (
+                    face["facet_ids_source"]
+                    == NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT
+                    and facet_count == 0
+                    and facet_ids == []
+                    and face["raw_facet_ids"] is None
+                )
+            )
             and face["face_identity_sha256"]
             == face_spans[face_index]["face_reference_sha256"]
             and (

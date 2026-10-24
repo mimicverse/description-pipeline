@@ -22,7 +22,10 @@ from description_pipeline.geometry.native_fin_topology import (
 )
 from description_pipeline.geometry.native_u import native_curve_domain_transform
 from description_pipeline.io import PipelineError
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
+from description_pipeline.schemas import (
+    NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.native_mesh_observations import verify_native_mesh_observations
 
@@ -186,7 +189,7 @@ class NativeMeshObservationTests(unittest.TestCase):
                     "facet_count": 0,
                     "area_m2": 2e-13,
                     "tessellate_result": False,
-                    "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                    "used_api": NATIVE_FACETLESS_EVIDENCE_API,
                 }
             ],
             triangle_vertices=triangles,
@@ -594,6 +597,10 @@ class NativeMeshObservationTests(unittest.TestCase):
             item = body(row)
             item["faces"][1]["facet_ids"].append(item["faces"][0]["facet_ids"][0])
             item["faces"][1]["facet_ids"].sort()
+            item["faces"][1]["facet_count"] = len(item["faces"][1]["facet_ids"])
+            item["faces"][1]["raw_facet_ids"] = list(
+                item["faces"][1]["facet_ids"]
+            )
 
         def missing_fin(row):
             body(row)["facets"][0]["fin_ids"].pop()
@@ -667,12 +674,32 @@ class NativeMeshObservationTests(unittest.TestCase):
 
         missing_edge_fin = copy.deepcopy(original)
         missing_edge_fin["tessellation"]["native_edges"][0]["fin_ids"].pop()
+        missing_edge_fin["tessellation"]["native_edges"][0][
+            "native_fin_count"
+        ] = len(
+            missing_edge_fin["tessellation"]["native_edges"][0]["fin_ids"]
+        )
+        missing_edge_fin["tessellation"]["native_edges"][0][
+            "raw_fin_ids"
+        ] = list(
+            missing_edge_fin["tessellation"]["native_edges"][0]["fin_ids"]
+        )
 
         extra_internal_fin = copy.deepcopy(original)
         extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"].append(
             internal_fin["fin_id"]
         )
         extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"].sort()
+        extra_internal_fin["tessellation"]["native_edges"][0][
+            "native_fin_count"
+        ] = len(
+            extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"]
+        )
+        extra_internal_fin["tessellation"]["native_edges"][0][
+            "raw_fin_ids"
+        ] = list(
+            extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"]
+        )
 
         edge_fin = next(
             fin for fin in body["fins"] if fin["edge_reference_sha256"] == edge["edge_reference_sha256"]
@@ -1044,6 +1071,8 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         edge = tessellation["native_edges"][0]
         fin_ids = set(edge["fin_ids"])
         edge["fin_ids"] = []
+        edge["native_fin_count"] = 0
+        edge["raw_fin_ids"] = []
         for fin in tessellation["itessellation"]["bodies"][0]["fins"]:
             if fin["fin_id"] not in fin_ids:
                 continue

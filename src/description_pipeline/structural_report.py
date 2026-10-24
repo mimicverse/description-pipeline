@@ -17,7 +17,7 @@ from .geometry.native_u import (
 )
 from .geometry.native_tessellation import parse_native_tessellation
 from .io import PipelineError, file_digest, read_data, write_json
-from .schemas import EFFECTIVE_INSTANCES_SCHEMA
+from .schemas import EFFECTIVE_INSTANCES_SCHEMA, NATIVE_FACETLESS_EVIDENCE_API
 
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
@@ -274,7 +274,7 @@ def _canonical_untessellated_faces(
 
     if not isinstance(value, list):
         return None
-    pinned_api = "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
+    pinned_api = NATIVE_FACETLESS_EVIDENCE_API
     out: list[dict] = []
     for entry in value:
         if not isinstance(entry, dict):

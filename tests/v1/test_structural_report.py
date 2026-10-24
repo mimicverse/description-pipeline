@@ -7,7 +7,10 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from description_pipeline.io import file_digest, write_json
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
+from description_pipeline.schemas import (
+    NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from description_pipeline.structural_report import write_structural_report
 from tests.sources import support
 
@@ -798,7 +801,7 @@ class StructuralReportTests(unittest.TestCase):
             "facet_count": 0,
             "area_m2": 0.0004,
             "tessellate_result": False,
-            "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+            "used_api": NATIVE_FACETLESS_EVIDENCE_API,
         }
         row.update(overrides)
         return row

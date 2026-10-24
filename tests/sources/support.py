@@ -31,7 +31,10 @@ from description_pipeline.geometry.native_u import (
     native_point_error,
 )
 from description_pipeline.io import file_digest
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
+from description_pipeline.schemas import (
+    NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
@@ -499,6 +502,9 @@ def native_tessellation_fixture(
                 {
                     "face_index": span["face_index"],
                     "facet_ids": facet_ids,
+                    "facet_count": len(facet_ids),
+                    "facet_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
+                    "raw_facet_ids": list(facet_ids),
                     "face_identity_sha256": span[
                         "face_reference_sha256"
                     ],
@@ -803,6 +809,9 @@ def native_tessellation_fixture(
                 "end_reference_error": None,
                 "face_indices": face_indices,
                 "fin_ids": sorted(edge_fin_ids),
+                "native_fin_count": len(edge_fin_ids),
+                "fin_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
+                "raw_fin_ids": sorted(edge_fin_ids),
                 "u_min": u_min,
                 "u_max": u_max,
                 "curve_start_point_m": list(curve_start_point),

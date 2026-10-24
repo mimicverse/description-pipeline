@@ -11,6 +11,7 @@ from ..geometry.native_tessellation import (
     summarize_native_topology,
 )
 from ..io import PipelineError, confined
+from ..schemas import NATIVE_FACETLESS_EVIDENCE_API
 from ..sources.snapshot import verify_snapshot
 from . import native_discovery as evidence
 
@@ -195,7 +196,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                     component + ": a degenerate-face probe error is only admissible at zero native area",
                 )
             _require(
-                face["used_api"] == "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                face["used_api"] == NATIVE_FACETLESS_EVIDENCE_API,
                 component + ": unsupported untessellated-face evidence API",
             )
             component_untessellated.append(
