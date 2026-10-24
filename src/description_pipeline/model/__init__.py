@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import jsonschema
 import numpy as np
 
 from ..io import PipelineError, digest, file_digest, inventory, read_data, write_json
-from ..schemas import ENGINEERING_MODEL_SCHEMA
+from ..schemas import ENGINEERING_MODEL_SCHEMA as ENGINEERING_MODEL_SCHEMA
 from ..sources.solidworks.naming import fixed_joint_name
 
 
