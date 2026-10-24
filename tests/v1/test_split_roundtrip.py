@@ -22,6 +22,7 @@ from description_pipeline.io import digest
 from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
+from description_pipeline.sources.solidworks import capture_transaction
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import seal_closure_selection
@@ -331,7 +332,7 @@ class SplitRoundtripTests(unittest.TestCase):
         # producer root, when the scenario asks for one, enters the handoff BEFORE the
         # seal so the sealed receipt carries it coherently.
         windows_root = getattr(self, "_windows_root", None)
-        original_inspect = steps.inspect_prepared_input
+        original_inspect = capture_transaction.inspect_prepared_package
 
         def inspect_with_root(*args, **kwargs):
             report = original_inspect(*args, **kwargs)
@@ -348,7 +349,11 @@ class SplitRoundtripTests(unittest.TestCase):
                 "description_pipeline.runtime.tool_record",
                 return_value=native_tool(),
             ),
-            patch.object(steps, "inspect_prepared_input", side_effect=inspect_with_root),
+            patch.object(
+                capture_transaction,
+                "inspect_prepared_package",
+                side_effect=inspect_with_root,
+            ),
         ):
             capture = solidworks.capture(
                 prepared_package,

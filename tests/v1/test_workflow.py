@@ -12,6 +12,7 @@ from unittest.mock import patch
 from description_pipeline import solidworks, steps
 from description_pipeline.cli import main
 from description_pipeline.io import PipelineError, digest, file_digest, inventory, read_data, write_json
+from description_pipeline.sources.solidworks import capture_transaction
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.stages import stage_view
 
@@ -302,7 +303,7 @@ class WorkflowTests(unittest.TestCase):
     def test_static_inspection_is_consumed_once_and_changed_inspected_bytes_are_rejected(self):
         self.seal()
         self.acquisition_without_admin()
-        inspect_prepared = steps.inspect_prepared_input
+        inspect_prepared = capture_transaction.inspect_prepared_package
         calls: list = []
 
         def change_after_inspection(package):
@@ -312,7 +313,11 @@ class WorkflowTests(unittest.TestCase):
             return report
 
         with (
-            patch.object(steps, "inspect_prepared_input", side_effect=change_after_inspection),
+            patch.object(
+                capture_transaction,
+                "inspect_prepared_package",
+                side_effect=change_after_inspection,
+            ),
             patch(
                 "description_pipeline.sources.solidworks.discovery.source_definition",
                 return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},

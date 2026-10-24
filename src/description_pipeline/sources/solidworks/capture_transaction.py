@@ -22,7 +22,6 @@ from ...io import (
     read_data,
     write_json,
 )
-from ...runtime import native_readiness
 from ...sources.snapshot import verify_snapshot
 from ...stages import checked
 from .capture_package import (
@@ -474,6 +473,15 @@ def capture_native_package(
             raise PipelineError(
                 "The sealed capture plan carries no saved configuration"
             )
+        prepared_files = package_inventory(package)
+        _archive_input(package, staging)
+        report["package_files"] = {
+            name: checksum
+            for name, checksum in sorted(
+                inventory(staging / "input").items()
+            )
+            if name != "request.json"
+        }
         source = {
             "provider": "solidworks",
             "assembly": str(assembly.resolve()),
@@ -493,15 +501,6 @@ def capture_native_package(
             "closure": native_source_closure(package),
         }
         definition = {"source": source, "plan": plan}
-        prepared_files = package_inventory(package)
-        _archive_input(package, staging)
-        report["package_files"] = {
-            name: checksum
-            for name, checksum in sorted(
-                inventory(staging / "input").items()
-            )
-            if name != "request.json"
-        }
         write_json(staging / "input/handoff.json", report)
         return definition, report, prepared_files
 
@@ -530,6 +529,8 @@ def capture_native_package(
                 "Native SLDASM/SLDPRT capture requires Windows with licensed SolidWorks"
             )
         if backend is None:
+            from ...runtime import native_readiness
+
             return native_readiness()
         reader = getattr(backend, "native_ready", None)
         if callable(reader):
