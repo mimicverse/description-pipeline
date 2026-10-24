@@ -10,7 +10,6 @@ from ..geometry.native_tessellation import (
     parse_native_tessellation,
     summarize_native_topology,
 )
-from ..geometry.native_u import native_tolerant_edge_value_warning
 from ..io import PipelineError, confined
 from ..sources.snapshot import verify_snapshot
 from . import native_discovery as evidence
@@ -90,7 +89,7 @@ def _stl_triangle_vertices(path: Path, triangles: int) -> list[tuple[tuple[float
 
 def verify_native_mesh_observations(bundle: Path) -> dict:
     manifest = verify_snapshot(Path(bundle) / "evidence")
-    source_scopes = evidence.source_scopes(bundle)
+    evidence.source_scopes(bundle)
     native = ((manifest.get("identity") or {}).get("capture") or {}).get("evidence_class") == "cad"
     rows = evidence.geometry(bundle)
     warnings = []
@@ -126,7 +125,6 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             _stl_triangle_vertices(path, triangles),
             native_fin_resolutions=native_fin_resolutions,
             native_identity_warnings=native_identity_warnings,
-            expected_source_scope=source_scopes.get(component),
         )
         warnings.extend(native_fin_resolutions)
         warnings.extend(native_identity_warnings)
@@ -134,7 +132,6 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             tessellation,
             spans,
             component=component,
-            expected_source_scope=source_scopes.get(component),
         )
         _require(
             topology["status"] == "evidence_complete",
@@ -233,15 +230,3 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             row["area_m2"] for row in untessellated_warnings
         ),
     }
-
-
-def native_geometry_value_warnings(bundle: Path) -> list[dict]:
-    """Return canonical value warnings re-derived from native geometry evidence."""
-
-    details = verify_native_mesh_observations(Path(bundle))
-    try:
-        return native_tolerant_edge_value_warning(details["warnings"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise PipelineError(
-            "Native geometry value warnings are not reproducible"
-        ) from error

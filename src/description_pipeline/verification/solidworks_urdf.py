@@ -25,12 +25,8 @@ from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, 
 from ..geometry import stl
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    NATIVE_TOLERANT_EDGE_GAP_WARNING,
-    NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
     native_scope_warning_details_match,
     native_scope_warning_projection,
-    native_tolerant_edge_value_warning,
-    native_tolerant_edge_warning_set_matches,
 )
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
@@ -4133,13 +4129,6 @@ def native_gate_warning_diagnostics(details: dict) -> list[dict]:
         native_scope_warning_details_match(scope_projection, warnings),
         "Native scope warning projection is incomplete, forged or mismatched",
     )
-    _require(
-        native_tolerant_edge_warning_set_matches(
-            projected,
-            warnings,
-        ),
-        "Native tolerant-edge warning projection is incomplete, forged or mismatched",
-    )
     return projected
 
 
@@ -4203,8 +4192,6 @@ def evaluate_bundle(
     if model is not None:
         for warning in (model.get("provenance") or {}).get("value_warnings") or []:
             if isinstance(warning, dict) and warning.get("code"):
-                if warning["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING:
-                    continue
                 diagnostics.append(
                     {
                         "code": str(warning["code"]),
@@ -4435,11 +4422,6 @@ def _verify_model(
             model,
             carrier,
             native_geometry_rows=native_geometry_rows,
-            native_warnings=(
-                native_geometry.get("warnings")
-                if isinstance(native_geometry, dict)
-                else None
-            ),
             metadata_warnings=metadata_warnings,
         ),
     )
@@ -4703,7 +4685,6 @@ def _value_warning_gate(
     carrier=None,
     *,
     native_geometry_rows=None,
-    native_warnings=None,
     metadata_warnings=None,
 ):
     """Re-derive every non-native value warning from source facts and the model."""
@@ -5409,21 +5390,8 @@ def _value_warning_gate(
             "Link mass properties are transformed, translated or recombined from native readings."
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
-        NATIVE_TOLERANT_EDGE_GAP_WARNING: NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
         METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
     }
-    try:
-        native_value_warnings = native_tolerant_edge_value_warning(
-            native_warnings or []
-        )
-    except (TypeError, ValueError) as error:
-        raise PipelineError(
-            "Native geometry value-warning projection is incomplete"
-        ) from error
-    for native_warning in native_value_warnings:
-        expected.setdefault(native_warning["code"], []).extend(
-            native_warning["objects"]
-        )
     _require(
         set(actual) == set(expected),
         "Non-native value provenance warning classes differ from the delivery: "

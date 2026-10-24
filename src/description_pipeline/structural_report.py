@@ -14,7 +14,6 @@ from .geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     native_scope_warning_details_match,
     native_scope_warning_diagnostic_is_valid,
-    native_tolerant_edge_warning_set_matches,
 )
 from .geometry.native_tessellation import parse_native_tessellation
 from .io import PipelineError, file_digest, read_data, write_json
@@ -259,7 +258,6 @@ def _canonical_effective_warnings(value) -> list | None:
 
 def _canonical_untessellated_faces(
     value,
-    source_scopes,
 ) -> list | None:
     """The canonical ``no_facets_faces`` rows of ``raw/geometry.json``, or ``None``.
 
@@ -302,11 +300,6 @@ def _canonical_untessellated_faces(
                 entry.get("triangles"),
                 native_fin_resolutions=[],
                 native_identity_warnings=[],
-                expected_source_scope=(
-                    source_scopes.get(component)
-                    if isinstance(source_scopes, dict)
-                    else None
-                ),
             )
         except PipelineError:
             return None
@@ -527,28 +520,6 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 if isinstance(warnings, list):
                     native_gate_warnings = warnings
                 break
-    if not native_tolerant_edge_warning_set_matches(
-        quality_diagnostics if isinstance(quality_diagnostics, list) else [],
-        native_gate_warnings or [],
-    ):
-        entries.append(
-            {
-                "severity": "blocker",
-                "code": "report.native_tolerant_edge_warning_invalid",
-                "object": receipt.get("main_assembly"),
-                "message": (
-                    "Native tolerant-edge warning projection is incomplete or forged"
-                ),
-                "source": "reports/quality.json/diagnostics",
-                "evidence": {
-                    "quality_diagnostics_present": isinstance(
-                        quality_diagnostics,
-                        list,
-                    ),
-                    "native_gate_warnings_present": native_gate_warnings is not None,
-                },
-            }
-        )
     if quality_diagnostics is not None:
         if not isinstance(quality_diagnostics, list):
             entries.append(
@@ -766,16 +737,6 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     }
                 )
     geometry_source = "evidence/raw/geometry.json"
-    source_scopes = None
-    if evidence_root is not None:
-        from .verification.native_discovery import (  # noqa: PLC0415
-            source_scopes as validated_source_scopes,
-        )
-
-        try:
-            source_scopes = validated_source_scopes(Path(evidence_root))
-        except PipelineError:
-            source_scopes = None
     geometry = sources.get(geometry_source)
     if isinstance(geometry, dict) and geometry.get("errors"):
         entries.extend(_findings(geometry, geometry_source))
@@ -813,7 +774,6 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
     else:
         untessellated = _canonical_untessellated_faces(
             geometry,
-            source_scopes,
         )
         if untessellated is None:
             entries.append(
