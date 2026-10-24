@@ -101,11 +101,15 @@ def _hold_conflict_until_authorization_attempt(
     try:
         with connection, connection.cursor() as cursor:
             cursor.execute(
-                "SELECT effect_id FROM effect_intent WHERE effect_id = %s FOR UPDATE",
+                "SELECT effect_id FROM effect_intent WHERE effect_id = %s",
                 (effect_id,),
             )
             if cursor.fetchone() is None:
                 raise AssertionError("conflict target effect is missing")
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(4, hashtext(%s))",
+                (effect_id,),
+            )
             cursor.execute(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM effect_fact WHERE effect_id = %s",
                 (effect_id,),
@@ -191,11 +195,15 @@ def _hold_effect_row(
     try:
         with connection, connection.cursor() as cursor:
             cursor.execute(
-                "SELECT effect_id FROM effect_intent WHERE effect_id = %s FOR UPDATE",
+                "SELECT effect_id FROM effect_intent WHERE effect_id = %s",
                 (effect_id,),
             )
             if cursor.fetchone() is None:
                 raise AssertionError("lock target effect is missing")
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(4, hashtext(%s))",
+                (effect_id,),
+            )
             ready.set()
             if not release.wait(20):
                 raise TimeoutError("effect lock release timed out")

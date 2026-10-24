@@ -248,15 +248,43 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         )
         self.assertIsNotNone(immutable)
         self.assertNotIn("UPDATE", immutable.group(0))
-        self.assertRegex(
+        self.assertIn(
+            "GRANT UPDATE (last_seen_at, closed_at, closure_code)\n"
+            '    ON :"platform_schema".execution_claim TO platform_service;',
             text,
-            r'GRANT SELECT, INSERT, UPDATE ON\s+[^;]*execution_claim',
+        )
+        self.assertNotRegex(
+            text, r"GRANT SELECT, INSERT, UPDATE ON\s+[^;]*execution_claim"
         )
         for table in ("request", "run", "stage", "operation", "run_event"):
             self.assertNotRegex(
                 text,
                 rf":\"platform_schema\"\.{table}\b",
             )
+
+    def test_immutable_fact_tables_reject_update_delete_and_truncate(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        self.assertIn(
+            'CREATE OR REPLACE FUNCTION :"platform_schema".reject_immutable_fact_mutation()',
+            text,
+        )
+        self.assertIn("BEFORE UPDATE OR DELETE", text)
+        self.assertIn("BEFORE TRUNCATE", text)
+        for table in (
+            "run_admission",
+            "artifact",
+            "command",
+            "command_input_artifact",
+            "stage_decision",
+            "stage_candidate",
+            "effect_intent",
+            "effect_fact",
+        ):
+            with self.subTest(table=table):
+                self.assertIn(
+                    f'ON :"platform_schema".{table}',
+                    text,
+                )
 
 
 if __name__ == "__main__":

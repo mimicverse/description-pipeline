@@ -41,8 +41,11 @@ class _Cursor:
         self.queries = []
 
     def execute(self, query, parameters=None):
-        self.current = self.results.pop(0) if self.results else None
-        self.queries.append((" ".join(query.split()), parameters))
+        normalized = " ".join(query.split())
+        self.current = None if normalized.startswith("SELECT pg_advisory_xact_lock") else (
+            self.results.pop(0) if self.results else None
+        )
+        self.queries.append((normalized, parameters))
 
     def fetchone(self):
         if isinstance(self.current, list):

@@ -236,6 +236,117 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".run_display_metadata (
     CHECK ((hidden_at IS NULL) = (hidden_reason IS NULL))
 );
 
+CREATE OR REPLACE FUNCTION :"platform_schema".reject_immutable_fact_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'integrity_constraint_violation',
+        MESSAGE = format(
+            'immutable_fact_mutation_rejected: %I.%I',
+            TG_TABLE_SCHEMA,
+            TG_TABLE_NAME
+        );
+END;
+$$;
+
+DROP TRIGGER IF EXISTS reject_update_delete
+    ON :"platform_schema".run_admission;
+CREATE TRIGGER reject_update_delete
+    BEFORE UPDATE OR DELETE ON :"platform_schema".run_admission
+    FOR EACH ROW EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_truncate
+    ON :"platform_schema".run_admission;
+CREATE TRIGGER reject_truncate
+    BEFORE TRUNCATE ON :"platform_schema".run_admission
+    FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_update_delete
+    ON :"platform_schema".artifact;
+CREATE TRIGGER reject_update_delete
+    BEFORE UPDATE OR DELETE ON :"platform_schema".artifact
+    FOR EACH ROW EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_truncate
+    ON :"platform_schema".artifact;
+CREATE TRIGGER reject_truncate
+    BEFORE TRUNCATE ON :"platform_schema".artifact
+    FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_update_delete
+    ON :"platform_schema".command;
+CREATE TRIGGER reject_update_delete
+    BEFORE UPDATE OR DELETE ON :"platform_schema".command
+    FOR EACH ROW EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_truncate
+    ON :"platform_schema".command;
+CREATE TRIGGER reject_truncate
+    BEFORE TRUNCATE ON :"platform_schema".command
+    FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_update_delete
+    ON :"platform_schema".command_input_artifact;
+CREATE TRIGGER reject_update_delete
+    BEFORE UPDATE OR DELETE ON :"platform_schema".command_input_artifact
+    FOR EACH ROW EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_truncate
+    ON :"platform_schema".command_input_artifact;
+CREATE TRIGGER reject_truncate
+    BEFORE TRUNCATE ON :"platform_schema".command_input_artifact
+    FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_update_delete
+    ON :"platform_schema".stage_decision;
+CREATE TRIGGER reject_update_delete
+    BEFORE UPDATE OR DELETE ON :"platform_schema".stage_decision
+    FOR EACH ROW EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_truncate
+    ON :"platform_schema".stage_decision;
+CREATE TRIGGER reject_truncate
+    BEFORE TRUNCATE ON :"platform_schema".stage_decision
+    FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_update_delete
+    ON :"platform_schema".stage_candidate;
+CREATE TRIGGER reject_update_delete
+    BEFORE UPDATE OR DELETE ON :"platform_schema".stage_candidate
+    FOR EACH ROW EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_truncate
+    ON :"platform_schema".stage_candidate;
+CREATE TRIGGER reject_truncate
+    BEFORE TRUNCATE ON :"platform_schema".stage_candidate
+    FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_update_delete
+    ON :"platform_schema".effect_intent;
+CREATE TRIGGER reject_update_delete
+    BEFORE UPDATE OR DELETE ON :"platform_schema".effect_intent
+    FOR EACH ROW EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_truncate
+    ON :"platform_schema".effect_intent;
+CREATE TRIGGER reject_truncate
+    BEFORE TRUNCATE ON :"platform_schema".effect_intent
+    FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_update_delete
+    ON :"platform_schema".effect_fact;
+CREATE TRIGGER reject_update_delete
+    BEFORE UPDATE OR DELETE ON :"platform_schema".effect_fact
+    FOR EACH ROW EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+DROP TRIGGER IF EXISTS reject_truncate
+    ON :"platform_schema".effect_fact;
+CREATE TRIGGER reject_truncate
+    BEFORE TRUNCATE ON :"platform_schema".effect_fact
+    FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
 DO $$
 BEGIN
     IF to_regclass('run') IS NOT NULL

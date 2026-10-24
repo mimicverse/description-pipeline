@@ -164,18 +164,28 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                 """
             )
 
-    def _insert_run(self, run_id: str) -> None:
+    def _insert_run(
+        self,
+        run_id: str,
+        *,
+        parent_run_id: str | None = None,
+        from_stage: str | None = None,
+        request: dict | None = None,
+    ) -> None:
+        request = request or {"purpose": "engineering"}
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO run_admission (
-                    run_id, request_id, request, request_digest
-                ) VALUES (%s, %s, %s::jsonb, %s)
+                    run_id, request_id, parent_run_id, from_stage, request, request_digest
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
                 """,
                 (
                     run_id,
                     f"request-{run_id}",
-                    '{"purpose":"engineering"}',
+                    parent_run_id,
+                    from_stage,
+                    json.dumps(request),
                     digest({"run_id": run_id}),
                 ),
             )
@@ -1018,7 +1028,6 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                 )
 
             future_run = "run-future-input"
-            self._insert_run(future_run)
             with tempfile.TemporaryDirectory(prefix="future-input-artifact-") as future_directory:
                 future_source = Path(future_directory)
                 (future_source / "repository-snapshot.json").write_text(
@@ -1033,17 +1042,13 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                     producer_tool_sha256=digest({"tool": "repository-reader"}),
                 )
             facts.register_artifact(future_artifact)
-            with self._connect() as connection, connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT request FROM run_admission WHERE run_id = %s",
-                    (future_run,),
-                )
-                request_record = cursor.fetchone()[0]
-                request_record["future_stage_input"] = future_artifact.to_record()
-                cursor.execute(
-                    "UPDATE run_admission SET request = %s::jsonb WHERE run_id = %s",
-                    (json.dumps(request_record), future_run),
-                )
+            self._insert_run(
+                future_run,
+                request={
+                    "purpose": "engineering",
+                    "future_stage_input": future_artifact.to_record(),
+                },
+            )
 
             query = recovery.RECOVERY_ROOT_QUERY.replace("platform.", f'"{self.schema}".')
             recovery_root = recovery.validate_recovery_root(self._query(query)[0][0])
@@ -1170,16 +1175,7 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
     def test_run_control_store_reads_canonical_runs_and_owns_display_metadata(self) -> None:
         self._install_canonical_schema()
         self._insert_run("run-parent")
-        self._insert_run("run-child")
-        with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE run_admission
-                SET parent_run_id = %s, from_stage = 'freeze'
-                WHERE run_id = %s
-                """,
-                ("run-parent", "run-child"),
-            )
+        self._insert_run("run-child", parent_run_id="run-parent", from_stage="freeze")
         store = RunControlStore(self._connect)
 
         summaries = {row.run_id: row for row in store.list_admitted_runs()}
