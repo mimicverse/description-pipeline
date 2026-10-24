@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import shutil
 import tempfile
 import unittest
@@ -27,6 +28,7 @@ from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 from description_pipeline.pipeline.stages.generate import (
     CAPTURE_ARTIFACT_KIND,
     GENERATE_OUTPUT_CONTRACT,
+    GENERATE_RECEIPT,
     GENERATE_REQUEST_SCHEMA,
     GenerateHandler,
 )
@@ -334,6 +336,215 @@ class ProductionWarningTests(unittest.TestCase):
             actual = generation_value_warnings(root)
         expected = native_tolerant_edge_value_warning([source])
         self.assertEqual(actual, expected)
+        self.assertEqual(actual[0]["objects"][0]["fin_endpoint"], "end")
+        self.assertEqual(
+            actual[0]["objects"][0]["topology_endpoint_set"],
+            source["topology_endpoint_set"],
+        )
+
+    def test_fallback_without_v5_identity_does_not_mint_a_warning(self) -> None:
+        source = warning_fixtures.tolerant_warning()
+        geometry = [
+            {
+                "component": "part-1",
+                "tessellation": {
+                    "native_edges": [],
+                    "itessellation": {
+                        "bodies": [
+                            {
+                                "body_type": 1,
+                                "body_index": 0,
+                                "fins": [
+                                    {
+                                        "classification": "native_edge",
+                                        "fin_id": source["fin_id"],
+                                        "edge_reference_sha256": source["edge_reference_sha256"],
+                                        "start_evidence": {
+                                            "tolerant_edge_evidence": None,
+                                            "topology_endpoint_set_accepted": False,
+                                        },
+                                        "end_evidence": {
+                                            "tolerant_edge_evidence": None,
+                                            "topology_endpoint_set_accepted": False,
+                                        },
+                                        "open_edge_boundary_identity": None,
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                },
+            }
+        ]
+        with tempfile.TemporaryDirectory(prefix="generate-fallback-warning-") as temporary:
+            root = Path(temporary)
+            write_json(root / "evidence/raw/geometry.json", geometry)
+            write_json(root / "evidence/raw/source_scopes.json", {"part-1": source["source_scope"]})
+            self.assertEqual(generation_value_warnings(root), [])
+
+
+class GenerateVerifyClosureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from tests.v1.test_pipeline_verify import PipelineVerifyHandlerTests
+
+        self.fixture = PipelineVerifyHandlerTests(methodName="runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.view_index = 0
+
+    def _evaluate(self, generate_ref=None) -> dict:
+        from description_pipeline.interface_records import check_policy_digest
+        from description_pipeline.pipeline.verify import _evaluation_view, _verify_artifact_tree
+        from description_pipeline.stages import CONTRACT_SHA256
+        from description_pipeline.verification.solidworks_urdf import evaluate_bundle
+
+        generate_ref = generate_ref or self.fixture.generate_ref
+        self.view_index += 1
+        root = self.fixture.root / f"independent-view-{self.view_index}"
+        generate_root = (
+            self.fixture.generate_root
+            if generate_ref == self.fixture.generate_ref
+            else self.fixture.store.materialize(
+                generate_ref,
+                self.fixture.root / f"independent-generate-{self.view_index}",
+            )
+        )
+        generate = _verify_artifact_tree(generate_root, generate_ref)
+        capture = _verify_artifact_tree(self.fixture.capture_root, self.fixture.capture_ref)
+        _evaluation_view(
+            root,
+            generate=generate,
+            capture=capture,
+            contract_sha256=CONTRACT_SHA256,
+            policy_sha256=check_policy_digest(),
+        )
+        return evaluate_bundle(root)
+
+    def _reseal(self, name: str, mutation) -> object:
+        from description_pipeline.io import file_digest
+
+        source = self.fixture.root / f"mutated-generate-{name}"
+        shutil.copytree(self.fixture.generate_source, source)
+        urdf = source / "urdf/robot.urdf"
+        model_path = source / "model/robot.json"
+        before_model = model_path.read_bytes()
+        before_urdf = urdf.read_bytes()
+        mutation(model_path=model_path, urdf=urdf)
+        receipt_path = source / GENERATE_RECEIPT
+        receipt = read_data(receipt_path)
+        if model_path.read_bytes() != before_model:
+            model = read_data(model_path)
+            receipt["model_sha256"] = file_digest(model_path)
+            receipt["semantic_identity"] = model.get("semantic_identity")
+        if urdf.read_bytes() != before_urdf:
+            receipt["urdf_sha256"] = file_digest(urdf)
+        write_json(receipt_path, receipt)
+        return self.fixture.store.seal_tree(
+            source,
+            kind="stage_output:generate",
+            producer_run_id=self.fixture.generator_command.run_id,
+            producer_stage="generate",
+            producer_tool_sha256=self.fixture.generate_executor,
+        )
+
+    def test_generate_pair_closes_to_independent_verify_with_per_field_warnings(self) -> None:
+        report = self._evaluate()
+        self.assertIs(report["passed"], True, [check for check in report["checks"] if not check["passed"]])
+        model = read_data(self.fixture.generate_root / "model/robot.json")
+        warnings = model["provenance"]["value_warnings"]
+        by_code = {item["code"]: item for item in warnings}
+        for code in (
+            "display.material_fallback",
+            "display.constant",
+            "geometry.derived_from_native",
+            "physics.derived_from_native",
+            "metadata.non_native",
+        ):
+            self.assertIn(code, by_code)
+            self.assertTrue(by_code[code]["objects"])
+            self.assertTrue(all(item.get("object") for item in by_code[code]["objects"]))
+            self.assertTrue(all(item.get("fields") or item.get("field") for item in by_code[code]["objects"]))
+
+    def test_resealed_generate_semantic_mutations_are_rejected(self) -> None:
+        cases = (
+            (
+                "material-color",
+                lambda model_path, urdf: urdf.write_text(
+                    re.sub(
+                        r'rgba="[^"]+"',
+                        'rgba="1 0 0 1"',
+                        urdf.read_text(encoding="utf-8"),
+                        count=1,
+                    ),
+                    encoding="utf-8",
+                ),
+                "urdf.syntax_names",
+            ),
+            (
+                "object-binding",
+                lambda model_path, urdf: urdf.write_text(
+                    re.sub(
+                        r'visual name="[^"]+"',
+                        'visual name="foreign_visual"',
+                        urdf.read_text(encoding="utf-8"),
+                        count=1,
+                    ),
+                    encoding="utf-8",
+                ),
+                "urdf.syntax_names",
+            ),
+            (
+                "inertia",
+                lambda model_path, urdf: urdf.write_text(
+                    re.sub(
+                        r'ixx="[^"]+"',
+                        'ixx="9.0"',
+                        urdf.read_text(encoding="utf-8"),
+                        count=1,
+                    ),
+                    encoding="utf-8",
+                ),
+                "inertia.arm_link",
+            ),
+            (
+                "axis-transform",
+                lambda model_path, urdf: urdf.write_text(
+                    re.sub(
+                        r'<axis xyz="[^"]+"',
+                        '<axis xyz="0 1 0"',
+                        urdf.read_text(encoding="utf-8"),
+                        count=1,
+                    ),
+                    encoding="utf-8",
+                ),
+                "urdf.syntax_names",
+            ),
+            (
+                "missing-warning",
+                lambda model_path, urdf: write_json(
+                    model_path,
+                    {
+                        **read_data(model_path),
+                        "provenance": {
+                            **read_data(model_path)["provenance"],
+                            "value_warnings": [
+                                item
+                                for item in read_data(model_path)["provenance"]["value_warnings"]
+                                if item["code"] != "display.material_fallback"
+                            ],
+                        },
+                    },
+                ),
+                "provenance.value_warnings",
+            ),
+        )
+        for name, mutation, expected_gate in cases:
+            with self.subTest(name=name):
+                reference = self._reseal(name, mutation)
+                report = self._evaluate(reference)
+                self.assertIs(report["passed"], False)
+                failed = {check["id"] for check in report["checks"] if check["passed"] is not True}
+                self.assertIn(expected_gate, failed)
 
 
 if __name__ == "__main__":
