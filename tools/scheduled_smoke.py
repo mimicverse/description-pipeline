@@ -401,11 +401,13 @@ def _mock_endpoint(
                 if job.get("capture_request") is not None:
                     self._send(200 if job["capture_request"] == requested else 409, _view(job))
                     return
-                definition_archive = bundle_dir / "capture-request.zip"
-                definition_archive.write_bytes(body)
-                destination = bundle_dir / "prepared"
-                shutil.copytree(stage_root, destination)
+                attempt = bundle_dir / ("attempt-" + uuid.uuid4().hex)
+                attempt.mkdir()
+                definition_archive = attempt / "capture-request.zip"
+                destination = attempt / "prepared"
                 try:
+                    definition_archive.write_bytes(body)
+                    shutil.copytree(stage_root, destination)
                     prepared_package = discovery_transfer.stage_capture_request(
                         definition_archive,
                         destination,
@@ -428,7 +430,7 @@ def _mock_endpoint(
                         main_assembly=main_assembly, configuration={}, targets={},
                         prepared=prepared_package, on_event=observed,
                     )
-                    capture_dir = bundle_dir / "capture"
+                    capture_dir = attempt / "capture"
                     with (
                         patch.object(solidworks, "_native_tool_record", return_value=fixture["native_tool"]),
                         patch("description_pipeline.runtime.tool_record", return_value=fixture["native_tool"]),
@@ -440,22 +442,28 @@ def _mock_endpoint(
                             handoff_sha256=job["handoff_sha256"],
                             upload_sha256=job["request"]["upload_sha256"],
                         )
-                    if result.get("native_complete") is not True:
+                    receipt = result.get("capture_archive")
+                    if (
+                        result.get("native_complete") is not True
+                        or result.get("state") != "native_complete"
+                        or not isinstance(receipt, dict)
+                    ):
                         raise RuntimeError(f"Control fixture capture failed: {result.get('error')}")
+                    archive_bytes = (capture_dir / receipt["name"]).read_bytes()
+                    native_stages = json.loads((capture_dir / "reports/native-stages.json").read_text())
                 except Exception as error:
                     shutil.rmtree(destination, ignore_errors=True)
                     self._send(409, {"error": str(error)})
                     return
                 state["definition_posts"].append({"prepared_sha256": prepared, "size": len(body)})
-                receipt = result["capture_archive"]
-                job["_artifacts"][receipt["name"]] = (capture_dir / receipt["name"]).read_bytes()
+                job["_artifacts"][receipt["name"]] = archive_bytes
                 job.update(
                     capture_request=requested,
                     prepared_dir=str(package),
                     prepared_files=dict(prepared_files),
                 )
                 job["status"] = "native_complete"
-                job["stages"] = json.loads((capture_dir / "reports/native-stages.json").read_text())
+                job["stages"] = native_stages
                 job["events"] = list(job["stages"]["events"])
                 job["result"] = result
                 job["error"] = None

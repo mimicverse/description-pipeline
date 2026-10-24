@@ -11,6 +11,8 @@ import hashlib
 import json
 import shutil
 import sys
+from .native_transfer import load_native_receipts
+
 from pathlib import Path
 
 from . import __version__
@@ -926,7 +928,6 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
     from .verification.solidworks_urdf import (
         check_bundle,
         evaluate_bundle,
-        load_native_receipts,
         rebuilt_definition,
         require_qualified_report,
     )

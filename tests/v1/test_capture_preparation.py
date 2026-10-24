@@ -721,6 +721,21 @@ class CapturePreparationTests(unittest.TestCase):
         value["document_states"] = _document_state_snapshots(preparation)
         self.validate(value)
 
+    def test_session_active_configuration_cannot_shift_in_both_final_windows(self) -> None:
+        value = payload(virtual_reuse=True)
+        state = self.preparation(value)["part_states_after"][0]["state"]
+        state["configurations"].append({
+            "name": "Parked", "needs_rebuild": False, "add_rebuild_save_mark": False,
+        })
+        value["document_states"] = _document_state_snapshots(self.preparation(value))
+        self.validate(value)
+        for snapshot in value["document_states"].values():
+            for document in snapshot["documents"]:
+                if document["document_type"] == 1:
+                    document["state"]["configuration"] = "Parked"
+        with self.assertRaisesRegex(PipelineError, "rebuild baseline"):
+            self.validate(value)
+
     def test_session_path_may_change_only_with_current_native_owner(self) -> None:
         value = payload(virtual_reuse=True)
         pristine = value["document_states"]["document_state_after_pristine_readout.json"]

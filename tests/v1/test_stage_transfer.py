@@ -610,6 +610,40 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(manifest["native_stage_scope"], list(native_transfer.NATIVE_STAGE_SCOPE))
         self.assertEqual(manifest["main_assembly_sha256"], manifest["files"]["input/cad/" + MAIN_ASSEMBLY])
 
+    def test_archive_and_in_memory_receipts_use_the_same_manifest_verifier(self) -> None:
+        seal(self.root, self.archive)
+        with mock.patch.object(native_transfer, "verify_transfer", wraps=native_transfer.verify_transfer) as verify:
+            admit(self.archive, self.base / "public-api")
+        self.assertEqual(verify.call_count, 1)
+        for label, mutation in (
+            ("unknown", lambda manifest: {**manifest, "unexpected_field": True}),
+            ("scope", lambda manifest: {**manifest, "native_stage_scope": ["capture"]}),
+        ):
+            with self.subTest(case=label):
+                broken = self.base / f"manifest-{label}.zip"
+                repack(self.archive, broken, {}, manifest_mutate=mutation)
+                destination = self.base / f"reject-{label}"
+                with self.assertRaises(PipelineError):
+                    admit(broken, destination)
+                self.assertFalse(destination.exists())
+                with zipfile.ZipFile(broken) as archive:
+                    receipts = {
+                        "native_tool_bytes": archive.read("reports/native-tool.json"),
+                        "native_stages_bytes": archive.read("reports/native-stages.json"),
+                        "transfer_manifest_bytes": archive.read(transfer.CAPTURE_MANIFEST),
+                    }
+                with (
+                    mock.patch.object(
+                        native_transfer, "verify_transfer", wraps=native_transfer.verify_transfer,
+                    ) as verify,
+                    self.assertRaises(PipelineError),
+                ):
+                    native_transfer.validate_native_receipts(self.root, receipts)
+                self.assertEqual(verify.call_count, 1)
+
+    def test_complete_roundtrip_preserves_every_closed_member(self) -> None:
+        manifest = seal(self.root, self.archive)
+
         destination = self.base / "admitted"
         admitted = admit(self.archive, destination)
         self.assertEqual(admitted, manifest)
@@ -715,7 +749,7 @@ class StageTransferTests(unittest.TestCase):
             with self.subTest(case=label):
                 broken = self.base / f"{label}.zip"
                 raw_copy(self.archive, broken, **arguments)
-                with self.assertRaisesRegex(PipelineError, "inventory differs"):
+                with self.assertRaisesRegex(PipelineError, "inventory differs|provenance is incomplete"):
                     admit(broken, self.base / f"out-{label}")
 
     def test_edited_or_replaced_member_bytes_are_refused(self) -> None:
@@ -725,7 +759,7 @@ class StageTransferTests(unittest.TestCase):
         broken = self.base / "edited.zip"
         # Same length so the size invariant still holds and the content hash is what rejects it.
         raw_copy(self.archive, broken, replace={"input/handoff.json": b"X" * len(original)})
-        with self.assertRaisesRegex(PipelineError, "hash differs"):
+        with self.assertRaisesRegex(PipelineError, "differs from the transfer manifest"):
             admit(broken, self.base / "out-edited")
 
     def test_self_consistent_but_incomplete_stage_receipts_are_refused(self) -> None:
@@ -860,7 +894,10 @@ class StageTransferTests(unittest.TestCase):
             admit(broken, self.base / "out-manifest")
 
     def test_size_and_file_limits_are_enforced(self) -> None:
-        with mock.patch.object(transfer, "MAX_TRANSFER_FILES", 1), self.assertRaisesRegex(PipelineError, "file limit"):
+        with (
+            mock.patch.object(native_transfer, "MAX_TRANSFER_FILES", 1),
+            self.assertRaisesRegex(PipelineError, "file limit"),
+        ):
             seal(self.root, self.base / "limit.zip")
         seal(self.root, self.archive)
         with mock.patch.object(transfer, "MAX_TRANSFER_BYTES", 8), self.assertRaisesRegex(PipelineError, "size limit"):

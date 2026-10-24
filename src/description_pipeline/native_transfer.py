@@ -16,7 +16,7 @@ from pathlib import Path
 from packaging.utils import canonicalize_name
 
 from . import __version__
-from .delivery import PIPELINE_ID, TRANSFER_FILES
+from .delivery import PIPELINE_ID, TRANSFER_FILES, CAPTURE_MANIFEST
 from .interface_records import record_archive_path, validate_source_record
 from .io import (
     PipelineError,
@@ -35,9 +35,6 @@ from .sources.snapshot import verify_snapshot
 from .sources.solidworks.handoff import MAX_HANDOFF_BYTES, MAX_HANDOFF_FILES
 from .sources.solidworks.revision import package_inventory
 from .stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA, stage_view
-
-CAPTURE_MANIFEST = "transfer-manifest.json"
-
 
 TRANSFER_SCHEMA = "solidworks-to-urdf.transfer/v1"
 
@@ -80,7 +77,6 @@ _TOOL_SCHEMA = TOOL_SCHEMA
 _STAGE_DEFINITIONS = {stage["id"]: stage for stage in CONTRACT["stages"]}
 
 
-_READ_CHUNK = 1024 * 1024
 
 
 def _require(condition, message: str) -> None:
@@ -1113,12 +1109,68 @@ def _validate_capture(
     }
 
 
+def capture_manifest(
+    root: Path, *, run_id: str, handoff_sha256: str, upload_sha256: str,
+    main_assembly: str, native_tool: dict,
+) -> dict:
+    """Build and validate one closed native payload with the shared verifier."""
+
+    root = Path(root)
+    _require(isinstance(run_id, str) and run_id.strip(), "run_id must be a nonempty string")
+    _require(_is_sha256(handoff_sha256), "handoff_sha256 must be a sha256 digest")
+    _require(_is_sha256(upload_sha256), "upload_sha256 must be a sha256 digest")
+    _require(isinstance(main_assembly, str) and main_assembly.strip(), "main_assembly must be a relative file name")
+    artifact_path_parts(main_assembly)
+
+    files = inventory(root)
+    # Sealing outputs (the archive, the optional sidecar manifest) and the live stage view are
+    # never payload: Linux rewrites the live view after admission.
+    ignored = {CAPTURE_MANIFEST, *_LIVE_REPORTS}
+    files = {name: checksum for name, checksum in files.items() if name not in ignored}
+    _require(files, "Capture root contains no files to seal")
+    _require(len(files) <= MAX_TRANSFER_FILES, "Capture exceeds the transfer file limit")
+    total_bytes = sum(confined(root, name).stat().st_size for name in files)
+    _require(total_bytes <= MAX_TRANSFER_BYTES, "Capture exceeds the transfer size limit")
+    stray = sorted(name for name in files if not _allowed_payload(name))
+    _require(not stray, f"Capture contains files outside the transfer payload: {stray[:5]}")
+    for name in _REQUIRED_REPORTS:
+        _require(name in files, f"Capture lacks required report: {name}")
+    _require(any(name == "input" or name.startswith("input/") for name in files), "Capture lacks the archived input")
+    _require(
+        any(name == "evidence" or name.startswith("evidence/") for name in files),
+        "Capture lacks the evidence snapshot",
+    )
+
+    manifest = {
+        "schema_version": TRANSFER_SCHEMA,
+        "run_id": run_id,
+        "handoff_sha256": handoff_sha256,
+        "upload_sha256": upload_sha256,
+        "main_assembly": main_assembly,
+        "main_assembly_sha256": file_digest(confined(root, "input/cad/" + main_assembly)),
+        "native_tool": native_tool,
+        "native_tool_sha256": digest(native_tool),
+        "files": files,
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "native_stage_scope": list(NATIVE_STAGE_SCOPE),
+    }
+    verify_transfer(root, transfer_manifest=manifest, capture_only=True)
+    return manifest
+
+
 def verify_transfer(
     bundle: Path,
     *,
     regenerated: tuple[str, ...] = (),
     carried: dict[str, str] | None = None,
     native_receipts: dict | None = None,
+    transfer_manifest: dict | None = None,
+    capture_only: bool = False,
+    expected_run_id: str | None = None,
+    expected_handoff_sha256: str | None = None,
+    expected_main_assembly: str | None = None,
+    expected_native_tool: dict | None = None,
     expected_upload_sha256: str | None = None,
     native_prepared_dir: str | None = None,
     native_prepared_files: dict[str, str] | None = None,
@@ -1144,6 +1196,10 @@ def verify_transfer(
     bundle = Path(bundle)
     supplied = {}
     team_receipts = {}
+    _require(
+        native_receipts is None or transfer_manifest is None,
+        "Transfer manifest cannot have two receipt sources",
+    )
     if native_receipts is not None:
         _require(isinstance(native_receipts, dict), "Native receipts must be supplied as an object")
         for name in ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes"):
@@ -1176,6 +1232,9 @@ def verify_transfer(
             )
         except PipelineError as error:
             raise PipelineError("Native receipts are not UTF-8 JSON") from error
+    elif transfer_manifest is not None:
+        receipt_manifest = transfer_manifest
+        receipt_native_tool = receipt_stages = None
     else:
         present = [name for name in TRANSFER_FILES if (bundle / name).is_file()]
         if not present:
@@ -1209,6 +1268,17 @@ def verify_transfer(
     _require(manifest.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
     files = manifest.get("files")
     _require(isinstance(files, dict) and files, "Transfer manifest declares no files")
+    if capture_only:
+        ignored = {CAPTURE_MANIFEST}
+        if transfer_manifest is not None:
+            ignored.update(_LIVE_REPORTS)
+        actual = set(inventory(bundle)) - ignored
+        _require(
+            actual == set(files),
+            "Transfer archive inventory differs from its manifest: "
+            f"missing={sorted(set(files) - actual)[:5]}, extra={sorted(actual - set(files))[:5]}",
+        )
+    _require(len(files) <= MAX_TRANSFER_FILES, "Capture exceeds the transfer file limit")
     _require(
         set(_REQUIRED_REPORTS) <= set(files),
         f"Transfer manifest omits required capture reports: {sorted(set(_REQUIRED_REPORTS) - set(files))}",
@@ -1343,6 +1413,14 @@ def verify_transfer(
     )
     if expected_upload_sha256 is not None:
         _require(upload == expected_upload_sha256, "Transfer binds another upload")
+    if expected_run_id is not None:
+        _require(run_id == expected_run_id, "Transfer belongs to another run")
+    if expected_handoff_sha256 is not None:
+        _require(handoff == expected_handoff_sha256, "Transfer binds another handoff")
+    if expected_main_assembly is not None:
+        _require(main_assembly == expected_main_assembly, "Transfer binds another main assembly")
+    if expected_native_tool is not None:
+        _require(manifest.get("native_tool") == expected_native_tool, "Transfer carries another native tool record")
     try:
         canonical_run_id = str(uuid.UUID(run_id))
     except (ValueError, AttributeError, TypeError) as error:
@@ -1369,6 +1447,7 @@ def verify_transfer(
         "handoff_sha256": handoff,
         "upload_sha256": upload,
         "main_assembly": main_assembly,
+        "main_assembly_sha256": validated["main_assembly_sha256"],
         "files": len(files),
         "source_revision_id": validated["source_revision_id"],
         "hardware_id": validated["hardware_id"],
@@ -1432,4 +1511,30 @@ def validate_native_receipts(
         "native_stages": stages,
         "transfer_manifest": transfer,
         **summary,
+    }
+
+
+def load_native_receipts(root: Path) -> dict[str, bytes] | None:
+    """Load the complete native receipt triplet from one delivery boundary."""
+
+    names = {
+        "native_tool_bytes": "reports/native-tool.json",
+        "native_stages_bytes": "reports/native-stages.json",
+        "transfer_manifest_bytes": "transfer-manifest.json",
+        "structural_team_md_bytes": "reports/structural-team.md",
+        "structural_team_json_bytes": "reports/structural-team.json",
+    }
+    paths = {
+        name: confined(root, relative, exists=False)
+        for name, relative in names.items()
+    }
+    required = ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes")
+    present = [paths[name].is_file() for name in required]
+    if not any(present):
+        return None
+    _require(all(present), "Native receipt triplet is incomplete")
+    return {
+        name: path.read_bytes()
+        for name, path in paths.items()
+        if path.is_file()
     }

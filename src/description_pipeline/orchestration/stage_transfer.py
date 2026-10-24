@@ -12,7 +12,6 @@ import shutil
 import stat
 import tempfile
 import zipfile
-from contextlib import suppress
 from pathlib import Path
 
 from ..build.archive import ZIP_EPOCH
@@ -21,28 +20,19 @@ from ..io import (
     artifact_path_parts,
     canonical,
     confined,
-    digest,
-    file_digest,
-    inventory,
-    parse_data,
+    read_data,
 )
-from ..native_transfer import (
-    _LIVE_REPORTS,
-    _READ_CHUNK,
-    _REQUIRED_REPORTS,
-    CAPTURE_MANIFEST,
-    MAX_MANIFEST_BYTES,
-    MAX_TRANSFER_BYTES,
-    MAX_TRANSFER_FILES,
-    NATIVE_STAGE_SCOPE,
-    TRANSFER_SCHEMA,
-    _allowed_payload,
-    _is_sha256,
-    _require,
-    _validate_capture,
-)
+from .. import native_transfer
+from ..native_transfer import CAPTURE_MANIFEST, MAX_MANIFEST_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES
+
 
 CAPTURE_ARCHIVE = "native-evidence.zip"
+_READ_CHUNK = 1024 * 1024
+
+
+def _require(condition, message):
+    if not condition:
+        raise PipelineError(message)
 
 
 def seal_capture(
@@ -59,35 +49,8 @@ def seal_capture(
 
     root = Path(root)
     archive = Path(archive)
-    _require(isinstance(run_id, str) and run_id.strip(), "run_id must be a nonempty string")
-    _require(_is_sha256(handoff_sha256), "handoff_sha256 must be a sha256 digest")
-    _require(_is_sha256(upload_sha256), "upload_sha256 must be a sha256 digest")
-    _require(isinstance(main_assembly, str) and main_assembly.strip(), "main_assembly must be a relative file name")
-    artifact_path_parts(main_assembly)
     _require(not archive.exists(), f"Transfer archive already exists: {archive}")
-
-    files = inventory(root)
-    # Sealing outputs (the archive, the optional sidecar manifest) and the live stage view are
-    # never payload: Linux rewrites the live view after admission.
-    ignored = {CAPTURE_MANIFEST, *_LIVE_REPORTS}
-    with suppress(ValueError):
-        ignored.add(archive.resolve().relative_to(root.resolve()).as_posix())
-    files = {name: checksum for name, checksum in files.items() if name not in ignored}
-    _require(files, "Capture root contains no files to seal")
-    _require(len(files) <= MAX_TRANSFER_FILES, "Capture exceeds the transfer file limit")
-    total_bytes = sum(confined(root, name).stat().st_size for name in files)
-    _require(total_bytes <= MAX_TRANSFER_BYTES, "Capture exceeds the transfer size limit")
-    stray = sorted(name for name in files if not _allowed_payload(name))
-    _require(not stray, f"Capture contains files outside the transfer payload: {stray[:5]}")
-    for name in _REQUIRED_REPORTS:
-        _require(name in files, f"Capture lacks required report: {name}")
-    _require(any(name == "input" or name.startswith("input/") for name in files), "Capture lacks the archived input")
-    _require(
-        any(name == "evidence" or name.startswith("evidence/") for name in files),
-        "Capture lacks the evidence snapshot",
-    )
-
-    validated = _validate_capture(
+    manifest = native_transfer.capture_manifest(
         root,
         run_id=run_id,
         handoff_sha256=handoff_sha256,
@@ -95,20 +58,7 @@ def seal_capture(
         main_assembly=main_assembly,
         native_tool=native_tool,
     )
-    manifest = {
-        "schema_version": TRANSFER_SCHEMA,
-        "run_id": run_id,
-        "handoff_sha256": handoff_sha256,
-        "upload_sha256": upload_sha256,
-        "main_assembly": main_assembly,
-        "main_assembly_sha256": validated["main_assembly_sha256"],
-        "native_tool": native_tool,
-        "native_tool_sha256": digest(native_tool),
-        "files": files,
-        "file_count": len(files),
-        "total_bytes": total_bytes,
-        "native_stage_scope": list(NATIVE_STAGE_SCOPE),
-    }
+    files = manifest["files"]
     archive.parent.mkdir(parents=True, exist_ok=True)
     try:
         _write_streaming_zip(archive, root, files, canonical(manifest))
@@ -158,7 +108,7 @@ def _write_streaming_zip(archive: Path, root: Path, files: dict[str, str], manif
         target.writestr(manifest_info, manifest_bytes)
 
 
-def _extract(archive: Path, staging: Path) -> dict:
+def _extract(archive: Path, staging: Path) -> None:
     try:
         with zipfile.ZipFile(archive) as source:
             infos = source.infolist()
@@ -192,49 +142,8 @@ def _extract(archive: Path, staging: Path) -> dict:
             _require(CAPTURE_MANIFEST in names, "Transfer archive lacks transfer-manifest.json")
             manifest_info = source.getinfo(CAPTURE_MANIFEST)
             _require(manifest_info.file_size <= MAX_MANIFEST_BYTES, "Transfer manifest exceeds the size limit")
-            manifest_bytes = source.read(manifest_info)
-            try:
-                manifest = parse_data(manifest_bytes, Path(CAPTURE_MANIFEST))
-            except (UnicodeDecodeError, ValueError) as error:
-                raise PipelineError(f"Transfer manifest is not readable JSON: {error}") from error
-            _require(isinstance(manifest, dict), "Transfer manifest must be an object")
-            _require(manifest.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
-            files = manifest.get("files")
-            _require(isinstance(files, dict) and files, "Transfer manifest declares no files")
-            members = {info.filename for info in infos if info.filename != CAPTURE_MANIFEST}
-            missing = sorted(set(files) - members)
-            extra = sorted(members - set(files))
-            _require(
-                not missing and not extra,
-                f"Transfer archive inventory differs from its manifest: missing={missing[:5]}, extra={extra[:5]}",
-            )
-            stray = sorted(name for name in members if not _allowed_payload(name))
-            _require(not stray, f"Transfer contains members outside the capture payload: {stray[:5]}")
-            _require(
-                manifest.get("file_count") == len(files),
-                "Transfer manifest file count differs from its inventory",
-            )
-            _require(
-                manifest.get("total_bytes") == sum(source.getinfo(name).file_size for name in files),
-                "Transfer manifest size differs from its members",
-            )
-            _require(
-                manifest.get("native_stage_scope") == list(NATIVE_STAGE_SCOPE),
-                "Transfer manifest declares another native stage scope",
-            )
-            _require(_is_sha256(manifest.get("handoff_sha256")), "Transfer manifest handoff digest is not a sha256")
-            _require(
-                manifest.get("native_tool_sha256") == digest(manifest.get("native_tool")),
-                "Transfer manifest native tool digest differs from its record",
-            )
-            for name, checksum in files.items():
-                artifact_path_parts(name)
-                _require(_is_sha256(checksum), f"Transfer manifest hash is not a sha256: {name}")
-
             total_written = 0
             for info in infos:
-                if info.filename == CAPTURE_MANIFEST:
-                    continue
                 target = staging.joinpath(*artifact_path_parts(info.filename))
                 target.parent.mkdir(parents=True, exist_ok=True)
                 written = 0
@@ -251,15 +160,6 @@ def _extract(archive: Path, staging: Path) -> dict:
                         )
                         sink.write(chunk)
                 _require(written == info.file_size, f"Transfer member size changed while reading: {info.filename}")
-            for name, checksum in files.items():
-                _require(
-                    file_digest(staging.joinpath(*artifact_path_parts(name))) == checksum,
-                    f"Transfer member hash differs from its manifest: {name}",
-                )
-            # The admitted root must retain the exact canonical manifest bytes for downstream
-            # seeding, subject binding and publication.
-            (staging / CAPTURE_MANIFEST).write_bytes(manifest_bytes)
-            return manifest
     except zipfile.BadZipFile as error:
         raise PipelineError(f"Transfer archive is not a readable zip: {error}") from error
 
@@ -286,29 +186,19 @@ def admit_capture(
     staging = Path(tempfile.mkdtemp(prefix="transfer-", dir=destination.parent))
     installed = False
     try:
-        manifest = _extract(archive, staging)
-        _require(manifest.get("run_id") == expected_run_id, "Transfer belongs to another run")
-        _require(manifest.get("handoff_sha256") == expected_handoff_sha256, "Transfer binds another handoff")
-        _require(manifest.get("upload_sha256") == expected_upload_sha256, "Transfer binds another upload")
-        _require(manifest.get("main_assembly") == expected_main_assembly, "Transfer binds another main assembly")
-        _require(
-            manifest.get("native_tool") == expected_native_tool,
-            "Transfer carries another native tool record",
-        )
-        validated = _validate_capture(
+        _extract(archive, staging)
+        native_transfer.verify_transfer(
             staging,
-            run_id=expected_run_id,
-            handoff_sha256=expected_handoff_sha256,
-            upload_sha256=expected_upload_sha256,
-            main_assembly=expected_main_assembly,
-            native_tool=expected_native_tool,
+            expected_run_id=expected_run_id,
+            expected_handoff_sha256=expected_handoff_sha256,
+            expected_upload_sha256=expected_upload_sha256,
+            expected_main_assembly=expected_main_assembly,
+            expected_native_tool=expected_native_tool,
             native_prepared_dir=expected_prepared_dir,
             native_prepared_files=expected_prepared_files,
+            capture_only=True,
         )
-        _require(
-            manifest.get("main_assembly_sha256") == validated["main_assembly_sha256"],
-            "Transfer main assembly hash differs from the capture input",
-        )
+        manifest = read_data(staging / CAPTURE_MANIFEST)
         os.replace(staging, destination)
         installed = True
         return manifest

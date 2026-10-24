@@ -222,7 +222,8 @@ def _stamp(root: Path, receipt: dict) -> None:
 
 
 def _check(root: Path) -> dict:
-    from .verification.solidworks_urdf import check_bundle, load_native_receipts
+    from .verification.solidworks_urdf import check_bundle
+    from .native_transfer import load_native_receipts
 
     return check_bundle(
         root,
@@ -331,6 +332,8 @@ def _failed_run(staging, output, receipt, event, error):
         with contextlib.suppress(Exception):
             event({"stage": phase, "state": "failed"})
     receipt.update(passed=False, state="failed", stage=phase, error=str(error))
+    if "native_complete" in receipt:
+        receipt["native_complete"] = False
     if hasattr(error, "code"):
         receipt["error_code"] = error.code
     detail = getattr(error, "detail", None) or getattr(error, "details", None)

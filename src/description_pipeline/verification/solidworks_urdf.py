@@ -20,6 +20,7 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
+from ..native_transfer import load_native_receipts
 from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
 from ..geometry.native_u import (
@@ -1501,6 +1502,37 @@ def _capture_preparation(root, manifest):
             ),
         }
 
+    def stable_document_key(key, document_type, bound_rows, label):
+        scopes = {item["storage_scope"] for item in bound_rows}
+        _require(len(scopes) == 1, f"{label} mixed file and session identity for one document")
+        scope = next(iter(scopes))
+        if scope == "file":
+            stable_key = ("file", key)
+        else:
+            provenance = {item["provenance_state"] for item in bound_rows}
+            owners = {item["owner_sha256"] for item in bound_rows}
+            _require(
+                len(provenance) == 1 and len(owners) == 1,
+                f"{label} session document has ambiguous provenance",
+            )
+            stable_key = (
+                "session",
+                next(iter(provenance)),
+                document_type,
+                tuple(sorted(item["instance"] for item in bound_rows)),
+                tuple(sorted(item["referenced_configuration"] for item in bound_rows)),
+                tuple(sorted({normalized_path(item["owner_document_path"]) for item in bound_rows})),
+                next(iter(owners)),
+            )
+            for item in bound_rows:
+                owner_key = normalized_path(item["owner_document_path"])
+                _require(
+                    owner_key in before_sources
+                    and before_sources[owner_key]["sha256"] == item["owner_sha256"],
+                    f"{label} session owner bytes are not bound to the captured source",
+                )
+        return stable_key
+
     def document_snapshot(relative: str, label: str):
         payload = read_data(confined(root, "evidence/raw/" + relative))
         _require(
@@ -1594,34 +1626,7 @@ def _capture_preparation(root, manifest):
                 all(item["document_type"] == document_type for item in bound_rows),
                 f"{label} loaded a document with conflicting native types: {state['path']}",
             )
-            scopes = {item["storage_scope"] for item in bound_rows}
-            _require(len(scopes) == 1, f"{label} mixed file and session identity for one document")
-            scope = next(iter(scopes))
-            if scope == "file":
-                stable_key = ("file", key)
-            else:
-                provenance = {item["provenance_state"] for item in bound_rows}
-                owners = {item["owner_sha256"] for item in bound_rows}
-                _require(
-                    len(provenance) == 1 and len(owners) == 1,
-                    f"{label} session document has ambiguous provenance",
-                )
-                stable_key = (
-                    "session",
-                    next(iter(provenance)),
-                    document_type,
-                    tuple(sorted(item["instance"] for item in bound_rows)),
-                    tuple(sorted(item["referenced_configuration"] for item in bound_rows)),
-                    tuple(sorted({normalized_path(item["owner_document_path"]) for item in bound_rows})),
-                    next(iter(owners)),
-                )
-                for item in bound_rows:
-                    owner_key = normalized_path(item["owner_document_path"])
-                    _require(
-                        owner_key in before_sources
-                        and before_sources[owner_key]["sha256"] == item["owner_sha256"],
-                        f"{label} session owner bytes are not bound to the captured source",
-                    )
+            stable_key = stable_document_key(key, document_type, bound_rows, label)
             _require(stable_key not in signatures, f"{label} repeats a stable document identity")
             signatures[stable_key] = engineering_state_signature(state)
             if key == top_key:
@@ -1641,13 +1646,22 @@ def _capture_preparation(root, manifest):
     )
     baseline_states = {}
     for row in [*assembly_after, *part_rows.values()]:
-        baseline_states[("file", normalized_path(row["path"]))] = engineering_state_signature(row["state"])
+        key = normalized_path(row["path"])
+        bound_rows = [
+            item for item in topology_after
+            if item["storage_scope"] != "suppressed" and normalized_path(item["document_path"]) == key
+        ]
+        identity = stable_document_key(key, bound_rows[0]["document_type"], bound_rows, "Capture baseline")
+        baseline_states[identity] = engineering_state_signature(row["state"])
+    _require(
+        set(baseline_states) == set(after_reads_states),
+        "Read boundary differs from the complete rebuild baseline",
+    )
     for key, signature in baseline_states.items():
-        if key[1] in before_sources:
-            _require(
-                after_reads_states.get(key) == signature,
-                f"Loaded document state differs from its rebuild baseline: {key[1]}",
-            )
+        _require(
+            after_reads_states[key] == signature,
+            f"Loaded document state differs from its rebuild baseline: {key}",
+        )
 
     parents_by_document = {}
     for item in not_top:
@@ -2281,32 +2295,6 @@ def _native_receipts_evidence(root, receipts):
         "Native receipt does not bind this delivery's release identity",
     )
     return evidence
-
-
-def load_native_receipts(root: Path) -> dict[str, bytes] | None:
-    """Load the complete native receipt triplet from one delivery boundary."""
-
-    names = {
-        "native_tool_bytes": "reports/native-tool.json",
-        "native_stages_bytes": "reports/native-stages.json",
-        "transfer_manifest_bytes": "transfer-manifest.json",
-        "structural_team_md_bytes": "reports/structural-team.md",
-        "structural_team_json_bytes": "reports/structural-team.json",
-    }
-    paths = {
-        name: confined(root, relative, exists=False)
-        for name, relative in names.items()
-    }
-    required = ("native_tool_bytes", "native_stages_bytes", "transfer_manifest_bytes")
-    present = [paths[name].is_file() for name in required]
-    if not any(present):
-        return None
-    _require(all(present), "Native receipt triplet is incomplete")
-    return {
-        name: path.read_bytes()
-        for name, path in paths.items()
-        if path.is_file()
-    }
 
 
 def _tool(root, native_receipts=None):

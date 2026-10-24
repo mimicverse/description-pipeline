@@ -28,12 +28,13 @@ SOURCE_RECORD = "input/source.json"
 TOOL_RECORD = "tool.json"
 
 #: The immutable native provenance triplet consumed by capture transfer.
-TRANSFER_FILES = ("reports/native-tool.json", "reports/native-stages.json", "transfer-manifest.json")
+CAPTURE_MANIFEST = "transfer-manifest.json"
+TRANSFER_FILES = ("reports/native-tool.json", "reports/native-stages.json", CAPTURE_MANIFEST)
 
 #: Entries a stamped pipeline output root may carry beyond the strict delivery
 #: layout: the rendered reports directory, the sealed transfer sidecar and the
 #: repository checkout attributes/readme.
-STAMPED_EXTRA = ("reports", "transfer-manifest.json", ".gitattributes", "README.md")
+STAMPED_EXTRA = ("reports", CAPTURE_MANIFEST, ".gitattributes", "README.md")
 
 
 def writable_output(path: Path) -> bool:
