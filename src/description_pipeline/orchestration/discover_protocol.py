@@ -312,7 +312,7 @@ class ArchiveDiscoverAdapter:
         self.on_activity = on_activity
         self.invocations: list[dict] = []
 
-    def invoke(
+    def submit(
         self,
         source_archive: Path,
         request: NativeDiscoverRequest,

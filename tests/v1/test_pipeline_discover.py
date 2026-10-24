@@ -7,6 +7,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +28,10 @@ from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
     StageCandidate,
     StageCommand,
+    StageDeferral,
     StageDecision,
+    StageEffectWait,
+    StagePending,
     StageResult,
     StageFailure,
 )
@@ -48,6 +52,7 @@ from description_pipeline.schemas import (
     NATIVE_DISCOVER_EFFECT_SCHEMA,
     NATIVE_DISCOVER_REQUEST_SCHEMA,
     PLATFORM_CONFIG_SCHEMA,
+    STAGE_EFFECT_WAIT_SCHEMA,
     STAGE_RESULT_SCHEMA,
     TOOL_SCHEMA,
 )
@@ -194,12 +199,33 @@ class _MemoryEffectPort:
                 "outbound": outbound.set_sha256,
             }
         )
+        target_value = dict(target)
+        expected_value = dict(expected_state)
+        expected_state_digest = digest(expected_value)
         self.ledger.by_key[effect_key] = {
             "effect_id": effect_id,
             "command_id": self.command.command_id,
+            "effect_kind": effect_kind,
+            "expected_state": expected_value,
+            "expected_state_digest": expected_state_digest,
+            "intent_identity_digest": digest(
+                {
+                    "command_id": self.command.command_id,
+                    "effect_id": effect_id,
+                    "effect_key": effect_key,
+                    "effect_kind": effect_kind,
+                    "expected_state": expected_value,
+                    "expected_state_digest": expected_state_digest,
+                    "outbound_artifact_id": outbound.artifact_id,
+                    "outbound_digest": outbound.set_sha256,
+                    "target": target_value,
+                }
+            ),
+            "outbound": outbound,
             "state": EffectState.PREPARED,
             "outbound_sha256": outbound.set_sha256,
             "payload": None,
+            "target": target_value,
         }
         return SimpleNamespace(effect_id=effect_id)
 
@@ -265,6 +291,7 @@ class _MemoryEffectPort:
             state=entry["state"],
             decisive_fact=None,
             payload_artifact=entry["payload"],
+            outbound_artifact=entry.get("outbound"),
         )
 
     def effect_settlement_for_key(self, effect_key):
@@ -550,6 +577,25 @@ class DiscoverDomainTests(unittest.TestCase):
         self.harness = DiscoverHarness(Path(self.temporary.name))
         self.command = self.harness.command()
 
+    def _resume_wait(self) -> StageEffectWait:
+        effect_key = f"native-discover:{self.command.command_id}"
+        entry = self.harness.effects.by_key[effect_key]
+        outbound = entry["outbound"]
+        return StageEffectWait(
+            schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+            run_id=self.command.run_id,
+            stage="discover",
+            command_id=self.command.command_id,
+            request_digest=self.command.request_digest,
+            effect_id=entry["effect_id"],
+            effect_key=effect_key,
+            effect_kind="native_operation",
+            intent_identity_digest=entry["intent_identity_digest"],
+            outbound_artifact_id=outbound.artifact_id,
+            outbound_digest=outbound.set_sha256,
+            expected_state_digest=entry["expected_state_digest"],
+        )
+
     def test_complete_sourceset_transfers_once_and_ends_at_discover_result(self) -> None:
         backend = CountingBackend(copy.deepcopy(self.harness.record))
         port = self.harness.port(backend=backend)
@@ -573,6 +619,97 @@ class DiscoverDomainTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertIn("spare/base.SLDPRT", result["selection"]["files"])
         self.assertNotIn("unused/base.SLDPRT", result["selection"]["files"])
+
+    def test_nonterminal_native_submission_returns_one_effect_deferral(self) -> None:
+        backend = CountingBackend(copy.deepcopy(self.harness.record))
+        adapter = self.harness.port(backend=backend)
+        claim, effects = self.harness.effect_port(self.command)
+        with patch.object(adapter, "submit", return_value=None) as submit:
+            execution = DiscoverHandler(adapter).execute(
+                self.command,
+                claim,
+                self.harness.workspace(),
+                effects=effects,
+            )
+
+        self.assertIsInstance(execution, StageDeferral)
+        effect_key = f"native-discover:{self.command.command_id}"
+        entry = self.harness.effects.by_key[effect_key]
+        self.assertEqual(execution.effect_id, entry["effect_id"])
+        self.assertIs(entry["state"], EffectState.UNKNOWN)
+        self.assertIsNotNone(entry["outbound"])
+        submit.assert_called_once()
+        self.assertEqual(backend.calls, 0)
+        self.assertEqual(self.harness.effects.authorizations, 1)
+
+    def test_resume_reuses_satisfied_observation_without_resend(self) -> None:
+        adapter = self.harness.port()
+        handler = DiscoverHandler(adapter)
+        first_claim, first_effects = self.harness.effect_port(
+            self.command,
+            fence=1,
+        )
+        first = handler.execute(
+            self.command,
+            first_claim,
+            self.harness.workspace(),
+            effects=first_effects,
+        )
+        self.assertEqual(first.outcome, "completed")
+        wait = self._resume_wait()
+        second_claim, second_effects = self.harness.effect_port(
+            self.command,
+            fence=2,
+        )
+
+        resumed = handler.execute(
+            self.command,
+            second_claim,
+            self.harness.workspace(),
+            effects=second_effects,
+            resume=wait,
+        )
+
+        self.assertEqual(resumed.outcome, "completed")
+        self.assertEqual(len(adapter.invocations), 1)
+        self.assertEqual(self.harness.effects.authorizations, 1)
+
+    def test_resume_rejects_a_foreign_wait_before_native_resend(self) -> None:
+        adapter = self.harness.port()
+        handler = DiscoverHandler(adapter)
+        first_claim, first_effects = self.harness.effect_port(
+            self.command,
+            fence=1,
+        )
+        handler.execute(
+            self.command,
+            first_claim,
+            self.harness.workspace(),
+            effects=first_effects,
+        )
+        wait = replace(
+            self._resume_wait(),
+            expected_state_digest=digest({"foreign": "wait"}),
+        )
+        second_claim, second_effects = self.harness.effect_port(
+            self.command,
+            fence=2,
+        )
+
+        with self.assertRaises(ProtocolError) as raised:
+            handler.execute(
+                self.command,
+                second_claim,
+                self.harness.workspace(),
+                effects=second_effects,
+                resume=wait,
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "discover.resume_identity_mismatch",
+        )
+        self.assertEqual(len(adapter.invocations), 1)
 
     def test_real_discover_handler_runs_as_one_diagnostic_stage(self) -> None:
         scope = DiagnosticReplayScope.from_inputs(
@@ -841,6 +978,7 @@ class _Services:
         self.keys: dict[str, str] = {}
         self.candidate = None
         self.decision = None
+        self.pending = None
         self.fail_commit_once = False
         self.materializations = 0
 
@@ -944,7 +1082,53 @@ class _Services:
         return self.harness.effects.states_for_command(command_id)
 
     def pending_effect_for_command(self, command_id):
+        if (
+            self.pending is not None
+            and self.pending.wait.command_id == command_id
+        ):
+            return self.pending
         return None
+
+    def verify_pending_effect(self, command, pending):
+        if (
+            self.pending != pending
+            or pending.wait.command_id != command.command_id
+            or pending.wait.request_digest != command.request_digest
+        ):
+            raise ProtocolError(
+                "discover.pending_mismatch",
+                {"command_id": command.command_id},
+            )
+        return pending
+
+    def yield_claim_for_effect(self, command, claim, effect_id):
+        entry = next(
+            value
+            for value in self.harness.effects.by_key.values()
+            if value["effect_id"] == effect_id
+        )
+        outbound = entry["outbound"]
+        self.pending = StagePending(
+            StageEffectWait(
+                schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+                run_id=command.run_id,
+                stage=command.stage,
+                command_id=command.command_id,
+                request_digest=command.request_digest,
+                effect_id=effect_id,
+                effect_key=next(
+                    key
+                    for key, value in self.harness.effects.by_key.items()
+                    if value["effect_id"] == effect_id
+                ),
+                effect_kind="native_operation",
+                intent_identity_digest=entry["intent_identity_digest"],
+                outbound_artifact_id=outbound.artifact_id,
+                outbound_digest=outbound.set_sha256,
+                expected_state_digest=entry["expected_state_digest"],
+            )
+        )
+        return self.pending
 
     def effect_port(self, command, claim, workspace):
         return self.harness.effects.bind(command, claim, workspace)
@@ -973,6 +1157,7 @@ class _Services:
             failure_envelope=None,
             decided_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
+        self.pending = None
         return self.decision
 
 
@@ -1013,6 +1198,60 @@ class DiscoverEngineTests(unittest.TestCase):
         recovered = execute_stage(command_id=self.command.command_id, handler=self.handler, services=self.services)
         self.assertEqual(recovered.outcome, "completed")
         self.assertEqual(len(self.port.invocations), 1)
+
+    def test_engine_yields_and_resumes_without_native_resend(self) -> None:
+        original_submit = self.port.submit
+        with patch.object(self.port, "submit", return_value=None) as submit:
+            pending = execute_stage(
+                command_id=self.command.command_id,
+                handler=self.handler,
+                services=self.services,
+            )
+        self.assertIsInstance(pending, StagePending)
+        submit.assert_called_once()
+        effect_id = pending.wait.effect_id
+        entry = next(
+            value
+            for value in self.harness.effects.by_key.values()
+            if value["effect_id"] == effect_id
+        )
+        self.assertIs(entry["state"], EffectState.UNKNOWN)
+
+        archive = (
+            self.root
+            / "engine-workspace-1"
+            / "discover-outbound-1"
+            / "source-set.zip"
+        )
+        observation = original_submit(
+            archive,
+            self.harness.native_request(self.command),
+            self.root / "canonical-observation",
+        )
+        self.assertIsNotNone(observation)
+        claim = self.harness.claim(self.command, fence=1)
+        observer_effects = self.harness.effects.bind(
+            self.command,
+            claim,
+            self.harness.workspace(),
+        )
+        observer_effects.reconcile_effect(
+            effect_id,
+            source="native_observer",
+            state_class="known",
+            evidence_root=observation.root,
+        )
+        self.assertIs(entry["state"], EffectState.SATISFIED)
+
+        resumed = execute_stage(
+            command_id=self.command.command_id,
+            handler=self.handler,
+            services=self.services,
+        )
+
+        self.assertEqual(resumed.outcome, "completed")
+        self.assertEqual(len(self.port.invocations), 1)
+        self.assertIsNone(self.services.pending)
 
     def test_unknown_effect_is_refused_before_native_call(self) -> None:
         self.harness.effects.preload_unknown(f"native-discover:{self.command.command_id}")

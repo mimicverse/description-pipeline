@@ -13,7 +13,6 @@ import shutil
 import tempfile
 import threading
 import time
-import uuid
 import zipfile
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -42,7 +41,6 @@ from .discover_protocol import (
     OBSERVATION_ARCHIVE,
     SOURCE_ARCHIVE,
     admit_observation_bundle,
-    seal_source_archive,
 )
 from .native_operation_runtime import (
     CAPTURE_KIND,
@@ -619,6 +617,40 @@ class NativeOperationClient:
             view = self.upload_input(intent.operation_id, archive)
             expected.require(view)
         return view
+
+    def resume_input_transfer(
+        self,
+        envelope: Mapping[str, object],
+        archive: str | Path,
+    ) -> NativeOperationView | None:
+        """Resume upload only when the exact existing operation never admitted input."""
+
+        try:
+            intent = NativeOperationCreate.from_record(envelope)
+        except NativeOperationError as error:
+            raise NativeOperationProtocolError(str(error)) from error
+        expected = NativeOperationStatusExpectation.from_create(intent)
+        try:
+            view = self.get_operation(intent.operation_id)
+        except NativeOperationNotFound:
+            return None
+        expected.require(view)
+        if view.state != "accepted":
+            return view
+        source = Path(archive)
+        if (
+            not source.is_file()
+            or source.is_symlink()
+            or source.stat().st_size != intent.input_archive_bytes
+            or file_digest(source) != intent.input_archive_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "local input archive differs from the existing accepted operation",
+                status=409,
+                code="input_archive_mismatch",
+            )
+        view = self.upload_input(intent.operation_id, source)
+        return expected.require(view)
 
     async def probe_operation_status_async(
         self,
@@ -1840,14 +1872,6 @@ def capture_handler_from_native_operation(
 
 
 @dataclass(frozen=True, slots=True)
-class NativeDiscoverExecution:
-    """Compatibility result for ports that wrap one sealed observation."""
-
-    effect_id: str
-    observation: NativeObservation
-
-
-@dataclass(frozen=True, slots=True)
 class NativeOperationDiscoverPort:
     """Discover port that owns one remote operation and never starts Capture."""
 
@@ -1910,54 +1934,35 @@ class NativeOperationDiscoverPort:
             self.operation_id(request),
         )
 
-    def invoke(
+    def submit(
         self,
         source_archive: Path,
         request,
         workspace: Path,
-    ) -> NativeObservation:
+    ) -> NativeObservation | None:
         archive = Path(source_archive)
         workspace = Path(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
-        view = self.observe(request)
-        if view is not None:
-            self._validate_existing(view, request)
-        if view is None or view.state == "accepted":
-            if not archive.is_file() or archive.is_symlink():
-                raise NativeOperationProtocolError(
-                    "Discover requires the complete sealed SourceSet archive"
-                )
-            if view is not None and file_digest(archive) != view.input_archive_sha256:
-                raise NativeOperationClientConflict(
-                    "local SourceSet archive differs from the existing operation",
-                    status=409,
-                    code="native_operation_conflict",
-                )
-            envelope = build_operation_record(
-                operation_id=request.operation_id,
-                kind=DISCOVER_KIND,
-                request=request.to_record(),
-                input_archive_sha256=file_digest(archive),
-                input_archive_bytes=archive.stat().st_size,
-                native_tool_requirement_sha256=digest(self._tool()),
-                output_contract=NATIVE_OBSERVATION_SCHEMA,
+        if not archive.is_file() or archive.is_symlink():
+            raise NativeOperationProtocolError(
+                "Discover requires the complete sealed SourceSet archive"
             )
-            view = self.client.create_operation(envelope)
-            self._validate_existing(view, request)
-        if view.state == "accepted":
-            view = self.client.upload_input(request.operation_id, archive)
-        if view.state not in _TERMINAL_STATES:
-            view = self.client.wait_for_terminal(
-                request.operation_id,
-                timeout=self.timeout,
-                poll_interval=self.poll_interval,
-            )
+        envelope = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=file_digest(archive),
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=digest(self._tool()),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+        )
+        try:
+            view = self.client.submit_operation(envelope, archive)
+        except NativeOperationClientError as error:
+            if error.status is None or error.status >= 500:
+                return None
+            raise
         self._validate_existing(view, request)
-        if view.state == "unknown":
-            raise NativeOperationRemoteUnknown(
-                view.failure.message if view.failure else "native Discover result is unknown",
-                code=view.failure.code if view.failure else "native_operation_unknown",
-            )
         if view.state in {"failed", "cancelled"}:
             failure = view.failure
             raise NativeDiscoverRefusal(
@@ -1965,9 +1970,7 @@ class NativeOperationDiscoverPort:
                 failure.message if failure else f"native Discover ended {view.state}",
             )
         if view.state != "satisfied":
-            raise NativeOperationProtocolError(
-                f"native Discover ended in unexpected state {view.state!r}"
-            )
+            return None
         downloaded = self.client.download_artifact(
             request.operation_id,
             workspace / f"{request.operation_id}-{OBSERVATION_ARCHIVE}",
@@ -1994,29 +1997,6 @@ class NativeOperationDiscoverPort:
             )
         return observation
 
-    def discover(
-        self,
-        request,
-        source_root: Path,
-        workspace: Path,
-    ) -> NativeDiscoverExecution:
-        archive = seal_source_archive(
-            Path(source_root),
-            request.source_files,
-            Path(workspace)
-            / f"{request.operation_id}-input-{uuid.uuid4().hex}-{SOURCE_ARCHIVE}",
-        )
-        observation = self.invoke(
-            archive,
-            request,
-            Path(workspace) / "operation",
-        )
-        return NativeDiscoverExecution(
-            effect_id=f"native-discover:{request.operation_id}",
-            observation=observation,
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class NativeRemoteDiscoverAdapter:
     """DiscoverDomainAdapter over the Windows operation client."""
@@ -2024,13 +2004,13 @@ class NativeRemoteDiscoverAdapter:
     port: NativeOperationDiscoverPort
     artifacts: object
 
-    def invoke(
+    def submit(
         self,
         source_archive: Path,
         request,
         workspace: Path,
-    ) -> NativeObservation:
-        return self.port.invoke(source_archive, request, workspace)
+    ) -> NativeObservation | None:
+        return self.port.submit(source_archive, request, workspace)
 
     def materialize(
         self,
@@ -2076,7 +2056,6 @@ __all__ = [
     "MAX_OPERATION_ARCHIVE_BYTES",
     "MAX_OPERATION_JSON_BYTES",
     "ArtifactDownload",
-    "NativeDiscoverExecution",
     "NativeOperationCapturePort",
     "NativeOperationClient",
     "NativeOperationClientConflict",

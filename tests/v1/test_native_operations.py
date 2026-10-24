@@ -22,6 +22,7 @@ from description_pipeline.orchestration.native_operation_client import (
     NativeOperationCapturePort,
     NativeOperationClient,
     NativeOperationClientConflict,
+    NativeOperationClientError,
     NativeOperationDiscoverPort,
     NativeOperationEffectObserver,
     NativeOperationEndpoint,
@@ -310,6 +311,153 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         terminal = client.submit_operation(envelope, self.archive)
         self.assertEqual(terminal, finished)
         self.assertEqual(calls, 1)
+
+    def test_accepted_operation_can_resume_the_same_input_transfer(self) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "accepted-transfer-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        envelope = _operation("operation-accepted-transfer", self.archive)
+        accepted = client.create_operation(envelope)
+        self.assertEqual(accepted.state, "accepted")
+        self.assertNotIn(
+            "input_admitted",
+            {event["type"] for event in runtime._events(envelope["operation_id"])},
+        )
+
+        corrupt = self.root / "corrupt-input.zip"
+        corrupt.write_bytes(b"different archive")
+        with self.assertRaises(NativeOperationClientError):
+            client.upload_input(envelope["operation_id"], corrupt)
+        rejected = client.get_operation(envelope["operation_id"])
+        self.assertEqual(rejected.state, "accepted")
+        self.assertNotIn(
+            "input_admitted",
+            {event["type"] for event in runtime._events(envelope["operation_id"])},
+        )
+
+        client.create_operation = mock.Mock(
+            wraps=client.create_operation
+        )
+        submitted = client.resume_input_transfer(envelope, self.archive)
+        self.assertIsNotNone(submitted)
+        self.assertIn(
+            submitted.state,
+            {"awaiting_input", "running", "satisfied"},
+        )
+        finished = client.wait_for_terminal(
+            envelope["operation_id"],
+            timeout=5,
+        )
+
+        self.assertEqual(finished.state, "satisfied")
+        self.assertEqual(self.calls, 1)
+        client.create_operation.assert_not_called()
+        events = runtime._events(envelope["operation_id"])
+        self.assertEqual(
+            sum(event["type"] == "accepted" for event in events),
+            1,
+        )
+        self.assertEqual(
+            sum(event["type"] == "input_admitted" for event in events),
+            1,
+        )
+
+    def test_input_transfer_resume_never_creates_a_missing_operation(self) -> None:
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN)
+        )
+        envelope = _operation("operation-missing-transfer", self.archive)
+        client.get_operation = mock.Mock(
+            side_effect=NativeOperationNotFound("missing", status=404)
+        )
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError(
+                "resume transfer must not create another operation"
+            )
+        )
+        client.upload_input = mock.Mock(
+            side_effect=AssertionError(
+                "missing operation has no accepted input slot"
+            )
+        )
+
+        self.assertIsNone(
+            client.resume_input_transfer(envelope, self.archive)
+        )
+        client.get_operation.assert_called_once_with(
+            "operation-missing-transfer"
+        )
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
+
+    def test_input_transfer_resume_observes_admitted_operation_without_reupload(
+        self,
+    ) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_executor(
+            request,
+            source_archive,
+            workspace,
+            native_tool,
+        ):
+            del request, source_archive, native_tool
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("native operation was not released")
+            artifact = Path(workspace) / "result.zip"
+            artifact.write_bytes(b"admitted operation result")
+            return NativeOperationResult(
+                artifact_path=artifact,
+                artifact_name="result.zip",
+                output_contract=OUTPUT_CONTRACT,
+                resource_terminated=True,
+            )
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "admitted-transfer-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: blocking_executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        envelope = _operation("operation-admitted-transfer", self.archive)
+        client.create_operation(envelope)
+        client.create_operation = mock.Mock(
+            wraps=client.create_operation
+        )
+        client.upload_input = mock.Mock(
+            wraps=client.upload_input
+        )
+
+        first = client.resume_input_transfer(envelope, self.archive)
+        self.assertIsNotNone(first)
+        self.assertTrue(entered.wait(5))
+        self.assertIn(
+            first.state,
+            {"awaiting_input", "running"},
+        )
+        second = client.resume_input_transfer(envelope, self.archive)
+        self.assertIn(second.state, {"running", "satisfied"})
+        self.assertEqual(client.create_operation.call_count, 0)
+        self.assertEqual(client.upload_input.call_count, 1)
+        release.set()
+        self.assertEqual(
+            client.wait_for_terminal(
+                envelope["operation_id"],
+                timeout=5,
+            ).state,
+            "satisfied",
+        )
 
     def test_async_status_probe_is_one_read_and_does_not_block_the_event_loop(self) -> None:
         runtime = NativeOperationRuntime(
@@ -1522,6 +1670,21 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         return server.client()
 
+    def submit_and_wait(
+        self,
+        port: NativeOperationDiscoverPort,
+        client: NativeOperationClient,
+        archive: Path,
+        request: NativeDiscoverRequest,
+        workspace: Path,
+    ):
+        observation = port.submit(archive, request, workspace)
+        if observation is None:
+            client.wait_for_terminal(request.operation_id, timeout=5)
+            observation = port.submit(archive, request, workspace)
+        self.assertIsNotNone(observation)
+        return observation
+
     def observer_fixture(
         self,
         operation_id: str,
@@ -1596,7 +1759,9 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             "description_pipeline.pipeline.capture._capture_native_transaction",
             capture,
         ):
-            observation = port.invoke(
+            observation = self.submit_and_wait(
+                port,
+                client,
                 archive,
                 request,
                 workspace,
@@ -1616,17 +1781,81 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.assertTrue(remote.resource_terminated)
         self.assertEqual(remote.kind, DISCOVER_KIND)
         self.assertEqual(remote.artifact.media_type, "application/zip")
-        repeated = port.invoke(
+        repeated = port.submit(
             archive,
             request,
             workspace,
         )
+        self.assertIsNotNone(repeated)
         self.assertEqual(
             repeated.observation_sha256,
             observation.observation_sha256,
         )
         self.assertEqual(reader.calls, 1)
         self.assertEqual(backend.calls, 1)
+
+    def test_discover_submit_returns_without_waiting_and_reuses_operation(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class GatedBackend(_CountingBackend):
+            def discover_native(
+                self,
+                frozen_source,
+                settings,
+                *,
+                on_activity=None,
+            ):
+                del frozen_source, settings, on_activity
+                self.calls += 1
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("native Discover was not released")
+                return copy.deepcopy(self.payload)
+
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = GatedBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        client.create_operation = mock.Mock(
+            wraps=client.create_operation
+        )
+        client.upload_input = mock.Mock(
+            wraps=client.upload_input
+        )
+        port = NativeOperationDiscoverPort(
+            client,
+            NATIVE_TOOL,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        workspace = self.root / "workspace-nonblocking-submit"
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        request = self.request("discover-operation-nonblocking")
+
+        self.assertIsNone(
+            port.submit(archive, request, workspace / "operation")
+        )
+        self.assertTrue(entered.wait(5))
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(client.create_operation.call_count, 1)
+        self.assertEqual(client.upload_input.call_count, 1)
+
+        release.set()
+        client.wait_for_terminal(request.operation_id, timeout=5)
+        observation = port.submit(
+            archive,
+            request,
+            workspace / "operation",
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(client.create_operation.call_count, 1)
+        self.assertEqual(client.upload_input.call_count, 1)
 
     def test_effect_observer_downloads_satisfied_discover_without_posting(self) -> None:
         reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
@@ -1645,7 +1874,13 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             workspace / "input-source-set.zip",
         )
         request = self.request("discover-operation-observer")
-        port.invoke(archive, request, workspace / "operation")
+        self.submit_and_wait(
+            port,
+            client,
+            archive,
+            request,
+            workspace / "operation",
+        )
         command, intent, outbound = self.observer_fixture(
             request.operation_id,
             workspace,
@@ -1724,7 +1959,13 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             workspace / "input-source-set.zip",
         )
         request = self.request("discover-operation-foreign-executor")
-        port.invoke(archive, request, workspace / "operation")
+        self.submit_and_wait(
+            port,
+            client,
+            archive,
+            request,
+            workspace / "operation",
+        )
         command, intent, outbound = self.observer_fixture(
             request.operation_id,
             workspace,
@@ -1771,7 +2012,13 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             workspace / "input-source-set.zip",
         )
         request = self.request("discover-operation-observer-changed")
-        port.invoke(archive, request, workspace / "operation")
+        self.submit_and_wait(
+            port,
+            client,
+            archive,
+            request,
+            workspace / "operation",
+        )
         command, intent, outbound = self.observer_fixture(
             request.operation_id,
             workspace,
