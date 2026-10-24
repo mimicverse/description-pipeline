@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from ..interface_records import REQUEST_PURPOSES
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
-from ..orchestration.discover_protocol import NativeDiscoverExecution, NativeDiscoverFailure
+from ..orchestration.discover_protocol import SOURCE_ARCHIVE, seal_source_archive
 from ..sources.solidworks.discover_stage import (
     NativeDiscoverRefusal,
     NativeDiscoverRequest,
+    NativeObservation,
     admit_native_observation,
 )
 from ..sources.solidworks.discovery import (
@@ -31,13 +33,14 @@ from .contracts import (
     StageCandidate,
     StageCommand,
     StageExecution,
+    StageFailure,
 )
+from .effects import EffectState, StageEffectPort
 from .engine import StageWorkspace
 
 DISCOVER_REQUEST_SCHEMA = "description-pipeline.discover-request/v1"
 DISCOVER_RESULT_SCHEMA = "description-pipeline.discover-result/v1"
 DISCOVER_CHECKS_SCHEMA = "description-pipeline.discover-checks/v1"
-DISCOVER_FAILURE_SCHEMA = "description-pipeline.discover-failure/v1"
 RULESET_CATALOG_SCHEMA = "description-pipeline.ruleset-catalog/v1"
 ARTIFACT_MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
 
@@ -83,20 +86,22 @@ _ARTIFACT_FIELDS = (
 )
 
 
-class DiscoverNativePort(Protocol):
-    """Runtime-owned native effect port.
+class DiscoverDomainAdapter(Protocol):
+    """Native/domain transport used only after common effect authorization."""
 
-    Implementations must authorize the complete outbound through the common
-    effect journal before issuing the remote call. An unknown existing effect
-    must be reconciled or refused without invoking the native operation.
-    """
-
-    def discover(
+    def invoke(
         self,
+        source_archive: Path,
         request: NativeDiscoverRequest,
-        source_root: Path,
         workspace: Path,
-    ) -> NativeDiscoverExecution: ...
+    ) -> NativeObservation: ...
+
+    def materialize(
+        self,
+        artifact,
+        request: NativeDiscoverRequest,
+        destination: Path,
+    ) -> NativeObservation: ...
 
 
 def _plain(value: Any) -> Any:
@@ -324,53 +329,10 @@ def _write_canonical(path: Path, value: Any) -> None:
     path.write_bytes(canonical(value) + b"\n")
 
 
-def _failure_execution(
-    command: StageCommand,
-    claim: ExecutionClaim,
-    workspace: StageWorkspace,
-    refusal: NativeDiscoverRefusal,
-    *,
-    effect_id: str | None = None,
-) -> StageExecution:
-    failure = {
-        "schema_version": DISCOVER_FAILURE_SCHEMA,
-        "stage": "discover",
-        "command_id": command.command_id,
-        "idempotency_key": command.idempotency_key,
-        "request_digest": command.request_digest,
-        "claim_id": claim.claim_id,
-        "fence": claim.fence,
-        "claimed_executor_sha256": claim.owner_sha256,
-        "reason_code": refusal.code,
-        "message": refusal.message,
-        "detail": refusal.detail,
-        "effects": {
-            "required": [] if effect_id is None else [effect_id],
-            "known": [] if effect_id is None else [effect_id],
-        },
-        "evidence": {
-            "success_artifact_available": False,
-            "reason": "Discover refused before a complete result artifact existed",
-        },
-        "observed_at": datetime.now(UTC).isoformat(),
-    }
-    root = workspace.root / f"discover-failure-{claim.fence}"
-    if root.exists():
-        raise ProtocolError("discover.candidate_conflict", {"candidate": str(root)})
-    _write_canonical(root / "failure.json", failure)
-    return StageExecution(
-        outcome="failed",
-        candidate_root=str(root),
-        checks_sha256=digest(failure),
-        required_effect_ids=() if effect_id is None else (effect_id,),
-        reason_code=refusal.code,
-    )
-
-
 class DiscoverHandler:
-    """Run one Discover command through a runtime-authorized native effect."""
+    """Run one Discover command through the command-bound runtime effect port."""
 
-    def __init__(self, native: DiscoverNativePort) -> None:
+    def __init__(self, native: DiscoverDomainAdapter) -> None:
         self.native = native
 
     def execute(
@@ -378,13 +340,15 @@ class DiscoverHandler:
         command: StageCommand,
         claim: ExecutionClaim,
         workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
     ) -> StageExecution:
         try:
             if command.stage != "discover" or command.kind != "stage":
                 raise NativeDiscoverRefusal("discover.stage_invalid", "Command does not authorize Discover")
             if command.predecessor_decision_id is None:
                 raise NativeDiscoverRefusal("discover.predecessor_invalid", "Discover requires Freeze predecessor")
-            if claim.command_id != command.command_id or claim.owner_sha256 != command.expected_executor_sha256:
+            if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
                 raise NativeDiscoverRefusal("discover.claim_invalid", "Claim does not own this Discover command")
             request = _validate_request(command)
             bound = _bound_artifacts(command, request)
@@ -411,30 +375,41 @@ class DiscoverHandler:
                 purpose=request["purpose"],
                 expected_native_tool_sha256=request["expected_native_tool_sha256"],
             )
-            execution = self.native.discover(
+            effect_artifact, observation = self._obtain_observation(
+                command,
+                claim,
+                workspace,
+                request,
                 native_request,
                 roots["source_set"],
-                workspace.root / f"native-discover-{claim.fence}",
+                effects,
             )
             try:
-                observation = admit_native_observation(execution.observation.root, request=native_request)
+                observation = admit_native_observation(
+                    observation.root,
+                    request=native_request,
+                    artifact_ref=effect_artifact,
+                )
             except NativeDiscoverRefusal as refusal:
-                raise NativeDiscoverFailure(
-                    execution.effect_id,
+                raise StageFailure(
                     refusal.code,
                     refusal.message,
-                    refusal.detail,
+                    evidence_artifacts=(effect_artifact,),
                 ) from refusal
             except PipelineError as error:
-                raise NativeDiscoverFailure(
-                    execution.effect_id,
+                raise StageFailure(
                     "discover.observation_invalid",
                     str(error),
+                    evidence_artifacts=(effect_artifact,),
                 ) from error
             selection = dict(observation.selection)
             bindings_files = selection.get("files")
             if not isinstance(bindings_files, Mapping):
-                raise NativeDiscoverRefusal("discover.selection_invalid", "Native observation carries no selection")
+                raise StageFailure(
+                    "discover.selection_invalid",
+                    "Native observation carries no selection",
+                    evidence_artifacts=(effect_artifact,),
+                )
             selected_root = workspace.root / f"selected-{claim.fence}"
             _copy_selected(roots["source_set"], selected_root, bindings_files)
             output = workspace.root / f"discover-result-{claim.fence}"
@@ -456,10 +431,10 @@ class DiscoverHandler:
                     submission_identity=_submission_identity(request["submission_identity"]),
                 )
             except PipelineError as error:
-                raise NativeDiscoverFailure(
-                    execution.effect_id,
+                raise StageFailure(
                     "discover.derivation_invalid",
                     str(error),
+                    evidence_artifacts=(effect_artifact,),
                 ) from error
             shutil.copytree(observation.root, output / "native-observation")
             checks = {
@@ -477,6 +452,7 @@ class DiscoverHandler:
                         "details": {
                             "observation_sha256": observation.observation_sha256,
                             "native_tool_sha256": observation.manifest["native_tool_sha256"],
+                            "effect_artifact_id": effect_artifact.artifact_id,
                         },
                     },
                     {
@@ -521,42 +497,177 @@ class DiscoverHandler:
             _write_canonical(output / "checks.json", checks)
             _write_canonical(output / "result.json", result)
             if not prepared.passed:
-                failure = {
-                    "schema_version": DISCOVER_FAILURE_SCHEMA,
-                    "stage": "discover",
-                    "command_id": command.command_id,
-                    "request_digest": command.request_digest,
-                    "reason_code": "discover.findings",
-                    "message": "Discover derivation contains blocking findings",
-                    "findings": [dict(item) for item in prepared.findings],
-                    "effects": {"required": [execution.effect_id], "known": [execution.effect_id]},
-                    "observed_at": datetime.now(UTC).isoformat(),
-                }
-                _write_canonical(output / "failure.json", failure)
+                raise StageFailure(
+                    "discover.findings",
+                    "Discover derivation contains blocking findings",
+                    evidence_artifacts=(effect_artifact,),
+                )
             return StageExecution(
-                outcome="completed" if prepared.passed else "failed",
+                outcome="completed",
                 candidate_root=str(output),
                 checks_sha256=digest(checks),
-                required_effect_ids=(execution.effect_id,),
-                reason_code=None if prepared.passed else "discover.findings",
-            )
-        except NativeDiscoverFailure as refusal:
-            return _failure_execution(
-                command,
-                claim,
-                workspace,
-                refusal,
-                effect_id=refusal.effect_id,
             )
         except NativeDiscoverRefusal as refusal:
-            return _failure_execution(command, claim, workspace, refusal)
+            raise StageFailure(refusal.code, refusal.message) from refusal
+
+    def _obtain_observation(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        request: Mapping[str, Any],
+        native_request: NativeDiscoverRequest,
+        source_root: Path,
+        effects: StageEffectPort,
+    ) -> tuple[ArtifactRef, NativeObservation]:
+        effect_key = f"native-discover:{command.command_id}"
+        settlement = effects.effect_settlement_for_key(effect_key)
+        state = None if settlement is None else settlement.state
+        if state in {EffectState.UNKNOWN, EffectState.CONFLICT}:
+            raise ProtocolError(
+                "effect.unresolved",
+                {"effect_key": effect_key, "state": state.value},
+            )
+        if state is EffectState.DEFINITELY_FAILED:
+            raise StageFailure(
+                "discover.native_definitely_failed",
+                "The native Discover effect is definitely failed and cannot be resent",
+            )
+        if state is EffectState.SATISFIED:
+            if settlement is None or settlement.payload_artifact is None:
+                raise ProtocolError("effect.payload_missing", {"effect_key": effect_key})
+            observation = self.native.materialize(
+                settlement.payload_artifact,
+                native_request,
+                workspace.root / f"discover-observation-{claim.fence}",
+            )
+            return settlement.payload_artifact, observation
+
+        outbound_root, source_archive_sha256 = self._write_outbound(
+            workspace,
+            claim,
+            native_request,
+            source_root,
+        )
+        intent = effects.prepare_effect(
+            effect_key=effect_key,
+            effect_kind="native_operation",
+            target={
+                "operation_id": command.command_id,
+                "main_assembly": request["main_assembly"],
+                "native_tool_sha256": request["expected_native_tool_sha256"],
+            },
+            expected_state={
+                "schema_version": "description-pipeline.native-discover-effect/v1",
+                "operation_id": command.command_id,
+                "request_digest": command.request_digest,
+                "source_inventory_sha256": request["source_inventory_sha256"],
+                "source_archive_sha256": source_archive_sha256,
+                "native_tool_sha256": request["expected_native_tool_sha256"],
+            },
+            outbound_root=outbound_root,
+        )
+        if settlement is not None and settlement.effect_id != intent.effect_id:
+            raise ProtocolError("effect.identity_conflict", {"effect_key": effect_key})
+        effects.authorize_dispatch(intent.effect_id, source="linux_discover_handler")
+        try:
+            observation = self.native.invoke(
+                outbound_root / SOURCE_ARCHIVE,
+                native_request,
+                workspace.root / f"native-discover-{claim.fence}",
+            )
+        except NativeDiscoverRefusal as refusal:
+            failure = StageFailure(refusal.code, refusal.message)
+            failure_root = workspace.root / f"native-discover-failure-{claim.fence}"
+            try:
+                _write_canonical(
+                    failure_root / "native-failure-evidence.json",
+                    {
+                        "reason_code": refusal.code,
+                        "message": refusal.message,
+                        "detail": refusal.detail,
+                    },
+                )
+                effects.record_response(
+                    intent.effect_id,
+                    source="windows_discover",
+                    response_root=failure_root,
+                )
+                effects.record_observation(
+                    intent.effect_id,
+                    source="windows_discover",
+                    state_class="known",
+                    observation_root=failure_root,
+                )
+                settled = effects.effect_settlement(intent.effect_id)
+                if settled.payload_artifact is not None:
+                    failure = StageFailure(
+                        refusal.code,
+                        refusal.message,
+                        evidence_artifacts=(settled.payload_artifact,),
+                    )
+            except Exception:
+                failure.unavailable_reason = "native_failure_evidence_unavailable"
+            raise failure from refusal
+        except BaseException:
+            with suppress(Exception):
+                effects.record_timeout(intent.effect_id, source="windows_discover")
+            raise
+        effects.record_response(
+            intent.effect_id,
+            source="windows_discover",
+            response_root=observation.root,
+        )
+        effects.record_observation(
+            intent.effect_id,
+            source="windows_discover",
+            state_class="known",
+            observation_root=observation.root,
+        )
+        settled = effects.effect_settlement(intent.effect_id)
+        if settled.state is not EffectState.SATISFIED or settled.payload_artifact is None:
+            raise ProtocolError(
+                "effect.not_satisfied",
+                {"effect_id": intent.effect_id, "state": settled.state.value},
+            )
+        observation = self.native.materialize(
+            settled.payload_artifact,
+            native_request,
+            workspace.root / f"discover-observation-{claim.fence}",
+        )
+        return settled.payload_artifact, observation
+
+    @staticmethod
+    def _write_outbound(
+        workspace: StageWorkspace,
+        claim: ExecutionClaim,
+        request: NativeDiscoverRequest,
+        source_root: Path,
+    ) -> tuple[Path, str]:
+        root = workspace.root / f"discover-outbound-{claim.fence}"
+        if root.exists():
+            raise ProtocolError("discover.workspace_invalid", {"reason": "outbound-exists", "root": str(root)})
+        root.mkdir(parents=True)
+        _write_canonical(root / "request.json", request.to_record())
+        _write_canonical(
+            root / "source.json",
+            {
+                "source_files": dict(request.source_files),
+                "source_inventory_sha256": request.source_inventory_sha256,
+            },
+        )
+        archive = seal_source_archive(source_root, request.source_files, root / SOURCE_ARCHIVE)
+        return root, file_digest(archive)
 
     def validate_candidate(
         self,
         command: StageCommand,
         claim: ExecutionClaim,
         candidate: StageCandidate,
+        *,
+        effects: StageEffectPort,
     ) -> StageCandidate:
+        del effects
         result = candidate.result
         if (
             result.command_id != command.command_id
@@ -565,12 +676,10 @@ class DiscoverHandler:
             or result.request_digest != command.request_digest
         ):
             raise ProtocolError("discover.candidate_mismatch", {"command_id": command.command_id})
-        if claim.command_id != command.command_id:
+        if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
             raise ProtocolError("discover.claim_mismatch", {"command_id": command.command_id})
         if result.actual_executor_sha256 != command.expected_executor_sha256:
             raise ProtocolError("discover.executor_mismatch", {"command_id": command.command_id})
-        if not result.required_effect_ids:
-            raise ProtocolError("discover.effect_missing", {"command_id": command.command_id})
         if result.outcome in {"failed", "cancelled"} and not (
             isinstance(result.reason_code, str) and result.reason_code.startswith("discover.")
         ):
@@ -581,13 +690,12 @@ class DiscoverHandler:
 __all__ = [
     "CONFIGURATION_KIND",
     "DISCOVER_CHECKS_SCHEMA",
-    "DISCOVER_FAILURE_SCHEMA",
     "DISCOVER_REQUEST_SCHEMA",
     "DISCOVER_RESULT_SCHEMA",
     "FREEZE_RESULT_KIND",
     "RULESET_CATALOG_SCHEMA",
     "RULESET_KIND",
     "SOURCE_SET_KIND",
+    "DiscoverDomainAdapter",
     "DiscoverHandler",
-    "DiscoverNativePort",
 ]

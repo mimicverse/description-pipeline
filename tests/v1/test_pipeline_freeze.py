@@ -17,6 +17,7 @@ from description_pipeline.pipeline import (
     StageCommand,
     StageDecision,
     StageResult,
+    StageFailure,
     StageWorkspace,
     execute_stage,
 )
@@ -24,6 +25,7 @@ from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.pipeline.freeze import (
     CONFIGURATION_KIND,
     FREEZE_REQUEST_SCHEMA,
+    FreezeRefusal,
     ORIGINALS_KIND,
     RULESET_CATALOG_SCHEMA,
     RULESET_KIND,
@@ -58,13 +60,20 @@ class CountingFreezeHandler(FreezeHandler):
         self.executions = 0
         self.validations = 0
 
-    def execute(self, command, claim, workspace):
+    def execute(self, command, claim, workspace, *, effects):
         self.executions += 1
-        return super().execute(command, claim, workspace)
+        return super().execute(command, claim, workspace, effects=effects)
 
-    def validate_candidate(self, command, claim, candidate):
+    def validate_candidate(self, command, claim, candidate, *, effects):
         self.validations += 1
-        return super().validate_candidate(command, claim, candidate)
+        return super().validate_candidate(command, claim, candidate, effects=effects)
+
+
+class NoEffects:
+    """Freeze declares no effects and must never query the capability."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"Freeze touched effect capability: {name}")
 
 
 class FreezeHarness:
@@ -137,7 +146,8 @@ class FreezeHarness:
             claim_id=f"claim-{fence}",
             command_id=command.command_id,
             fence=fence,
-            owner_sha256=command.expected_executor_sha256,
+            owner_sha256=digest({"process": f"freeze-{fence}"}),
+            executor_sha256=command.expected_executor_sha256,
             lane_key=None,
             expires_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(minutes=5),
         )
@@ -162,9 +172,15 @@ class FreezeDomainTests(unittest.TestCase):
 
     def test_complete_command_and_artifact_closure_complete_once(self) -> None:
         command = self.harness.command()
-        execution = self.handler.execute(command, self.harness.claim(command), self.harness.workspace())
+        claim = self.harness.claim(command)
+        self.assertNotEqual(claim.owner_sha256, claim.executor_sha256)
+        execution = self.handler.execute(
+            command,
+            claim,
+            self.harness.workspace(),
+            effects=NoEffects(),
+        )
         self.assertEqual(execution.outcome, "completed")
-        self.assertEqual(execution.required_effect_ids, ())
         root = Path(execution.candidate_root)
         self.assertEqual(
             {path.name for path in root.iterdir()},
@@ -184,37 +200,51 @@ class FreezeDomainTests(unittest.TestCase):
             ],
         )
 
-    def test_wrong_request_artifact_binding_returns_minimal_failure(self) -> None:
+    def test_wrong_request_artifact_binding_raises_stage_failure_with_cause(self) -> None:
         command = self.harness.command(request=self.harness.request(originals_artifact_id="another-artifact"))
-        execution = self.handler.execute(command, self.harness.claim(command), self.harness.workspace())
-        self.assertEqual(execution.outcome, "failed")
-        self.assertEqual(execution.reason_code, "freeze.artifact_binding_mismatch")
-        root = Path(execution.candidate_root)
-        self.assertEqual({path.name for path in root.iterdir()}, {"failure.json"})
-        failure = read_data(root / "failure.json")
-        self.assertEqual(execution.checks_sha256, digest(failure))
-        self.assertEqual(failure["effects"], {"required": [], "known": []})
-        self.assertFalse(failure["evidence"]["success_artifact_available"])
+        with self.assertRaises(StageFailure) as raised:
+            self.handler.execute(
+                command,
+                self.harness.claim(command),
+                self.harness.workspace(),
+                effects=NoEffects(),
+            )
+        self.assertEqual(raised.exception.reason_code, "freeze.artifact_binding_mismatch")
+        self.assertIsInstance(raised.exception.__cause__, FreezeRefusal)
+        self.assertFalse((self.harness.root / "freeze-failure-1").exists())
 
     def test_wrong_original_content_binding_is_refused(self) -> None:
         command = self.harness.command(request=self.harness.request(upload_inventory_sha256=digest({"wrong": 1})))
-        execution = self.handler.execute(command, self.harness.claim(command), self.harness.workspace())
-        self.assertEqual(execution.outcome, "failed")
-        self.assertEqual(execution.reason_code, "freeze.original_binding_mismatch")
+        with self.assertRaises(StageFailure) as raised:
+            self.handler.execute(
+                command,
+                self.harness.claim(command),
+                self.harness.workspace(),
+                effects=NoEffects(),
+            )
+        self.assertEqual(raised.exception.reason_code, "freeze.original_binding_mismatch")
 
     def test_ruleset_version_is_bound_inside_the_immutable_catalog(self) -> None:
         command = self.harness.command(request=self.harness.request(ruleset_version="another-version"))
-        execution = self.handler.execute(command, self.harness.claim(command), self.harness.workspace())
-        self.assertEqual(execution.outcome, "failed")
-        self.assertEqual(execution.reason_code, "freeze.ruleset_invalid")
+        with self.assertRaises(StageFailure) as raised:
+            self.handler.execute(
+                command,
+                self.harness.claim(command),
+                self.harness.workspace(),
+                effects=NoEffects(),
+            )
+        self.assertEqual(raised.exception.reason_code, "freeze.ruleset_invalid")
 
     def test_case_only_main_assembly_variant_is_refused(self) -> None:
         command = self.harness.command(request=self.harness.request(main_assembly="TOP.sldasm"))
-        execution = self.handler.execute(command, self.harness.claim(command), self.harness.workspace())
-        self.assertEqual(execution.outcome, "failed")
-        self.assertEqual(execution.reason_code, "freeze.main_assembly_invalid")
-        failure = read_data(Path(execution.candidate_root) / "failure.json")
-        self.assertEqual(failure["detail"]["case_match"], "top.SLDASM")
+        with self.assertRaises(StageFailure) as raised:
+            self.handler.execute(
+                command,
+                self.harness.claim(command),
+                self.harness.workspace(),
+                effects=NoEffects(),
+            )
+        self.assertEqual(raised.exception.reason_code, "freeze.main_assembly_invalid")
 
 
 class _Services:
@@ -278,9 +308,9 @@ class _Services:
         self.seals += 1
         members = _members(Path(execution.candidate_root))
         artifact_id = digest({"result": execution.checks_sha256, "members": members})
-        result_artifact = ArtifactRef(
+        output_artifact = ArtifactRef(
             artifact_id=artifact_id,
-            kind="freeze_result" if execution.outcome == "completed" else "freeze_failure",
+            kind="stage_output:freeze",
             locator=f"cas://artifact/{artifact_id}",
             manifest_sha256=digest({"manifest": artifact_id}),
             set_sha256=digest({"members": members}),
@@ -295,20 +325,45 @@ class _Services:
             stage="freeze",
             request_digest=command.request_digest,
             outcome=execution.outcome,
-            result_artifact=result_artifact,
+            output_artifact=output_artifact,
             actual_executor_sha256=command.expected_executor_sha256,
             checks_sha256=execution.checks_sha256,
-            required_effect_ids=execution.required_effect_ids,
             reason_code=execution.reason_code,
         )
-        self.candidate = StageCandidate(result=result)
+        record_id = digest({"result_record": result.digest})
+        result_record_artifact = ArtifactRef(
+            artifact_id=record_id,
+            kind="stage_result",
+            locator=f"cas://artifact/{record_id}",
+            manifest_sha256=digest({"manifest": record_id}),
+            set_sha256=digest({"record": record_id}),
+            producer_run_id=command.run_id,
+            producer_stage="freeze",
+            producer_tool_sha256=claim.executor_sha256,
+        )
+        self.candidate = StageCandidate(
+            result=result,
+            result_record_artifact=result_record_artifact,
+            candidate_id=f"candidate-{result.digest}",
+            claim_id=claim.claim_id,
+            fence=claim.fence,
+        )
         return self.candidate
 
     def verify_candidate(self, command, claim, candidate):
         return candidate
 
-    def effect_state(self, effect_id):
-        raise AssertionError(f"Freeze has no external effect: {effect_id}")
+    def effect_states_for_command(self, command_id):
+        return {}
+
+    def effect_port(self, command, claim, workspace):
+        return NoEffects()
+
+    def commit_failure(self, command, claim, failure):
+        raise AssertionError("Freeze success tests do not commit failures")
+
+    def discard_workspace(self, workspace):
+        return None
 
     def commit_decision(self, command, claim, candidate):
         self.commits += 1
@@ -320,12 +375,13 @@ class _Services:
             run_id=command.run_id,
             stage="freeze",
             command_id=command.command_id,
-            result_artifact=candidate.result.result_artifact,
+            result_record_artifact=candidate.result_record_artifact,
             result_digest=candidate.result.digest,
             actual_executor_sha256=candidate.result.actual_executor_sha256,
             outcome=candidate.result.outcome,
             original_producer_decision_id=None,
             reason_code=candidate.result.reason_code,
+            failure_envelope=None,
             decided_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
         return self.decision
@@ -373,7 +429,7 @@ class FreezeEngineRecoveryTests(unittest.TestCase):
 
         self.assertEqual(recovered.outcome, "completed")
         self.assertEqual(self.handler.executions, 1)
-        self.assertEqual(self.handler.validations, 1)
+        self.assertEqual(self.handler.validations, 2)
         self.assertEqual(self.services.seals, 1)
         self.assertEqual(self.services.commits, 2)
 

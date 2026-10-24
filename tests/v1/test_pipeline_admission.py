@@ -184,21 +184,23 @@ class AdmissionHarness:
             stage="freeze",
             request_digest=freeze_command.request_digest,
             outcome="completed",
-            result_artifact=result_artifact,
+            output_artifact=result_artifact,
             actual_executor_sha256=self.spec.expected_executor_sha256,
             checks_sha256=digest({"checks": "freeze"}),
         )
+        result_record_artifact = self.store.seal_stage_result(result)
         decision = StageDecision(
             decision_id="freeze-decision",
             run_id=self.spec.run_id,
             stage="freeze",
             command_id=freeze_command.command_id,
-            result_artifact=result_artifact,
+            result_record_artifact=result_record_artifact,
             result_digest=result.digest,
             actual_executor_sha256=self.spec.expected_executor_sha256,
             outcome="completed",
             original_producer_decision_id=None,
             reason_code=None,
+            failure_envelope=None,
             decided_at=datetime(2026, 10, 25, 9, 31, tzinfo=UTC),
         )
         return VerifiedPredecessor(
@@ -333,12 +335,12 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(discover.stage, "discover")
         self.assertEqual(discover.predecessor_decision_id, "freeze-decision")
         self.assertEqual(discover.request["schema_version"], DISCOVER_REQUEST_SCHEMA)
-        self.assertEqual(discover.request["freeze_artifact_id"], predecessor.result.result_artifact.artifact_id)
+        self.assertEqual(discover.request["freeze_artifact_id"], predecessor.result.output_artifact.artifact_id)
         self.assertEqual(discover.request["source_inventory_sha256"], self.harness.originals.inventory_sha256)
         self.assertEqual(discover.request["ruleset_version"], self.harness.spec.ruleset.version)
         self.assertEqual(discover.request["submission_identity"]["owner"], self.harness.spec.principal)
         self.assertEqual(discover.request["submission_identity"]["hardware_id"], self.harness.spec.target_hardware)
-        self.assertEqual(discover.input_artifacts[0], predecessor.result.result_artifact)
+        self.assertEqual(discover.input_artifacts[0], predecessor.result.output_artifact)
         self.assertEqual(validate_discover_command(self.harness.spec, predecessor, discover), discover)
         self.assertEqual(
             validate_stage_command(self.harness.spec, discover, predecessor=predecessor),
@@ -372,12 +374,13 @@ class AdmissionProjectionTests(unittest.TestCase):
             run_id=predecessor.decision.run_id,
             stage="freeze",
             command_id=predecessor.decision.command_id,
-            result_artifact=predecessor.decision.result_artifact,
+            result_record_artifact=predecessor.decision.result_record_artifact,
             result_digest=digest({"wrong": "result"}),
             actual_executor_sha256=predecessor.decision.actual_executor_sha256,
             outcome="completed",
             original_producer_decision_id=None,
             reason_code=None,
+            failure_envelope=None,
             decided_at=predecessor.decision.decided_at,
         )
         with self.assertRaises(ProtocolError):

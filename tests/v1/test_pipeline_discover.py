@@ -9,11 +9,13 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import digest, file_digest, read_data, write_json
 from description_pipeline.orchestration.discover_protocol import (
-    LocalArchiveDiscoverPort,
+    ArchiveDiscoverAdapter,
     admit_observation_bundle,
     seal_observation_bundle,
 )
@@ -24,10 +26,12 @@ from description_pipeline.pipeline import (
     StageCommand,
     StageDecision,
     StageResult,
+    StageFailure,
     StageWorkspace,
     execute_stage,
 )
 from description_pipeline.pipeline.contracts import ProtocolError
+from description_pipeline.pipeline import discover as discover_module
 from description_pipeline.pipeline.discover import (
     CONFIGURATION_KIND,
     DISCOVER_REQUEST_SCHEMA,
@@ -37,8 +41,9 @@ from description_pipeline.pipeline.discover import (
     SOURCE_SET_KIND,
     DiscoverHandler,
 )
-from description_pipeline.pipeline.effects import EffectState
+from description_pipeline.pipeline.effects import EffectSettlement, EffectState
 from description_pipeline.sources.solidworks.discover_stage import (
+    NativeDiscoverRefusal,
     NativeDiscoverRequest,
     admit_native_observation,
 )
@@ -121,9 +126,153 @@ class CountingBackend(FakeBackend):
         return super().discover_native(frozen_source, settings, on_activity=on_activity)
 
 
+class EffectLedger:
+    """Small in-memory double for the common effect-port semantics."""
+
+    def __init__(self, artifacts: ArtifactStore) -> None:
+        self.artifacts = artifacts
+        self.by_key: dict[str, dict] = {}
+        self.authorizations = 0
+        self.timeouts = 0
+
+    def bind(self, command, claim, workspace) -> _MemoryEffectPort:
+        return _MemoryEffectPort(self, command, claim, workspace)
+
+    def preload_unknown(self, effect_key: str) -> None:
+        effect_id = "effect-" + digest({"key": effect_key})
+        self.by_key[effect_key] = {
+            "effect_id": effect_id,
+            "state": EffectState.UNKNOWN,
+            "outbound_sha256": None,
+            "payload": None,
+        }
+
+    def states_for_command(self, command_id: str) -> dict[str, EffectState]:
+        return {
+            value["effect_id"]: value["state"]
+            for value in self.by_key.values()
+            if value.get("command_id") == command_id
+        }
+
+
+class _MemoryEffectPort:
+    def __init__(self, ledger: EffectLedger, command, claim, workspace) -> None:
+        self.ledger = ledger
+        self.command = command
+        self.claim = claim
+        self.workspace = workspace
+
+    def prepare_effect(self, *, effect_key, effect_kind, target, expected_state, outbound_root):
+        outbound = self.ledger.artifacts.seal_tree(
+            outbound_root,
+            kind="effect_payload",
+            producer_run_id=self.command.run_id,
+            producer_stage=self.command.stage,
+            producer_tool_sha256=self.claim.executor_sha256,
+        )
+        existing = self.ledger.by_key.get(effect_key)
+        if existing is not None:
+            if existing["outbound_sha256"] != outbound.set_sha256:
+                raise ProtocolError("effect.identity_conflict", {"effect_key": effect_key})
+            return SimpleNamespace(effect_id=existing["effect_id"])
+        effect_id = "effect-" + digest(
+            {
+                "command_id": self.command.command_id,
+                "effect_key": effect_key,
+                "outbound": outbound.set_sha256,
+            }
+        )
+        self.ledger.by_key[effect_key] = {
+            "effect_id": effect_id,
+            "command_id": self.command.command_id,
+            "state": EffectState.PREPARED,
+            "outbound_sha256": outbound.set_sha256,
+            "payload": None,
+        }
+        return SimpleNamespace(effect_id=effect_id)
+
+    def authorize_dispatch(self, effect_id, *, source):
+        entry = self._entry(effect_id)
+        if entry["state"] is not EffectState.PREPARED:
+            raise ProtocolError("effect.dispatch_refused", {"state": entry["state"].value})
+        entry["state"] = EffectState.UNKNOWN
+        self.ledger.authorizations += 1
+        return SimpleNamespace(effect_id=effect_id, fact_type="dispatch_authorized")
+
+    def record_response(self, effect_id, *, source, response_root):
+        entry = self._entry(effect_id)
+        if entry["state"] is not EffectState.UNKNOWN:
+            raise ProtocolError("effect.response_refused", {"state": entry["state"].value})
+        return SimpleNamespace(effect_id=effect_id, fact_type="response")
+
+    def record_timeout(self, effect_id, *, source, detail_root=None):
+        entry = self._entry(effect_id)
+        entry["state"] = EffectState.UNKNOWN
+        self.ledger.timeouts += 1
+        return SimpleNamespace(effect_id=effect_id, fact_type="timeout")
+
+    def record_observation(self, effect_id, *, source, state_class, observation_root):
+        entry = self._entry(effect_id)
+        payload = self.ledger.artifacts.seal_tree(
+            observation_root,
+            kind="effect_observation",
+            producer_run_id=self.command.run_id,
+            producer_stage=self.command.stage,
+            producer_tool_sha256=self.claim.executor_sha256,
+        )
+        entry["payload"] = payload
+        entry["state"] = EffectState.SATISFIED if state_class == "known" else EffectState.UNKNOWN
+        return SimpleNamespace(effect_id=effect_id, fact_type="observation")
+
+    def reconcile_effect(self, effect_id, *, source, state_class, evidence_root):
+        entry = self._entry(effect_id)
+        payload = self.ledger.artifacts.seal_tree(
+            evidence_root,
+            kind="effect_reconciliation",
+            producer_run_id=self.command.run_id,
+            producer_stage=self.command.stage,
+            producer_tool_sha256=self.claim.executor_sha256,
+        )
+        entry["payload"] = payload
+        entry["state"] = (
+            EffectState.SATISFIED
+            if state_class == "known"
+            else EffectState.DEFINITELY_FAILED
+            if state_class == "absent"
+            else EffectState.UNKNOWN
+        )
+        return SimpleNamespace(effect_id=effect_id, fact_type="reconciled")
+
+    def effect_state(self, effect_id):
+        return self._entry(effect_id)["state"]
+
+    def effect_settlement(self, effect_id):
+        entry = self._entry(effect_id)
+        return EffectSettlement(
+            effect_id=effect_id,
+            state=entry["state"],
+            decisive_fact=None,
+            payload_artifact=entry["payload"],
+        )
+
+    def effect_settlement_for_key(self, effect_key):
+        entry = self.ledger.by_key.get(effect_key)
+        if entry is None:
+            return None
+        return self.effect_settlement(entry["effect_id"])
+
+    def _entry(self, effect_id):
+        for entry in self.ledger.by_key.values():
+            if entry["effect_id"] == effect_id:
+                return entry
+        raise AssertionError(effect_id)
+
+
 class DiscoverHarness:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.store = ArtifactStore(root / "cas")
+        self.effects = EffectLedger(self.store)
         self.source = root / "artifacts/source"
         self.rules = root / "artifacts/rules"
         self.configuration = root / "artifacts/configuration"
@@ -240,7 +389,8 @@ class DiscoverHarness:
             claim_id=f"claim-{fence}",
             command_id=command.command_id,
             fence=fence,
-            owner_sha256=command.expected_executor_sha256,
+            owner_sha256=digest({"process": f"discover-{fence}"}),
+            executor_sha256=command.expected_executor_sha256,
             lane_key="native",
             expires_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(minutes=5),
         )
@@ -271,9 +421,14 @@ class DiscoverHarness:
             },
         )
 
-    def port(self, *, reader=None, backend=None) -> LocalArchiveDiscoverPort:
+    def effect_port(self, command, *, fence=1):
+        claim = self.claim(command, fence=fence)
+        return claim, self.effects.bind(command, claim, self.workspace())
+
+    def port(self, *, reader=None, backend=None) -> ArchiveDiscoverAdapter:
         backend = backend or CountingBackend(copy.deepcopy(self.record))
-        return LocalArchiveDiscoverPort(
+        return ArchiveDiscoverAdapter(
+            artifacts=self.store,
             native_tool=NATIVE_TOOL,
             selection_reader_factory=lambda: reader or ClosureReader(),
             backend_factory=lambda _root, _files: backend,
@@ -291,11 +446,17 @@ class DiscoverDomainTests(unittest.TestCase):
         backend = CountingBackend(copy.deepcopy(self.harness.record))
         port = self.harness.port(backend=backend)
         handler = DiscoverHandler(port)
-        execution = handler.execute(self.command, self.harness.claim(self.command), self.harness.workspace())
+        claim, effects = self.harness.effect_port(self.command)
+        execution = handler.execute(
+            self.command,
+            claim,
+            self.harness.workspace(),
+            effects=effects,
+        )
 
         self.assertEqual(execution.outcome, "completed")
-        self.assertEqual(execution.required_effect_ids, ("native-discover:discover-command-1",))
-        self.assertEqual(len(port.transfers), 1)
+        self.assertEqual(len(port.invocations), 1)
+        self.assertEqual(self.harness.effects.authorizations, 1)
         self.assertEqual(backend.calls, 1)
         root = Path(execution.candidate_root)
         self.assertTrue((root / "prepared/discovery/native-discovery.json").is_file())
@@ -306,10 +467,12 @@ class DiscoverDomainTests(unittest.TestCase):
         self.assertNotIn("unused/base.SLDPRT", result["selection"]["files"])
 
     def test_sealed_observation_round_trips_as_one_return_bundle(self) -> None:
+        claim, effects = self.harness.effect_port(self.command)
         execution = DiscoverHandler(self.harness.port()).execute(
             self.command,
-            self.harness.claim(self.command),
+            claim,
             self.harness.workspace(),
+            effects=effects,
         )
         observation_root = Path(execution.candidate_root) / "native-observation"
         request = self.harness.native_request(self.command)
@@ -323,6 +486,67 @@ class DiscoverDomainTests(unittest.TestCase):
         self.assertEqual(admitted.manifest, observation.manifest)
         self.assertEqual(admitted.record, observation.record)
 
+    def test_satisfied_effect_reuses_the_same_sealed_payload_without_resend(self) -> None:
+        adapter = self.harness.port()
+        handler = DiscoverHandler(adapter)
+        first_claim, first_effects = self.harness.effect_port(self.command, fence=1)
+        first = handler.execute(
+            self.command,
+            first_claim,
+            self.harness.workspace(),
+            effects=first_effects,
+        )
+        second_claim, second_effects = self.harness.effect_port(self.command, fence=2)
+        second = handler.execute(
+            self.command,
+            second_claim,
+            self.harness.workspace(),
+            effects=second_effects,
+        )
+        self.assertEqual(first.outcome, "completed")
+        self.assertEqual(second.outcome, "completed")
+        self.assertEqual(len(adapter.invocations), 1)
+        self.assertEqual(self.harness.effects.authorizations, 1)
+
+    def test_prepared_effect_receives_one_dispatch_authorization(self) -> None:
+        request = self.harness.native_request(self.command)
+        prepare_claim, prepare_effects = self.harness.effect_port(self.command, fence=1)
+        outbound, archive_sha256 = DiscoverHandler._write_outbound(
+            self.harness.workspace(),
+            prepare_claim,
+            request,
+            self.harness.source,
+        )
+        prepare_effects.prepare_effect(
+            effect_key=f"native-discover:{self.command.command_id}",
+            effect_kind="native_operation",
+            target={
+                "operation_id": self.command.command_id,
+                "main_assembly": MAIN,
+                "native_tool_sha256": TOOL_SHA256,
+            },
+            expected_state={
+                "schema_version": "description-pipeline.native-discover-effect/v1",
+                "operation_id": self.command.command_id,
+                "request_digest": self.command.request_digest,
+                "source_inventory_sha256": digest(self.harness.source_files),
+                "source_archive_sha256": archive_sha256,
+                "native_tool_sha256": TOOL_SHA256,
+            },
+            outbound_root=outbound,
+        )
+        execute_claim, execute_effects = self.harness.effect_port(self.command, fence=2)
+        adapter = self.harness.port()
+        execution = DiscoverHandler(adapter).execute(
+            self.command,
+            execute_claim,
+            self.harness.workspace(),
+            effects=execute_effects,
+        )
+        self.assertEqual(execution.outcome, "completed")
+        self.assertEqual(self.harness.effects.authorizations, 1)
+        self.assertEqual(len(adapter.invocations), 1)
+
     def test_package_outside_reference_is_refused_before_native_record_read(self) -> None:
         def outside(evidence):
             evidence["documents"][MAIN]["resolved_edges"][0]["resolved_path"] = "C:\\outside\\cad\\base.SLDPRT"
@@ -330,15 +554,45 @@ class DiscoverDomainTests(unittest.TestCase):
 
         reader = ClosureReader(transform=outside)
         backend = CountingBackend(copy.deepcopy(self.harness.record))
-        execution = DiscoverHandler(self.harness.port(reader=reader, backend=backend)).execute(
-            self.command,
-            self.harness.claim(self.command),
-            self.harness.workspace(),
-        )
-        self.assertEqual(execution.outcome, "failed")
-        self.assertIn(execution.reason_code, {"selection_closure_invalid", "discover.native_refused"})
+        claim, effects = self.harness.effect_port(self.command)
+        with self.assertRaises(StageFailure) as raised:
+            DiscoverHandler(self.harness.port(reader=reader, backend=backend)).execute(
+                self.command,
+                claim,
+                self.harness.workspace(),
+                effects=effects,
+            )
+        self.assertIn(raised.exception.reason_code, {"selection_closure_invalid", "discover.native_refused"})
+        self.assertIsInstance(raised.exception.__cause__, NativeDiscoverRefusal)
         self.assertEqual(reader.calls, 1)
         self.assertEqual(backend.calls, 0)
+
+    def test_failure_evidence_write_cannot_replace_the_domain_failure(self) -> None:
+        def outside(evidence):
+            evidence["documents"][MAIN]["resolved_edges"][0]["resolved_path"] = "C:\\outside\\cad\\base.SLDPRT"
+            return evidence
+
+        original_write = discover_module._write_canonical
+
+        def fail_native_evidence(path, value):
+            if path.name == "native-failure-evidence.json":
+                raise OSError("evidence write unavailable")
+            return original_write(path, value)
+
+        claim, effects = self.harness.effect_port(self.command)
+        with (
+            patch.object(discover_module, "_write_canonical", side_effect=fail_native_evidence),
+            self.assertRaises(StageFailure) as raised,
+        ):
+            DiscoverHandler(self.harness.port(reader=ClosureReader(transform=outside))).execute(
+                self.command,
+                claim,
+                self.harness.workspace(),
+                effects=effects,
+            )
+        self.assertIn(raised.exception.reason_code, {"selection_closure_invalid", "discover.native_refused"})
+        self.assertEqual(raised.exception.unavailable_reason, "native_failure_evidence_unavailable")
+        self.assertIsInstance(raised.exception.__cause__, NativeDiscoverRefusal)
 
     def test_embedded_virtual_component_evidence_survives_the_single_transfer(self) -> None:
         def add_virtual(evidence):
@@ -365,8 +619,12 @@ class DiscoverDomainTests(unittest.TestCase):
             evidence["virtual_components"].append(slot)
             return evidence
 
+        claim, effects = self.harness.effect_port(self.command)
         execution = DiscoverHandler(self.harness.port(reader=ClosureReader(transform=add_virtual))).execute(
-            self.command, self.harness.claim(self.command), self.harness.workspace()
+            self.command,
+            claim,
+            self.harness.workspace(),
+            effects=effects,
         )
         self.assertEqual(execution.outcome, "completed")
         result = read_data(Path(execution.candidate_root) / "result.json")
@@ -378,38 +636,34 @@ class DiscoverDomainTests(unittest.TestCase):
     def test_saved_and_declared_configuration_mismatch_is_refused(self) -> None:
         payload = copy.deepcopy(self.harness.record)
         payload["saved_configuration"] = "Other"
-        execution = DiscoverHandler(self.harness.port(backend=CountingBackend(payload))).execute(
-            self.command, self.harness.claim(self.command), self.harness.workspace()
-        )
-        self.assertEqual(execution.outcome, "failed")
-        self.assertEqual(execution.reason_code, "discover.derivation_invalid")
+        claim, effects = self.harness.effect_port(self.command)
+        with self.assertRaises(StageFailure) as raised:
+            DiscoverHandler(self.harness.port(backend=CountingBackend(payload))).execute(
+                self.command,
+                claim,
+                self.harness.workspace(),
+                effects=effects,
+            )
+        self.assertEqual(raised.exception.reason_code, "discover.derivation_invalid")
 
     def test_no_capture_or_downstream_stage_is_invoked(self) -> None:
         with patch(
             "description_pipeline.solidworks.capture",
             side_effect=AssertionError("Capture must not run from Discover"),
         ) as capture:
+            claim, effects = self.harness.effect_port(self.command)
             execution = DiscoverHandler(self.harness.port()).execute(
                 self.command,
-                self.harness.claim(self.command),
+                claim,
                 self.harness.workspace(),
+                effects=effects,
             )
         self.assertEqual(execution.outcome, "completed")
         capture.assert_not_called()
 
 
-class _BlockedEffectPort:
-    def __init__(self) -> None:
-        self.authorization_checks = 0
-        self.native_calls = 0
-
-    def discover(self, request, source_root, workspace):
-        self.authorization_checks += 1
-        raise RuntimeError("effect is unknown; reconcile before resend")
-
-
 class _Services:
-    def __init__(self, root: Path, harness: DiscoverHarness, port: LocalArchiveDiscoverPort) -> None:
+    def __init__(self, root: Path, harness: DiscoverHarness, port: ArchiveDiscoverAdapter) -> None:
         self.root = root
         self.harness = harness
         self.port = port
@@ -419,7 +673,6 @@ class _Services:
         self.decision = None
         self.fail_commit_once = False
         self.materializations = 0
-        self.effects = {"native-discover:discover-command-1": EffectState.SATISFIED}
 
     def add(self, command):
         prior = self.keys.get(command.idempotency_key)
@@ -467,7 +720,7 @@ class _Services:
     def seal_candidate(self, command, claim, execution):
         members = _members(Path(execution.candidate_root))
         artifact_id = digest({"result": execution.checks_sha256, "members": members})
-        artifact = ArtifactRef(
+        output_artifact = ArtifactRef(
             artifact_id=artifact_id,
             kind="stage_output:discover",
             locator=f"cas://artifact/{artifact_id}",
@@ -484,20 +737,46 @@ class _Services:
             stage="discover",
             request_digest=command.request_digest,
             outcome=execution.outcome,
-            result_artifact=artifact,
+            output_artifact=output_artifact,
             actual_executor_sha256=command.expected_executor_sha256,
             checks_sha256=execution.checks_sha256,
-            required_effect_ids=execution.required_effect_ids,
+            required_effect_ids=tuple(self.harness.effects.states_for_command(command.command_id)),
             reason_code=execution.reason_code,
         )
-        self.candidate = StageCandidate(result=result)
+        record_id = digest({"result_record": result.digest})
+        result_record_artifact = ArtifactRef(
+            artifact_id=record_id,
+            kind="stage_result",
+            locator=f"cas://artifact/{record_id}",
+            manifest_sha256=digest({"manifest": record_id}),
+            set_sha256=digest({"record": record_id}),
+            producer_run_id=command.run_id,
+            producer_stage="discover",
+            producer_tool_sha256=claim.executor_sha256,
+        )
+        self.candidate = StageCandidate(
+            result=result,
+            result_record_artifact=result_record_artifact,
+            candidate_id=f"candidate-{result.digest}",
+            claim_id=claim.claim_id,
+            fence=claim.fence,
+        )
         return self.candidate
 
     def verify_candidate(self, command, claim, candidate):
         return candidate
 
-    def effect_state(self, effect_id):
-        return self.effects[effect_id]
+    def effect_states_for_command(self, command_id):
+        return self.harness.effects.states_for_command(command_id)
+
+    def effect_port(self, command, claim, workspace):
+        return self.harness.effects.bind(command, claim, workspace)
+
+    def commit_failure(self, command, claim, failure):
+        raise AssertionError("Discover success tests do not commit failures")
+
+    def discard_workspace(self, workspace):
+        return None
 
     def commit_decision(self, command, claim, candidate):
         if self.fail_commit_once:
@@ -508,12 +787,13 @@ class _Services:
             run_id=command.run_id,
             stage="discover",
             command_id=command.command_id,
-            result_artifact=candidate.result.result_artifact,
+            result_record_artifact=candidate.result_record_artifact,
             result_digest=candidate.result.digest,
             actual_executor_sha256=candidate.result.actual_executor_sha256,
             outcome=candidate.result.outcome,
             original_producer_decision_id=None,
             reason_code=candidate.result.reason_code,
+            failure_envelope=None,
             decided_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
         return self.decision
@@ -535,7 +815,7 @@ class DiscoverEngineTests(unittest.TestCase):
         first = execute_stage(command_id=self.command.command_id, handler=self.handler, services=self.services)
         second = execute_stage(command_id=self.command.command_id, handler=self.handler, services=self.services)
         self.assertEqual(first, second)
-        self.assertEqual(len(self.port.transfers), 1)
+        self.assertEqual(len(self.port.invocations), 1)
 
     def test_same_key_with_changed_rules_is_conflict(self) -> None:
         alternate = self.harness.command(
@@ -551,19 +831,25 @@ class DiscoverEngineTests(unittest.TestCase):
         self.services.fail_commit_once = True
         with self.assertRaisesRegex(RuntimeError, "after Discover seal"):
             execute_stage(command_id=self.command.command_id, handler=self.handler, services=self.services)
-        self.assertEqual(len(self.port.transfers), 1)
+        self.assertEqual(len(self.port.invocations), 1)
         shutil.rmtree(self.harness.source)
         recovered = execute_stage(command_id=self.command.command_id, handler=self.handler, services=self.services)
         self.assertEqual(recovered.outcome, "completed")
-        self.assertEqual(len(self.port.transfers), 1)
+        self.assertEqual(len(self.port.invocations), 1)
 
     def test_unknown_effect_is_refused_before_native_call(self) -> None:
-        blocked = _BlockedEffectPort()
-        handler = DiscoverHandler(blocked)
-        with self.assertRaisesRegex(RuntimeError, "effect is unknown"):
-            handler.execute(self.command, self.harness.claim(self.command), self.harness.workspace())
-        self.assertEqual(blocked.authorization_checks, 1)
-        self.assertEqual(blocked.native_calls, 0)
+        self.harness.effects.preload_unknown(f"native-discover:{self.command.command_id}")
+        claim, effects = self.harness.effect_port(self.command)
+        with self.assertRaises(ProtocolError) as raised:
+            DiscoverHandler(self.port).execute(
+                self.command,
+                claim,
+                self.harness.workspace(),
+                effects=effects,
+            )
+        self.assertEqual(raised.exception.code, "effect.unresolved")
+        self.assertEqual(self.harness.effects.authorizations, 0)
+        self.assertEqual(len(self.port.invocations), 0)
 
 
 if __name__ == "__main__":

@@ -321,6 +321,7 @@ class AdmissionSpec:
             "change_summary": self.change_summary,
             "configuration": self.configuration.to_record(),
             "contract_sha256": self.contract_sha256,
+            "created_at": self.created_at.isoformat(),
             "expected_executor_sha256": self.expected_executor_sha256,
             "expected_native_tool_sha256": self.expected_native_tool_sha256,
             "from_stage": self.from_stage,
@@ -462,10 +463,12 @@ class VerifiedPredecessor:
             or self.command.run_id != self.decision.run_id
             or self.command.request_digest != self.result.request_digest
             or self.result.digest != self.decision.result_digest
-            or self.result.result_artifact != self.decision.result_artifact
+            or self.decision.result_record_artifact is None
+            or self.result.output_artifact.kind == "stage_result"
             or self.result.actual_executor_sha256 != self.decision.actual_executor_sha256
             or self.result.outcome != "completed"
             or self.decision.outcome != "completed"
+            or self.decision.failure_envelope is not None
         ):
             raise ProtocolError("admission.predecessor_invalid", {"stage": self.stage})
 
@@ -478,11 +481,15 @@ def _base_command(
     input_artifacts: tuple[ArtifactRef, ...],
     predecessor_decision_id: str | None,
 ) -> StageCommand:
-    suffix = ""
-    if predecessor_decision_id is not None:
-        suffix = ":" + digest({"decision_id": predecessor_decision_id})
+    command_identity = digest(
+        {
+            "admission_sha256": spec.admission_sha256,
+            "predecessor_decision_id": predecessor_decision_id,
+            "stage": stage,
+        }
+    )
     return StageCommand.create(
-        command_id=f"{stage}:{spec.admission_sha256}{suffix}",
+        command_id=f"{stage}:{command_identity}",
         run_id=spec.run_id,
         stage=stage,
         idempotency_key=f"{spec.run_id}/{stage}",
@@ -553,7 +560,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         raise ProtocolError("admission.predecessor_invalid", {"reason": "run-mismatch"})
     request = {
         "schema_version": DISCOVER_REQUEST_SCHEMA,
-        "freeze_artifact_id": predecessor.result.result_artifact.artifact_id,
+        "freeze_artifact_id": predecessor.result.output_artifact.artifact_id,
         "source_set_artifact_id": spec.originals.ref.artifact_id,
         "ruleset_artifact_id": spec.ruleset.artifact.ref.artifact_id,
         "configuration_artifact_id": spec.configuration.ref.artifact_id,
@@ -572,7 +579,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         stage="discover",
         request=request,
         input_artifacts=(
-            predecessor.result.result_artifact,
+            predecessor.result.output_artifact,
             spec.originals.ref,
             spec.ruleset.artifact.ref,
             spec.configuration.ref,

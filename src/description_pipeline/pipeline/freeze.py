@@ -27,12 +27,13 @@ from .contracts import (
     StageCandidate,
     StageCommand,
     StageExecution,
+    StageFailure,
 )
+from .effects import StageEffectPort
 from .engine import StageWorkspace
 
 FREEZE_REQUEST_SCHEMA = "description-pipeline.freeze-request/v1"
 FREEZE_CHECKS_SCHEMA = "description-pipeline.freeze-checks/v1"
-FREEZE_FAILURE_SCHEMA = "description-pipeline.freeze-failure/v1"
 RULESET_CATALOG_SCHEMA = "description-pipeline.ruleset-catalog/v1"
 ARTIFACT_MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
 
@@ -290,44 +291,6 @@ def _write_canonical(path: Path, value: Any) -> None:
     path.write_bytes(canonical(value) + b"\n")
 
 
-def _failure_execution(
-    command: StageCommand,
-    claim: ExecutionClaim,
-    workspace: StageWorkspace,
-    refusal: FreezeRefusal,
-) -> StageExecution:
-    failure = {
-        "schema_version": FREEZE_FAILURE_SCHEMA,
-        "stage": "freeze",
-        "command_id": command.command_id,
-        "idempotency_key": command.idempotency_key,
-        "request_digest": command.request_digest,
-        "claim_id": claim.claim_id,
-        "fence": claim.fence,
-        "claimed_executor_sha256": claim.owner_sha256,
-        "reason_code": refusal.code,
-        "message": refusal.message,
-        "detail": refusal.detail,
-        "effects": {"required": [], "known": []},
-        "evidence": {
-            "success_artifact_available": False,
-            "reason": "Freeze refused before a complete success artifact existed",
-        },
-        "observed_at": datetime.now(UTC).isoformat(),
-    }
-    root = workspace.root / f"freeze-failure-{claim.fence}"
-    if root.exists():
-        raise ProtocolError("freeze.candidate_conflict", {"candidate": str(root)})
-    _write_canonical(root / "failure.json", failure)
-    return StageExecution(
-        outcome="failed",
-        candidate_root=str(root),
-        checks_sha256=digest(failure),
-        required_effect_ids=(),
-        reason_code=refusal.code,
-    )
-
-
 class FreezeHandler:
     """Bind a complete Freeze command to immutable input and produce one decision."""
 
@@ -336,13 +299,16 @@ class FreezeHandler:
         command: StageCommand,
         claim: ExecutionClaim,
         workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
     ) -> StageExecution:
+        del effects
         try:
             if command.stage != "freeze" or command.kind != "stage":
                 raise FreezeRefusal("freeze.stage_invalid", "The command does not authorize the Freeze stage")
             if command.predecessor_decision_id is not None:
                 raise FreezeRefusal("freeze.predecessor_invalid", "Freeze is a root stage and has no predecessor")
-            if claim.command_id != command.command_id or claim.owner_sha256 != command.expected_executor_sha256:
+            if claim.command_id != command.command_id or claim.executor_sha256 != command.expected_executor_sha256:
                 raise FreezeRefusal("freeze.claim_invalid", "The execution claim does not own this Freeze command")
             request = _validate_request(command)
             bound = _bound_artifacts(command, request)
@@ -432,24 +398,21 @@ class FreezeHandler:
                 outcome="completed",
                 candidate_root=str(output),
                 checks_sha256=digest(checks),
-                required_effect_ids=(),
             )
         except FreezeRefusal as refusal:
-            return _failure_execution(command, claim, workspace, refusal)
+            raise StageFailure(refusal.code, refusal.message) from refusal
         except PipelineError as error:
-            return _failure_execution(
-                command,
-                claim,
-                workspace,
-                FreezeRefusal("freeze.input_invalid", str(error)),
-            )
+            raise StageFailure("freeze.input_invalid", str(error)) from error
 
     def validate_candidate(
         self,
         command: StageCommand,
         claim: ExecutionClaim,
         candidate: StageCandidate,
+        *,
+        effects: StageEffectPort,
     ) -> StageCandidate:
+        del effects
         result = candidate.result
         if (
             result.command_id != command.command_id
@@ -462,8 +425,6 @@ class FreezeHandler:
             raise ProtocolError("freeze.claim_mismatch", {"command_id": command.command_id})
         if result.actual_executor_sha256 != command.expected_executor_sha256:
             raise ProtocolError("freeze.executor_mismatch", {"command_id": command.command_id})
-        if result.required_effect_ids:
-            raise ProtocolError("freeze.effects_unexpected", {"command_id": command.command_id})
         if result.outcome in {"failed", "cancelled"} and not (
             isinstance(result.reason_code, str) and result.reason_code.startswith(_TERMINAL_REASON_PREFIX)
         ):
@@ -474,7 +435,6 @@ class FreezeHandler:
 __all__ = [
     "CONFIGURATION_KIND",
     "FREEZE_CHECKS_SCHEMA",
-    "FREEZE_FAILURE_SCHEMA",
     "FREEZE_REQUEST_SCHEMA",
     "ORIGINALS_KIND",
     "RULESET_CATALOG_SCHEMA",

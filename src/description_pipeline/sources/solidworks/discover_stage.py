@@ -254,7 +254,12 @@ def observe_native_record(
     return admit_native_observation(output, request=request)
 
 
-def admit_native_observation(observation_root: Path, *, request: NativeDiscoverRequest) -> NativeObservation:
+def admit_native_observation(
+    observation_root: Path,
+    *,
+    request: NativeDiscoverRequest,
+    artifact_ref=None,
+) -> NativeObservation:
     """Recompute and admit one Windows-sealed native observation."""
 
     root = Path(observation_root)
@@ -318,6 +323,24 @@ def admit_native_observation(observation_root: Path, *, request: NativeDiscoverR
             {"path": name},
         )
     actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
+    cas_manifest = root / "manifest.json"
+    if cas_manifest.is_file() and not cas_manifest.is_symlink():
+        try:
+            cas_record = read_data(cas_manifest)
+        except (PipelineError, OSError, ValueError) as error:
+            raise NativeDiscoverRefusal(
+                "discover.observation_invalid", "Observation CAS manifest is unreadable"
+            ) from error
+        if (
+            isinstance(cas_record, dict)
+            and cas_record.get("schema_version") == "description-pipeline.artifact-manifest/v1"
+        ):
+            if artifact_ref is not None and cas_record.get("artifact_id") != artifact_ref.artifact_id:
+                raise NativeDiscoverRefusal(
+                    "discover.observation_mismatch",
+                    "Observation CAS manifest names another artifact",
+                )
+            actual.discard("manifest.json")
     _require(
         actual == OBSERVATION_MEMBERS | {OBSERVATION_MANIFEST},
         "discover.observation_invalid",
