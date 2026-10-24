@@ -2411,6 +2411,24 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         self.assertEqual(tessellation.tessellate_calls, 1)
 
+    def test_native_face_null_requires_a_zero_native_count(self):
+        body, face, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.GetFaceFacets = lambda _face: None
+        tessellation.face_facet_counts[id(face)] = 1
+
+        with self.assertRaisesRegex(
+            CadError,
+            "invalid facet ID array",
+        ) as caught:
+            self.capture(body, extension, body_type=1)
+
+        self.assertEqual(caught.exception.detail["native_count"], "1")
+        self.assertEqual(caught.exception.detail["raw_ids"], "None")
+        self.assertEqual(caught.exception.detail["raw_ids_type"], "NoneType")
+        self.assertEqual(tessellation.tessellate_calls, 1)
+
     def test_untessellated_sheet_edge_may_have_no_fins(self):
         body, face, edge, tessellation, extension = (
             self.open_boundary_fixture()
@@ -5890,6 +5908,9 @@ class NativeFinCaptureTests(unittest.TestCase):
             lambda value: value["itessellation"]["bodies"][0]["faces"][
                 0
             ].__setitem__("raw_facet_ids", None),
+            lambda value: value["itessellation"]["bodies"][0]["faces"][
+                0
+            ].__setitem__("raw_facet_ids", [999]),
             lambda value: value["native_edges"][0].__setitem__(
                 "native_fin_count", 99
             ),
@@ -5902,6 +5923,9 @@ class NativeFinCaptureTests(unittest.TestCase):
             ),
             lambda value: value["native_edges"][0].__setitem__(
                 "raw_fin_ids", None
+            ),
+            lambda value: value["native_edges"][0].__setitem__(
+                "raw_fin_ids", [999]
             ),
         )
         for mutate in mutations:
