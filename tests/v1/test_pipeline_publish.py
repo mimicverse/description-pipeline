@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import PipelineError, digest, file_digest, inventory, read_data, write_json
@@ -224,6 +229,159 @@ class _PullRequests:
         )
         self.rows[index] = row
         return row
+
+
+class _PullRequestHttpService:
+    def __init__(self) -> None:
+        self.rows: list[dict] = []
+        self.lock = threading.Lock()
+        service = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def _json(self, status: int, payload) -> None:
+                body = json.dumps(payload, sort_keys=True).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                query = parse_qs(parsed.query)
+                if parsed.path != "/pulls":
+                    self._json(404, {"error": "not_found"})
+                    return
+                with service.lock:
+                    rows = [
+                        row
+                        for row in service.rows
+                        if row["base_ref"] == query.get("base", [""])[0]
+                        and row["head_ref"] == query.get("head", [""])[0]
+                        and row["head_oid"] == query.get("commit", [""])[0]
+                    ]
+                self._json(200, rows)
+
+            def do_POST(self):
+                if self.path != "/pulls":
+                    self._json(404, {"error": "not_found"})
+                    return
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length))
+                with service.lock:
+                    number = len(service.rows) + 1
+                    row = {
+                        **request,
+                        "number": number,
+                        "url": f"http://127.0.0.1/pull/{number}",
+                        "state": "OPEN",
+                    }
+                    service.rows.append(row)
+                self._json(201, row)
+
+            def do_PATCH(self):
+                if not self.path.startswith("/pulls/"):
+                    self._json(404, {"error": "not_found"})
+                    return
+                number = int(self.path.rsplit("/", 1)[-1])
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length))
+                with service.lock:
+                    row = next(item for item in service.rows if item["number"] == number)
+                    row.update(request)
+                self._json(200, row)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+
+
+class _HttpPullRequests:
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url
+
+    def _call(self, method: str, path: str, payload: dict | None = None):
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = Request(
+            self.base_url + path,
+            data=data,
+            method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=5) as response:
+            return json.loads(response.read())
+
+    def observe(self, *, repository, base_ref, head_ref, candidate_commit):
+        rows = self._call(
+            "GET",
+            "/pulls?" + urlencode({"base": base_ref, "head": head_ref, "commit": candidate_commit}),
+        )
+        return tuple(
+            PullRequestObservation(
+                number=row["number"],
+                url=row["url"],
+                state=row["state"],
+                base_ref=row["base_ref"],
+                head_ref=row["head_ref"],
+                head_oid=row["head_oid"],
+                title=row["title"],
+                body=row["body"],
+            )
+            for row in rows
+        )
+
+    def create(self, *, repository, base_ref, head_ref, candidate_commit, title, body):
+        row = self._call(
+            "POST",
+            "/pulls",
+            {
+                "repository": repository,
+                "base_ref": base_ref,
+                "head_ref": head_ref,
+                "head_oid": candidate_commit,
+                "title": title,
+                "body": body,
+            },
+        )
+        return PullRequestObservation(
+            number=row["number"],
+            url=row["url"],
+            state=row["state"],
+            base_ref=row["base_ref"],
+            head_ref=row["head_ref"],
+            head_oid=row["head_oid"],
+            title=row["title"],
+            body=row["body"],
+        )
+
+    def update(self, *, repository, number, candidate_commit, title, body):
+        row = self._call(
+            "PATCH",
+            f"/pulls/{number}",
+            {"head_oid": candidate_commit, "title": title, "body": body},
+        )
+        return PullRequestObservation(
+            number=row["number"],
+            url=row["url"],
+            state=row["state"],
+            base_ref=row["base_ref"],
+            head_ref=row["head_ref"],
+            head_oid=row["head_oid"],
+            title=row["title"],
+            body=row["body"],
+        )
 
 
 class PublishFixture:
@@ -497,6 +655,19 @@ class PublishHandlerTests(unittest.TestCase):
         expected_time = datetime(2026, 10, 25, tzinfo=UTC)
         self.assertEqual(datetime.fromisoformat(metadata[2].replace("Z", "+00:00")), expected_time)
         self.assertEqual(datetime.fromisoformat(metadata[5].replace("Z", "+00:00")), expected_time)
+
+    def test_publish_uses_controlled_loopback_http_pull_request_service(self) -> None:
+        service = _PullRequestHttpService()
+        self.addCleanup(service.close)
+        handler = PublishHandler(
+            self.fixture.store,
+            pull_requests=_HttpPullRequests(service.base_url),
+        )
+        execution = self._run(handler=handler)
+        self.assertEqual(execution.outcome, "completed")
+        self.assertEqual(len(service.rows), 1)
+        receipt = read_data(Path(execution.candidate_root) / "publication-receipt.json")
+        self.assertEqual(service.rows[0]["head_oid"], receipt["candidate_commit"])
 
     def test_second_run_reuses_satisfied_effects_without_external_calls(self) -> None:
         first = self._run()
