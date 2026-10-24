@@ -822,6 +822,7 @@ def read_sealed_native_operation_request(
 
     if command.stage == "capture":
         from ..pipeline.capture import (
+            CAPTURE_INPUT_ARCHIVE,
             CaptureRequest,
             _outbound_tree_sha256,
             validate_capture_effect_outbound,
@@ -845,11 +846,18 @@ def read_sealed_native_operation_request(
             "command_id": command.command_id,
             "effect_key": request.effect_key,
             "handoff_sha256": request.handoff_sha256,
+            "input_archive_bytes": outbound["input_archive_bytes"],
+            "input_archive_sha256": outbound["input_archive_sha256"],
             "main_assembly": request.main_assembly,
             "native_tool_record_sha256": request.native_tool_record_sha256,
             "native_tool_source_sha256": request.native_tool_source_sha256,
             "object_set_sha256": digest(objects),
-            "outbound_sha256": _outbound_tree_sha256(outbound),
+            "operation_id": outbound["operation_id"],
+            "outbound_sha256": _outbound_tree_sha256(
+                outbound,
+                outbound_root / CAPTURE_INPUT_ARCHIVE,
+            ),
+            "payload_sha256": outbound["payload_sha256"],
             "prepared_sha256": request.prepared_sha256,
             "request_digest": command.request_digest,
             "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
@@ -880,21 +888,37 @@ def read_sealed_native_operation_request(
         }
         try:
             native_request = CaptureOperationRequest.from_record(request_record)
+            operation = build_operation_record(
+                operation_id=outbound["operation_id"],
+                kind=CAPTURE_KIND,
+                request=native_request.to_record(),
+                input_archive_sha256=outbound["input_archive_sha256"],
+                input_archive_bytes=outbound["input_archive_bytes"],
+                native_tool_requirement_sha256=(
+                    request.native_tool_record_sha256
+                ),
+                output_contract=CAPTURE_TRANSFER_SCHEMA,
+            )
         except Exception as error:
             raise NativeOperationProtocolError(
                 "Capture reconciliation outbound is not a canonical native request"
             ) from error
+        if (
+            outbound["operation_id"] != operation["operation_id"]
+            or outbound["payload_sha256"] != operation["payload_sha256"]
+        ):
+            raise NativeOperationProtocolError(
+                "Capture reconciliation outbound operation identity is inconsistent"
+            )
         return SealedNativeOperationRequest(
-            operation_id=native_capture_operation_id(
-                run_id=command.run_id,
-                command_id=command.command_id,
-                effect_key=request.effect_key,
-            ),
+            operation_id=outbound["operation_id"],
             kind=CAPTURE_KIND,
             request=native_request,
             request_sha256=digest(native_request.to_record()),
-            payload_sha256=None,
+            payload_sha256=outbound["payload_sha256"],
             native_tool_requirement_sha256=request.native_tool_record_sha256,
+            input_archive=outbound_root / CAPTURE_INPUT_ARCHIVE,
+            input_archive_sha256=outbound["input_archive_sha256"],
         )
 
     if command.stage == "discover":

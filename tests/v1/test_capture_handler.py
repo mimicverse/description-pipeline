@@ -642,6 +642,8 @@ class CaptureHandlerTests(unittest.TestCase):
         outbound_root: Path,
     ) -> tuple[NativeOperationClient, str]:
         outbound = read_data(outbound_root / "outbound.json")
+        input_archive = outbound_root / capture_module.CAPTURE_INPUT_ARCHIVE
+        self.assertTrue(input_archive.is_file())
         request = CaptureOperationRequest.from_record(
             {
                 "schema_version": CAPTURE_OPERATION_SCHEMA,
@@ -674,22 +676,26 @@ class CaptureHandlerTests(unittest.TestCase):
             media_type="application/zip",
         )
         now = datetime.now(UTC).isoformat()
+        native_owner_sha256 = digest(
+            {"native_operation_claim": operation_id}
+        )
+        native_executor_sha256 = digest(self.current_native_tool)
         view = NativeOperationView(
             schema_version=OPERATION_VIEW_SCHEMA,
             operation_id=operation_id,
             kind=CAPTURE_KIND,
-            payload_sha256=digest({"operation": operation_id}),
+            payload_sha256=outbound["payload_sha256"],
             state="satisfied",
             request_sha256=digest(request.to_record()),
-            input_archive_sha256=digest({"input": operation_id}),
+            input_archive_sha256=(
+                outbound["input_archive_sha256"]
+            ),
             native_tool_requirement_sha256=digest(
                 self.current_native_tool
             ),
-            actual_native_tool_sha256=digest(
-                self.current_native_tool
-            ),
-            owner_sha256=outbound["execution"]["owner_sha256"],
-            executor_sha256=outbound["execution"]["executor_sha256"],
+            actual_native_tool_sha256=native_executor_sha256,
+            owner_sha256=native_owner_sha256,
+            executor_sha256=native_executor_sha256,
             resource_terminated=True,
             artifact=artifact,
             failure=None,
@@ -843,6 +849,10 @@ class CaptureHandlerTests(unittest.TestCase):
         self.assertEqual(execution.outcome, "completed")
         outbound_path = workspace.root / "capture-effect-outbound/outbound.json"
         outbound = read_data(outbound_path)
+        input_archive = (
+            outbound_path.parent
+            / capture_module.CAPTURE_INPUT_ARCHIVE
+        )
         self.assertEqual(
             outbound["prepared_files"],
             self.prepared_files,
@@ -860,15 +870,61 @@ class CaptureHandlerTests(unittest.TestCase):
             outbound["native_tool_record_sha256"],
             self.native_tool_sha256,
         )
+        self.assertEqual(
+            outbound["input_archive_bytes"],
+            input_archive.stat().st_size,
+        )
+        self.assertEqual(
+            outbound["input_archive_sha256"],
+            file_digest(input_archive),
+        )
+        self.assertEqual(
+            outbound["operation_id"],
+            native_capture_operation_id(
+                run_id=self.command.run_id,
+                command_id=self.command.command_id,
+                effect_key="capture-native",
+            ),
+        )
+        self.assertRegex(outbound["payload_sha256"], r"\A[0-9a-f]{64}\Z")
         for root in workspace.inputs.values():
             shutil.rmtree(root)
         self.assertEqual(
             capture_module.validate_capture_effect_outbound(
-                outbound_path,
+                outbound_path.parent,
                 self.command,
             ),
             outbound,
         )
+
+    def test_effect_outbound_rejects_changed_exact_input_archive(self) -> None:
+        workspace = self.workspace(name="capture-outbound-archive")
+        effects = self.effects()
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.capture_tool,
+        ):
+            execution = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(execution.outcome, "completed")
+        settlement = effects.effect_settlement_for_key("capture-native")
+        self.assertIsNotNone(settlement)
+        self.assertIsNotNone(settlement.outbound_artifact)
+        recovered = self.store.materialize(
+            settlement.outbound_artifact,
+            self.root / "recovered-effect-outbound",
+        )
+        archive = recovered / capture_module.CAPTURE_INPUT_ARCHIVE
+        archive.write_bytes(archive.read_bytes() + b"tampered")
+        with self.assertRaisesRegex(Exception, "effect_outbound"):
+            capture_module.validate_capture_effect_outbound(
+                recovered,
+                self.command,
+            )
 
     def test_effect_reuse_rejects_a_different_current_outbound_closure(self) -> None:
         workspace = self.workspace()
