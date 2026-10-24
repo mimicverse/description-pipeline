@@ -5,7 +5,12 @@ from __future__ import annotations
 import unittest
 from datetime import UTC, datetime
 
+from description_pipeline.io import digest
 from description_pipeline.platform.queries import read_run_projection, render_stage_summary
+from description_pipeline.schemas import (
+    RUN_ADMISSION_SCHEMA,
+    STAGE_COMMAND_SCHEMA,
+)
 
 
 class _Cursor:
@@ -17,17 +22,61 @@ class _Cursor:
     def execute(self, statement: str, parameters) -> None:
         self.statements.append(statement)
         if "FROM run_admission" in statement:
+            request = {"run_id": "run-1"}
             self.result = [
                 (
                     "request-1",
                     None,
                     "freeze",
-                    "a" * 64,
+                    request,
+                    digest(
+                        {
+                            "from_stage": "freeze",
+                            "parent_run_id": None,
+                            "request": request,
+                            "request_id": "request-1",
+                            "run_id": "run-1",
+                            "schema_version": RUN_ADMISSION_SCHEMA,
+                        }
+                    ),
                     datetime(2026, 10, 25, tzinfo=UTC),
                 )
             ]
-        elif "FROM command" in statement:
-            self.result = [("freeze-command", "freeze", "stage", "b" * 64, None)]
+        elif "FROM command\n" in statement:
+            request = {"run_id": "run-1"}
+            request_digest = digest(
+                {
+                    "command_id": "freeze-command",
+                    "config_snapshot_sha256": "c" * 64,
+                    "contract_sha256": "d" * 64,
+                    "expected_executor_sha256": "f" * 64,
+                    "idempotency_key": "run-1/freeze",
+                    "input_artifacts": [],
+                    "kind": "stage",
+                    "policy_sha256": "e" * 64,
+                    "predecessor_decision_id": None,
+                    "request": request,
+                    "run_id": "run-1",
+                    "schema_version": STAGE_COMMAND_SCHEMA,
+                    "stage": "freeze",
+                }
+            )
+            self.result = [
+                (
+                    "freeze-command",
+                    "run-1",
+                    "stage",
+                    "freeze",
+                    request,
+                    request_digest,
+                    "run-1/freeze",
+                    "c" * 64,
+                    "d" * 64,
+                    "e" * 64,
+                    "f" * 64,
+                    None,
+                )
+            ]
         else:
             self.result = []
 

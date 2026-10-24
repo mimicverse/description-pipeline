@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, get_args
 
 from ..artifacts import ArtifactStore
 from ..io import PipelineError, digest, read_data
@@ -53,23 +53,27 @@ from .contracts import (
     DiagnosticReplayScope,
     DispatchCommand,
     DispatchConf,
+    EffectKind,
     FailureEnvelope,
     RunAdmission,
     StageCommand,
     StageDecision,
+    StageEffectWait,
     StageId,
+    StagePending,
     StageResult,
 )
 from .discover import DiscoverDomainAdapter, DiscoverHandler
+from .dispatch import DispatchAdapter, DispatchResult, TechnicalDispatchService
 from .effects import EffectIntent
-from .engine import StageHandler, StageServices, execute_stage
+from .engine import StageAttemptResult, StageHandler, StageServices, execute_stage
 from .freeze import FreezeHandler
+from .services import CanonicalStageServices, ClaimPolicy
 from .reconciliation import (
     EffectReconciliationAdapter,
     EffectReconciliationResult,
     EffectReconciliationService,
 )
-from .services import CanonicalStageServices, ClaimPolicy
 from .stages.generate import GenerateHandler
 from .stages.publish import PublishHandler
 from .verify import VerifyHandler
@@ -82,6 +86,12 @@ STAGES: tuple[StageId, ...] = (
     "generate",
     "verify",
     "publish",
+)
+_EFFECT_KINDS = frozenset(get_args(EffectKind))
+_REQUIRED_RECONCILIATION_KINDS = (
+    "native_operation",
+    "git_ref_update",
+    "pr_upsert",
 )
 
 
@@ -117,6 +127,36 @@ class AirflowTaskBinding:
             raise ApplicationError(
                 "application.airflow_binding_invalid",
                 "Airflow map_index must be -1 for an unmapped task or a non-negative index",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class EffectWakeupHint:
+    """One non-authoritative wake-up observation for a canonical effect wait."""
+
+    wait_digest: str
+    observed_at: datetime
+    changed: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.wait_digest, str)
+            or len(self.wait_digest) != 64
+            or any(character not in "0123456789abcdef" for character in self.wait_digest)
+        ):
+            raise ApplicationError(
+                "application.effect_wakeup_invalid",
+                "Effect wake-up digest is invalid",
+            )
+        if not isinstance(self.observed_at, datetime) or self.observed_at.tzinfo is None:
+            raise ApplicationError(
+                "application.effect_wakeup_invalid",
+                "Effect wake-up time must be timezone-aware",
+            )
+        if type(self.changed) is not bool:
+            raise ApplicationError(
+                "application.effect_wakeup_invalid",
+                "Effect wake-up changed flag must be boolean",
             )
 
 
@@ -210,6 +250,8 @@ def _native_client_from_environment(
 class AdmissionFactPort(Protocol):
     def load_admission(self, run_id: str) -> RunAdmission | None: ...
 
+    def load_admission_by_request_id(self, request_id: str) -> RunAdmission | None: ...
+
     def admit_run(
         self,
         admission: RunAdmission,
@@ -219,6 +261,8 @@ class AdmissionFactPort(Protocol):
     ) -> tuple[StageCommand, DispatchCommand, EffectIntent]: ...
 
     def load_command(self, command_id: str) -> StageCommand: ...
+
+    def load_dispatch_command(self, command_id: str) -> DispatchCommand: ...
 
     def create_command(
         self,
@@ -235,6 +279,12 @@ class AdmissionFactPort(Protocol):
     def decision_for(self, command: StageCommand) -> StageDecision | None: ...
 
     def load_result(self, decision: StageDecision) -> StageResult: ...
+
+    def effect_intent_for_key(self, command_id: str, effect_key: str) -> EffectIntent | None: ...
+
+
+class CancellationControlPort(Protocol):
+    def send(self, *, cancel_command_id: str, target_effect_id: str): ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +417,12 @@ def _stage_result_record(value: StageResult | FailureEnvelope) -> tuple[str, dic
     raise ApplicationError("application.result_invalid", "The common engine returned an unknown result")
 
 
+def _stage_attempt_record(value: StageAttemptResult) -> tuple[str, dict[str, Any]]:
+    if isinstance(value, StagePending):
+        return "pending", {"wait": value.wait.to_record()}
+    return _stage_result_record(value)
+
+
 class StageApplication:
     """Static production composition; handlers and builders cannot be mutated after construction."""
 
@@ -380,7 +436,8 @@ class StageApplication:
         builders: Mapping[StageId, CommandBuilder],
         clock: Callable[[], datetime] = _utc_now,
         reconciler: EffectReconciliationService | None = None,
-        reconciliation_adapter: EffectReconciliationAdapter | None = None,
+        reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
+        cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
     ) -> None:
         if getattr(services, "facts", facts) is not facts:
             raise ApplicationError("application.store_identity_mismatch", "Stage services use another fact store")
@@ -390,10 +447,18 @@ class StageApplication:
         self.facts = facts
         self.artifacts = artifacts
         self.clock = clock
-        if (reconciler is None) != (reconciliation_adapter is None):
+        adapters = dict(reconciliation_adapters or {})
+        unknown_kinds = set(adapters) - _EFFECT_KINDS
+        if unknown_kinds:
+            raise ApplicationError(
+                "application.reconciliation_kind_invalid",
+                "Unknown effect reconciliation adapter kind",
+                detail={"kinds": sorted(unknown_kinds)},
+            )
+        if (reconciler is None) != (not adapters):
             raise ApplicationError(
                 "application.reconciliation_incomplete",
-                "Reconciliation requires both its service and read-only adapter",
+                "Reconciliation requires both its service and read-only adapters",
             )
         if reconciler is not None and (
             reconciler.facts is not facts
@@ -404,7 +469,16 @@ class StageApplication:
                 "Reconciliation uses another fact or artifact store",
             )
         self.reconciler = reconciler
-        self.reconciliation_adapter = reconciliation_adapter
+        self.reconciliation_adapters = MappingProxyType(adapters)
+        controllers = dict(cancellation_controllers or {})
+        unknown_cancellation_kinds = set(controllers) - _EFFECT_KINDS
+        if unknown_cancellation_kinds:
+            raise ApplicationError(
+                "application.cancellation_kind_invalid",
+                "Unknown cancellation controller kind",
+                detail={"kinds": sorted(unknown_cancellation_kinds)},
+            )
+        self.cancellation_controllers = MappingProxyType(controllers)
         for name, values in (("handlers", handlers), ("builders", builders)):
             unknown = set(values) - set(STAGES)
             if unknown:
@@ -423,10 +497,18 @@ class StageApplication:
             "handlers": [stage for stage in STAGES if stage not in self.handlers],
             "builders": [stage for stage in STAGES if stage not in self.builders],
             "reconciliation": (
-                []
+                [
+                    kind
+                    for kind in _REQUIRED_RECONCILIATION_KINDS
+                    if kind not in self.reconciliation_adapters
+                ]
                 if self.reconciler is not None
-                and self.reconciliation_adapter is not None
-                else ["native"]
+                else list(_REQUIRED_RECONCILIATION_KINDS)
+            ),
+            "cancellation": (
+                []
+                if "native_operation" in self.cancellation_controllers
+                else ["native_operation"]
             ),
         }
 
@@ -438,15 +520,29 @@ class StageApplication:
     ) -> EffectReconciliationResult:
         """Observe one unresolved effect without acquiring or resending it."""
 
-        if self.reconciler is None or self.reconciliation_adapter is None:
+        if self.reconciler is None or not self.reconciliation_adapters:
             raise ApplicationPortMissing(
                 "application.reconciliation_missing",
                 "The read-only effect observer is not installed",
             )
+        intent = self.facts.effect_intent_for_key(command_id, effect_key)
+        if intent is None:
+            raise ApplicationError(
+                "application.effect_missing",
+                "The effect intent is not registered",
+                detail={"command_id": command_id, "effect_key": effect_key},
+            )
+        adapter = self.reconciliation_adapters.get(intent.effect_kind)
+        if adapter is None:
+            raise ApplicationPortMissing(
+                "application.reconciliation_kind_missing",
+                f"The {intent.effect_kind} effect observer is not installed",
+                detail={"effect_kind": intent.effect_kind},
+            )
         return self.reconciler.reconcile(
             command_id=command_id,
             effect_key=effect_key,
-            adapter=self.reconciliation_adapter,
+            adapter=adapter,
         )
 
     def _require_handler(self, stage: StageId) -> StageHandler:
@@ -748,6 +844,75 @@ class StageApplication:
             )
         return spec.originals
 
+    def dispatch(
+        self,
+        command_id: str,
+        adapter: DispatchAdapter,
+    ) -> DispatchResult:
+        """Drive one admitted dispatch command through the common effect runtime."""
+
+        command = self.facts.load_dispatch_command(command_id)
+        claim_policy = getattr(self.services, "claim_policy", None)
+        work_root = getattr(self.services, "work_root", None)
+        if (
+            not isinstance(claim_policy, ClaimPolicy)
+            or not isinstance(work_root, Path)
+        ):
+            raise ApplicationPortMissing(
+                "application.dispatch_missing",
+                "The production dispatch service is not installed",
+            )
+        service = TechnicalDispatchService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=work_root / "dispatch",
+            claim_policy=ClaimPolicy(
+                owner_sha256=claim_policy.owner_sha256,
+                executor_sha256=command.expected_executor_sha256,
+                lease=claim_policy.lease,
+            ),
+            clock=self.clock,
+            adapter=adapter,
+        )
+        return service.dispatch(command_id)
+
+    def cancel(
+        self,
+        *,
+        effect_kind: str,
+        cancel_command_id: str,
+        target_effect_id: str,
+    ):
+        """Send one cancellation transport for its exact effect kind."""
+
+        controller = self.cancellation_controllers.get(effect_kind)
+        if controller is None:
+            raise ApplicationPortMissing(
+                "application.cancellation_missing",
+                f"The {effect_kind} cancellation controller is not installed",
+                detail={"effect_kind": effect_kind},
+            )
+        return controller.send(
+            cancel_command_id=cancel_command_id,
+            target_effect_id=target_effect_id,
+        )
+
+    def admission_by_request_id(self, request_id: str) -> RunAdmission | None:
+        """Read one existing admission by its stable request key."""
+
+        if not isinstance(request_id, str) or not request_id:
+            raise ApplicationError(
+                "application.request_id_invalid",
+                "A non-empty request id is required",
+            )
+        loader = getattr(self.facts, "load_admission_by_request_id", None)
+        if not callable(loader):
+            raise ApplicationError(
+                "application.request_lookup_missing",
+                "The fact store cannot resolve request-id admission identity",
+            )
+        return loader(request_id)
+
     def _load_spec(self, run_id: str) -> tuple[AdmissionSpec, RunAdmission]:
         admission = self.facts.load_admission(run_id)
         if admission is None:
@@ -875,16 +1040,27 @@ class StageApplication:
             certificate = (root / CERTIFICATE_FILENAME).read_bytes()
         return VerifiedVerifyResult.from_artifact_bytes(predecessor, artifact, certificate)
 
-    def execute_registered_command(self, command_id: str) -> StageResult | FailureEnvelope:
-        """Execute one already-registered command through the one common engine."""
+    def execute_registered_command(
+        self,
+        command_id: str,
+        *,
+        resume: StageEffectWait | None = None,
+    ) -> StageAttemptResult:
+        """Execute one registered command through the one common engine."""
 
         command = self.facts.load_command(command_id)
         if command.kind != "stage" or command.stage is None:
             raise ApplicationError("application.command_not_stage", "Only stage commands can execute")
         handler = self._require_handler(command.stage)
-        return execute_stage(command_id=command_id, handler=handler, services=self.services)
+        return execute_stage(
+            command_id=command_id,
+            handler=handler,
+            services=self.services,
+            resume=resume,
+            resume_reconciler=self if resume is not None else None,
+        )
 
-    def replay(self, command_id: str) -> StageResult | FailureEnvelope:
+    def replay(self, command_id: str) -> StageAttemptResult:
         """Replay an already-admitted sealed command with no alternate execution path."""
 
         command = self.facts.load_command(command_id)
@@ -902,8 +1078,8 @@ class StageApplication:
         scope.validate_for(command.stage, command.input_artifacts)
         return self.execute_registered_command(command_id)
 
-    def run_stage(self, run_id: str, stage: StageId) -> StageResult | FailureEnvelope:
-        """Execute or return one stage after proving every prior decision in the admitted run."""
+    def run_stage(self, run_id: str, stage: StageId) -> StageAttemptResult:
+        """Execute one admitted stage or return its canonical pending wait."""
 
         if stage not in STAGES:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {stage!r}")
@@ -981,6 +1157,52 @@ class StageApplication:
             return self.execute_registered_command(stored.command_id)
         raise ApplicationError("application.stage_plan_invalid", "The stage plan ended without a target")
 
+    def resume_stage(
+        self,
+        wait: StageEffectWait,
+        *,
+        wakeup: EffectWakeupHint | None = None,
+    ) -> StageAttemptResult:
+        """Reconcile one exact yielded effect and resume its same canonical command."""
+
+        if not isinstance(wait, StageEffectWait):
+            raise ApplicationError(
+                "application.effect_wait_invalid",
+                "A canonical StageEffectWait is required for resume",
+            )
+        self._validate_airflow_task_binding(wait.run_id, wait.stage)
+        if wakeup is not None:
+            if not isinstance(wakeup, EffectWakeupHint):
+                raise ApplicationError(
+                    "application.effect_wakeup_invalid",
+                    "The optional wake-up value must be an EffectWakeupHint",
+                )
+            if wakeup.wait_digest != wait.digest:
+                raise ApplicationError(
+                    "application.effect_wakeup_mismatch",
+                    "The wake-up hint names another effect wait",
+                    detail={
+                        "expected": wait.digest,
+                        "actual": wakeup.wait_digest,
+                    },
+                )
+        return self.execute_registered_command(
+            wait.command_id,
+            resume=wait,
+        )
+
+    async def observe_pending(self, wait: StageEffectWait) -> EffectWakeupHint:
+        """Perform one passive status observation without acquiring authority."""
+
+        if not isinstance(wait, StageEffectWait):
+            raise ApplicationError(
+                "application.effect_wait_invalid",
+                "A canonical StageEffectWait is required for observation",
+            )
+        from ..orchestration.airflow_effect_trigger import probe_effect_wait
+
+        return await probe_effect_wait(wait)
+
     def _validate_airflow_task_binding(self, run_id: str, stage: StageId) -> None:
         """Reject a context binding that differs from the admitted dispatch identity."""
 
@@ -1039,11 +1261,11 @@ class StageApplication:
 
         if through not in STAGES:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {through!r}")
-        last = None
-        completed_stage = None
+        last: StageAttemptResult | None = None
+        completed_stage: StageId | None = None
         for stage in STAGES[: STAGES.index(through) + 1]:
             last = self.run_stage(run_id, stage)
-            outcome, payload = _stage_result_record(last)
+            outcome, payload = _stage_attempt_record(last)
             if outcome != "completed":
                 return ApplicationOutcome(
                     run_id=run_id,
@@ -1053,11 +1275,16 @@ class StageApplication:
                     missing_capabilities=self.missing_capabilities(),
                 )
             completed_stage = stage
+        if not isinstance(last, StageResult):
+            raise ApplicationError(
+                "application.result_invalid",
+                "The stage sequence ended without a completed StageResult",
+            )
         return ApplicationOutcome(
             run_id=run_id,
             stage=completed_stage,
             outcome="completed",
-            payload=last.to_record() if last is not None else {},
+            payload=last.to_record(),
             missing_capabilities=self.missing_capabilities(),
         )
 
@@ -1071,7 +1298,8 @@ def build_stage_application(
     builders: Mapping[StageId, CommandBuilder] | None = None,
     clock: Callable[[], datetime] = _utc_now,
     reconciler: EffectReconciliationService | None = None,
-    reconciliation_adapter: EffectReconciliationAdapter | None = None,
+    reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
+    cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
 ) -> StageApplication:
     """Construct one immutable application from explicit ports; no hidden fallback exists."""
 
@@ -1083,7 +1311,8 @@ def build_stage_application(
         builders=builders or {},
         clock=clock,
         reconciler=reconciler,
-        reconciliation_adapter=reconciliation_adapter,
+        reconciliation_adapters=reconciliation_adapters,
+        cancellation_controllers=cancellation_controllers,
     )
 
 
@@ -1096,7 +1325,8 @@ def application_from_environment(
     handlers: Mapping[StageId, StageHandler] | None = None,
     builders: Mapping[StageId, CommandBuilder] | None = None,
     native_operation_client: NativeOperationClient | None = None,
-    reconciliation_adapter: EffectReconciliationAdapter | None = None,
+    reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
+    cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
     airflow_task_binding: AirflowTaskBinding | None = None,
     clock: Callable[[], datetime] = _utc_now,
 ) -> StageApplication:
@@ -1165,8 +1395,68 @@ def application_from_environment(
                 artifact_store=artifacts,
                 tool_provider=tool_provider,
             )
-    if reconciliation_adapter is None and client is not None:
-        reconciliation_adapter = NativeOperationEffectObserver(client)
+    adapters = dict(reconciliation_adapters or {})
+    if client is not None:
+        adapters.setdefault(
+            "native_operation",
+            NativeOperationEffectObserver(client),
+        )
+    from .stages import publish as publish_stage
+
+    publish_observer = getattr(
+        publish_stage,
+        "PublishGitReconciliationAdapter",
+        None,
+    )
+    if publish_observer is not None:
+        adapters.setdefault("git_ref_update", publish_observer())
+    pull_request_observer = getattr(
+        publish_stage,
+        "PublishPullRequestReconciliationAdapter",
+        None,
+    )
+    if pull_request_observer is not None:
+        from ..repository.publish import GitHubCliPullRequestClient
+
+        pull_request_root = Path(work_root) / "publish-pr-observer"
+        pull_request_root.mkdir(parents=True, exist_ok=True)
+        adapters.setdefault(
+            "pr_upsert",
+            pull_request_observer(
+                GitHubCliPullRequestClient(pull_request_root)
+            ),
+        )
+    controllers = dict(cancellation_controllers or {})
+    if client is not None:
+        try:
+            from .cancellation import CancellationControlService
+            from ..orchestration.native_operation_cancellation import (
+                NATIVE_OPERATION_EFFECT_KIND,
+                native_operation_cancellation_adapter,
+            )
+        except ModuleNotFoundError as error:
+            if error.name not in {
+                "description_pipeline.pipeline.cancellation",
+                "description_pipeline.orchestration.native_operation_cancellation",
+            }:
+                raise
+        else:
+            cancellation_adapter = native_operation_cancellation_adapter(
+                client,
+                facts=facts,
+                artifacts=artifacts,
+            )
+            controllers.setdefault(
+                NATIVE_OPERATION_EFFECT_KIND,
+                CancellationControlService(
+                    facts=facts,
+                    artifacts=artifacts,
+                    work_root=Path(work_root) / "cancellation",
+                    claim_policy=services.claim_policy,
+                    clock=clock,
+                    adapter=cancellation_adapter,
+                ),
+            )
     reconciler = (
         EffectReconciliationService(
             facts=facts,
@@ -1175,7 +1465,7 @@ def application_from_environment(
             observer_tool_sha256=executor_sha256,
             clock=clock,
         )
-        if reconciliation_adapter is not None
+        if adapters
         else None
     )
     installed: dict[StageId, StageHandler] = {
@@ -1206,16 +1496,20 @@ def application_from_environment(
         builders=builders or {},
         clock=clock,
         reconciler=reconciler,
-        reconciliation_adapter=reconciliation_adapter,
+        reconciliation_adapters=adapters,
+        cancellation_controllers=controllers,
     )
 __all__ = [
     "STAGES",
     "AdmissionOutcome",
+    "AirflowTaskBinding",
     "ApplicationError",
     "ApplicationOutcome",
     "ApplicationPortMissing",
+    "CancellationControlPort",
     "CommandBuildContext",
     "CommandBuilder",
+    "EffectWakeupHint",
     "StageApplication",
     "application_from_environment",
     "build_stage_application",

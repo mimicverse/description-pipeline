@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import contextlib
 import json
+import hashlib
 import shutil
 import tempfile
 from pathlib import Path
 from unittest import mock
 
 from description_pipeline.delivery import read_delivery_manifest
-from description_pipeline.io import read_data, write_json
+from description_pipeline.io import digest, read_data, write_json
+from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.platform.storage import seal_stage_confirmation
 from description_pipeline.platform.store import PlatformStore
 from description_pipeline.verification import solidworks_urdf
@@ -27,6 +29,89 @@ from .test_platform_store import FakeWorld, build_sealed_delivery
 
 #: The definition the synthetic sealed publication fixture binds its quality to.
 DEFINITION = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
+
+
+class RegisteredProjectionArtifacts:
+    """Materialize the immutable members registered by one test-side projection."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, dict[str, bytes]] = {}
+
+    def register(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        files: dict[str, bytes],
+        kind: str | None = None,
+    ) -> dict:
+        ordered = dict(sorted(files.items()))
+        set_sha256 = digest(
+            {
+                "members": [
+                    {
+                        "path": path,
+                        "bytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                    for path, data in ordered.items()
+                ]
+            }
+        )
+        artifact_id = "fixture:" + digest({"run_id": run_id, "stage": stage, "set": set_sha256})
+        record = {
+            "artifact_id": artifact_id,
+            "kind": kind or f"stage_output:{stage}",
+            "locator": f"cas://artifact/{artifact_id}",
+            "manifest_sha256": digest({"manifest": artifact_id}),
+            "producer_run_id": run_id,
+            "producer_stage": stage,
+            "producer_tool_sha256": digest({"tool": stage}),
+            "set_sha256": set_sha256,
+        }
+        ArtifactRef.from_record(record)
+        self.objects[artifact_id] = ordered
+        return record
+
+    def materialize(self, artifact: ArtifactRef, destination: str | Path) -> Path:
+        files = self.objects.get(artifact.artifact_id)
+        if files is None:
+            raise AssertionError(f"Unknown projection artifact {artifact.artifact_id}")
+        root = Path(destination)
+        root.mkdir(parents=True)
+        for path, data in files.items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        return root
+
+
+class RegisteredRunControl:
+    """Expose the canonical portal control surface over the registered fixture."""
+
+    def __init__(self, store: PlatformStore) -> None:
+        self.store = store
+        self.fact_projection = store.fact_projection
+        self.projection_artifacts = store.projection_artifacts
+
+    def admission(self):
+        return self.store.admission()
+
+    def list_run_display_metadata(self):
+        return self.store.run_displays()
+
+    def get_run_display_metadata(self, run_id: str):
+        return self.store.run_display(run_id)
+
+    def rename_run(self, run_id: str, display_name: str | None):
+        return self.store.set_run_display(run_id, display_name)
+
+    def hide_run(self, run_id: str, *, actor: str):
+        return self.store.hide_run(run_id, actor=actor)
+
+    def restore_run(self, run_id: str):
+        return self.store.restore_run(run_id)
 
 
 @contextlib.contextmanager
@@ -44,6 +129,10 @@ class RegisteredPlatform:
         self.root.mkdir(parents=True, exist_ok=True)
         self.world = FakeWorld()
         self.store = PlatformStore(self.world.connect, sealed=self.sealed)
+        self.projection_artifacts = RegisteredProjectionArtifacts()
+        self.store.fact_projection = self.fact_projection
+        self.store.projection_artifacts = self.projection_artifacts
+        self.run_control = RegisteredRunControl(self.store)
 
     def sealed(self, uri: str) -> Path:
         return self.root / "sealed" / uri.removeprefix("store://sealed/")
@@ -227,3 +316,278 @@ class RegisteredPlatform:
             self.world.events.append(
                 (run_id, start + offset, "stage", str(event.get("stage") or ""), None, json.dumps(event))
             )
+
+    def fact_projection(self, run_id: str) -> dict | None:
+        """Project registered legacy fixture rows into the canonical read facts."""
+
+        record = self.store.run_record(run_id)
+        if not isinstance(record, dict):
+            return None
+        registered = self.store.stage_records(run_id)
+        stage_rows: list[dict] = []
+        by_stage: dict[str, dict[str, dict]] = {}
+        members: dict[str, dict] = {}
+        for stage in STAGES:
+            row = registered.get(stage)
+            if not isinstance(row, dict):
+                stage_rows.append(
+                    {
+                        "stage": stage,
+                        "state": "waiting",
+                        "command": None,
+                        "decision": None,
+                        "receipt": {"artifacts": []},
+                        "checkpoint_uri": None,
+                        "reused_from_run": None,
+                        "original_executed_at": None,
+                        "updated_at": None,
+                        "scope_kind": "formal",
+                        "formal_eligible": False,
+                        "qualification": None,
+                        "in_scope": True,
+                    }
+                )
+                by_stage[stage] = {}
+                continue
+            receipt = row.get("receipt") if isinstance(row.get("receipt"), dict) else {}
+            tree = self._stage_tree(run_id, stage, row.get("checkpoint_uri"))
+            selected = (
+                {
+                    path.relative_to(tree).as_posix(): path.read_bytes()
+                    for path in sorted(tree.rglob("*"))
+                    if path.is_file() and path.name != "manifest.json"
+                }
+                if tree is not None and tree.is_dir()
+                else {}
+            )
+            if stage == "verify" and selected:
+                selected = self._bind_projection_verify(
+                    run_id,
+                    selected,
+                    receipt,
+                )
+            artifact = self.projection_artifacts.register(
+                run_id=run_id,
+                stage=stage,
+                files=selected,
+            )
+            stage_members = {
+                path: {
+                    "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "artifact": artifact,
+                }
+                for path, data in selected.items()
+            }
+            by_stage[stage] = stage_members
+            members.update(stage_members)
+            outcome = row.get("state")
+            command = None
+            if stage == "verify" and "verification-certificate.json" in selected:
+                pair = self._verify_pair_refs(run_id, selected)
+                command = {
+                    "command_id": f"fixture:{run_id}:verify",
+                    "input_artifacts": [pair[0], pair[1]],
+                }
+            qualification = {
+                "outcome": outcome,
+                "scope_kind": "formal",
+                "formal_eligible": outcome == "completed",
+                "qualification_digest": digest(
+                    {
+                        "run_id": run_id,
+                        "stage": stage,
+                        "outcome": outcome,
+                        "scope_kind": "formal",
+                    }
+                ),
+            }
+            stage_rows.append(
+                {
+                    **row,
+                    "stage": stage,
+                    "command": command,
+                    "decision": {
+                        "command_id": (command or {}).get(
+                            "command_id",
+                            f"fixture:{run_id}:{stage}",
+                        ),
+                        "outcome": outcome,
+                        "reason_code": receipt.get("error_code"),
+                    },
+                    "scope_kind": "formal",
+                    "formal_eligible": outcome == "completed",
+                    "qualification": qualification,
+                    "in_scope": True,
+                }
+            )
+        run_state = {
+            "completed": "running",
+            "succeeded": "succeeded",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "running": "running",
+        }.get(str(record.get("state")), str(record.get("state")))
+        events = []
+        for event in sorted(
+            (row for row in self.world.events if row[0] == run_id),
+            key=lambda row: row[1],
+        ):
+            try:
+                payload = json.loads(event[5])
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                events.append(payload)
+        return {
+            "run_id": run_id,
+            "request_id": record.get("request_id"),
+            "parent_run_id": record.get("parent_run_id"),
+            "from_stage": record.get("from_stage"),
+            "request": record.get("request") or {},
+            "purpose": (
+                (record.get("request") or {}).get("purpose")
+                if isinstance(record.get("request"), dict)
+                else None
+            ),
+            "scope": {
+                "kind": "formal",
+                "target_stage": None,
+                "formal_eligible": run_state == "succeeded",
+            },
+            "formal_eligible": run_state == "succeeded",
+            "state": run_state,
+            "events": events,
+            "stages": stage_rows,
+            "by_stage": by_stage,
+            "members": members,
+            "technical": {
+                "commands": [],
+                "claims": [],
+                "effects": [],
+            },
+        }
+
+    def _stage_tree(self, run_id: str, stage: str, checkpoint_uri: object) -> Path | None:
+        if not isinstance(checkpoint_uri, str) or not checkpoint_uri.startswith("store://sealed/"):
+            return None
+        relative = checkpoint_uri.removeprefix("store://sealed/")
+        if relative != f"{run_id}/{stage}":
+            return None
+        return self.sealed(checkpoint_uri)
+
+    def _bind_projection_verify(
+        self,
+        run_id: str,
+        files: dict[str, bytes],
+        receipt: dict,
+    ) -> dict[str, bytes]:
+        generate_files = {
+            path: data
+            for path, data in files.items()
+            if path.startswith(("model/", "urdf/", "meshes/")) or path == "tool.json"
+        }
+        if "urdf/robot.urdf" not in generate_files:
+            generate_files["urdf/robot.urdf"] = b"<robot name='fixture'/>\n"
+        capture_files = {
+            path: data
+            for path, data in files.items()
+            if path.startswith(("input/", "evidence/"))
+        }
+        if not capture_files:
+            capture_files["input/handoff.json"] = b"{}\n"
+        capture = self.projection_artifacts.register(
+            run_id=run_id,
+            stage="capture",
+            files=capture_files,
+        )
+        config_snapshot_sha256 = "e" * 64
+        contract_sha256 = "f" * 64
+        generate_executor_sha256 = digest({"tool": "generate"})
+        generate_receipt = {
+            "capture_artifact": capture,
+            "config_snapshot_sha256": config_snapshot_sha256,
+            "contract_sha256": contract_sha256,
+            "actual_executor_sha256": generate_executor_sha256,
+            "required_executor_sha256": generate_executor_sha256,
+        }
+        generate_receipt_bytes = (
+            json.dumps(generate_receipt, sort_keys=True).encode("utf-8")
+            + b"\n"
+        )
+        generate_files["reports/generate.json"] = (
+            generate_receipt_bytes
+        )
+        files["reports/generate.json"] = generate_receipt_bytes
+        generate = self.projection_artifacts.register(
+            run_id=run_id,
+            stage="generate",
+            files=generate_files,
+        )
+        quality = {}
+        try:
+            parsed = json.loads(files.get("reports/quality.json", b"{}"))
+            quality = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            quality = {}
+        verified = quality.get("passed") is True
+        del receipt
+        subject = generate["set_sha256"]
+        request = {
+            "capture_artifact": capture,
+            "generate_artifact": generate,
+        }
+        certificate = {
+            "actual_verifier": {"executor": "fixture"},
+            "actual_verifier_sha256": digest({"tool": "verify"}),
+            "capture_artifact": capture,
+            "checks": quality.get("checks") or [],
+            "config_snapshot_sha256": config_snapshot_sha256,
+            "contract_sha256": contract_sha256,
+            "decision": "PASS" if verified else "FAIL",
+            "diagnostics": quality.get("diagnostics") or [],
+            "evaluation_subject_sha256": digest(
+                {
+                    **{
+                        "input/" + path.removeprefix("input/"): hashlib.sha256(data).hexdigest()
+                        for path, data in capture_files.items()
+                        if path.startswith("input/")
+                    },
+                    **{
+                        "evidence/" + path.removeprefix("evidence/"): hashlib.sha256(data).hexdigest()
+                        for path, data in capture_files.items()
+                        if path.startswith("evidence/")
+                    },
+                    **{
+                        path: hashlib.sha256(data).hexdigest()
+                        for path, data in generate_files.items()
+                        if path == "tool.json"
+                        or path.startswith(
+                            ("model/", "urdf/", "meshes/")
+                        )
+                    },
+                }
+            ),
+            "generate_artifact": generate,
+            "generate_receipt_sha256": hashlib.sha256(
+                generate_receipt_bytes
+            ).hexdigest(),
+            "passed": verified,
+            "policy_sha256": "1" * 64,
+            "purpose": "engineering",
+            "request": request,
+            "request_sha256": digest(request),
+            "schema_version": "solidworks-to-urdf.verification-certificate/v1",
+            "subject_sha256": subject,
+        }
+        certificate["verification_key"] = digest(certificate)
+        files["verification-certificate.json"] = (
+            json.dumps(certificate, sort_keys=True).encode("utf-8") + b"\n"
+        )
+        files["verification-execution.json"] = b"{}\n"
+        return files
+
+    def _verify_pair_refs(self, run_id: str, files: dict[str, bytes]) -> tuple[dict, dict]:
+        certificate = json.loads(files["verification-certificate.json"])
+        del run_id
+        return certificate["generate_artifact"], certificate["capture_artifact"]

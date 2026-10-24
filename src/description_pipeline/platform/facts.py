@@ -90,6 +90,10 @@ class FactConflict(FactStoreError):
     """A canonical key is already bound to a different immutable value."""
 
 
+class RunNotAdmittedError(FactStoreError):
+    """A display-only mutation names no canonical run admission."""
+
+
 class StageResultReader(Protocol):
     """Read and independently validate one sealed StageResult artifact."""
 
@@ -625,7 +629,7 @@ class RunControlStore(AdmissionControlStore):
             cursor.execute(statement, parameters)
             row = cursor.fetchone()
         if row is None:
-            raise FactStoreError("The run is not admitted")
+            raise RunNotAdmittedError("The run is not admitted")
         return RunDisplayMetadata(*row)
 
 
@@ -768,6 +772,10 @@ class FactStore(RunControlStore):
         row = cursor.fetchone()
         if row is None:
             return None
+        return self._admission_from_row(row)
+
+    @staticmethod
+    def _admission_from_row(row) -> RunAdmission:
         return RunAdmission(
             schema_version=RUN_ADMISSION_SCHEMA,
             run_id=row[0],
@@ -782,6 +790,24 @@ class FactStore(RunControlStore):
     def load_admission(self, run_id: str) -> RunAdmission | None:
         with self._transaction() as connection:
             return self._load_admission_cursor(connection.cursor(), run_id)
+
+    def load_admission_by_request_id(self, request_id: str) -> RunAdmission | None:
+        """Read the immutable admission identity for one stable request key."""
+
+        if not isinstance(request_id, str) or not request_id:
+            raise FactStoreError("A request id is required")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT run_id, request_id, parent_run_id, from_stage, request, request_digest, created_at
+                FROM run_admission
+                WHERE request_id = %s
+                """,
+                (request_id,),
+            )
+            row = cursor.fetchone()
+        return None if row is None else self._admission_from_row(row)
 
     def admit_diagnostic(
         self,
@@ -1192,16 +1218,10 @@ class FactStore(RunControlStore):
             raise FactStoreError("Supporting predecessors must be verified immutable facts")
         if discover_result is not None and not isinstance(discover_result, VerifiedDiscoverResult):
             raise FactStoreError("A verified Discover result is required")
-        if verify_result is not None and not isinstance(
-            verify_result,
-            VerifiedVerifyResult,
-        ):
+        if verify_result is not None and not isinstance(verify_result, VerifiedVerifyResult):
             raise FactStoreError("A verified Verify result is required")
-        if publish_intent is not None and not isinstance(
-            publish_intent,
-            VerifiedPublishIntent,
-        ):
-            raise FactStoreError("A verified publication intent is required")
+        if publish_intent is not None and not isinstance(publish_intent, VerifiedPublishIntent):
+            raise FactStoreError("A verified Publish intent is required")
         if not isinstance(command, StageCommand) or command.kind != "stage" or command.stage is None:
             raise FactStoreError("A successor stage command is required")
         try:
@@ -2392,8 +2412,10 @@ class FactStore(RunControlStore):
                     raise FactStoreError("The effect dispatch command disappeared")
             self._lock_effect_ledger_cursor(cursor, claim.command_id)
             self._verify_open_claim_cursor(cursor, claim)
-            self._lock_effect_cursor(cursor, effect_id)
-            cursor.execute("SELECT command_id FROM effect_intent WHERE effect_id = %s", (effect_id,))
+            cursor.execute(
+                "SELECT command_id FROM effect_intent WHERE effect_id = %s",
+                (effect_id,),
+            )
             row = cursor.fetchone()
             if row is None:
                 raise FactStoreError(f"The effect {effect_id!r} is not registered")
@@ -2520,20 +2542,34 @@ class FactStore(RunControlStore):
         closed_at: datetime,
     ) -> None:
         if not isinstance(claim, ExecutionClaim):
-            raise FactStoreError("A canonical execution claim is required for closure")
+            raise FactStoreError(
+                "A canonical execution claim is required for closure"
+            )
         if closure_code not in {"completed", "definite_failure"}:
             raise FactStoreError("A technical command closes only as completed or definite_failure")
         if not isinstance(closed_at, datetime) or closed_at.tzinfo is None:
             raise FactStoreError("Claim closure time must be timezone-aware")
         with self._transaction() as connection:
             cursor = connection.cursor()
-            command = self._lock_command_scope_cursor(cursor, claim.command_id)
+            command = self._lock_command_scope_cursor(
+                cursor,
+                claim.command_id,
+            )
             if (
                 command[1] == "dispatch"
-                and self._load_dispatch_command_cursor(cursor, claim.command_id) is None
+                and self._load_dispatch_command_cursor(
+                    cursor,
+                    claim.command_id,
+                )
+                is None
             ):
-                raise FactStoreError("The execution claim command is missing")
-            self._lock_effect_ledger_cursor(cursor, claim.command_id)
+                raise FactStoreError(
+                    "The execution claim command is missing"
+                )
+            self._lock_effect_ledger_cursor(
+                cursor,
+                claim.command_id,
+            )
             self._verify_open_claim_cursor(cursor, claim)
             cursor.execute(
                 """
@@ -2560,7 +2596,9 @@ class FactStore(RunControlStore):
             )
             closed_rows = cursor.fetchall()
             if len(closed_rows) != 1:
-                raise FactConflict("The execution claim changed before closure")
+                raise FactConflict(
+                    "The execution claim changed before closure"
+                )
 
     def append_effect_fact(
         self,
@@ -2814,16 +2852,23 @@ class FactStore(RunControlStore):
                     lock=True,
                 )
                 if set(candidate.result.required_effect_ids) != set(existing_states):
-                    raise FactConflict("The completed decision effect ids differ from the current ledger")
+                    raise FactConflict(
+                        "The completed decision effect ids differ from the current ledger"
+                    )
                 if candidate.result.outcome == "completed" and any(
-                    state is not EffectState.SATISFIED for state in existing_states.values()
+                    state is not EffectState.SATISFIED
+                    for state in existing_states.values()
                 ):
-                    raise FactConflict("The completed decision now conflicts with its effect ledger")
+                    raise FactConflict(
+                        "The completed decision now conflicts with its effect ledger"
+                    )
                 if candidate.result.outcome != "completed" and any(
                     state in {EffectState.UNKNOWN, EffectState.CONFLICT}
                     for state in existing_states.values()
                 ):
-                    raise FactConflict("The definite decision now conflicts with its effect ledger")
+                    raise FactConflict(
+                        "The definite decision now conflicts with its effect ledger"
+                    )
                 return existing
             self._verify_open_claim_cursor(cursor, claim)
             states = self._effect_states_for_command_cursor(
@@ -2947,7 +2992,8 @@ class FactStore(RunControlStore):
                     lock=True,
                 )
                 declared_existing = {
-                    effect_id: state.value for effect_id, state in existing_states.items()
+                    effect_id: state.value
+                    for effect_id, state in existing_states.items()
                 }
                 if (
                     existing.command_id == command.command_id

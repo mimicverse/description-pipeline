@@ -28,22 +28,11 @@ TASK_IDS = (
 )
 
 
-class _DownEndpoint:
-    """A Windows endpoint that is not reachable at all."""
-
-    def get_job(self, run_id):
-        raise EndpointError("windows down")
-
-    def rerun_plan(self, run_id):
-        raise EndpointError("windows down")
-
-
 class _EndpointSlot:
     """The portal's Windows endpoint: unreachable until a test assigns one native job."""
 
     def __init__(self) -> None:
         self.job: dict | None = None
-        self.plan: dict | None = None
         self.calls = 0
 
     def get_job(self, run_id):
@@ -51,12 +40,6 @@ class _EndpointSlot:
         if self.job is None:
             raise EndpointError("windows down")
         return self.job
-
-    def rerun_plan(self, run_id):
-        self.calls += 1
-        if self.plan is not None:
-            return self.plan
-        raise EndpointError("windows down")
 
 
 class _ExpiredAirflow:
@@ -90,39 +73,19 @@ class PortalSplitTests(unittest.TestCase):
         self.app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=self.airflow,
-                endpoint=lambda: self.windows,
-                platform_store=self.platform.store,
+                run_control_store=self.platform.run_control,
                 config_identity_provider=lambda: "c" * 64,
             )
         )
-
-    def test_snapshot_and_rerun_rows_survive_windows_downtime(self) -> None:
-        snapshot = self.app._job_snapshot(RUN, _DownEndpoint())
-        self.assertEqual(snapshot["run_id"], RUN)
-        self.assertEqual(snapshot["status"], "passed")
-        rows = self.app._rerun_rows(RUN)
-        self.assertEqual([row["stage"] for row in rows], [stage["id"] for stage in portal_module.CONTRACT["stages"]])
-        run_rows = {row["stage"]: row for row in rows}
-        self.assertTrue(run_rows["generate"]["eligible"])
-        self.assertTrue(run_rows["verify"]["eligible"])
-        self.assertFalse(run_rows["publish"]["eligible"])
-        self.assertFalse(run_rows["capture"]["eligible"])
-        child_rows = {row["stage"]: row for row in self.app._rerun_rows(CHILD)}
-        self.assertTrue(child_rows["publish"]["eligible"])
-        self.assertFalse(child_rows["verify"]["eligible"])
 
     def test_store_paths_stay_behind_airflow_authorization(self) -> None:
         with self.assertRaises(portal_module.PortalError) as caught:
             self.app._preview_payload(SimpleNamespace(token="t"), "portal-20261007T000000-abcdef01")
         self.assertEqual(caught.exception.status, HTTPStatus.UNAUTHORIZED)
 
-    def test_native_complete_is_a_live_boundary_for_retry_and_delete(self) -> None:
-        """The native boundary must stay retryable, deletable and visibly in progress."""
-        job = {
-            "status": "native_complete",
-            "native_status": "satisfied",
-            "result": {"native_complete": True},
-        }
+    def test_canonical_state_is_the_live_boundary_for_retry_and_delete(self) -> None:
+        """Deletion follows canonical run and claim state, not the retired job route."""
+        job = {"status": "native_complete", "result": {"native_complete": True}}
         self.windows.job = job
         tasks = [
             {"task_id": "freeze", "state": "success"},
@@ -149,51 +112,17 @@ class PortalSplitTests(unittest.TestCase):
             created_at=0.0,
             last_seen=0.0,
         )
-        # The run ended and every task is terminal: the sealed native half is done evidence.
+        # The admitted run is terminal and has no open canonical claim.
         self.assertIsNone(self.app._delete_refusal(session, {"state": "success"}, RUN))
-        # A native job that is genuinely still executing keeps refusing deletion ...
-        self.windows.job = {"status": "running"}
+        self.platform.conclude(RUN, "running")
         self.assertEqual(self.app._delete_refusal(session, {"state": "success"}, RUN)[0], "run_active")
-        # ... and an unrecognized native status still fails closed.
-        self.windows.job = {"status": "unexpected"}
+        self.platform.conclude(RUN, "unresolved")
+        self.assertEqual(
+            self.app._delete_refusal(session, {"state": "success"}, RUN)[0],
+            "reconciliation_required",
+        )
+        self.platform.conclude(RUN, "unexpected")
         self.assertEqual(self.app._delete_refusal(session, {"state": "success"}, RUN)[0], "unconfirmed")
-
-    def test_portable_rows_clear_stale_native_prerequisites(self) -> None:
-        native_prerequisites = {
-            "inputs": "ok",
-            "tool": "ok",
-            "receipt": "absent",
-            "earliest_required": "generate",
-        }
-        self.windows.plan = {
-            "stage_reruns": [
-                {
-                    "stage": stage["id"],
-                    "name": stage["name"],
-                    "eligible": False,
-                    "reason": "native",
-                    "message": "Native endpoint",
-                    "recomputes": [stage["id"]],
-                    "retains": [],
-                    "prerequisites": dict(native_prerequisites),
-                    "target_changed": False,
-                }
-                for stage in portal_module.CONTRACT["stages"]
-            ]
-        }
-        rows = {row["stage"]: row for row in self.app._rerun_rows(RUN)}
-        # The Windows plan cannot describe the portable surface: its stale prerequisite
-        # summary must not survive on the three Linux-owned rows ...
-        for stage in ("generate", "verify", "publish"):
-            self.assertEqual(rows[stage]["prerequisites"], [], stage)
-            self.assertNotIn("absent", str(rows[stage]["prerequisites"]), stage)
-        self.assertTrue(rows["generate"]["eligible"])
-        self.assertTrue(rows["verify"]["eligible"])
-        self.assertFalse(rows["publish"]["eligible"])
-        self.assertEqual(rows["publish"]["reason"], "linux_checkpoint_missing")
-        # ... while every native-stage row keeps its own plan untouched.
-        self.assertEqual(rows["capture"]["prerequisites"], native_prerequisites)
-        self.assertEqual(rows["capture"]["reason"], "native")
 
     def test_unauthorized_linked_rerun_is_refused_before_side_effects(self) -> None:
         upload_root = self.tmp / "uploads"
@@ -201,8 +130,7 @@ class PortalSplitTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=self.airflow,
-                endpoint=lambda: self.windows,
-                platform_store=self.platform.store,
+                run_control_store=self.platform.run_control,
                 upload_root=upload_root,
                 config_identity_provider=lambda: "c" * 64,
             )

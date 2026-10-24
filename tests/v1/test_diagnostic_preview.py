@@ -193,8 +193,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -216,8 +215,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -241,8 +239,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -272,8 +269,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -291,8 +287,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -318,8 +313,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -338,8 +332,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -347,7 +340,25 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertIs(preview["verified"], False)
         self.assertEqual(preview["state"], "unverified")
         self.assertEqual(preview["reason"], "verification_failed")
-        self.assertEqual(preview["subject_sha256"], hashlib.sha256(URDF).hexdigest())
+        projection = platform.fact_projection(RUN)
+        certificate_member = projection["by_stage"]["verify"]["verification-certificate.json"]
+        certificate = json.loads(
+            platform.projection_artifacts.objects[
+                certificate_member["artifact"]["artifact_id"]
+            ]["verification-certificate.json"]
+        )
+        self.assertEqual(
+            preview["subject_sha256"],
+            certificate["generate_artifact"]["set_sha256"],
+        )
+        self.assertEqual(
+            preview["generate_artifact_id"],
+            certificate["generate_artifact"]["artifact_id"],
+        )
+        self.assertEqual(
+            preview["capture_artifact_id"],
+            certificate["capture_artifact"]["artifact_id"],
+        )
         self.assertEqual(preview["urdf"], "urdf/robot.urdf")
         self.assertIn("urdf/robot.urdf", preview["files"])
         self.assertEqual(
@@ -404,8 +415,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -483,8 +493,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")

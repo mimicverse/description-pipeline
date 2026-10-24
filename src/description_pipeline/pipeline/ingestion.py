@@ -29,12 +29,8 @@ from ..repository.publish import (
     seal_repository_snapshot,
 )
 from ..repository.review_branch import review_branch
-from ..runtime import tool_record
-from ..schemas import (
-    NATIVE_TOOL_REQUIREMENT_KIND,
-    PRODUCTION_ADMISSION_INTENT_SCHEMA,
-    TOOL_SCHEMA,
-)
+from ..runtime import scoped_executor_sha256, tool_record
+from ..schemas import NATIVE_TOOL_REQUIREMENT_KIND, TOOL_SCHEMA
 from ..sources.solidworks.handoff import describe_handoff
 from ..stages import CONTRACT_SHA256
 from .admission import (
@@ -541,7 +537,9 @@ class AdmissionOutcomePort(Protocol):
     dispatch_command: DispatchCommand
 
 
-_ADMINISTRATIVE_INTENT_SCHEMA = PRODUCTION_ADMISSION_INTENT_SCHEMA
+_ADMINISTRATIVE_INTENT_SCHEMA = (
+    "description-pipeline.production-admission-intent/v1"
+)
 
 
 def _intent_differences(
@@ -692,9 +690,10 @@ class PreparedAdmission:
                 "admission_ingestion.outcome_invalid",
                 {"run_id": self.spec.run_id, "reason": "admission-spec"},
             ) from error
-        expected_intent = _spec_administrative_intent(self.spec)
-        actual_intent = _spec_administrative_intent(outcome_spec)
-        differences = _intent_differences(expected_intent, actual_intent)
+        differences = _intent_differences(
+            _spec_administrative_intent(self.spec),
+            _spec_administrative_intent(outcome_spec),
+        )
         if differences:
             raise ProtocolError(
                 "admission_ingestion.intent_conflict",
@@ -703,8 +702,7 @@ class PreparedAdmission:
                     "fields": differences,
                 },
             )
-        expected_run = build_run_admission(outcome_spec)
-        if outcome.admission != expected_run:
+        if outcome.admission != build_run_admission(outcome_spec):
             raise ProtocolError(
                 "admission_ingestion.outcome_invalid",
                 {"run_id": self.spec.run_id, "reason": "admission-bindings"},
@@ -831,7 +829,10 @@ class ProductionAdmissionFactory:
             verify=source,
             publish=source,
         )
-        dispatch = source
+        dispatch = scoped_executor_sha256(
+            portable,
+            "airflow_dispatch",
+        )
         return executors, source, dispatch, portable
 
     def _native_requirement(
@@ -899,7 +900,7 @@ class ProductionAdmissionFactory:
         self,
         request: ProductionAdmissionRequest,
         resolved: Mapping[str, Any],
-        ingestion_executor_sha256: str,
+        ingestion_tool_sha256: str,
     ) -> VerifiedArtifact:
         handoff_root = _real_directory(
             resolved["storage"]["handoff_root"],
@@ -934,7 +935,7 @@ class ProductionAdmissionFactory:
             kind=SOURCE_SET_KIND,
             producer_run_id=None,
             producer_stage=None,
-            producer_tool_sha256=ingestion_executor_sha256,
+            producer_tool_sha256=ingestion_tool_sha256,
         )
         verified = self._verified(artifact)
         if verified.inventory != files:
@@ -944,7 +945,7 @@ class ProductionAdmissionFactory:
     def _seal_ruleset(
         self,
         resolved: Mapping[str, Any],
-        ingestion_executor_sha256: str,
+        ingestion_tool_sha256: str,
     ) -> VerifiedRuleset:
         roots = resolved["specifications"]["record_roots"]
         if not isinstance(roots, list) or not roots:
@@ -991,8 +992,8 @@ class ProductionAdmissionFactory:
                             "admission_ingestion.ruleset_invalid",
                             {"reason": "changed", "path": name},
                         )
-                    root_records[relative] = copied
                     records[name] = copied
+                    root_records[relative] = copied
                 logical_roots.append(
                     RulesetRoot(path=root_path, members=root_records)
                 )
@@ -1015,7 +1016,7 @@ class ProductionAdmissionFactory:
                 kind=RULESET_KIND,
                 producer_run_id=None,
                 producer_stage=None,
-                producer_tool_sha256=ingestion_executor_sha256,
+                producer_tool_sha256=ingestion_tool_sha256,
             )
         verified = self._verified(artifact)
         with tempfile.TemporaryDirectory(prefix="admission-ruleset-read-", dir=self.work_root) as directory:
@@ -1032,7 +1033,7 @@ class ProductionAdmissionFactory:
         self,
         resolved: Mapping[str, Any],
         snapshot_bytes: bytes,
-        ingestion_executor_sha256: str,
+        ingestion_tool_sha256: str,
     ) -> VerifiedArtifact:
         artifact_root = _real_directory(
             resolved["storage"]["artifact_root"],
@@ -1051,7 +1052,7 @@ class ProductionAdmissionFactory:
                 kind=CONFIGURATION_KIND,
                 producer_run_id=None,
                 producer_stage=None,
-                producer_tool_sha256=ingestion_executor_sha256,
+                producer_tool_sha256=ingestion_tool_sha256,
             )
         return self._verified(artifact)
 
@@ -1060,7 +1061,7 @@ class ProductionAdmissionFactory:
         request: ProductionAdmissionRequest | ProductionFreezeSuccessorRequest,
         resolved: Mapping[str, Any],
         created_at: datetime,
-        ingestion_executor_sha256: str,
+        ingestion_tool_sha256: str,
     ) -> VerifiedPublishIntent:
         target = resolved["targets"].get(request.target_hardware)
         if not isinstance(target, Mapping):
@@ -1152,7 +1153,7 @@ class ProductionAdmissionFactory:
                 kind=REPOSITORY_SNAPSHOT_KIND,
                 producer_run_id=None,
                 producer_stage=None,
-                producer_tool_sha256=ingestion_executor_sha256,
+                producer_tool_sha256=ingestion_tool_sha256,
             )
         verified = self._verified(artifact)
         with tempfile.TemporaryDirectory(prefix="admission-repository-read-", dir=self.work_root) as directory:
@@ -1240,13 +1241,13 @@ class ProductionAdmissionFactory:
         resolved, platform_config_sha256, snapshot_bytes = self._load_platform()
         (
             executors,
-            ingestion_executor_sha256,
+            ingestion_tool_sha256,
             dispatch_executor_sha256,
             portable_tool,
         ) = self._installed()
         native_tool_requirement, native_source_sha256, native_record_sha256 = (
             self._native_requirement(
-                ingestion_executor_sha256,
+                ingestion_tool_sha256,
                 portable_tool,
             )
         )
@@ -1259,19 +1260,19 @@ class ProductionAdmissionFactory:
             originals = self._seal_upload(
                 request,
                 resolved,
-                ingestion_executor_sha256,
+                ingestion_tool_sha256,
             )
-        ruleset = self._seal_ruleset(resolved, ingestion_executor_sha256)
+        ruleset = self._seal_ruleset(resolved, ingestion_tool_sha256)
         configuration = self._seal_configuration(
             resolved,
             snapshot_bytes,
-            ingestion_executor_sha256,
+            ingestion_tool_sha256,
         )
         publish_intent = self._publication(
             request,
             resolved,
             created_at,
-            ingestion_executor_sha256,
+            ingestion_tool_sha256,
         )
         spec = AdmissionSpec(
             schema_version=ADMISSION_SPEC_SCHEMA,

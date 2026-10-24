@@ -48,7 +48,6 @@ from description_pipeline.pipeline.stages.generate import GenerateHandler
 from description_pipeline.pipeline.stages.publish import (
     PR_EFFECT_KEY,
     PublishHandler,
-    PublishIncomplete,
     PublishPullRequestReconciliationAdapter,
 )
 from description_pipeline.pipeline.verify import VerifyHandler
@@ -491,7 +490,11 @@ class RealSixStageChainTests(unittest.TestCase):
             builders={},
             clock=lambda: current,
             reconciler=reconciler,
-            reconciliation_adapter=reconciliation_adapter,
+            reconciliation_adapters=(
+                {"pr_upsert": reconciliation_adapter}
+                if reconciliation_adapter is not None
+                else None
+            ),
         )
 
     def test_production_intake_completes_the_real_six_stage_chain(self) -> None:
@@ -826,8 +829,14 @@ class RealSixStageChainTests(unittest.TestCase):
                 clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
                 portable_tool_provider=lambda: copy.deepcopy(self.portable),
             )
-            with self.assertRaisesRegex(PublishIncomplete, "publish.pr_unknown"):
-                application.execute_run(RUN_ID)
+            pending = application.execute_run(RUN_ID)
+
+        self.assertEqual(pending.outcome, "pending")
+        self.assertEqual(pending.stage, "publish")
+        self.assertEqual(
+            pending.payload["wait"]["effect_key"],
+            PR_EFFECT_KEY,
+        )
 
         self.assertEqual(pull_requests.create_calls, 1)
         self.assertEqual(len(pull_requests.rows), 1)

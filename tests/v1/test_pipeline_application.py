@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import shutil
@@ -11,7 +12,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from description_pipeline import cli
 from description_pipeline.artifacts import ArtifactStore
@@ -19,9 +20,9 @@ from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.pipeline.admission import build_run_admission
 from description_pipeline.pipeline.application import (
     STAGES,
-    AirflowTaskBinding,
     ApplicationError,
     ApplicationPortMissing,
+    EffectWakeupHint,
     StageApplication,
     application_from_environment,
 )
@@ -33,18 +34,16 @@ from description_pipeline.pipeline.contracts import (
     StageCandidate,
     StageCommand,
     StageDecision,
+    StageEffectWait,
     StageExecution,
+    StagePending,
     StageResult,
 )
 from description_pipeline.pipeline.engine import StageWorkspace
-from description_pipeline.pipeline.reconciliation import EffectReconciliationService
-from description_pipeline.pipeline.services import ClaimPolicy
 from description_pipeline.pipeline.verify import NoExternalEffects
-from description_pipeline.orchestration.native_operation_client import (
-    NativeOperationEffectObserver,
-)
 from description_pipeline.schemas import (
     DISCOVER_RESULT_SCHEMA,
+    STAGE_EFFECT_WAIT_SCHEMA,
     STAGE_RESULT_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
     VERIFICATION_EXECUTION_SCHEMA,
@@ -97,7 +96,7 @@ class _CompletingHandler:
                 "executor": "verify",
                 "source_sha256": command.expected_executor_sha256,
             }
-            verifier_sha256 = verifier["source_sha256"]
+            verifier_sha256 = command.expected_executor_sha256
             request = {
                 "capture_artifact": capture.to_record(),
                 "config_snapshot_sha256": command.config_snapshot_sha256,
@@ -183,12 +182,6 @@ class _MemoryBackend:
             return self.commands[command_id]
         except KeyError as error:
             raise PipelineError(f"unknown command: {command_id}") from error
-
-    def load_dispatch_command(self, command_id: str):
-        try:
-            return self.dispatch_commands[command_id]
-        except KeyError as error:
-            raise PipelineError(f"unknown dispatch command: {command_id}") from error
 
     def create_command(
         self,
@@ -420,38 +413,6 @@ class StageApplicationTests(unittest.TestCase):
             discover.command_id,
         })
 
-    def test_linked_freeze_origins_require_the_parent_committed_closure(self):
-        self.application.admit(self.harness.spec)
-        with self.assertRaisesRegex(
-            ApplicationError,
-            "no completed Freeze decision",
-        ):
-            self.application.load_verified_freeze_origins("run-1")
-
-    def test_airflow_binding_must_match_the_admitted_dispatch_and_stage(self):
-        admitted = self.application.admit(self.harness.spec)
-        self.backend.claim_policy = ClaimPolicy(
-            owner_sha256="a" * 64,
-            executor_sha256=self.harness.spec.executors.freeze,
-            lease=timedelta(minutes=5),
-            dag_id=admitted.dispatch_command.dag_id,
-            dag_run_id="another-run",
-            task_id="freeze",
-            map_index=-1,
-        )
-        with self.assertRaisesRegex(ApplicationError, "admitted dispatch"):
-            self.application.run_stage(self.harness.spec.run_id, "freeze")
-        self.assertEqual(self.freeze.executions, 0)
-
-        self.backend.claim_policy = replace(
-            self.backend.claim_policy,
-            dag_run_id=admitted.dispatch_command.dag_run_id,
-            task_id="discover",
-        )
-        with self.assertRaisesRegex(ApplicationError, "requested stage"):
-            self.application.run_stage(self.harness.spec.run_id, "freeze")
-        self.assertEqual(self.freeze.executions, 0)
-
     def test_execute_run_resumes_after_a_completed_prefix(self):
         self.application.admit(self.harness.spec)
         freeze = self.application.run_stage("run-1", "freeze")
@@ -462,6 +423,127 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(self.freeze.executions, 1)
         self.assertEqual(self.discover.executions, 1)
 
+    def test_pending_stage_is_projected_without_advancing_execute_run(self):
+        wait = StageEffectWait(
+            schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+            run_id="run-1",
+            stage="freeze",
+            command_id="command-freeze",
+            request_digest=digest({"request": "freeze"}),
+            effect_id="effect-freeze",
+            effect_key="dispatch",
+            effect_kind="airflow_dispatch",
+            intent_identity_digest=digest({"intent": "freeze"}),
+            outbound_artifact_id="freeze-outbound",
+            outbound_digest=digest({"outbound": "freeze"}),
+            expected_state_digest=digest({"expected": "freeze"}),
+        )
+        with patch.object(
+            self.application,
+            "run_stage",
+            return_value=StagePending(wait),
+        ) as run_stage:
+            outcome = self.application.execute_run("run-1", through="discover")
+
+        run_stage.assert_called_once_with("run-1", "freeze")
+        self.assertEqual(outcome.stage, "freeze")
+        self.assertEqual(outcome.outcome, "pending")
+        self.assertEqual(outcome.payload, {"wait": wait.to_record()})
+
+    def test_resume_reenters_the_same_command_with_canonical_reconciliation(self):
+        admitted = self.application.admit(self.harness.spec)
+        wait = StageEffectWait(
+            schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+            run_id=admitted.freeze_command.run_id,
+            stage="freeze",
+            command_id=admitted.freeze_command.command_id,
+            request_digest=admitted.freeze_command.request_digest,
+            effect_id="effect-freeze",
+            effect_key="dispatch",
+            effect_kind="airflow_dispatch",
+            intent_identity_digest=digest({"intent": "freeze"}),
+            outbound_artifact_id="freeze-outbound",
+            outbound_digest=digest({"outbound": "freeze"}),
+            expected_state_digest=digest({"expected": "freeze"}),
+        )
+        pending = StagePending(wait)
+        with patch(
+            "description_pipeline.pipeline.application.execute_stage",
+            return_value=pending,
+        ) as execute:
+            result = self.application.resume_stage(wait)
+
+        self.assertEqual(result, pending)
+        execute.assert_called_once_with(
+            command_id=admitted.freeze_command.command_id,
+            handler=self.freeze,
+            services=self.backend,
+            resume=wait,
+            resume_reconciler=self.application,
+        )
+
+    def test_foreign_wakeup_hint_cannot_change_the_resume_target(self):
+        admitted = self.application.admit(self.harness.spec)
+        wait = StageEffectWait(
+            schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+            run_id=admitted.freeze_command.run_id,
+            stage="freeze",
+            command_id=admitted.freeze_command.command_id,
+            request_digest=admitted.freeze_command.request_digest,
+            effect_id="effect-freeze",
+            effect_key="dispatch",
+            effect_kind="airflow_dispatch",
+            intent_identity_digest=digest({"intent": "freeze"}),
+            outbound_artifact_id="freeze-outbound",
+            outbound_digest=digest({"outbound": "freeze"}),
+            expected_state_digest=digest({"expected": "freeze"}),
+        )
+        foreign = EffectWakeupHint(
+            wait_digest="0" * 64,
+            observed_at=datetime(2026, 10, 25, tzinfo=UTC),
+            changed=True,
+        )
+        with patch(
+            "description_pipeline.pipeline.application.execute_stage"
+        ) as execute, self.assertRaisesRegex(
+            ApplicationError,
+            "another effect wait",
+        ):
+            self.application.resume_stage(wait, wakeup=foreign)
+        execute.assert_not_called()
+
+    def test_observe_pending_delegates_to_the_passive_native_probe(self):
+        admitted = self.application.admit(self.harness.spec)
+        wait = StageEffectWait(
+            schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+            run_id=admitted.freeze_command.run_id,
+            stage="freeze",
+            command_id=admitted.freeze_command.command_id,
+            request_digest=admitted.freeze_command.request_digest,
+            effect_id="effect-freeze",
+            effect_key="dispatch",
+            effect_kind="airflow_dispatch",
+            intent_identity_digest=digest({"intent": "freeze"}),
+            outbound_artifact_id="freeze-outbound",
+            outbound_digest=digest({"outbound": "freeze"}),
+            expected_state_digest=digest({"expected": "freeze"}),
+        )
+        hint = EffectWakeupHint(
+            wait_digest=wait.digest,
+            observed_at=datetime(2026, 10, 25, tzinfo=UTC),
+            changed=True,
+        )
+        probe = AsyncMock(return_value=hint)
+        with patch(
+            "description_pipeline.orchestration.airflow_effect_trigger."
+            "probe_effect_wait",
+            probe,
+        ):
+            result = asyncio.run(self.application.observe_pending(wait))
+
+        self.assertEqual(result, hint)
+        probe.assert_awaited_once_with(wait)
+
     def test_run_reports_exact_missing_capability_without_fallback(self):
         self.application.admit(self.harness.spec)
         with self.assertRaises(ApplicationPortMissing) as caught:
@@ -469,10 +551,6 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail["stage"], "capture")
         self.assertIn("capture", self.application.missing_capabilities()["handlers"])
         self.assertEqual(self.application.missing_capabilities()["builders"], [])
-        self.assertEqual(
-            self.application.missing_capabilities()["reconciliation"],
-            ["native"],
-        )
 
     def test_verified_discover_result_projects_capture_through_the_same_engine(self):
         capture = _CompletingHandler()
@@ -607,57 +685,6 @@ class StageApplicationTests(unittest.TestCase):
         self.assertIn("capture", application.handlers)
         self.assertIn("discover", application.handlers)
         self.assertIsInstance(application.handlers["publish"], PublishHandler)
-        self.assertIsInstance(application.reconciler, EffectReconciliationService)
-        self.assertIsInstance(
-            application.reconciliation_adapter,
-            NativeOperationEffectObserver,
-        )
-        self.assertEqual(application.missing_capabilities()["reconciliation"], [])
-
-    def test_environment_composition_carries_the_explicit_airflow_task_binding(self):
-        executor = "a" * 64
-        token = self.root / "bound-endpoint.token"
-        token.write_text("t" * 40, encoding="utf-8")
-        token.chmod(0o600)
-        environment = {
-            "PLATFORM_ARTIFACT_ROOT": str(self.root / "bound-cas"),
-            "PLATFORM_SERVICE_DSN": "postgresql://unused/unused",
-            "PIPELINE_WORK_ROOT": str(self.root / "bound-work"),
-            "SOLIDWORKS_ENDPOINT_URL": "http://127.0.0.1:18765",
-            "ENDPOINT_TOKEN_FILE": str(token),
-        }
-        binding = AirflowTaskBinding(
-            dag_id="solidworks_to_urdf",
-            dag_run_id="portal-bound-run",
-            task_id="freeze",
-            map_index=-1,
-        )
-        with patch(
-            "description_pipeline.pipeline.application.tool_record",
-            return_value={"source_sha256": executor},
-        ):
-            application = application_from_environment(
-                environment,
-                airflow_task_binding=binding,
-            )
-        policy = application.services.claim_policy
-        self.assertEqual(policy.dag_id, binding.dag_id)
-        self.assertEqual(policy.dag_run_id, binding.dag_run_id)
-        self.assertEqual(policy.task_id, binding.task_id)
-        self.assertEqual(policy.map_index, binding.map_index)
-
-    def test_airflow_task_binding_rejects_an_invalid_map_index(self):
-        for value in (None, -2, 0.0, True):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ApplicationError,
-                "map_index",
-            ):
-                AirflowTaskBinding(
-                    dag_id="solidworks_to_urdf",
-                    dag_run_id="portal-bound-run",
-                    task_id="freeze",
-                    map_index=value,
-                )
 
 
 if __name__ == "__main__":
