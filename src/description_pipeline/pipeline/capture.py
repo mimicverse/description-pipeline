@@ -707,9 +707,6 @@ def _capture_native_transaction(
             )
         except Exception as error:
             return _failed_capture(staging, output, receipt, event, error)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging)
 
 
 def _invoke_native_operation(
@@ -1017,6 +1014,14 @@ class CaptureHandler:
             if native.output is None or not native.output.exists():
                 raise ProtocolError("capture.failure_evidence_missing", {"outcome": native.outcome})
             effects.record_response(effect_id, source="capture-handler", response_root=native.output)
+            if not native.resources_settled:
+                effects.record_observation(
+                    effect_id,
+                    source="capture-handler",
+                    state_class="unobservable",
+                    observation_root=native.output,
+                )
+                raise CaptureUnresolved(native.reason_code or "capture.native_resources_unknown")
             effects.reconcile_effect(
                 effect_id,
                 source="capture-handler",

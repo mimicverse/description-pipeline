@@ -22,6 +22,7 @@ from description_pipeline.pipeline import (
     StageCommand,
     StageWorkspace,
 )
+from description_pipeline.pipeline import capture as capture_module
 from description_pipeline.pipeline.capture import CaptureUnresolved, NativeCaptureResult
 from description_pipeline.pipeline.discover import (
     CONFIGURATION_KIND,
@@ -746,6 +747,72 @@ class CaptureHandlerTests(unittest.TestCase):
         self.assertEqual(effects.observed[0][0], "timeout")
         self.assertEqual(effects.observed[1][0], "unobservable")
 
+    def test_native_failure_without_resource_settlement_stays_unknown(self) -> None:
+        workspace = self.workspace()
+        failure_root = workspace.root / "native-failed"
+        failure_root.mkdir()
+        (failure_root / "raw.txt").write_text("native failure bytes\n", encoding="utf-8")
+        operation = Mock(
+            return_value=NativeCaptureResult(
+                "failed",
+                failure_root,
+                None,
+                {"state": "failed"},
+                False,
+                "cad_process_cleanup_failed",
+            )
+        )
+        effects = self.effects()
+        with self.assertRaisesRegex(CaptureUnresolved, "cad_process_cleanup_failed"):
+            self.handler(native_operation=operation).execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(
+            [kind for kind, _effect_id in effects.observed],
+            ["response", "unobservable"],
+        )
+        self.assertEqual(
+            effects.effect_settlement_for_key("capture-native").state,
+            EffectState.UNKNOWN,
+        )
+        self.assertTrue((failure_root / "raw.txt").is_file())
+
+    def test_native_failure_with_resource_proof_is_terminal_and_reconciled(self) -> None:
+        workspace = self.workspace()
+        failure_root = workspace.root / "native-definitely-failed"
+        failure_root.mkdir()
+        (failure_root / "raw.txt").write_text("definitive failure\n", encoding="utf-8")
+        operation = Mock(
+            return_value=NativeCaptureResult(
+                "failed",
+                failure_root,
+                None,
+                {"state": "failed"},
+                True,
+                "cad_domain_refused",
+            )
+        )
+        effects = self.effects()
+        execution = self.handler(native_operation=operation).execute(
+            self.command,
+            self.claim,
+            workspace,
+            effects=effects,
+        )
+        self.assertEqual(execution.outcome, "failed")
+        self.assertTrue(execution.resources_settled)
+        self.assertEqual(
+            [kind for kind, _effect_id in effects.observed],
+            ["response", "reconciled:absent"],
+        )
+        self.assertEqual(
+            effects.effect_settlement_for_key("capture-native").state,
+            EffectState.DEFINITELY_FAILED,
+        )
+
     def test_admission_rejects_tampered_upstream_identity_without_installing(self) -> None:
         workspace = self.workspace()
         with patch("description_pipeline.runtime.tool_record", return_value=self.capture_tool):
@@ -829,6 +896,43 @@ class CaptureHandlerTests(unittest.TestCase):
                 expected_execution=execution_record,
             )
         self.assertFalse(destination.exists())
+
+
+class CaptureTransactionPreservationTests(unittest.TestCase):
+    def test_failure_evidence_failure_keeps_the_untouched_native_staging_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capture-preservation-") as temporary:
+            root = Path(temporary)
+            package = root / "package"
+            package.mkdir()
+            output = root / "output"
+
+            def fail_evidence(_package, staging, **_kwargs):
+                staging.mkdir(parents=True, exist_ok=True)
+                (staging / "raw-native.bin").write_bytes(b"original native bytes")
+                raise RuntimeError("native reader failed")
+
+            with (
+                patch("description_pipeline.steps.capture_evidence", side_effect=fail_evidence),
+                patch(
+                    "description_pipeline.pipeline.capture._keep_capture_diagnostic",
+                    side_effect=OSError("diagnostic install failed"),
+                ),
+                self.assertRaisesRegex(OSError, "diagnostic install failed"),
+            ):
+                capture_module._capture_native_transaction(
+                    package,
+                    output,
+                    run_id=CHILD,
+                    handoff_sha256=digest({"handoff": 1}),
+                    main_assembly=MAIN,
+                )
+
+            retained = list(root.glob(".output-capture-*"))
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(
+                (retained[0] / "raw-native.bin").read_bytes(),
+                b"original native bytes",
+            )
 
 
 if __name__ == "__main__":
