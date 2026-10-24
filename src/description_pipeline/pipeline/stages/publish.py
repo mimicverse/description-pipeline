@@ -37,14 +37,16 @@ from ..contracts import (
 )
 from ..effects import EffectSettlement, EffectState, StageEffectPort
 from ..engine import StageWorkspace
+from ..publish_contract import (
+    PUBLISH_OUTPUT_CONTRACT,
+    PUBLISH_REQUEST_SCHEMA,
+    REPOSITORY_SNAPSHOT_KIND,
+)
 
-PUBLISH_REQUEST_SCHEMA = "description-pipeline.publish-request/v1"
 PUBLISH_RECEIPT_SCHEMA = "description-pipeline.publication-receipt/v1"
-PUBLISH_OUTPUT_CONTRACT = "solidworks-to-urdf.publication-artifact/v1"
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 VERIFY_ARTIFACT_KIND = "stage_output:verify"
-REPOSITORY_SNAPSHOT_KIND = "repository_snapshot"
 GENERATE_RECEIPT = "reports/generate.json"
 VERIFY_CERTIFICATE = "verification-certificate.json"
 VERIFY_EXECUTION = "verification-execution.json"

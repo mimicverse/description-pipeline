@@ -41,16 +41,17 @@ from .contracts import (
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
-
-REQUEST_SCHEMA = "description-pipeline.verify-request/v1"
-CERTIFICATE_SCHEMA = "description-pipeline.verification-certificate/v1"
-RECEIPT_SCHEMA = "description-pipeline.verification-execution/v1"
-OUTPUT_CONTRACT = "solidworks-to-urdf.verification-artifact/v1"
-GENERATE_ARTIFACT_KIND = "stage_output:generate"
-CAPTURE_ARTIFACT_KIND = "stage_output:capture"
-GENERATE_RECEIPT = "reports/generate.json"
-CERTIFICATE_FILENAME = "verification-certificate.json"
-EXECUTION_RECEIPT_FILENAME = "verification-execution.json"
+from .verify_contract import (
+    CAPTURE_ARTIFACT_KIND,
+    CERTIFICATE_FILENAME,
+    CERTIFICATE_SCHEMA,
+    EXECUTION_RECEIPT_FILENAME,
+    GENERATE_ARTIFACT_KIND,
+    GENERATE_RECEIPT,
+    OUTPUT_CONTRACT,
+    RECEIPT_SCHEMA,
+    REQUEST_SCHEMA,
+)
 _PURPOSES = frozenset({PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW})
 _VOLATILE_DETAIL_KEYS = frozenset({"stderr", "stdout", "returncode", "traceback"})
 

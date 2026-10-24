@@ -142,7 +142,9 @@ claim。它不复用 Freeze claim。触发器响应、异常和后续观察都�
 `AdmissionSpec` 是 principal、purpose、request、target、originals、rules、configuration、
 六个 stage executor 身份和命令身份的唯一纯事实。每个 builder 只从
 `StageExecutors.for_stage(stage)` 取得自己的 executor；Windows native closure 由独立的
-`native_tool_sha256` 表达，Linux Capture executor 与它不要求相同。
+`native_tool_source_sha256` 表达，Linux Capture executor 与它不要求相同。完整
+`native_tool` 记录的摘要另作为 `native_tool_record_sha256` 保留，不能拿它与源码身份
+互换。
 
 `build_freeze_command`、`build_run_admission` 及
 `FactStore.admit_run` 共同验证 Freeze command 是该 spec 的确定性投影；错绑原件、规则、
@@ -150,13 +152,15 @@ claim。它不复用 Freeze claim。触发器响应、异常和后续观察都�
 
 Freeze 完成后，`FactStore.create_command` 同时要求持久化 `RunAdmission`、已验证的
 immediate `VerifiedPredecessor`、按阶段所需的 supporting predecessors，以及 Capture
-需要的 `VerifiedDiscoverResult`。它在 run 锁内逐个核对所有 predecessor command、
+需要的 `VerifiedDiscoverResult`、Publish 需要的 `VerifiedVerifyResult` 与
+`VerifiedPublishIntent`。它在 run 锁内逐个核对所有 predecessor command、
 decision、StageResult artifact 和业务输出 artifact，再由同一 spec 重建并验证目标命令。
 
-当前纯 builder/validator 覆盖 Freeze、Discover、Capture、Generate 和 Verify。Capture
+当前纯 builder/validator 覆盖 Freeze、Discover、Capture、Generate、Verify 和 Publish。Capture
 从已验证 Discover 结果读取 prepared/handoff/upload/native 身份；Generate 只接受 Capture；
-Verify 同时核对 Generate 和 Capture lineage。Publish 继续以
-`admission.publish_contract_pending` 明确拒绝，不创建 stub 或冒称六阶段完成。
+Verify 同时核对 Generate 和 Capture lineage。Publish 只接受封存 Verify artifact 中的
+certificate、已验证明细的 Generate/Capture pair、已封存 RepositorySnapshot 与确定性的
+commit 元数据；builder 不读取当前 Git、scratch 或未封存配置。
 
 该路径不会接受调用方自报的 principal、purpose、source、configuration 或 executor
 字段；任一前驱或 support 事实与已注册事实不同，都在 command 写入前拒绝。
