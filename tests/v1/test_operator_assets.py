@@ -81,14 +81,16 @@ class BrowserAssetHealthTests(unittest.TestCase):
 
 
 class NativeCaptureControlOrderingTests(unittest.TestCase):
-    def test_state_first_replay_is_delegated_before_optional_input_checks(self) -> None:
+    def test_native_reconcile_delegates_to_the_canonical_effect_entry(self) -> None:
         control = CONTROL.read_text(encoding="utf-8")
-        marker = 'if [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] && [ "$REPORTED_STAGE" = "capture" ]'
+        marker = "  reconcile)\n"
         self.assertIn(marker, control)
-        branch = control.split(marker, 1)[1].split(
-            'if [ -n "$NATIVE_DERIVED$NATIVE_ARCHIVE" ]',
-            1,
-        )[0]
-        self.assertIn('"$HERE/reconcile-native-capture.py"', branch)
-        self.assertNotIn('-d "$NATIVE_DERIVED"', branch)
-        self.assertNotIn('-f "$NATIVE_ARCHIVE"', branch)
+        branch = control.split(marker, 1)[1].split("    ;;\n", 1)[0]
+        self.assertIn('"$HERE/reconcile-effect.py"', branch)
+        self.assertIn("PLATFORM_ARTIFACT_ROOT", branch)
+        self.assertIn("PIPELINE_WORK_ROOT", branch)
+        self.assertIn("--effect-key", branch)
+        self.assertNotIn("PlatformStore", branch)
+        self.assertNotIn("--outcome", branch)
+        self.assertNotIn("--reported-stage", branch)
+        self.assertNotIn("NativeOperationEffectObserver", branch)

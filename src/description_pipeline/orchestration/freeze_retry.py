@@ -19,9 +19,9 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from ..io import PipelineError, digest
-from ..platform.store import PlatformStore
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import validate_file_index
 
@@ -40,6 +40,16 @@ class FreezeRetryRefusal(Exception):
         super().__init__(message)
         self.reason = reason
         self.message = message
+
+
+class FreezeRetryFacts(Protocol):
+    """Canonical query port for one terminal Freeze parent and its sealed evidence."""
+
+    def run_record(self, run_id: str) -> dict | None: ...
+
+    def stage_records(self, run_id: str) -> dict[str, dict]: ...
+
+    def request_record(self, request_id: str) -> dict | None: ...
 
 
 @dataclass(frozen=True)
@@ -176,7 +186,7 @@ def _read_bound_selection(log_path: str, bound_sha256: str, *, parent_dag_run_id
 
 
 def resolve_freeze_retry_identity(
-    platform: PlatformStore,
+    platform: FreezeRetryFacts,
     parent_run_id: str,
     *,
     parent_dag_run_id: str,

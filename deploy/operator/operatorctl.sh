@@ -18,11 +18,8 @@
 #   rollback  restore both ends from the recorded previous installation
 #
 #   operatorctl.sh <verb> --config FILE
-#   orphan recovery: reconcile --run-id R --stage S --outcome failed --evidence FILE... \
-#     --native-receipt FILE --native-run-id UUID --orphan-operation-id OP \
-#     --orphan-task-id TASK --orphan-map-index N
-#   native capture recovery first reads the recorded operation/stage/owner result; a complete
-#   replay returns it without requiring the original receipt, derived directory or archive.
+#   reconcile selects one exact effect through the production StageApplication registry,
+#   observes its external target and appends evidence-backed reconciliation.
 #
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
 # live under the configured state root (outside Git).
@@ -146,10 +143,9 @@ usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
 start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
 stop inputs: [--keep-database] (supported writers stop; the managed database stays active)
-reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
-orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N [--reported-stage STAGE]
-native capture recovery adds: --install-id ID [--derived DIR --archive FILE] (--reported-stage capture, --stage discover, --outcome failed)
-  a completed replay returns immediately; the input files are required only when the state-first read misses
+reconcile inputs: --run-id R --stage STAGE --effect-key KEY
+  terminal effects return their recorded state without observation; unknown effects use
+  the StageApplication registry. A stage with no remote effect is replayed by the engine
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
 USAGE
   exit 2
@@ -163,23 +159,14 @@ INSTALL_ID=""
 WHEEL_FILE=""
 ENDPOINT_IDENTITY=""
 RELEASE_FILE=""
-NATIVE_DERIVED=""
-NATIVE_ARCHIVE=""
 RUN_ID=""
 STAGE=""
-OUTCOME=""
-NATIVE_RECEIPT=""
-NATIVE_RUN_ID=""
-ORPHAN_OPERATION_ID=""
-ORPHAN_TASK_ID=""
-ORPHAN_MAP_INDEX=""
-REPORTED_STAGE=""
+EFFECT_KEY=""
 KEEP_ADMISSION_CLOSED=""
 KEEP_DATABASE=""
 MAINTENANCE_LOCK_FD=""
 MAINTENANCE_LOCK_PATH=""
 LOCKED_STATE_ROOT=""
-EVIDENCE=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG_SOURCE_FILE="${2:-}"; shift 2 ;;
@@ -189,16 +176,7 @@ while [ $# -gt 0 ]; do
     --release-file) RELEASE_FILE="${2:-}"; shift 2 ;;
     --run-id) RUN_ID="${2:-}"; shift 2 ;;
     --stage) STAGE="${2:-}"; shift 2 ;;
-    --outcome) OUTCOME="${2:-}"; shift 2 ;;
-    --native-receipt) NATIVE_RECEIPT="${2:-}"; shift 2 ;;
-    --native-run-id) NATIVE_RUN_ID="${2:-}"; shift 2 ;;
-    --orphan-operation-id) ORPHAN_OPERATION_ID="${2:-}"; shift 2 ;;
-    --orphan-task-id) ORPHAN_TASK_ID="${2:-}"; shift 2 ;;
-    --orphan-map-index) ORPHAN_MAP_INDEX="${2:-}"; shift 2 ;;
-    --reported-stage) REPORTED_STAGE="${2:-}"; shift 2 ;;
-    --derived) NATIVE_DERIVED="${2:-}"; shift 2 ;;
-    --archive) NATIVE_ARCHIVE="${2:-}"; shift 2 ;;
-    --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
+    --effect-key) EFFECT_KEY="${2:-}"; shift 2 ;;
     --keep-admission-closed) KEEP_ADMISSION_CLOSED=1; shift ;;
     --keep-database) KEEP_DATABASE=1; shift ;;
     *) usage ;;
@@ -2015,8 +1993,6 @@ elif [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTIO
    && [ "$ACTION" != "stage" ] && [ "$ACTION" != "promote" ] && [ "$ACTION" != "rollback" ]; then
   usage
 fi
-[ -z "$NATIVE_RECEIPT$NATIVE_RUN_ID$ORPHAN_OPERATION_ID$ORPHAN_TASK_ID$ORPHAN_MAP_INDEX" ] \
-  || [ "$ACTION" = "reconcile" ] || usage
 snapshot_config
 # Every verb passes the same static config gate first; the install record and its derived
 # per-generation environment stay the single authority for the operational verbs.
@@ -3393,120 +3369,30 @@ PY
     echo "rollback complete: restored $(basename "$PREVIOUS_RECORD" .json) (the admission stays closed; run start after review)"
     ;;
   reconcile)
-    [ -n "$RUN_ID" ] && [ -n "$STAGE" ] && [ -n "$OUTCOME" ] && [ "${#EVIDENCE[@]}" -gt 0 ] \
-      || die "reconcile requires --run-id, --stage, --outcome and at least one --evidence"
-    case "$OUTCOME" in
-      completed|failed|cancelled) ;;
-      *) die "unresolved is not a result; --outcome must be completed, failed or cancelled" ;;
+    [ -n "$RUN_ID" ] && [ -n "$STAGE" ] && [ -n "$EFFECT_KEY" ] \
+      || die "reconcile requires --run-id, --stage and --effect-key"
+    case "$STAGE" in
+      freeze|discover|capture|generate|verify|publish) ;;
+      *) die "reconcile requires a canonical pipeline stage" ;;
     esac
-    ORPHAN_INPUTS="$NATIVE_RECEIPT$NATIVE_RUN_ID$ORPHAN_OPERATION_ID$ORPHAN_TASK_ID$ORPHAN_MAP_INDEX$REPORTED_STAGE"
-    if [ -n "$ORPHAN_INPUTS" ]; then
-      [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] && [ -n "$ORPHAN_OPERATION_ID" ] \
-        && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
-        || die "orphan recovery requires --native-receipt, --native-run-id, --orphan-operation-id --orphan-task-id and --orphan-map-index together"
-      [ "$OUTCOME" = "failed" ] || die "orphan recovery records the observed failed outcome only"
-      [[ "$ORPHAN_MAP_INDEX" =~ ^-?[0-9]+$ ]] || die "--orphan-map-index must be an integer"
-    fi
-    if [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] && [ "$REPORTED_STAGE" = "capture" ]; then
-      [ -n "$INSTALL_ID" ] \
-        && [ -n "$RUN_ID" ] && [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] \
-        && [ -n "$ORPHAN_OPERATION_ID" ] && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
-        || die "native capture recovery requires the complete discover/capture receipt and operation binding"
-      [ "$NATIVE_RUN_ID" = "$RUN_ID" ] || die "the native receipt names another run"
-      (
-        set -a
-        . "$ENV_FILE"
-        set +a
-        args=(--run-id "$RUN_ID" --job "$NATIVE_RECEIPT" --operation-id "$ORPHAN_OPERATION_ID" \
-          --task-id "$ORPHAN_TASK_ID" --map-index "$ORPHAN_MAP_INDEX")
-        [ -z "$NATIVE_DERIVED" ] || args+=(--derived "$NATIVE_DERIVED")
-        [ -z "$NATIVE_ARCHIVE" ] || args+=(--archive "$NATIVE_ARCHIVE")
-        for item in "${EVIDENCE[@]}"; do args+=(--evidence "$item"); done
-        "$AIRFLOW_VENV/bin/python" "$HERE/reconcile-native-capture.py" "${args[@]}"
-      )
-      exit $?
-    fi
-    if [ -n "$NATIVE_DERIVED$NATIVE_ARCHIVE" ]; then
-      die "native capture recovery inputs require --stage discover --outcome failed --reported-stage capture"
-    fi
-    if [ -n "$ORPHAN_INPUTS" ]; then
-      [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
-    fi
-    # Every reconcile shape consumes the generation DSNs: read them back from the derived
-    # environment file so the canonical action always runs against the controlled values.
+    # The application reads the current effect kind and selects its one installed adapter.
+    # Operator arguments cannot manufacture a result or select a second registry.
     [ -f "$ENV_FILE" ] || die "the derived environment is missing; run install"
-    PLATFORM_SERVICE_DSN="$(generation_env_value "$ENV_FILE" PLATFORM_SERVICE_DSN)"
-    PLATFORM_OPERATOR_DSN="$(generation_env_value "$ENV_FILE" PLATFORM_OPERATOR_DSN)"
-    PIPELINE_STORE_ROOT="$(generation_env_value "$ENV_FILE" PIPELINE_STORE_ROOT)"
-    export PLATFORM_SERVICE_DSN PLATFORM_OPERATOR_DSN PIPELINE_STORE_ROOT
-    RECONCILE_RUN_ID="$RUN_ID" RECONCILE_STAGE="$STAGE" RECONCILE_OUTCOME="$OUTCOME" \
-    RECONCILE_EVIDENCE="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
-    RECONCILE_NATIVE_RECEIPT="$NATIVE_RECEIPT" RECONCILE_NATIVE_RUN_ID="$NATIVE_RUN_ID" \
-    RECONCILE_ORPHAN_OPERATION_ID="$ORPHAN_OPERATION_ID" RECONCILE_ORPHAN_TASK_ID="$ORPHAN_TASK_ID" \
-    RECONCILE_ORPHAN_MAP_INDEX="$ORPHAN_MAP_INDEX" RECONCILE_REPORTED_STAGE="$REPORTED_STAGE" \
-      "$AIRFLOW_VENV/bin/python" - <<'PY' || die "reconcile refused"
-# platform-reconcile
-import json
-import os
-
-from description_pipeline import io
-from description_pipeline.platform.store import PlatformStore
-
-run_id = os.environ["RECONCILE_RUN_ID"]
-stage = os.environ["RECONCILE_STAGE"]
-outcome = os.environ["RECONCILE_OUTCOME"]
-evidence = json.loads(os.environ["RECONCILE_EVIDENCE"])
-
-# One canonical action: the maintenance intent registers, the orphan binding backfills and the
-# settlement commits - or the whole action rolls back - inside one short store transaction.  A
-# retry with the same operation key, evidence, binding and outcome reuses the recorded result;
-# any conflict refuses with zero change and no maintenance row left behind.  The Store action
-# owns every acceptance rule for the original native bytes; this entry only names the raw
-# inputs and never validates, rewrites or manufactures a receipt.
-binding = None
-native_receipt = os.environ.get("RECONCILE_NATIVE_RECEIPT") or ""
-if native_receipt:
-    # The Store action owns every acceptance rule for the original bytes and the bound DagRun;
-    # this entry only names the raw inputs.
-    binding = {
-        "operation_id": os.environ["RECONCILE_ORPHAN_OPERATION_ID"],
-        "task_id": os.environ["RECONCILE_ORPHAN_TASK_ID"],
-        "map_index": int(os.environ["RECONCILE_ORPHAN_MAP_INDEX"]),
-    }
-    # The bound DagRun's terminal fact is verified by the Store action itself on its own
-    # acceptance boundary (the runtime identity's reader); this entry holds no copy of the
-    # predicate and passes only the raw inputs.
-
-reported_stage = os.environ.get("RECONCILE_REPORTED_STAGE") or ""
-reconcile_frame = {
-    "outcome": outcome,
-    "evidence": evidence,
-    "binding": binding,
-}
-if reported_stage:
-    reconcile_frame["reported_stage"] = reported_stage
-reconcile = {
-    "operation_key": f"operatorctl-reconcile:{run_id}:{stage}:{outcome}",
-    "evidence": evidence,
-    "params_digest": io.digest(reconcile_frame),
-}
-if binding is not None:
-    reconcile["binding"] = binding
-    reconcile["native_receipt"] = {
-        "path": native_receipt,
-        "native_run_id": os.environ["RECONCILE_NATIVE_RUN_ID"],
-    }
-    if reported_stage:
-        reconcile["reported_stage"] = reported_stage
-store = PlatformStore.from_environment()
-store.confirm_stage(
-    run_id=run_id,
-    stage=stage,
-    state=outcome,
-    reconcile=reconcile,
-)
-print(f"reconciled={run_id}:{stage} outcome={outcome}")
-PY
+    (
+      set -a
+      # shellcheck disable=SC1090
+      . "$ENV_FILE"
+      set +a
+      RESOLVED_CONFIG="$("$CONTROL_PYTHON" "$HERE/platform_config.py" resolve --config "$CONFIG_FILE")"
+      PLATFORM_ARTIFACT_ROOT="$(printf '%s' "$RESOLVED_CONFIG" | "$CONTROL_PYTHON" -c \
+        'import json,sys; print(json.load(sys.stdin)["storage"]["artifact_root"])')"
+      PLATFORM_WORKSPACE_ROOT="$(printf '%s' "$RESOLVED_CONFIG" | "$CONTROL_PYTHON" -c \
+        'import json,sys; print(json.load(sys.stdin)["storage"]["workspace_root"])')"
+      PIPELINE_WORK_ROOT="$PLATFORM_WORKSPACE_ROOT"
+      export PLATFORM_ARTIFACT_ROOT PIPELINE_WORK_ROOT
+      "$AIRFLOW_VENV/bin/python" "$HERE/reconcile-effect.py" \
+        --run-id "$RUN_ID" --stage "$STAGE" --effect-key "$EFFECT_KEY"
+    ) || die "reconcile refused"
     ;;
   *) usage ;;
 esac
