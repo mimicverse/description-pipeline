@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -41,6 +42,7 @@ from description_pipeline.pipeline.stages.publish import (
 from description_pipeline.repository.publish import (
     PublicationRepository,
     PullRequestObservation,
+    seal_repository_snapshot,
 )
 from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import ENGINEERING_MODEL_SCHEMA
@@ -432,15 +434,23 @@ class PublishFixture:
             producer_stage="verify",
             producer_tool_sha256=digest(VERIFY_IDENTITY),
         )
-        publication_subject = tree_digest(
-            {
-                **{"input/" + path: checksum for path, checksum in inventory(capture_root / "input").items()},
-                **{"evidence/" + path: checksum for path, checksum in inventory(capture_root / "evidence").items()},
-                **{"model/" + path: checksum for path, checksum in inventory(generate_root / "model").items()},
-                **{"urdf/" + path: checksum for path, checksum in inventory(generate_root / "urdf").items()},
-                **{"meshes/" + path: checksum for path, checksum in inventory(generate_root / "meshes").items()},
-                "tool.json": file_digest(generate_root / "tool.json"),
-            }
+        snapshot_root = self.root / "repository-snapshot"
+        self.snapshot = seal_repository_snapshot(
+            self.repo,
+            snapshot_root,
+            repository_slug="example/robot",
+            origin_url=str(self.remote),
+            base_ref="main",
+            base_oid=self.base_oid,
+            branch_ref="work/solidworks/robot/engineering",
+            head_oid=None,
+        )
+        self.snapshot_ref = self.store.seal_tree(
+            snapshot_root,
+            kind=publish_stage.REPOSITORY_SNAPSHOT_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"tool": "snapshot-builder"}),
         )
         self.command = StageCommand.create(
             command_id="publish-command",
@@ -453,10 +463,9 @@ class PublishFixture:
                 "generate_artifact_id": self.generate_ref.artifact_id,
                 "capture_artifact_id": self.capture_ref.artifact_id,
                 "verify_artifact_id": self.verify_ref.artifact_id,
+                "repository_snapshot_artifact_id": self.snapshot_ref.artifact_id,
                 "verified_subject_sha256": self.generate_ref.set_sha256,
-                "expected_publication_subject_sha256": publication_subject,
                 "repository_slug": "example/robot",
-                "repository_path": str(self.repo),
                 "origin_url": str(self.remote),
                 "base_ref": "main",
                 "expected_base_oid": self.base_oid,
@@ -473,7 +482,7 @@ class PublishFixture:
                     "body": "verified offline publication fixture",
                 },
             },
-            input_artifacts=(self.capture_ref, self.generate_ref, self.verify_ref),
+            input_artifacts=(self.capture_ref, self.generate_ref, self.verify_ref, self.snapshot_ref),
             config_snapshot_sha256=CONFIG_SHA,
             contract_sha256=CONTRACT_SHA,
             policy_sha256=POLICY_SHA,
@@ -500,6 +509,9 @@ class PublishFixture:
                 ),
                 self.verify_ref.artifact_id: self.store.materialize(
                     self.verify_ref, self.root / "workspace/inputs/verify"
+                ),
+                self.snapshot_ref.artifact_id: self.store.materialize(
+                    self.snapshot_ref, self.root / "workspace/inputs/repository-snapshot"
                 ),
             },
         )
@@ -623,6 +635,8 @@ class PublishHandlerTests(unittest.TestCase):
         )
 
     def test_publish_prepares_commits_and_satisfies_two_effects(self) -> None:
+        self.assertNotIn("repository_path", self.fixture.command.request)
+        self.assertNotIn("expected_publication_subject_sha256", self.fixture.command.request)
         execution = self._run()
         self.assertEqual(execution.outcome, "completed")
         self.assertTrue(execution.resources_settled)
@@ -638,13 +652,16 @@ class PublishHandlerTests(unittest.TestCase):
         git_effect_id = self.fixture.effects.by_key[publish_stage.GIT_EFFECT_KEY]
         outbound_id = self.fixture.effects.intents[git_effect_id].outbound_artifact_id
         bundle = self.fixture.store.objects / outbound_id / "candidate.bundle"
-        self.assertEqual(git(self.fixture.repo, "bundle", "verify", str(bundle)).returncode, 0)
+        plan_path = self.fixture.store.objects / outbound_id / "publication-plan.json"
+        repo = self.fixture.workspace.root / "repository"
+        self.assertEqual(git(repo, "bundle", "verify", str(bundle)).returncode, 0)
+        self.assertEqual(file_digest(plan_path), receipt["publication_plan_sha256"])
         self.assertEqual(
-            git(self.fixture.repo, "rev-parse", f"{commit}^{{tree}}").stdout.strip(),
+            git(repo, "rev-parse", f"{commit}^{{tree}}").stdout.strip(),
             receipt["candidate_tree"],
         )
         metadata = git(
-            self.fixture.repo,
+            repo,
             "show",
             "-s",
             "--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI",
@@ -687,6 +704,37 @@ class PublishHandlerTests(unittest.TestCase):
         after = (self.fixture.pr.observe_calls, self.fixture.pr.create_calls, self.fixture.pr.update_calls)
         self.assertEqual(first.checks_sha256, second.checks_sha256)
         self.assertEqual(before, after)
+
+    def test_sealed_snapshot_replays_after_original_checkout_is_deleted(self) -> None:
+        first = self._run()
+        first_receipt = read_data(Path(first.candidate_root) / "publication-receipt.json")
+        shutil.rmtree(self.fixture.repo)
+        second_root = self.fixture.root / "fresh-workspace"
+        second_workspace = StageWorkspace(
+            root=second_root,
+            inputs={
+                ref.artifact_id: self.fixture.store.materialize(
+                    ref,
+                    second_root / "inputs" / ref.artifact_id,
+                )
+                for ref in self.fixture.command.input_artifacts
+            },
+        )
+        second_claim = replace(
+            self.fixture.claim,
+            claim_id="publish-claim-fresh",
+            fence=2,
+            owner_sha256=digest({"process": "publish-fresh"}),
+        )
+        with (
+            patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")),
+            patch.object(self.fixture.pr, "create", side_effect=AssertionError("must not recreate PR")),
+            patch.object(self.fixture.pr, "update", side_effect=AssertionError("must not update PR")),
+        ):
+            second = self._run(workspace=second_workspace, claim=second_claim)
+        second_receipt = read_data(Path(second.candidate_root) / "publication-receipt.json")
+        self.assertEqual(first_receipt, second_receipt)
+        self.assertEqual(first.checks_sha256, second.checks_sha256)
 
     def test_candidate_recovery_consumes_receipt_without_external_calls(self) -> None:
         execution = self._run()
@@ -734,6 +782,26 @@ class PublishHandlerTests(unittest.TestCase):
         branch = git(self.fixture.repo, "ls-remote", "origin", f"refs/heads/{branch_ref}")
         self.assertEqual(branch.stdout, "")
 
+    def test_missing_or_tampered_repository_snapshot_is_rejected(self) -> None:
+        missing = StageWorkspace(
+            root=self.fixture.root / "missing-snapshot",
+            inputs={
+                key: value
+                for key, value in self.fixture.workspace.inputs.items()
+                if key != self.fixture.snapshot_ref.artifact_id
+            },
+        )
+        with self.assertRaisesRegex(PipelineError, "input_closure"):
+            self._run(workspace=missing)
+        snapshot_path = (
+            self.fixture.store.objects
+            / self.fixture.snapshot_ref.artifact_id
+            / "repository.bundle"
+        )
+        snapshot_path.write_bytes(snapshot_path.read_bytes() + b"tamper")
+        with self.assertRaises(PipelineError):
+            self._run()
+
     def test_head_drift_refuses_before_external_effect(self) -> None:
         branch_ref = self.fixture.command.request["branch_ref"]
         seed = self.fixture.root / "seed"
@@ -771,13 +839,26 @@ class PublishHandlerTests(unittest.TestCase):
         self.assertEqual(observed, racing)
 
     def test_commit_blob_mutation_is_rejected_before_push(self) -> None:
-        hook = self.fixture.repo / ".git/hooks/pre-commit"
-        hook.write_text(
-            "#!/bin/sh\nprintf tampered >> model/robot.json\ngit add model/robot.json\n",
-            encoding="utf-8",
-        )
-        hook.chmod(0o755)
-        with self.assertRaisesRegex(PipelineError, "publish.blob_mismatch"):
+        original = publish_stage.materialize_repository_snapshot
+
+        def materialize_with_hook(*args, **kwargs):
+            result = original(*args, **kwargs)
+            hook = Path(args[1]) / ".git/hooks/pre-commit"
+            hook.write_text(
+                "#!/bin/sh\nprintf tampered >> model/robot.json\ngit add model/robot.json\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+            return result
+
+        with (
+            patch.object(
+                publish_stage,
+                "materialize_repository_snapshot",
+                materialize_with_hook,
+            ),
+            self.assertRaisesRegex(PipelineError, "publish.blob_mismatch"),
+        ):
             self._run()
         branch_ref = self.fixture.command.request["branch_ref"]
         branch = git(self.fixture.repo, "ls-remote", "origin", f"refs/heads/{branch_ref}")

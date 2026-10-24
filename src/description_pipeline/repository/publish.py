@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..delivery import subject_digest
-from ..io import PipelineError, digest, inventory
+from ..io import PipelineError, digest, inventory, read_data, write_json
 
 GOVERNED_PATHS = (
     "manifest.json",
@@ -38,6 +38,9 @@ GIT_ATTRIBUTES = (
 ).encode("ascii")
 _OID = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+REPOSITORY_SNAPSHOT_SCHEMA = "description-pipeline.repository-snapshot/v1"
+REPOSITORY_SNAPSHOT_FILE = "repository.bundle"
+REPOSITORY_SNAPSHOT_METADATA = "snapshot.json"
 
 
 class PublicationError(PipelineError):
@@ -66,6 +69,122 @@ def validate_ref(repository: Path, ref: str) -> None:
         raise PublicationError("publish.invalid_ref", {"ref": ref})
     if _run(repository, "check-ref-format", f"refs/heads/{ref}", check=False).returncode != 0:
         raise PublicationError("publish.invalid_ref", {"ref": ref})
+
+
+@dataclass(frozen=True, slots=True)
+class RepositorySnapshot:
+    repository: str
+    origin_url: str
+    base_ref: str
+    base_oid: str
+    branch_ref: str
+    head_oid: str | None
+    bundle_sha256: str
+
+
+def seal_repository_snapshot(
+    repository: Path,
+    destination: Path,
+    *,
+    repository_slug: str,
+    origin_url: str,
+    base_ref: str,
+    base_oid: str,
+    branch_ref: str,
+    head_oid: str | None,
+) -> RepositorySnapshot:
+    """Persist every Git object required to rebuild a Publish checkout."""
+
+    source = Path(repository).resolve()
+    actual_origin = _text_run(source, "remote", "get-url", "origin")
+    if actual_origin != origin_url:
+        raise PublicationError("publish.origin_mismatch", {"expected": origin_url, "actual": actual_origin})
+    validate_ref(source, base_ref)
+    validate_ref(source, branch_ref)
+    if _OID.fullmatch(base_oid) is None or (head_oid is not None and _OID.fullmatch(head_oid) is None):
+        raise PublicationError("publish.snapshot_ref")
+    destination = Path(destination)
+    destination.mkdir(parents=True)
+    bundle = destination / REPOSITORY_SNAPSHOT_FILE
+    _run(source, "bundle", "create", str(bundle), "--all")
+    snapshot = RepositorySnapshot(
+        repository=repository_slug,
+        origin_url=origin_url,
+        base_ref=base_ref,
+        base_oid=base_oid,
+        branch_ref=branch_ref,
+        head_oid=head_oid,
+        bundle_sha256=hashlib.sha256(bundle.read_bytes()).hexdigest(),
+    )
+    write_json(
+        destination / REPOSITORY_SNAPSHOT_METADATA,
+        {
+            "schema_version": REPOSITORY_SNAPSHOT_SCHEMA,
+            "repository": snapshot.repository,
+            "origin_url": snapshot.origin_url,
+            "base_ref": snapshot.base_ref,
+            "base_oid": snapshot.base_oid,
+            "branch_ref": snapshot.branch_ref,
+            "head_oid": snapshot.head_oid,
+            "bundle_sha256": snapshot.bundle_sha256,
+        },
+    )
+    return snapshot
+
+
+def materialize_repository_snapshot(
+    source: Path,
+    destination: Path,
+    *,
+    expected_repository: str,
+    expected_origin_url: str,
+    expected_base_ref: str,
+    expected_base_oid: str,
+    expected_branch_ref: str,
+    expected_head_oid: str | None,
+) -> RepositorySnapshot:
+    """Reconstruct a local checkout only from the sealed snapshot artifact."""
+
+    source = Path(source)
+    payload = read_data(source / REPOSITORY_SNAPSHOT_METADATA)
+    expected_fields = {
+        "schema_version",
+        "repository",
+        "origin_url",
+        "base_ref",
+        "base_oid",
+        "branch_ref",
+        "head_oid",
+        "bundle_sha256",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise PublicationError("publish.snapshot_shape")
+    if payload["schema_version"] != REPOSITORY_SNAPSHOT_SCHEMA:
+        raise PublicationError("publish.snapshot_schema")
+    snapshot = RepositorySnapshot(**{key: payload[key] for key in expected_fields - {"schema_version"}})
+    bundle = source / REPOSITORY_SNAPSHOT_FILE
+    if hashlib.sha256(bundle.read_bytes()).hexdigest() != snapshot.bundle_sha256:
+        raise PublicationError("publish.snapshot_bundle")
+    expected = RepositorySnapshot(
+        repository=expected_repository,
+        origin_url=expected_origin_url,
+        base_ref=expected_base_ref,
+        base_oid=expected_base_oid,
+        branch_ref=expected_branch_ref,
+        head_oid=expected_head_oid,
+        bundle_sha256=snapshot.bundle_sha256,
+    )
+    if snapshot != expected:
+        raise PublicationError("publish.snapshot_binding")
+    destination = Path(destination)
+    if destination.exists():
+        raise PublicationError("publish.snapshot_destination", {"path": str(destination)})
+    _run(destination.parent, "clone", "--quiet", str(bundle), str(destination), check=True)
+    _run(destination, "remote", "set-url", "origin", expected_origin_url)
+    for oid in (expected.base_oid, expected.head_oid):
+        if oid is not None and _run(destination, "cat-file", "-e", f"{oid}^{{commit}}", check=False).returncode != 0:
+            raise PublicationError("publish.snapshot_object_missing", {"oid": oid})
+    return snapshot
 
 
 @dataclass(frozen=True, slots=True)
