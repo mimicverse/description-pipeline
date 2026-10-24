@@ -861,13 +861,6 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             timeout=5,
             poll_interval=0.01,
         )
-        recovered_execution = {
-            **sealed_execution,
-            "claim_id": "claim-recovered",
-            "executor_sha256": digest({"executor": "recovered-platform"}),
-            "fence": 2,
-            "owner_sha256": digest({"owner": "recovered-platform"}),
-        }
         common = {
             "backend": None,
             "run_id": run_id,
@@ -876,7 +869,6 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             "upload_sha256": request["upload_sha256"],
             "main_assembly": request["main_assembly"],
             "upstream_artifacts": tuple(request["upstream_artifacts"]),
-            "execution": recovered_execution,
             "native_tool": NATIVE_TOOL,
             "sealed_dispatch": sealed_dispatch,
         }
@@ -903,7 +895,45 @@ class NativeOperationRuntimeTests(unittest.TestCase):
     def test_unknown_sealed_capture_dispatch_is_never_resent(self) -> None:
         archive = self.root / "unknown-capture-input.zip"
         archive.write_bytes(b"unknown capture input archive")
-        operation_id = "operation-unknown-sealed-dispatch"
+        run_id = "run-unknown-sealed"
+        command_id = "command-unknown-sealed"
+        effect_key = "capture-native"
+        operation_id = native_capture_operation_id(
+            run_id=run_id,
+            command_id=command_id,
+            effect_key=effect_key,
+        )
+        sealed_execution = {
+            "claim_id": "claim-unknown-original",
+            "command_id": command_id,
+            "effect_key": effect_key,
+            "executor_sha256": digest({"executor": "original-platform"}),
+            "fence": 1,
+            "native_tool_sha256": digest(NATIVE_TOOL),
+            "owner_sha256": digest({"owner": "original-platform"}),
+            "run_id": run_id,
+        }
+        request = {
+            "schema_version": CAPTURE_OPERATION_SCHEMA,
+            "command_id": command_id,
+            "run_id": run_id,
+            "request_digest": digest({"request": run_id}),
+            "effect_key": effect_key,
+            "handoff_sha256": "b" * 64,
+            "upload_sha256": "c" * 64,
+            "prepared_sha256": digest(
+                {"cad/robot.SLDASM": "a" * 64}
+            ),
+            "main_assembly": "cad/robot.SLDASM",
+            "package_files": {"cad/robot.SLDASM": "a" * 64},
+            "upstream_artifacts": [
+                _artifact(stage, run_id)
+                for stage in ("freeze", "discover")
+            ],
+            "execution": sealed_execution,
+            "native_tool_source_sha256": NATIVE_TOOL["source_sha256"],
+            "request_evidence": REQUEST_EVIDENCE,
+        }
 
         def executor(request, source_archive, workspace, native_tool):
             del request, source_archive, workspace, native_tool
@@ -913,11 +943,11 @@ class NativeOperationRuntimeTests(unittest.TestCase):
                 resource_terminated=True,
             )
 
-        envelope = _operation(operation_id, archive)
+        envelope = _operation(operation_id, archive, request=request)
         sealed_dispatch = SimpleNamespace(
             operation=envelope,
             input_archive=archive,
-            execution=envelope["request"]["execution"],
+            execution=sealed_execution,
         )
         runtime = NativeOperationRuntime(
             state_root=self.root / "unknown-sealed-state",
@@ -941,19 +971,12 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         )
         common = {
             "backend": None,
-            "run_id": operation_id,
-            "request_digest": envelope["request"]["request_digest"],
-            "handoff_sha256": envelope["request"]["handoff_sha256"],
-            "upload_sha256": envelope["request"]["upload_sha256"],
-            "main_assembly": envelope["request"]["main_assembly"],
-            "upstream_artifacts": tuple(
-                envelope["request"]["upstream_artifacts"]
-            ),
-            "execution": {
-                **envelope["request"]["execution"],
-                "claim_id": "claim-recovered-unknown",
-                "fence": 2,
-            },
+            "run_id": run_id,
+            "request_digest": request["request_digest"],
+            "handoff_sha256": request["handoff_sha256"],
+            "upload_sha256": request["upload_sha256"],
+            "main_assembly": request["main_assembly"],
+            "upstream_artifacts": tuple(request["upstream_artifacts"]),
             "native_tool": NATIVE_TOOL,
             "sealed_dispatch": sealed_dispatch,
         }

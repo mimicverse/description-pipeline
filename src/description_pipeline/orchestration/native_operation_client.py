@@ -1708,7 +1708,6 @@ class NativeOperationCapturePort:
         upload_sha256: str,
         main_assembly: str,
         upstream_artifacts: tuple[Mapping[str, object], ...],
-        execution: Mapping[str, object],
         native_tool: Mapping[str, object],
         sealed_dispatch=None,
     ) -> RemoteNativeCaptureResult:
@@ -1716,111 +1715,58 @@ class NativeOperationCapturePort:
             raise NativeOperationProtocolError(
                 "The remote Capture adapter does not accept a Linux CAD backend"
             )
-        expected = None
-        if sealed_dispatch is not None:
-            intent, request, archive, current_tool = self._sealed_request(
-                sealed_dispatch,
-                native_tool,
+        if sealed_dispatch is None:
+            raise NativeOperationProtocolError(
+                "The remote Capture adapter requires one sealed dispatch"
             )
-            operation_id = intent.operation_id
-            expected = NativeOperationStatusExpectation.from_create(intent)
-            view = observe_native_operation(self.client, operation_id)
-            if view is not None:
-                expected.require(view)
-            if view is None:
-                view = self.client.create_operation(intent.to_record())
-                expected.require(view)
+        intent, request, archive, _current_tool = self._sealed_request(
+            sealed_dispatch,
+            native_tool,
+        )
+        operation_id = self.operation_id(
+            run_id=request.run_id,
+            command_id=request.command_id,
+            effect_key=request.effect_key,
+        )
+        expected_upstream = tuple(
+            dict(record) for record in upstream_artifacts
+        )
+        if (
+            intent.operation_id != operation_id
+            or request.run_id != run_id
+            or request.request_digest != request_digest
+            or request.handoff_sha256 != handoff_sha256
+            or request.upload_sha256 != upload_sha256
+            or request.main_assembly != main_assembly
+            or tuple(request.upstream_artifacts) != expected_upstream
+            or (
+                inputs is not None
+                and dict(request.package_files)
+                != dict(inputs.prepared_files)
+            )
+        ):
+            raise NativeOperationClientConflict(
+                "The sealed Capture dispatch differs from the current command",
+                status=409,
+                code="native_operation_conflict",
+            )
+        expected = NativeOperationStatusExpectation.from_create(intent)
+        view = observe_native_operation(self.client, operation_id)
+        if view is not None:
+            expected.require(view)
         else:
-            request, current_tool = self._request_record(
-                inputs,
-                native_tool,
-                run_id=run_id,
-                request_digest=request_digest,
-                handoff_sha256=handoff_sha256,
-                upload_sha256=upload_sha256,
-                main_assembly=main_assembly,
-                upstream_artifacts=upstream_artifacts,
-                execution=execution,
-            )
-            if dict(native_tool) != current_tool:
-                raise NativeOperationProtocolError(
-                    "Capture handler supplied a tool identity other than the current native tool"
-                )
-            operation_id = self.operation_id(
-                run_id=run_id,
-                command_id=request.command_id,
-                effect_key=request.effect_key,
-            )
-            view = observe_native_operation(self.client, operation_id)
-            request_sha256 = digest(request.to_record())
-            full_tool_sha256 = digest(current_tool)
-            if view is not None and (
-                view.kind != CAPTURE_KIND
-                or view.request_sha256 != request_sha256
-                or view.native_tool_requirement_sha256 != full_tool_sha256
-            ):
-                raise NativeOperationClientConflict(
-                    "Capture operation identity is bound to a different request",
-                    status=409,
-                    code="native_operation_conflict",
-                )
-            if view is not None:
-                _require_native_executor(view, full_tool_sha256)
-            archive = output.parent / f"{operation_id}-prepared.zip"
-            if view is None or view.state == "accepted":
-                archive.parent.mkdir(parents=True, exist_ok=True)
-                expected_archive = (
-                    None if view is None else view.input_archive_sha256
-                )
-                if not (
-                    expected_archive is not None
-                    and archive.is_file()
-                    and not archive.is_symlink()
-                    and file_digest(archive) == expected_archive
-                ):
-                    archive.unlink(missing_ok=True)
-                    archive = seal_source_archive(
-                        inputs.package,
-                        inputs.prepared_files,
-                        archive,
-                    )
-                if (
-                    expected_archive is not None
-                    and file_digest(archive) != expected_archive
-                ):
-                    raise NativeOperationClientConflict(
-                        "local Capture archive differs from the existing operation",
-                        status=409,
-                        code="native_operation_conflict",
-                    )
-                envelope = build_operation_record(
-                    operation_id=operation_id,
-                    kind=CAPTURE_KIND,
-                    request=request.to_record(),
-                    input_archive_sha256=file_digest(archive),
-                    input_archive_bytes=archive.stat().st_size,
-                    native_tool_requirement_sha256=full_tool_sha256,
-                    output_contract=CAPTURE_TRANSFER_SCHEMA,
-                )
-                expected = NativeOperationStatusExpectation.from_create(
-                    NativeOperationCreate.from_record(envelope)
-                )
-                view = self.client.create_operation(envelope)
-                expected.require(view)
+            view = self.client.create_operation(intent.to_record())
+            expected.require(view)
         if view.state == "accepted":
             view = self.client.upload_input(operation_id, archive)
-            if expected is not None:
-                expected.require(view)
+            expected.require(view)
         if view.state not in _TERMINAL_STATES:
             view = self.client.wait_for_terminal(
                 operation_id,
                 timeout=self.timeout,
                 poll_interval=self.poll_interval,
             )
-        if expected is not None:
-            expected.require(view)
-        else:
-            _require_native_executor(view, digest(current_tool))
+        expected.require(view)
         receipt = view.to_record()
         if view.state == "satisfied":
             output.mkdir(parents=True, exist_ok=True)

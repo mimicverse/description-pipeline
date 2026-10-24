@@ -1067,6 +1067,60 @@ class CaptureHandlerTests(unittest.TestCase):
         client.upload_input.assert_not_called()
         client.cancel_operation.assert_not_called()
 
+    def test_native_effect_observer_marks_missing_claimed_owner_unestablished(
+        self,
+    ) -> None:
+        effects = self.effects()
+        workspace = self.workspace(name="workspace-missing-native-owner")
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.current_native_tool,
+        ):
+            completed = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(completed.outcome, "completed")
+        archive = workspace.root / "capture-effect-payload/native-evidence.zip"
+        outbound_root = workspace.root / "capture-effect-outbound"
+        intent = next(
+            item
+            for item in self.effect_ledger.intents.values()
+            if item.command_id == self.command.command_id
+        )
+        client, _operation_id = self._observer_client(
+            archive=archive,
+            outbound_root=outbound_root,
+        )
+        observed = client.get_operation.return_value
+        client.get_operation = Mock(
+            return_value=replace(observed, owner_sha256=None)
+        )
+        observer_root = self.root / "capture-observer-missing-native-owner"
+        observer_root.mkdir()
+
+        evidence = NativeOperationEffectObserver(client).observe(
+            command=self.command,
+            intent=intent,
+            outbound_root=outbound_root,
+            workspace_root=observer_root,
+        )
+
+        self.assertEqual(evidence.fact_type, "reconciled")
+        self.assertEqual(evidence.state_class, "known")
+        identity = evidence.metadata["identity"]
+        self.assertIsNone(identity["native_runtime"]["owner_sha256"])
+        self.assertEqual(
+            identity["native_runtime"]["owner_binding"],
+            "unestablished",
+        )
+        self.assertEqual(
+            identity["platform_origin"]["owner_sha256"],
+            self.claim.owner_sha256,
+        )
+
     def test_native_effect_observer_rejects_executor_not_actual_native_tool(self) -> None:
         effects = self.effects()
         workspace = self.workspace(name="workspace-foreign-native-executor")
