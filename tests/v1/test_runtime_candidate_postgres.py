@@ -767,7 +767,9 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "origin_url": "https://example.test/example/robot.git",
             "base_ref": "main",
             "base_oid": "1" * 40,
-            "branch_ref": "work/solidworks/robot/engineering",
+            "branch_ref": (
+                "work/description/robot/0123456789abcdef01234567"
+            ),
             "head_oid": None,
             "bundle_sha256": digest({"unused": "replaced below"}),
         }

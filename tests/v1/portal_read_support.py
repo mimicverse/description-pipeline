@@ -193,7 +193,7 @@ class RegisteredPlatform:
                     "commit": "c" * 40,
                     "base": "feature/robot",
                     "repository_slug": "example/robot",
-                    "branch": "work/solidworks/robot/engineering",
+                    "branch": "work/description/robot/0123456789abcdef01234567",
                     "url": "https://github.com/example/robot/pull/1",
                 },
             }

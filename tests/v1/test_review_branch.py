@@ -10,28 +10,35 @@ from description_pipeline.repository.review_branch import (
 
 
 class ReviewBranchTests(unittest.TestCase):
-    def test_engineering_and_inspection_branches_are_canonical(self) -> None:
-        self.assertEqual(review_branch("M3.0", "engineering"), "work/solidworks/m3.0/engineering")
-        self.assertEqual(
-            review_branch("m3.0", "inspection_preview"),
-            "work/solidworks/m3.0/inspection_preview",
+    def test_request_branches_are_canonical_and_deterministic(self) -> None:
+        branch = review_branch("M3.0", "run-1", "request-1")
+        self.assertRegex(
+            branch,
+            r"work/description/m3\.0/[0-9a-f]{24}",
         )
-        self.assertTrue(is_review_branch("work/solidworks/m3.0/engineering"))
-        self.assertTrue(is_review_branch("work/solidworks/m3.0/inspection_preview"))
+        self.assertEqual(
+            branch,
+            review_branch("m3.0", "run-1", "request-1"),
+        )
+        self.assertNotEqual(
+            branch,
+            review_branch("m3.0", "run-2", "request-1"),
+        )
+        self.assertTrue(is_review_branch(branch))
 
-    def test_noncanonical_and_purpose_unknown_branches_are_rejected(self) -> None:
+    def test_noncanonical_branches_are_rejected(self) -> None:
         for value in (
             "main",
             "refs/heads/main",
             "feature/m3.0",
-            "work/solidworks/M3.0/engineering",
-            "work/solidworks/m3.0/unknown",
-            "work/solidworks/m3.0/engineering/extra",
+            "work/description/M3.0/0123456789abcdef01234567",
+            "work/description/m3.0/not-a-request-digest",
+            "work/description/m3.0/0123456789abcdef01234567/extra",
             None,
         ):
             self.assertFalse(is_review_branch(value), value)
         with self.assertRaises(ReviewBranchError):
-            review_branch("m3.0", "unknown")
+            review_branch("m3.0", "", "request-1")
 
 
 if __name__ == "__main__":

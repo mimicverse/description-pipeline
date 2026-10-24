@@ -65,6 +65,10 @@ VERIFY_IDENTITY = {
 POLICY_SHA = check_policy_digest()
 CONTRACT_SHA = CONTRACT_SHA256
 CONFIG_SHA = digest({"config": "fixture"})
+REVIEW_BRANCH = "work/description/robot/0123456789abcdef01234567"
+OTHER_REVIEW_BRANCH = (
+    "work/description/robot2/89abcdef0123456789abcdef"
+)
 
 
 def git(repo: Path | None, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -458,7 +462,7 @@ class PublishFixture:
             origin_url=str(self.remote),
             base_ref="main",
             base_oid=self.base_oid,
-            branch_ref="work/solidworks/robot/engineering",
+            branch_ref=REVIEW_BRANCH,
             head_oid=None,
         )
         self.snapshot_ref = self.store.seal_tree(
@@ -485,7 +489,7 @@ class PublishFixture:
                 "origin_url": str(self.remote),
                 "base_ref": "main",
                 "expected_base_oid": self.base_oid,
-                "branch_ref": "work/solidworks/robot/engineering",
+                "branch_ref": REVIEW_BRANCH,
                 "expected_head_oid": None,
                 "commit": {
                     "author_name": "Publish Bot",
@@ -734,8 +738,8 @@ class PublishHandlerTests(unittest.TestCase):
             ("main", "refs/heads/main", "protected-main"),
             ("main", "feature/robot", "not-review-branch"),
             (
-                "work/solidworks/robot/engineering",
-                "work/solidworks/robot/engineering",
+                REVIEW_BRANCH,
+                REVIEW_BRANCH,
                 "same-as-base",
             ),
         )
@@ -866,7 +870,7 @@ else:
             shutil.rmtree(first_root)
             state_path.unlink()
 
-            second_branch = "work/solidworks/robot2/engineering"
+            second_branch = OTHER_REVIEW_BRANCH
             snapshot_root = self.fixture.root / "repository-snapshot-2"
             seal_repository_snapshot(
                 self.fixture.repo,
@@ -1034,7 +1038,7 @@ else:
         git(None, "clone", str(second_remote), str(second_repo))
         git(second_repo, "config", "user.name", "Seed")
         git(second_repo, "config", "user.email", "seed@example.test")
-        second_branch = "work/solidworks/robot2/engineering"
+        second_branch = OTHER_REVIEW_BRANCH
         snapshot_root = self.fixture.root / "concurrent-repository-snapshot-2"
         seal_repository_snapshot(
             second_repo,

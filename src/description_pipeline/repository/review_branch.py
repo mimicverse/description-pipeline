@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 
-from ..interface_records import REQUEST_PURPOSES
+from ..io import digest
 
-REVIEW_BRANCH = "work/solidworks/{hardware}/{purpose}"
+REVIEW_BRANCH = "work/description/{hardware}/{request}"
 
 
 class ReviewBranchError(ValueError):
@@ -23,12 +23,20 @@ def _slug_hardware(value: str) -> str:
     return slug
 
 
-def review_branch(hardware: str, purpose: str) -> str:
-    """Return the one managed review branch for a hardware and declared purpose."""
+def review_branch(hardware: str, run_id: str, request_id: str) -> str:
+    """Return the immutable review branch for one admitted request."""
 
-    if purpose not in REQUEST_PURPOSES:
-        raise ReviewBranchError("purpose_not_supported", {"hardware": hardware, "purpose": purpose})
-    return REVIEW_BRANCH.format(hardware=_slug_hardware(hardware), purpose=purpose)
+    if not isinstance(run_id, str) or not run_id:
+        raise ReviewBranchError("run_id_invalid", run_id)
+    if not isinstance(request_id, str) or not request_id:
+        raise ReviewBranchError("request_id_invalid", request_id)
+    request_digest = digest(
+        {"run_id": run_id, "request_id": request_id}
+    )[:24]
+    return REVIEW_BRANCH.format(
+        hardware=_slug_hardware(hardware),
+        request=request_digest,
+    )
 
 
 def is_review_branch(value: object) -> bool:
@@ -37,10 +45,16 @@ def is_review_branch(value: object) -> bool:
     if not isinstance(value, str):
         return False
     parts = value.split("/")
-    if len(parts) != 4 or parts[:2] != ["work", "solidworks"]:
+    if len(parts) != 4 or parts[:2] != ["work", "description"]:
+        return False
+    request_digest = parts[3]
+    if (
+        len(request_digest) != 24
+        or any(character not in "0123456789abcdef" for character in request_digest)
+    ):
         return False
     try:
-        return review_branch(parts[2], parts[3]) == value
+        return _slug_hardware(parts[2]) == parts[2]
     except ReviewBranchError:
         return False
 

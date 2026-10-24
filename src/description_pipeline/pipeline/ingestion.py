@@ -695,7 +695,11 @@ class ProductionAdmissionFactory:
                 "admission_ingestion.repository_base_missing",
                 {"base_ref": base_ref},
             )
-        branch_ref = review_branch(request.target_hardware, request.purpose)
+        branch_ref = review_branch(
+            request.target_hardware,
+            request.run_id,
+            request.request_id,
+        )
         if _REF.fullmatch(branch_ref) is None:
             raise ProtocolError(
                 "admission_ingestion.repository_branch_invalid",

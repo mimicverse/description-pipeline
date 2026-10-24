@@ -1581,7 +1581,8 @@ def check_result(result: dict | None, *, expected_slug: str, expected_base: str)
         raise ResultNotPublishable("submission.base does not match the expected base branch")
     if not is_review_branch(submission.get("branch")):
         raise ResultNotPublishable(
-            "submission.branch must be the deterministic work/solidworks/<hardware>/<purpose> branch"
+            "submission.branch must be the deterministic "
+            "work/description/<hardware>/<request> branch"
         )
     return result
 
