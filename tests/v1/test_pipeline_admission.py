@@ -17,16 +17,25 @@ from description_pipeline.pipeline import (
     StageCommand,
     StageDecision,
     StageResult,
+    StageExecutors,
     VerifiedArtifact,
+    VerifiedDiscoverResult,
     VerifiedPredecessor,
     VerifiedRuleset,
+    build_capture_command,
     build_discover_command,
     build_freeze_command,
+    build_generate_command,
+    build_publish_command,
     build_run_admission,
+    build_verify_command,
+    validate_capture_command,
     validate_discover_command,
     validate_freeze_command,
+    validate_generate_command,
     validate_run_admission,
     validate_stage_command,
+    validate_verify_command,
     validate_store_command,
 )
 from description_pipeline.pipeline.admission import ADMISSION_SPEC_SCHEMA
@@ -34,7 +43,6 @@ from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.pipeline.discover import (
     CONFIGURATION_KIND,
     DISCOVER_REQUEST_SCHEMA,
-    FREEZE_RESULT_KIND,
     RULESET_KIND,
     SOURCE_SET_KIND,
 )
@@ -102,10 +110,16 @@ class AdmissionHarness:
             originals=self.originals,
             ruleset=self.verified_ruleset,
             configuration=self.configuration,
-            expected_native_tool_sha256="a" * 64,
+            executors=StageExecutors(
+                freeze=digest({"executor": "freeze"}),
+                discover=digest({"executor": "discover"}),
+                capture=digest({"executor": "capture"}),
+                generate=digest({"executor": "generate"}),
+                verify=digest({"executor": "verify"}),
+                publish=digest({"executor": "publish"}),
+            ),
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": 1}),
-            expected_executor_sha256=digest({"executor": "stage-runner"}),
             created_at=datetime(2026, 10, 25, 9, 30, tzinfo=UTC),
         )
 
@@ -167,37 +181,40 @@ class AdmissionHarness:
         )
 
     def freeze_result(self, freeze_command: StageCommand) -> VerifiedPredecessor:
-        output = self.root / "freeze-result"
+        return self.predecessor("freeze", freeze_command, {"stage": "freeze"})
+
+    def predecessor(self, stage: str, command: StageCommand, payload: dict) -> VerifiedPredecessor:
+        output = self.root / f"{stage}-result-{command.command_id.replace(':', '-')}"
         output.mkdir()
-        write_json(output / "result.json", {"stage": "freeze"})
+        write_json(output / "result.json", payload)
         result_artifact = self.store.seal_tree(
             output,
-            kind=FREEZE_RESULT_KIND,
+            kind=f"stage_output:{stage}",
             producer_run_id=self.spec.run_id,
-            producer_stage="freeze",
-            producer_tool_sha256=self.spec.expected_executor_sha256,
+            producer_stage=stage,
+            producer_tool_sha256=self.spec.executors.for_stage(stage),
         )
         result = StageResult(
             schema_version="description-pipeline.stage-result/v1",
-            command_id=freeze_command.command_id,
+            command_id=command.command_id,
             run_id=self.spec.run_id,
-            stage="freeze",
-            request_digest=freeze_command.request_digest,
+            stage=stage,
+            request_digest=command.request_digest,
             outcome="completed",
             output_artifact=result_artifact,
-            actual_executor_sha256=self.spec.expected_executor_sha256,
-            checks_sha256=digest({"checks": "freeze"}),
+            actual_executor_sha256=self.spec.executors.for_stage(stage),
+            checks_sha256=digest({"checks": stage}),
             resources_settled=True,
         )
         result_record_artifact = self.store.seal_stage_result(result)
         decision = StageDecision(
-            decision_id="freeze-decision",
+            decision_id=f"{stage}-decision",
             run_id=self.spec.run_id,
-            stage="freeze",
-            command_id=freeze_command.command_id,
+            stage=stage,
+            command_id=command.command_id,
             result_record_artifact=result_record_artifact,
             result_digest=result.digest,
-            actual_executor_sha256=self.spec.expected_executor_sha256,
+            actual_executor_sha256=self.spec.executors.for_stage(stage),
             outcome="completed",
             original_producer_decision_id=None,
             reason_code=None,
@@ -205,8 +222,8 @@ class AdmissionHarness:
             decided_at=datetime(2026, 10, 25, 9, 31, tzinfo=UTC),
         )
         return VerifiedPredecessor(
-            stage="freeze",
-            command=freeze_command,
+            stage=stage,
+            command=command,
             result=result,
             decision=decision,
         )
@@ -368,6 +385,201 @@ class AdmissionProjectionTests(unittest.TestCase):
             validate_discover_command(self.harness.spec, predecessor, forged)
         self.assertIn("request.purpose", raised.exception.detail["fields"])
 
+    def test_capture_generate_and_verify_project_from_verified_lineage(self) -> None:
+        freeze = self.harness.freeze_result(self.command)
+        discover_command = build_discover_command(self.harness.spec, freeze)
+        discover_payload = {
+            "schema_version": "description-pipeline.discover-result/v1",
+            "command_id": discover_command.command_id,
+            "run_id": self.harness.spec.run_id,
+            "request_digest": discover_command.request_digest,
+            "selection": {
+                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+                "handoff_sha256": digest({"selected": 1}),
+                "upload_sha256": self.harness.originals.inventory_sha256,
+                "main_assembly": self.harness.spec.main_assembly,
+            },
+            "prepared_sha256": digest({"prepared": 1}),
+            "native_observation_sha256": digest({"observation": 1}),
+            "source_set_artifact": self.harness.originals_ref.to_record(),
+            "ruleset_artifact": self.harness.ruleset_ref.to_record(),
+            "configuration_artifact": self.harness.configuration_ref.to_record(),
+            "passed": True,
+        }
+        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
+        discover = self.harness.predecessor("discover", discover_command, discover_payload)
+        discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
+        capture_command = build_capture_command(
+            self.harness.spec,
+            freeze,
+            discover,
+            discover_result,
+        )
+        capture = self.harness.predecessor("capture", capture_command, {"stage": "capture"})
+        generate_command = build_generate_command(self.harness.spec, capture)
+        generate = self.harness.predecessor("generate", generate_command, {"stage": "generate"})
+        verify_command = build_verify_command(self.harness.spec, generate, capture)
+
+        self.assertEqual(capture_command.stage, "capture")
+        self.assertEqual(
+            set(capture_command.request),
+            {"effect_key", "handoff_sha256", "main_assembly", "prepared_sha256", "upload_sha256"},
+        )
+        self.assertEqual(capture_command.predecessor_decision_id, discover.decision.decision_id)
+        self.assertEqual(
+            capture_command.input_artifacts,
+            (
+                freeze.result.output_artifact,
+                discover.result.output_artifact,
+            ),
+        )
+        self.assertEqual(capture_command.request["prepared_sha256"], discover_result.prepared_sha256)
+        self.assertEqual(
+            generate_command.request,
+            {
+                "schema_version": "description-pipeline.generate-request/v1",
+                "capture_artifact_id": capture.result.output_artifact.artifact_id,
+                "output_contract": "solidworks-to-urdf.generated-artifact/v1",
+            },
+        )
+        self.assertEqual(
+            set(verify_command.request),
+            {
+                "capture_artifact_id",
+                "generate_artifact_id",
+                "output_contract",
+                "purpose",
+                "schema_version",
+            },
+        )
+        self.assertEqual(verify_command.request["generate_artifact_id"], generate.result.output_artifact.artifact_id)
+        self.assertEqual(verify_command.request["capture_artifact_id"], capture.result.output_artifact.artifact_id)
+        self.assertEqual(verify_command.request["purpose"], self.harness.spec.purpose)
+        self.assertEqual(
+            validate_capture_command(
+                self.harness.spec,
+                freeze,
+                discover,
+                discover_result,
+                capture_command,
+            ),
+            capture_command,
+        )
+        self.assertEqual(validate_generate_command(self.harness.spec, capture, generate_command), generate_command)
+        self.assertEqual(
+            validate_verify_command(self.harness.spec, generate, capture, verify_command),
+            verify_command,
+        )
+        self.assertEqual(
+            validate_stage_command(
+                self.harness.spec,
+                capture_command,
+                predecessor=discover,
+                supporting_predecessors=(freeze,),
+                discover_result=discover_result,
+            ),
+            capture_command,
+        )
+        self.assertEqual(
+            validate_stage_command(
+                self.harness.spec,
+                generate_command,
+                predecessor=capture,
+            ),
+            generate_command,
+        )
+        self.assertEqual(
+            validate_stage_command(
+                self.harness.spec,
+                verify_command,
+                predecessor=generate,
+                supporting_predecessors=(capture,),
+            ),
+            verify_command,
+        )
+        wrong_generate = AdmissionHarness.manual(
+            generate_command,
+            request={**_request(generate_command), "capture_artifact_id": "another-capture"},
+        )
+        with self.assertRaises(ProtocolError) as generate_error:
+            validate_generate_command(self.harness.spec, capture, wrong_generate)
+        self.assertIn("request.capture_artifact_id", generate_error.exception.detail["fields"])
+        wrong_verify = AdmissionHarness.manual(
+            verify_command,
+            request={**_request(verify_command), "capture_artifact_id": "another-capture"},
+        )
+        with self.assertRaises(ProtocolError) as verify_error:
+            validate_verify_command(self.harness.spec, generate, capture, wrong_verify)
+        self.assertIn("request.capture_artifact_id", verify_error.exception.detail["fields"])
+
+    def test_wrong_capture_prepared_digest_is_rejected(self) -> None:
+        freeze = self.harness.freeze_result(self.command)
+        discover_command = build_discover_command(self.harness.spec, freeze)
+        discover_payload = {
+            "schema_version": "description-pipeline.discover-result/v1",
+            "command_id": discover_command.command_id,
+            "run_id": self.harness.spec.run_id,
+            "request_digest": discover_command.request_digest,
+            "selection": {
+                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+                "upload_sha256": self.harness.originals.inventory_sha256,
+                "main_assembly": self.harness.spec.main_assembly,
+            },
+            "prepared_sha256": digest({"prepared": 1}),
+            "native_observation_sha256": digest({"observation": 1}),
+            "source_set_artifact": self.harness.originals_ref.to_record(),
+            "ruleset_artifact": self.harness.ruleset_ref.to_record(),
+            "configuration_artifact": self.harness.configuration_ref.to_record(),
+            "passed": True,
+        }
+        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
+        discover = self.harness.predecessor("discover", discover_command, discover_payload)
+        discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
+        capture = build_capture_command(self.harness.spec, freeze, discover, discover_result)
+        forged = AdmissionHarness.manual(
+            capture,
+            request={**_request(capture), "prepared_sha256": digest({"another": 1})},
+        )
+        with self.assertRaises(ProtocolError) as raised:
+            validate_capture_command(self.harness.spec, freeze, discover, discover_result, forged)
+        self.assertIn("request.prepared_sha256", raised.exception.detail["fields"])
+
+    def test_publish_boundary_is_explicitly_pending(self) -> None:
+        freeze = self.harness.freeze_result(self.command)
+        discover_command = build_discover_command(self.harness.spec, freeze)
+        discover_payload = {
+            "schema_version": "description-pipeline.discover-result/v1",
+            "command_id": discover_command.command_id,
+            "run_id": self.harness.spec.run_id,
+            "request_digest": discover_command.request_digest,
+            "selection": {
+                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+                "upload_sha256": self.harness.originals.inventory_sha256,
+                "main_assembly": self.harness.spec.main_assembly,
+            },
+            "prepared_sha256": digest({"prepared": 1}),
+            "native_observation_sha256": digest({"observation": 1}),
+            "source_set_artifact": self.harness.originals_ref.to_record(),
+            "ruleset_artifact": self.harness.ruleset_ref.to_record(),
+            "configuration_artifact": self.harness.configuration_ref.to_record(),
+            "passed": True,
+        }
+        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
+        discover = self.harness.predecessor("discover", discover_command, discover_payload)
+        discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
+        capture_command = build_capture_command(self.harness.spec, freeze, discover, discover_result)
+        capture = self.harness.predecessor("capture", capture_command, {"stage": "capture"})
+        generate_command = build_generate_command(self.harness.spec, capture)
+        generate = self.harness.predecessor("generate", generate_command, {"stage": "generate"})
+        verify = self.harness.predecessor(
+            "verify",
+            build_verify_command(self.harness.spec, generate, capture),
+            {"stage": "verify"},
+        )
+        with self.assertRaises(ProtocolError) as raised:
+            build_publish_command(self.harness.spec, verify)
+        self.assertEqual(raised.exception.code, "admission.publish_contract_pending")
+
     def test_invalid_predecessor_fact_cannot_project_discover(self) -> None:
         predecessor = self.harness.freeze_result(self.command)
         wrong = StageDecision(
@@ -393,21 +605,21 @@ class AdmissionProjectionTests(unittest.TestCase):
             )
 
     def test_unsupported_stage_is_explicit(self) -> None:
-        capture = StageCommand.create(
-            command_id="capture-command",
+        publish = StageCommand.create(
+            command_id="publish-command",
             run_id="run-1",
-            stage="capture",
-            idempotency_key="run-1/capture",
+            stage="publish",
+            idempotency_key="run-1/publish",
             request={},
             input_artifacts=(),
             config_snapshot_sha256=self.harness.configuration_ref.set_sha256,
             contract_sha256=self.harness.spec.contract_sha256,
             policy_sha256=self.harness.spec.policy_sha256,
-            expected_executor_sha256=self.harness.spec.expected_executor_sha256,
-            predecessor_decision_id="discover-decision",
+            expected_executor_sha256=self.harness.spec.executors.publish,
+            predecessor_decision_id="verify-decision",
         )
         with self.assertRaises(ProtocolError) as raised:
-            validate_stage_command(self.harness.spec, capture)
+            validate_stage_command(self.harness.spec, publish)
         self.assertEqual(raised.exception.code, "admission.stage_not_supported")
 
 
