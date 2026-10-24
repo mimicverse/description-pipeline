@@ -1206,7 +1206,9 @@ class PublishHandler:
         *,
         effects: StageEffectPort,
     ) -> StageExecution:
-        if command.stage != "publish" or command.predecessor_decision_id is None:
+        if command.stage != "publish" or (
+            command.predecessor_decision_id is None and command.diagnostic_scope is None
+        ):
             raise ProtocolError("publish.command", {"command_id": command.command_id})
         request = _request(command, workspace)
         self._verify_inputs(request)

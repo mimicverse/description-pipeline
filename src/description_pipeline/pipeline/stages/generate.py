@@ -237,7 +237,7 @@ class GenerateHandler:
     ) -> StageExecution:
         if command.stage != "generate":
             raise ProtocolError("generate.stage_mismatch", {"stage": command.stage})
-        if command.predecessor_decision_id is None:
+        if command.predecessor_decision_id is None and command.diagnostic_scope is None:
             raise ProtocolError("generate.predecessor_missing", {"command_id": command.command_id})
         if claim.command_id != command.command_id:
             raise ProtocolError("generate.claim_mismatch", {"command_id": command.command_id})
