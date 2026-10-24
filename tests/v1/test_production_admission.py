@@ -759,7 +759,11 @@ class ProductionAdmissionTests(unittest.TestCase):
         freeze_result = application.execute_registered_command(
             parent.freeze_command.command_id
         )
-        self.assertEqual(freeze_result.outcome, "completed")
+        self.assertEqual(
+            freeze_result.outcome,
+            "completed",
+            freeze_result.to_record(),
+        )
         parent_spec = AdmissionSpec.from_record(parent.admission.request)
         self.assertEqual(
             application.load_verified_freeze_origins(parent_spec.run_id),
