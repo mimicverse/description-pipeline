@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import tempfile
 import threading
@@ -26,10 +27,12 @@ from description_pipeline.orchestration.native_operation_client import (
     NativeOperationEndpoint,
     NativeOperationNotFound,
     NativeOperationProtocolError,
+    NativeOperationStatusExpectation,
     NativeOperationToolProvider,
     capture_handler_from_native_operation,
     discover_adapter_from_native_operation,
     native_capture_operation_id,
+    native_operation_input_was_admitted,
 )
 from description_pipeline.orchestration.discover_protocol import seal_source_archive
 from description_pipeline.orchestration.native_operation_runtime import (
@@ -39,6 +42,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     DISCOVER_KIND,
     DiscoverOperationExecutor,
     NativeOperationFailure,
+    NativeOperationCreate,
     NativeOperationResult,
     NativeOperationRuntime,
     build_operation_record,
@@ -247,6 +251,152 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(downloaded.path, destination)
         self.assertEqual(destination.read_bytes(), b"sealed native artifact")
         self.assertEqual(downloaded.sha256, file_digest(destination))
+
+    def test_submit_operation_returns_the_current_state_without_polling_or_resend(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def blocking_executor(request, source_archive, workspace, native_tool):
+            nonlocal calls
+            del request, source_archive, native_tool
+            calls += 1
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("test executor was not released")
+            artifact = Path(workspace) / "result.zip"
+            artifact.write_bytes(b"completed after deferred wait")
+            return NativeOperationResult(
+                artifact_path=artifact,
+                artifact_name="result.zip",
+                output_contract=OUTPUT_CONTRACT,
+                resource_terminated=True,
+            )
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: blocking_executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        sleeper = mock.Mock()
+        client = NativeOperationClient(
+            NativeOperationEndpoint(server.base_url, TOKEN, timeout=5.0),
+            sleeper=sleeper,
+        )
+        envelope = _operation("operation-submit-once", self.archive)
+
+        submitted = client.submit_operation(envelope, self.archive)
+
+        self.assertIn(submitted.state, {"awaiting_input", "running"})
+        self.assertTrue(entered.wait(5))
+        self.assertTrue(native_operation_input_was_admitted(submitted))
+        self.assertEqual(calls, 1)
+        sleeper.assert_not_called()
+
+        self.archive.unlink()
+        repeated = client.submit_operation(envelope, self.archive)
+        self.assertEqual(calls, 1)
+        self.assertIn(repeated.state, {"awaiting_input", "running"})
+
+        release.set()
+        finished = client.wait_for_terminal("operation-submit-once", timeout=5)
+        self.assertEqual(finished.state, "satisfied")
+        terminal = client.submit_operation(envelope, self.archive)
+        self.assertEqual(terminal, finished)
+        self.assertEqual(calls, 1)
+
+    def test_async_status_probe_is_one_read_and_does_not_block_the_event_loop(self) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        envelope = _operation("operation-status-probe", self.archive)
+        view = client.submit_operation(envelope, self.archive)
+        expected = NativeOperationStatusExpectation.from_create(
+            NativeOperationCreate.from_record(envelope)
+        )
+        def slow_read(_operation_id):
+            time.sleep(0.15)
+            return view
+
+        slow_read = mock.Mock(side_effect=slow_read)
+        client.get_operation = slow_read
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError("status probe must not create")
+        )
+        client.upload_input = mock.Mock(
+            side_effect=AssertionError("status probe must not upload")
+        )
+        client.cancel_operation = mock.Mock(
+            side_effect=AssertionError("status probe must not cancel")
+        )
+
+        async def exercise():
+            task = asyncio.create_task(
+                client.probe_operation_status_async(expected)
+            )
+            ticks = 0
+            while not task.done():
+                ticks += 1
+                await asyncio.sleep(0.005)
+            return await task, ticks
+
+        observed, ticks = asyncio.run(exercise())
+
+        self.assertEqual(observed, view)
+        self.assertGreater(ticks, 2)
+        slow_read.assert_called_once_with("operation-status-probe")
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
+        client.cancel_operation.assert_not_called()
+
+        with self.assertRaises(NativeOperationClientConflict):
+            asyncio.run(
+                client.probe_operation_status_async(
+                    replace(expected, request_sha256=digest({"foreign": True}))
+                )
+            )
+
+    def test_async_status_probe_reports_missing_without_other_calls(self) -> None:
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN)
+        )
+        expected = NativeOperationStatusExpectation(
+            operation_id="operation-missing",
+            kind=CAPTURE_KIND,
+            request_sha256=digest({"request": "missing"}),
+            native_tool_requirement_sha256=digest(NATIVE_TOOL),
+            input_archive_sha256=file_digest(self.archive),
+            payload_sha256=digest({"payload": "missing"}),
+        )
+        client.get_operation = mock.Mock(
+            side_effect=NativeOperationNotFound("not found", status=404)
+        )
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError("status probe must not create")
+        )
+        client.upload_input = mock.Mock(
+            side_effect=AssertionError("status probe must not upload")
+        )
+        client.cancel_operation = mock.Mock(
+            side_effect=AssertionError("status probe must not cancel")
+        )
+
+        observed = asyncio.run(client.probe_operation_status_async(expected))
+
+        self.assertIsNone(observed)
+        client.get_operation.assert_called_once_with("operation-missing")
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
+        client.cancel_operation.assert_not_called()
 
     def test_same_operation_id_with_changed_payload_is_conflict(self) -> None:
         runtime = NativeOperationRuntime(

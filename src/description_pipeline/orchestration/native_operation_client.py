@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import http.client
@@ -68,6 +69,7 @@ MAX_OPERATION_JSON_BYTES = 8 * 1024**2
 MAX_OPERATION_ARCHIVE_BYTES = 16 * 1024**3
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 _TERMINAL_STATES = frozenset({"satisfied", "failed", "cancelled", "unknown"})
+_KINDS = frozenset({DISCOVER_KIND, CAPTURE_KIND})
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _WINDOWS_RESERVED_NAMES = frozenset(
     {
@@ -169,6 +171,82 @@ class ArtifactDownload:
     bytes: int
     sha256: str
     media_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOperationStatusExpectation:
+    """The immutable remote-operation identity that a status probe must match."""
+
+    operation_id: str
+    kind: str
+    request_sha256: str
+    native_tool_requirement_sha256: str
+    input_archive_sha256: str
+    payload_sha256: str
+
+    def __post_init__(self) -> None:
+        NativeOperationClient._operation_id(self.operation_id)
+        if self.kind not in _KINDS:
+            raise ValueError("kind is not a native operation kind")
+        for name in (
+            "request_sha256",
+            "native_tool_requirement_sha256",
+            "input_archive_sha256",
+            "payload_sha256",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+
+    @classmethod
+    def from_create(cls, intent: NativeOperationCreate) -> NativeOperationStatusExpectation:
+        if not isinstance(intent, NativeOperationCreate):
+            raise TypeError("intent must be a NativeOperationCreate")
+        return cls(
+            operation_id=intent.operation_id,
+            kind=intent.kind,
+            request_sha256=intent.request_sha256,
+            native_tool_requirement_sha256=intent.native_tool_requirement_sha256,
+            input_archive_sha256=intent.input_archive_sha256,
+            payload_sha256=intent.payload_sha256,
+        )
+
+    def require(self, view: NativeOperationView) -> NativeOperationView:
+        """Reject an endpoint view that names another immutable operation."""
+
+        if not isinstance(view, NativeOperationView):
+            raise NativeOperationProtocolError(
+                "native operation status is not a canonical view"
+            )
+        if (
+            view.operation_id != self.operation_id
+            or view.kind != self.kind
+            or view.request_sha256 != self.request_sha256
+            or view.native_tool_requirement_sha256
+            != self.native_tool_requirement_sha256
+            or view.input_archive_sha256 != self.input_archive_sha256
+            or view.payload_sha256 != self.payload_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "native operation status differs from the frozen request",
+                status=409,
+                code="native_operation_conflict",
+            )
+        if (
+            view.actual_native_tool_sha256 is not None
+            and view.actual_native_tool_sha256
+            != self.native_tool_requirement_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "native operation status reports another native tool",
+                status=409,
+                code="native_tool_mismatch",
+            )
+        return view
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,6 +559,62 @@ class NativeOperationClient:
             )
         return view
 
+    def submit_operation(
+        self,
+        envelope: Mapping[str, object],
+        archive: str | Path,
+    ) -> NativeOperationView:
+        """Submit once when needed, then return the current durable state without polling."""
+
+        try:
+            intent = NativeOperationCreate.from_record(envelope)
+        except NativeOperationError as error:
+            raise NativeOperationProtocolError(str(error)) from error
+        expected = NativeOperationStatusExpectation.from_create(intent)
+        try:
+            view = self.get_operation(intent.operation_id)
+        except NativeOperationNotFound:
+            view = None
+        if view is None or view.state == "accepted":
+            source = Path(archive)
+            if not source.is_file() or source.is_symlink():
+                raise ValueError("input archive must be one regular file")
+            if (
+                source.stat().st_size != intent.input_archive_bytes
+                or file_digest(source) != intent.input_archive_sha256
+            ):
+                raise NativeOperationClientConflict(
+                    "local input archive differs from the sealed operation intent",
+                    status=409,
+                    code="input_archive_mismatch",
+                )
+        if view is None:
+            view = self.create_operation(envelope)
+            expected.require(view)
+        else:
+            expected.require(view)
+        if view.state == "accepted":
+            view = self.upload_input(intent.operation_id, archive)
+            expected.require(view)
+        return view
+
+    async def probe_operation_status_async(
+        self,
+        expected: NativeOperationStatusExpectation,
+    ) -> NativeOperationView | None:
+        """Perform one read-only status GET without blocking the event loop."""
+
+        if not isinstance(expected, NativeOperationStatusExpectation):
+            raise TypeError("expected must be a NativeOperationStatusExpectation")
+        try:
+            view = await asyncio.to_thread(
+                self.get_operation,
+                expected.operation_id,
+            )
+        except NativeOperationNotFound:
+            return None
+        return expected.require(view)
+
     def cancel_operation(self, operation_id: str) -> NativeOperationView:
         operation_id = self._operation_id(operation_id)
         response = self._request_json(
@@ -635,6 +769,14 @@ def observe_native_operation(
         return client.get_operation(operation_id)
     except NativeOperationNotFound:
         return None
+
+
+def native_operation_input_was_admitted(view: NativeOperationView) -> bool:
+    """Whether submission no longer needs to upload the immutable input."""
+
+    if not isinstance(view, NativeOperationView):
+        raise TypeError("view must be a NativeOperationView")
+    return view.state != "accepted"
 
 
 def _capture_archive_manifest(archive: Path) -> dict[str, object]:
@@ -1816,6 +1958,7 @@ __all__ = [
     "NativeOperationNotFound",
     "NativeOperationProtocolError",
     "NativeOperationRemoteUnknown",
+    "NativeOperationStatusExpectation",
     "NativeOperationToolProvider",
     "NativeOperationWaitTimeout",
     "NativeRemoteDiscoverAdapter",
@@ -1825,6 +1968,7 @@ __all__ = [
     "capture_handler_from_native_operation",
     "discover_adapter_from_native_operation",
     "native_capture_operation_id",
+    "native_operation_input_was_admitted",
     "observe_native_operation",
     "read_sealed_native_operation_request",
 ]
