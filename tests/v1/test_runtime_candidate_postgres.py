@@ -867,6 +867,37 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertNotEqual(claim_rows[0][0], claim_rows[0][1])
         self.assertTrue(claim_rows[0][2])
 
+    def test_transport_identity_is_explicit_without_requiring_a_different_digest(self) -> None:
+        admission, freeze_command = self._new_admission("same-transport")
+        conf = DispatchConf(
+            schema_version="description-pipeline.airflow-dispatch-conf/v1",
+            run_id=admission.run_id,
+            freeze_command_id=freeze_command.command_id,
+        )
+        artifact = self.artifacts.seal_dispatch_conf(
+            conf,
+            producer_run_id=admission.run_id,
+            producer_tool_sha256=self.executor,
+        )
+        dispatch = DispatchCommand.create(
+            command_id=f"dispatch-{admission.run_id}",
+            run_id=admission.run_id,
+            freeze_command_id=freeze_command.command_id,
+            idempotency_key=f"{admission.run_id}/dispatch",
+            dag_id="solidworks_to_urdf",
+            dag_run_id=f"portal-{admission.run_id}",
+            conf_artifact=artifact,
+            expected_executor_sha256=self.executor,
+        )
+        stored_freeze, stored_dispatch, _intent = self.facts.admit_run(
+            admission,
+            freeze_command,
+            dispatch,
+            artifact,
+        )
+        self.assertEqual(stored_freeze.expected_executor_sha256, stored_dispatch.expected_executor_sha256)
+        self.assertNotEqual(stored_freeze.command_id, stored_dispatch.command_id)
+
     def test_lost_dispatch_response_observes_the_same_dag_run_without_resending(self) -> None:
         with self.airflow_stub.lock:
             self.airflow_stub.lost_response = True

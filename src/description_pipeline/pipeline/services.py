@@ -486,7 +486,6 @@ class BoundStageEffectPort:
             source=source,
             payload=payload,
             state_class=state_class,
-            bound_claim=False,
         )
 
     def reconcile_effect(
@@ -504,7 +503,6 @@ class BoundStageEffectPort:
             source=source,
             payload=payload,
             state_class=state_class,
-            bound_claim=False,
         )
 
     def effect_state(self, effect_id: str) -> EffectState:

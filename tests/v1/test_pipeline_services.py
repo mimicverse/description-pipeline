@@ -40,6 +40,10 @@ class _Facts:
     def decision_for(self, command):
         return self.decision
 
+    def cancellation_for(self, command):
+        del command
+        return None
+
     def load_result(self, decision):
         return self.artifacts.read_result(decision.result_record_artifact)
 
@@ -110,7 +114,8 @@ class _Facts:
         )
         return self.decision
 
-    def commit_failure(self, command, claim, failure):
+    def commit_failure(self, command, claim, failure, *, workspace_root):
+        del command, claim, failure, workspace_root
         raise AssertionError("failure not expected")
 
 

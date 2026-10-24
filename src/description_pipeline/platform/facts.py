@@ -18,9 +18,7 @@ from ..io import PipelineError, digest
 from ..pipeline.admission import (
     AdmissionSpec,
     VerifiedDiscoverResult,
-    VerifiedPublishIntent,
     VerifiedPredecessor,
-    VerifiedVerifyResult,
     validate_run_admission,
     validate_store_command,
 )
@@ -53,12 +51,6 @@ from ..pipeline.effects import (
     project_effect_settlement,
     project_effect_state,
 )
-from ..schemas import (
-    AIRFLOW_DISPATCH_EFFECT_SCHEMA,
-    DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
-    RUN_ADMISSION_SCHEMA,
-    STAGE_COMMAND_SCHEMA,
-)
 
 
 class FactStoreError(PipelineError):
@@ -79,7 +71,7 @@ class StageResultReader(Protocol):
     def read_dispatch_conf(self, artifact: ArtifactRef) -> DispatchConf: ...
 
 
-_DIAGNOSTIC_COMMAND_REQUEST_SCHEMA = DIAGNOSTIC_COMMAND_REQUEST_SCHEMA
+_DIAGNOSTIC_COMMAND_REQUEST_SCHEMA = "description-pipeline.diagnostic-command-request/v1"
 
 
 def _stored_command_request(command: StageCommand) -> Mapping[str, object]:
@@ -227,7 +219,7 @@ class FactStore:
         if row is None:
             return None
         return RunAdmission(
-            schema_version=RUN_ADMISSION_SCHEMA,
+            schema_version="description-pipeline.run-admission/v1",
             run_id=row[0],
             request_id=row[1],
             parent_run_id=row[2],
@@ -387,7 +379,7 @@ class FactStore:
         command: DispatchCommand,
     ) -> EffectIntent:
         expected = {
-            "schema_version": AIRFLOW_DISPATCH_EFFECT_SCHEMA,
+            "schema_version": "description-pipeline.airflow-dispatch-effect/v1",
             "conf_artifact_id": command.conf_artifact.artifact_id,
             "conf_set_sha256": command.conf_artifact.set_sha256,
             "dag_id": command.dag_id,
@@ -469,7 +461,7 @@ class FactStore:
                 raise FactStoreError("The diagnostic command row differs from its sealed request")
             return command
         return StageCommand(
-            schema_version=STAGE_COMMAND_SCHEMA,
+            schema_version="description-pipeline.stage-command/v1",
             command_id=row[0],
             run_id=row[1],
             kind=row[2],
@@ -602,8 +594,6 @@ class FactStore:
         predecessor: VerifiedPredecessor,
         supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
         discover_result: VerifiedDiscoverResult | None = None,
-        verify_result: VerifiedVerifyResult | None = None,
-        publish_intent: VerifiedPublishIntent | None = None,
     ) -> StageCommand:
         """Validate and register one successor command after its predecessor decision."""
 
@@ -617,10 +607,6 @@ class FactStore:
             raise FactStoreError("Supporting predecessors must be verified immutable facts")
         if discover_result is not None and not isinstance(discover_result, VerifiedDiscoverResult):
             raise FactStoreError("A verified Discover result is required")
-        if verify_result is not None and not isinstance(verify_result, VerifiedVerifyResult):
-            raise FactStoreError("A verified Verify result is required")
-        if publish_intent is not None and not isinstance(publish_intent, VerifiedPublishIntent):
-            raise FactStoreError("A verified Publish intent is required")
         if not isinstance(command, StageCommand) or command.kind != "stage" or command.stage is None:
             raise FactStoreError("A successor stage command is required")
         try:
@@ -632,8 +618,6 @@ class FactStore:
                 predecessor=predecessor,
                 supporting_predecessors=supporting_predecessors,
                 discover_result=discover_result,
-                verify_result=verify_result,
-                publish_intent=publish_intent,
             )
         except ProtocolError as error:
             raise FactStoreError("The successor command fails typed semantic validation") from error
@@ -767,9 +751,9 @@ class FactStore:
             if row is None:
                 return None
             decision = self._decision_from_row(cursor, row)
-            if decision.command_id != command.command_id:
-                raise FactConflict("The stage decision belongs to another command")
-            return decision
+        if decision.command_id != command.command_id:
+            raise FactConflict("The stage decision is bound to another command")
+        return decision
 
     def load_result(self, decision: StageDecision) -> StageResult:
         if decision.result_record_artifact is None:
@@ -1143,8 +1127,10 @@ class FactStore:
                 claim.executor_sha256,
             ):
                 raise FactConflict("The effect fact names a foreign claim/fence")
-            if fact_type == "dispatch_authorized" and stored[4] is not None:
-                raise FactConflict("The dispatch authorization claim is already closed")
+            if stored[4] is not None and fact_type not in {"response", "timeout"}:
+                raise FactConflict(
+                    "A closed execution claim may append only late response or timeout evidence"
+                )
         cursor.execute("SELECT command_id FROM effect_intent WHERE effect_id = %s FOR UPDATE", (effect_id,))
         row = cursor.fetchone()
         if row is None:
@@ -1170,6 +1156,17 @@ class FactStore:
             )
             if cursor.fetchone() is None:
                 raise FactConflict("The response/timeout has no matching dispatch authorization")
+        if fact_type in {"observation", "reconciled"}:
+            intent, facts = self._effect_cursor(cursor, effect_id, lock=True)
+            state = project_effect_state(intent, facts)
+            if state in {
+                EffectState.SATISFIED,
+                EffectState.DEFINITELY_FAILED,
+                EffectState.CONFLICT,
+            }:
+                raise FactConflict(
+                    "An observation or reconciliation cannot reinterpret a terminal effect"
+                )
         if payload_artifact is not None:
             self._insert_artifact(cursor, payload_artifact)
         if metadata_artifact is not None:
@@ -1575,6 +1572,22 @@ class FactStore:
                     or existing.outcome != candidate.result.outcome
                 ):
                     raise FactConflict("The command is already bound to a different decision")
+                existing_states = self._effect_states_for_command_cursor(
+                    cursor,
+                    command.command_id,
+                    lock=True,
+                )
+                if set(candidate.result.required_effect_ids) != set(existing_states):
+                    raise FactConflict("The completed decision effect ids differ from the current ledger")
+                if candidate.result.outcome == "completed" and any(
+                    state is not EffectState.SATISFIED for state in existing_states.values()
+                ):
+                    raise FactConflict("The completed decision now conflicts with its effect ledger")
+                if candidate.result.outcome != "completed" and any(
+                    state in {EffectState.UNKNOWN, EffectState.CONFLICT}
+                    for state in existing_states.values()
+                ):
+                    raise FactConflict("The definite decision now conflicts with its effect ledger")
                 return existing
             self._verify_open_claim_cursor(cursor, claim)
             states = self._effect_states_for_command_cursor(
@@ -1685,10 +1698,23 @@ class FactStore:
             existing_row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
             if existing_row is not None:
                 existing = self._decision_from_row(cursor, existing_row)
+                existing_states = self._effect_states_for_command_cursor(
+                    cursor,
+                    command.command_id,
+                    lock=True,
+                )
+                declared_existing = {
+                    effect_id: state.value for effect_id, state in existing_states.items()
+                }
                 if (
                     existing.command_id == command.command_id
                     and existing.outcome == failure.outcome
                     and existing.failure_envelope == failure
+                    and dict(failure.effect_states) == declared_existing
+                    and not any(
+                        state in {EffectState.UNKNOWN, EffectState.CONFLICT}
+                        for state in existing_states.values()
+                    )
                 ):
                     return failure
                 raise FactConflict("The command is already bound to a different decision")

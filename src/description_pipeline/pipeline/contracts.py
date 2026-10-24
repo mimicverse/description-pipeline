@@ -1348,6 +1348,8 @@ def project_stage_status(
     if decision_outcome is not None:
         if decision_outcome not in {"completed", "failed", "cancelled"}:
             raise ProtocolError("stage_status.invalid", {"decision_outcome": decision_outcome})
+        if decision_outcome == "completed" and any(state != "satisfied" for state in effect_states):
+            return StageStatus.UNRESOLVED
         return StageStatus(decision_outcome)
     if not predecessor_completed:
         return StageStatus.BLOCKED
@@ -1374,4 +1376,6 @@ def project_run_status(
             raise ProtocolError("run_status.invalid", {"stage_outcome": outcome})
         if outcome != "completed":
             return RunStatus(outcome)
+    if any(state != "satisfied" for state in effect_states):
+        return RunStatus.UNRESOLVED
     return RunStatus.SUCCEEDED

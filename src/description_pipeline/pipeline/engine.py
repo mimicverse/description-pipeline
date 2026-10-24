@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Protocol
 
 from ..io import canonical
-from ..schemas import UNHANDLED_STAGE_FAILURE_SCHEMA
 from .contracts import (
     ExecutionClaim,
     FailureEnvelope,
@@ -175,47 +174,50 @@ def _validate_effect_settlement(services: StageServices, command: StageCommand, 
         )
 
 
-def _validate_decision_identity(command: StageCommand, decision) -> None:
+def _validate_confirmed_decision(
+    services: StageServices,
+    command: StageCommand,
+    decision: StageDecision,
+) -> None:
     if (
         decision.command_id != command.command_id
         or decision.run_id != command.run_id
         or decision.stage != command.stage
-        or decision.actual_executor_sha256 != command.expected_executor_sha256
-        or decision.outcome not in {"completed", "failed", "cancelled"}
     ):
         raise ProtocolError("decision.command_mismatch", {"command_id": command.command_id})
+    if decision.failure_envelope is None:
+        return
+    current = services.effect_states_for_command(command.command_id)
+    declared = dict(decision.failure_envelope.effect_states)
+    actual = {effect_id: state.value for effect_id, state in current.items()}
+    if declared != actual:
+        raise ProtocolError(
+            "decision.effect_changed",
+            {"command_id": command.command_id, "declared": declared, "actual": actual},
+        )
+    if any(state in {EffectState.UNKNOWN, EffectState.CONFLICT} for state in current.values()):
+        raise ProtocolError(
+            "decision.effect_unresolved",
+            {
+                "command_id": command.command_id,
+                "effect_states": {effect_id: state.value for effect_id, state in sorted(current.items())},
+            },
+        )
 
 
-def _validate_cached_decision(
+def _confirmed_decision_record(
     services: StageServices,
     command: StageCommand,
-    decision,
-) -> None:
-    _validate_decision_identity(command, decision)
+    decision: StageDecision,
+) -> StageResult | FailureEnvelope:
+    _validate_confirmed_decision(services, command, decision)
     if decision.failure_envelope is not None:
-        failure = decision.failure_envelope
-        if (
-            failure.command_id != command.command_id
-            or failure.run_id != command.run_id
-            or failure.stage != command.stage
-            or failure.request_digest != command.request_digest
-            or failure.actual_executor_sha256 != decision.actual_executor_sha256
-            or failure.outcome != decision.outcome
-        ):
-            raise ProtocolError("failure.command_mismatch", {"command_id": command.command_id})
-        ledger = services.effect_states_for_command(command.command_id)
-        recorded = dict(failure.effect_states)
-        current = {effect_id: state.value for effect_id, state in ledger.items()}
-        if recorded != current or any(state in {"unknown", "conflict"} for state in current.values()):
-            raise ProtocolError(
-                "effect.unsettled",
-                {"command_id": command.command_id, "effect_states": sorted(current.items())},
-            )
-        return
+        return decision.failure_envelope
     result = services.load_result(decision)
     _validate_result_identity(command, result)
     _validate_effect_settlement(services, command, result)
     services.verify_decision(decision, result)
+    return result
 
 
 def execute_stage(
@@ -239,11 +241,7 @@ def execute_stage(
 
     confirmed = services.decision_for(command)
     if confirmed is not None:
-        _validate_cached_decision(services, command, confirmed)
-        if confirmed.failure_envelope is not None:
-            return confirmed.failure_envelope
-        result = services.load_result(confirmed)
-        return result
+        return _confirmed_decision_record(services, command, confirmed)
 
     claim = services.acquire_claim(command)
     if claim.command_id != command.command_id:
@@ -314,7 +312,7 @@ def execute_stage(
         return candidate.result
     except Exception as error:
         failure_record = {
-            "schema_version": UNHANDLED_STAGE_FAILURE_SCHEMA,
+            "schema_version": "description-pipeline.unhandled-stage-failure/v1",
             "command_id": command.command_id,
             "run_id": command.run_id,
             "stage": command.stage,

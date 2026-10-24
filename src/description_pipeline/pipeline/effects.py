@@ -392,6 +392,10 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
             terminal = True
             continue
         if fact.fact_type == "observation":
+            if terminal:
+                # A late observation from an old execution remains audit evidence,
+                # but it cannot reinterpret an already terminal external effect.
+                continue
             if fact.state_class in {"known", "unobservable"}:
                 state = EffectState.SATISFIED if fact.state_class == "known" else EffectState.UNKNOWN
             elif fact.state_class == "absent" and state is not EffectState.PREPARED:
@@ -403,6 +407,10 @@ def project_effect_settlement(intent: EffectIntent, facts: tuple[EffectFact, ...
             terminal = state is EffectState.SATISFIED
             continue
         if fact.fact_type == "reconciled":
+            if terminal:
+                # Reconciliation establishes a terminal outcome once. Later
+                # evidence must use the explicit conflict path if it contradicts it.
+                continue
             if fact.state_class == "known":
                 state = EffectState.SATISFIED
             elif fact.state_class == "absent":

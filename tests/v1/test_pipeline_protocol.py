@@ -157,6 +157,16 @@ class EffectProjectionTests(unittest.TestCase):
         settlement = project_effect_state(self.intent, facts)
         self.assertEqual(settlement, EffectState.SATISFIED)
 
+    def test_late_observation_and_reconciliation_do_not_rewrite_a_terminal_effect(self) -> None:
+        facts = (
+            self.fact(1, "dispatch_authorized"),
+            self.fact(2, "reconciled", state_class="known"),
+            self.fact(3, "observation", state_class="unobservable"),
+            self.fact(4, "observation", state_class="absent"),
+            self.fact(5, "reconciled", state_class="absent"),
+        )
+        self.assertEqual(project_effect_state(self.intent, facts), EffectState.SATISFIED)
+
     def test_absent_observation_after_send_is_not_definite_failure(self) -> None:
         facts = (
             self.fact(1, "dispatch_authorized"),
@@ -295,6 +305,24 @@ class DerivedStateTests(unittest.TestCase):
             RunStatus.CANCELLED,
         )
 
+    def test_completed_decisions_require_satisfied_effects(self) -> None:
+        self.assertEqual(
+            project_stage_status(
+                decision_outcome="completed",
+                effect_states=("definitely_failed",),
+                predecessor_completed=True,
+                open_claim=False,
+            ),
+            StageStatus.UNRESOLVED,
+        )
+        self.assertEqual(
+            project_run_status(
+                stage_outcomes=("completed",) * 6,
+                effect_states=("definitely_failed",),
+            ),
+            RunStatus.UNRESOLVED,
+        )
+
 
 class CommandIdentityTests(unittest.TestCase):
     def test_run_admission_is_immutable_and_self_contained(self) -> None:
@@ -430,6 +458,7 @@ class _Services:
         self.seal_calls = 0
         self.commit_calls = 0
         self.effects = {"native-effect": EffectState.SATISFIED}
+        self.cancel_command = None
         self.claim = ExecutionClaim(
             claim_id="claim-1",
             command_id=command_value.command_id,
@@ -447,6 +476,9 @@ class _Services:
 
     def decision_for(self, command_value):
         return self.decision
+
+    def cancellation_for(self, command_value):
+        return self.cancel_command
 
     def load_result(self, decision):
         return self.candidate.result
@@ -537,7 +569,7 @@ class _Services:
         )
         return self.decision
 
-    def commit_failure(self, command_value, claim, failure):
+    def commit_failure(self, command_value, claim, failure, *, workspace_root):
         raise AssertionError("failure not expected")
 
     def discard_workspace(self, workspace):
@@ -597,77 +629,80 @@ class StageEngineTests(unittest.TestCase):
         self.assertEqual(self.handler.validations, 2)
         self.assertEqual(self.services.commit_calls, 2)
 
-    def test_cached_completed_decision_rechecks_the_current_effect_ledger(self) -> None:
+    def test_cached_completed_decision_fails_closed_when_its_effect_conflicts(self) -> None:
         execute_stage(
             command_id=self.command.command_id,
             handler=self.handler,
             services=self.services,
         )
-        self.services.effects["native-effect"] = EffectState.UNKNOWN
-        with self.assertRaises(ProtocolError) as raised:
+        self.services.effects["native-effect"] = EffectState.CONFLICT
+        with self.assertRaises(ProtocolError) as context:
             execute_stage(
                 command_id=self.command.command_id,
                 handler=self.handler,
                 services=self.services,
             )
-        self.assertEqual(raised.exception.code, "effect.unsettled")
+        self.assertEqual(context.exception.code, "effect.unsettled")
+        self.assertEqual(self.handler.executions, 1)
 
-    def test_cached_decision_cannot_belong_to_another_command(self) -> None:
-        execute_stage(
-            command_id=self.command.command_id,
-            handler=self.handler,
-            services=self.services,
-        )
-        self.services.decision = replace(self.services.decision, command_id="foreign-command")
-        with self.assertRaises(ProtocolError) as raised:
-            execute_stage(
-                command_id=self.command.command_id,
-                handler=self.handler,
-                services=self.services,
-            )
-        self.assertEqual(raised.exception.code, "decision.command_mismatch")
-
-    def test_cached_failure_rejects_changed_or_unresolved_effect_states(self) -> None:
+    def test_cached_failure_requires_original_command_and_current_ledger(self) -> None:
         failure = FailureEnvelope(
             schema_version=FAILURE_ENVELOPE_SCHEMA,
             command_id=self.command.command_id,
             run_id=self.command.run_id,
-            stage=self.command.stage,
+            stage="generate",
             request_digest=self.command.request_digest,
             outcome="failed",
             actual_executor_sha256=self.command.expected_executor_sha256,
-            reason_code="domain.failed",
-            error_type="StageFailure",
-            error_message="domain failed",
+            reason_code="domain_failure",
+            error_type="DomainFailure",
+            error_message="domain failure",
             error_detail=None,
-            effect_states=(("native-effect", "prepared"),),
+            effect_states=(("native-effect", "definitely_failed"),),
             evidence_artifacts=(),
             retained_locations=(),
             unavailable_reason=None,
             occurred_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
         self.services.decision = StageDecision(
-            decision_id="failed-decision",
+            decision_id="decision-failure",
             run_id=self.command.run_id,
-            stage=self.command.stage,
+            stage="generate",
             command_id=self.command.command_id,
             result_record_artifact=None,
             result_digest=None,
             actual_executor_sha256=self.command.expected_executor_sha256,
             outcome="failed",
             original_producer_decision_id=None,
-            reason_code="domain.failed",
+            reason_code="domain_failure",
             failure_envelope=failure,
             decided_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
-        self.services.effects["native-effect"] = EffectState.UNKNOWN
-        with self.assertRaises(ProtocolError) as raised:
+        self.services.effects["native-effect"] = EffectState.CONFLICT
+        with self.assertRaises(ProtocolError) as context:
             execute_stage(
                 command_id=self.command.command_id,
                 handler=self.handler,
                 services=self.services,
             )
-        self.assertEqual(raised.exception.code, "effect.unsettled")
+        self.assertEqual(context.exception.code, "decision.effect_changed")
+        self.assertEqual(self.handler.executions, 0)
+
+    def test_cached_decision_cannot_be_reused_by_another_command(self) -> None:
+        execute_stage(
+            command_id=self.command.command_id,
+            handler=self.handler,
+            services=self.services,
+        )
+        self.services.decision = replace(self.services.decision, command_id="other-command")
+        with self.assertRaises(ProtocolError) as context:
+            execute_stage(
+                command_id=self.command.command_id,
+                handler=self.handler,
+                services=self.services,
+            )
+        self.assertEqual(context.exception.code, "decision.command_mismatch")
+        self.assertEqual(self.handler.executions, 1)
 
 
 if __name__ == "__main__":

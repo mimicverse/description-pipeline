@@ -30,8 +30,10 @@ from description_pipeline.pipeline import (
     EffectReconciliationService,
     EffectState,
     ExecutionClaim,
+    execute_stage,
     build_diagnostic_command,
 )
+from description_pipeline.pipeline.contracts import ProtocolError
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.platform.facts import FactConflict, FactStore
 
@@ -147,6 +149,14 @@ class _ExistingArtifactAdapter:
             payload_artifact=self.artifact,
             metadata={"source": "existing-verified-artifact"},
         )
+
+
+class _ForbiddenHandler:
+    def execute(self, *_args, **_kwargs):
+        raise AssertionError("A cached decision must be validated before handler execution")
+
+    def validate_candidate(self, *_args, **_kwargs):
+        raise AssertionError("A cached decision must never reach candidate validation")
 
 
 @unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
@@ -389,17 +399,65 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
             "FROM execution_claim WHERE command_id = %s AND fence = 1",
             (command.command_id,),
         )[0]
+        old_claim_record = ExecutionClaim(
+            claim_id=old_claim[0],
+            command_id=command.command_id,
+            fence=old_claim[1],
+            owner_sha256=old_claim[2],
+            executor_sha256=old_claim[3],
+            lane_key=old_claim[4],
+            expires_at=old_claim[5],
+        )
+        old_services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=self.work_root / "old-claim",
+            claim_policy=ClaimPolicy(
+                owner_sha256=old_claim_record.owner_sha256,
+                executor_sha256=self.executor,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: later,
+        )
+        old_workspace = old_services.materialize(command, old_claim_record, candidate=None)
+        self.addCleanup(old_services.discard_workspace, old_workspace)
+        old_effects = old_services.effect_port(command, old_claim_record, old_workspace)
+        late_observation = old_workspace.root / "late-observation"
+        late_observation.mkdir()
+        (late_observation / "observation.json").write_text('{"late": true}\n', encoding="utf-8")
+        late_reconciliation = old_workspace.root / "late-reconciliation"
+        late_reconciliation.mkdir()
+        (late_reconciliation / "evidence.json").write_text('{"late": true}\n', encoding="utf-8")
+        with self.assertRaisesRegex(FactConflict, "closed execution claim"):
+            old_effects.record_observation(
+                settlement.effect_id,
+                source="late-old-observation",
+                state_class="unobservable",
+                observation_root=late_observation,
+            )
+        with self.assertRaisesRegex(FactConflict, "closed execution claim"):
+            old_effects.reconcile_effect(
+                settlement.effect_id,
+                source="late-old-reconciliation",
+                state_class="absent",
+                evidence_root=late_reconciliation,
+            )
+        with self.assertRaisesRegex(FactConflict, "closed execution claim"):
+            self.facts.append_effect_fact(
+                effect_id=settlement.effect_id,
+                claim=old_claim_record,
+                fact_type="conflict",
+                source="late-old-conflict",
+                state_class=None,
+                payload_artifact=None,
+                payload_digest=digest({"late_conflict": command.command_id}),
+                observed_at=later + timedelta(minutes=1),
+                fact_id="late-conflict-" + command.command_id,
+                expected_command_id=command.command_id,
+            )
         self.facts.append_effect_fact(
             effect_id=settlement.effect_id,
-            claim=ExecutionClaim(
-                claim_id=old_claim[0],
-                command_id=command.command_id,
-                fence=old_claim[1],
-                owner_sha256=old_claim[2],
-                executor_sha256=old_claim[3],
-                lane_key=old_claim[4],
-                expires_at=old_claim[5],
-            ),
+            claim=old_claim_record,
             fact_type="response",
             source="late-old-process-response",
             state_class=None,
@@ -421,6 +479,46 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
             ),
             [("dispatch_authorized",), ("reconciled",), ("response",)],
         )
+        self.assertEqual(
+            self._query(
+                "SELECT outcome FROM stage_decision WHERE command_id = %s",
+                (command.command_id,),
+            ),
+            [("completed",)],
+        )
+        self.facts.append_effect_fact(
+            effect_id=settlement.effect_id,
+            claim=None,
+            fact_type="conflict",
+            source="independent-conflict-audit",
+            state_class=None,
+            payload_artifact=None,
+            payload_digest=digest({"independent_conflict": command.command_id}),
+            observed_at=later + timedelta(minutes=2),
+            fact_id="independent-conflict-" + command.command_id,
+            expected_command_id=command.command_id,
+        )
+        self.assertEqual(
+            self.facts.effect_settlement_for_key(command.command_id, "native").state,
+            EffectState.CONFLICT,
+        )
+        restarted_services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=self.work_root / "restarted-decision",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": "restarted-decision"}),
+                executor_sha256=self.executor,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: later + timedelta(minutes=3),
+        )
+        with self.assertRaisesRegex(ProtocolError, "effect.unsettled"):
+            execute_stage(
+                command_id=command.command_id,
+                handler=_ForbiddenHandler(),
+                services=restarted_services,
+            )
         self.assertEqual(
             self._query(
                 "SELECT outcome FROM stage_decision WHERE command_id = %s",
