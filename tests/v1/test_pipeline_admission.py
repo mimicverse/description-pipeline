@@ -495,6 +495,18 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(discover.request["freeze_artifact_id"], predecessor.result.output_artifact.artifact_id)
         self.assertEqual(discover.request["source_inventory_sha256"], self.harness.originals.inventory_sha256)
         self.assertEqual(discover.request["ruleset_version"], self.harness.spec.ruleset.version)
+        self.assertEqual(
+            discover.request["expected_native_tool_sha256"],
+            self.harness.spec.native_tool_source_sha256,
+        )
+        self.assertEqual(
+            discover.request["expected_native_tool_record_sha256"],
+            self.harness.spec.native_tool_record_sha256,
+        )
+        self.assertEqual(
+            discover.request["native_tool_requirement_artifact_id"],
+            self.harness.spec.native_tool_requirement.ref.artifact_id,
+        )
         self.assertEqual(discover.request["submission_identity"]["owner"], self.harness.spec.principal)
         self.assertEqual(discover.request["submission_identity"]["hardware_id"], self.harness.spec.target_hardware)
         self.assertEqual(discover.input_artifacts[0], predecessor.result.output_artifact)
@@ -516,13 +528,26 @@ class AdmissionProjectionTests(unittest.TestCase):
     def test_wrong_discover_request_field_is_rejected(self) -> None:
         predecessor = self.harness.freeze_result(self.command)
         discover = build_discover_command(self.harness.spec, predecessor)
-        forged = AdmissionHarness.manual(
-            discover,
-            request={**_request(discover), "purpose": "inspection_preview"},
-        )
-        with self.assertRaises(ProtocolError) as raised:
-            validate_discover_command(self.harness.spec, predecessor, forged)
-        self.assertIn("request.purpose", raised.exception.detail["fields"])
+        for field, value in (
+            ("purpose", "inspection_preview"),
+            ("expected_native_tool_record_sha256", "f" * 64),
+            ("native_tool_requirement_artifact_id", "another-native-tool"),
+        ):
+            with self.subTest(field=field):
+                forged = AdmissionHarness.manual(
+                    discover,
+                    request={**_request(discover), field: value},
+                )
+                with self.assertRaises(ProtocolError) as raised:
+                    validate_discover_command(
+                        self.harness.spec,
+                        predecessor,
+                        forged,
+                    )
+                self.assertIn(
+                    f"request.{field}",
+                    raised.exception.detail["fields"],
+                )
 
     def test_capture_generate_and_verify_project_from_verified_lineage(self) -> None:
         freeze = self.harness.freeze_result(self.command)

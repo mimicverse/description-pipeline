@@ -69,6 +69,8 @@ NATIVE_TOOL = {
     "source_sha256": TOOL_SHA256,
     "runtime": {"role": "native"},
 }
+NATIVE_TOOL_RECORD_SHA256 = digest(NATIVE_TOOL)
+NATIVE_TOOL_REQUIREMENT_ARTIFACT_ID = "native-tool-requirement-fixture"
 
 
 def _members(root: Path) -> list[dict]:
@@ -367,6 +369,10 @@ class DiscoverHarness:
                 "inventory_digest": None,
             },
             "expected_native_tool_sha256": TOOL_SHA256,
+            "expected_native_tool_record_sha256": NATIVE_TOOL_RECORD_SHA256,
+            "native_tool_requirement_artifact_id": (
+                NATIVE_TOOL_REQUIREMENT_ARTIFACT_ID
+            ),
         }
         record.update(overrides)
         return record
@@ -415,6 +421,12 @@ class DiscoverHarness:
             main_assembly=value["main_assembly"],
             purpose=value["purpose"],
             expected_native_tool_sha256=value["expected_native_tool_sha256"],
+            expected_native_tool_record_sha256=value[
+                "expected_native_tool_record_sha256"
+            ],
+            native_tool_requirement_artifact_id=value[
+                "native_tool_requirement_artifact_id"
+            ],
         )
 
     def workspace(self):
@@ -539,6 +551,10 @@ class DiscoverDomainTests(unittest.TestCase):
                 "source_inventory_sha256": digest(self.harness.source_files),
                 "source_archive_sha256": archive_sha256,
                 "native_tool_sha256": TOOL_SHA256,
+                "native_tool_record_sha256": NATIVE_TOOL_RECORD_SHA256,
+                "native_tool_requirement_artifact_id": (
+                    NATIVE_TOOL_REQUIREMENT_ARTIFACT_ID
+                ),
             },
             outbound_root=outbound,
         )

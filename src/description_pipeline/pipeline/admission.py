@@ -1147,6 +1147,12 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         "platform_config_sha256": spec.platform_config_sha256,
         "submission_identity": _submission_identity(spec),
         "expected_native_tool_sha256": spec.native_tool_source_sha256,
+        "expected_native_tool_record_sha256": (
+            spec.native_tool_record_sha256
+        ),
+        "native_tool_requirement_artifact_id": (
+            spec.native_tool_requirement.ref.artifact_id
+        ),
     }
     return _base_command(
         spec,

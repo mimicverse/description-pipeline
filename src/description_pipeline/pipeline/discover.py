@@ -73,6 +73,8 @@ _REQUEST_FIELDS = frozenset(
         "platform_config_sha256",
         "submission_identity",
         "expected_native_tool_sha256",
+        "expected_native_tool_record_sha256",
+        "native_tool_requirement_artifact_id",
     }
 )
 _SUBMISSION_FIELDS = frozenset(
@@ -178,8 +180,17 @@ def _validate_request(command: StageCommand) -> dict[str, Any]:
             "discover.source_inventory_mismatch",
             "SourceSet inventory differs from its request digest",
         )
-    for field in ("ruleset_catalog_sha256", "platform_config_sha256", "expected_native_tool_sha256"):
+    for field in (
+        "ruleset_catalog_sha256",
+        "platform_config_sha256",
+        "expected_native_tool_sha256",
+        "expected_native_tool_record_sha256",
+    ):
         _sha(request[field], field)
+    _text(
+        request["native_tool_requirement_artifact_id"],
+        "native_tool_requirement_artifact_id",
+    )
     submission = request["submission_identity"]
     if not isinstance(submission, dict) or set(submission) != _SUBMISSION_FIELDS:
         raise NativeDiscoverRefusal("discover.request_invalid", "Submission identity fields are invalid")
@@ -384,6 +395,12 @@ class DiscoverHandler:
                 main_assembly=request["main_assembly"],
                 purpose=request["purpose"],
                 expected_native_tool_sha256=request["expected_native_tool_sha256"],
+                expected_native_tool_record_sha256=request[
+                    "expected_native_tool_record_sha256"
+                ],
+                native_tool_requirement_artifact_id=request[
+                    "native_tool_requirement_artifact_id"
+                ],
             )
             effect_artifact, observation = self._obtain_observation(
                 command,
@@ -413,6 +430,15 @@ class DiscoverHandler:
                     str(error),
                     evidence_artifacts=(effect_artifact,),
                 ) from error
+            if (
+                digest(dict(observation.native_tool))
+                != request["expected_native_tool_record_sha256"]
+            ):
+                raise StageFailure(
+                    "discover.native_tool_record_mismatch",
+                    "Observed native tool record differs from the current frozen requirement",
+                    evidence_artifacts=(effect_artifact,),
+                )
             selection = dict(observation.selection)
             bindings_files = selection.get("files")
             if not isinstance(bindings_files, Mapping):
@@ -583,6 +609,12 @@ class DiscoverHandler:
                 "source_inventory_sha256": request["source_inventory_sha256"],
                 "source_archive_sha256": source_archive_sha256,
                 "native_tool_sha256": request["expected_native_tool_sha256"],
+                "native_tool_record_sha256": request[
+                    "expected_native_tool_record_sha256"
+                ],
+                "native_tool_requirement_artifact_id": request[
+                    "native_tool_requirement_artifact_id"
+                ],
             },
             outbound_root=outbound_root,
         )

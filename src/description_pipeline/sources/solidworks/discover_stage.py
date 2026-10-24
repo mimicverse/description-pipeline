@@ -33,6 +33,8 @@ _REQUEST_FIELDS = frozenset(
         "main_assembly",
         "purpose",
         "expected_native_tool_sha256",
+        "expected_native_tool_record_sha256",
+        "native_tool_requirement_artifact_id",
     }
 )
 _OBSERVATION_FIELDS = frozenset(
@@ -98,6 +100,8 @@ class NativeDiscoverRequest:
     main_assembly: str
     purpose: str
     expected_native_tool_sha256: str
+    expected_native_tool_record_sha256: str
+    native_tool_requirement_artifact_id: str
 
     def __post_init__(self) -> None:
         if self.schema_version != NATIVE_REQUEST_SCHEMA:
@@ -124,6 +128,18 @@ class NativeDiscoverRequest:
         )
         _require(self.purpose in REQUEST_PURPOSES, "discover.native_request_invalid", "Purpose is unsupported")
         _sha(self.expected_native_tool_sha256, "expected_native_tool_sha256")
+        _sha(
+            self.expected_native_tool_record_sha256,
+            "expected_native_tool_record_sha256",
+        )
+        _require(
+            isinstance(self.native_tool_requirement_artifact_id, str)
+            and bool(self.native_tool_requirement_artifact_id)
+            and "\x00" not in self.native_tool_requirement_artifact_id,
+            "discover.native_request_invalid",
+            "Native tool requirement artifact ID is invalid",
+            {"field": "native_tool_requirement_artifact_id"},
+        )
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -137,6 +153,12 @@ class NativeDiscoverRequest:
             "main_assembly": self.main_assembly,
             "purpose": self.purpose,
             "expected_native_tool_sha256": self.expected_native_tool_sha256,
+            "expected_native_tool_record_sha256": (
+                self.expected_native_tool_record_sha256
+            ),
+            "native_tool_requirement_artifact_id": (
+                self.native_tool_requirement_artifact_id
+            ),
         }
 
     @classmethod
@@ -169,7 +191,11 @@ class NativeObservation:
         return file_digest(self.root / OBSERVATION_MANIFEST)
 
 
-def _validated_tool(native_tool: object, expected_sha256: str) -> dict:
+def _validated_tool(
+    native_tool: object,
+    expected_source_sha256: str,
+    expected_record_sha256: str,
+) -> dict:
     _require(
         isinstance(native_tool, Mapping) and bool(native_tool),
         "discover.native_tool_invalid",
@@ -177,9 +203,14 @@ def _validated_tool(native_tool: object, expected_sha256: str) -> dict:
     )
     tool = dict(native_tool)
     _require(
-        tool.get("source_sha256") == expected_sha256,
+        tool.get("source_sha256") == expected_source_sha256,
         "discover.native_tool_mismatch",
         "Native tool source identity differs from the expected tool",
+    )
+    _require(
+        digest(tool) == expected_record_sha256,
+        "discover.native_tool_record_mismatch",
+        "Native tool full record differs from the current frozen requirement",
     )
     return tool
 
@@ -215,7 +246,11 @@ def observe_native_record(
         "discover.source_selection_mismatch",
         "Selected staged files differ from the sealed selection",
     )
-    tool = _validated_tool(native_tool, request.expected_native_tool_sha256)
+    tool = _validated_tool(
+        native_tool,
+        request.expected_native_tool_sha256,
+        request.expected_native_tool_record_sha256,
+    )
     settings = DiscoverySettings(main_assembly=request.main_assembly)
     record = read_native_record(selected_source, settings, backend=backend, on_activity=on_activity)
     record = copy.deepcopy(record)
@@ -390,7 +425,11 @@ def admit_native_observation(
         "Selection was computed from another full SourceSet",
     )
     tool = read_data(root / "tool.json")
-    _validated_tool(tool, request.expected_native_tool_sha256)
+    _validated_tool(
+        tool,
+        request.expected_native_tool_sha256,
+        request.expected_native_tool_record_sha256,
+    )
     _require(
         manifest["native_tool"] == tool and manifest["native_tool_sha256"] == digest(tool),
         "discover.observation_mismatch",
