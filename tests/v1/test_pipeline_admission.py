@@ -113,11 +113,12 @@ class AdmissionHarness:
             executors=StageExecutors(
                 freeze=digest({"executor": "freeze"}),
                 discover=digest({"executor": "discover"}),
-                capture=digest({"executor": "capture"}),
+                capture=digest({"executor": "native"}),
                 generate=digest({"executor": "generate"}),
                 verify=digest({"executor": "verify"}),
                 publish=digest({"executor": "publish"}),
             ),
+            native_tool_sha256=digest({"executor": "native"}),
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": 1}),
             created_at=datetime(2026, 10, 25, 9, 30, tzinfo=UTC),
