@@ -5493,6 +5493,14 @@ class SolidWorksBackend(CadBackend):
             self._capture_required_configuration_map(graph["topology"])
         )
 
+    @classmethod
+    def _capture_owner_identity(cls, path):
+        """Normalize an owner by the owner's own controlled storage class."""
+
+        if session_artifact_path(path):
+            return cls._capture_session_path_signature(path)
+        return normalize_document_path(os.path.abspath(path))
+
     @staticmethod
     def _capture_session_path_signature(path):
         text = str(path or "")
@@ -5535,16 +5543,12 @@ class SolidWorksBackend(CadBackend):
                 item["session_path"] = cls._capture_session_path_signature(
                     row["document_path"]
                 )
-                if row["owner_document_path"] is not None:
-                    item["owner_identity"] = cls._capture_session_path_signature(
-                        row["owner_document_path"]
-                    )
             else:
                 item["normalized_path"] = row["normalized_path"]
-                if row["owner_document_path"] is not None:
-                    item["owner_identity"] = normalize_document_path(
-                        os.path.abspath(row["owner_document_path"])
-                    )
+            if row["owner_document_path"] is not None:
+                item["owner_identity"] = cls._capture_owner_identity(
+                    row["owner_document_path"]
+                )
             stable.append(item)
         return sorted(
             stable,
@@ -5890,6 +5894,19 @@ class SolidWorksBackend(CadBackend):
                 )
             fresh_document = self._document_handle_by_path(path)
             fresh_graph = self._capture_rebuild_graph(fresh_document, path)
+            fresh_session = self._capture_session_evidence(path)
+            recovery["fresh_session"] = fresh_session
+            if fresh_session["identity"]["pid"] != fresh_pid:
+                raise ValueError(
+                    "the fresh capture session changed its process identity"
+                )
+            if (
+                fresh_graph["session_files"]
+                and fresh_session["temp_root"] is None
+            ):
+                raise ValueError(
+                    "the fresh capture session has no dependency artifact root"
+                )
             fresh_top = self._capture_graph_top_row(fresh_graph)
             fresh_state = fresh_top["initial_state"]
             source_unchanged = fresh_graph["source_files"] == graph["source_files"]

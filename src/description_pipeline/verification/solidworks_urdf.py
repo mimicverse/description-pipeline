@@ -1023,6 +1023,19 @@ def _capture_preparation(root, manifest):
         return rows
 
     def topology_semantic(rows):
+        def owner_identity(value):
+            if value is None:
+                return None
+            parts = [
+                part.casefold()
+                for part in re.split(r"[\\/]", str(value))
+                if part
+            ]
+            markers = [part for part in parts if part in {"ic~~", "vc~~"}]
+            if markers:
+                return session_path_identity(value)
+            return normalized_path(value)
+
         return sorted(
             [
                 {
@@ -1034,10 +1047,8 @@ def _capture_preparation(root, manifest):
                     "storage_scope": row["storage_scope"],
                     "provenance_state": row["provenance_state"],
                     "owner_sha256": row["owner_sha256"],
-                    "owner_document_path": (
-                        normalized_path(row["owner_document_path"])
-                        if row["owner_document_path"] is not None
-                        else None
+                    "owner_document_path": owner_identity(
+                        row["owner_document_path"]
                     ),
                     **(
                         {}

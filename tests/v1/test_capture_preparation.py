@@ -1514,6 +1514,23 @@ class CapturePreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "unique sorted list"):
             self.validate(mapping)
 
+    def test_session_owner_is_validated_as_a_file_identity(self) -> None:
+        value = payload(virtual_reuse=True)
+        self.validate(value)
+
+        wrong_owner = payload(virtual_reuse=True)
+        preparation = self.preparation(wrong_owner)
+        for topology_name in ("topology_before", "topology_after"):
+            for row in preparation[topology_name]:
+                if row["storage_scope"] == "session":
+                    row["owner_document_path"] = _normalized(PART)
+                    break
+        with self.assertRaisesRegex(
+            PipelineError,
+            "owner differs from its occurrence parent",
+        ):
+            self.validate(wrong_owner)
+
     def test_schema_state_and_source_mutations_are_rejected(self) -> None:
         cases = (
             (

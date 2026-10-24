@@ -360,6 +360,51 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 SolidWorksBackend._capture_session_path_signature(str(value))
 
+    def test_session_child_uses_its_file_backed_owner_identity(self) -> None:
+        session_path = (
+            r"C:\Users\solid\AppData\Local\Temp\swx8108\VC~~\waist"
+            r"\Copy of 复件 (2) 零件10^waist.SLDPRT"
+        )
+        owner_path = (
+            r"c:\description-v1-review\endpoint-deliveries"
+            r"\.a8eabd2a-57f0-5928-914b-2a6803a71005-capture-r6jieh8j"
+            r"\evidence.partial\source\waist.sldasm"
+        )
+        row = {
+            "depth": 2,
+            "document_path": session_path,
+            "normalized_path": normalize_document_path(session_path),
+            "document_type": 1,
+            "instance": "waist-1/Copy of 复件 (2) 零件10^waist-1",
+            "native_api_pid": 8108,
+            "owner_document_path": owner_path,
+            "owner_sha256": (
+                "5b9ab6263b6a8a7ff5ab821614225ea9"
+                "fc1325b59fc3c7a7e0916d08b70caf37"
+            ),
+            "provenance_state": "embedded_virtual_component",
+            "referenced_configuration": "默认",
+            "storage_scope": "session",
+            "suppression_state": 2,
+        }
+        with patch(
+            "description_pipeline.sources.solidworks.native."
+            "embedded_virtual_component_root",
+            return_value=r"C:\Users\solid\AppData\Local\Temp\swx8108",
+        ):
+            stable = SolidWorksBackend._capture_stable_topology([row])
+
+        self.assertEqual(
+            stable[0]["owner_identity"],
+            normalize_document_path(os.path.abspath(owner_path)),
+        )
+        self.assertEqual(stable[0]["owner_sha256"], row["owner_sha256"])
+        self.assertEqual(
+            stable[0]["session_path"],
+            "vc~~/waist/copy of 复件 (2) 零件10^waist.sldprt",
+        )
+        self.assertNotIn("normalized_path", stable[0])
+
     def test_loaded_document_signature_rejects_extra_and_missing_documents(self) -> None:
         top_key = normalize_document_path(os.path.abspath(PATH))
         part_key = normalize_document_path(os.path.abspath(PART))
@@ -839,6 +884,81 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         )
         self.assertFalse(old_top.save_calls or old_child.save_calls)
         self.assertFalse(fresh_top.save_calls or fresh_child.save_calls)
+
+    def test_recovery_rebinds_a_fresh_virtual_session_dependency(self):
+        old_virtual = _Doc(
+            "/tmp/swx1234/VC~~/robot/virtual_assembly.SLDASM",
+            read_only=False,
+        )
+        old_child = _Doc(CHILD, needs_rebuild2=1)
+        old_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+            children=[
+                _Component("child-1", old_child),
+                _Component("virtual-1", old_virtual, is_virtual=True),
+            ],
+        )
+        fresh_virtual = _Doc(
+            "/tmp/swx5678/VC~~/robot/virtual_assembly.SLDASM",
+            read_only=False,
+        )
+        fresh_child = _Doc(CHILD, needs_rebuild2=1)
+        fresh_top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[
+                _Component("child-1", fresh_child),
+                _Component("virtual-1", fresh_virtual, is_virtual=True),
+            ],
+        )
+        fresh_top._rebuild_callback = lambda: setattr(
+            fresh_child,
+            "needs_rebuild2",
+            0,
+        )
+        backend = _RecoveryBackend(
+            {
+                PATH: old_top,
+                CHILD: old_child,
+                old_virtual.GetPathName: old_virtual,
+            },
+            {
+                PATH: fresh_top,
+                CHILD: fresh_child,
+                fresh_virtual.GetPathName: fresh_virtual,
+            },
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="8" * 64,
+        ):
+            returned, preparation = backend._rebuild_capture_copy(
+                old_top,
+                PATH,
+            )
+
+        self.assertIs(returned, fresh_top)
+        self.assertEqual(fresh_top.rebuild_calls, 1)
+        self.assertEqual(fresh_virtual.rebuild_calls, 0)
+        self.assertEqual(
+            preparation["session_dependency_paths"],
+            [fresh_virtual.GetPathName],
+        )
+        recovery = preparation["session_recovery"]
+        self.assertEqual(
+            recovery["fresh_session"],
+            preparation["session"],
+        )
+        self.assertEqual(
+            recovery["fresh_session"]["temp_root"],
+            "/tmp/swx5678",
+        )
+        self.assertEqual(
+            recovery["retirement"]["after"],
+            {"state": "closed", "pid": 1234},
+        )
 
     def test_fresh_session_already_clean_does_not_rebuild_top_again(self):
         old_child = _Doc(CHILD, needs_rebuild2=1)
