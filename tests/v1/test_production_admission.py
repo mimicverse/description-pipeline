@@ -106,7 +106,15 @@ def _admission_outcome(artifacts: ArtifactStore, spec: AdmissionSpec) -> Admissi
         producer_tool_sha256=spec.dispatch_executor_sha256,
     )
     dispatch = DispatchCommand.create(
-        command_id="dispatch:" + digest({"run_id": spec.run_id}),
+        command_id="dispatch:" + digest(
+            {
+                "admission_sha256": spec.admission_sha256,
+                "dag_id": "solidworks_to_urdf",
+                "dag_run_id": spec.request_id,
+                "freeze_command_id": freeze.command_id,
+                "run_id": spec.run_id,
+            }
+        ),
         run_id=spec.run_id,
         freeze_command_id=freeze.command_id,
         idempotency_key=f"{spec.run_id}/dispatch",

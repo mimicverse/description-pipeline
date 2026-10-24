@@ -580,6 +580,15 @@ class PreparedAdmission:
             )
         expected_freeze = build_freeze_command(outcome_spec)
         dispatch = outcome.dispatch_command
+        expected_dispatch_id = "dispatch:" + digest(
+            {
+                "admission_sha256": outcome_spec.admission_sha256,
+                "dag_id": "solidworks_to_urdf",
+                "dag_run_id": outcome_spec.request_id,
+                "freeze_command_id": expected_freeze.command_id,
+                "run_id": outcome_spec.run_id,
+            }
+        )
         if (
             not isinstance(outcome.freeze_command, StageCommand)
             or outcome.freeze_command != expected_freeze
@@ -590,9 +599,12 @@ class PreparedAdmission:
             )
         if (
             not isinstance(dispatch, DispatchCommand)
+            or dispatch.command_id != expected_dispatch_id
             or dispatch.run_id != outcome_spec.run_id
             or dispatch.freeze_command_id != expected_freeze.command_id
             or dispatch.idempotency_key != f"{outcome_spec.run_id}/dispatch"
+            or dispatch.dag_id != "solidworks_to_urdf"
+            or dispatch.dag_run_id != outcome_spec.request_id
             or dispatch.expected_executor_sha256
             != outcome_spec.dispatch_executor_sha256
         ):
