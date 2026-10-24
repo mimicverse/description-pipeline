@@ -222,9 +222,9 @@ def _stamp(root: Path, receipt: dict) -> None:
 
 
 def _check(root: Path) -> dict:
-    from .verification.solidworks_urdf import check_bundle
+    from .verification.solidworks_urdf import check_bundle, native_receipts
 
-    return check_bundle(root)
+    return check_bundle(root, native_receipts=native_receipts(root))
 
 
 def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
@@ -248,9 +248,26 @@ def _native_tool_record() -> dict:
 def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, main_assembly):
     """Close a capture-only run: provenance reports, sealed transfer, native_complete."""
 
+    from .orchestration.stage_transfer import expected_native_check_details
+
     tool = _native_tool_record()
     write_json(staging / "reports/native-tool.json", tool)
     receipt.update(state="native_complete", passed=False, native_complete=True, native_tool=tool, stage="capture")
+    discovery = read_data(staging / "evidence/discovery.json")
+    native_files = discovery.get("native_files") if isinstance(discovery, dict) else None
+    if not isinstance(native_files, dict) or not native_files:
+        raise PipelineError("Native discovery has no file inventory")
+    expected_details = expected_native_check_details(
+        staging,
+        handoff_sha256=handoff_sha256,
+        main_assembly=main_assembly,
+        main_assembly_sha256=file_digest(staging / "input/cad" / main_assembly),
+        native_files=native_files,
+    )
+    for event in receipt["events"]:
+        check = event.get("check") if isinstance(event, dict) else None
+        if isinstance(check, dict) and check.get("id") in expected_details:
+            check["details"] = expected_details[check["id"]]
     _stamp(staging, receipt)
     # The native receipt must stay stable even when Linux rewrites reports/stages.json, and
     # it keeps the raw events (with timestamps) so the portable side can seed prior_events.
@@ -518,9 +535,9 @@ def publish(
             definition, input_report = _replay_seeded_inputs(staging)
             receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
             _require_subject(staging, expected_subject)
-            from .verification.solidworks_urdf import check_bundle, rebuilt_definition, require_qualified_report
+            from .verification.solidworks_urdf import rebuilt_definition, require_qualified_report
 
-            report = require_qualified_report(check_bundle(staging), rebuilt_definition(staging), root=staging)
+            report = require_qualified_report(_check(staging), rebuilt_definition(staging), root=staging)
             if expected_subject and report.get("subject_sha256") != expected_subject:
                 raise PipelineError("Verified report is bound to a different subject")
             receipt.update(

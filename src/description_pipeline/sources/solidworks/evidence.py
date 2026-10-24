@@ -98,6 +98,7 @@ def metadata_value_warnings(
     runtime: dict[str, Any],
     rewrite_environment: dict[str, Any],
     *,
+    expected_tool: dict[str, Any],
     runtime_sha256: str,
     rewrite_sha256: str,
     expected_configuration: str,
@@ -148,6 +149,9 @@ def metadata_value_warnings(
         fields_by_file_rule.setdefault((file, rule_id), []).extend(pointers)
 
     def classify_toolchain(record: dict[str, Any], file: str) -> None:
+        from ...delivery import PIPELINE_ID
+        from ...schemas import TOOL_SCHEMA
+
         toolchain = require_record(
             record["toolchain"],
             f"{file} toolchain",
@@ -168,11 +172,19 @@ def metadata_value_warnings(
                 "runtime",
             },
         )
-        for key in ("schema_version", "pipeline_id", "version"):
-            require_text(toolchain[key], f"{file} toolchain.{key}")
-        require_digest(toolchain["source_sha256"], f"{file} toolchain.source_sha256")
-        if toolchain["release"] is not None and not isinstance(toolchain["release"], dict):
-            fail(f"{file} toolchain.release metadata must be an object or null")
+        if toolchain["schema_version"] != TOOL_SCHEMA:
+            fail(f"{file} toolchain uses an unknown schema")
+        if toolchain["pipeline_id"] != PIPELINE_ID:
+            fail(f"{file} toolchain belongs to another pipeline")
+        if toolchain["version"] != require_text(expected_tool.get("version"), "expected tool version"):
+            fail(f"{file} toolchain version differs from the delivery tool")
+        if require_digest(toolchain["source_sha256"], f"{file} toolchain.source_sha256") != require_digest(
+            expected_tool.get("source_sha256"),
+            "expected tool source_sha256",
+        ):
+            fail(f"{file} toolchain source digest differs from the delivery tool")
+        if toolchain["release"] != expected_tool.get("release"):
+            fail(f"{file} toolchain release differs from the delivery tool")
         add(
             file,
             "metadata.tool_identity",
@@ -190,6 +202,16 @@ def metadata_value_warnings(
         )
         for key in ("role", "python", "system", "machine"):
             require_text(runtime[key], f"{file} toolchain.runtime.{key}")
+        expected_runtime = require_record(
+            expected_tool.get("runtime"),
+            "expected tool runtime",
+            required={"role", "python", "system", "machine", "packages"},
+            allowed={"role", "python", "system", "machine", "packages"},
+        )
+        if runtime["role"] != "native" or runtime["system"] != "Windows":
+            fail(f"{file} toolchain is not the native Windows runtime")
+        if runtime != expected_runtime:
+            fail(f"{file} toolchain runtime differs from the delivery native runtime")
         packages = runtime["packages"]
         if not isinstance(packages, dict) or not all(
             isinstance(name, str) and name and isinstance(version, str) and version
@@ -202,7 +224,41 @@ def metadata_value_warnings(
             *(f"/toolchain/runtime/{key}" for key in ("role", "python", "system", "machine", "packages")),
         )
 
-    def classify_solidworks(record: dict[str, Any], file: str) -> None:
+    def session_identity(value: Any, label: str, *, required_state: str) -> dict[str, Any]:
+        identity = require_record(
+            value,
+            label,
+            required={"pid", "state"},
+            allowed={"pid", "state", "executable", "ownership", "lease"},
+        )
+        if type(identity["pid"]) is not int or identity["pid"] <= 0:
+            fail(f"{label}.pid must be a positive integer")
+        if identity["state"] != required_state:
+            fail(f"{label}.state must be {required_state!r}")
+        if "executable" in identity:
+            require_text(identity["executable"], f"{label}.executable")
+        if "ownership" in identity:
+            require_text(identity["ownership"], f"{label}.ownership")
+        lease = identity.get("lease")
+        if lease is not None:
+            lease = require_record(
+                lease,
+                f"{label}.lease",
+                required={"held", "holder_pid", "path"},
+                allowed={"held", "holder_pid", "path"},
+            )
+            if type(lease["held"]) is not bool:
+                fail(f"{label}.lease.held must be a boolean")
+            if lease["holder_pid"] is not None and (
+                type(lease["holder_pid"]) is not int or lease["holder_pid"] <= 0
+            ):
+                fail(f"{label}.lease.holder_pid must be null or a positive integer")
+            require_text(lease["path"], f"{label}.lease.path")
+            if lease["held"] != (required_state == "active"):
+                fail(f"{label}.lease state contradicts the process state")
+        return identity
+
+    def classify_solidworks(record: dict[str, Any], file: str) -> dict[str, dict[str, Any]]:
         facts = require_record(
             record["solidworks"],
             f"{file} solidworks",
@@ -223,12 +279,21 @@ def metadata_value_warnings(
         add(file, "metadata.platform_constant", "/solidworks/input_mode")
 
         sessions = facts["sessions"]
-        if not isinstance(sessions, dict) or not all(
-            isinstance(role, str) and role and isinstance(identity, dict)
-            for role, identity in sessions.items()
-        ):
-            fail(f"{file} solidworks.sessions metadata must map roles to objects")
-        for role in sorted(sessions):
+        if not isinstance(sessions, dict) or set(sessions) != {"source", "copy"}:
+            fail(f"{file} solidworks.sessions must name the source and copy sessions exactly")
+        source_session = session_identity(
+            sessions["source"],
+            f"{file} solidworks.sessions.source",
+            required_state="closed",
+        )
+        copy_session = session_identity(
+            sessions["copy"],
+            f"{file} solidworks.sessions.copy",
+            required_state="active",
+        )
+        if source_session["pid"] == copy_session["pid"]:
+            fail(f"{file} source and copy sessions reuse one pid")
+        for role in ("source", "copy"):
             add(file, "metadata.process_observation", "/solidworks/sessions/" + _pointer_token(role))
 
         unavailable = facts.get("unavailable", {})
@@ -261,8 +326,15 @@ def metadata_value_warnings(
                 fail(f"{file} solidworks.{key} does not have its documented native type")
             if member in unavailable:
                 fail(f"{file} solidworks.{key} has both a value and an unavailable diagnostic")
+        return {"source": source_session, "copy": copy_session}
 
-    def classify_session_boundary(record: dict[str, Any], file: str) -> None:
+    def classify_session_boundary(
+        record: dict[str, Any],
+        file: str,
+        *,
+        capture_sessions: dict[str, dict[str, Any]],
+        rewrite_sessions: dict[str, dict[str, Any]],
+    ) -> None:
         boundary = require_record(
             record["session_boundary"],
             f"{file} session_boundary",
@@ -382,11 +454,37 @@ def metadata_value_warnings(
             required={"role", "retired", "before", "after"},
             allowed={"role", "retired", "before", "after"},
         )
-        require_text(retirement["role"], f"{file} retirement.role")
+        if retirement["role"] != "copy":
+            fail(f"{file} retirement.role must be 'copy'")
         if retirement["retired"] is not True:
             fail(f"{file} retirement.retired is not exactly true")
-        if not isinstance(retirement["before"], dict) or not isinstance(retirement["after"], dict):
-            fail(f"{file} retirement session identities must be objects")
+        retired_before = session_identity(
+            retirement["before"],
+            f"{file} retirement.before",
+            required_state="active",
+        )
+        retired_after = session_identity(
+            retirement["after"],
+            f"{file} retirement.after",
+            required_state="closed",
+        )
+        if retired_before["pid"] != retired_after["pid"]:
+            fail(f"{file} retirement changed the retired process pid")
+        if retired_before["pid"] != rewrite_sessions["copy"]["pid"]:
+            fail(f"{file} retirement.before differs from the rewrite copy session")
+        for key in ("executable", "ownership"):
+            if (
+                key in retired_before or key in rewrite_sessions["copy"]
+            ) and retired_before.get(key) != rewrite_sessions["copy"].get(key):
+                fail(f"{file} retirement.before {key} differs from the rewrite copy session")
+        if capture_sessions["source"]["pid"] != rewrite_sessions["source"]["pid"]:
+            fail(f"{file} capture and rewrite source pids differ")
+        if capture_sessions["source"]["state"] != "closed":
+            fail(f"{file} source session remained active during capture")
+        if capture_sessions["copy"]["state"] != "active":
+            fail(f"{file} capture copy session is not active")
+        if capture_sessions["copy"]["pid"] == retired_before["pid"]:
+            fail(f"{file} capture reused the retired rewrite process")
         add(
             file,
             "metadata.process_observation",
@@ -442,19 +540,33 @@ def metadata_value_warnings(
     rewrite_sha256 = require_digest(rewrite_sha256, REWRITE_ENVIRONMENT_EVIDENCE)
     expected_configuration = require_text(expected_configuration, "expected configuration")
     closure_top_level = require_text(closure_top_level, "closure top-level")
+    expected_tool = require_record(
+        expected_tool,
+        "expected native tool",
+        required={"schema_version", "pipeline_id", "version", "source_sha256", "runtime"},
+        allowed={"schema_version", "pipeline_id", "version", "source_sha256", "release", "runtime"},
+    )
 
+    sessions_by_file = {}
     for record, file in (
         (runtime, RUNTIME_EVIDENCE),
         (rewrite_environment, REWRITE_ENVIRONMENT_EVIDENCE),
     ):
         for key in ("captured_at", "platform", "python", "worker_version"):
             require_text(record[key], f"{file} {key}")
+        if record["worker_version"] != expected_tool["version"]:
+            fail(f"{file} worker_version differs from the delivery native tool")
         add(file, "metadata.platform_execution", "/captured_at", "/platform", "/worker_version")
         add(file, "metadata.python_version_split", "/python")
         classify_toolchain(record, file)
-        classify_solidworks(record, file)
+        sessions_by_file[file] = classify_solidworks(record, file)
 
-    classify_session_boundary(runtime, RUNTIME_EVIDENCE)
+    classify_session_boundary(
+        runtime,
+        RUNTIME_EVIDENCE,
+        capture_sessions=sessions_by_file[RUNTIME_EVIDENCE],
+        rewrite_sessions=sessions_by_file[REWRITE_ENVIRONMENT_EVIDENCE],
+    )
 
     objects: list[dict[str, Any]] = []
     for file, digest in (

@@ -15,6 +15,7 @@ import hashlib
 import shutil
 import zipfile
 
+from ..interface_records import validate_source_record
 from ..io import PipelineError, digest, file_digest, read_data
 from ..sources.solidworks.selection import validate_file_index, verify_selection
 from ..orchestration.airflow_client import capture_archive_metadata, validate_run_id
@@ -100,22 +101,17 @@ def _recorded_payloads(platform: PlatformStore, run_id: str) -> list:
     return [row.get("payload") if isinstance(row, dict) else None for row in recorded_events(platform, run_id)]
 
 
-def source_identity(capture: Path) -> tuple[str | None, str | None]:
+def source_identity(capture: Path) -> tuple[str, str | None]:
     """Hardware and revision of one admitted capture tree, read from its frozen source."""
     source_path = capture / "input/source.json"
     if not source_path.is_file():
-        return None, None
-    payload = read_data(source_path)
-    if not isinstance(payload, dict):
-        return None, None
-    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    hardware = identity.get("hardware_id")
+        raise PipelineError("The admitted capture carries no input/source.json identity")
+    payload = validate_source_record(read_data(source_path))
+    identity = payload["identity"]
+    metadata = payload["metadata"]
+    hardware = identity["hardware_id"]
     revision = metadata.get("revision")
-    return (
-        hardware if isinstance(hardware, str) and hardware else None,
-        revision if isinstance(revision, str) and revision else None,
-    )
+    return hardware, revision if isinstance(revision, str) and revision else None
 
 
 def import_native_capture(

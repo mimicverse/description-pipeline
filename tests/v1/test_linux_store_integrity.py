@@ -280,7 +280,7 @@ class LinuxStoreIntegrityTests(SplitAdmissionMixin, unittest.TestCase):
         with (
             mock.patch.object(flow, "tool_record", return_value=portable_record(self.tool)),
             mock.patch.object(flow.solidworks, "generate", side_effect=AssertionError("must not run")),
-            self.assertRaisesRegex(PipelineError, "differs from the recorded admission"),
+            self.assertRaisesRegex(PipelineError, "does not digest to its handoff"),
         ):
             flow.run_stage(self.store, self.store_root, RUN, "generate")
 

@@ -3439,7 +3439,7 @@ class PlatformStore:
         # The prepared index must be complete: every staged input member except the
         # carried request and the index itself has to appear in its inventory.
         indexed = {path[len("input/") :] for path in stamped if path.startswith("input/")}
-        missing = sorted(indexed - set(files) - {"request.json", "handoff.json"})
+        missing = sorted(indexed - set(files) - {"request.json", "handoff.json", "source.json"})
         if missing:
             raise PlatformStoreError(f"The sealed input/handoff.json index is incomplete: {missing}")
         expected_handoff = digest(files)
@@ -3686,6 +3686,41 @@ class PlatformStore:
             }
             if {name: record["state"] for name, record in stages.items()} != expected:
                 raise PlatformStoreError("The native capture replay does not match its terminal stage projection")
+            for stage_name in ("freeze", "discover"):
+                record = stages[stage_name]
+                definition, sealed_root = self._verify_sealed(
+                    record["checkpoint_uri"],
+                    record["receipt"],
+                )
+                _sealed_receipt(
+                    record["receipt"],
+                    run_id=run_id,
+                    stage=stage_name,
+                    state="completed",
+                    checkpoint_uri=record["checkpoint_uri"],
+                    definition=definition,
+                    root=sealed_root,
+                )
+            capture_record = stages["capture"]
+            self._verify_sealed(
+                capture_record["checkpoint_uri"],
+                capture_record["receipt"],
+                completed=False,
+            )
+            _sealed_receipt(
+                capture_record["receipt"],
+                run_id=run_id,
+                stage="capture",
+                state="failed",
+                checkpoint_uri=capture_record["checkpoint_uri"],
+                definition=None,
+            )
+            self._verify_bound_discover_airflow(
+                cursor,
+                dag_id=owner_dag,
+                dag_run_id=owner_run,
+                binding=binding,
+            )
             return {
                 "operation": {
                     "operation_id": operation_id,

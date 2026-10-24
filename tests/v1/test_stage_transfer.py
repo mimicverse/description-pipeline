@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -17,17 +19,22 @@ from packaging.utils import canonicalize_name
 from description_pipeline import __version__ as PIPELINE_VERSION
 from description_pipeline.build.archive import write_zip
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import PipelineError, canonical, digest, file_digest, read_data, write_json
+from description_pipeline.io import PipelineError, canonical, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
+from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.stages import stage_view as rendered_stage_view
 
 from . import protocol_support
 
-RUN_ID = "20261010T000000-transfer"
-HANDOFF = "a" * 64
+RUN_ID = "20261010-0000-4000-8000-000000000001"
 MAIN_ASSEMBLY = "robot.SLDASM"
+MAIN_BYTES = b"CAD-BYTES"
+NATIVE_FILES = {
+    MAIN_ASSEMBLY: hashlib.sha256(MAIN_BYTES).hexdigest(),
+}
+HANDOFF = digest(NATIVE_FILES)
 
 
 def native_tool() -> dict:
@@ -65,62 +72,353 @@ def stage_view(
     return view
 
 
+def _capture_events(
+    root: Path,
+    *,
+    handoff: str,
+    main: str,
+    native_files: dict[str, str],
+) -> list[dict]:
+    started = datetime(2026, 10, 10, tzinfo=UTC)
+
+    def event(offset: int, stage: str, state: str, check=None):
+        row = {
+            "at": (started + timedelta(microseconds=offset)).isoformat(),
+            "stage": stage,
+            "state": state,
+        }
+        if check is not None:
+            row["check"] = check
+        return row
+
+    def check(boundary: str, identifier: str, details: dict) -> dict:
+        return {
+            "boundary": boundary,
+            "details": details,
+            "id": identifier,
+            "state": "passed",
+        }
+
+    handoff_record = read_data(root / "input/handoff.json")
+    input_inventory = {
+        name: checksum
+        for name, checksum in inventory(root / "input").items()
+        if name not in {"handoff.json", "request.json"}
+    }
+    evidence_inventory = {
+        name: checksum
+        for name, checksum in inventory(root / "evidence").items()
+        if name
+        not in {
+            "capture-plan.json",
+            "capture.json",
+            "discovery.json",
+            "native-runtime.json",
+        }
+    }
+    main_sha256 = native_files[main]
+    return [
+        event(
+            0,
+            "freeze",
+            "running",
+            check(
+                "input",
+                "handoff.admission",
+                {"handoff_sha256": handoff, "package": "fixture"},
+            ),
+        ),
+        event(
+            1,
+            "freeze",
+            "running",
+            check(
+                "output",
+                "handoff.integrity",
+                {
+                    "files": {
+                        f"handoff/{name}": checksum
+                        for name, checksum in native_files.items()
+                    },
+                    "handoff_sha256": handoff,
+                    "main_assembly": main,
+                    "main_assembly_sha256": main_sha256,
+                },
+            ),
+        ),
+        event(2, "freeze", "completed"),
+        event(
+            3,
+            "discover",
+            "running",
+            check(
+                "input",
+                "discovery.inputs",
+                {
+                    "files_sha256": handoff,
+                    "handoff_sha256": handoff,
+                    "main_assembly": main,
+                    "record_roots": [],
+                },
+            ),
+        ),
+        event(
+            4,
+            "discover",
+            "running",
+            check(
+                "output",
+                "discovery.definition",
+                {
+                    "discovery_sha256": "b" * 64,
+                    "findings": [],
+                    "hardware_id": "fixture",
+                    "passed": True,
+                    "revision": "r1",
+                },
+            ),
+        ),
+        event(
+            5,
+            "discover",
+            "running",
+            check(
+                "output",
+                "discovery.binding",
+                {
+                    "base": "fixture",
+                    "discovery_sha256": "b" * 64,
+                    "files": native_files,
+                    "hardware_id": "fixture",
+                    "prepared_sha256": HANDOFF,
+                    "repository_slug": "example/fixture",
+                    "revision": "r1",
+                },
+            ),
+        ),
+        event(6, "discover", "completed"),
+        event(
+            7,
+            "capture",
+            "running",
+            check(
+                "input",
+                "input.valid",
+                {
+                    "cad_revision": handoff_record["cad_revision"],
+                    "files": {
+                        f"input/{name}": checksum
+                        for name, checksum in input_inventory.items()
+                    },
+                    "files_sha256": digest(handoff_record["package_files"]),
+                    "handoff_sha256": handoff,
+                    "passed": True,
+                    "warnings": [],
+                },
+            ),
+        ),
+        event(
+            8,
+            "capture",
+            "running",
+            check(
+                "input",
+                "runtime.ready",
+                {
+                    "role": "native",
+                    "scope": "fixture",
+                    "solidworks_executable": "fixture.exe",
+                },
+            ),
+        ),
+        event(
+            9,
+            "capture",
+            "running",
+            check(
+                "output",
+                "capture.integrity",
+                {
+                    "files": {
+                        f"evidence/{name}": checksum
+                        for name, checksum in evidence_inventory.items()
+                    },
+                    "manifest_sha256": file_digest(root / "evidence/manifest.json"),
+                },
+            ),
+        ),
+        event(
+            10,
+            "capture",
+            "running",
+            check(
+                "output",
+                "capture.input_stability",
+                {
+                    "files": {
+                        f"input/{Path(name).name}": checksum
+                        for name, checksum in input_inventory.items()
+                    }
+                },
+            ),
+        ),
+        event(11, "capture", "completed"),
+    ]
+
+
 def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, main: str = MAIN_ASSEMBLY) -> Path:
     root = Path(base) / "capture"
     (root / "input" / "cad").mkdir(parents=True)
-    (root / "input" / "cad" / main).write_bytes(b"CAD-BYTES")
+    (root / "input" / "cad" / main).write_bytes(MAIN_BYTES)
     native_files = {main: file_digest(root / "input" / "cad" / main)}
+    package_files = {"cad/" + main: native_files[main]}
+    cad_revision = {
+        "change_summary": "fixture",
+        "control": None,
+        "hardware_id": "fixture",
+        "owner": None,
+        "revision": "r1",
+    }
+    source_identity = {
+        "configuration": "Default",
+        "handoff_digest": handoff,
+        "hardware_id": "fixture",
+        "kind": "source-revision",
+        "main_assembly": main,
+        "records": [],
+    }
+    write_json(
+        root / "input/source.json",
+        {
+            "schema_version": SOURCE_RECORD_SCHEMA,
+            "source_revision_id": digest(source_identity),
+            "identity": source_identity,
+            "selection": {
+                "configuration": "Default",
+                "hardware_id": "fixture",
+                "hardware_source": "cad",
+                "main_assembly": main,
+            },
+            "metadata": {
+                "change_summary": "fixture",
+                "change_summary_source": "cad",
+                "control": None,
+                "owner": None,
+                "revision": "r1",
+            },
+        },
+    )
     write_json(
         root / "evidence/discovery.json",
         {
-            "identity": {"main_assembly": main},
+            "identity": {
+                "delivery_configuration": "Default",
+                "hardware_id": "fixture",
+                "main_assembly": main,
+                "revision": "r1",
+            },
             "handoff_sha256": handoff,
             "native_files": native_files,
             "findings": [],
             "robot_name": "robot",
         },
     )
-    package_files = {"cad/" + main: native_files[main]}
     write_json(
         root / "input/handoff.json",
         {
             "passed": True,
+            "input": {
+                "hardware_id": "fixture",
+                "source": {
+                    "assembly": main,
+                    "configuration": "Default",
+                },
+            },
             "input_receipt": {"inventory": dict(sorted(native_files.items()))},
-            "cad_revision": {"revision": "r1"},
+            "cad_revision": cad_revision,
             "package_files": dict(sorted(package_files.items())),
             "main_assembly": main,
             "configuration": "Default",
         },
     )
     evidence = root / "evidence"
-    (evidence / "source").mkdir(parents=True)
-    (evidence / "source/base.SLDPRT").write_bytes(b"PART-BYTES")
-    write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
+    (evidence / "raw").mkdir(parents=True)
     (evidence / "evidence").mkdir()
+    write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
+    dependency_closure = {
+        "configuration": "Default",
+        "copy_files": {"source/" + main: native_files[main]},
+        "mapping": [
+            {
+                "copy": "source/" + main,
+                "copy_sha256": native_files[main],
+                "instance": "top_level",
+                "source": str(root / "input/cad" / main),
+                "source_sha256": native_files[main],
+            }
+        ],
+        "original_files": {str(root / "input/cad" / main): native_files[main]},
+        "top_level": str(root / "input/cad" / main),
+    }
+    write_json(evidence / "raw/dependency_closure.json", dependency_closure)
+    material = {
+        "assembly": str(root / "input/cad" / main),
+        "configuration": "Default",
+        "measured_source": "cad_api",
+        "schema_version": "solidworks-to-urdf.material-provenance/v1",
+        "warnings": [],
+    }
+    write_json(evidence / "raw/material_provenance.json", material)
+    tool = native_tool()
+    environment = {
+        "captured_at": "2026-10-10T00:00:00Z",
+        "platform": "Windows-11",
+        "python": "3.12.10",
+        "session_boundary": {},
+        "solidworks": {
+            "revision": "34.4.1",
+            "sessions": {},
+        },
+        "toolchain": tool,
+        "worker_version": tool["version"],
+    }
+    dependency_inputs = [(main.casefold(), native_files[main])]
     identity = {
         "provider": "solidworks",
         "assembly": str(root / "input" / "cad" / main),
-        "dependency_digest": "c" * 64,
+        "document_id": str(root / "input" / "cad" / main),
+        "configuration": "Default",
+        "worker_version": tool["version"],
+        "solidworks_revision": "34.4.1",
+        "dependency_digest": digest(dependency_inputs),
     }
-    write_json(
-        evidence / "evidence/collection.json",
-        {
-            "identity": identity,
-            "capture": {
-                "originals_unchanged": {
-                    "files_checked": 2,
-                    "states_recorded": 2,
-                    "state_scope": "initial_source_observation",
-                },
-                "source_hashes": {main.lower(): {"sha256": "d" * 64}},
+    collection = {
+        "identity": identity,
+        "environment": environment,
+        "capture": {
+            "collected_document": str(root / "input/cad" / main),
+            "originals_unchanged": {
+                "files_checked": 1,
+                "states_recorded": 1,
+                "state_scope": "initial_source_observation",
             },
+            "source_hashes": {main.casefold(): {"sha256": native_files[main]}},
         },
-    )
+    }
+    write_json(evidence / "evidence/collection.json", collection)
+    write_json(evidence / "evidence/environment.json", environment)
     # The capture stage declares evidence/capture.json, evidence/geometry/ and
     # evidence/native-runtime.json as native outputs; the synthetic tree carries
     # them so a sealed capture delivery covers its stage contract.
-    write_json(evidence / "capture.json", {"main_assembly": main, "instances": [], "states": []})
-    write_json(evidence / "native-runtime.json", {"api": "synthetic", "session": {}})
+    write_json(
+        evidence / "capture.json",
+        {
+            "collection": collection,
+            "dependency_closure": dependency_closure,
+            "material_provenance": material,
+        },
+    )
+    write_json(evidence / "native-runtime.json", environment)
     (evidence / "geometry").mkdir()
     (evidence / "geometry/base.stl").write_bytes(b"STL-BYTES")
     write_manifest(
@@ -129,8 +427,17 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
         identity=identity,
         evidence_class="cad",
     )
-    write_json(root / "reports/native-tool.json", native_tool())
-    write_json(root / "reports/native-stages.json", stage_view(run_id=run_id, handoff=handoff))
+    write_json(root / "reports/native-tool.json", tool)
+    events = _capture_events(
+        root,
+        handoff=handoff,
+        main=main,
+        native_files=native_files,
+    )
+    write_json(
+        root / "reports/native-stages.json",
+        stage_view(run_id=run_id, handoff=handoff, events=events),
+    )
     # The native capture stamps the structural-team reports beside the sealed payload; they
     # must travel with the archive so the Linux side can always hand them to the team.
     write_json(
@@ -374,7 +681,7 @@ class StageTransferTests(unittest.TestCase):
             broken,
             {"evidence/evidence/collection.json": payload, "evidence/manifest.json": canonical(evidence_manifest)},
         )
-        with self.assertRaisesRegex(PipelineError, "CAD bytes were unchanged"):
+        with self.assertRaisesRegex(PipelineError, "Standalone capture collection"):
             admit(broken, self.base / "out-evidence")
 
     def test_self_consistent_input_report_tamper_is_refused(self) -> None:
@@ -404,8 +711,8 @@ class StageTransferTests(unittest.TestCase):
         )
         # The archive is fully self-consistent; only the native discovery inventory still names
         # the original bytes, so the main-assembly binding must refuse it.
-        with self.assertRaisesRegex(PipelineError, "native file inventory"):
-            admit(self.base / "main.zip", self.base / "out-main")
+        with self.assertRaisesRegex(PipelineError, "Native discovery inventory"):
+            admit(broken, self.base / "out-main")
 
     def test_native_discovery_binding_is_enforced(self) -> None:
         seal(self.root, self.archive)
@@ -561,6 +868,16 @@ class StageTransferTests(unittest.TestCase):
         report = json.loads((self.root / "input/handoff.json").read_text(encoding="utf-8"))
         report["package_files"]["big.bin"] = hashlib.sha256(payload).hexdigest()
         write_json(self.root / "input/handoff.json", report)
+        events = _capture_events(
+            self.root,
+            handoff=HANDOFF,
+            main=MAIN_ASSEMBLY,
+            native_files={MAIN_ASSEMBLY: file_digest(self.root / "input/cad" / MAIN_ASSEMBLY)},
+        )
+        write_json(
+            self.root / "reports/native-stages.json",
+            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
+        )
 
         manifest = seal(self.root, self.archive)
         self.assertEqual(manifest["files"]["input/big.bin"], hashlib.sha256(payload).hexdigest())
@@ -678,47 +995,140 @@ class StageTransferTests(unittest.TestCase):
             # The fixture keeps its authoring carriers; the retired keys are
             # dropped at the call boundary and only groups/axis_requests reach
             # the product.
-            freeze(support.capture_requests(config), snapshot, backend=backend, worker_version="test-worker")
+            native_identity = native_tool()
+            with mock.patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=native_identity,
+            ):
+                freeze(
+                    support.capture_requests(config),
+                    snapshot,
+                    backend=backend,
+                    worker_version=native_identity["version"],
+                )
 
             capture = self.base / "real-capture"
             (capture / "input" / "cad").mkdir(parents=True)
             shutil.copyfile(assembly, capture / "input" / "cad" / assembly.name)
+            for name in ("base.SLDPRT", "arm.SLDPRT"):
+                shutil.copyfile(work / "cad" / name, capture / "input" / "cad" / name)
             shutil.copytree(snapshot, capture / "evidence")
+            collection = read_data(capture / "evidence/evidence/collection.json")
+            write_json(
+                capture / "evidence/capture.json",
+                {
+                    "collection": collection,
+                    "dependency_closure": read_data(
+                        capture / "evidence/raw/dependency_closure.json"
+                    ),
+                    "material_provenance": read_data(
+                        capture / "evidence/raw/material_provenance.json"
+                    ),
+                },
+            )
+            write_json(capture / "evidence/native-runtime.json", collection["environment"])
             native_files = {
                 name: file_digest(work / "cad" / name) for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
             }
+            handoff_sha256 = digest(native_files)
             write_json(
                 capture / "evidence/discovery.json",
                 {
-                    "identity": {"main_assembly": assembly.name},
-                    "handoff_sha256": HANDOFF,
+                    "identity": {
+                        "delivery_configuration": "Default",
+                        "hardware_id": "fixture",
+                        "main_assembly": assembly.name,
+                    },
+                    "handoff_sha256": handoff_sha256,
                     "native_files": native_files,
                 },
             )
             manifest = read_data(capture / "evidence" / "manifest.json")
+            manifest["files"]["capture.json"] = file_digest(capture / "evidence/capture.json")
             manifest["files"]["discovery.json"] = file_digest(capture / "evidence" / "discovery.json")
+            manifest["files"]["native-runtime.json"] = file_digest(
+                capture / "evidence/native-runtime.json"
+            )
             manifest["files"] = dict(sorted(manifest["files"].items()))
             write_json(capture / "evidence" / "manifest.json", manifest)
-            package_files = {"cad/" + assembly.name: file_digest(capture / "input" / "cad" / assembly.name)}
+            package_files = {
+                "cad/" + name: checksum
+                for name, checksum in native_files.items()
+            }
             write_json(
                 capture / "input/handoff.json",
                 {
                     "passed": True,
-                    "input_receipt": {"inventory": {assembly.name: package_files["cad/" + assembly.name]}},
-                    "cad_revision": {"revision": "r1"},
+                    "input": {
+                        "hardware_id": "fixture",
+                        "source": {
+                            "assembly": assembly.name,
+                            "configuration": "Default",
+                        },
+                    },
+                    "input_receipt": {"inventory": dict(sorted(native_files.items()))},
+                    "cad_revision": {"hardware_id": "fixture", "revision": "r1"},
                     "package_files": dict(sorted(package_files.items())),
                     "main_assembly": assembly.name,
                     "configuration": "Default",
                 },
             )
-            write_json(capture / "reports/native-tool.json", native_tool())
-            write_json(capture / "reports/native-stages.json", stage_view())
+            source_identity = {
+                "configuration": "Default",
+                "handoff_digest": handoff_sha256,
+                "hardware_id": "fixture",
+                "kind": "source-revision",
+                "main_assembly": assembly.name,
+                "records": [],
+            }
+            write_json(
+                capture / "input/source.json",
+                {
+                    "schema_version": SOURCE_RECORD_SCHEMA,
+                    "source_revision_id": digest(source_identity),
+                    "identity": source_identity,
+                    "selection": {
+                        "configuration": "Default",
+                        "hardware_id": "fixture",
+                        "hardware_source": "cad",
+                        "main_assembly": assembly.name,
+                    },
+                    "metadata": {
+                        "change_summary": "fixture",
+                        "change_summary_source": "cad",
+                        "control": None,
+                        "owner": None,
+                        "revision": "r1",
+                    },
+                },
+            )
+            write_json(capture / "reports/native-tool.json", native_identity)
+            events = _capture_events(
+                capture,
+                handoff=handoff_sha256,
+                main=assembly.name,
+                native_files=native_files,
+            )
+            write_json(
+                capture / "reports/native-stages.json",
+                stage_view(run_id=RUN_ID, handoff=handoff_sha256, events=events),
+            )
 
             archive = self.base / "real.zip"
-            manifest = seal(capture, archive, main_assembly=assembly.name)
+            manifest = seal(
+                capture,
+                archive,
+                handoff_sha256=handoff_sha256,
+                main_assembly=assembly.name,
+            )
             self.assertIn("evidence/evidence/collection.json", manifest["files"])
             destination = self.base / "real-admitted"
-            admit(archive, destination, expected_main_assembly=assembly.name)
+            admit(
+                archive,
+                destination,
+                expected_handoff_sha256=handoff_sha256,
+                expected_main_assembly=assembly.name,
+            )
             self.assertTrue((destination / "evidence/manifest.json").is_file())
             self.assertTrue((destination / transfer.CAPTURE_MANIFEST).is_file())
         finally:
@@ -836,13 +1246,143 @@ class StageTransferTests(unittest.TestCase):
                 "input/handoff.json": canonical(report),
             },
         )
-        with self.assertRaisesRegex(PipelineError, "native file inventory"):
+        with self.assertRaisesRegex(PipelineError, "Native discovery inventory"):
             transfer.verify_transfer(remade)
 
         removed = bundle("gate-removed")
         (removed / "reports/native-stages.json").unlink()
         with self.assertRaises(PipelineError):
             transfer.verify_transfer(removed)
+
+    def test_source_record_is_required_and_cross_bound(self) -> None:
+        missing = capture_root(self.base / "missing-source")
+        (missing / "input/source.json").unlink()
+        with self.assertRaisesRegex(PipelineError, "input/source.json"):
+            seal(missing, self.base / "missing-source.zip")
+
+        forged = capture_root(self.base / "foreign-source")
+        source_path = forged / "input/source.json"
+        source = read_data(source_path)
+        source["identity"]["hardware_id"] = "foreign-hardware"
+        source["selection"]["hardware_id"] = "foreign-hardware"
+        source["source_revision_id"] = digest(source["identity"])
+        write_json(source_path, source)
+        with self.assertRaisesRegex(PipelineError, "Source record identity differs"):
+            seal(forged, self.base / "foreign-source.zip")
+
+    def test_input_valid_details_are_recomputed_from_archived_bytes(self) -> None:
+        root = capture_root(self.base / "input-details")
+        view = read_data(root / "reports/native-stages.json")
+        invalid = next(
+            event["check"]
+            for event in view["events"]
+            if (event.get("check") or {}).get("id") == "input.valid"
+        )
+        invalid["details"]["files"][f"input/cad/{MAIN_ASSEMBLY}"] = "0" * 64
+        write_json(
+            root / "reports/native-stages.json",
+            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=view["events"]),
+        )
+        with self.assertRaisesRegex(PipelineError, "input.valid"):
+            seal(root, self.base / "input-details.zip")
+
+    def test_stage_event_order_timestamp_and_completion_are_strict(self) -> None:
+        started = datetime(2026, 10, 10, tzinfo=UTC)
+
+        root = capture_root(self.base / "stage-order")
+        events = copy.deepcopy(read_data(root / "reports/native-stages.json")["events"])
+        reordered = [
+            event
+            for stage in ("capture", "freeze", "discover")
+            for event in events
+            if event["stage"] == stage
+        ]
+        for index, event in enumerate(reordered):
+            event["at"] = (started + timedelta(microseconds=index)).isoformat()
+        write_json(
+            root / "reports/native-stages.json",
+            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=reordered),
+        )
+        with self.assertRaisesRegex(PipelineError, "reordered, missing or interleaved"):
+            seal(root, self.base / "stage-order.zip")
+
+        root = capture_root(self.base / "stage-time")
+        events = copy.deepcopy(read_data(root / "reports/native-stages.json")["events"])
+        events[0]["at"], events[-1]["at"] = events[-1]["at"], events[0]["at"]
+        write_json(
+            root / "reports/native-stages.json",
+            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
+        )
+        with self.assertRaisesRegex(PipelineError, "not monotonic"):
+            seal(root, self.base / "stage-time.zip")
+
+        root = capture_root(self.base / "stage-complete")
+        events = copy.deepcopy(read_data(root / "reports/native-stages.json")["events"])
+        capture_completed = next(
+            event
+            for event in events
+            if event["stage"] == "capture" and event["state"] == "completed"
+        )
+        events.insert(-1, {**capture_completed, "at": events[-1]["at"]})
+        for index, event in enumerate(events):
+            event["at"] = (started + timedelta(microseconds=index)).isoformat()
+        write_json(
+            root / "reports/native-stages.json",
+            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
+        )
+        with self.assertRaisesRegex(PipelineError, "exactly one completed"):
+            seal(root, self.base / "stage-complete.zip")
+
+    def test_native_inventory_rejects_missing_or_added_dependencies(self) -> None:
+        for label, added in (("missing", False), ("added", True)):
+            with self.subTest(label=label):
+                root = capture_root(self.base / f"inventory-{label}")
+                extra = root / "input/cad/extra.SLDPRT"
+                extra.write_bytes(b"EXTRA")
+                report_path = root / "input/handoff.json"
+                report = read_data(report_path)
+                report["input_receipt"]["inventory"]["extra.SLDPRT"] = file_digest(extra)
+                report["package_files"]["cad/extra.SLDPRT"] = file_digest(extra)
+                write_json(report_path, report)
+                discovery_path = root / "evidence/discovery.json"
+                discovery = read_data(discovery_path)
+                if added:
+                    discovery["native_files"]["extra.SLDPRT"] = "0" * 64
+                write_json(discovery_path, discovery)
+                with self.assertRaisesRegex(PipelineError, "Native discovery inventory"):
+                    seal(root, self.base / f"inventory-{label}.zip")
+
+    def test_capture_identity_is_cross_bound_to_tool_runtime_and_sources(self) -> None:
+        root = capture_root(self.base / "identity")
+        collection_path = root / "evidence/evidence/collection.json"
+        collection = read_data(collection_path)
+        collection["identity"].update(
+            document_id=r"C:\foreign\Other.SLDASM",
+            worker_version="999.0.0",
+            solidworks_revision="99.9.9",
+            dependency_digest="f" * 64,
+        )
+        write_json(collection_path, collection)
+        capture_record = read_data(root / "evidence/capture.json")
+        capture_record["collection"] = collection
+        write_json(root / "evidence/capture.json", capture_record)
+        evidence_manifest = read_data(root / "evidence/manifest.json")
+        evidence_manifest["identity"] = collection["identity"]
+        evidence_manifest["files"]["evidence/collection.json"] = file_digest(collection_path)
+        evidence_manifest["files"]["capture.json"] = file_digest(root / "evidence/capture.json")
+        write_json(root / "evidence/manifest.json", evidence_manifest)
+        events = _capture_events(
+            root,
+            handoff=HANDOFF,
+            main=MAIN_ASSEMBLY,
+            native_files=NATIVE_FILES,
+        )
+        write_json(
+            root / "reports/native-stages.json",
+            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
+        )
+        with self.assertRaisesRegex(PipelineError, "worker version differs"):
+            seal(root, self.base / "identity.zip")
 
     def test_native_receipts_must_carry_events_that_rebuild_their_rows(self) -> None:
         cases = {}
@@ -860,13 +1400,13 @@ class StageTransferTests(unittest.TestCase):
 
         missing_stage = stage_view()
         missing_stage["events"] = [event for event in missing_stage["events"] if event.get("stage") != "capture"]
-        cases["incomplete-events"] = (missing_stage, "rebuilt from their own events")
+        cases["incomplete-events"] = (missing_stage, "reordered, missing or interleaved")
 
         malformed = stage_view()
         malformed["events"] = [
             *malformed["events"],
             {
-                "at": "2026-10-10T00:00:00+00:00",
+                "at": "2030-10-11T00:00:00+00:00",
                 "stage": "capture",
                 "state": "running",
                 "check": {"state": "maybe"},
@@ -887,7 +1427,7 @@ class StageTransferTests(unittest.TestCase):
         receipt["events"] = [event for event in receipt["events"] if isinstance(event.get("check"), dict)][:1]
         root = capture_root(self.base / "fabricated")
         write_json(root / "reports/native-stages.json", receipt)
-        with self.assertRaisesRegex(PipelineError, "rebuilt from their own events"):
+        with self.assertRaisesRegex(PipelineError, "reordered, missing or interleaved"):
             seal(root, self.base / "fabricated.zip")
 
     def test_windows_evidence_paths_transport_onto_linux(self) -> None:
@@ -901,11 +1441,25 @@ class StageTransferTests(unittest.TestCase):
         collection["identity"]["assembly"] = windows
         payload = canonical(collection)
         collection_path.write_bytes(payload)
+        capture_record = json.loads((evidence / "capture.json").read_text(encoding="utf-8"))
+        capture_record["collection"] = collection
+        write_json(evidence / "capture.json", capture_record)
         manifest_path = evidence / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["identity"]["assembly"] = windows
         manifest["files"]["evidence/collection.json"] = hashlib.sha256(payload).hexdigest()
+        manifest["files"]["capture.json"] = file_digest(evidence / "capture.json")
         manifest_path.write_bytes(canonical(manifest))
+        events = _capture_events(
+            root,
+            handoff=HANDOFF,
+            main=MAIN_ASSEMBLY,
+            native_files=NATIVE_FILES,
+        )
+        write_json(
+            root / "reports/native-stages.json",
+            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
+        )
 
         archive = self.base / "winpath.zip"
         seal(root, archive)

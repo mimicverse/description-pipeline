@@ -903,6 +903,7 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
     from .verification.solidworks_urdf import (
         check_bundle,
         evaluate_bundle,
+        native_receipts,
         rebuilt_definition,
         require_qualified_report,
     )
@@ -916,7 +917,8 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
         return {"subject_sha256": actual}
 
     checked(on_event, "verify", "input", "verification.subject", verify_subject)
-    report = evaluate_bundle(staging)
+    receipts = native_receipts(staging)
+    report = evaluate_bundle(staging, native_receipts=receipts)
     write_json(staging / "reports/quality.json", report)
     checked(
         on_event,
@@ -930,7 +932,11 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
         "verify",
         "output",
         "verification.report_binding",
-        lambda: require_qualified_report(check_bundle(staging), rebuilt_definition(staging), root=staging),
+        lambda: require_qualified_report(
+            check_bundle(staging, native_receipts=receipts),
+            rebuilt_definition(staging),
+            root=staging,
+        ),
         describe=lambda value: {
             "passed": value.get("passed"),
             "subject_sha256": value.get("subject_sha256"),

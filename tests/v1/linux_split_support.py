@@ -128,7 +128,7 @@ class SplitAdmissionMixin:
             build_request_evidence(
                 purpose="engineering",
                 request_id="fixture-frozen-request",
-                target_hardware="nd_fixture",
+                target_hardware="fixture",
                 change_summary="fixture frozen original",
                 main_assembly=MAIN_ASSEMBLY,
                 handoff_digest=HANDOFF,

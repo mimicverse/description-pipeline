@@ -3200,6 +3200,8 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
 
         discover_root = self.tmp / self.run_id / "discover"
         subject, artifacts, _upload, native_handoff = build_sealed_delivery(discover_root)
+        capture_root = self.tmp / self.run_id / "capture"
+        capture_subject, capture_artifacts, _capture_upload, _capture_handoff = build_sealed_delivery(capture_root)
         native_tool = read_data(discover_root / "reports" / "native-tool.json")
         native_stages = self._capture_stage_view()
         self.store.confirm_stage(
@@ -3234,7 +3236,10 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 "state": "failed",
                 "passed": False,
                 "error": "The sealed capture plan carries an unsafe selector document",
+                "subject_sha256": capture_subject,
+                "artifacts": capture_artifacts,
             },
+            checkpoint_uri=f"store://sealed/{self.run_id}/capture",
         )
         for stage in ("generate", "verify", "publish"):
             self.store.confirm_stage(run_id=self.run_id, stage=stage, state="blocked", receipt={})
@@ -3668,6 +3673,66 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 owner_operation_id=self.native_id,
             )
         self.assertEqual(self.world.snapshot_state(), before)
+
+    def test_state_first_recovery_revalidates_sealed_rows_receipts_and_airflow(self) -> None:
+        self._prepare_capture_failure()
+        reconcile = self._capture_reconcile()
+        self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
+
+        original_freeze = self.world.stages[(self.run_id, "freeze")]
+        self.world.stages[(self.run_id, "freeze")] = (
+            "completed",
+            {},
+            *original_freeze[2:],
+        )
+        with self.assertRaises((PlatformStoreError, PipelineError)):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.world.stages[(self.run_id, "freeze")] = original_freeze
+
+        original_capture = self.world.stages[(self.run_id, "capture")]
+        changed_capture = dict(original_capture[1])
+        changed_capture["passed"] = True
+        self.world.stages[(self.run_id, "capture")] = (
+            "failed",
+            changed_capture,
+            *original_capture[2:],
+        )
+        with self.assertRaises(PlatformStoreError):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.world.stages[(self.run_id, "capture")] = original_capture
+
+        self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "running"
+        with self.assertRaises(PlatformStoreError):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "failed"
+
+        discover_root = self.tmp / self.run_id / "discover"
+        backup = self.tmp / "discover-backup"
+        shutil.copytree(discover_root, backup)
+        shutil.rmtree(discover_root)
+        with self.assertRaises((PlatformStoreError, PipelineError)):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        shutil.copytree(backup, discover_root)
 
     def test_capture_settlement_refuses_a_foreign_owner_binding(self) -> None:
         self._prepare_capture_failure()

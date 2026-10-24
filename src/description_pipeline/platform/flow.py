@@ -386,11 +386,7 @@ def _registered_capture_identity(
     uri = row.get("checkpoint_uri")
     if row.get("state") != "completed" or not isinstance(uri, str) or not uri:
         return None, None
-    try:
-        confirmed = platform.confirmed_stage(run_id, "capture")
-    except PipelineError:
-        # The sealed rebinding refused (damaged or forged bytes): no identity is granted.
-        return None, None
+    confirmed = platform.confirmed_stage(run_id, "capture")
     if not isinstance(confirmed, dict):
         return None, None
     from .capture import source_identity

@@ -5259,6 +5259,7 @@ class SolidWorksBackend(CadBackend):
 
         rebuilt = bool(child_rebuilds or top_rebuild is not None)
         return doc, {
+            "schema_version": "solidworks-to-urdf.capture-preparation/v1",
             "used_api": (
                 "IModelDocExtension.NeedsRebuild2/"
                 "IConfiguration.NeedsRebuild/"
@@ -5285,6 +5286,7 @@ class SolidWorksBackend(CadBackend):
             "save_flag_before": state_before.get("save_flag"),
             "save_flag_after": top_state.get("save_flag"),
             "state_before": state_before,
+            "state_after_children": state_after_children,
             "state_after": top_state,
             "assembly_states_before": [
                 {

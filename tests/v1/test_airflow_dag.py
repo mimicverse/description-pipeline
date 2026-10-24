@@ -2141,8 +2141,35 @@ class DagTests(unittest.TestCase):
         )
         source = store_root / "sealed" / parent_run_id / "capture" / "input"
         source.mkdir(parents=True)
+        source_identity = {
+            "configuration": "Default",
+            "handoff_digest": "d" * 64,
+            "hardware_id": "m3.0",
+            "kind": "source-revision",
+            "main_assembly": "assembly.SLDASM",
+            "records": [],
+        }
         (source / "source.json").write_text(
-            json.dumps({"identity": {"hardware_id": "m3.0"}, "metadata": {"revision": "r1"}}),
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.source-record/v1",
+                    "source_revision_id": digest(source_identity),
+                    "identity": source_identity,
+                    "selection": {
+                        "configuration": "Default",
+                        "hardware_id": "m3.0",
+                        "hardware_source": "cad",
+                        "main_assembly": "assembly.SLDASM",
+                    },
+                    "metadata": {
+                        "change_summary": "fixture",
+                        "change_summary_source": "cad",
+                        "control": None,
+                        "owner": None,
+                        "revision": "r1",
+                    },
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -3890,6 +3917,7 @@ class LinkedMaterializationTests(unittest.TestCase):
         from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
         from description_pipeline.io import digest, read_data, write_json
         from description_pipeline.platform.store import PlatformStore
+        from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
         from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
         from description_pipeline.verification import solidworks_urdf
         from tests.v1 import test_stage_transfer as native
@@ -3908,7 +3936,6 @@ class LinkedMaterializationTests(unittest.TestCase):
         # exactly as ``capture_root`` writes it (bare staged names under input/cad).
         handoff = digest({"robot.SLDASM": hashlib.sha256(b"CAD-BYTES").hexdigest()})
         self.tree = native.capture_root(Path(self.temporary.name) / "native", run_id=self.PARENT, handoff=handoff)
-        write_json(self.tree / "input/source.json", {"source": "synthetic-native"})
         write_json(self.tree / "input/records/arm.json", {"record": "synthetic-native"})
         from description_pipeline.io import file_digest
 
@@ -3919,17 +3946,43 @@ class LinkedMaterializationTests(unittest.TestCase):
             "records/arm.json": file_digest(self.tree / "input/records/arm.json"),
         }
         write_json(self.tree / "input" / "handoff.json", report)
-        for name in ("capture-plan", "capture", "native-runtime"):
-            write_json(self.tree / f"evidence/{name}.json", {"synthetic": name})
-        (self.tree / "evidence/geometry").mkdir(exist_ok=True)
+        write_json(self.tree / "evidence/capture-plan.json", {"synthetic": "capture-plan"})
         (self.tree / "evidence/geometry/part.stl").write_bytes(b"synthetic-stl")
-        identity = read_data(self.tree / "evidence/evidence/collection.json")["identity"]
-        native.write_manifest(self.tree / "evidence", kind="solidworks", identity=identity, evidence_class="cad")
+        evidence_manifest = read_data(self.tree / "evidence/manifest.json")
+        evidence_manifest["files"]["capture-plan.json"] = file_digest(
+            self.tree / "evidence/capture-plan.json"
+        )
+        evidence_manifest["files"]["geometry/part.stl"] = file_digest(
+            self.tree / "evidence/geometry/part.stl"
+        )
+        write_json(self.tree / "evidence/manifest.json", evidence_manifest)
+        events = native._capture_events(
+            self.tree,
+            handoff=handoff,
+            main="robot.SLDASM",
+            native_files={"robot.SLDASM": hashlib.sha256(b"CAD-BYTES").hexdigest()},
+        )
+        write_json(
+            self.tree / "reports/native-stages.json",
+            native.stage_view(run_id=self.PARENT, handoff=handoff, events=events),
+        )
         transfer = native.seal(
             self.tree, Path(self.temporary.name) / "fixture-native.zip", run_id=self.PARENT, handoff_sha256=handoff
         )
         write_json(self.tree / "transfer-manifest.json", transfer)
-        write_json(self.tree / "input/request.json", {"request": "synthetic-frozen-original"})
+        (self.tree / "input/request.json").write_bytes(
+            request_evidence_bytes(
+                build_request_evidence(
+                    purpose="engineering",
+                    request_id="linked-materialization",
+                    target_hardware="fixture",
+                    change_summary="linked materialization fixture",
+                    main_assembly="robot.SLDASM",
+                    handoff_digest=handoff,
+                    platform_config_digest="c" * 64,
+                )
+            )
+        )
         self.module._ensure_subject_layout(self.tree)
         write_json(self.tree / "model/robot.json", {"model": "synthetic"})
         (self.tree / "urdf/robot.urdf").write_text("<robot/>\n", encoding="utf-8")

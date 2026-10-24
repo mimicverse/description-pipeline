@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import tempfile
 import unittest
@@ -21,8 +22,8 @@ from .test_stage_entries import REPLAYED_INSPECTION, make_seed
 from .test_stage_transfer import capture_root as build_capture_root
 from .test_stage_transfer import native_tool as build_native_tool
 
-HANDOFF = "b" * 64
 MAIN = "robot.SLDASM"
+HANDOFF = digest({MAIN: hashlib.sha256(b"CAD-BYTES").hexdigest()})
 
 
 def stage_events(stage_id: str) -> list[dict]:
@@ -61,6 +62,10 @@ class StageBoundaryTests(unittest.TestCase):
         self.package.mkdir()
         (self.package / "assembly.SLDASM").write_bytes(b"control")
         self.output = self.root / "delivery"
+        event_fixture = build_capture_root(self.root / "event-fixture", handoff=HANDOFF)
+        self.native_events = json.loads(
+            (event_fixture / "reports/native-stages.json").read_text(encoding="utf-8")
+        )["events"]
 
     @staticmethod
     def _fake_capture(calls):
@@ -82,7 +87,12 @@ class StageBoundaryTests(unittest.TestCase):
             for name in ("reports/structural-team.md", "reports/structural-team.json"):
                 (Path(staging) / name).unlink(missing_ok=True)
             if on_event is not None:
-                for event in stage_events("capture"):
+                fixture_events = json.loads(
+                    (Path(staging) / "reports/native-stages.json").read_text(encoding="utf-8")
+                )["events"]
+                for event in (
+                    item for item in fixture_events if item.get("stage") == "capture"
+                ):
                     on_event(event)
             if on_activity is not None:
                 on_activity({"phase": "capture", "action": "seal"})
@@ -108,7 +118,9 @@ class StageBoundaryTests(unittest.TestCase):
                 run_id="8d0c55c4-1cad-5aff-af5f-5cc0bfc5a977",
                 handoff_sha256=HANDOFF,
                 main_assembly=MAIN,
-                prior_events=[*stage_events("freeze"), *stage_events("discover")],
+                prior_events=[
+                    event for event in self.native_events if event.get("stage") in {"freeze", "discover"}
+                ],
                 on_activity=records.append,
             )
 
@@ -133,7 +145,9 @@ class StageBoundaryTests(unittest.TestCase):
                 run_id="7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865",
                 handoff_sha256=HANDOFF,
                 main_assembly=MAIN,
-                prior_events=[*stage_events("freeze"), *stage_events("discover")],
+                prior_events=[
+                    event for event in self.native_events if event.get("stage") in {"freeze", "discover"}
+                ],
             )
         self.assertIs(result["native_complete"], True)
         self.assertIs(result["passed"], False)

@@ -188,6 +188,24 @@ def _load_verifier():
     return check_bundle
 
 
+def _run_verifier(root: Path, *, native_receipts=None) -> dict:
+    verifier = _load_verifier()
+    if native_receipts is None:
+        return verifier(root)
+    return verifier(root, native_receipts=native_receipts)
+
+
+def _native_receipts(root: Path) -> dict[str, bytes] | None:
+    """Load the immutable native provenance bytes when this boundary carries them."""
+
+    from ..verification.solidworks_urdf import native_receipts
+
+    try:
+        return native_receipts(Path(root))
+    except PipelineError as error:
+        raise PrError("native_receipts_incomplete", str(error)) from error
+
+
 def _gh(repository: Path, *args: str) -> str:
     result = subprocess.run(["gh", *args], cwd=repository, check=True, capture_output=True, text=True, encoding="utf-8")
     return result.stdout
@@ -353,9 +371,9 @@ def _validate_ref(repository: Path, name: str, *, branch: bool) -> None:
         raise PrError("invalid_ref", name)
 
 
-def _verify(bundle: Path) -> tuple[str, dict]:
+def _verify(bundle: Path, *, native_receipts=None) -> tuple[str, dict]:
     subject = subject_digest(bundle)
-    report = _load_verifier()(bundle)
+    report = _run_verifier(bundle, native_receipts=native_receipts)
     if not isinstance(report, dict) or report.get("passed") is not True:
         raise PrError("verification_failed", report if isinstance(report, dict) else None)
     if report.get("subject_sha256") != subject:
@@ -372,8 +390,8 @@ def _verify(bundle: Path) -> tuple[str, dict]:
     return subject, report
 
 
-def _reverify(root: Path, subject: str) -> None:
-    report = _load_verifier()(root)
+def _reverify(root: Path, subject: str, *, native_receipts=None) -> None:
+    report = _run_verifier(root, native_receipts=native_receipts)
     if not isinstance(report, dict) or report.get("passed") is not True or report.get("subject_sha256") != subject:
         raise PrError("reverification_failed", report if isinstance(report, dict) else None)
     try:
@@ -384,7 +402,7 @@ def _reverify(root: Path, subject: str) -> None:
         raise PrError("reverification_binding_mismatch", None)
 
 
-def _verify_committed(repository: Path, commit: str, subject: str) -> str:
+def _verify_committed(repository: Path, commit: str, subject: str, *, native_receipts=None) -> str:
     """Verify Git blob bytes, including changes made by clean filters."""
     tree = subprocess.run(
         ["git", "-C", str(repository), "ls-tree", "-rz", commit, "--", *GOVERNED_PATHS], check=True, capture_output=True
@@ -410,7 +428,7 @@ def _verify_committed(repository: Path, commit: str, subject: str) -> str:
         attributes = root / ".gitattributes"
         if not attributes.is_file() or attributes.read_bytes() != GIT_ATTRIBUTES:
             raise PrError("committed_git_metadata_mismatch", ".gitattributes")
-        _reverify(root, subject)
+        _reverify(root, subject, native_receipts=native_receipts)
         return file_digest(root / "reports/quality.json")
 
 
@@ -490,9 +508,16 @@ def _prepare_worktree(repository: Path, worktree: Path, base_sha: str, head_sha:
             raise PrError("base_conflict", merge.stderr[-400:])
 
 
-def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> tuple[str, bool]:
+def _stage_commit(
+    bundle: Path,
+    worktree: Path,
+    subject: str,
+    message: str,
+    *,
+    native_receipts=None,
+) -> tuple[str, bool]:
     _copy_governed(bundle, worktree)
-    _reverify(worktree, subject)
+    _reverify(worktree, subject, native_receipts=native_receipts)
     changed = _git(worktree, "status", "--porcelain").stdout.splitlines()
     for line in changed:
         path = line[3:].strip().strip('"')
@@ -1020,6 +1045,7 @@ def submit_bundle(
 
     try:
         _validate(source_bundle, submission_input=True)
+        native_receipts = _native_receipts(source_bundle)
         source_subject = subject_digest(source_bundle)
         submission_root = Path(tempfile.mkdtemp(prefix="urdf-submission-"))
         bundle = submission_root / "delivery"
@@ -1037,7 +1063,7 @@ def submit_bundle(
         lock_info = _lock(repository)
         if _git(repository, "status", "--porcelain").stdout.strip():
             raise PrError("dirty_repository", "commit, stash or remove unrelated changes first")
-        subject, report = _verify(bundle)
+        subject, report = _verify(bundle, native_receipts=native_receipts)
         open_prs = _open_pr_matches(repository, slug, base, branch)
         if len(open_prs) > 1:
             raise PrError("pr_ambiguous_before_write", open_prs)
@@ -1069,10 +1095,19 @@ def submit_bundle(
             if previous is not None:
                 _check_successor(previous, current_revision)
             commit, noop = _stage_commit(
-                bundle, worktree, subject, message or f"feat({hardware}): publish SolidWorks-to-URDF bundle"
+                bundle,
+                worktree,
+                subject,
+                message or f"feat({hardware}): publish SolidWorks-to-URDF bundle",
+                native_receipts=native_receipts,
             )
-            _reverify(worktree, subject)
-            quality_sha256 = _verify_committed(worktree, commit, subject)
+            _reverify(worktree, subject, native_receipts=native_receipts)
+            quality_sha256 = _verify_committed(
+                worktree,
+                commit,
+                subject,
+                native_receipts=native_receipts,
+            )
             observed(
                 "publication.git",
                 "passed",
