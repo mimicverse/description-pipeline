@@ -869,6 +869,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--current-native-tool", type=Path)
     parser.add_argument("--expected-run-id")
     parser.add_argument("--expected-prepared-sha256")
+    parser.add_argument("--diagnostic-created-at", required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     return parser.parse_args(argv)
 
@@ -895,6 +896,9 @@ def main(argv: list[str] | None = None) -> int:
             native_tool=current_native_tool,
             expected_run_id=args.expected_run_id,
             expected_prepared_sha256=args.expected_prepared_sha256,
+            diagnostic_created_at=datetime.fromisoformat(
+                args.diagnostic_created_at.replace("Z", "+00:00")
+            ),
         )
         args.receipt.parent.mkdir(parents=True, exist_ok=True)
         write_json(args.receipt, receipt)
