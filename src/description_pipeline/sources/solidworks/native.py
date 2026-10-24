@@ -8521,8 +8521,12 @@ class SolidWorksBackend(CadBackend):
                                     edge_row["face_indices"]
                                 ),
                                 "curve_sense": domain["sense"],
-                                "curve_closed": domain["is_closed"],
-                                "curve_periodic": domain["is_periodic"],
+                                "curve_closed": edge_row["curve_end_params"][
+                                    "is_closed"
+                                ],
+                                "curve_periodic": edge_row["curve_end_params"][
+                                    "is_periodic"
+                                ],
                                 "gap_m": edge_tolerance["gap_m"],
                             },
                         ) from error

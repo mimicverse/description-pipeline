@@ -2586,6 +2586,27 @@ class NativeFinCaptureTests(unittest.TestCase):
             1,
         )
 
+    def test_open_edge_identity_error_preserves_cause_and_curve_flags(self):
+        message = "fixture underlying identity failure"
+        with (
+            patch.object(
+                native_module,
+                "native_open_edge_boundary_identity",
+                side_effect=ValueError(message),
+            ),
+            self.assertRaises(CadError) as caught,
+        ):
+            self.r3_open_tolerant_tessellation()
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn(message, caught.exception.detail["error"])
+        self.assertIs(caught.exception.detail["curve_closed"], False)
+        self.assertIs(caught.exception.detail["curve_periodic"], False)
+        self.assertIsInstance(caught.exception.__cause__, ValueError)
+
     def test_segmented_open_edge_identity_reaches_parser(self):
         entry, triangles = self.segmented_open_tolerant_tessellation()
         body = entry["itessellation"]["bodies"][0]
