@@ -410,7 +410,8 @@ class PublishTests(unittest.TestCase):
     def test_failure_after_pr_creation_preserves_url_and_pushed_commit(self):
         self.gh_mode = "fail_view"
         result = self.submit()
-        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "github_failed_after_push")
         self.assertEqual(result["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(result["commit"], self.fx.remote_head())
 
@@ -746,7 +747,8 @@ class PublishTests(unittest.TestCase):
         first = self.submit()
         self.gh_mode = "fail_update"
         result = self.submit()
-        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "github_failed_after_push")
         self.assertEqual(result["url"], first["url"])
         self.assertEqual(result["commit"], self.fx.remote_head())
 
@@ -862,7 +864,8 @@ class PublishTests(unittest.TestCase):
     def test_gh_failure_after_push_keeps_pushed_receipt(self) -> None:
         self.gh_mode = "fail"
         result = self.submit()
-        self.assertEqual(result["state"], "gh_failed_after_push")
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "github_failed_after_push")
         self.assertEqual(result["commit"], self.fx.remote_head())
         self.assertEqual(result["branch"], BRANCH)
         self.assertTrue(result["subject"])

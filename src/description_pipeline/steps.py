@@ -1017,5 +1017,8 @@ def publish_model(
         "passed": publication_succeeded(result, subject),
     }
 
-    _state(on_event, "publish", "completed" if result["passed"] else "failed", error=result.get("error"))
+    state = "completed" if result["passed"] else result.get("state", "failed")
+    if state not in {"completed", "failed", "unresolved"}:
+        state = "failed"
+    _state(on_event, "publish", state, error=result.get("error"))
     return result

@@ -58,7 +58,7 @@ from description_pipeline.interface_records import (
     validate_health,
 )
 from description_pipeline.schemas import CACHE_RELEASE_RECEIPT_SCHEMA, HEALTH_SCHEMA, RESOURCE_POLICY_SCHEMA
-from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, validate_freeze_events
 
 TOKEN = "scheduled-token"
 ROOT = Path(__file__).resolve().parents[1]
@@ -236,9 +236,38 @@ def _mock_endpoint(
                     "upload_sha256": digest(upload_files),
                     "main_assembly": main_assembly,
                 }
+                fixture_events = (fixture.get("native_stages") or {}).get("events") or []
+                expected_freeze = (
+                    validate_freeze_events(
+                        [event for event in fixture_events if event.get("stage") == "freeze"]
+                    )
+                    if fixture_events
+                    else None
+                )
+                try:
+                    supplied_freeze = validate_freeze_events(payload.get("freeze_events"))
+                except Exception:
+                    self._send(409, {"error": "selection request freeze binding is invalid"})
+                    return
+                freeze_receipt = payload.get("freeze_receipt_sha256")
                 if (
-                    set(payload) - {"run_id", "upload_files", "upload_sha256", "main_assembly", "resume"}
+                    set(payload)
+                    - {
+                        "run_id",
+                        "upload_files",
+                        "upload_sha256",
+                        "main_assembly",
+                        "freeze_events",
+                        "freeze_events_sha256",
+                        "freeze_receipt_sha256",
+                        "resume",
+                    }
                     or {key: payload.get(key) for key in fresh} != fresh
+                    or (expected_freeze is not None and supplied_freeze != expected_freeze)
+                    or payload.get("freeze_events_sha256") != digest(supplied_freeze)
+                    or not isinstance(freeze_receipt, str)
+                    or len(freeze_receipt) != 64
+                    or any(character not in "0123456789abcdef" for character in freeze_receipt)
                 ):
                     self._send(409, {"error": "selection request differs from the staged intake"})
                     return
@@ -1135,6 +1164,29 @@ def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict, 
     }
 
 
+def _wait_platform_sql_evidence(
+    platform_schema: str,
+    run_id: str,
+    projection: dict,
+    *,
+    request_id: str,
+    timeout_seconds: float = 30.0,
+) -> dict:
+    """Allow the post-DagRun failure callback to settle before asserting platform rows."""
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        evidence = _platform_sql_evidence(
+            platform_schema,
+            run_id,
+            projection,
+            request_id=request_id,
+        )
+        if evidence.get("ok") or time.monotonic() >= deadline:
+            return evidence
+        time.sleep(1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -1722,7 +1774,7 @@ def main() -> int:
                     problems.append(
                         "the preview and the quality document do not agree on one bound subject digest"
                     )
-            sql_evidence = _platform_sql_evidence(
+            sql_evidence = _wait_platform_sql_evidence(
                 args.platform_schema,
                 native_id,
                 projection,

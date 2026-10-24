@@ -60,6 +60,7 @@ class PlatformCaptureImportTests(unittest.TestCase):
             run_id=RUN,
             handoff=HANDOFF,
             upload=self.upload_sha256,
+            upload_files=UPLOAD,
         )
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(
@@ -71,6 +72,8 @@ class PlatformCaptureImportTests(unittest.TestCase):
             main_assembly=MAIN_ASSEMBLY,
             native_tool=self.tool,
         )
+        for event in capture_job(RUN, self.archive, self.tool)["request"]["freeze_events"]:
+            self.store.append_event(RUN, stage="freeze", kind="stage", payload=event)
 
     def _sealed(self, uri):
         return self.store_root / "sealed" / uri.removeprefix("store://sealed/")
@@ -112,6 +115,12 @@ class PlatformCaptureImportTests(unittest.TestCase):
         self.assertTrue((self._paths(RUN).capture_dir / "transfer-manifest.json").is_file())
         recorded = [event for event in self.world.events if event[0] == RUN]
         self.assertTrue(recorded, "the sealed native events must mirror into the platform stream")
+        freeze_events = [event for event in recorded if event[3] == "freeze"]
+        self.assertEqual(
+            len(freeze_events),
+            len(job["request"]["freeze_events"]),
+            "import must reference the registered Freeze block instead of appending a duplicate",
+        )
 
     def test_changed_selection_refuses_before_downloading(self) -> None:
         mutations = (
@@ -142,6 +151,7 @@ class PlatformCaptureImportTests(unittest.TestCase):
             run_id=FRESH,
             handoff=HANDOFF,
             upload=self.upload_sha256,
+            upload_files=UPLOAD,
         )
         record_path = source / "evidence/discovery.json"
         record = json.loads(record_path.read_text())

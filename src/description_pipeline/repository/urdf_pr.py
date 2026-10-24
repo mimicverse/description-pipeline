@@ -1298,18 +1298,18 @@ def submit_bundle(
             {"error": "github_failed" if pushed else "git_failed", "detail": (error.stderr or "")[-300:]},
         )
         if pushed:
-            return {
-                "state": "gh_failed_after_push",
-                "error": "github_failed",
-                "commit": pushed,
-                "branch": branch,
-                "subject": subject,
-                "subject_sha256": subject,
-                "passed": False,
-                "base": base,
-                "retry": {"command": "gh pr list --head " + branch, "stderr": (error.stderr or "")[-300:]},
-                "url": getattr(error, "pr_url", ""),
-            }
+            receipt = _unresolved(
+                "github_failed_after_push",
+                {"stderr": (error.stderr or "")[-300:]},
+                commit=pushed,
+                branch=branch,
+                subject=subject,
+                base=base,
+                url=getattr(error, "pr_url", ""),
+            )
+            receipt["reason"] = "github_failed"
+            receipt["retry"]["command"] = "gh pr list --head " + branch
+            return receipt
         return {
             "state": "failed",
             "error": "git_failed",

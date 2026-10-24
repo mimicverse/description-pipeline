@@ -667,15 +667,6 @@ def expected_native_check_details(
         if name not in generated_top_level
     }
     return {
-        "handoff.integrity": {
-            "files": {
-                f"handoff/{name}": checksum
-                for name, checksum in native_files.items()
-            },
-            "handoff_sha256": handoff_sha256,
-            "main_assembly": main_assembly,
-            "main_assembly_sha256": main_assembly_sha256,
-        },
         "discovery.inputs": {
             "files_sha256": handoff_sha256,
             "handoff_sha256": handoff_sha256,
@@ -708,6 +699,7 @@ def _validate_stage_details(
     view: dict,
     *,
     handoff_sha256: str,
+    upload_sha256: str,
     main_assembly: str,
     main_assembly_sha256: str,
     native_files: dict[str, str],
@@ -744,10 +736,57 @@ def _validate_stage_details(
     admission = checks["handoff.admission"].get("details")
     _require(
         isinstance(admission, dict)
-        and admission.get("handoff_sha256") == handoff_sha256
+        and set(admission) == {"handoff_sha256", "package"}
+        and admission.get("handoff_sha256") == upload_sha256
         and isinstance(admission.get("package"), str)
         and bool(admission["package"]),
-        "Freeze handoff.admission differs from the frozen identity",
+        "Freeze handoff.admission differs from the full upload identity",
+    )
+    integrity = checks["handoff.integrity"].get("details")
+    _require(
+        isinstance(integrity, dict)
+        and set(integrity) == {"files", "handoff_sha256", "main_assembly", "main_assembly_sha256"},
+        "Freeze handoff.integrity fields are incomplete or unknown",
+    )
+    upload_files = integrity.get("files")
+    _require(
+        isinstance(upload_files, dict) and bool(upload_files),
+        "Freeze handoff.integrity carries no full upload inventory",
+    )
+    normalized_upload = {}
+    for name, checksum in upload_files.items():
+        _require(
+            isinstance(name, str) and name.startswith("handoff/") and _is_sha256(checksum),
+            "Freeze handoff.integrity has a malformed upload row",
+        )
+        relative = name.removeprefix("handoff/")
+        artifact_path_parts(relative)
+        key = relative.casefold()
+        _require(key not in normalized_upload, f"Freeze upload inventory collides case-insensitively: {relative}")
+        normalized_upload[key] = checksum
+    _require(
+        integrity.get("handoff_sha256") == upload_sha256
+        and digest(
+            {
+                name.removeprefix("handoff/"): checksum
+                for name, checksum in upload_files.items()
+            }
+        )
+        == upload_sha256,
+        "Freeze handoff.integrity differs from the full upload identity",
+    )
+    _require(
+        integrity.get("main_assembly") == main_assembly
+        and integrity.get("main_assembly_sha256")
+        == next(
+            (
+                checksum
+                for name, checksum in native_files.items()
+                if name.casefold() == main_assembly.casefold()
+            ),
+            None,
+        ),
+        "Freeze handoff.integrity does not bind the selected main assembly",
     )
 
     discovery_record = read_data(confined(root, "evidence/discovery.json"))
@@ -966,6 +1005,19 @@ def _validate_source_identity(
         source_file = expected.get("file")
         record_key = expected.get("key")
         anchor = expected.get("anchor")
+        reference = item["reference"]
+        reference_path, marker, reference_key = reference.partition("#")
+        _require(
+            marker in {"", "#"} and reference.count("#") <= 1 and bool(reference_path),
+            f"Controlled record reference is not canonical: {reference}",
+        )
+        canonical_reference_path = reference_path.replace("\\", "/")
+        _require(
+            reference_path == canonical_reference_path
+            and canonical_reference_path == str(source_file or "").replace("\\", "/")
+            and reference_key == str(record_key or ""),
+            f"Controlled record reference disagrees with its file or key: {reference}",
+        )
         _require(
             _is_sha256(source_sha256)
             and record_sha256 == source_sha256
@@ -973,7 +1025,7 @@ def _validate_source_identity(
             and isinstance(source_file, str)
             and bool(source_file)
             and isinstance(record_key, str)
-            and (anchor is None or isinstance(anchor, str))
+            and (anchor is None or (isinstance(anchor, str) and bool(anchor)))
             and isinstance(handoff_files, dict),
             f"Controlled record path differs from the source record: {item['reference']}",
         )
@@ -993,6 +1045,17 @@ def _validate_source_identity(
             == source_sha256,
             f"Controlled record bytes differ from the source record: {item['reference']}",
         )
+        if anchor is not None:
+            try:
+                content = confined(root, "input/" + archived_record).read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                raise PipelineError(
+                    f"Controlled record anchor is unreadable: {item['reference']}"
+                ) from error
+            _require(
+                anchor in content,
+                f"Controlled record anchor is not present in its bound bytes: {item['reference']}",
+            )
     request_path = confined(root, "input/request.json", exists=False)
     if request_path.is_file():
         request, _request_sha256 = read_request_evidence(request_path)
@@ -1158,6 +1221,7 @@ def _validate_capture(
         root,
         view,
         handoff_sha256=handoff_sha256,
+        upload_sha256=upload_sha256,
         main_assembly=main_assembly,
         main_assembly_sha256=main_assembly_sha256,
         native_files=native_files,

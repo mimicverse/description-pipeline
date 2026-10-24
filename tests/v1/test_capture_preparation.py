@@ -72,6 +72,7 @@ def _topology_row(
     provenance_state=None,
     suppression_state=2,
 ) -> dict:
+    session = storage_scope == "session"
     return {
         "instance": instance,
         "depth": depth,
@@ -82,6 +83,9 @@ def _topology_row(
         "suppression_state": suppression_state,
         "storage_scope": storage_scope,
         "provenance_state": provenance_state,
+        "owner_document_path": _normalized(TOP) if session else None,
+        "owner_sha256": "a" * 64 if session else None,
+        "native_api_pid": int(re.search(r"swx(\d+)", path).group(1)) if session else None,
     }
 
 
@@ -131,6 +135,7 @@ def _document_state_snapshots(preparation: dict) -> dict[str, dict]:
         "parts": sum(item["document_type"] == 1 for item in documents),
         "assemblies": sum(item["document_type"] == 2 for item in documents),
         "documents": documents,
+        "topology": copy.deepcopy(preparation["topology_after"]),
     }
     return {
         "document_state_after_reads.json": copy.deepcopy(snapshot),
@@ -318,6 +323,13 @@ def payload(*, virtual_reuse: bool = False) -> dict:
         "assembly_document_count": 1,
         "child_rebuilds": [],
         "top_rebuild": None,
+        "rebuild_calls": [
+            {
+                "kind": "initial",
+                "initial_pending": [],
+                "rebuild_candidates": [],
+            }
+        ],
         "needs_rebuild2_before": 0,
         "needs_rebuild2_after": 0,
         "configuration_needs_rebuild_before": False,
@@ -404,7 +416,7 @@ def payload(*, virtual_reuse: bool = False) -> dict:
 
 
 def dynamic_child_payload() -> dict:
-    """One clean initial child becomes pending before its fresh rebuild turn."""
+    """One initially pending child is rebuilt inside the fixed ancestor closure."""
 
     value = payload()
     preparation = value["scene"]["notes"]["capture_preparation"]
@@ -430,12 +442,14 @@ def dynamic_child_payload() -> dict:
     )
     preparation["rebuild_performed"] = True
     child_state = _state(CHILD_ASSEMBLY)
+    child_before = _state(CHILD_ASSEMBLY, needs_rebuild=1)
+    child_key = _normalized(CHILD_ASSEMBLY)
     preparation["assembly_states_before"].append(
         {
             "depth": 1,
             "path": CHILD_ASSEMBLY,
             "instances": ["arm-1"],
-            "state": copy.deepcopy(child_state),
+            "state": copy.deepcopy(child_before),
         }
     )
     preparation["assembly_states_after"].append(
@@ -447,8 +461,7 @@ def dynamic_child_payload() -> dict:
         }
     )
     preparation["part_states_after"] = []
-    fresh_before = copy.deepcopy(child_state)
-    fresh_before["needs_rebuild2_value"] = 1
+    fresh_before = copy.deepcopy(child_before)
     preparation["child_rebuilds"] = [
         {
             "path": CHILD_ASSEMBLY,
@@ -456,12 +469,28 @@ def dynamic_child_payload() -> dict:
             "instances": ["arm-1"],
             "elapsed_seconds": 0.1,
             "result": True,
+            "call_sequence": 1,
             "state_before": fresh_before,
             "state_after": copy.deepcopy(child_state),
         }
     ]
+    preparation["rebuild_calls"] = [
+        {
+            "kind": "initial",
+            "initial_pending": [child_key],
+            "rebuild_candidates": [child_key],
+        },
+        {
+            "sequence": 1,
+            "kind": "child",
+            "path": CHILD_ASSEMBLY,
+            "depth": 1,
+            "state_before": copy.deepcopy(fresh_before),
+            "result": True,
+            "state_after": copy.deepcopy(child_state),
+        },
+    ]
     source_files = preparation["source_files_before"]
-    child_key = _normalized(CHILD_ASSEMBLY)
     source_files.pop(_normalized(PART))
     source_files[child_key] = {"path": CHILD_ASSEMBLY, "sha256": "b" * 64}
     preparation["source_files_after"] = copy.deepcopy(source_files)
@@ -604,6 +633,138 @@ class CapturePreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "Missing raw document snapshot"):
             self.validate(absent)
 
+    def test_pristine_continuity_ignores_diagnostics_and_configuration_order(self) -> None:
+        value = payload()
+        preparation = self.preparation(value)
+        for row in [
+            *preparation["assembly_states_before"],
+            *preparation["assembly_states_after"],
+            *preparation["part_states_after"],
+        ]:
+            row["state"]["configurations"].append(
+                {
+                    "name": "Unused",
+                    "needs_rebuild": False,
+                    "add_rebuild_save_mark": False,
+                }
+            )
+        for state in (
+            preparation["state_before"],
+            preparation["state_after_children"],
+            preparation["state_after"],
+        ):
+            state["configurations"].append(
+                {
+                    "name": "Unused",
+                    "needs_rebuild": False,
+                    "add_rebuild_save_mark": False,
+                }
+            )
+        value["document_states"] = _document_state_snapshots(preparation)
+        pristine = value["document_states"]["document_state_after_pristine_readout.json"]
+        for document in pristine["documents"]:
+            document["state"]["save_flag"] = True
+            for configuration in document["state"]["configurations"]:
+                configuration["add_rebuild_save_mark"] = True
+            document["state"]["configurations"].reverse()
+        self.validate(value)
+
+    def test_part_occurrences_may_use_multiple_reference_configurations(self) -> None:
+        value = payload()
+        preparation = self.preparation(value)
+        for row in preparation["topology_before"] + preparation["topology_after"]:
+            if row["instance"] == "arm-1":
+                row["referenced_configuration"] = "Short"
+            elif row["instance"] == "arm-2":
+                row["referenced_configuration"] = "Long"
+        part_state = preparation["part_states_after"][0]["state"]
+        part_state["configurations"].extend(
+            [
+                {
+                    "name": "Short",
+                    "needs_rebuild": False,
+                    "add_rebuild_save_mark": False,
+                },
+                {
+                    "name": "Long",
+                    "needs_rebuild": False,
+                    "add_rebuild_save_mark": False,
+                },
+            ]
+        )
+        for component in value["discovery"]["raw"]["components"]:
+            component["configuration"] = "Short" if component["instance_id"] == "arm-1" else "Long"
+        for edge in value["discovery"]["raw"]["source_selection"]["closure"]["documents"][
+            "cad/robot.SLDASM"
+        ]["resolved_edges"]:
+            edge["configuration"] = "Short" if edge["instance"] == "arm-1" else "Long"
+        value["document_states"] = _document_state_snapshots(preparation)
+        self.validate(value)
+
+    def test_session_path_may_change_only_with_current_native_owner(self) -> None:
+        value = payload(virtual_reuse=True)
+        pristine = value["document_states"]["document_state_after_pristine_readout.json"]
+        changed = "/tmp/swx22000/VC~~/waist/virtual.SLDPRT"
+        for document in pristine["documents"]:
+            if document["path"] == VIRTUAL:
+                document["path"] = changed
+                document["state"]["path"] = changed
+        for row in pristine["topology"]:
+            if row["storage_scope"] == "session":
+                row["document_path"] = changed
+                row["normalized_path"] = _normalized(changed)
+                row["native_api_pid"] = 22000
+        self.validate(value)
+
+        foreign_owner = copy.deepcopy(value)
+        pristine = foreign_owner["document_states"]["document_state_after_pristine_readout.json"]
+        for row in pristine["topology"]:
+            if row["storage_scope"] == "session":
+                row["owner_sha256"] = "f" * 64
+        with self.assertRaisesRegex(PipelineError, "semantic native topology"):
+            self.validate(foreign_owner)
+
+    def test_cached_materialization_reopen_uses_ic_owner_evidence(self) -> None:
+        value = payload(virtual_reuse=True)
+        preparation = self.preparation(value)
+        materialized = "/tmp/swx21040/IC~~/waist/imported.SLDPRT"
+        for row in preparation["topology_before"] + preparation["topology_after"]:
+            if row["storage_scope"] == "session":
+                row["document_path"] = materialized
+                row["normalized_path"] = _normalized(materialized)
+                row["provenance_state"] = "cached_materialization"
+        preparation["part_states_after"][0]["path"] = materialized
+        part_state = preparation["part_states_after"][0]["state"]
+        part_state["path"] = materialized
+        for component in value["discovery"]["raw"]["components"]:
+            component["document"] = materialized
+        closure = value["discovery"]["raw"]["source_selection"]["closure"]
+        closure["virtual_components"] = []
+        closure["imports"] = [
+            {
+                "instance": instance,
+                "materialization": materialized,
+                "configuration": "Default",
+            }
+            for instance in ("virtual-1", "virtual-2")
+        ]
+        preparation["session_dependency_paths"] = [materialized]
+        value["closure"]["copy_files"] = {"source/robot.SLDASM": "a" * 64}
+        value["document_states"] = _document_state_snapshots(preparation)
+
+        pristine = value["document_states"]["document_state_after_pristine_readout.json"]
+        reopened = "/tmp/swx22000/IC~~/waist/imported.SLDPRT"
+        for document in pristine["documents"]:
+            if document["path"] == materialized:
+                document["path"] = reopened
+                document["state"]["path"] = reopened
+        for row in pristine["topology"]:
+            if row["storage_scope"] == "session":
+                row["document_path"] = reopened
+                row["normalized_path"] = _normalized(reopened)
+                row["native_api_pid"] = 22000
+        self.validate(value)
+
     def test_actual_rebuild_producer_feeds_the_independent_final_state_consumer(self) -> None:
         from description_pipeline.sources.solidworks import native
         from tests.sources.test_solidworks_rebuild_lifecycle import _Backend, _Component, _Doc
@@ -624,6 +785,9 @@ class CapturePreparationTests(unittest.TestCase):
             for row in preparation[name]:
                 if row.get("document_path"):
                     row["normalized_path"] = _normalized(row["document_path"])
+        for row in documents["topology"]:
+            if row.get("document_path"):
+                row["normalized_path"] = _normalized(row["document_path"])
         for name in ("source_files_before", "source_files_after"):
             preparation[name] = {
                 _normalized(row["path"]): row
@@ -722,6 +886,9 @@ class CapturePreparationTests(unittest.TestCase):
                 "suppression_state": 0,
                 "storage_scope": "suppressed",
                 "provenance_state": None,
+                "owner_document_path": None,
+                "owner_sha256": None,
+                "native_api_pid": None,
             }
 
         value = payload()
@@ -731,6 +898,7 @@ class CapturePreparationTests(unittest.TestCase):
         preparation["topology_before"] = _sort_topology(preparation["topology_before"])
         preparation["topology_after"] = _sort_topology(preparation["topology_after"])
         preparation["component_count"] += 1
+        value["document_states"] = _document_state_snapshots(preparation)
         value["discovery"]["raw"]["source_selection"]["closure"]["suppressed"] = [
             {
                 "document": "cad/robot.SLDASM",
@@ -751,6 +919,9 @@ class CapturePreparationTests(unittest.TestCase):
             missing["scene"]["notes"]["capture_preparation"]["topology_before"]
         )
         missing["scene"]["notes"]["capture_preparation"]["component_count"] -= 1
+        missing["document_states"] = _document_state_snapshots(
+            missing["scene"]["notes"]["capture_preparation"]
+        )
         with self.assertRaisesRegex(PipelineError, "sealed native occurrence graph"):
             self.validate(missing)
 
@@ -761,6 +932,7 @@ class CapturePreparationTests(unittest.TestCase):
         forged_preparation["topology_before"] = _sort_topology(forged_preparation["topology_before"])
         forged_preparation["topology_after"] = _sort_topology(forged_preparation["topology_after"])
         forged_preparation["component_count"] += 1
+        forged["document_states"] = _document_state_snapshots(forged_preparation)
         with self.assertRaisesRegex(PipelineError, "sealed native occurrence graph"):
             self.validate(forged)
 
@@ -792,6 +964,15 @@ class CapturePreparationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineError, "rebuilt more than once"):
             self.validate(duplicate)
+
+    def test_fresh_pending_sibling_outside_initial_closure_is_rejected(self) -> None:
+        value = dynamic_child_payload()
+        preparation = self.preparation(value)
+        preparation["assembly_states_before"][-1]["state"]["needs_rebuild2_value"] = 0
+        preparation["rebuild_calls"][0]["initial_pending"] = []
+        preparation["rebuild_calls"][0]["rebuild_candidates"] = []
+        with self.assertRaisesRegex(PipelineError, "outside the initial dirty ancestor closure"):
+            self.validate(value)
 
     def test_file_and_session_occurrence_paths_are_not_rebound_by_basename(self) -> None:
         rebound_file = payload()

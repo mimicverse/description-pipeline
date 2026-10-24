@@ -2328,7 +2328,8 @@ def write_target_delivery(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
     for name, text in (records or {}).items():
-        target = root / "input/records" / name
+        relative = name if name.replace("\\", "/").startswith("records/") else f"records/{name}"
+        target = root / "input" / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
     write_json(root / "evidence/discovery.json", discovery or {})
@@ -2615,12 +2616,13 @@ def compose_delivery_inputs(
 
     payload_records: list[dict] = []
     for name, text in (records or {}).items():
-        target = delivery / "input" / "records" / name
+        archive_name = "records/" + Path(name).name
+        target = delivery / "input" / archive_name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
         common = {
             "file": str(name),
-            "package_file": str(name),
+            "package_file": archive_name,
             "sha256": _hashlib.sha256(text.encode("utf-8")).hexdigest(),
         }
         keys = _record_keys_for(record, record_keys, str(name))
@@ -3000,6 +3002,74 @@ def seal_scene_inputs(
     environment = Path(destination) / "evidence/environment.json"
     if not runtime.is_file():
         runtime.write_bytes(environment.read_bytes())
+    from packaging.utils import canonicalize_name
+
+    from description_pipeline import __version__
+    from description_pipeline.delivery import PIPELINE_ID
+    from description_pipeline.io import read_data, write_json
+    from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
+
+    runtime_record = read_data(runtime)
+    native_tool = {
+        "schema_version": "solidworks-to-urdf.tool/v1",
+        "pipeline_id": PIPELINE_ID,
+        "version": __version__,
+        "source_sha256": "f" * 64,
+        "release": None,
+        "runtime": {
+            "role": "native",
+            "system": "Windows",
+            "python": "3.12.14",
+            "machine": "AMD64",
+            "packages": {
+                canonicalize_name(name): RUNTIME_VERSIONS[name]
+                for name in required_packages("native")
+            },
+        },
+    }
+    rewrite_path = Path(destination) / "evidence/rewrite-environment.json"
+    rewrite = read_data(rewrite_path)
+    runtime_copy_pid = runtime_record.get("solidworks", {}).get("sessions", {}).get("copy", {}).get("pid")
+    rewrite_copy_pid = rewrite.get("solidworks", {}).get("sessions", {}).get("copy", {}).get("pid")
+    runtime_copy_pid = runtime_copy_pid if type(runtime_copy_pid) is int and runtime_copy_pid > 0 else 101
+    rewrite_copy_pid = rewrite_copy_pid if type(rewrite_copy_pid) is int and rewrite_copy_pid > 0 else 100
+    source_pid = min(runtime_copy_pid, rewrite_copy_pid) - 1
+    if source_pid <= 0:
+        source_pid = max(runtime_copy_pid, rewrite_copy_pid) + 1
+    runtime_sessions = {
+        "source": {"pid": source_pid, "state": "closed"},
+        "copy": {"pid": runtime_copy_pid, "state": "active"},
+    }
+    rewrite_sessions = {
+        "source": {"pid": source_pid, "state": "closed"},
+        "copy": {"pid": rewrite_copy_pid, "state": "active"},
+    }
+    runtime_record["platform"] = "Windows-11"
+    runtime_record["toolchain"] = native_tool
+    runtime_record["worker_version"] = str(native_tool["version"])
+    runtime_record["solidworks"]["sessions"] = runtime_sessions
+    boundary = runtime_record.get("session_boundary")
+    if isinstance(boundary, dict) and isinstance(boundary.get("retirement"), dict):
+        retirement = boundary["retirement"]
+        for key, state in (("before", "active"), ("after", "closed")):
+            identity = retirement.get(key)
+            if isinstance(identity, dict):
+                retirement[key] = {
+                    "pid": rewrite_copy_pid,
+                    "state": state,
+                    **{
+                        name: identity[name]
+                        for name in ("executable", "ownership", "lease")
+                        if name in identity
+                    },
+                }
+    rewrite["platform"] = "Windows-11"
+    rewrite["toolchain"] = native_tool
+    rewrite["worker_version"] = str(native_tool["version"])
+    rewrite["solidworks"]["sessions"] = rewrite_sessions
+    write_json(runtime, runtime_record)
+    write_json(rewrite_path, rewrite)
+    write_json(Path(destination) / "reports/native-tool.json", native_tool)
     from description_pipeline.sources.snapshot import write_manifest
 
     manifest = json.loads((Path(destination) / "manifest.json").read_text(encoding="utf-8"))
@@ -3035,12 +3105,13 @@ def stage_discovery_inputs(
     root = Path(root)
     payload_records = []
     for relative, text in (controlled or {}).items():
-        path = root / "input" / "records" / relative
+        archive_name = "records/" + Path(relative).name
+        path = root / "input" / archive_name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
         common = {
             "file": relative,
-            "package_file": relative,
+            "package_file": archive_name,
             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         }
         keys = _record_keys_for(record, record_keys, str(relative))

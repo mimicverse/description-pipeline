@@ -263,6 +263,9 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
                 "suppression_state": None,
                 "storage_scope": "file",
                 "provenance_state": None,
+                "owner_document_path": None,
+                "owner_sha256": None,
+                "native_api_pid": None,
             },
             *[
                 {
@@ -275,6 +278,9 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
                     "suppression_state": 2,
                     "storage_scope": "file",
                     "provenance_state": None,
+                    "owner_document_path": None,
+                    "owner_sha256": None,
+                    "native_api_pid": None,
                 }
                 for component in scene.components
             ],
@@ -308,6 +314,13 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
             "assembly_document_count": 1,
             "child_rebuilds": [],
             "top_rebuild": None,
+            "rebuild_calls": [
+                {
+                    "kind": "initial",
+                    "initial_pending": [],
+                    "rebuild_candidates": [],
+                }
+            ],
             "needs_rebuild2_before": 0,
             "needs_rebuild2_after": 0,
             "configuration_needs_rebuild_before": False,
@@ -419,6 +432,39 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
             "parts": sum(item["document_type"] == 1 for item in documents),
             "assemblies": sum(item["document_type"] == 2 for item in documents),
             "documents": documents,
+            "topology": [
+                {
+                    "instance": "top",
+                    "depth": 0,
+                    "document_path": top_path,
+                    "normalized_path": normalize_document_path(os.path.abspath(top_path)),
+                    "document_type": 2,
+                    "referenced_configuration": "Default",
+                    "suppression_state": None,
+                    "storage_scope": "file",
+                    "provenance_state": None,
+                    "owner_document_path": None,
+                    "owner_sha256": None,
+                    "native_api_pid": None,
+                },
+                *[
+                    {
+                        "instance": component_name,
+                        "depth": 1,
+                        "document_path": component_path,
+                        "normalized_path": normalize_document_path(os.path.abspath(component_path)),
+                        "document_type": 1,
+                        "referenced_configuration": "Default",
+                        "suppression_state": 2,
+                        "storage_scope": "file",
+                        "provenance_state": None,
+                        "owner_document_path": None,
+                        "owner_sha256": None,
+                        "native_api_pid": None,
+                    }
+                    for component_name, component_path in self._capture_component_paths
+                ],
+            ],
         }
 
     def export_component_meshes(self, destinations: dict[str, str], on_activity=None) -> dict[str, dict]:
@@ -902,16 +948,18 @@ class HermeticSixStageTests(unittest.TestCase):
                 on_event=self._record,
             )
 
-        self.assertEqual(failed["state"], "gh_failed_after_push")
+        self.assertEqual(failed["state"], "unresolved")
+        self.assertEqual(failed["error"], "github_failed_after_push")
         self.assertIs(failed["passed"], False)
-        self.assertEqual(failed["error"], "github_failed")
-        self.assertEqual(failed["error_code"], "github_failed")
-        self.assertEqual(failed["submission"]["error"], "github_failed")
+        self.assertEqual(failed["error"], "github_failed_after_push")
+        self.assertEqual(failed["reason"], "github_failed")
+        self.assertEqual(failed["error_code"], "github_failed_after_push")
+        self.assertEqual(failed["submission"]["error"], "github_failed_after_push")
         self.assertEqual(failed["subject_sha256"], subject)
         self.assertEqual(failed["quality"]["passed"], True)
         self._assert_failed_publish_evidence(failed, subject)
         boundary_failure = self._portable_publish_failure(failed)
-        self.assertEqual(getattr(boundary_failure, "code", None), "github_failed")
+        self.assertEqual(getattr(boundary_failure, "code", None), "github_failed_after_push")
         self.assertTrue(
             _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").strip(),
             "the local Git push completed before GitHub failed",

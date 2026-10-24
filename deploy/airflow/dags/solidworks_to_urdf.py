@@ -263,7 +263,7 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
         "run_id": run_id,
         "stage": stage,
         "state": state,
-        "passed": False if state == "failed" else CONFIRMED_STAGE_PASSED[stage],
+        "passed": False if state in {"failed", "unresolved", "cancelled"} else CONFIRMED_STAGE_PASSED[stage],
         "subject_sha256": (manifest.get("subject") or {}).get("digest"),
         "artifacts": [dict(record) for record in (manifest.get("subject") or {}).get("files") or []],
     }
@@ -275,7 +275,7 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
         # a missing or unreadable transfer refuses (no prepared-package fallback).
         transfer_path = tree / CAPTURE_MANIFEST
         if not transfer_path.is_file():
-            if state not in {"failed", "cancelled"}:
+            if state not in {"failed", "unresolved", "cancelled"}:
                 raise AirflowFailException(f"The {stage!r} stage tree carries no native transfer identity")
         else:
             transfer = read_data(transfer_path)
@@ -284,7 +284,7 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
                 raise AirflowFailException(f"The {stage!r} stage tree carries an unreadable native transfer identity")
             payload["handoff_sha256"] = transfer_handoff
     for key in (
-        "error", "error_code", "detail", "diagnostic_path", "failure_diagnostics",
+        "error", "error_code", "reason", "detail", "diagnostic_path", "failure_diagnostics",
         "tool", "native_tool", "quality", "submission",
         "upload_sha256", "native_prepared_dir", "native_prepared_files",
     ):
@@ -305,7 +305,13 @@ def _seal_and_confirm(
     settle_operations: bool = True,
 ) -> dict:
     """Seal the stage tree through the one writer primitive, then register the stage record."""
-    sealed_receipt = _platform_receipt(run_id, stage, receipt, tree, state=None if state == "completed" else "failed")
+    sealed_receipt = _platform_receipt(
+        run_id,
+        stage,
+        receipt,
+        tree,
+        state=None if state == "completed" else state,
+    )
     uri, completed = seal_stage_confirmation(store_root, run_id, stage, Path(tree), sealed_receipt)
     executed_at = datetime.now(UTC) if state == "completed" else None
     if state == "completed":
@@ -361,6 +367,32 @@ def _register_failed_stage(
         except Exception:  # pragma: no cover - diagnostics must never mask the stage's own failure
             log.exception("failed-stage sealing unavailable run=%s stage=%s", run_id, stage)
     platform.confirm_stage(run_id=run_id, stage=stage, state="failed", receipt=receipt)
+
+
+def _register_unresolved_stage(
+    platform: PlatformStore,
+    store_root: Path,
+    run_id: str,
+    stage: str,
+    receipt: dict,
+    tree: str | Path,
+) -> None:
+    """Seal a side-effect-unknown receipt without turning it into a definite failure."""
+
+    tree = Path(tree)
+    if not (tree / "manifest.json").is_file():
+        raise AirflowFailException(
+            f"The unresolved {stage!r} stage has no sealed subject tree for reconciliation"
+        )
+    _seal_and_confirm(
+        platform,
+        store_root,
+        run_id,
+        stage,
+        tree,
+        receipt,
+        state="unresolved",
+    )
 
 
 def _failure_tree(run_dir: Path, stage: str) -> Path:
@@ -620,30 +652,66 @@ def _portable_registered(
             log.exception("live event write failed run=%s stage=%s", run_id, stage)
 
     kwargs.setdefault("on_event", live)
+    unresolved_detected = False
     try:
         receipt = flow.run_stage(platform, store_root, run_id, stage, **kwargs)
         _portable_report(receipt, stage=stage, context=context)
+        if stage == "publish" and receipt.get("state") == "unresolved":
+            unresolved_detected = True
+            try:
+                _register_unresolved_stage(platform, store_root, run_id, stage, receipt, tree)
+            except Exception:
+                log.exception(
+                    "unresolved publication registration unavailable run=%s; retaining reconciliation debt",
+                    run_id,
+                )
+            raise _boundary_failure(
+                receipt.get("error") or "publish ended with an unresolved external side effect",
+                receipt,
+            )
         _portable_summary(receipt, stage=stage)  # a non-confirmed receipt never reaches registration
     except Exception as error:
-        _converge_failed_stage(
-            run_id,
-            stage,
-            error,
-            tree=tree if Path(tree).is_dir() else None,
-            products=True,
-            config_digest=config_digest,
-        )
+        if not unresolved_detected:
+            _converge_failed_stage(
+                run_id,
+                stage,
+                error,
+                tree=tree if Path(tree).is_dir() else None,
+                products=True,
+                config_digest=config_digest,
+            )
         raise
     try:
         _register_completed_stage(run_id, stage, tree, receipt, config_digest=config_digest)
     except Exception as error:
-        _converge_failed_stage(
-            run_id,
-            stage,
-            error,
-            tree=tree if (Path(tree) / "manifest.json").is_file() else None,
-            config_digest=config_digest,
-        )
+        if stage == "publish" and receipt.get("passed") is True:
+            try:
+                platform, store_root = _platform_binding(config_digest)
+                _register_unresolved_stage(
+                    platform,
+                    store_root,
+                    run_id,
+                    stage,
+                    {
+                        **receipt,
+                        "error": "publication_registration_unknown",
+                        "detail": f"{type(error).__name__}: {error}",
+                    },
+                    tree,
+                )
+            except Exception:
+                log.exception(
+                    "publication side effect completed but unresolved registration failed run=%s",
+                    run_id,
+                )
+        else:
+            _converge_failed_stage(
+                run_id,
+                stage,
+                error,
+                tree=tree if (Path(tree) / "manifest.json").is_file() else None,
+                config_digest=config_digest,
+            )
         raise
     return receipt
 

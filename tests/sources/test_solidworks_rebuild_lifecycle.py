@@ -593,6 +593,26 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertIn("RuntimeError: rebuild native failure", caught.exception.detail["error"])
         self.assertEqual(backend.refresh_calls, [])
 
+    def test_mid_rebuild_failure_keeps_the_partial_native_journal(self):
+        child = _Doc(CHILD, needs_rebuild2=1, rebuild_result=False)
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend.collect_scene(PATH, [])
+        journal = caught.exception.detail["rebuild_journal"]
+        self.assertEqual(journal[0]["kind"], "initial")
+        self.assertEqual(
+            journal[0]["initial_pending"],
+            [normalize_document_path(os.path.abspath(CHILD))],
+        )
+        self.assertIn(
+            (CHILD, "cad_rebuild_failed"),
+            {(row.get("path"), row.get("error_code")) for row in journal[1:]},
+        )
+
     def test_native_refresh_exception_preserves_phase_and_error(self):
         backend = _Backend(RuntimeError("document lookup failed"))
         doc = _Doc(PATH, needs_rebuild2=1)
@@ -1000,6 +1020,46 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             preparation["source_files_before"],
         )
         self.assertEqual(source_hash.call_count, 2)
+
+    def test_shared_part_occurrences_keep_short_long_and_restore_parked(self):
+        class ConfiguredPart(_Doc):
+            def GetConfigurationNames(self):
+                return ["Parked", "Short", "Long"]
+
+            def GetConfigurationByName(self, name):
+                if name not in self.GetConfigurationNames():
+                    raise ValueError(f"unknown configuration: {name}")
+                return _Configuration(self, name, False)
+
+        part = ConfiguredPart(
+            PART,
+            configuration="Parked",
+            document_type=1,
+        )
+        top = _Doc(
+            PATH,
+            children=[
+                _Component("part-short", part, referenced_configuration="Short"),
+                _Component("part-long", part, referenced_configuration="Long"),
+            ],
+        )
+        backend = _Backend({PATH: top, PART: part})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(len(preparation["part_states_after"]), 1)
+        state = preparation["part_states_after"][0]["state"]
+        self.assertEqual(state["configuration"], "Parked")
+        self.assertEqual(
+            {
+                row["referenced_configuration"]
+                for row in preparation["topology_before"]
+                if row["instance"] in {"part-short", "part-long"}
+            },
+            {"Short", "Long"},
+        )
 
     def test_pending_virtual_assembly_rebuilds_as_the_owning_session_document(self):
         virtual = _Doc(VIRTUAL_ASSEMBLY, read_only=False, needs_rebuild2=1)

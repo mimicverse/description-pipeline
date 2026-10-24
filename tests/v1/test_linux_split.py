@@ -70,6 +70,7 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
             run_id=RUN,
             handoff=HANDOFF,
             upload=self.upload_sha256,
+            upload_files=UPLOAD,
         )
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(
@@ -335,6 +336,7 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
                 run_id=NEGATIVE,
                 handoff=HANDOFF,
                 upload=self.upload_sha256,
+                upload_files=UPLOAD,
             ),
             negative_archive,
             run_id=NEGATIVE,

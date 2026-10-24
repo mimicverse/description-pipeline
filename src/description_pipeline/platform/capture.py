@@ -11,6 +11,7 @@ file-side state is consulted.
 from __future__ import annotations
 
 from pathlib import Path
+import copy
 import hashlib
 import shutil
 import zipfile
@@ -26,6 +27,7 @@ from ..orchestration.stage_transfer import (
     admit_capture,
     verify_transfer,
 )
+from ..stages import canonical_freeze_timestamp, validate_freeze_events
 from .flow import RunPaths, _registered_request_sha256, recorded_events
 from .store import PlatformStore
 
@@ -77,16 +79,84 @@ def _check_selected_capture(capture: Path, selection: dict) -> None:
             raise PipelineError(f"The captured source differs from the selected bytes: {name}")
 
 
-def _append_native_events(platform: PlatformStore, run_id: str, capture: Path) -> None:
-    """Mirror the sealed native stage receipts into the platform's live stream, once each."""
-    receipt = read_data(capture / "reports/native-stages.json")
-    remaining = _recorded_payloads(platform, run_id)
-    for event in (receipt or {}).get("events") or []:
-        if not isinstance(event, dict):
+def _registered_freeze_events(platform: PlatformStore, run_id: str) -> list[dict]:
+    """Read the one registered Linux freeze block from platform rows."""
+
+    events = []
+    for row in recorded_events(platform, run_id):
+        if not isinstance(row, dict) or row.get("stage") != "freeze":
             continue
-        if event in remaining:
+        payload = row.get("payload")
+        if payload == {"state": "completed"}:
+            continue
+        if (
+            row.get("kind") != "stage"
+            or not isinstance(payload, dict)
+            or payload.get("stage") != "freeze"
+        ):
+            raise PipelineError("A freeze-stage row is not a raw native-protocol event")
+        events.append({"at": canonical_freeze_timestamp(row.get("at")), **copy.deepcopy(payload)})
+    return validate_freeze_events(events)
+
+
+def _event_key(event: dict, *, stage=None, kind="stage", at=None) -> tuple:
+    """One event identity independent of whether its instant is a row or payload field."""
+
+    payload = copy.deepcopy(event)
+    timestamp = payload.pop("at", None)
+    if timestamp is None:
+        timestamp = at
+    return (
+        stage or payload.get("stage"),
+        kind,
+        canonical_freeze_timestamp(timestamp),
+        digest(payload),
+    )
+
+
+def _append_native_events(
+    platform: PlatformStore,
+    run_id: str,
+    capture: Path,
+    expected_freeze_events,
+) -> None:
+    """Validate the carried Freeze block once, then mirror only new native events."""
+
+    expected_freeze = validate_freeze_events(expected_freeze_events)
+    if _registered_freeze_events(platform, run_id) != expected_freeze:
+        raise PipelineError("The native capture Freeze block differs from the registered platform facts")
+    receipt = read_data(capture / "reports/native-stages.json")
+    receipt_events = (receipt or {}).get("events") or []
+    if not isinstance(receipt_events, list):
+        raise PipelineError("The native stage receipt has no event list")
+    receipt_freeze = [
+        event
+        for event in receipt_events
+        if isinstance(event, dict) and event.get("stage") == "freeze"
+    ]
+    if validate_freeze_events(receipt_freeze) != expected_freeze:
+        raise PipelineError("The native stage receipt changed its carried Freeze block")
+    remaining = {
+        _event_key(
+            payload if isinstance(payload, dict) else {},
+            stage=row.get("stage"),
+            kind=row.get("kind"),
+            at=row.get("at"),
+        )
+        for row in recorded_events(platform, run_id)
+        for payload in [row.get("payload") if isinstance(row, dict) else None]
+    }
+    receipt_keys = set()
+    for event in receipt_events:
+        if not isinstance(event, dict) or event.get("stage") == "freeze":
+            continue
+        key = _event_key(event)
+        if key in receipt_keys:
+            raise PipelineError("The native stage receipt repeats an event")
+        receipt_keys.add(key)
+        if key in remaining:
             # An earlier attempt already mirrored this event; recovery never duplicates it.
-            remaining.remove(event)
+            remaining.remove(key)
             continue
         platform.append_event(
             run_id,
@@ -94,11 +164,6 @@ def _append_native_events(platform: PlatformStore, run_id: str, capture: Path) -
             kind=str(event.get("kind") or "stage"),
             payload=event,
         )
-
-
-def _recorded_payloads(platform: PlatformStore, run_id: str) -> list:
-    """Every recorded payload of one run, over the shared paging read facility."""
-    return [row.get("payload") if isinstance(row, dict) else None for row in recorded_events(platform, run_id)]
 
 
 def source_identity(capture: Path) -> tuple[str, str | None]:
@@ -120,6 +185,10 @@ def import_native_capture(
     """Download the sealed native capture and admit it into the attempt."""
     run_id = validate_run_id(run_id)
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    native_request = job.get("request") if isinstance(job.get("request"), dict) else {}
+    freeze_events = validate_freeze_events(native_request.get("freeze_events"))
+    if native_request.get("freeze_events_sha256") != digest(freeze_events):
+        raise PipelineError("The native capture Freeze block differs from its bound digest")
     native_tool = result.get("native_tool")
     if not isinstance(native_tool, dict) or not native_tool:
         raise PipelineError("The native job carries no tool record; the transfer cannot be verified")
@@ -184,7 +253,7 @@ def import_native_capture(
         if not isinstance(summary, dict) or summary.get("handoff_sha256") != handoff:
             raise PipelineError("The admitted capture differs from its native manifest receipt")
         _check_selected_capture(capture, selection)
-        _append_native_events(platform, run_id, capture)
+        _append_native_events(platform, run_id, capture, freeze_events)
     else:
         paths.run_dir.mkdir(parents=True, exist_ok=True)
         archive_path = paths.run_dir / CAPTURE_ARCHIVE
@@ -215,7 +284,7 @@ def import_native_capture(
             expected_prepared_files=prepared_files,
         )
         _check_selected_capture(capture, selection)
-        _append_native_events(platform, run_id, capture)
+        _append_native_events(platform, run_id, capture, freeze_events)
     hardware, revision = source_identity(capture)
     return {
         "run_id": run_id,

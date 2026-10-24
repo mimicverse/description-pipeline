@@ -63,6 +63,7 @@ class LinuxStoreIntegrityTests(SplitAdmissionMixin, unittest.TestCase):
             run_id=RUN,
             handoff=HANDOFF,
             upload=self.upload_sha256,
+            upload_files=UPLOAD,
         )
         self.archive = self.tmp / "native-evidence.zip"
         seal_capture(

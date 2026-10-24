@@ -80,7 +80,11 @@ def _capture_events(
     handoff: str,
     main: str,
     native_files: dict[str, str],
+    upload: str | None = None,
+    upload_files: dict[str, str] | None = None,
 ) -> list[dict]:
+    upload = upload or handoff
+    upload_files = dict(upload_files or native_files)
     started = datetime(2026, 10, 10, tzinfo=UTC)
 
     def event(offset: int, stage: str, state: str, check=None):
@@ -140,7 +144,7 @@ def _capture_events(
             check(
                 "input",
                 "handoff.admission",
-                {"handoff_sha256": handoff, "package": "fixture"},
+                {"handoff_sha256": upload, "package": "fixture"},
             ),
         ),
         event(
@@ -153,9 +157,9 @@ def _capture_events(
                 {
                     "files": {
                         f"handoff/{name}": checksum
-                        for name, checksum in native_files.items()
+                        for name, checksum in upload_files.items()
                     },
-                    "handoff_sha256": handoff,
+                    "handoff_sha256": upload,
                     "main_assembly": main,
                     "main_assembly_sha256": main_sha256,
                 },
@@ -287,12 +291,16 @@ def capture_root(
     run_id: str = RUN_ID,
     handoff: str = HANDOFF,
     upload: str = HANDOFF,
+    upload_files: dict[str, str] | None = None,
     main: str = MAIN_ASSEMBLY,
 ) -> Path:
     root = Path(base) / "capture"
     (root / "input" / "cad").mkdir(parents=True)
     (root / "input" / "cad" / main).write_bytes(MAIN_BYTES)
     native_files = {main: file_digest(root / "input" / "cad" / main)}
+    upload_files = dict(upload_files or native_files)
+    if digest(upload_files) != upload:
+        raise AssertionError("upload fixture digest differs from its inventory")
     package_files = {"cad/" + main: native_files[main]}
     cad_revision = {
         "change_summary": "fixture",
@@ -476,6 +484,8 @@ def capture_root(
     events = _capture_events(
         root,
         handoff=handoff,
+        upload=upload,
+        upload_files=upload_files,
         main=main,
         native_files=native_files,
     )
@@ -616,8 +626,13 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual((destination / transfer.CAPTURE_MANIFEST).read_bytes(), sealed)
 
     def test_full_upload_and_selected_native_handoff_are_bound_separately(self) -> None:
-        upload_sha256 = digest({**NATIVE_FILES, "excluded.SLDPRT": "e" * 64})
-        root = capture_root(self.base / "separate-upload", upload=upload_sha256)
+        upload_files = {**NATIVE_FILES, "excluded.SLDPRT": "e" * 64}
+        upload_sha256 = digest(upload_files)
+        root = capture_root(
+            self.base / "separate-upload",
+            upload=upload_sha256,
+            upload_files=upload_files,
+        )
         archive = self.base / "separate-upload.zip"
         manifest = seal(root, archive, upload_sha256=upload_sha256)
         self.assertEqual(manifest["upload_sha256"], upload_sha256)
@@ -1445,6 +1460,89 @@ class StageTransferTests(unittest.TestCase):
         )
         with self.assertRaises(PipelineError):
             seal(record_bound, self.base / "record-source.zip")
+
+    def test_controlled_record_reference_binds_its_file_key_and_anchor(self) -> None:
+        def record_root(label: str) -> Path:
+            root = capture_root(self.base / f"record-binding-{label}")
+            content = b'{"value": "bound"}\n'
+            archive_name = "records/source.txt"
+            target = root / "input" / archive_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            checksum = hashlib.sha256(content).hexdigest()
+            handoff = read_data(root / "input/handoff.json")
+            handoff["package_files"][archive_name] = checksum
+            write_json(root / "input/handoff.json", handoff)
+            source_path = root / "input/source.json"
+            source = read_data(source_path)
+            source["identity"]["records"] = [
+                {
+                    "reference": "components/source.json#value",
+                    "file_sha256": checksum,
+                }
+            ]
+            source["source_revision_id"] = digest(source["identity"])
+            write_json(source_path, source)
+            handoff = read_data(root / "input/handoff.json")
+            handoff["package_files"]["source.json"] = file_digest(source_path)
+            write_json(root / "input/handoff.json", handoff)
+            discovery_path = root / "evidence/discovery.json"
+            discovery = read_data(discovery_path)
+            discovery["records"] = [
+                {
+                    "reference": "components/source.json#value",
+                    "file": "components/source.json",
+                    "key": "value",
+                    "package_file": archive_name,
+                    "sha256": checksum,
+                    "source_sha256": checksum,
+                    "anchor": '"value"',
+                }
+            ]
+            write_json(discovery_path, discovery)
+            evidence_manifest = read_data(root / "evidence/manifest.json")
+            evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
+            write_json(root / "evidence/manifest.json", evidence_manifest)
+            events = _capture_events(
+                root,
+                handoff=HANDOFF,
+                main=MAIN_ASSEMBLY,
+                native_files=NATIVE_FILES,
+            )
+            write_json(
+                root / "reports/native-stages.json",
+                stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
+            )
+            return root
+
+        valid = record_root("valid")
+        self.assertEqual(seal(valid, self.base / "record-binding-valid.zip")["run_id"], RUN_ID)
+
+        for label, mutate, pattern in (
+            ("file", lambda row: row.update(file="components/other.json"), "reference disagrees"),
+            ("key", lambda row: row.update(key="other"), "reference disagrees"),
+            ("anchor", lambda row: row.update(anchor='"missing"'), "anchor is not present"),
+        ):
+            root = record_root(label)
+            discovery_path = root / "evidence/discovery.json"
+            discovery = read_data(discovery_path)
+            mutate(discovery["records"][0])
+            write_json(discovery_path, discovery)
+            evidence_manifest = read_data(root / "evidence/manifest.json")
+            evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
+            write_json(root / "evidence/manifest.json", evidence_manifest)
+            events = _capture_events(
+                root,
+                handoff=HANDOFF,
+                main=MAIN_ASSEMBLY,
+                native_files=NATIVE_FILES,
+            )
+            write_json(
+                root / "reports/native-stages.json",
+                stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
+            )
+            with self.assertRaisesRegex(PipelineError, pattern):
+                seal(root, self.base / f"record-binding-{label}.zip")
 
     def test_controlled_record_archive_path_is_canonical_and_never_overwrites(self) -> None:
         self.assertEqual(transfer.record_archive_path("records/record.txt"), "records/record.txt")

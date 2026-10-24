@@ -583,6 +583,9 @@ def publish(
                     receipt["error_code"] = error
                 if "detail" in submitted:
                     receipt["detail"] = submitted["detail"]
+                for key in ("reason", "commit", "url", "retry"):
+                    if key in submitted:
+                        receipt[key] = submitted[key]
             _stamp(output, receipt)
             return {**receipt, "output": str(output)}
         except Exception as error:

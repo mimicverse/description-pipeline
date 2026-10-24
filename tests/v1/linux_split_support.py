@@ -24,7 +24,12 @@ from description_pipeline.platform import flow
 from description_pipeline.platform import storage as platform_storage
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages, tool_record
-from description_pipeline.stages import CONFIRMED_STAGE_PASSED, CONTRACT, CONTRACT_SHA256
+from description_pipeline.stages import (
+    CONFIRMED_STAGE_PASSED,
+    CONTRACT,
+    CONTRACT_SHA256,
+    validate_freeze_events,
+)
 
 from .test_stage_transfer import MAIN_ASSEMBLY
 
@@ -58,6 +63,13 @@ def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
             for name, checksum in binding["files"].items()
         }
         prepared_dir = str(Path(collection["identity"]["assembly"]).parent)
+        freeze_events = validate_freeze_events(
+            [
+                event
+                for event in native_stages["events"]
+                if event.get("stage") == "freeze"
+            ]
+        )
     return {
         "status": "native_complete",
         "run_id": run_id,
@@ -72,6 +84,9 @@ def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
             "upload_files": dict(UPLOAD),
             "upload_sha256": digest(UPLOAD),
             "main_assembly": MAIN_ASSEMBLY,
+            "freeze_events": freeze_events,
+            "freeze_events_sha256": digest(freeze_events),
+            "freeze_receipt_sha256": "f" * 64,
         },
         "selection": {
             "state": "sealed",
@@ -220,6 +235,8 @@ class SplitAdmissionMixin:
         paths = self._paths(run_id)
         archive = Path(archive) if archive is not None else self.archive
         job = capture_job(run_id, archive, self.tool)
+        for event in job["request"]["freeze_events"]:
+            self.store.append_event(run_id, stage="freeze", kind="stage", payload=event)
         endpoint = FakeEndpoint(archive.read_bytes())
         result = platform_capture.import_native_capture(self.store, paths, run_id, job, endpoint)
         # The DAG materializes both mutable copies of the registered frozen request:

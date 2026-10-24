@@ -2593,6 +2593,42 @@ class PlatformRegistrationTests(unittest.TestCase):
             [{"run_id": "run-1", "stage": "publish", "operation_key": "run-1/publish:0"}],
         )
 
+    def test_an_unresolved_publication_is_registered_as_unresolved(self) -> None:
+        tree = self._tree(stage="publish")
+        receipt = {
+            "run_id": "run-1",
+            "state": "unresolved",
+            "passed": False,
+            "error": "push_response_lost",
+            "subject_sha256": "a" * 64,
+            "commit": "b" * 40,
+            "url": "https://example.test/pull/1",
+            "submission": {
+                "state": "unresolved",
+                "passed": False,
+                "subject_sha256": "a" * 64,
+            },
+        }
+        with (
+            patch.object(self.module.flow, "run_stage", return_value=receipt),
+            self.assertRaises(self.module.AirflowFailException),
+        ):
+            self.module._portable_registered(
+                "run-1",
+                "publish",
+                tree=tree,
+                expected_subject="a" * 64,
+                base="main",
+                context={
+                    "dag_run": SimpleNamespace(run_id="portal-publish-1"),
+                    "ti": SimpleNamespace(task_id="publish", map_index=-1, xcom_push=lambda **kwargs: None),
+                },
+            )
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]["state"], "unresolved")
+        self.assertEqual(self.calls[0]["receipt"]["state"], "unresolved")
+        self.assertEqual(self.calls[0]["receipt"]["submission"], receipt["submission"])
+
     def test_a_stage_failure_converges_with_the_actual_products(self) -> None:
         tree = self._tree(stage="generate")
         with (
