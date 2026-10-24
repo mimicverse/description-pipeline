@@ -1037,6 +1037,10 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             main_assembly=self.MAIN,
             purpose="engineering",
             expected_native_tool_sha256=expected_native_tool_sha256,
+            expected_native_tool_record_sha256=digest(NATIVE_TOOL),
+            native_tool_requirement_artifact_id=(
+                "native-tool-requirement-fixture"
+            ),
         )
 
     def runtime(self, reader, backend):

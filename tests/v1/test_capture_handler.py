@@ -341,6 +341,12 @@ class CaptureHandlerTests(unittest.TestCase):
             ruleset_catalog_sha256=self.ruleset_ref.set_sha256,
             platform_config_sha256=self.configuration_ref.set_sha256,
             expected_native_tool_sha256=self.expected_native_tool_sha256,
+            expected_native_tool_record_sha256=(
+                self.native_tool_sha256
+            ),
+            native_tool_requirement_artifact_id=(
+                self.native_tool_requirement_ref.artifact_id
+            ),
         )
         discover_command = StageCommand.create(
             command_id="discover-command",
