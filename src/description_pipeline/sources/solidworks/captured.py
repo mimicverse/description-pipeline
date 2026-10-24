@@ -1,4 +1,4 @@
-"""Derive the portable scene from an already verified immutable CAD snapshot.
+"""Derive the Generate input from an already verified immutable CAD snapshot.
 
 This module never loads a native CAD library or modifies the capture. Windows
 seals native observations and their source configuration; Linux constructs the
@@ -11,8 +11,8 @@ from types import SimpleNamespace
 from ...io import PipelineError, confined, digest, inventory, read_data
 
 
-def derive_scene(root: Path, manifest: dict) -> dict:
-    """Construct a scene using only members of a verified SolidWorks snapshot."""
+def derive_engineering_input(root: Path, manifest: dict) -> dict:
+    """Construct Generate input using only a verified SolidWorks snapshot."""
     from .evidence import (
         REWRITE_ENVIRONMENT_EVIDENCE,
         RUNTIME_EVIDENCE,

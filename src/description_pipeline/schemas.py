@@ -9,6 +9,7 @@ literal.
 from __future__ import annotations
 
 INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
+ENGINEERING_MODEL_SCHEMA = "solidworks-to-urdf.engineering-model/v1"
 TOOL_SCHEMA = "solidworks-to-urdf.tool/v1"
 EFFECTIVE_INSTANCES_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"

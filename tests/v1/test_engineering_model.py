@@ -56,7 +56,7 @@ class EngineeringModelTests(unittest.TestCase):
             mutated["name"] = "mutated_robot"
             mutated_model = EngineeringModel.from_dict(mutated)
             self.assertNotEqual(mutated_model.semantic_sha256, model.semantic_sha256)
-            with self.assertRaisesRegex(PipelineError, "Canonical model robot name differs"):
+            with self.assertRaisesRegex(PipelineError, "robot identity"):
                 _xml(root, {"source": {"robot_name": "fixture_arm"}}, mutated_model.to_dict())
 
 

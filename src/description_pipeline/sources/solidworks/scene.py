@@ -25,8 +25,7 @@ from .naming import (
     visual_name,
 )
 from .native_limits import ENGINEERING_DEFAULT_POLICY_ID, PREVIEW_POLICY_ID
-from ...model import ENGINEERING_MODEL_SCHEMA
-from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
+from ...schemas import ENGINEERING_MODEL_SCHEMA, LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
 
 def engineering_model_schema_supported(value: object) -> bool:
@@ -1508,15 +1507,15 @@ def _build_frames(
 
 
 def load_scene(snapshot_root: Path) -> dict[str, Any]:
-    """Verify a frozen snapshot and derive its CAD-only scene on the portable host."""
+    """Legacy loader for replay/tests; Generate consumes derive_engineering_input."""
 
     from ..snapshot import verify_snapshot
 
     root = Path(snapshot_root).resolve()
     manifest = verify_snapshot(root)
-    from .captured import derive_scene
+    from .captured import derive_engineering_input
 
-    scene = derive_scene(root, manifest)
+    scene = derive_engineering_input(root, manifest)
     if not isinstance(scene, dict) or not engineering_model_schema_supported(scene.get("schema_version")):
         raise ConfigError("unexpected scene schema", {"snapshot": str(root)})
     if scene.get("units") != "SI":

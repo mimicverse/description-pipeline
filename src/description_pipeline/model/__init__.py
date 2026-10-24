@@ -12,9 +12,8 @@ import jsonschema
 import numpy as np
 
 from ..io import PipelineError, digest, file_digest, inventory, read_data, write_json
+from ..schemas import ENGINEERING_MODEL_SCHEMA
 from ..sources.solidworks.naming import fixed_joint_name
-
-ENGINEERING_MODEL_SCHEMA = "solidworks-to-urdf.engineering-model/v1"
 
 
 @dataclass(frozen=True)

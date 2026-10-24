@@ -880,13 +880,11 @@ def capture_evidence(
 def generate_model(staging: Path, definition: dict, input_report: dict, *, on_event=None) -> str:
     """Generate one canonical model and bind every derived file before independent checking."""
     from .model import EngineeringModel, compile, emit
-    from .sources.solidworks.scene import load_scene
-    from .verification.native_mesh_observations import (
-        native_geometry_value_warnings,
-    )
+    from .sources.solidworks.captured import derive_engineering_input
+    from .sources.solidworks.generation_warnings import generation_value_warnings
 
     _state(on_event, "generate", "running")
-    checked(
+    manifest = checked(
         on_event,
         "generate",
         "input",
@@ -895,12 +893,12 @@ def generate_model(staging: Path, definition: dict, input_report: dict, *, on_ev
         describe=lambda value: _snapshot_details(staging, value),
     )
     write_json(staging / "tool.json", tool_record())
-    model_input = load_scene(staging / "evidence")
+    model_input = derive_engineering_input(staging / "evidence", manifest)
     # URDF comments are written before the verify stage.  Derive their native
     # geometry claims from evidence here; _value_warning_gate recomputes them
     # independently and refuses any missing, forged, or stale model warning.
-    native_warnings = native_geometry_value_warnings(staging)
-    model = compile(model_input, native_warnings=native_warnings)
+    generation_warnings = generation_value_warnings(staging)
+    model = compile(model_input, native_warnings=generation_warnings)
     if model.name != definition["source"]["robot_name"]:
         raise PipelineError("Compiled model name differs from the frozen source identity")
     emit(model, evidence_root=staging / "evidence", destination=staging)

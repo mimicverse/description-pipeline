@@ -12,7 +12,7 @@ from xml.etree import ElementTree as ET
 from description_pipeline.backends.urdf import MESH_PART_TRIANGLE_LIMIT, generate_urdf
 from description_pipeline.io import PipelineError, file_digest, read_data
 from description_pipeline.model import EngineeringModel
-from description_pipeline.sources.solidworks.naming import material_name, mesh_path
+from description_pipeline.sources.solidworks.naming import material_name, mesh_path, visual_name
 from description_pipeline.verification.solidworks_urdf import _xml
 
 
@@ -40,6 +40,9 @@ def _mesh_scene(filename: str) -> dict:
     base = next(link for link in scene["links"] if link["name"] == "base_link")
     for role in ("visuals", "collisions"):
         base[role][0]["filename"] = filename
+        base[role][0]["name"] = visual_name(filename, link=base["name"])
+        if role == "visuals":
+            base[role][0]["material"] = material_name(filename, link=base["name"])
     return scene
 
 
