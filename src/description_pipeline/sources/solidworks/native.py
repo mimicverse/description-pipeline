@@ -8324,17 +8324,12 @@ class SolidWorksBackend(CadBackend):
                     for evidence in endpoint_evidence
                 )
                 row["open_edge_boundary_identity"] = None
-                requires_open_identity = (
-                    uses_tolerant_gap or uses_closest_fallback
-                ) and open_identity_candidate
-                if (
-                    requires_open_identity
-                    and not unique_topology_accepted
-                ):
-                    if not endpoint_set_mode:
+                requires_open_identity = False
+                if uses_tolerant_gap and not unique_topology_accepted:
+                    if not endpoint_set_mode or not open_identity_candidate:
                         raise CadError(
                             "cad_native_tessellation_unreadable",
-                            "ambiguous endpoint sets require an open-edge endpoint identity",
+                            "tolerant gap use requires an open-edge endpoint identity",
                             {
                                 **base,
                                 "edge_index": edge_row["index"],
@@ -8345,6 +8340,28 @@ class SolidWorksBackend(CadBackend):
                                 "cofin_raw_id": cofin_id,
                             },
                         )
+                    requires_open_identity = True
+                elif (
+                    uses_closest_fallback
+                    and open_identity_candidate
+                    and not unique_topology_accepted
+                ):
+                    if not endpoint_set_mode:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "ambiguous closest-point fallback requires an open-edge endpoint identity",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "fin_id": fin_id,
+                                "direct_error_m": direct_error,
+                                "swapped_error_m": swapped_error,
+                                "face_count": incidence,
+                                "cofin_raw_id": cofin_id,
+                            },
+                        )
+                    requires_open_identity = True
+                if requires_open_identity:
                     edge_tolerance = edge["edge_tolerance"]
                     if edge_tolerance["state"] != "success":
                         raise CadError(

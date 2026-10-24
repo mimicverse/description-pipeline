@@ -3086,16 +3086,32 @@ def _parse_itessellation_evidence(
                 and len(edge["face_indices"]) == 1
                 and fin["cofin_raw_id"] == -1
             )
-            requires_open_identity = (
-                uses_tolerant_gap or uses_closest_fallback
-            ) and open_identity_candidate
+            requires_open_identity = False
+            if uses_tolerant_gap:
+                requires_open_identity = not unique_topology_accepted
+                if requires_open_identity:
+                    _require(
+                        endpoint_set_mode and open_identity_candidate,
+                        component
+                        + f": native tessellation v8 edge {reference} "
+                        + "uses a tolerant gap without open-edge endpoint identity",
+                    )
+            elif (
+                uses_closest_fallback
+                and open_identity_candidate
+                and not unique_topology_accepted
+            ):
+                _require(
+                    endpoint_set_mode,
+                    component
+                    + f": native tessellation v8 edge {reference} "
+                    + "uses fallback boundary evidence without open-edge endpoint identity",
+                )
+                requires_open_identity = True
             recomputed_open_identity = None
             open_identity_sha256 = None
             topology_accepted = unique_topology_accepted
-            if (
-                requires_open_identity
-                and unique_topology_accepted
-            ):
+            if uses_tolerant_gap and unique_topology_accepted:
                 _require(
                     fin["open_edge_boundary_identity"] is None,
                     component
