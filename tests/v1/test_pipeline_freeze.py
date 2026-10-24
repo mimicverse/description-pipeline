@@ -25,9 +25,10 @@ from description_pipeline.pipeline.freeze import (
     FREEZE_REQUEST_SCHEMA,
     FreezeRefusal,
     ORIGINALS_KIND,
-    RULESET_CATALOG_SCHEMA,
     RULESET_KIND,
     FreezeHandler,
+    RulesetCatalog,
+    RulesetRoot,
 )
 from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 
@@ -88,14 +89,18 @@ class FreezeHarness:
         (self.originals / "top.SLDASM").write_bytes(b"assembly-bytes")
         (self.originals / "parts").mkdir()
         (self.originals / "parts" / "part.SLDPRT").write_bytes(b"part-bytes")
-        write_json(
-            self.ruleset / "catalog.json",
-            {
-                "schema_version": RULESET_CATALOG_SCHEMA,
-                "version": "rules-2026-10-25",
-                "records": {"arm": {"path": "records/arm.json", "sha256": digest({"arm": 1})}},
-            },
+        rules_root = self.ruleset / "root-000"
+        rules_root.mkdir()
+        (rules_root / "arm.json").write_text('{"value":1}\n', encoding="utf-8")
+        members = {"arm.json": file_digest(rules_root / "arm.json")}
+        roots = (RulesetRoot(path="root-000", members=members),)
+        catalog = RulesetCatalog(
+            version="records-" + digest([root.to_record() for root in roots]),
+            roots=roots,
+            records={"root-000/arm.json": members["arm.json"]},
         )
+        self.ruleset_version = catalog.version
+        write_json(self.ruleset / "catalog.json", catalog.to_record())
         write_json(self.configuration / "config.json", {"snapshot": "config-1"})
         self.originals_ref = _artifact(ORIGINALS_KIND, self.originals)
         self.ruleset_ref = _artifact(RULESET_KIND, self.ruleset)
@@ -115,7 +120,7 @@ class FreezeHarness:
             "purpose": "engineering",
             "change_summary": "Freeze the admitted revision",
             "main_assembly": "top.SLDASM",
-            "ruleset_version": "rules-2026-10-25",
+            "ruleset_version": self.ruleset_version,
             "originals_artifact_id": self.originals_ref.artifact_id,
             "ruleset_artifact_id": self.ruleset_ref.artifact_id,
             "configuration_artifact_id": self.configuration_ref.artifact_id,

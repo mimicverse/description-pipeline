@@ -46,6 +46,11 @@ from .contracts import (
 )
 from .effects import EffectState, StageEffectPort
 from .engine import StageWorkspace
+from .freeze import (
+    RulesetCatalog,
+    read_ruleset_catalog,
+    ruleset_record_roots,
+)
 
 FREEZE_RESULT_KIND = "stage_output:freeze"
 SOURCE_SET_KIND = "freeze_originals"
@@ -294,19 +299,21 @@ def _input_roots(command: StageCommand, workspace: StageWorkspace, bound: Mappin
     return result
 
 
-def _ruleset_version(root: Path, expected: str) -> dict:
+def _ruleset_version(root: Path, expected: str) -> RulesetCatalog:
     try:
-        record = read_data(confined(root, "catalog.json"))
+        catalog = read_ruleset_catalog(root)
     except (PipelineError, OSError, ValueError) as error:
         raise NativeDiscoverRefusal("discover.ruleset_invalid", "Ruleset catalog is missing or unreadable") from error
-    if (
-        not isinstance(record, dict)
-        or record.get("schema_version") != RULESET_CATALOG_SCHEMA
-        or record.get("version") != expected
-        or not isinstance(record.get("records"), dict)
-    ):
+    if catalog.version != expected:
         raise NativeDiscoverRefusal("discover.ruleset_invalid", "Ruleset catalog is invalid or names another version")
-    return record
+    try:
+        ruleset_record_roots(root, catalog)
+    except PipelineError as error:
+        raise NativeDiscoverRefusal(
+            "discover.ruleset_invalid",
+            "Ruleset roots differ from their sealed catalog",
+        ) from error
+    return catalog
 
 
 def _submission_identity(value: Mapping[str, Any]) -> SubmissionIdentity:
@@ -419,7 +426,10 @@ class DiscoverHandler:
             output = workspace.root / f"discover-result-{claim.fence}"
             output.mkdir(parents=True, exist_ok=False)
             settings = DiscoverySettings(
-                record_roots=(roots["ruleset"],),
+                record_roots=ruleset_record_roots(
+                    roots["ruleset"],
+                    ruleset,
+                ),
                 main_assembly=request["main_assembly"],
                 purpose=request["purpose"],
             )
@@ -470,7 +480,11 @@ class DiscoverHandler:
                     {
                         "id": "ruleset.derivation",
                         "state": "passed",
-                        "details": {"version": ruleset["version"], "sha256": bound["ruleset"].set_sha256},
+                        "details": {
+                            "version": ruleset.version,
+                            "sha256": bound["ruleset"].set_sha256,
+                            "roots": [root.to_record() for root in ruleset.roots],
+                        },
                     },
                     {
                         "id": "derivation.findings",

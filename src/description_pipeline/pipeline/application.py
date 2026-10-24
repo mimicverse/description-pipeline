@@ -16,7 +16,7 @@ from typing import Any, Protocol
 
 from ..artifacts import ArtifactStore
 from ..io import PipelineError, digest, read_data
-from ..platform.facts import FactStore
+from ..platform.facts import FactConflict, FactStore
 from ..orchestration.native_operation_client import (
     NativeOperationClient,
     NativeOperationDiscoverPort,
@@ -401,6 +401,7 @@ class StageApplication:
         for expected, role in (
             (spec.originals, "originals"),
             (spec.configuration, "configuration"),
+            (spec.native_tool_requirement, "native_tool_requirement"),
         ):
             actual = VerifiedArtifact.from_store_record(
                 expected.ref,
@@ -493,30 +494,25 @@ class StageApplication:
             producer_run_id=spec.run_id,
             producer_tool_sha256=dispatch_executor_sha256,
         )
-        dag_run_id = dispatch_dag_run_id or spec.request_id
-        dispatch_identity = {
-            "admission_sha256": spec.admission_sha256,
-            "dag_id": dispatch_dag_id,
-            "dag_run_id": dag_run_id,
-            "freeze_command_id": command.command_id,
-            "run_id": spec.run_id,
-        }
-        dispatch_command = DispatchCommand.create(
-            command_id="dispatch:" + digest(dispatch_identity),
-            run_id=spec.run_id,
-            freeze_command_id=command.command_id,
-            idempotency_key=f"{spec.run_id}/dispatch",
-            dag_id=dispatch_dag_id,
-            dag_run_id=dag_run_id,
-            conf_artifact=conf_artifact,
-            expected_executor_sha256=dispatch_executor_sha256,
-        )
-        stored_command, stored_dispatch, _intent = self.facts.admit_run(
-            admission,
+        dispatch_command = self._project_dispatch_command(
+            spec,
             command,
-            dispatch_command,
             conf_artifact,
+            dispatch_dag_id=dispatch_dag_id,
+            dispatch_dag_run_id=dispatch_dag_run_id,
         )
+        try:
+            stored_command, stored_dispatch, _intent = self.facts.admit_run(
+                admission,
+                command,
+                dispatch_command,
+                conf_artifact,
+            )
+        except FactConflict:
+            existing = self.load_admission_outcome(spec.run_id)
+            if existing is None:
+                raise
+            return existing
         if stored_command != command or stored_dispatch != dispatch_command:
             raise ApplicationError(
                 "application.admission_conflict",
@@ -525,6 +521,99 @@ class StageApplication:
         return AdmissionOutcome(
             admission=admission,
             freeze_command=stored_command,
+            dispatch_command=stored_dispatch,
+        )
+
+    @staticmethod
+    def _dispatch_identity(
+        spec: AdmissionSpec,
+        command: StageCommand,
+        *,
+        dispatch_dag_id: str = "solidworks_to_urdf",
+        dispatch_dag_run_id: str | None = None,
+    ) -> dict[str, str]:
+        return {
+            "admission_sha256": spec.admission_sha256,
+            "dag_id": dispatch_dag_id,
+            "dag_run_id": dispatch_dag_run_id or spec.request_id,
+            "freeze_command_id": command.command_id,
+            "run_id": spec.run_id,
+        }
+
+    def _project_dispatch_command(
+        self,
+        spec: AdmissionSpec,
+        command: StageCommand,
+        conf_artifact: ArtifactRef,
+        *,
+        dispatch_dag_id: str = "solidworks_to_urdf",
+        dispatch_dag_run_id: str | None = None,
+    ) -> DispatchCommand:
+        dag_run_id = dispatch_dag_run_id or spec.request_id
+        dispatch_identity = self._dispatch_identity(
+            spec,
+            command,
+            dispatch_dag_id=dispatch_dag_id,
+            dispatch_dag_run_id=dag_run_id,
+        )
+        return DispatchCommand.create(
+            command_id="dispatch:" + digest(dispatch_identity),
+            run_id=spec.run_id,
+            freeze_command_id=command.command_id,
+            idempotency_key=f"{spec.run_id}/dispatch",
+            dag_id=dispatch_dag_id,
+            dag_run_id=dag_run_id,
+            conf_artifact=conf_artifact,
+            expected_executor_sha256=spec.dispatch_executor_sha256,
+        )
+
+    def load_admission_outcome(self, run_id: str) -> AdmissionOutcome | None:
+        """Read and validate one admitted run without sealing or writing any input."""
+
+        admission = self.facts.load_admission(run_id)
+        if admission is None:
+            return None
+        if not isinstance(admission.request, Mapping):
+            raise ApplicationError(
+                "application.admission_invalid",
+                "Run admission request is malformed",
+            )
+        request_record = json.loads(json.dumps(_plain(admission.request), sort_keys=True))
+        spec = AdmissionSpec.from_record(request_record)
+        validate_run_admission(spec, admission)
+        self._verify_admission_artifacts(spec)
+        freeze_command = build_freeze_command(spec)
+        stored_freeze = self.facts.load_command(freeze_command.command_id)
+        if stored_freeze != freeze_command:
+            raise ApplicationError(
+                "application.admission_command_mismatch",
+                "Stored Freeze command differs from its deterministic admission projection",
+            )
+        dispatch_identity = self._dispatch_identity(spec, stored_freeze)
+        dispatch_command_id = "dispatch:" + digest(dispatch_identity)
+        stored_dispatch = self.facts.load_dispatch_command(dispatch_command_id)
+        expected_dispatch = self._project_dispatch_command(
+            spec,
+            stored_freeze,
+            stored_dispatch.conf_artifact,
+        )
+        if stored_dispatch != expected_dispatch:
+            raise ApplicationError(
+                "application.admission_command_mismatch",
+                "Stored dispatch command differs from its deterministic projection",
+            )
+        conf = self.artifacts.read_dispatch_conf(stored_dispatch.conf_artifact)
+        if (
+            conf.run_id != spec.run_id
+            or conf.freeze_command_id != stored_freeze.command_id
+        ):
+            raise ApplicationError(
+                "application.admission_command_mismatch",
+                "Stored dispatch conf names another run or Freeze command",
+            )
+        return AdmissionOutcome(
+            admission=admission,
+            freeze_command=stored_freeze,
             dispatch_command=stored_dispatch,
         )
 

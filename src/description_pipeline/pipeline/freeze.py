@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,9 @@ from ..io import (
     confined,
     digest,
     file_digest,
+    inventory,
     read_data,
+    parse_data,
 )
 from ..schemas import (
     ARTIFACT_MANIFEST_SCHEMA,
@@ -41,6 +44,9 @@ from .contracts import (
 )
 from .effects import StageEffectPort
 from .engine import StageWorkspace
+
+_RULESET_CATALOG_FIELDS = frozenset({"schema_version", "version", "records", "roots"})
+_RULESET_ROOT_FIELDS = frozenset({"path", "members"})
 
 ORIGINALS_KIND = "freeze_originals"
 RULESET_KIND = "freeze_ruleset"
@@ -68,6 +74,141 @@ _ARTIFACT_FIELDS = (
     ("configuration", CONFIGURATION_KIND, "configuration_artifact_id"),
 )
 _TERMINAL_REASON_PREFIX = "freeze."
+
+
+@dataclass(frozen=True, slots=True)
+class RulesetRoot:
+    """One portable logical record root inside a sealed ruleset artifact."""
+
+    path: str
+    members: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        try:
+            parts = artifact_path_parts(self.path)
+        except PipelineError as error:
+            raise ValueError("ruleset root path is not canonical") from error
+        if not parts or "/".join(parts) != self.path or self.path == "catalog.json":
+            raise ValueError("ruleset root path is not canonical")
+        if not isinstance(self.members, Mapping):
+            raise ValueError("ruleset root members must be an object")
+        members = {}
+        folded = set()
+        for relative, checksum in self.members.items():
+            if not isinstance(relative, str) or not isinstance(checksum, str):
+                raise ValueError("ruleset members must map text paths to digests")
+            try:
+                member_parts = artifact_path_parts(relative)
+            except PipelineError as error:
+                raise ValueError("ruleset member path is not canonical") from error
+            if not member_parts or "/".join(member_parts) != relative:
+                raise ValueError("ruleset member path is not canonical")
+            if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+                raise ValueError("ruleset member digest is invalid")
+            key = relative.casefold()
+            if key in folded:
+                raise ValueError("ruleset member paths collide")
+            folded.add(key)
+            members[relative] = checksum
+        object.__setattr__(self, "members", dict(sorted(members.items())))
+
+    def to_record(self) -> dict[str, Any]:
+        return {"path": self.path, "members": dict(self.members)}
+
+    @classmethod
+    def from_record(cls, record: object) -> RulesetRoot:
+        if not isinstance(record, Mapping) or set(record) != _RULESET_ROOT_FIELDS:
+            raise ValueError("ruleset root fields are invalid")
+        return cls(path=record["path"], members=record["members"])
+
+
+@dataclass(frozen=True, slots=True)
+class RulesetCatalog:
+    """The ordered logical roots and closed member inventory of one ruleset."""
+
+    version: str
+    roots: tuple[RulesetRoot, ...]
+    records: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, str) or not self.version:
+            raise ValueError("ruleset version is invalid")
+        if (
+            not isinstance(self.roots, tuple)
+            or not self.roots
+            or not all(isinstance(root, RulesetRoot) for root in self.roots)
+        ):
+            raise ValueError("ruleset roots are invalid")
+        root_paths = [root.path.casefold() for root in self.roots]
+        if len(root_paths) != len(set(root_paths)):
+            raise ValueError("ruleset roots collide")
+        for index, root in enumerate(self.roots):
+            root_parts = tuple(part.casefold() for part in root.path.split("/"))
+            for other in self.roots[index + 1 :]:
+                other_parts = tuple(part.casefold() for part in other.path.split("/"))
+                shortest = min(len(root_parts), len(other_parts))
+                if root_parts[:shortest] == other_parts[:shortest]:
+                    raise ValueError("ruleset roots overlap")
+        records: dict[str, str] = {}
+        for root in self.roots:
+            for relative, checksum in root.members.items():
+                path = f"{root.path}/{relative}"
+                if path in records:
+                    raise ValueError("ruleset records collide")
+                records[path] = checksum
+        if not isinstance(self.records, Mapping) or dict(self.records) != records:
+            raise ValueError("ruleset records differ from their logical roots")
+        expected_version = "records-" + digest([root.to_record() for root in self.roots])
+        if self.version != expected_version:
+            raise ValueError("ruleset version differs from its logical roots")
+        object.__setattr__(self, "records", dict(sorted(records.items())))
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "schema_version": RULESET_CATALOG_SCHEMA,
+            "version": self.version,
+            "records": dict(self.records),
+            "roots": [root.to_record() for root in self.roots],
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> RulesetCatalog:
+        if not isinstance(record, Mapping) or set(record) != _RULESET_CATALOG_FIELDS:
+            raise ValueError("ruleset catalog fields are invalid")
+        if record.get("schema_version") != RULESET_CATALOG_SCHEMA:
+            raise ValueError("ruleset catalog schema is unsupported")
+        roots = record.get("roots")
+        if not isinstance(roots, list):
+            raise ValueError("ruleset roots must be a list")
+        return cls(
+            version=record["version"],
+            roots=tuple(RulesetRoot.from_record(item) for item in roots),
+            records=record["records"],
+        )
+
+
+def read_ruleset_catalog(root: Path) -> RulesetCatalog:
+    path = confined(Path(root), "catalog.json")
+    try:
+        record = parse_data(path.read_bytes(), path)
+        return RulesetCatalog.from_record(record)
+    except (PipelineError, OSError, TypeError, ValueError) as error:
+        raise PipelineError(f"Ruleset catalog is invalid: {error}") from error
+
+
+def ruleset_record_roots(root: Path, catalog: RulesetCatalog) -> tuple[Path, ...]:
+    """Resolve sealed logical roots and verify every cataloged byte."""
+
+    root = Path(root)
+    result = []
+    for item in catalog.roots:
+        directory = confined(root, item.path, exists=False)
+        if not directory.is_dir() or directory.is_symlink() or directory.is_junction():
+            raise PipelineError(f"Ruleset root is missing or unsafe: {item.path}")
+        if inventory(directory) != dict(item.members):
+            raise PipelineError(f"Ruleset root differs from its catalog: {item.path}")
+        result.append(directory)
+    return tuple(result)
 
 
 class FreezeRefusal(PipelineError):
@@ -275,20 +416,21 @@ def _copy_original_payload(files: Mapping[str, str], source: Path, destination: 
             )
 
 
-def _ruleset_record(root: Path, expected_version: str) -> dict[str, Any]:
-    path = confined(root, "catalog.json")
+def _ruleset_record(root: Path, expected_version: str) -> RulesetCatalog:
     try:
-        record = read_data(path)
-    except (PipelineError, OSError, ValueError) as error:
+        catalog = read_ruleset_catalog(root)
+    except (PipelineError, OSError, TypeError, ValueError) as error:
         raise FreezeRefusal("freeze.ruleset_invalid", "Ruleset catalog metadata is missing or unreadable") from error
-    if (
-        not isinstance(record, dict)
-        or record.get("schema_version") != RULESET_CATALOG_SCHEMA
-        or record.get("version") != expected_version
-        or not isinstance(record.get("records"), dict)
-    ):
+    if catalog.version != expected_version:
         raise FreezeRefusal("freeze.ruleset_invalid", "Ruleset catalog metadata is invalid or names another version")
-    return record
+    try:
+        ruleset_record_roots(root, catalog)
+    except PipelineError as error:
+        raise FreezeRefusal(
+            "freeze.ruleset_invalid",
+            "Ruleset roots differ from their sealed catalog",
+        ) from error
+    return catalog
 
 
 def _write_canonical(path: Path, value: Any) -> None:
@@ -370,7 +512,10 @@ class FreezeHandler:
                     {
                         "id": "ruleset.catalog",
                         "state": "passed",
-                        "details": {"version": ruleset["version"], "set_sha256": bound["ruleset"].set_sha256},
+                        "details": {
+                            "catalog": ruleset.to_record(),
+                            "set_sha256": bound["ruleset"].set_sha256,
+                        },
                     },
                     {
                         "id": "configuration.snapshot",
@@ -405,7 +550,10 @@ class FreezeHandler:
             )
             _write_canonical(
                 output / "ruleset.json",
-                {"artifact": bound["ruleset"].to_record(), "catalog": ruleset},
+                {
+                    "artifact": bound["ruleset"].to_record(),
+                    "catalog": ruleset.to_record(),
+                },
             )
             _write_canonical(
                 output / "configuration.json",
@@ -460,4 +608,8 @@ __all__ = [
     "RULESET_KIND",
     "FreezeHandler",
     "FreezeRefusal",
+    "RulesetCatalog",
+    "RulesetRoot",
+    "read_ruleset_catalog",
+    "ruleset_record_roots",
 ]

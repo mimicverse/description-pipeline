@@ -34,8 +34,9 @@ from .freeze import (
     CONFIGURATION_KIND,
     FREEZE_REQUEST_SCHEMA,
     ORIGINALS_KIND,
-    RULESET_CATALOG_SCHEMA,
     RULESET_KIND,
+    RulesetCatalog,
+    RulesetRoot,
 )
 from .publish_contract import (
     PUBLISH_OUTPUT_CONTRACT,
@@ -277,11 +278,34 @@ class VerifiedRuleset:
 
     artifact: VerifiedArtifact
     version: str
+    roots: tuple[RulesetRoot, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.artifact, VerifiedArtifact) or self.artifact.ref.kind != RULESET_KIND:
             raise ProtocolError("admission.invalid", {"where": "ruleset"})
         _require_text(self.version, "admission.invalid", "ruleset.version")
+        if (
+            not isinstance(self.roots, tuple)
+            or not self.roots
+            or not all(isinstance(root, RulesetRoot) for root in self.roots)
+        ):
+            raise ProtocolError("admission.ruleset_invalid", {"where": "roots"})
+        records = {
+            f"{root.path}/{relative}": checksum
+            for root in self.roots
+            for relative, checksum in root.members.items()
+        }
+        expected_version = "records-" + digest([root.to_record() for root in self.roots])
+        expected_inventory = {
+            "catalog.json": self.artifact.inventory.get("catalog.json"),
+            **records,
+        }
+        if (
+            self.version != expected_version
+            or self.artifact.inventory != expected_inventory
+            or any(checksum is None for checksum in expected_inventory.values())
+        ):
+            raise ProtocolError("admission.ruleset_invalid", {"where": "bindings"})
 
     @classmethod
     def from_catalog_bytes(
@@ -296,28 +320,39 @@ class VerifiedRuleset:
             raise ProtocolError("admission.ruleset_invalid", {"where": "catalog.json", "reason": "bytes-mismatch"})
         try:
             record = parse_data(catalog_bytes, Path("catalog.json"))
+            catalog: RulesetCatalog = RulesetCatalog.from_record(record)
         except PipelineError as error:
             raise ProtocolError("admission.ruleset_invalid", {"reason": str(error)}) from error
-        if (
-            not isinstance(record, dict)
-            or record.get("schema_version") != RULESET_CATALOG_SCHEMA
-            or not isinstance(record.get("version"), str)
-            or not record["version"]
-            or not isinstance(record.get("records"), dict)
-        ):
-            raise ProtocolError("admission.ruleset_invalid", {"where": "catalog.json"})
-        return cls(artifact=artifact, version=record["version"])
+        except (TypeError, ValueError) as error:
+            raise ProtocolError("admission.ruleset_invalid", {"where": "catalog.json"}) from error
+        return cls(
+            artifact=artifact,
+            version=catalog.version,
+            roots=catalog.roots,
+        )
 
     def to_record(self) -> dict[str, Any]:
-        return {"artifact": self.artifact.to_record(), "version": self.version}
+        return {
+            "artifact": self.artifact.to_record(),
+            "version": self.version,
+            "roots": [root.to_record() for root in self.roots],
+        }
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> VerifiedRuleset:
-        if not isinstance(record, Mapping) or set(record) != {"artifact", "version"}:
+        if not isinstance(record, Mapping) or set(record) != {"artifact", "version", "roots"}:
             raise ProtocolError("admission.ruleset_invalid", {"where": "record"})
+        roots = record["roots"]
+        if not isinstance(roots, (list, tuple)):
+            raise ProtocolError("admission.ruleset_invalid", {"where": "roots"})
+        try:
+            parsed_roots = tuple(RulesetRoot.from_record(root) for root in roots)
+        except (TypeError, ValueError) as error:
+            raise ProtocolError("admission.ruleset_invalid", {"where": "roots"}) from error
         return cls(
             artifact=_verified_from_record(record["artifact"]),
             version=record["version"],
+            roots=parsed_roots,
         )
 
 

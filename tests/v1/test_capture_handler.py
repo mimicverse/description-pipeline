@@ -292,7 +292,7 @@ class CaptureHandlerTests(unittest.TestCase):
             "purpose": "engineering",
             "change_summary": "Prove adjacent Freeze Discover Capture contracts",
             "main_assembly": MAIN,
-            "ruleset_version": "rules-2026-10-25",
+            "ruleset_version": self.stage_fixture.ruleset_version,
             "originals_artifact_id": self.source_ref.artifact_id,
             "ruleset_artifact_id": self.ruleset_ref.artifact_id,
             "configuration_artifact_id": self.configuration_ref.artifact_id,

@@ -34,12 +34,12 @@ from description_pipeline.pipeline.discover import (
     CONFIGURATION_KIND,
     DISCOVER_REQUEST_SCHEMA,
     FREEZE_RESULT_KIND,
-    RULESET_CATALOG_SCHEMA,
     RULESET_KIND,
     SOURCE_SET_KIND,
     DiscoverHandler,
 )
 from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
+from description_pipeline.pipeline.freeze import RulesetCatalog, RulesetRoot
 from description_pipeline.pipeline.effects import EffectSettlement, EffectState
 from description_pipeline.schemas import (
     NATIVE_DISCOVER_EFFECT_SCHEMA,
@@ -296,21 +296,9 @@ class DiscoverHarness:
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(payload)
-        (self.rules / "catalog.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": RULESET_CATALOG_SCHEMA,
-                    "version": "rules-2026-10-25",
-                    "records": {
-                        "budget": "budget.json",
-                        "joint": "joints/arm.json",
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        (self.rules / "joints").mkdir()
-        (self.rules / "budget.json").write_text(
+        rules_root = self.rules / "root-000"
+        (rules_root / "joints").mkdir(parents=True)
+        (rules_root / "budget.json").write_text(
             json.dumps(
                 {
                     "robot": {
@@ -321,7 +309,7 @@ class DiscoverHarness:
             ),
             encoding="utf-8",
         )
-        (self.rules / "joints/arm.json").write_text(
+        (rules_root / "joints/arm.json").write_text(
             json.dumps(
                 {
                     "limits": {"lower": -1.5, "upper": 1.5},
@@ -330,6 +318,19 @@ class DiscoverHarness:
             ),
             encoding="utf-8",
         )
+        members = {
+            path.relative_to(rules_root).as_posix(): file_digest(path)
+            for path in sorted(rules_root.rglob("*"))
+            if path.is_file()
+        }
+        roots = (RulesetRoot(path="root-000", members=members),)
+        catalog = RulesetCatalog(
+            version="records-" + digest([root.to_record() for root in roots]),
+            roots=roots,
+            records={f"root-000/{path}": checksum for path, checksum in members.items()},
+        )
+        self.ruleset_version = catalog.version
+        write_json(self.rules / "catalog.json", catalog.to_record())
         write_json(self.configuration / "config.json", {"snapshot": "configuration-1"})
         write_json(self.freeze / "result.json", {"stage": "freeze", "passed": True})
         self.source_files = {name: file_digest(self.source / name) for name in self.source_bytes}
@@ -353,7 +354,7 @@ class DiscoverHarness:
             "source_inventory_sha256": digest(self.source_files),
             "main_assembly": MAIN,
             "purpose": "engineering",
-            "ruleset_version": "rules-2026-10-25",
+            "ruleset_version": self.ruleset_version,
             "ruleset_catalog_sha256": self.rules_ref.set_sha256,
             "platform_config_sha256": self.configuration_ref.set_sha256,
             "submission_identity": {

@@ -19,7 +19,7 @@ except ImportError:
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.interface_records import check_policy_digest
-from description_pipeline.io import canonical, digest, write_json
+from description_pipeline.io import canonical, digest, inventory, write_json
 from description_pipeline.orchestration.discover_protocol import (
     ArchiveDiscoverAdapter,
 )
@@ -41,6 +41,8 @@ from description_pipeline.pipeline.freeze import (
     FreezeHandler,
     ORIGINALS_KIND,
     RULESET_KIND,
+    RulesetCatalog,
+    RulesetRoot,
 )
 from description_pipeline.pipeline.services import (
     CanonicalStageServices,
@@ -183,6 +185,21 @@ class RealSixStageChainTests(unittest.TestCase):
         self.store = self.publish.store
         self.portable = _portable_tool()
         self.native = _native_tool()
+        release = {
+            "schema_version": "solidworks-to-urdf.release/v1",
+            "pipeline_id": "solidworks-to-urdf",
+            "version": "1.5.0",
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "source_sha256": digest(
+                {"description_pipeline/runtime.py": "c" * 64}
+            ),
+            "package_files": {
+                "description_pipeline/runtime.py": "c" * 64,
+            },
+        }
+        self.portable["release"] = copy.deepcopy(release)
+        self.native["release"] = copy.deepcopy(release)
 
         self.source_root = self.root / "source"
         for relative, payload in {
@@ -204,17 +221,26 @@ class RealSixStageChainTests(unittest.TestCase):
         )
 
         self.rules_root = self.root / "rules"
-        catalog = {
-            "schema_version": "solidworks-to-urdf.ruleset-catalog/v1",
-            "version": "rules-real-six-stage",
-            "records": {
-                "budget": "budget.json",
-                "joint": "joints/arm.json",
-            },
-        }
-        write_json(self.rules_root / "catalog.json", catalog)
+        logical_root = self.rules_root / "root-000"
         for relative, payload in RECORDS.items():
-            write_json(self.rules_root / relative, payload)
+            write_json(logical_root / relative, payload)
+        root_record = RulesetRoot(
+            path="root-000",
+            members=inventory(logical_root),
+        )
+        catalog = RulesetCatalog(
+            version="records-"
+            + digest([root_record.to_record()]),
+            roots=(root_record,),
+            records={
+                f"root-000/{relative}": checksum
+                for relative, checksum in root_record.members.items()
+            },
+        )
+        write_json(
+            self.rules_root / "catalog.json",
+            catalog.to_record(),
+        )
         self.ruleset_ref = self.store.seal_tree(
             self.rules_root,
             kind=RULESET_KIND,

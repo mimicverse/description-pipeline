@@ -41,11 +41,12 @@ from .admission import (
     VerifiedPublishIntent,
     VerifiedRepositorySnapshot,
     VerifiedRuleset,
+    build_freeze_command,
     build_run_admission,
 )
-from .contracts import ProtocolError, RunAdmission
+from .contracts import DispatchCommand, ProtocolError, RunAdmission, StageCommand
 from .discover import CONFIGURATION_KIND, RULESET_KIND, SOURCE_SET_KIND
-from .freeze import RULESET_CATALOG_SCHEMA
+from .freeze import RulesetCatalog, RulesetRoot
 from .publish_contract import REPOSITORY_SNAPSHOT_KIND, REPOSITORY_SNAPSHOT_METADATA
 from ..orchestration.feishu_oauth import valid_actor_principal
 
@@ -346,10 +347,81 @@ class ProductionAdmissionRequest:
         }
 
 
+class AdmissionOutcomePort(Protocol):
+    """The immutable receipt returned by the real StageApplication."""
+
+    admission: RunAdmission
+    freeze_command: StageCommand
+    dispatch_command: DispatchCommand
+
+
+_ADMINISTRATIVE_INTENT_SCHEMA = (
+    "description-pipeline.production-admission-intent/v1"
+)
+
+
+def _intent_differences(
+    expected: Mapping[str, Any],
+    actual: Mapping[str, Any],
+) -> list[str]:
+    return sorted(
+        key
+        for key in set(expected) | set(actual)
+        if expected.get(key) != actual.get(key)
+    )
+
+
+def _request_administrative_intent(
+    request: ProductionAdmissionRequest,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _ADMINISTRATIVE_INTENT_SCHEMA,
+        "run_id": request.run_id,
+        "request_id": request.request_id,
+        "parent_run_id": request.parent_run_id,
+        "from_stage": request.from_stage,
+        "principal": request.principal,
+        "target_hardware": request.target_hardware,
+        "purpose": request.purpose,
+        "change_summary": request.change_summary,
+        "main_assembly": request.main_assembly,
+        "originals": {
+            "files": request.receipt.files,
+            "bytes": request.receipt.bytes,
+            "inventory_sha256": request.receipt.handoff_sha256,
+        },
+    }
+
+
+def _spec_administrative_intent(spec: AdmissionSpec) -> dict[str, Any]:
+    return {
+        "schema_version": _ADMINISTRATIVE_INTENT_SCHEMA,
+        "run_id": spec.run_id,
+        "request_id": spec.request_id,
+        "parent_run_id": spec.parent_run_id,
+        "from_stage": spec.from_stage,
+        "principal": spec.principal,
+        "target_hardware": spec.target_hardware,
+        "purpose": spec.purpose,
+        "change_summary": spec.change_summary,
+        "main_assembly": spec.main_assembly,
+        "originals": {
+            "files": len(spec.originals.members),
+            "bytes": sum(member.bytes for member in spec.originals.members),
+            "inventory_sha256": spec.originals.inventory_sha256,
+        },
+    }
+
+
 class AdmissionApplication(Protocol):
     """The one atomic admission write consumed by the loader."""
 
-    def admit(self, spec: AdmissionSpec) -> RunAdmission: ...
+    def admit(self, spec: AdmissionSpec) -> AdmissionOutcomePort: ...
+
+    def load_admission_outcome(
+        self,
+        run_id: str,
+    ) -> AdmissionOutcomePort | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,16 +431,80 @@ class PreparedAdmission:
     spec: AdmissionSpec
     run_admission: RunAdmission
 
-    def register(self, application: AdmissionApplication) -> RunAdmission:
+    def validate_outcome(
+        self,
+        outcome: AdmissionOutcomePort,
+    ) -> AdmissionSpec:
+        if not all(
+            hasattr(outcome, field)
+            for field in ("admission", "freeze_command", "dispatch_command")
+        ):
+            raise ProtocolError(
+                "admission_ingestion.outcome_invalid",
+                {"run_id": self.spec.run_id, "reason": "fields"},
+            )
+        if (
+            not isinstance(outcome.admission, RunAdmission)
+            or not isinstance(outcome.admission.request, Mapping)
+        ):
+            raise ProtocolError(
+                "admission_ingestion.outcome_invalid",
+                {"run_id": self.spec.run_id, "reason": "admission"},
+            )
+        try:
+            outcome_spec = AdmissionSpec.from_record(outcome.admission.request)
+        except (PipelineError, TypeError, ValueError) as error:
+            raise ProtocolError(
+                "admission_ingestion.outcome_invalid",
+                {"run_id": self.spec.run_id, "reason": "admission-spec"},
+            ) from error
+        expected_intent = _spec_administrative_intent(self.spec)
+        actual_intent = _spec_administrative_intent(outcome_spec)
+        differences = _intent_differences(expected_intent, actual_intent)
+        if differences:
+            raise ProtocolError(
+                "admission_ingestion.intent_conflict",
+                {
+                    "run_id": self.spec.run_id,
+                    "fields": differences,
+                },
+            )
+        expected_run = build_run_admission(outcome_spec)
+        if outcome.admission != expected_run:
+            raise ProtocolError(
+                "admission_ingestion.outcome_invalid",
+                {"run_id": self.spec.run_id, "reason": "admission-bindings"},
+            )
+        expected_freeze = build_freeze_command(outcome_spec)
+        dispatch = outcome.dispatch_command
+        if (
+            not isinstance(outcome.freeze_command, StageCommand)
+            or outcome.freeze_command != expected_freeze
+        ):
+            raise ProtocolError(
+                "admission_ingestion.outcome_mismatch",
+                {"where": "freeze_command", "run_id": self.spec.run_id},
+            )
+        if (
+            not isinstance(dispatch, DispatchCommand)
+            or dispatch.run_id != outcome_spec.run_id
+            or dispatch.freeze_command_id != expected_freeze.command_id
+            or dispatch.idempotency_key != f"{outcome_spec.run_id}/dispatch"
+            or dispatch.expected_executor_sha256
+            != outcome_spec.dispatch_executor_sha256
+        ):
+            raise ProtocolError(
+                "admission_ingestion.outcome_mismatch",
+                {"where": "dispatch_command", "run_id": self.spec.run_id},
+            )
+        return outcome_spec
+
+    def register(self, application: AdmissionApplication) -> AdmissionOutcomePort:
         if not callable(getattr(application, "admit", None)):
             raise TypeError("application must provide admit(spec)")
-        actual = application.admit(self.spec)
-        if actual != self.run_admission:
-            raise ProtocolError(
-                "admission_ingestion.run_mismatch",
-                {"run_id": self.spec.run_id},
-            )
-        return actual
+        outcome = application.admit(self.spec)
+        self.validate_outcome(outcome)
+        return outcome
 
 
 class ProductionAdmissionFactory:
@@ -446,21 +582,15 @@ class ProductionAdmissionFactory:
             verify=source,
             publish=source,
         )
-        ingestion = digest(
-            {
-                "kind": "admission_ingestion",
-                "portable_tool_sha256": digest(portable),
-            }
-        )
         dispatch = scoped_executor_sha256(
             portable,
             "airflow_dispatch",
         )
-        return executors, ingestion, dispatch
+        return executors, source, dispatch
 
     def _native_requirement(
         self,
-        ingestion_tool_sha256: str,
+        ingestion_executor_sha256: str,
     ) -> tuple[VerifiedArtifact, str, str]:
         tool = _canonical_mapping(
             self.native_tool_provider(),
@@ -490,7 +620,7 @@ class ProductionAdmissionFactory:
                 kind=NATIVE_TOOL_REQUIREMENT_KIND,
                 producer_run_id=None,
                 producer_stage=None,
-                producer_tool_sha256=ingestion_tool_sha256,
+                producer_tool_sha256=ingestion_executor_sha256,
             )
         requirement = self._verified(artifact)
         if requirement.inventory != {"tool.json": record_sha256}:
@@ -510,7 +640,7 @@ class ProductionAdmissionFactory:
         self,
         request: ProductionAdmissionRequest,
         resolved: Mapping[str, Any],
-        ingestion_tool_sha256: str,
+        ingestion_executor_sha256: str,
     ) -> VerifiedArtifact:
         handoff_root = _real_directory(
             resolved["storage"]["handoff_root"],
@@ -545,7 +675,7 @@ class ProductionAdmissionFactory:
             kind=SOURCE_SET_KIND,
             producer_run_id=None,
             producer_stage=None,
-            producer_tool_sha256=ingestion_tool_sha256,
+            producer_tool_sha256=ingestion_executor_sha256,
         )
         verified = self._verified(artifact)
         if verified.inventory != files:
@@ -555,7 +685,7 @@ class ProductionAdmissionFactory:
     def _seal_ruleset(
         self,
         resolved: Mapping[str, Any],
-        ingestion_tool_sha256: str,
+        ingestion_executor_sha256: str,
     ) -> VerifiedRuleset:
         roots = resolved["specifications"]["record_roots"]
         if not isinstance(roots, list) or not roots:
@@ -563,9 +693,13 @@ class ProductionAdmissionFactory:
         with tempfile.TemporaryDirectory(prefix="admission-rules-", dir=self.work_root) as directory:
             target = Path(directory)
             records: dict[str, str] = {}
+            logical_roots: list[RulesetRoot] = []
             seen: set[str] = set()
             for index, root_value in enumerate(roots):
                 root = _real_directory(root_value, f"record_roots[{index}]")
+                root_path = f"root-{index:03d}"
+                (target / root_path).mkdir()
+                root_records: dict[str, str] = {}
                 for source in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
                     if source.is_symlink() or source.is_junction() or not stat.S_ISREG(source.stat().st_mode):
                         if source.is_dir() and not source.is_symlink() and not source.is_junction():
@@ -580,7 +714,7 @@ class ProductionAdmissionFactory:
                             "admission_ingestion.ruleset_invalid",
                             {"where": relative},
                         )
-                    name = f"root-{index:03d}/{relative}"
+                    name = f"{root_path}/{relative}"
                     folded = name.casefold()
                     if folded in seen:
                         raise ProtocolError(
@@ -598,24 +732,31 @@ class ProductionAdmissionFactory:
                             "admission_ingestion.ruleset_invalid",
                             {"reason": "changed", "path": name},
                         )
+                    root_records[relative] = copied
                     records[name] = copied
+                logical_roots.append(
+                    RulesetRoot(path=root_path, members=root_records)
+                )
             if not records:
                 raise ProtocolError("admission_ingestion.ruleset_empty")
-            version = "records-" + digest(records)
+            version = "records-" + digest(
+                [root.to_record() for root in logical_roots]
+            )
+            catalog = RulesetCatalog(
+                version=version,
+                roots=tuple(logical_roots),
+                records=records,
+            )
             write_json(
                 target / "catalog.json",
-                {
-                    "schema_version": RULESET_CATALOG_SCHEMA,
-                    "version": version,
-                    "records": records,
-                },
+                catalog.to_record(),
             )
             artifact = self.artifacts.seal_tree(
                 target,
                 kind=RULESET_KIND,
                 producer_run_id=None,
                 producer_stage=None,
-                producer_tool_sha256=ingestion_tool_sha256,
+                producer_tool_sha256=ingestion_executor_sha256,
             )
         verified = self._verified(artifact)
         with tempfile.TemporaryDirectory(prefix="admission-ruleset-read-", dir=self.work_root) as directory:
@@ -632,7 +773,7 @@ class ProductionAdmissionFactory:
         self,
         resolved: Mapping[str, Any],
         snapshot_bytes: bytes,
-        ingestion_tool_sha256: str,
+        ingestion_executor_sha256: str,
     ) -> VerifiedArtifact:
         artifact_root = _real_directory(
             resolved["storage"]["artifact_root"],
@@ -651,7 +792,7 @@ class ProductionAdmissionFactory:
                 kind=CONFIGURATION_KIND,
                 producer_run_id=None,
                 producer_stage=None,
-                producer_tool_sha256=ingestion_tool_sha256,
+                producer_tool_sha256=ingestion_executor_sha256,
             )
         return self._verified(artifact)
 
@@ -660,7 +801,7 @@ class ProductionAdmissionFactory:
         request: ProductionAdmissionRequest,
         resolved: Mapping[str, Any],
         created_at: datetime,
-        ingestion_tool_sha256: str,
+        ingestion_executor_sha256: str,
     ) -> VerifiedPublishIntent:
         target = resolved["targets"].get(request.target_hardware)
         if not isinstance(target, Mapping):
@@ -752,7 +893,7 @@ class ProductionAdmissionFactory:
                 kind=REPOSITORY_SNAPSHOT_KIND,
                 producer_run_id=None,
                 producer_stage=None,
-                producer_tool_sha256=ingestion_tool_sha256,
+                producer_tool_sha256=ingestion_executor_sha256,
             )
         verified = self._verified(artifact)
         with tempfile.TemporaryDirectory(prefix="admission-repository-read-", dir=self.work_root) as directory:
@@ -802,29 +943,29 @@ class ProductionAdmissionFactory:
         resolved, platform_config_sha256, snapshot_bytes = self._load_platform()
         (
             executors,
-            ingestion_tool_sha256,
+            ingestion_executor_sha256,
             dispatch_executor_sha256,
         ) = self._installed()
         native_tool_requirement, native_source_sha256, native_record_sha256 = (
-            self._native_requirement(ingestion_tool_sha256)
+            self._native_requirement(ingestion_executor_sha256)
         )
         created_at = self._now()
         originals = self._seal_upload(
             request,
             resolved,
-            ingestion_tool_sha256,
+            ingestion_executor_sha256,
         )
-        ruleset = self._seal_ruleset(resolved, ingestion_tool_sha256)
+        ruleset = self._seal_ruleset(resolved, ingestion_executor_sha256)
         configuration = self._seal_configuration(
             resolved,
             snapshot_bytes,
-            ingestion_tool_sha256,
+            ingestion_executor_sha256,
         )
         publish_intent = self._publication(
             request,
             resolved,
             created_at,
-            ingestion_tool_sha256,
+            ingestion_executor_sha256,
         )
         spec = AdmissionSpec(
             schema_version=ADMISSION_SPEC_SCHEMA,
@@ -860,7 +1001,41 @@ class ProductionAdmissionFactory:
         self,
         application: AdmissionApplication,
         request: ProductionAdmissionRequest,
-    ) -> RunAdmission:
+    ) -> AdmissionOutcomePort:
+        if not isinstance(request, ProductionAdmissionRequest):
+            raise TypeError("request must be a ProductionAdmissionRequest")
+        if not callable(getattr(application, "load_admission_outcome", None)):
+            raise TypeError("application must provide load_admission_outcome(run_id)")
+        existing = application.load_admission_outcome(request.run_id)
+        if existing is not None:
+            if (
+                not isinstance(existing.admission, RunAdmission)
+                or not isinstance(existing.admission.request, Mapping)
+            ):
+                raise ProtocolError(
+                    "admission_ingestion.outcome_invalid",
+                    {"run_id": request.run_id, "reason": "admission"},
+                )
+            existing_spec = AdmissionSpec.from_record(
+                existing.admission.request
+            )
+            differences = _intent_differences(
+                _request_administrative_intent(request),
+                _spec_administrative_intent(existing_spec),
+            )
+            if differences:
+                raise ProtocolError(
+                    "admission_ingestion.intent_conflict",
+                    {
+                        "run_id": request.run_id,
+                        "fields": differences,
+                    },
+                )
+            PreparedAdmission(
+                spec=existing_spec,
+                run_admission=build_run_admission(existing_spec),
+            ).validate_outcome(existing)
+            return existing
         return self.prepare(request).register(application)
 
 
@@ -874,7 +1049,7 @@ def load_production_admission(
     work_root: Path,
     clock: Callable[[], datetime] | None = None,
     portable_tool_provider: Callable[[], Mapping[str, Any]] | None = None,
-) -> RunAdmission:
+) -> AdmissionOutcomePort:
     """Minimal loader call for the production entry."""
 
     return ProductionAdmissionFactory(
@@ -889,6 +1064,7 @@ def load_production_admission(
 
 __all__ = [
     "AdmissionApplication",
+    "AdmissionOutcomePort",
     "PreparedAdmission",
     "ProductionAdmissionFactory",
     "ProductionAdmissionRequest",

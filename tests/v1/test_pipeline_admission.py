@@ -60,7 +60,11 @@ from description_pipeline.pipeline.discover import (
     RULESET_KIND,
     SOURCE_SET_KIND,
 )
-from description_pipeline.pipeline.freeze import FREEZE_REQUEST_SCHEMA, RULESET_CATALOG_SCHEMA
+from description_pipeline.pipeline.freeze import (
+    FREEZE_REQUEST_SCHEMA,
+    RulesetCatalog,
+    RulesetRoot,
+)
 from description_pipeline.pipeline.publish_contract import (
     PUBLISH_OUTPUT_CONTRACT,
     PUBLISH_REQUEST_SCHEMA,
@@ -106,15 +110,26 @@ class AdmissionHarness:
                 "parts/arm.SLDPRT": b"arm",
             },
         )
+        rule_bytes = b'{"limits":{"lower":-1.0,"upper":1.0}}\n'
+        root_members = {
+            "joints/arm.json": hashlib.sha256(rule_bytes).hexdigest(),
+        }
+        rule_roots = (RulesetRoot(path="root-000", members=root_members),)
+        rule_catalog = RulesetCatalog(
+            version="records-" + digest([root.to_record() for root in rule_roots]),
+            roots=rule_roots,
+            records={
+                "root-000/joints/arm.json": root_members["joints/arm.json"],
+            },
+        )
+        ruleset_files = {
+            "catalog.json": canonical(rule_catalog.to_record()),
+            "root-000/joints/arm.json": rule_bytes,
+        }
         self.ruleset_ref = self._seal_source(
             RULESET_KIND,
             root / "rules",
-            {
-                "catalog.json": (
-                    f'{{"schema_version":"{RULESET_CATALOG_SCHEMA}","version":"rules-2026-10-25","records":{{}}}}\n'
-                ).encode(),
-                "joints/arm.json": b'{"limits":{"lower":-1.0,"upper":1.0}}\n',
-            },
+            ruleset_files,
         )
         self.configuration_ref = self._seal_source(
             CONFIGURATION_KIND,
@@ -140,7 +155,7 @@ class AdmissionHarness:
         )
         self.verified_ruleset = VerifiedRuleset.from_catalog_bytes(
             self.ruleset,
-            (root / "rules/catalog.json").read_bytes(),
+            ruleset_files["catalog.json"],
         )
         self.publish_intent = self._publish_intent()
         self.spec = AdmissionSpec(
