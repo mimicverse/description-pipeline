@@ -130,6 +130,7 @@ class _UnsealedFailureHandler:
 class _UnexpectedFailureHandler:
     def execute(self, command, claim, workspace, *, effects):
         (workspace.root / "native-attempt.txt").write_text("in-flight native state\n", encoding="utf-8")
+        (workspace.root / "failure.json").write_text("original domain failure\n", encoding="utf-8")
         raise RuntimeError("unexpected native state")
 
     def validate_candidate(self, command, claim, candidate, *, effects):
@@ -572,7 +573,8 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertEqual(len(workspaces), 1)
         workspace = workspaces[0]
         self.assertTrue((workspace / "native-attempt.txt").is_file())
-        marker = workspace / "failure.json"
+        self.assertEqual((workspace / "failure.json").read_text(encoding="utf-8"), "original domain failure\n")
+        marker = workspace / "engine-unhandled-failure.json"
         self.assertTrue(marker.is_file())
         self.assertEqual(
             __import__("json").loads(marker.read_text(encoding="utf-8"))["error_type"],
@@ -602,7 +604,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertEqual(len(workspaces), 1)
         self.assertIn(
             "decision commit response lost",
-            (workspaces[0] / "failure.json").read_text(encoding="utf-8"),
+            (workspaces[0] / "engine-unhandled-failure.json").read_text(encoding="utf-8"),
         )
 
     def test_expected_executor_drift_stops_before_handler_execution(self) -> None:

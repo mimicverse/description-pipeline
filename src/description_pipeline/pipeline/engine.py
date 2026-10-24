@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from ..io import write_json
+from ..io import canonical
 from .contracts import (
     ExecutionClaim,
     FailureEnvelope,
@@ -269,21 +269,26 @@ def execute_stage(
         cleanup_workspace = candidate.result.outcome == "completed" and candidate.result.resources_settled is True
         return candidate.result
     except Exception as error:
-        with contextlib.suppress(Exception):
-            write_json(
-                workspace.root / "failure.json",
-                {
-                    "schema_version": "description-pipeline.unhandled-stage-failure/v1",
-                    "command_id": command.command_id,
-                    "run_id": command.run_id,
-                    "stage": command.stage,
-                    "claim_id": claim.claim_id,
-                    "fence": claim.fence,
-                    "error_type": type(error).__name__,
-                    "error_message": str(error)[:4096],
-                    "recorded_at": datetime.now(UTC).isoformat(),
-                    "workspace": str(workspace.root.resolve()),
-                },
+        with (
+            contextlib.suppress(Exception),
+            (workspace.root / "engine-unhandled-failure.json").open("xb") as stream,
+        ):
+            stream.write(
+                canonical(
+                    {
+                        "schema_version": "description-pipeline.unhandled-stage-failure/v1",
+                        "command_id": command.command_id,
+                        "run_id": command.run_id,
+                        "stage": command.stage,
+                        "claim_id": claim.claim_id,
+                        "fence": claim.fence,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error)[:4096],
+                        "recorded_at": datetime.now(UTC).isoformat(),
+                        "workspace": str(workspace.root.resolve()),
+                    }
+                )
+                + b"\n"
             )
         raise
     finally:
