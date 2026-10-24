@@ -503,6 +503,7 @@ class StageCandidate:
     """A sealed stage result not yet committed as a decision."""
 
     result: StageResult
+    result_record_artifact: ArtifactRef | None = None
     candidate_id: str | None = None
     claim_id: str | None = None
     fence: int | None = None
@@ -510,10 +511,12 @@ class StageCandidate:
     def __post_init__(self) -> None:
         if not isinstance(self.result, StageResult):
             raise ProtocolError("candidate.invalid", {"where": "result"})
-        values = (self.candidate_id, self.claim_id, self.fence)
+        values = (self.result_record_artifact, self.candidate_id, self.claim_id, self.fence)
         if any(value is None for value in values) and not all(value is None for value in values):
             raise ProtocolError("candidate.invalid", {"reason": "partial-persisted-identity"})
-        if self.candidate_id is not None:
+        if self.result_record_artifact is not None:
+            if not isinstance(self.result_record_artifact, ArtifactRef):
+                raise ProtocolError("candidate.invalid", {"where": "result_record_artifact"})
             _require_text(self.candidate_id, "candidate.invalid", "candidate_id")
             _require_text(self.claim_id, "candidate.invalid", "claim_id")
             if type(self.fence) is not int or self.fence <= 0:

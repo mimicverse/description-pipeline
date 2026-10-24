@@ -771,6 +771,7 @@ class FactStore:
                 return stored
             return StageCandidate(
                 result=result,
+                result_record_artifact=result_artifact,
                 candidate_id=candidate_id,
                 claim_id=claim.claim_id,
                 fence=claim.fence,
@@ -792,6 +793,7 @@ class FactStore:
         result = self._result_reader.read_result(artifact)
         return StageCandidate(
             result=result,
+            result_record_artifact=artifact,
             candidate_id=row[0],
             claim_id=row[1],
             fence=row[2],
