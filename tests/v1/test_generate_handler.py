@@ -6,6 +6,7 @@ import copy
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +22,7 @@ from description_pipeline.pipeline.contracts import (
     StageResult,
 )
 from description_pipeline.pipeline.engine import StageWorkspace
+from description_pipeline.runtime import tool_record
 from description_pipeline.pipeline.stages.generate import (
     CAPTURE_ARTIFACT_KIND,
     GENERATE_OUTPUT_CONTRACT,
@@ -31,6 +33,7 @@ from description_pipeline.sources.solidworks.generation_warnings import generati
 from description_pipeline.sources.snapshot import write_manifest
 
 from tests.sources import test_solidworks_mass_authority as authority_fixtures
+from description_pipeline.pipeline.stages import generate as generate_stage
 from tests.v1 import test_native_scope_warning_projection as warning_fixtures
 
 
@@ -70,6 +73,8 @@ class GenerateHandlerTests(unittest.TestCase):
             producer_stage="capture",
             producer_tool_sha256=capture_tool,
         )
+        self.tool = tool_record(role="portable")
+        self.executor = self.tool["source_sha256"]
         self.command = StageCommand.create(
             command_id="generate-command",
             run_id="generate-run",
@@ -84,7 +89,7 @@ class GenerateHandlerTests(unittest.TestCase):
             config_snapshot_sha256=digest({"config": 1}),
             contract_sha256=digest({"rules": 1}),
             policy_sha256=digest({"policy": 1}),
-            expected_executor_sha256=digest({"executor": "generate-tool"}),
+            expected_executor_sha256=self.executor,
             predecessor_decision_id="capture-decision",
         )
         self.handler = GenerateHandler(self.store)
@@ -98,6 +103,7 @@ class GenerateHandlerTests(unittest.TestCase):
             command_id=self.command.command_id,
             fence=fence,
             owner_sha256=digest({"process": fence}),
+            executor_sha256=self.executor,
             lane_key=None,
             expires_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(minutes=5),
         )
@@ -127,12 +133,12 @@ class GenerateHandlerTests(unittest.TestCase):
                 side_effect=AssertionError("verification helper must not produce model warnings"),
             ),
         ):
-            first = self.handler.execute(self.command, first_claim, first_workspace)
+            first = self.handler.execute(self.command, first_claim, first_workspace, effects=object())
         first_files = inventory(Path(first.candidate_root))
         shutil.rmtree(first_workspace.root)
 
         second_workspace, second_claim = self._workspace("attempt-b", 2)
-        second = self.handler.execute(self.command, second_claim, second_workspace)
+        second = self.handler.execute(self.command, second_claim, second_workspace, effects=object())
         second_files = inventory(Path(second.candidate_root))
 
         self.assertEqual(first.outcome, "completed")
@@ -141,9 +147,58 @@ class GenerateHandlerTests(unittest.TestCase):
         self.assertNotIn(str(first_workspace.root), repr(first_files))
         self.assertNotIn(str(second_workspace.root), repr(second_files))
 
-    def test_mutated_candidate_is_rejected_by_deterministic_replay(self) -> None:
+    def _candidate(self, output_artifact, *, checks_sha256: str) -> StageCandidate:
+        result = StageResult(
+            schema_version="description-pipeline.stage-result/v1",
+            command_id=self.command.command_id,
+            run_id=self.command.run_id,
+            stage="generate",
+            request_digest=self.command.request_digest,
+            outcome="completed",
+            output_artifact=output_artifact,
+            actual_executor_sha256=self.executor,
+            checks_sha256=checks_sha256,
+        )
+        return StageCandidate(result=result)
+
+    def test_candidate_validation_is_structural_and_does_not_regenerate(self) -> None:
         workspace, claim = self._workspace("attempt", 1)
-        execution = self.handler.execute(self.command, claim, workspace)
+        with (
+            patch.object(generate_stage, "_compile_capture", wraps=generate_stage._compile_capture) as compile_call,
+            patch.object(generate_stage, "emit", wraps=generate_stage.emit) as emit_call,
+        ):
+            execution = self.handler.execute(self.command, claim, workspace, effects=object())
+            candidate_artifact = self.store.seal_tree(
+                execution.candidate_root,
+                kind="stage_output:generate",
+                producer_run_id=self.command.run_id,
+                producer_stage="generate",
+                producer_tool_sha256=self.executor,
+            )
+            candidate = self._candidate(candidate_artifact, checks_sha256=execution.checks_sha256)
+            self.handler.validate_candidate(self.command, claim, candidate, effects=object())
+        self.assertEqual(compile_call.call_count, 1)
+        self.assertEqual(emit_call.call_count, 1)
+
+    def test_receipt_records_actual_and_required_tool_identity_separately(self) -> None:
+        workspace, claim = self._workspace("attempt", 1)
+        execution = self.handler.execute(self.command, claim, workspace, effects=object())
+        tool = read_data(Path(execution.candidate_root) / "tool.json")
+        receipt = read_data(Path(execution.candidate_root) / "reports/generate.json")
+        self.assertEqual(receipt["required_executor_sha256"], self.command.expected_executor_sha256)
+        self.assertEqual(receipt["actual_executor_sha256"], tool["source_sha256"])
+        self.assertEqual(tool, self.tool)
+
+    def test_current_tool_must_match_command_and_claim(self) -> None:
+        workspace, claim = self._workspace("attempt", 1)
+        drifted = replace(claim, executor_sha256=digest({"tool": "different"}))
+        with self.assertRaisesRegex(ProtocolError, "generate.executor_mismatch"):
+            self.handler.execute(self.command, drifted, workspace, effects=object())
+        self.assertFalse((workspace.root / "output").exists())
+
+    def test_mutated_output_is_rejected_without_generation(self) -> None:
+        workspace, claim = self._workspace("attempt", 1)
+        execution = self.handler.execute(self.command, claim, workspace, effects=object())
         candidate_root = workspace.root / "candidate-source"
         shutil.copytree(execution.candidate_root, candidate_root)
         urdf = candidate_root / "urdf/robot.urdf"
@@ -155,25 +210,60 @@ class GenerateHandlerTests(unittest.TestCase):
             producer_stage="generate",
             producer_tool_sha256=self.command.expected_executor_sha256,
         )
-        result = StageResult(
-            schema_version="description-pipeline.stage-result/v1",
-            command_id=self.command.command_id,
-            run_id=self.command.run_id,
-            stage="generate",
-            request_digest=self.command.request_digest,
-            outcome="completed",
-            result_artifact=candidate_artifact,
-            actual_executor_sha256=self.command.expected_executor_sha256,
-            checks_sha256=execution.checks_sha256,
+        candidate = self._candidate(candidate_artifact, checks_sha256=execution.checks_sha256)
+        with (
+            patch.object(generate_stage, "_compile_capture") as compile_call,
+            self.assertRaisesRegex(ProtocolError, "generate.receipt_urdf"),
+        ):
+            self.handler.validate_candidate(self.command, claim, candidate, effects=object())
+        compile_call.assert_not_called()
+
+    def test_mutated_model_is_rejected_without_generation(self) -> None:
+        workspace, claim = self._workspace("attempt", 1)
+        execution = self.handler.execute(self.command, claim, workspace, effects=object())
+        candidate_root = workspace.root / "candidate-source"
+        shutil.copytree(execution.candidate_root, candidate_root)
+        model_path = candidate_root / "model/robot.json"
+        model = read_data(model_path)
+        model["name"] = "mutated_robot"
+        write_json(model_path, model)
+        candidate_artifact = self.store.seal_tree(
+            candidate_root,
+            kind="stage_output:generate",
+            producer_run_id=self.command.run_id,
+            producer_stage="generate",
+            producer_tool_sha256=self.executor,
         )
-        with self.assertRaisesRegex(ProtocolError, "generate.candidate_mismatch"):
-            self.handler.validate_candidate(self.command, claim, StageCandidate(result=result))
+        candidate = self._candidate(candidate_artifact, checks_sha256=execution.checks_sha256)
+        with (
+            patch.object(generate_stage, "_compile_capture") as compile_call,
+            self.assertRaisesRegex(ProtocolError, "generate.receipt_model"),
+        ):
+            self.handler.validate_candidate(self.command, claim, candidate, effects=object())
+        compile_call.assert_not_called()
+
+    def test_input_artifact_mutation_is_rejected(self) -> None:
+        workspace, claim = self._workspace("attempt", 1)
+        execution = self.handler.execute(self.command, claim, workspace, effects=object())
+        candidate_artifact = self.store.seal_tree(
+            execution.candidate_root,
+            kind="stage_output:generate",
+            producer_run_id=self.command.run_id,
+            producer_stage="generate",
+            producer_tool_sha256=self.executor,
+        )
+        capture_object = self.store.objects / self.capture_ref.artifact_id
+        request_path = capture_object / "input/request.json"
+        request_path.write_bytes(request_path.read_bytes() + b" ")
+        candidate = self._candidate(candidate_artifact, checks_sha256=execution.checks_sha256)
+        with self.assertRaises(PipelineError):
+            self.handler.validate_candidate(self.command, claim, candidate, effects=object())
 
     def test_missing_capture_input_fails_before_output(self) -> None:
         workspace, claim = self._workspace("attempt", 1)
         (workspace.inputs[self.capture_ref.artifact_id] / "input/request.json").unlink()
         with self.assertRaises(PipelineError):
-            self.handler.execute(self.command, claim, workspace)
+            self.handler.execute(self.command, claim, workspace, effects=object())
         self.assertFalse((workspace.root / "output").exists())
 
 
