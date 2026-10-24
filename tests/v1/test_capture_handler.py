@@ -446,9 +446,9 @@ class CaptureHandlerTests(unittest.TestCase):
             request=request
             or {
                 "effect_key": "capture-native",
-                "expected_native_tool_sha256": self.expected_native_tool_sha256,
                 "handoff_sha256": self.handoff_sha256,
                 "main_assembly": MAIN,
+                "native_tool_sha256": self.expected_native_tool_sha256,
                 "prepared_sha256": digest(self.prepared_files),
                 "upload_sha256": self.upload_sha256,
             },
@@ -611,7 +611,7 @@ class CaptureHandlerTests(unittest.TestCase):
         operation = Mock()
         request = {
             **self.command.to_record()["request"],
-            "expected_native_tool_sha256": "d" * 64,
+            "native_tool_sha256": "d" * 64,
         }
         command = self._command(request=request)
         claim = self._claim(command, "claim-native-rebind", fence=1)
