@@ -112,8 +112,7 @@ class ArtifactStore:
         artifact_id = digest(base)
         return {**base, "artifact_id": artifact_id}
 
-    def _manifest(self, artifact_id: str) -> dict:
-        target = self.objects / artifact_id
+    def _manifest_at(self, target: Path, *, artifact_id: str | None = None) -> dict:
         if target.is_symlink():
             raise ArtifactStoreError("An artifact object path may not be a symbolic link")
         manifest_path = target / MANIFEST_NAME
@@ -123,11 +122,14 @@ class ArtifactStore:
         if (
             not isinstance(record, dict)
             or record.get("schema_version") != MANIFEST_SCHEMA
-            or record.get("artifact_id") != artifact_id
+            or record.get("artifact_id") != (artifact_id or target.name)
             or not isinstance(record.get("members"), list)
         ):
             raise ArtifactStoreError("The artifact manifest is not canonical")
         return record
+
+    def _manifest(self, artifact_id: str) -> dict:
+        return self._manifest_at(self.objects / artifact_id, artifact_id=artifact_id)
 
     def _ref(self, record: dict, manifest_path: Path) -> ArtifactRef:
         producer = record.get("producer")
@@ -144,11 +146,8 @@ class ArtifactStore:
             producer_tool_sha256=producer.get("tool_sha256"),
         )
 
-    def verify(self, artifact: ArtifactRef) -> dict:
-        if artifact.locator != f"{LOCATOR_PREFIX}{artifact.artifact_id}":
-            raise ArtifactStoreError("The artifact locator differs from its immutable id")
-        target = self.objects / artifact.artifact_id
-        record = self._manifest(artifact.artifact_id)
+    def _verify_root(self, artifact: ArtifactRef, target: Path) -> dict:
+        record = self._manifest_at(target, artifact_id=artifact.artifact_id)
         manifest_path = target / MANIFEST_NAME
         stored_ref = self._ref(record, manifest_path)
         if stored_ref != artifact:
@@ -163,6 +162,51 @@ class ArtifactStore:
         if actual_files != expected_files:
             raise ArtifactStoreError("The artifact tree carries an unregistered member")
         return record
+
+    def verify(self, artifact: ArtifactRef) -> dict:
+        if artifact.locator != f"{LOCATOR_PREFIX}{artifact.artifact_id}":
+            raise ArtifactStoreError("The artifact locator differs from its immutable id")
+        return self._verify_root(artifact, self.objects / artifact.artifact_id)
+
+    def import_object(self, source_store: ArtifactStore, artifact: ArtifactRef) -> ArtifactRef:
+        """Copy one verified source object without changing its manifest or producer identity."""
+
+        if not isinstance(source_store, ArtifactStore):
+            raise ArtifactStoreError("A source ArtifactStore is required")
+        source_record = source_store.verify(artifact)
+        if source_store.root.resolve() == self.root.resolve():
+            return artifact
+        target = self.objects / artifact.artifact_id
+        if target.exists():
+            if self.verify(artifact) != source_record:
+                raise ArtifactStoreError("The destination artifact differs from the source manifest")
+            return artifact
+        source = source_store.objects / artifact.artifact_id
+        temporary = Path(tempfile.mkdtemp(prefix=f".import-{artifact.artifact_id}.", dir=self.objects))
+        try:
+            shutil.copytree(source, temporary, dirs_exist_ok=True, symlinks=True)
+            imported_record = self._verify_root(artifact, temporary)
+            if imported_record != source_record:
+                raise ArtifactStoreError("The imported artifact manifest differs from the source")
+            for path in sorted(
+                (item for item in temporary.rglob("*") if item.is_file()),
+                key=lambda item: item.relative_to(temporary).as_posix(),
+            ):
+                _fsync_path(path)
+            for directory in sorted(
+                (item for item in temporary.rglob("*") if item.is_dir()),
+                key=lambda item: len(item.parts),
+                reverse=True,
+            ):
+                _fsync_dir(directory)
+            _fsync_dir(temporary)
+            os.replace(temporary, target)
+            _fsync_dir(self.objects)
+            self.verify(artifact)
+            return artifact
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
 
     def seal_tree(
         self,

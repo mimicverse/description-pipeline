@@ -13,12 +13,16 @@ from .store import (
     PlatformStore,
     PlatformStoreError,
 )
+from .diagnostic import DiagnosticRuntimeConfig, DiagnosticStores, open_diagnostic_stores
 
 __all__ = [
     "AdmissionClosedError",
     "AdmissionView",
+    "DiagnosticRuntimeConfig",
+    "DiagnosticStores",
     "OperationConflictError",
     "OperationRecord",
     "PlatformStore",
     "PlatformStoreError",
+    "open_diagnostic_stores",
 ]

@@ -25,6 +25,7 @@ from description_pipeline.pipeline.application import (
 )
 from description_pipeline.pipeline.stages.publish import PublishHandler
 from description_pipeline.pipeline.contracts import (
+    DiagnosticReplayScope,
     ExecutionClaim,
     StageCandidate,
     StageCommand,
@@ -213,6 +214,7 @@ class _MemoryBackend:
             checks_sha256=execution.checks_sha256,
             resources_settled=execution.resources_settled,
             reason_code=execution.reason_code,
+            diagnostic_scope=command.diagnostic_scope,
         )
         record = self.artifacts.seal_stage_result(result)
         candidate = StageCandidate(
@@ -373,6 +375,30 @@ class StageApplicationTests(unittest.TestCase):
         admitted = self.application.admit(self.harness.spec)
         with self.assertRaisesRegex(ApplicationError, "diagnostic qualification"):
             self.application.replay(admitted.freeze_command.command_id)
+
+    def test_replay_executes_the_registered_diagnostic_command_once(self):
+        formal = self.application.admit(self.harness.spec).freeze_command
+        scope = DiagnosticReplayScope.from_inputs("freeze", formal.input_artifacts)
+        diagnostic = StageCommand.create(
+            command_id="diagnostic:freeze",
+            run_id="diagnostic-run",
+            stage="freeze",
+            idempotency_key="diagnostic-run/freeze",
+            request=formal.request,
+            input_artifacts=formal.input_artifacts,
+            config_snapshot_sha256=formal.config_snapshot_sha256,
+            contract_sha256=formal.contract_sha256,
+            policy_sha256=formal.policy_sha256,
+            expected_executor_sha256=formal.expected_executor_sha256,
+            predecessor_decision_id=None,
+            diagnostic_scope=scope,
+        )
+        self.backend.commands[diagnostic.command_id] = diagnostic
+        first = self.application.replay(diagnostic.command_id)
+        second = self.application.replay(diagnostic.command_id)
+        self.assertEqual(first, second)
+        self.assertEqual(first.diagnostic_scope, scope)
+        self.assertEqual(self.freeze.executions, 1)
 
     def test_admit_rejects_repository_metadata_detached_from_sealed_bytes(self):
         spec = self.harness.spec

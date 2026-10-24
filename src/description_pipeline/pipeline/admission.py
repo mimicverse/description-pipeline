@@ -615,6 +615,8 @@ class VerifiedPredecessor:
             or self.result.outcome != "completed"
             or self.decision.outcome != "completed"
             or self.decision.failure_envelope is not None
+            or self.command.diagnostic_scope is not None
+            or self.result.diagnostic_scope is not None
         ):
             raise ProtocolError("admission.predecessor_invalid", {"stage": self.stage})
 

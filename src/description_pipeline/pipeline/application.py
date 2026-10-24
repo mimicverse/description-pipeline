@@ -37,6 +37,7 @@ from .admission import (
 )
 from .contracts import (
     ArtifactRef,
+    DiagnosticReplayScope,
     DispatchCommand,
     DispatchConf,
     FailureEnvelope,
@@ -539,17 +540,18 @@ class StageApplication:
         """Replay an already-admitted sealed command with no alternate execution path."""
 
         command = self.facts.load_command(command_id)
-        scope = getattr(command, "scope", None)
-        if not isinstance(scope, Mapping) or scope.get("mode") != "diagnostic":
+        scope = command.diagnostic_scope
+        if not isinstance(scope, DiagnosticReplayScope):
             raise ApplicationError(
                 "application.replay_scope_required",
                 "Replay requires the common command scope to establish diagnostic qualification",
             )
-        if scope.get("target_stage") != command.stage:
+        if scope.target_stage != command.stage:
             raise ApplicationError(
                 "application.replay_scope_invalid",
                 "Diagnostic target stage differs from the registered command",
             )
+        scope.validate_for(command.stage, command.input_artifacts)
         return self.execute_registered_command(command_id)
 
     def run_stage(self, run_id: str, stage: StageId) -> StageResult | FailureEnvelope:

@@ -199,6 +199,13 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         )
         self.assertIn("WHERE kind = 'dispatch';", text)
 
+    def test_artifact_producer_is_descriptive_and_has_no_local_run_fk(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        artifact = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".artifact', 1)[1]
+        artifact = artifact.split(");", 1)[0]
+        self.assertIn("producer_run_id text,", artifact)
+        self.assertNotIn("producer_run_id text REFERENCES", artifact)
+
     def test_immutable_facts_have_no_service_update_grant(self) -> None:
         text = (PLATFORM_DIR / "roles.sql").read_text(encoding="utf-8")
         immutable = re.search(

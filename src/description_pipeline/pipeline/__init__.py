@@ -29,6 +29,7 @@ from .admission import (
 )
 from .contracts import (
     ArtifactRef,
+    DiagnosticReplayScope,
     DispatchCommand,
     DispatchConf,
     ExecutionClaim,
@@ -39,10 +40,13 @@ from .contracts import (
     StageDecision,
     StageExecution,
     StageFailure,
+    StageQualification,
     StageResult,
     RunStatus,
     StageStatus,
     effect_is_settled,
+    qualify_stage,
+    require_formal_qualification,
     project_run_status,
     project_stage_status,
 )
@@ -56,6 +60,12 @@ from .effects import (
     project_effect_state,
 )
 from .dispatch import DispatchAdapter, DispatchObservation, DispatchResult, TechnicalDispatchService
+from .diagnostic import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_command,
+    build_diagnostic_run_admission,
+    validate_diagnostic_command,
+)
 from .engine import StageHandler, StageServices, StageWorkspace, execute_stage
 from .discover import DiscoverDomainAdapter, DiscoverHandler
 from .capture import CaptureHandler
@@ -66,6 +76,8 @@ __all__ = [
     "ArtifactMember",
     "ArtifactRef",
     "CaptureHandler",
+    "DiagnosticAdmissionSpec",
+    "DiagnosticReplayScope",
     "DiscoverDomainAdapter",
     "DiscoverHandler",
     "DispatchAdapter",
@@ -92,6 +104,7 @@ __all__ = [
     "StageExecutors",
     "StageFailure",
     "StageHandler",
+    "StageQualification",
     "StageResult",
     "StageServices",
     "StageStatus",
@@ -103,6 +116,8 @@ __all__ = [
     "VerifiedRepositorySnapshot",
     "VerifiedRuleset",
     "build_capture_command",
+    "build_diagnostic_command",
+    "build_diagnostic_run_admission",
     "build_discover_command",
     "build_freeze_command",
     "build_generate_command",
@@ -115,7 +130,10 @@ __all__ = [
     "project_effect_state",
     "project_run_status",
     "project_stage_status",
+    "qualify_stage",
+    "require_formal_qualification",
     "validate_capture_command",
+    "validate_diagnostic_command",
     "validate_discover_command",
     "validate_freeze_command",
     "validate_generate_command",
