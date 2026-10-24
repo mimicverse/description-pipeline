@@ -35,7 +35,6 @@ SCHEMA_LITERAL_FIXTURES = {
     "tests/sources/test_solidworks_link_group_selections.py",
     "tests/sources/test_verify_declarations.py",
     "tests/v1/test_diagnostic_preview.py",
-    "tests/v1/test_discovery_transfer.py",
     "tests/v1/test_effective_instance_integration.py",
     "tests/v1/test_quality.py",
     "tests/v1/test_stage_transfer.py",

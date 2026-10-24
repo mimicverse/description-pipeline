@@ -1,25 +1,8 @@
-"""Client for the bearer-authenticated Windows SolidWorks execution endpoint.
+"""Shared configuration, result validation and historical native-job observation.
 
-The endpoint contract is fixed and carries no shell or local paths:
-
-* ``POST /v1/jobs`` with ``{run_id, upload_files, upload_sha256, main_assembly}`` starts one
-  staging job (idempotent per run_id; a different payload for the same run_id is HTTP 409);
-  an optional ``resume={parent_run, from_stage}`` inherits a parent's sealed dependency closure
-  for a linked native rerun;
-* ``POST /v1/jobs/<uuid>/files`` admits the one full indexed-folder archive (``application/zip``);
-  the endpoint stages it provisionally, then resolves, verifies and seals the native dependency
-  closure server-side;
-* ``GET /v1/jobs/<uuid>`` returns status/events/result/error plus the selection block and, once
-  sealed, the manifest; ``awaiting_definition`` exposes the raw-record artifact, and
-  ``POST /v1/jobs/<uuid>/definition`` submits the sealed capture request carrying
-  ``X-Prepared-SHA256``; ``POST /v1/jobs/<uuid>/abort`` reports one local derivation failure;
-* ``POST /v1/jobs/<uuid>/cache/release`` releases one terminal run's staged cache once the
-  Linux side confirms its closed imported inventory; the answer is an immutable receipt and
-  refusals are ``409 cache_release_refused`` with a stable reason;
-* ``GET /v1/jobs/<uuid>/artifacts/<name>`` streams one bound raw-record or native capture artifact;
-* ``GET /health`` exposes only ``pipeline_id`` and readiness.
-
-Plaintext HTTP is allowed only for loopback hosts; anything remote requires TLS.
+New Freeze, Discover and Capture execution uses the native-operation client. This
+module retains only the job observation routes still read by the portal and platform,
+plus immutable platform-configuration resolution.
 """
 
 from __future__ import annotations
@@ -30,12 +13,9 @@ import math
 import os
 import re
 import stat
-import tempfile
-import time
 import unicodedata
 import uuid
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -44,23 +24,17 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from ..delivery import PIPELINE_ID
-from ..io import PipelineError, artifact_path_parts, digest, parse_data
+from ..io import PipelineError, artifact_path_parts, parse_data
 from ..repository.review_branch import is_review_branch
 from ..interface_records import (
-    REQUEST_PURPOSES,
-    cache_import_confirmation_digest,
     check_config_identity_file,
     require_active_config_identity,
     validate_config_snapshot,
-    validate_cache_release_request,
     validate_connection_config_identity,
     validate_install_record,
 )
-from ..schemas import CACHE_IMPORT_CONFIRMATION_SCHEMA, CONFIG_SNAPSHOT_SCHEMA
-from ..sources.solidworks.selection import validate_file_index
-from ..stages import STAGE_IDS, publication_succeeded, validate_freeze_events
-from .selection_client import prepare_staging_archive
-from .stage_transfer import CAPTURE_ARCHIVE, MAX_TRANSFER_BYTES
+from ..schemas import CONFIG_SNAPSHOT_SCHEMA
+from ..stages import STAGE_IDS, publication_succeeded
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 #: One release ledger per run fixes the cache-release operation identity and
@@ -72,17 +46,10 @@ EVENT_KEYS = ("stage", "state", "at")
 #: ``awaiting_definition`` is the nonterminal hand-off where the native raw record
 #: is available and the generated definition ZIP is still to be submitted.
 RUN_STATES = {"queued", "selecting", "running", "awaiting_definition", "native_complete", "passed", "failed"}
-#: Staging transport states of a ``selecting`` job (frozen contract).
-SELECTION_STATES = ("awaiting_files", "reading", "sealed")
-#: The fixed artifact name of the native raw-record bundle (mirrors discovery_transfer).
-NATIVE_RECORD_ARCHIVE = "raw-record.zip"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
-_HARDWARE_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
-SUBMISSION_STATES = {"published", "updated", "noop"}
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _validate_activity_block(activity, label: str) -> None:
@@ -144,15 +111,6 @@ class EndpointNotFound(EndpointError):
     """The endpoint has no record of the requested run, job or route."""
 
 
-class JobFailed(EndpointError):
-    """The remote job reached the failed state."""
-
-    def __init__(self, run_id: str, job: dict[str, Any]) -> None:
-        super().__init__(f"job {run_id} failed: {job.get('error') or 'unknown error'}")
-        self.run_id = run_id
-        self.job = job
-
-
 class ResultNotPublishable(EndpointError):
     """A passed job whose result is missing quality or PR evidence."""
 
@@ -209,45 +167,6 @@ def native_run_id(dag_run_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{NATIVE_RUN_NAMESPACE}:{dag_run_id}"))
 
 
-def validate_resume(value: object, *, run_id: str | None = None) -> dict:
-    """One linked-run binding: the parent native UUID and the canonical restart stage."""
-    if not isinstance(value, dict) or set(value) != {"parent_run", "from_stage"}:
-        raise EndpointProtocolError("resume must carry exactly parent_run and from_stage")
-    parent = validate_run_id(value.get("parent_run"))
-    stage = value.get("from_stage")
-    if stage not in STAGE_IDS:
-        raise EndpointProtocolError(f"from_stage is not a canonical engineering stage: {stage!r}")
-    if run_id is not None and parent == run_id:
-        raise EndpointProtocolError("a linked run cannot reuse itself")
-    return {"parent_run": parent, "from_stage": stage}
-
-
-def _validate_capture_archive(archive) -> dict:
-    """The exact native capture-archive receipt the sealing contract produces."""
-    expected = {"name", "sha256", "size", "manifest_sha256"}
-    if not isinstance(archive, dict) or set(archive) != expected:
-        raise EndpointProtocolError("capture_archive must carry exactly name, sha256, size and manifest_sha256")
-    if archive.get("name") != CAPTURE_ARCHIVE:
-        raise EndpointProtocolError("capture_archive name differs from the transfer contract")
-    for key in ("sha256", "manifest_sha256"):
-        if not isinstance(archive.get(key), str) or _SHA256.fullmatch(archive[key]) is None:
-            raise EndpointProtocolError(f"capture_archive {key} must be lowercase SHA-256")
-    size = archive.get("size")
-    if type(size) is not int or size <= 0 or size > MAX_TRANSFER_BYTES:
-        raise EndpointProtocolError("capture_archive size must be a positive integer within the transfer bound")
-    return dict(archive)
-
-
-def capture_archive_metadata(job: dict) -> dict:
-    """The validated capture-archive receipt of one ``native_complete`` job."""
-    if not isinstance(job, dict) or job.get("status") != "native_complete":
-        raise EndpointProtocolError("the job is not native_complete")
-    result = job.get("result")
-    if not isinstance(result, dict) or result.get("native_complete") is not True:
-        raise EndpointProtocolError("native_complete result must declare native_complete = true")
-    return _validate_capture_archive(result.get("capture_archive"))
-
-
 def _validate_relative_path(value: str, field: str) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise EndpointProtocolError(f"{field} must be a POSIX relative path")
@@ -296,158 +215,8 @@ def normalize_change_summary(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def submission_identity(
-    *,
-    target_hardware,
-    change_summary=None,
-    principal=None,
-    purpose,
-    config: EndpointConfig,
-    published_revision=None,
-    warn=None,
-) -> dict | None:
-    """Build the validated submission identity carried beside the endpoint request.
-
-    Returns ``None`` when no target was selected (today's deferred behavior).
-    An unconfigured target fails closed; the previous published revision is read
-    best-effort through the supplied reader (any failure only warns and leaves
-    ``parent_revision`` absent).
-    """
-
-    target = str(target_hardware or "").strip()
-    summary = str(change_summary or "").strip()
-    if not target:
-        return None
-    declared_purpose = str(purpose or "").strip()
-    if declared_purpose not in REQUEST_PURPOSES:
-        raise EndpointProtocolError(f"purpose {declared_purpose!r} is not a declared submission purpose")
-    routing = config.targets.get(target)
-    if routing is None:
-        raise EndpointProtocolError(f"target_hardware {target!r} is not a configured publication target")
-    parent = None
-    repository = config.repositories.get(str(routing["repository_slug"]))
-    if repository is not None and published_revision is not None:
-        try:
-            previous = published_revision(repository, target, declared_purpose)
-        except Exception as error:  # noqa: BLE001 - identity derivation stays best-effort
-            if warn is not None:
-                warn(f"previous revision unavailable for {target}: {error}")
-        else:
-            if isinstance(previous, dict) and isinstance(previous.get("revision"), str):
-                parent = previous["revision"]
-    owner = principal if isinstance(principal, str) and principal.strip() else None
-    from ..interface_records import RESOURCE_POLICY_V1, resource_policy_v1_digest
-
-    return {
-        "hardware_id": target,
-        "owner": owner,
-        "change_summary": summary or None,
-        "parent_revision": parent,
-        "resource_policy": {
-            "schema_version": RESOURCE_POLICY_V1["schema_version"],
-            "digest": resource_policy_v1_digest(),
-        },
-    }
-
-
 def validate_artifact_name(value: str) -> str:
     return _validate_relative_path(value, "artifact name")
-
-
-def _validate_digest(value: str, field: str) -> str:
-    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
-        raise EndpointProtocolError(f"{field} must be a lowercase SHA-256 digest")
-    return value
-
-
-def validate_sha256(value: str) -> str:
-    return _validate_digest(value, "sha256")
-
-
-def validate_handoff_path(value: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise EndpointProtocolError("handoff_path must be a non-empty path")
-    path = value.strip()
-    if _CONTROL.search(path):
-        raise EndpointProtocolError("handoff_path must not contain control characters")
-    return path
-
-
-def cache_release_manifest(intake: Path, upload_files: dict[str, str]) -> list[dict]:
-    """The closed staged-cache inventory of one frozen upload (path, bytes, SHA-256).
-
-    The endpoint compares this inventory against the bytes it actually staged,
-    so it is built from the same files the portal uploaded, byte for byte.
-    """
-
-    entries: list[dict] = []
-    for relative in sorted(upload_files):
-        path = Path(intake).joinpath(*artifact_path_parts(relative))
-        if path.is_symlink() or not path.is_file():
-            raise PipelineError(f"The uploaded handoff item is missing: {relative!r}")
-        with path.open("rb") as stream:
-            checksum = hashlib.file_digest(stream, "sha256").hexdigest()
-        if checksum != upload_files[relative]:
-            raise PipelineError(f"The uploaded handoff changed after its index was recorded: {relative!r}")
-        entries.append({"path": relative, "bytes": path.stat().st_size, "sha256": checksum})
-    return entries
-
-
-def cache_release_request(
-    *,
-    run_id: str,
-    linux_run_id: str,
-    production_operation_id: str,
-    operation_id: str,
-    health: dict,
-    imported: list[dict],
-    sealed_receipt_sha256: str,
-    import_block: dict | None = None,
-) -> dict:
-    """One frozen IF-10 release request, bound to the endpoint identity read live.
-
-    Both binding blocks come from the endpoint's own ``/health`` answer (never
-    hard-coded): the release triple and the contract digest the caller must
-    bind.  ``sealed_receipt_sha256`` identifies the Linux sealed import
-    confirmation (the admitted capture manifest digest); the endpoint keeps it
-    opaque.  ``import_block`` reuses one already-frozen import block, so the
-    registered parameter digest and the executed request bind the same
-    confirmation bytes.  The request validates against the frozen record layer
-    before it leaves the Linux side.
-    """
-
-    release = health.get("release") if isinstance(health.get("release"), dict) else None
-    contract = health.get("contract") if isinstance(health.get("contract"), dict) else None
-    if release is None or contract is None:
-        raise EndpointProtocolError("the endpoint health carries no release identity or contract binding")
-    if import_block is None:
-        production = {"run_id": validate_run_id(run_id), "operation_id": production_operation_id}
-        confirmation = {
-            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
-            "imported": [dict(entry) for entry in imported],
-            "production": dict(production),
-            "sealed": {
-                "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "receipt_sha256": sealed_receipt_sha256,
-            },
-            "digest": "",
-        }
-        confirmation["digest"] = cache_import_confirmation_digest(confirmation)
-        import_block = {
-            "linux_run_id": linux_run_id,
-            "production": dict(production),
-            "confirmation": confirmation,
-        }
-    request = {
-        "operation_id": operation_id,
-        "binding": {
-            "release": {key: release[key] for key in ("version", "source_commit", "source_sha256")},
-            "contract": dict(contract),
-        },
-        "import": dict(import_block),
-    }
-    validate_cache_release_request(request)
-    return request
 
 
 def _validate_base_url(url: str) -> str:
@@ -780,183 +549,6 @@ def config_reference_cli(argv=None) -> int:
     return 0
 
 
-@dataclass(frozen=True, slots=True)
-class SelectionSnapshot:
-    """Validated selection block of one endpoint job snapshot."""
-
-    state: str
-    reader_sha256: str
-    upload_sha256: str
-    staged_files: dict[str, str]
-    manifest: dict | None = None
-
-
-def _selection_files(value: object, label: str) -> dict[str, str]:
-    if not isinstance(value, dict) or any(not isinstance(name, str) for name in value):
-        raise EndpointProtocolError(f"selection {label} must be a path->sha256 object")
-    files: dict[str, str] = {}
-    for name, checksum in value.items():
-        try:
-            parts = artifact_path_parts(name)
-        except PipelineError as error:
-            raise EndpointProtocolError(f"selection {label} has an inadmissible path: {name!r}") from error
-        if "/".join(parts) != name:
-            raise EndpointProtocolError(f"selection {label} has a noncanonical path: {name!r}")
-        if not isinstance(checksum, str) or _SHA256.fullmatch(checksum) is None:
-            raise EndpointProtocolError(f"selection {label} entry {name!r} has no lowercase sha256")
-        files[name] = checksum
-    return files
-
-
-def _selection_block(
-    job: dict, *, upload_files: dict[str, str] | None = None, initial: bool = False
-) -> SelectionSnapshot:
-    """Parse and validate one job's staging block against the frozen contract."""
-
-    tool = job.get("native_tool")
-    if not isinstance(tool, dict):
-        raise EndpointProtocolError("selection job carries no native tool record")
-    reader = validate_sha256(tool.get("source_sha256"))
-    block = job.get("selection")
-    if not isinstance(block, dict):
-        raise EndpointProtocolError("staging job carries no selection block")
-    state = block.get("state")
-    if state not in SELECTION_STATES:
-        raise EndpointProtocolError(f"unexpected staging state: {state!r}")
-    expected_keys = {"state", "reader_sha256", "upload_sha256", "staged_files"}
-    if "manifest" in block:
-        expected_keys.add("manifest")
-    if set(block) != expected_keys:
-        raise EndpointProtocolError("the staging block carries unexpected fields")
-    if validate_sha256(block.get("reader_sha256")) != reader:
-        raise EndpointProtocolError("staging reader identity differs from the native tool record")
-    upload_sha256 = validate_sha256(block.get("upload_sha256"))
-    staged = _selection_files(block.get("staged_files"), "staged_files")
-    manifest = block.get("manifest")
-    if manifest is not None and (not isinstance(manifest, dict) or not manifest):
-        raise EndpointProtocolError("selection manifest must be a non-empty object")
-    if state == "sealed" and manifest is None:
-        raise EndpointProtocolError("a sealed selection must carry its manifest")
-    if upload_files is not None:
-        if upload_sha256 != digest(upload_files):
-            raise EndpointProtocolError("staging upload digest differs from the upload index")
-        for name, checksum in staged.items():
-            if upload_files.get(name) != checksum:
-                raise EndpointProtocolError(f"staging names a file outside the upload index: {name!r}")
-        if state == "sealed" and staged != dict(upload_files):
-            raise EndpointProtocolError("a sealed staging must hold the full upload index")
-    if state == "awaiting_files" and (staged or manifest is not None):
-        raise EndpointProtocolError("an awaiting staging carries no staged bytes")
-    if initial and (state != "awaiting_files" or staged or manifest is not None):
-        raise EndpointProtocolError("staging must start from an empty awaiting stage")
-    return SelectionSnapshot(
-        state=state,
-        reader_sha256=reader,
-        upload_sha256=upload_sha256,
-        staged_files=staged,
-        manifest=manifest,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class AwaitingDefinition:
-    """Validated ``awaiting_definition`` snapshot: raw-record receipt and sealed selection."""
-
-    record_name: str
-    record_sha256: str
-    record_size: int
-    record_manifest: dict
-    native_tool: dict
-    selection: SelectionSnapshot
-
-
-def _native_record_block(record: object) -> dict:
-    """The flat raw-record artifact receipt the frozen transport contract declares."""
-
-    expected = {"name", "sha256", "size", "manifest_sha256", "manifest"}
-    if not isinstance(record, dict) or set(record) != expected:
-        raise EndpointProtocolError("native_record must carry exactly name, sha256, size, manifest_sha256 and manifest")
-    name = validate_artifact_name(record.get("name"))
-    if name != NATIVE_RECORD_ARCHIVE:
-        raise EndpointProtocolError("native_record name differs from the transport contract")
-    checksum = validate_sha256(record.get("sha256"))
-    manifest_sha256 = validate_sha256(record.get("manifest_sha256"))
-    size = record.get("size")
-    if type(size) is not int or size <= 0 or size > MAX_TRANSFER_BYTES:
-        raise EndpointProtocolError("native_record size must be a positive integer within the transfer bound")
-    manifest = record.get("manifest")
-    if not isinstance(manifest, dict) or not manifest:
-        raise EndpointProtocolError("native_record carries no bundle manifest")
-    if digest(manifest) != manifest_sha256:
-        raise EndpointProtocolError("native_record manifest does not match its recorded digest")
-    return {
-        "name": name,
-        "sha256": checksum,
-        "size": size,
-        "manifest_sha256": manifest_sha256,
-        "manifest": manifest,
-    }
-
-
-def _record_block(record: AwaitingDefinition | dict) -> dict:
-    """The validated flat raw-record receipt, from either carrier form."""
-
-    if isinstance(record, AwaitingDefinition):
-        record = {
-            "name": record.record_name,
-            "sha256": record.record_sha256,
-            "size": record.record_size,
-            "manifest_sha256": digest(record.record_manifest),
-            "manifest": record.record_manifest,
-        }
-    return _native_record_block(record)
-
-
-def _validate_failure_diagnostics(job: dict) -> dict | None:
-    """The hash-bound raw failure-diagnostics receipt of one job, or None when absent."""
-
-    value = job.get("failure_diagnostics")
-    if value is None:
-        return None
-    if not isinstance(value, dict) or set(value) != {"path", "sha256"} or value.get("path") != "diagnostic.json":
-        raise EndpointProtocolError("failure_diagnostics must name diagnostic.json with its sha256")
-    return {"path": "diagnostic.json", "sha256": validate_sha256(value.get("sha256"))}
-
-
-def _sealed_diagnostic_member(relative: object) -> str | None:
-    """One allowlisted sealed member name, or None when it is unsafe or unknown."""
-
-    from ..structural_report import is_sealed_diagnostic_member
-
-    if not isinstance(relative, str) or not relative or "\\" in relative or relative.startswith("/"):
-        return None
-    if any(part in {"", ".", ".."} for part in relative.split("/")):
-        return None
-    return relative if is_sealed_diagnostic_member(relative) else None
-
-
-def _awaiting_definition(job: dict, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
-    """Parse and validate one job's definition hand-off against the frozen contract."""
-
-    if not isinstance(job, dict) or job.get("status") != "awaiting_definition":
-        raise EndpointProtocolError("the job does not await a definition")
-    record = _native_record_block(job.get("native_record"))
-    tool = job.get("native_tool")
-    if not isinstance(tool, dict) or not tool:
-        raise EndpointProtocolError("definition job carries no native tool record")
-    selection = _selection_block(job, upload_files=upload_files)
-    if selection.state != "sealed" or selection.manifest is None:
-        raise EndpointProtocolError("the definition job carries no sealed selection manifest")
-    return AwaitingDefinition(
-        record_name=record["name"],
-        record_sha256=record["sha256"],
-        record_size=record["size"],
-        record_manifest=record["manifest"],
-        native_tool=tool,
-        selection=selection,
-    )
-
-
 class WindowsEndpoint:
     """Small JSON client; injectable opener keeps it testable without network."""
 
@@ -965,13 +557,9 @@ class WindowsEndpoint:
         config: EndpointConfig,
         *,
         opener: Callable[..., Any] | None = None,
-        sleeper: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
         self._opener = opener or _opener
-        self._sleep = sleeper
-        self._clock = clock
 
     def _exchange(self, request: urlrequest.Request) -> dict:
         try:
@@ -1001,341 +589,6 @@ class WindowsEndpoint:
                 },
             )
         )
-
-    def _request_stream(
-        self, method: str, path: str, source: Any, *, size: int, headers: dict[str, str] | None = None
-    ) -> dict:
-        """Stream one file body with a fixed Content-Length (no chunked upload)."""
-        return self._exchange(
-            urlrequest.Request(
-                self.config.base_url + path,
-                data=source,
-                method=method,
-                headers={
-                    "Authorization": f"Bearer {self.config.token}",
-                    "Content-Type": "application/zip",
-                    "Accept": "application/json",
-                    "Content-Length": str(size),
-                    **(headers or {}),
-                },
-            )
-        )
-
-    def _authorized_handoff_dir(self, path: str) -> Path:
-        """Authorize one absolute Linux folder against the platform handoff_roots allowlist."""
-        if not self.config.handoff_roots:
-            raise EndpointProtocolError(
-                "absolute Linux handoff folders require handoff_roots in the Airflow endpoint connection"
-            )
-        try:
-            from ..sources.solidworks.handoff import authorize_handoff
-
-            return authorize_handoff(Path(path), self.config.handoff_roots)
-        except (ImportError, PipelineError, TypeError, ValueError, OSError) as error:
-            raise EndpointProtocolError(str(error)) from error
-
-    def health(self) -> dict:
-        payload = self._request("GET", "/health")
-        if payload.get("pipeline_id") != PIPELINE_ID:
-            raise EndpointProtocolError(f"unexpected pipeline_id: {payload.get('pipeline_id')!r}")
-        if "ready" not in payload and "readiness" not in payload:
-            raise EndpointProtocolError("health response must include readiness")
-        return payload
-
-    def authorized_intake_dir(self, handoff_path: str) -> Path:
-        """The local sealed intake folder for one operator path, inside ``handoff_roots``."""
-
-        return self._authorized_handoff_dir(validate_handoff_path(handoff_path))
-
-    def start_staging_job(
-        self,
-        *,
-        run_id: str,
-        upload_files: dict[str, str],
-        main_assembly: str,
-        freeze_events: list[dict],
-        freeze_receipt_sha256: str,
-        resume: dict | None = None,
-    ) -> dict:
-        """Start one staging job: a fresh full-folder stage, or a linked rerun inheriting a sealed parent."""
-
-        validated = validate_file_index(upload_files)
-        main = validate_main_assembly(main_assembly)
-        validated_freeze_events = validate_freeze_events(freeze_events)
-        freeze_receipt = validate_sha256(freeze_receipt_sha256)
-        if main not in validated:
-            raise EndpointProtocolError("the main assembly is not part of the upload index")
-        payload = {
-            "run_id": validate_run_id(run_id),
-            "upload_files": dict(validated),
-            "upload_sha256": digest(validated),
-            "main_assembly": main,
-            "freeze_events": validated_freeze_events,
-            "freeze_events_sha256": digest(validated_freeze_events),
-            "freeze_receipt_sha256": freeze_receipt,
-        }
-        if resume is not None:
-            payload["resume"] = validate_resume(resume, run_id=payload["run_id"])
-        response = self._request("POST", "/v1/jobs", payload)
-        if response.get("run_id") != payload["run_id"] or response.get("request") != payload:
-            raise EndpointProtocolError("endpoint accepted a different staging request")
-        if response.get("status") not in RUN_STATES:
-            raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
-        snapshot = _selection_block(response, upload_files=validated, initial=resume is None)
-        if resume is None:
-            return response
-        if snapshot.state != "sealed" or snapshot.manifest is None:
-            raise EndpointProtocolError("a linked rerun must inherit the parent's sealed closure")
-        if snapshot.manifest.get("main_assembly") != main:
-            raise EndpointProtocolError("the inherited closure is bound to a different main assembly")
-        sealed_files = snapshot.manifest.get("files")
-        if not isinstance(sealed_files, dict) or not sealed_files:
-            raise EndpointProtocolError("the inherited closure carries no resolved files")
-        for name, checksum in sealed_files.items():
-            if validated.get(name) != checksum:
-                raise EndpointProtocolError(f"the inherited closure names a file outside the upload index: {name!r}")
-        return response
-
-    def staging_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> SelectionSnapshot:
-        """Fetch and validate the staging block; never trusts a partial contract."""
-
-        job = self.get_job(run_id)
-        validated = None if upload_files is None else validate_file_index(upload_files)
-        return _selection_block(job, upload_files=validated)
-
-    def stage_folder_archive(self, run_id: str, archive: Path, *, upload_files: dict[str, str]) -> dict:
-        """Push the one exact full-index folder archive; the endpoint stages it before resolving."""
-
-        validated = validate_file_index(upload_files)
-        archive = Path(archive)
-        size = archive.stat().st_size
-        if not 0 < size <= MAX_TRANSFER_BYTES:
-            raise EndpointProtocolError("staging archive has an invalid size")
-        with archive.open("rb") as handle:
-            response = self._request_stream(
-                "POST",
-                f"/v1/jobs/{validate_run_id(run_id)}/files",
-                handle,
-                size=size,
-            )
-        snapshot = _selection_block(response, upload_files=validated)
-        if snapshot.staged_files != validated:
-            raise EndpointProtocolError("endpoint did not stage the full indexed folder")
-        return response
-
-    def definition_snapshot(self, run_id: str, *, upload_files: dict[str, str] | None = None) -> AwaitingDefinition:
-        """Fetch and validate the definition hand-off; never trusts a partial contract."""
-
-        job = self.get_job(run_id)
-        validated = None if upload_files is None else validate_file_index(upload_files)
-        return _awaiting_definition(job, upload_files=validated)
-
-    def stream_native_record(
-        self, run_id: str, record: AwaitingDefinition | dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
-    ) -> Path:
-        """Stream the raw-record artifact to disk, requiring its exact size and digest."""
-
-        metadata = _record_block(record)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-            raise EndpointProtocolError("record size limit must be a positive integer")
-        if metadata["size"] > limit:
-            raise EndpointProtocolError("native record exceeds the configured size limit")
-        destination = Path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        hasher = hashlib.sha256()
-        total = 0
-        with (
-            self.open_artifact(run_id, metadata["name"]) as response,
-            tempfile.NamedTemporaryFile(prefix=".native-record-", dir=destination.parent, delete=False) as handle,
-        ):
-            temporary = Path(handle.name)
-            try:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > limit:
-                        raise EndpointProtocolError("native record exceeds the configured size limit")
-                    hasher.update(chunk)
-                    handle.write(chunk)
-            except BaseException:
-                with suppress(OSError):
-                    temporary.unlink()
-                raise
-        if total != metadata["size"] or hasher.hexdigest() != metadata["sha256"]:
-            with suppress(OSError):
-                temporary.unlink()
-            raise EndpointProtocolError("native record does not match its recorded size or digest")
-        os.replace(temporary, destination)
-        return destination
-
-    def post_definition_archive(self, run_id: str, archive: Path, *, prepared_sha256: str) -> dict:
-        """Submit the sealed capture request; the endpoint rebuilds the prepared package."""
-
-        prepared = validate_sha256(prepared_sha256)
-        archive = Path(archive)
-        size = archive.stat().st_size
-        if not 0 < size <= MAX_TRANSFER_BYTES:
-            raise EndpointProtocolError("definition archive has an invalid size")
-        with archive.open("rb") as handle:
-            response = self._request_stream(
-                "POST",
-                f"/v1/jobs/{validate_run_id(run_id)}/definition",
-                handle,
-                size=size,
-                headers={"X-Prepared-SHA256": prepared},
-            )
-        if not isinstance(response, dict):
-            raise EndpointProtocolError("definition acknowledgement must be a job object")
-        if response.get("run_id", run_id) != run_id:
-            raise EndpointProtocolError("endpoint acknowledged a different definition run")
-        if "status" in response and response["status"] not in RUN_STATES:
-            raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
-        return response
-
-    def download_failure_diagnostics(
-        self, run_id: str, job: dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
-    ) -> dict:
-        """Stream the hash-bound raw failure diagnostics of one failed job.
-
-        The bundle carries the exact sealed receipt and supporting evidence files
-        the Linux side renders the structural-team report from; the native host
-        never writes the report itself.  ``limit`` bounds the whole bundle,
-        manifest included.
-        """
-
-        from ..structural_report import DIAGNOSTIC_SCHEMA
-
-        receipt = _validate_failure_diagnostics(job)
-        if receipt is None:
-            raise EndpointNotFound("this run carries no failure diagnostics")
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-            raise EndpointProtocolError("diagnostics size limit must be a positive integer")
-        canonical = validate_run_id(run_id)
-        destination = Path(destination)
-        destination.mkdir(parents=True, exist_ok=True)
-        manifest_bytes = self._read_artifact(canonical, receipt["path"], receipt["sha256"], limit=min(limit, 1 << 22))
-        try:
-            manifest = json.loads(manifest_bytes)
-        except ValueError as error:
-            raise EndpointProtocolError("failure diagnostics manifest is not JSON") from error
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("schema") != DIAGNOSTIC_SCHEMA
-            or manifest.get("run_id") != canonical
-        ):
-            raise EndpointProtocolError("failure diagnostics manifest is invalid")
-        receipt_entry = manifest.get("receipt")
-        if not isinstance(receipt_entry, dict) or receipt_entry.get("path") != "receipt.json":
-            raise EndpointProtocolError("failure diagnostics carry no receipt entry")
-        files = manifest.get("files")
-        if not isinstance(files, dict):
-            raise EndpointProtocolError("failure diagnostics carry no file list")
-        members: dict[str, str] = {"receipt.json": validate_sha256(receipt_entry.get("sha256"))}
-        for relative, checksum in files.items():
-            safe = _sealed_diagnostic_member(relative)
-            if safe is None:
-                raise EndpointProtocolError(f"failure diagnostics name an unsafe or unknown member: {relative!r}")
-            members[f"evidence/{safe}"] = validate_sha256(checksum)
-        budget = limit - len(manifest_bytes)
-        if budget < 0:
-            raise EndpointProtocolError("failure diagnostics exceed the configured size limit")
-        written: dict[str, str] = {}
-        for name, expected in members.items():
-            target = destination / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            self._download_artifact(canonical, name, target, expected, limit=budget)
-            size = target.stat().st_size
-            budget -= size
-            if budget < 0:
-                raise EndpointProtocolError("failure diagnostics exceed the configured size limit")
-            written[name] = str(target)
-        try:
-            sealed_receipt = json.loads((destination / "receipt.json").read_bytes())
-        except ValueError as error:
-            raise EndpointProtocolError("failure diagnostics receipt is not JSON") from error
-        if not isinstance(sealed_receipt, dict) or sealed_receipt.get("run_id") != canonical:
-            raise EndpointProtocolError("failure diagnostics receipt belongs to a different run")
-        (destination / "diagnostic.json").write_bytes(manifest_bytes)
-        written["diagnostic.json"] = str(destination / "diagnostic.json")
-        return written
-
-    def _read_artifact(self, run_id: str, name: str, expected_sha256: str, *, limit: int) -> bytes:
-        """Read one bounded artifact and require its recorded digest."""
-
-        hasher = hashlib.sha256()
-        total = 0
-        chunks: list[bytes] = []
-        with self.open_artifact(run_id, name) as response:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > limit:
-                    raise EndpointProtocolError(f"artifact {name!r} exceeds the configured size limit")
-                hasher.update(chunk)
-                chunks.append(chunk)
-        if hasher.hexdigest() != expected_sha256:
-            raise EndpointProtocolError(f"artifact {name!r} does not match its recorded digest")
-        return b"".join(chunks)
-
-    def _download_artifact(self, run_id: str, name: str, target: Path, expected_sha256: str, *, limit: int) -> None:
-        """Stream one bounded artifact to disk under its recorded digest."""
-
-        hasher = hashlib.sha256()
-        total = 0
-        with (
-            self.open_artifact(run_id, name) as response,
-            tempfile.NamedTemporaryFile(prefix=f".{target.name}-", dir=target.parent, delete=False) as handle,
-        ):
-            temporary = Path(handle.name)
-            try:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > limit:
-                        raise EndpointProtocolError(f"artifact {name!r} exceeds the configured size limit")
-                    hasher.update(chunk)
-                    handle.write(chunk)
-            except BaseException:
-                with suppress(OSError):
-                    temporary.unlink()
-                raise
-        if hasher.hexdigest() != expected_sha256:
-            with suppress(OSError):
-                temporary.unlink()
-            raise EndpointProtocolError(f"artifact {name!r} does not match its recorded digest")
-        os.replace(temporary, target)
-
-    def abort_job(self, run_id: str, *, error: str, error_code: str, detail: dict | None = None) -> dict:
-        """Abort one awaiting-definition job after a local derivation failure; never hangs the endpoint."""
-
-        for field, value in (("error", error), ("error_code", error_code)):
-            if not isinstance(value, str) or not value.strip():
-                raise EndpointProtocolError(f"abort {field} must be a non-empty string")
-        if detail is not None and not isinstance(detail, dict):
-            raise EndpointProtocolError("abort detail must be an object of diagnostic fields")
-        response = self._request(
-            "POST",
-            f"/v1/jobs/{validate_run_id(run_id)}/abort",
-            {"error": error, "error_code": error_code, "detail": dict(detail) if detail else {}},
-        )
-        if not isinstance(response, dict):
-            raise EndpointProtocolError("abort acknowledgement must be a job object")
-        if response.get("run_id", run_id) != run_id:
-            raise EndpointProtocolError("endpoint acknowledged a different abort run")
-        if "status" in response and response["status"] not in RUN_STATES:
-            raise EndpointProtocolError(f"unexpected job status: {response.get('status')!r}")
-        return response
-
-    def release_cache(self, run_id: str, request: dict) -> dict:
-        """The sanctioned IF-10 release of one terminal run's staged cache."""
-
-        return self._request("POST", f"/v1/jobs/{validate_run_id(run_id)}/cache/release", request)
 
     def rerun_plan(self, run_id: str) -> dict:
         """Authoritative per-stage restart plan of one terminal native job.
@@ -1393,142 +646,6 @@ class WindowsEndpoint:
         _validate_activity(job)
         return job
 
-    def open_artifact(self, run_id: str, name: str) -> Any:
-        """Open one verified delivery artifact for streaming; the caller closes the response."""
-        canonical = validate_run_id(run_id)
-        artifact = validate_artifact_name(name)
-        encoded = urlparse.quote(artifact, safe="/")
-        request = urlrequest.Request(
-            f"{self.config.base_url}/v1/jobs/{canonical}/artifacts/{encoded}",
-            method="GET",
-            headers={"Authorization": f"Bearer {self.config.token}", "Accept": "*/*"},
-        )
-        try:
-            return self._opener(request, timeout=self.config.timeout)
-        except urlerror.HTTPError as error:
-            raise _http_refusal(error, context=f"artifact {artifact!r} is not part of run {canonical}") from error
-        except urlerror.URLError as error:
-            raise EndpointError(f"endpoint unreachable: {error.reason}") from error
-
-    def stream_capture_archive(
-        self, run_id: str, archive: dict, destination: Path, *, limit: int = MAX_TRANSFER_BYTES
-    ) -> Path:
-        """Stream the native capture archive to disk, requiring its exact size and digest."""
-        metadata = _validate_capture_archive(archive)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-            raise EndpointProtocolError("archive size limit must be a positive integer")
-        if metadata["size"] > limit:
-            raise EndpointProtocolError("capture archive exceeds the configured size limit")
-        destination = Path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256()
-        total = 0
-        with (
-            self.open_artifact(run_id, metadata["name"]) as response,
-            tempfile.NamedTemporaryFile(prefix=".capture-archive-", dir=destination.parent, delete=False) as handle,
-        ):
-            temporary = Path(handle.name)
-            try:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > limit:
-                        raise EndpointProtocolError("capture archive exceeds the configured size limit")
-                    digest.update(chunk)
-                    handle.write(chunk)
-            except BaseException:
-                with suppress(OSError):
-                    temporary.unlink()
-                raise
-        if total != metadata["size"] or digest.hexdigest() != metadata["sha256"]:
-            with suppress(OSError):
-                temporary.unlink()
-            raise EndpointProtocolError("capture archive does not match its recorded size or digest")
-        os.replace(temporary, destination)
-        return destination
-
-    def wait(self, run_id: str, *, interval: float = 2.0, timeout: float = 600.0) -> dict:
-        """Bounded polling; returns the job dict at the native terminal boundary.
-
-        Sealed native evidence transfers to Linux at ``native_complete``.
-        Qualification stays with the independent result gates.
-        """
-        deadline = self._clock() + timeout
-        while True:
-            job = self.get_job(run_id)
-            status = job["status"]
-            if status in {"passed", "native_complete"}:
-                return job
-            if status == "failed":
-                raise JobFailed(run_id, job)
-            if self._clock() >= deadline:
-                raise EndpointError(f"job {run_id} did not finish within {timeout:.0f}s")
-            self._sleep(interval)
-
-
-def _require_closure(upload_files: dict[str, str], main_assembly: str, snapshot: SelectionSnapshot) -> dict:
-    """The sealed closure manifest must bind to the local intake it was staged from."""
-
-    manifest = snapshot.manifest
-    if not isinstance(manifest, dict):
-        raise EndpointProtocolError("a sealed staging carries no closure manifest")
-    if manifest.get("upload_sha256") != digest(upload_files):
-        raise EndpointProtocolError("the closure manifest does not bind the upload index digest")
-    if manifest.get("main_assembly") != main_assembly:
-        raise EndpointProtocolError("the closure manifest is bound to a different main assembly")
-    files = manifest.get("files")
-    if not isinstance(files, dict) or not files:
-        raise EndpointProtocolError("the closure manifest carries no resolved files")
-    for name, checksum in files.items():
-        if upload_files.get(name) != checksum:
-            raise EndpointProtocolError(f"the closure manifest names a file outside the upload index: {name!r}")
-    if manifest.get("handoff_sha256") != digest(files):
-        raise EndpointProtocolError("the closure manifest does not bind its resolved closure digest")
-    return manifest
-
-
-def drive_staging(
-    endpoint: WindowsEndpoint,
-    *,
-    run_id: str,
-    upload_files: dict[str, str],
-    main_assembly: str,
-    intake_dir: Path,
-    batch_dir: Path,
-) -> dict:
-    """One bounded staging step: push the exact indexed folder once, wait, or verify the closure.
-
-    The archive carries every indexed name with the exact recorded bytes; a lost
-    acknowledgement is retried logically with the same member set and hashes, and
-    the endpoint seals the native closure itself - the client never plans rounds,
-    seals or transfers anything beyond the one full indexed folder.
-    """
-
-    validated = validate_file_index(upload_files)
-    snapshot = endpoint.staging_snapshot(run_id, upload_files=validated)
-    if snapshot.state == "awaiting_files":
-        batch_dir = Path(batch_dir)
-        batch_dir.mkdir(parents=True, exist_ok=True)
-        archive = batch_dir / f"staging-{digest(validated)}.zip"
-        try:
-            metadata = prepare_staging_archive(Path(intake_dir), archive, validated)
-            if metadata["files"] != validated:
-                raise EndpointProtocolError("the prepared staging archive differs from the upload index")
-            response = endpoint.stage_folder_archive(run_id, archive, upload_files=validated)
-        finally:
-            archive.unlink(missing_ok=True)
-        staged = _selection_block(response, upload_files=validated)
-        if staged.state not in {"reading", "sealed"} or staged.staged_files != validated:
-            raise EndpointProtocolError("endpoint did not stage the full indexed folder")
-        return {"action": "staged", "state": staged.state, "sealed": staged.state == "sealed"}
-    if snapshot.state == "reading":
-        return {"action": "wait", "state": "reading", "sealed": False}
-    manifest = _require_closure(validated, main_assembly, snapshot)
-    return {"action": "sealed", "state": "sealed", "sealed": True, "manifest": manifest}
-
-
 def verified_result(result: dict | None) -> dict:
     """Fail closed unless the run carries an independently verified model result.
 
@@ -1585,28 +702,6 @@ def check_result(result: dict | None, *, expected_slug: str, expected_base: str)
             "work/description/<hardware>/<request> branch"
         )
     return result
-
-
-def resolved_routing(job: dict) -> dict:
-    """The routing a native job resolved inside the serialized Windows execution.
-
-    A native handoff cannot name hardware, revision or destination before CAD discovery, so the
-    passed job snapshot must carry the routing it resolved instead of the operator request. The
-    repository target is keyed directly by the native hardware identity, so no alias is carried.
-    """
-    if not isinstance(job, dict):
-        raise EndpointProtocolError("job is not a JSON object")
-    routing = {}
-    for field in ("hardware_id", "revision", "repository_slug", "repository_base"):
-        value = job.get(field)
-        if not isinstance(value, str) or not value.strip() or _CONTROL.search(value):
-            raise EndpointProtocolError(f"native job has not resolved {field}")
-        routing[field] = value.strip()
-    if _HARDWARE_ID.fullmatch(routing["hardware_id"]) is None:
-        raise EndpointProtocolError("native job resolved a non-ASCII hardware_id")
-    if "/" not in routing["repository_slug"]:
-        raise EndpointProtocolError("native job resolved a repository_slug without an owner")
-    return routing
 
 
 class _SameHostRedirect(urlrequest.HTTPRedirectHandler):

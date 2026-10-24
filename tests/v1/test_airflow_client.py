@@ -1,22 +1,18 @@
-"""Neutral mocked-HTTP tests for the Windows endpoint client (auth, retries, failure semantics)."""
+"""Shared endpoint observation, configuration and result validation tests."""
 
 from __future__ import annotations
 
-import json
-import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
-import uuid
 import unittest
-from pathlib import Path
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib import parse as urlparse
-
-from tests.v1.protocol_support import protocol_events
+from pathlib import Path
 
 from description_pipeline.orchestration.airflow_client import (
     EndpointAuthError,
@@ -25,31 +21,23 @@ from description_pipeline.orchestration.airflow_client import (
     EndpointError,
     EndpointProtocolError,
     JOB_SCHEMA,
-    JobFailed,
     PIPELINE_ID,
     ResultNotPublishable,
     WindowsEndpoint,
     check_result,
     native_run_id,
-    resolved_routing,
     validate_artifact_name,
     validate_run_id,
     verified_result,
 )
-from description_pipeline.sources.solidworks.handoff import HANDOFF_SCHEMA
-from description_pipeline.io import digest
-from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
-from .freeze_event_support import FREEZE_RECEIPT_SHA256, freeze_events
+from description_pipeline.stages import STAGE_IDS
 
 TOKEN = "test-token"
 RUN_ID = "b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
-PARENT_ID = "0f3e2d1c-4b5a-6c7d-8e9f-0a1b2c3d4e5f"
 SHA = "a" * 64
 
 
 def rerun_plan_payload(run_id: str, status: str = "failed") -> dict:
-    from description_pipeline.stages import STAGE_IDS
-
     rows = [
         {
             "stage": stage,
@@ -74,81 +62,35 @@ def rerun_plan_payload(run_id: str, status: str = "failed") -> dict:
     return {"run_id": run_id, "status": status, "stage_reruns": rows}
 
 
-PREVIEW = {
-    "pipeline_id": PIPELINE_ID,
-    "run_id": RUN_ID,
-    "subject_sha256": SHA,
-    "urdf": "urdf/robot.urdf",
-    "files": {"urdf/robot.urdf": SHA, "meshes/base.stl": "d" * 64},
-}
-NATIVE_HANDOFF = {
-    "schema_version": HANDOFF_SCHEMA,
-    "pipeline_id": PIPELINE_ID,
-    "package": "handoff/m3.0",
-    "handoff_sha256": "b" * 64,
-}
-
-
-SELECTION_FILES = {"assembly.SLDASM": "c" * 64, "part.SLDPRT": "e" * 64}
-READER_SHA256 = "d" * 64
-
-
-def start_staging(endpoint, run_id: str = RUN_ID, **overrides) -> dict:
-    prior = freeze_events()
-    payload = {
-        "run_id": run_id,
-        "upload_files": SELECTION_FILES,
-        "main_assembly": "assembly.SLDASM",
-        "freeze_events": prior,
-        "freeze_receipt_sha256": FREEZE_RECEIPT_SHA256,
+def job_snapshot(*, status: str = "passed", events: list[dict] | None = None) -> dict:
+    return {
+        "schema_version": JOB_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "run_id": RUN_ID,
+        "status": status,
+        "events": events
+        if events is not None
+        else [{"stage": "freeze", "state": "completed", "at": "2026-10-25T00:00:00Z"}],
+        "result": None,
+        "error": None,
     }
-    payload.update(overrides)
-    return endpoint.start_staging_job(**payload)
 
 
 class MockEndpoint:
-    """Minimal stand-in for the Windows runner; state advances on each GET."""
+    """Read-only endpoint double for the retained job observation routes."""
 
     def __init__(
         self,
         *,
         token: str = TOKEN,
-        fail_job: bool = False,
-        invalid_events: bool = False,
-        omit_quality: bool = False,
-        omit_submission: bool = False,
-        publish_failed: bool = False,
-        quality_mismatch: bool = False,
         redirect_to: str | None = None,
-        handoff_response: dict | None = None,
-        preview_payload: dict | None = None,
-        artifact_redirect_to: str | None = None,
         rerun_payload: dict | None = None,
-        native_complete: bool = False,
     ) -> None:
         self.token = token
-        self.fail_job = fail_job
-        self.invalid_events = invalid_events
-        self.omit_quality = omit_quality
-        self.omit_submission = omit_submission
-        self.publish_failed = publish_failed
-        self.quality_mismatch = quality_mismatch
         self.redirect_to = redirect_to
-        self.handoff_response = handoff_response
-        self.preview_payload = preview_payload
-        self.artifact_redirect_to = artifact_redirect_to
         self.rerun_payload = rerun_payload
-        self.native_complete = native_complete
-        self.hits = 0
         self.jobs: dict[str, dict] = {}
-        self.resolved_paths: list[str] = []
-        self.imports: list[dict] = []
-        self.artifact_paths: list[str] = []
-        self.artifacts = {
-            "urdf/robot.urdf": b"<robot name='fixture'/>",
-            "meshes/base.stl": b"solid base",
-            "meshes/a b.stl": b"solid spaced",
-        }
+        self.hits = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -163,246 +105,37 @@ class MockEndpoint:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def _authorized(self) -> bool:
-                if self.headers.get("Authorization") != f"Bearer {outer.token}":
-                    self._send(401, {"error": "unauthorized"})
-                    return False
-                return True
-
             def do_GET(self) -> None:
                 outer.hits += 1
-                if self.path == "/health" and outer.redirect_to:
+                if outer.redirect_to:
                     self.send_response(302)
-                    self.send_header("Location", outer.redirect_to + "/health")
+                    self.send_header("Location", outer.redirect_to + self.path)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                if not self._authorized():
+                if self.headers.get("Authorization") != f"Bearer {outer.token}":
+                    self._send(401, {"error": "unauthorized"})
                     return
-                if self.path == "/health":
-                    self._send(200, {"pipeline_id": PIPELINE_ID, "ready": True})
+                parts = self.path.split("/")
+                run_id = parts[3] if len(parts) > 3 else ""
+                if len(parts) == 5 and parts[4] == "reruns":
+                    if run_id not in outer.jobs:
+                        self._send(404, {"error": "unknown run_id"})
+                        return
+                    self._send(
+                        200,
+                        outer.rerun_payload
+                        or rerun_plan_payload(run_id, outer.jobs[run_id]["status"]),
+                    )
                     return
-                if self.path.startswith("/v1/jobs/"):
-                    parts = self.path.split("/")
-                    run_id = parts[3] if len(parts) > 3 else ""
-                    if len(parts) >= 5 and parts[4] == "preview":
-                        job = outer.jobs.get(run_id)
-                        # The deployed endpoint retains a digest-bound preview for a verified
-                        # delivery even when the publish stage failed afterwards.
-                        retained_failure = outer.publish_failed and job is not None and job.get("status") == "failed"
-                        if job is None or (job.get("status") != "passed" and not retained_failure):
-                            self._send(404, {"error": "no passed delivery"})
-                            return
-                        payload = dict(outer.preview_payload or PREVIEW)
-                        payload["run_id"] = run_id
-                        self._send(200, payload)
-                        return
-                    if len(parts) >= 6 and parts[4] == "artifacts":
-                        if outer.artifact_redirect_to:
-                            self.send_response(302)
-                            self.send_header("Location", outer.artifact_redirect_to)
-                            self.send_header("Content-Length", "0")
-                            self.end_headers()
-                            return
-                        name = urlparse.unquote("/".join(parts[5:]))
-                        outer.artifact_paths.append(self.path)
-                        data = outer.artifacts.get(name)
-                        if data is None:
-                            self._send(404, {"error": "unknown artifact"})
-                            return
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/octet-stream")
-                        self.send_header("Content-Length", str(len(data)))
-                        self.end_headers()
-                        self.wfile.write(data)
-                        return
-                    if len(parts) >= 5 and parts[4] == "reruns":
-                        job = outer.jobs.get(run_id)
-                        if job is None:
-                            self._send(404, {"error": "unknown run_id"})
-                            return
-                        self._send(200, outer.rerun_payload or rerun_plan_payload(run_id, job.get("status", "failed")))
-                        return
+                if len(parts) == 4:
                     job = outer.jobs.get(run_id)
                     if job is None:
                         self._send(404, {"error": "unknown run_id"})
                         return
-                    if "hardware_id" not in job:
-                        job.update(
-                            hardware_id="m3.0",
-                            revision="r1",
-                            repository_slug="example/m3.0",
-                            repository_base="feature/m3.0",
-                        )
-                    job["pokes"] += 1
-                    if outer.fail_job:
-                        job["status"] = "failed"
-                        job["error"] = "cad capture failed"
-                        job["result"] = None
-                        job["discovery"] = {
-                            "passed": False,
-                            "findings": [
-                                {
-                                    "schema_version": "native-discovery/finding/v1",
-                                    "code": "discovery.axis_unresolved",
-                                    "object": "mate:elbow-1",
-                                    "message": "elbow axis cannot be resolved",
-                                    "detail": {"route": "native"},
-                                    "blocking": True,
-                                }
-                            ],
-                            "hardware_id": "m3.0",
-                            "revision": "r1",
-                            "discovery_sha256": "d" * 64,
-                        }
-                        job["events"] = protocol_events(failed_stage="discover")
-                    elif outer.publish_failed:
-                        # Real shape of a PR-service failure: verification passed, the overall
-                        # job and its publication failed, the delivery stays retained.
-                        quality_subject = "b" * 64 if outer.quality_mismatch else SHA
-                        job["status"] = "failed"
-                        job["error"] = "Incomplete or mismatched publication receipt"
-                        job["result"] = {
-                            "passed": False,
-                            "pipeline_id": PIPELINE_ID,
-                            "output": "build/out",
-                            "stage": "publish",
-                            "state": "failed",
-                            "subject_sha256": SHA,
-                            "quality": {
-                                "passed": True,
-                                "subject_sha256": quality_subject,
-                                "checks": [{"id": "physics.expected_mass", "state": "passed"}],
-                            },
-                            "submission": {
-                                "passed": False,
-                                "subject_sha256": SHA,
-                                "base": "feature/m3.0",
-                                "branch": "work/description/m3.0/0123456789abcdef01234567",
-                                "state": "failed",
-                                "error": "git_failed",
-                                "commit": "",
-                                "repository_slug": "example/m3.0",
-                            },
-                        }
-                        job["events"] = protocol_events(subject=SHA, failed_stage="publish")
-                    elif job["pokes"] >= 2 and outer.native_complete:
-                        # The split pipeline's native boundary: the capture is sealed and the
-                        # portable half continues on Linux.
-                        job["status"] = "native_complete"
-                        job["result"] = {
-                            "native_complete": True,
-                            "capture_archive": {
-                                "name": CAPTURE_ARCHIVE,
-                                "sha256": "a" * 64,
-                                "size": 1024,
-                                "manifest_sha256": "b" * 64,
-                            },
-                        }
-                        job["events"] = protocol_events(stages=("freeze", "discover", "capture"))
-                    elif job["pokes"] >= 2:
-                        job["status"] = "passed"
-                        result = {
-                            "passed": True,
-                            "pipeline_id": PIPELINE_ID,
-                            "output": "build/out",
-                            "subject_sha256": SHA,
-                            "submission": {
-                                "passed": True,
-                                "subject_sha256": SHA,
-                                "base": "feature/m3.0",
-                                "branch": "work/description/m3.0/0123456789abcdef01234567",
-                                "state": "published",
-                                "commit": "a" * 40,
-                                "repository_slug": "example/m3.0",
-                                "url": "https://github.com/example/m3.0/pull/1",
-                            },
-                        }
-                        if not outer.omit_quality:
-                            result["quality"] = {"passed": True, "subject_sha256": SHA, "checks": [{"id": "x"}]}
-                        if outer.omit_submission:
-                            result["submission"] = {"passed": False, "subject_sha256": SHA}
-                        job["result"] = result
-                        job["events"] = protocol_events(subject=SHA)
-                    else:
-                        job["status"] = "running"
-                    event = (
-                        {"phase": "job", "state": job["status"], "time": "t0"}
-                        if outer.invalid_events
-                        else {"stage": "job", "state": job["status"], "at": "t0"}
-                    )
-                    job["events"].append(event)
                     self._send(200, job)
                     return
                 self._send(404, {"error": "not found"})
-
-            def do_POST(self) -> None:
-                outer.hits += 1
-                if not self._authorized():
-                    return
-                length = int(self.headers.get("Content-Length") or 0)
-                body = self.rfile.read(length)
-                if self.path in {"/v1/handoffs/resolve", "/v1/handoffs/import"}:
-                    if self.path == "/v1/handoffs/resolve":
-                        outer.resolved_paths.append(json.loads(body or b"{}").get("handoff_path"))
-                    else:
-                        outer.imports.append(
-                            {
-                                "size": len(body),
-                                "bytes": body,
-                                "content_type": self.headers.get("Content-Type"),
-                                "content_length": self.headers.get("Content-Length"),
-                            }
-                        )
-                    self._send(200, dict(outer.handoff_response or NATIVE_HANDOFF))
-                    return
-                payload = json.loads(body or b"{}")
-                if self.path != "/v1/jobs":
-                    self._send(404, {"error": "not found"})
-                    return
-                run_id = payload.get("run_id", "")
-                if run_id in outer.jobs:
-                    if outer.jobs[run_id]["request"] != payload:
-                        self._send(409, {"error": "run_id bound to a different request"})
-                        return
-                    self._send(200, outer.jobs[run_id])
-                    return
-                job = {
-                    "schema_version": JOB_SCHEMA,
-                    "pipeline_id": PIPELINE_ID,
-                    "run_id": run_id,
-                    "status": "queued",
-                    "events": [{"stage": "submit", "state": "queued", "at": "t0"}],
-                    "result": None,
-                    "error": None,
-                    "pokes": 0,
-                    "request": payload,
-                }
-                if "upload_files" in payload:
-                    upload = dict(payload["upload_files"])
-                    job["native_tool"] = {"source_sha256": READER_SHA256, "role": "native"}
-                    if "resume" in payload:
-                        job["selection"] = {
-                            "state": "sealed",
-                            "reader_sha256": READER_SHA256,
-                            "upload_sha256": payload["upload_sha256"],
-                            "staged_files": upload,
-                            "manifest": {
-                                "main_assembly": payload["main_assembly"],
-                                "files": upload,
-                                "upload_sha256": payload["upload_sha256"],
-                                "handoff_sha256": digest(upload),
-                            },
-                        }
-                    else:
-                        job["selection"] = {
-                            "state": "awaiting_files",
-                            "reader_sha256": READER_SHA256,
-                            "upload_sha256": payload["upload_sha256"],
-                            "staged_files": {},
-                        }
-                outer.jobs[run_id] = job
-                self._send(202, {k: v for k, v in job.items() if k != "pokes"})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -421,111 +154,50 @@ class MockEndpoint:
 
 
 class ClientTests(unittest.TestCase):
-    def endpoint(self, server: MockEndpoint, token: str = TOKEN, roots=()) -> WindowsEndpoint:
-        return WindowsEndpoint(EndpointConfig(base_url=server.url, token=token, timeout=5, handoff_roots=roots))
-
-    def test_health_and_auth(self) -> None:
-        with MockEndpoint() as server:
-            health = self.endpoint(server).health()
-            self.assertEqual(health["pipeline_id"], PIPELINE_ID)
-            self.assertTrue(health["ready"])
-            with self.assertRaises(EndpointAuthError):
-                self.endpoint(server, token="wrong").health()
-
-    def test_start_is_idempotent_and_conflicts_on_mismatch(self) -> None:
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            first = start_staging(endpoint)
-            second = start_staging(endpoint)
-            self.assertEqual(first["run_id"], second["run_id"])
-            self.assertEqual(len(server.jobs), 1)
-            with self.assertRaises(EndpointConflict):
-                start_staging(endpoint, upload_files={"assembly.SLDASM": "9" * 64})
-
-    def test_native_job_binds_only_index_digest_and_main(self) -> None:
-        from description_pipeline.io import digest
-
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            job = start_staging(endpoint)
-            self.assertEqual(job["request"]["upload_sha256"], digest(SELECTION_FILES))
-            self.assertEqual(job["request"]["main_assembly"], "assembly.SLDASM")
-            self.assertNotIn("package", job["request"])
-            with self.assertRaises(EndpointConflict):
-                start_staging(endpoint, upload_files={"assembly.SLDASM": "9" * 64})
-
-    def test_native_job_resolves_routing_after_cad_discovery(self) -> None:
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint)
-            routing = resolved_routing(endpoint.get_job(RUN_ID))
-            self.assertEqual(routing["hardware_id"], "m3.0")
-            self.assertEqual(routing["repository_slug"], "example/m3.0")
-            self.assertEqual(routing["repository_base"], "feature/m3.0")
-            passed = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
-            check_result(
-                passed["result"],
-                expected_slug=routing["repository_slug"],
-                expected_base=routing["repository_base"],
+    def endpoint(self, server: MockEndpoint, *, token: str = TOKEN, roots=()) -> WindowsEndpoint:
+        return WindowsEndpoint(
+            EndpointConfig(
+                base_url=server.url,
+                token=token,
+                timeout=5,
+                handoff_roots=roots,
             )
+        )
 
-    def test_get_job_accepts_unresolved_routing_but_rejects_empty_values(self) -> None:
+    def test_get_job_reads_the_retained_contract_and_honors_auth(self) -> None:
+        with MockEndpoint() as server:
+            server.jobs[RUN_ID] = job_snapshot()
+            job = self.endpoint(server).get_job(RUN_ID)
+            self.assertEqual(job["run_id"], RUN_ID)
+            self.assertEqual(job["status"], "passed")
+            with self.assertRaises(EndpointAuthError):
+                self.endpoint(server, token="wrong").get_job(RUN_ID)
+
+    def test_get_job_rejects_invalid_events_and_empty_routing(self) -> None:
         with MockEndpoint() as server:
             endpoint = self.endpoint(server)
-            start_staging(endpoint)
-            self.assertNotIn("repository_slug", server.jobs[RUN_ID])
+            server.jobs[RUN_ID] = job_snapshot()
             endpoint.get_job(RUN_ID)
             server.jobs[RUN_ID]["repository_slug"] = " "
             with self.assertRaises(EndpointProtocolError):
                 endpoint.get_job(RUN_ID)
-            server.jobs[RUN_ID]["repository_slug"] = "example/m3.0"
-            server.jobs[RUN_ID]["hardware_id"] = "m3.0 左"
+            server.jobs[RUN_ID].pop("repository_slug")
+            server.jobs[RUN_ID]["events"] = [{"phase": "job", "state": "passed"}]
             with self.assertRaises(EndpointProtocolError):
-                resolved_routing(server.jobs[RUN_ID])
-            server.jobs[RUN_ID]["hardware_id"] = "9m3"
-            with self.assertRaises(EndpointProtocolError):
-                resolved_routing(server.jobs[RUN_ID])
-            server.jobs[RUN_ID]["hardware_id"] = "A" * 65
-            with self.assertRaises(EndpointProtocolError):
-                resolved_routing(server.jobs[RUN_ID])
-            server.jobs[RUN_ID]["hardware_id"] = "M3.0"
-            self.assertEqual(resolved_routing(server.jobs[RUN_ID])["hardware_id"], "M3.0")
+                endpoint.get_job(RUN_ID)
 
-    def test_absolute_handoff_requires_configured_roots(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "handoff"
-            source.mkdir()
-            with MockEndpoint() as server:
+    def test_rerun_plan_round_trips_and_refuses_partial_coverage(self) -> None:
+        with MockEndpoint() as server:
+            server.jobs[RUN_ID] = job_snapshot(status="failed")
+            plan = self.endpoint(server).rerun_plan(RUN_ID)
+            self.assertEqual(plan["run_id"], RUN_ID)
+            self.assertEqual([row["stage"] for row in plan["stage_reruns"]], list(STAGE_IDS))
+            broken = rerun_plan_payload(RUN_ID)
+            broken["stage_reruns"] = broken["stage_reruns"][:-1]
+            with MockEndpoint(rerun_payload=broken) as bad_server:
+                bad_server.jobs[RUN_ID] = job_snapshot(status="failed")
                 with self.assertRaises(EndpointProtocolError):
-                    self.endpoint(server).authorized_intake_dir(str(source))
-                self.assertEqual(server.hits, 0)
-                self.assertEqual(server.imports, [])
-
-    def test_absolute_handoff_outside_roots_is_rejected_without_network(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "handoffs"
-            root.mkdir()
-            outside = Path(tmp) / "private"
-            outside.mkdir()
-            with MockEndpoint() as server:
-                with self.assertRaises(EndpointProtocolError):
-                    self.endpoint(server, roots=[root]).authorized_intake_dir(str(outside))
-                self.assertEqual(server.hits, 0)
-                self.assertEqual(server.imports, [])
-
-    def test_linked_handoff_paths_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "handoffs"
-            root.mkdir()
-            outside = Path(tmp) / "outside"
-            outside.mkdir()
-            (root / "linked").symlink_to(outside, target_is_directory=True)
-            with MockEndpoint() as server:
-                with self.assertRaises(EndpointProtocolError):
-                    self.endpoint(server, roots=[root]).authorized_intake_dir(str(root / "linked" / "cell"))
-                self.assertEqual(server.hits, 0)
-                with self.assertRaises(EndpointProtocolError):
-                    self.endpoint(server, roots=[root / "linked"])
+                    self.endpoint(bad_server).rerun_plan(RUN_ID)
 
     def test_filesystem_root_and_relative_roots_are_refused(self) -> None:
         for roots in ("/", ["relative/root"], [123]):
@@ -533,8 +205,8 @@ class ClientTests(unittest.TestCase):
                 EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, handoff_roots=roots)
 
     def test_discovery_settings_are_validated_and_preserved(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
             records = root / "records"
             records.mkdir()
             config = EndpointConfig(
@@ -559,82 +231,33 @@ class ClientTests(unittest.TestCase):
                 EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [str(link)]})
 
     def test_discovery_record_paths_reject_root_and_dotdot_segments(self) -> None:
-        """The handoff-root rule, applied to discovery paths on the raw spelling.
-
-        ``Path`` collapses ``//`` before any parts check, so the guard judges the original
-        segments: ``..`` refuses whether or not it resolves, and empty segments (``a//b``)
-        refuse too - one clear message per label, the text is never silently rewritten, and a
-        clean absolute path still passes unchanged.
-        """
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
             records = root / "records"
             records.mkdir()
             nested = root / "sub"
             nested.mkdir()
-            config = EndpointConfig(
-                base_url="http://127.0.0.1",
-                token=TOKEN,
-                discovery={"record_roots": [str(records)]},
-            )
-            self.assertEqual(config.discovery["record_roots"], (records,))
             for value in (
-                str(records / ".." / "records"),  # resolvable: previously accepted unnormalized
+                str(records / ".." / "records"),
                 str(nested / ".." / "records"),
                 str(nested / ".." / "missing"),
-                str(nested) + "/../records",  # raw '..' spelling (Path would keep it too)
-                str(nested) + "/..",  # trailing '/..'
-                str(nested) + "//records",  # raw empty segment (Path would collapse it)
-                "/" + str(records),  # raw '//' root spelling
+                str(nested) + "/../records",
+                str(nested) + "/..",
+                str(nested) + "//records",
+                "/" + str(records),
                 "/",
             ):
                 with self.subTest(record_root=value):
                     with self.assertRaises(EndpointProtocolError) as caught:
-                        EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [value]})
-                    self.assertIn("discovery record root must be a dedicated absolute path", str(caught.exception))
-
-    def test_capture_archive_receipt_is_validated_exactly(self) -> None:
-        from description_pipeline.orchestration.airflow_client import capture_archive_metadata
-        from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST
-
-        archive = {
-            "name": CAPTURE_ARCHIVE,
-            "sha256": "a" * 64,
-            "size": 1024,
-            "manifest_sha256": "b" * 64,
-        }
-        job = {"status": "native_complete", "result": {"native_complete": True, "capture_archive": archive}}
-        self.assertEqual(capture_archive_metadata(job), archive)
-        for broken in (
-            {"status": "passed", "result": {"native_complete": True, "capture_archive": archive}},
-            {"status": "native_complete", "result": {"capture_archive": archive}},
-            {
-                "status": "native_complete",
-                "result": {"native_complete": True, "capture_archive": {**archive, "name": "other.zip"}},
-            },
-            {
-                "status": "native_complete",
-                "result": {
-                    "native_complete": True,
-                    "capture_archive": {**archive, "manifest_name": CAPTURE_MANIFEST},
-                },
-            },
-            {
-                "status": "native_complete",
-                "result": {"native_complete": True, "capture_archive": {**archive, "sha256": "A" * 64}},
-            },
-            {
-                "status": "native_complete",
-                "result": {"native_complete": True, "capture_archive": {**archive, "size": 0}},
-            },
-            {
-                "status": "native_complete",
-                "result": {"native_complete": True, "capture_archive": {**archive, "extra": 1}},
-            },
-        ):
-            with self.subTest(job=broken), self.assertRaises(EndpointProtocolError):
-                capture_archive_metadata(broken)
+                        EndpointConfig(
+                            base_url="http://127.0.0.1",
+                            token=TOKEN,
+                            discovery={"record_roots": [value]},
+                        )
+                    self.assertIn(
+                        "discovery record root must be a dedicated absolute path",
+                        str(caught.exception),
+                    )
 
     def test_linux_routing_map_and_store_root_are_validated(self) -> None:
         config = EndpointConfig(
@@ -643,7 +266,10 @@ class ClientTests(unittest.TestCase):
             repositories={"mimicverse/description": "/home/andy/Work/description"},
             store_root="/home/andy/operator/runs",
         )
-        self.assertEqual(config.repositories, {"mimicverse/description": Path("/home/andy/Work/description")})
+        self.assertEqual(
+            config.repositories,
+            {"mimicverse/description": Path("/home/andy/Work/description")},
+        )
         self.assertEqual(config.store_root, Path("/home/andy/operator/runs"))
         for kwargs in (
             {"repositories": {"noslug": "/srv/repo"}},
@@ -654,46 +280,6 @@ class ClientTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(EndpointProtocolError):
                 EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, **kwargs)
 
-    def test_stream_capture_archive_verifies_size_and_digest(self) -> None:
-        import io as io_module
-
-        from description_pipeline.orchestration.airflow_client import WindowsEndpoint
-        from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
-
-        payload = b"PK\x03\x04fixture-capture-archive"
-        archive = {
-            "name": CAPTURE_ARCHIVE,
-            "sha256": hashlib.sha256(payload).hexdigest(),
-            "size": len(payload),
-            "manifest_sha256": "b" * 64,
-        }
-
-        class Response:
-            def __init__(self, data: bytes) -> None:
-                self._stream = io_module.BytesIO(data)
-
-            def read(self, size: int = -1) -> bytes:
-                return self._stream.read(size)
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        endpoint = WindowsEndpoint(
-            EndpointConfig(base_url="http://127.0.0.1", token=TOKEN),
-            opener=lambda request, timeout: Response(payload),
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            destination = Path(tmp) / CAPTURE_ARCHIVE
-            self.assertEqual(endpoint.stream_capture_archive(RUN_ID, archive, destination), destination)
-            self.assertEqual(destination.read_bytes(), payload)
-            for broken in ({**archive, "sha256": "c" * 64}, {**archive, "size": len(payload) + 1}):
-                with self.assertRaises(EndpointProtocolError):
-                    endpoint.stream_capture_archive(RUN_ID, broken, destination)
-            self.assertEqual(destination.read_bytes(), payload)
-
     def test_native_run_id_is_canonical_and_stable(self) -> None:
         expected = str(uuid.uuid5(uuid.NAMESPACE_URL, f"solidworks_to_urdf:{RUN_ID}"))
         self.assertEqual(native_run_id(RUN_ID), expected)
@@ -701,110 +287,18 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(EndpointProtocolError):
             native_run_id("")
 
-    def test_open_artifact_streams_verified_bytes(self) -> None:
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint)
-            endpoint.wait(RUN_ID, interval=0.05, timeout=5)
-            with endpoint.open_artifact(RUN_ID, "urdf/robot.urdf") as response:
-                self.assertEqual(response.read(), b"<robot name='fixture'/>")
-            with endpoint.open_artifact(RUN_ID, "meshes/a b.stl") as response:
-                self.assertEqual(response.read(), b"solid spaced")
-            self.assertEqual(
-                server.artifact_paths,
-                [f"/v1/jobs/{RUN_ID}/artifacts/urdf/robot.urdf", f"/v1/jobs/{RUN_ID}/artifacts/meshes/a%20b.stl"],
-            )
-            with self.assertRaises(EndpointError):
-                endpoint.open_artifact(RUN_ID, "meshes/missing.stl")
-            for bad in ("../escape", "/etc/passwd", "a\\b", "", "."):
-                with self.subTest(bad=bad), self.assertRaises(EndpointProtocolError):
-                    endpoint.open_artifact(RUN_ID, bad)
-            self.assertEqual(len(server.artifact_paths), 3)
-
-    def test_open_artifact_refuses_cross_host_redirect(self) -> None:
-        with MockEndpoint(artifact_redirect_to="http://127.0.0.1:1/urdf/robot.urdf") as server:
-            endpoint = self.endpoint(server)
-            with self.assertRaises(EndpointError):
-                endpoint.open_artifact(RUN_ID, "urdf/robot.urdf")
-
-    def test_wait_passes_and_fails_closed_on_result(self) -> None:
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint)
-            job = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
-            self.assertEqual(job["status"], "passed")
-            self.assertEqual(
-                check_result(job["result"], expected_slug="example/m3.0", expected_base="feature/m3.0")["submission"][
-                    "url"
-                ],
-                "https://github.com/example/m3.0/pull/1",
-            )
-            with self.assertRaises(ResultNotPublishable):
-                check_result(
-                    {
-                        "passed": True,
-                        "pipeline_id": PIPELINE_ID,
-                        "subject_sha256": SHA,
-                        "quality": {"passed": True, "subject_sha256": SHA},
-                        "submission": {
-                            "passed": True,
-                            "subject_sha256": SHA,
-                            "base": "feature/m3.0",
-                            "branch": "work/description/m3.0/0123456789abcdef01234567",
-                            "state": "published",
-                            "commit": "a" * 40,
-                            "url": "https://example.test/pr/1",
-                        },
-                    },
-                    expected_slug="example/m3.0",
-                    expected_base="feature/m3.0",
-                )
-            good = job["result"]
-            for bad in (
-                {**good, "subject_sha256": "b" * 64},
-                {**good, "quality": {**good["quality"], "subject_sha256": "b" * 64}},
-                {**good, "submission": {**good["submission"], "url": "https://example.test/pr/1"}},
-                {**good, "submission": {**good["submission"], "commit": "xyz"}},
-                {**good, "submission": {**good["submission"], "state": "queued"}},
-                {**good, "submission": {**good["submission"], "repository_slug": "attacker/repo"}},
-                {**good, "submission": {**good["submission"], "base": "feature/other"}},
-                {**good, "submission": {**good["submission"], "branch": "main"}},
-            ):
-                with self.assertRaises(ResultNotPublishable):
-                    check_result(bad, expected_slug="example/m3.0", expected_base="feature/m3.0")
-        with MockEndpoint(omit_quality=True) as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint)
-            with self.assertRaises(ResultNotPublishable):
-                check_result(
-                    endpoint.wait(RUN_ID, interval=0.05, timeout=5)["result"],
-                    expected_slug="example/m3.0",
-                    expected_base="feature/m3.0",
-                )
-
-    def test_wait_returns_at_the_native_complete_boundary(self) -> None:
-        from description_pipeline.orchestration.airflow_client import capture_archive_metadata
-
-        with MockEndpoint(native_complete=True) as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint)
-            job = endpoint.wait(RUN_ID, interval=0.05, timeout=5)
-            self.assertEqual(job["status"], "native_complete")
-            archive = capture_archive_metadata(job)
-            self.assertEqual(archive["name"], CAPTURE_ARCHIVE)
-            self.assertEqual(archive["size"], 1024)
-
     def test_publication_failure_never_hides_or_weakens_the_verified_model(self) -> None:
-        # Real shape of a PR-service failure: the overall job and its publication failed while
-        # the model itself passed independent verification. Qualification must not hinge on
-        # publication success, and the strict publication gate must stay in place.
         result = {
             "passed": False,
             "pipeline_id": PIPELINE_ID,
             "stage": "publish",
             "state": "failed",
             "subject_sha256": SHA,
-            "quality": {"passed": True, "subject_sha256": SHA, "checks": [{"id": "x", "state": "passed"}]},
+            "quality": {
+                "passed": True,
+                "subject_sha256": SHA,
+                "checks": [{"id": "x", "state": "passed"}],
+            },
             "submission": {
                 "passed": False,
                 "subject_sha256": SHA,
@@ -818,7 +312,11 @@ class ClientTests(unittest.TestCase):
         }
         self.assertIs(verified_result(result), result)
         with self.assertRaises(ResultNotPublishable) as raised:
-            check_result(result, expected_slug="example/m3.0", expected_base="feature/m3.0")
+            check_result(
+                result,
+                expected_slug="example/m3.0",
+                expected_base="feature/m3.0",
+            )
         self.assertEqual(str(raised.exception), "result.passed is not true")
         for bad in (
             None,
@@ -827,18 +325,23 @@ class ClientTests(unittest.TestCase):
             {key: value for key, value in result.items() if key != "quality"},
             {**result, "quality": None},
             {**result, "quality": {**result["quality"], "passed": False}},
-            {**result, "quality": {**result["quality"], "subject_sha256": "b" * 64}},
+            {
+                **result,
+                "quality": {**result["quality"], "subject_sha256": "b" * 64},
+            },
         ):
             with self.subTest(bad=bad), self.assertRaises(ResultNotPublishable):
                 verified_result(bad)
 
     def test_internal_opener_ignores_ambient_proxies(self) -> None:
-        # A child process imports the opener under a hostile proxy environment (fake proxy that
-        # answers 502 and counts hits); only a direct connection passes.
         root = Path(__file__).resolve().parents[2]
         environment = {**os.environ, "PYTHONPATH": str(root / "src")}
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve().parent / "proxy_probe.py"), "airflow_client"],
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "proxy_probe.py"),
+                "airflow_client",
+            ],
             capture_output=True,
             text=True,
             timeout=60,
@@ -846,20 +349,6 @@ class ClientTests(unittest.TestCase):
             cwd=str(root),
         )
         self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
-
-    def test_failed_job_raises(self) -> None:
-        with MockEndpoint(fail_job=True) as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint)
-            with self.assertRaises(JobFailed):
-                endpoint.wait(RUN_ID, interval=0.05, timeout=5)
-
-    def test_invalid_event_contract_is_refused(self) -> None:
-        with MockEndpoint(invalid_events=True) as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint)
-            with self.assertRaises(EndpointProtocolError):
-                endpoint.get_job(RUN_ID)
 
     def test_input_validation(self) -> None:
         with self.assertRaises(EndpointProtocolError):
@@ -874,9 +363,10 @@ class ClientTests(unittest.TestCase):
 
     def test_cross_host_redirect_never_forwards_token(self) -> None:
         with MockEndpoint() as target, MockEndpoint(redirect_to=target.url) as redirector:
-            endpoint = WindowsEndpoint(EndpointConfig(base_url=redirector.url, token=TOKEN, timeout=5))
+            target.jobs[RUN_ID] = job_snapshot()
+            endpoint = self.endpoint(redirector)
             with self.assertRaises(EndpointError):
-                endpoint.health()
+                endpoint.get_job(RUN_ID)
             self.assertEqual(target.hits, 0)
 
     def test_refusal_bodies_reach_callers(self) -> None:
@@ -892,7 +382,7 @@ class ClientTests(unittest.TestCase):
             def log_message(self, *args) -> None:
                 return
 
-            def do_POST(self) -> None:
+            def do_GET(self) -> None:
                 encoded = json.dumps(body).encode()
                 self.send_response(409)
                 self.send_header("Content-Type", "application/json")
@@ -904,9 +394,14 @@ class ClientTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        endpoint = WindowsEndpoint(EndpointConfig(base_url=f"http://127.0.0.1:{server.server_port}", token=TOKEN))
+        endpoint = WindowsEndpoint(
+            EndpointConfig(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                token=TOKEN,
+            )
+        )
         with self.assertRaises(EndpointConflict) as caught:
-            start_staging(endpoint)
+            endpoint.get_job(RUN_ID)
         failure = caught.exception
         self.assertEqual(failure.status, 409)
         self.assertEqual(failure.code, "already_active")
@@ -917,142 +412,21 @@ class ClientTests(unittest.TestCase):
         self.assertIn("request conflict (409)", str(failure))
         self.assertIn("selection is bound to another run", str(failure))
 
-    def test_failure_diagnostics_downloads_hash_bound_members(self) -> None:
-        from description_pipeline.orchestration.airflow_client import (
-            EndpointNotFound,
-            _validate_failure_diagnostics,
-        )
-
-        receipt = json.dumps({"run_id": RUN_ID, "error": "boom", "main_assembly": "robot.SLDASM"}).encode()
-        evidence = b'{"findings": []}'
-        manifest = json.dumps(
-            {
-                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
-                "run_id": RUN_ID,
-                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(receipt).hexdigest()},
-                "files": {"evidence/discovery.json": hashlib.sha256(evidence).hexdigest()},
-                "partial": True,
-                "partial_files": ["evidence/raw/material_provenance.json"],
-            }
-        ).encode()
-        with MockEndpoint() as server:
-            server.artifacts["diagnostic.json"] = manifest
-            server.artifacts["receipt.json"] = receipt
-            server.artifacts["evidence/evidence/discovery.json"] = evidence
-            endpoint = self.endpoint(server)
-            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(manifest).hexdigest()}}
-            with tempfile.TemporaryDirectory() as tmp:
-                written = endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
-                self.assertEqual(Path(written["receipt.json"]).read_bytes(), receipt)
-                self.assertEqual(Path(written["evidence/evidence/discovery.json"]).read_bytes(), evidence)
-                self.assertEqual(Path(written["diagnostic.json"]).read_bytes(), manifest)
-                tampered = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": "0" * 64}}
-                with self.assertRaises(EndpointProtocolError):
-                    endpoint.download_failure_diagnostics(RUN_ID, tampered, Path(tmp) / "tampered")
-                with self.assertRaises(EndpointNotFound):
-                    endpoint.download_failure_diagnostics(RUN_ID, {}, Path(tmp) / "absent")
-                with self.assertRaises(EndpointProtocolError):
-                    endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp) / "tiny", limit=8)
-        with self.assertRaises(EndpointProtocolError):
-            _validate_failure_diagnostics({"failure_diagnostics": {"path": "other.json", "sha256": "0" * 64}})
-
-    def test_failure_diagnostics_refuses_cross_run_receipt_and_unknown_members(self) -> None:
-        foreign = b'{"run_id": "not-this-run", "error": "boom"}'
-        manifest = json.dumps(
-            {
-                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
-                "run_id": RUN_ID,
-                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(foreign).hexdigest()},
-                "files": {},
-            }
-        ).encode()
-        with MockEndpoint() as server:
-            server.artifacts["diagnostic.json"] = manifest
-            server.artifacts["receipt.json"] = foreign
-            endpoint = self.endpoint(server)
-            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(manifest).hexdigest()}}
-            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(EndpointProtocolError):
-                endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
-
-        unknown = json.dumps(
-            {
-                "schema": "solidworks-to-urdf.failure-diagnostics/v1",
-                "run_id": RUN_ID,
-                "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(foreign).hexdigest()},
-                "files": {"notes/extra.json": "0" * 64},
-            }
-        ).encode()
-        with MockEndpoint() as server:
-            server.artifacts["diagnostic.json"] = unknown
-            endpoint = self.endpoint(server)
-            job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(unknown).hexdigest()}}
-            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(EndpointProtocolError):
-                endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
-
-    def test_start_rejects_a_different_echoed_request(self) -> None:
-        response = {
-            "run_id": RUN_ID,
-            "status": "queued",
-            "request": {
-                "run_id": RUN_ID,
-                "upload_files": SELECTION_FILES,
-                "upload_sha256": "0" * 64,
-                "main_assembly": "assembly.SLDASM",
-            },
-        }
-        endpoint = WindowsEndpoint(
-            EndpointConfig(base_url="http://127.0.0.1", token=TOKEN),
-            opener=lambda *_args, **_kwargs: io.BytesIO(json.dumps(response).encode()),
-        )
-        with self.assertRaisesRegex(EndpointProtocolError, "different staging request"):
-            start_staging(endpoint)
-
-    def test_linked_start_forwards_resume_and_rerun_plan_round_trips(self) -> None:
-        from description_pipeline.stages import STAGE_IDS
-
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint, run_id=PARENT_ID)
-            plan = endpoint.rerun_plan(PARENT_ID)
-            self.assertEqual(plan["run_id"], PARENT_ID)
-            self.assertEqual([row["stage"] for row in plan["stage_reruns"]], list(STAGE_IDS))
-            child = start_staging(endpoint, resume={"parent_run": PARENT_ID, "from_stage": "verify"})
-            self.assertEqual(child["request"]["resume"], {"parent_run": PARENT_ID, "from_stage": "verify"})
-            with self.assertRaises(EndpointConflict):
-                start_staging(endpoint, resume={"parent_run": PARENT_ID, "from_stage": "generate"})
-
-    def test_linked_bindings_and_plans_are_validated_before_they_are_trusted(self) -> None:
-        with MockEndpoint() as server:
-            endpoint = self.endpoint(server)
-            start_staging(endpoint, run_id=PARENT_ID)
-            broken = rerun_plan_payload(PARENT_ID)
-            broken["stage_reruns"] = broken["stage_reruns"][:-1]
-            with MockEndpoint(rerun_payload=broken) as bad_server:
-                bad = self.endpoint(bad_server)
-                start_staging(bad, run_id=PARENT_ID)
-                with self.assertRaises(EndpointProtocolError):
-                    bad.rerun_plan(PARENT_ID)
-            for resume in (
-                {"parent_run": PARENT_ID, "from_stage": "freeze", "extra": True},
-                {"parent_run": PARENT_ID, "from_stage": "unknown"},
-                {"parent_run": "not-a-uuid", "from_stage": "verify"},
-                {"parent_run": RUN_ID, "from_stage": "verify"},
-            ):
-                with self.subTest(resume=str(resume)), self.assertRaises(EndpointProtocolError):
-                    start_staging(endpoint, resume=resume)
-
     def test_invalid_url_timeout_and_redirect_fail_closed(self) -> None:
-        for address in ("http://127.0.0.1:invalid", "http://127.0.0.1?token=x", "http://127.0.0.1#fragment"):
+        for address in (
+            "http://127.0.0.1:invalid",
+            "http://127.0.0.1?token=x",
+            "http://127.0.0.1#fragment",
+        ):
             with self.subTest(address=address), self.assertRaises(EndpointProtocolError):
                 EndpointConfig(base_url=address, token=TOKEN)
         for timeout in (0, -1, float("inf"), float("nan")):
             with self.subTest(timeout=timeout), self.assertRaises(EndpointProtocolError):
-                EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, timeout=timeout)
-        with (
-            MockEndpoint(redirect_to="http://127.0.0.1:invalid") as redirector,
-            self.assertRaises(EndpointError),
-        ):
-            self.endpoint(redirector).health()
+                EndpointConfig(
+                    base_url="http://127.0.0.1",
+                    token=TOKEN,
+                    timeout=timeout,
+                )
 
     def test_invalid_utf8_response_is_a_protocol_failure(self) -> None:
         endpoint = WindowsEndpoint(
@@ -1060,7 +434,7 @@ class ClientTests(unittest.TestCase):
             opener=lambda *_args, **_kwargs: io.BytesIO(b"\xff"),
         )
         with self.assertRaisesRegex(EndpointProtocolError, "invalid UTF-8"):
-            endpoint.health()
+            endpoint.get_job(RUN_ID)
 
 
 if __name__ == "__main__":
