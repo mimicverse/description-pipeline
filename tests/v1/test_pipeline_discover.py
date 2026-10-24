@@ -710,6 +710,9 @@ class _Services:
     def decision_for(self, command):
         return self.decision
 
+    def cancellation_for(self, command):
+        return None
+
     def load_result(self, decision):
         return self.candidate.result
 
