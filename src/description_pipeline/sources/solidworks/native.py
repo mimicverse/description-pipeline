@@ -3655,6 +3655,9 @@ class SolidWorksBackend(CadBackend):
         self._scene_document_key = None
         self._part_mass_properties = {}
         self._effective_instance_readings = {}
+        self._capture_expected_documents = None
+        self._capture_top_document = None
+        self._capture_topology = None
         self.save_flags.clear()
         with self._sessions_lock:
             sessions = list(self._sessions.values())
@@ -4802,6 +4805,191 @@ class SolidWorksBackend(CadBackend):
             )
         return doc, state
 
+    def _capture_loaded_documents(self, known_documents=None):
+        """Return every loaded capture-role document without inventing paths."""
+
+        app = self._app_obj()
+        documents = []
+        identities = set()
+        paths = set()
+        for raw in _as_list(_member(app, "GetDocuments")):
+            doc = _modeldoc2(_dynamic(raw))
+            path = str(_member(doc, "GetPathName") or "")
+            if not path:
+                raise CadError(
+                    "cad_capture_document_unbound",
+                    "A loaded CAD document has no path identity",
+                )
+            document_type = _member(doc, "GetType")
+            if type(document_type) is not int or document_type not in {1, 2}:
+                raise CadError(
+                    "cad_capture_document_unbound",
+                    "A loaded CAD document has an unsupported type",
+                    {"path": path, "document_type": document_type},
+                )
+            normalized = normalize_document_path(os.path.abspath(path))
+            identity = _com_iunknown_pointer(doc)
+            identity_key = (
+                int(identity) if isinstance(identity, int) else repr(identity)
+            )
+            if identity_key in identities:
+                raise CadError(
+                    "cad_capture_document_identity",
+                    "A loaded CAD document identity is duplicated",
+                    {"path": path},
+                )
+            if normalized in paths:
+                raise CadError(
+                    "cad_capture_document_identity",
+                    "A loaded CAD document path is duplicated",
+                    {"path": path},
+                )
+            identities.add(identity_key)
+            paths.add(normalized)
+            documents.append(
+                {
+                    "doc": doc,
+                    "identity": identity_key,
+                    "normalized_path": normalized,
+                    "path": path,
+                    "document_type": document_type,
+                }
+            )
+        if not documents:
+            raise CadError(
+                "cad_capture_document_unbound",
+                "The capture session has no loaded CAD documents",
+            )
+        return sorted(documents, key=lambda row: row["normalized_path"])
+
+    @staticmethod
+    def _require_loaded_document_set(loaded_documents, expected_paths):
+        loaded_paths = {row["normalized_path"] for row in loaded_documents}
+        missing = sorted(expected_paths - loaded_paths)
+        extras = sorted(loaded_paths - expected_paths)
+        if missing or extras:
+            raise CadError(
+                "cad_capture_document_unbound",
+                "Loaded CAD documents differ from the capture topology",
+                {"missing": missing, "extra": extras},
+            )
+
+    def _capture_assert_documents_ready(self, loaded_documents, *, phase):
+        rows = []
+        for loaded in loaded_documents:
+            doc, state = self._capture_rebuild_state(
+                loaded["path"],
+                document=loaded["doc"],
+                phase=phase,
+                include_assembly_controls=loaded["document_type"] == 2,
+            )
+            del doc
+            if (
+                state.get("needs_rebuild2_value") != 0
+                or state.get("configuration_needs_rebuild") is not False
+                or any(
+                    item["needs_rebuild"] is not False
+                    for item in state["configurations"]
+                )
+            ):
+                raise CadError(
+                    "cad_rebuild_incomplete",
+                    "Capture reads left a CAD document pending",
+                    {"path": loaded["path"], "phase": phase, "state": state},
+                )
+            rows.append(
+                {
+                    "path": loaded["path"],
+                    "document_type": loaded["document_type"],
+                    "state": state,
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _capture_semantic_topology(topology):
+        rows = []
+        for row in topology:
+            item = {
+                key: row.get(key)
+                for key in (
+                    "instance",
+                    "document_type",
+                    "referenced_configuration",
+                    "suppression_state",
+                    "storage_scope",
+                    "provenance_state",
+                )
+            }
+            if row.get("storage_scope") != "session":
+                item["normalized_path"] = row.get("normalized_path")
+            rows.append(item)
+        return sorted(
+            rows,
+            key=lambda row: tuple(
+                "" if row.get(key) is None else str(row.get(key)).casefold()
+                for key in (
+                    "instance",
+                    "normalized_path",
+                    "document_type",
+                    "referenced_configuration",
+                    "suppression_state",
+                    "storage_scope",
+                    "provenance_state",
+                )
+            ),
+        )
+
+    def verify_capture_documents_ready(self):
+        """Fail closed unless every loaded document is clean at this read boundary."""
+
+        expected_topology = getattr(self, "_capture_topology", None)
+        top_path = getattr(self, "_capture_top_document", None)
+        if not isinstance(expected_topology, list) or not top_path:
+            raise CadError(
+                "cad_capture_document_unbound",
+                "Capture document authority was not initialized",
+            )
+        graph = self._capture_rebuild_graph(
+            self._document_by_path(top_path),
+            top_path,
+        )
+        if (
+            self._capture_semantic_topology(graph["topology"])
+            != expected_topology
+        ):
+            raise CadError(
+                "cad_rebuild_topology_changed",
+                "Capture read boundary changed the engineering topology",
+                {
+                    "before": expected_topology,
+                    "after": self._capture_semantic_topology(graph["topology"]),
+                },
+            )
+        rows = self._capture_assert_documents_ready(
+            graph["loaded_documents"],
+            phase="capture_final",
+        )
+        top = next(
+            row
+            for row in graph["loaded_documents"]
+            if row["normalized_path"]
+            == normalize_document_path(os.path.abspath(top_path))
+        )
+        top_state = top["state"]
+        if top_state.get("read_only") is not True:
+            raise CadError(
+                "cad_rebuild_incomplete",
+                "Capture reads did not end with a read-only top assembly",
+                {"path": top_path, "state": top_state},
+            )
+        return {
+            "document_count": len(rows),
+            "parts": sum(row["document_type"] == 1 for row in rows),
+            "assemblies": sum(row["document_type"] == 2 for row in rows),
+            "documents": rows,
+        }
+
     def _capture_rebuild_graph(self, doc, path):
         """Return unique assembly documents, dependencies, and exact live topology."""
 
@@ -4834,6 +5022,7 @@ class SolidWorksBackend(CadBackend):
             }
         }
         part_documents = {}
+        known_documents = {normalized_top: doc}
         source_files = {normalized_top: {"path": path, "sha256": self._capture_source_digest(path)}}
         session_files = []
         topology = [
@@ -4962,6 +5151,7 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
                 if document_type == 2:
+                    known_documents[normalized] = model
                     row = assemblies.setdefault(
                         normalized,
                         {
@@ -4980,6 +5170,7 @@ class SolidWorksBackend(CadBackend):
                     if name:
                         row["instances"].append(name)
                 elif document_type == 1:
+                    known_documents[normalized] = model
                     row = part_documents.setdefault(
                         normalized,
                         {
@@ -5004,12 +5195,22 @@ class SolidWorksBackend(CadBackend):
                     {"path": path, "error": f"{type(error).__name__}: {error}"[:300]},
                 ) from error
 
+        expected_documents = set(assemblies) | set(part_documents)
+        loaded_documents = self._capture_loaded_documents(known_documents)
+        self._require_loaded_document_set(loaded_documents, expected_documents)
+        loaded_by_path = {
+            row["normalized_path"]: row for row in loaded_documents
+        }
         states = []
         for normalized, row in assemblies.items():
             dependency_doc, state = (
                 (doc, top_state)
                 if normalized == normalized_top
-                else self._capture_rebuild_state(row["path"], phase="before")
+                else self._capture_rebuild_state(
+                    row["path"],
+                    document=loaded_by_path[normalized]["doc"],
+                    phase="before",
+                )
             )
             configurations = row["referenced_configurations"]
             if not configurations or len(configurations) != 1:
@@ -5042,7 +5243,7 @@ class SolidWorksBackend(CadBackend):
         for normalized, row in part_documents.items():
             _part_doc, state = self._capture_rebuild_state(
                 row["path"],
-                document=row["doc"],
+                document=loaded_by_path[normalized]["doc"],
                 phase="before",
                 include_assembly_controls=False,
             )
@@ -5071,10 +5272,37 @@ class SolidWorksBackend(CadBackend):
                     continue
                 rebuild_candidates.add(parent)
                 pending.append(parent)
+        loaded_rows = []
+        state_by_path = {
+            row["normalized_path"]: row["initial_state"] for row in states
+        }
+        state_by_path.update(
+            {
+                row["normalized_path"]: row["initial_state"]
+                for row in part_states
+            }
+        )
+        topology_rows = {
+            row["normalized_path"]: row for row in topology if row["normalized_path"]
+        }
+        for loaded in loaded_documents:
+            normalized = loaded["normalized_path"]
+            topology_row = topology_rows[normalized]
+            loaded_rows.append(
+                {
+                    "doc": loaded["doc"],
+                    "path": loaded["path"],
+                    "normalized_path": normalized,
+                    "document_type": loaded["document_type"],
+                    "instance": topology_row["instance"],
+                    "state": state_by_path[normalized],
+                }
+            )
         return {
             "assemblies": states,
             "component_count": component_count,
             "initial_pending_children": sorted(initial_pending_children),
+            "loaded_documents": loaded_rows,
             "normalized_top": normalized_top,
             "part_documents": part_states,
             "rebuild_candidates": sorted(rebuild_candidates),
@@ -5179,6 +5407,13 @@ class SolidWorksBackend(CadBackend):
 
     def _rebuild_capture_copy(self, doc, path):
         graph = self._capture_rebuild_graph(doc, path)
+        self._capture_expected_documents = {
+            row["normalized_path"] for row in graph["loaded_documents"]
+        }
+        self._capture_top_document = path
+        self._capture_topology = self._capture_semantic_topology(
+            graph["topology"]
+        )
         assemblies = graph["assemblies"]
         top = next(
             row
@@ -5229,19 +5464,27 @@ class SolidWorksBackend(CadBackend):
         top_row = {**top, "state_before": state_after_children}
         top_rebuild = None
         if top_row["state_before"]["needs_rebuild2_value"] in (1, 2):
-            doc, top_final_state, top_rebuild = self._rebuild_capture_document(
+            doc, _top_final_state, top_rebuild = self._rebuild_capture_document(
                 top_row,
                 phase="top",
                 document=doc,
             )
         else:
-            doc, top_final_state = self._capture_rebuild_state(
+            doc, _top_final_state = self._capture_rebuild_state(
                 path,
                 document=doc,
                 phase="after_children",
             )
 
         final_graph = self._capture_rebuild_graph(doc, path)
+        self._require_loaded_document_set(
+            final_graph["loaded_documents"],
+            self._capture_expected_documents,
+        )
+        self._capture_assert_documents_ready(
+            final_graph["loaded_documents"],
+            phase="after_rebuild",
+        )
         if final_graph["topology"] != graph["topology"]:
             raise CadError(
                 "cad_rebuild_topology_changed",
@@ -5278,8 +5521,6 @@ class SolidWorksBackend(CadBackend):
             normalize_document_path(os.path.abspath(row["path"])): row
             for row in final_assemblies
         }
-        final_top = final_by_key[graph["normalized_top"]]
-        top_final_state = final_top["initial_state"]
         final_states = []
         for row in assemblies:
             key = normalize_document_path(os.path.abspath(row["path"]))
@@ -5322,11 +5563,7 @@ class SolidWorksBackend(CadBackend):
             )
         final_part_states = []
         for part in final_graph["part_documents"]:
-            _part_doc, state = self._capture_rebuild_state(
-                part["path"],
-                phase="final_part",
-                include_assembly_controls=False,
-            )
+            state = part["initial_state"]
             if (
                 state.get("needs_rebuild2_value") != 0
                 or state.get("configuration_needs_rebuild") is not False
@@ -5345,7 +5582,7 @@ class SolidWorksBackend(CadBackend):
                 }
             )
 
-        top_state = top_final_state
+        top_state = final_by_key[graph["normalized_top"]]["initial_state"]
         if top_state.get("read_only") is not True:
             raise CadError(
                 "cad_rebuild_incomplete",
