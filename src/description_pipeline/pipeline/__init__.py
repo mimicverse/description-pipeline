@@ -3,7 +3,6 @@
 from .admission import (
     AdmissionSpec,
     ArtifactMember,
-    PublicationActor,
     StageExecutors,
     VerifiedArtifact,
     VerifiedDiscoverResult,
@@ -107,7 +106,6 @@ __all__ = [
     "FailureEnvelope",
     "FreezeHandler",
     "FreezeRefusal",
-    "PublicationActor",
     "RunAdmission",
     "RunStatus",
     "StageCandidate",
