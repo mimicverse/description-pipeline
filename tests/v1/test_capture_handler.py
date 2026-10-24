@@ -2,28 +2,45 @@
 
 from __future__ import annotations
 
-import json
+import copy
 import hashlib
-import shutil
+import json
 import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from description_pipeline.io import digest
+from description_pipeline.artifacts import ArtifactStore
+from description_pipeline.io import digest, file_digest, read_data
 from description_pipeline.pipeline import (
     ArtifactRef,
     CaptureHandler,
+    DiscoverHandler,
     ExecutionClaim,
+    FreezeHandler,
     StageCommand,
     StageWorkspace,
 )
 from description_pipeline.pipeline.capture import CaptureUnresolved, NativeCaptureResult
+from description_pipeline.pipeline.discover import (
+    CONFIGURATION_KIND,
+    FREEZE_RESULT_KIND,
+    RULESET_KIND,
+    SOURCE_SET_KIND,
+)
+from description_pipeline.pipeline.freeze import FREEZE_REQUEST_SCHEMA
 from description_pipeline.orchestration.stage_transfer import admit_capture
 from description_pipeline.sources.solidworks.discovery import PLAN_FILE
 
-from .split_capture_fixture import build_fixture_capture, fixture_backend
+from .split_capture_fixture import fixture_backend
+from .test_pipeline_discover import (
+    ClosureReader,
+    CountingBackend,
+    DiscoverHarness,
+)
+from .test_split_roundtrip import capture_record
+from .test_stage_transfer import native_tool as build_capture_tool
 
 
 PARENT = "a0000000-0000-4000-8000-000000000001"
@@ -31,17 +48,25 @@ CHILD = "a0000000-0000-4000-8000-000000000002"
 MAIN = "cad/robot.SLDASM"
 
 
-def artifact(identifier: str, stage: str, run_id: str) -> ArtifactRef:
-    return ArtifactRef(
-        artifact_id=identifier,
-        kind=f"{stage}_result",
-        locator=f"cas://{identifier}",
-        manifest_sha256=digest({"manifest": identifier}),
-        set_sha256=digest({"set": identifier}),
-        producer_run_id=run_id,
-        producer_stage=stage,
-        producer_tool_sha256=digest({"tool": stage}),
-    )
+def _capture_component_closure(evidence: dict) -> dict:
+    """Bind selected dependency edges to the occurrence names Capture reads."""
+
+    root = evidence["documents"][MAIN]
+    retained = []
+    instances = {
+        "cad/base.SLDPRT": "base-1",
+        "cad/arm.SLDPRT": "arm-1",
+    }
+    for edge in root["resolved_edges"]:
+        instance = instances.get(edge["resolved"])
+        if instance is None:
+            continue
+        retained.append({**edge, "instance": instance})
+    root["resolved_edges"] = retained
+    evidence["graph"][MAIN]["references"] = ["cad/base.SLDPRT", "cad/arm.SLDPRT"]
+    evidence["documents"].pop("spare/base.SLDPRT", None)
+    evidence["graph"].pop("spare/base.SLDPRT", None)
+    return evidence
 
 
 class _Effects:
@@ -62,10 +87,141 @@ class CaptureHandlerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="capture-handler-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.fixture = build_fixture_capture(self.root / "fixture", run_id=PARENT)
-        self.package = Path(self.fixture["prepared_dir"])
-        self.freeze_ref = artifact("freeze-artifact", "freeze", PARENT)
-        self.discover_ref = artifact("discover-artifact", "discover", PARENT)
+        self.store = ArtifactStore(self.root / "artifact-store")
+        self.stage_fixture = DiscoverHarness(self.root / "discover-source")
+        self.stage_fixture.record = capture_record()
+        self.stage_fixture.record["files"] = {
+            name: self.stage_fixture.source_files[name]
+            for name in (MAIN, "cad/base.SLDPRT", "cad/arm.SLDPRT")
+        }
+        self.source_ref = self.store.seal_tree(
+            self.stage_fixture.source,
+            kind=SOURCE_SET_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"producer": SOURCE_SET_KIND}),
+        )
+        self.ruleset_ref = self.store.seal_tree(
+            self.stage_fixture.rules,
+            kind=RULESET_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"producer": RULESET_KIND}),
+        )
+        self.configuration_ref = self.store.seal_tree(
+            self.stage_fixture.configuration,
+            kind=CONFIGURATION_KIND,
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest({"producer": CONFIGURATION_KIND}),
+        )
+        freeze_request = {
+            "schema_version": FREEZE_REQUEST_SCHEMA,
+            "request_id": "request-capture-boundary",
+            "principal": "fixture:principal",
+            "target_hardware": "nd_fixture",
+            "purpose": "engineering",
+            "change_summary": "Prove adjacent Freeze Discover Capture contracts",
+            "main_assembly": MAIN,
+            "ruleset_version": "rules-2026-10-25",
+            "originals_artifact_id": self.source_ref.artifact_id,
+            "ruleset_artifact_id": self.ruleset_ref.artifact_id,
+            "configuration_artifact_id": self.configuration_ref.artifact_id,
+            "upload_inventory_sha256": digest(self.stage_fixture.source_files),
+            "ruleset_catalog_sha256": self.ruleset_ref.set_sha256,
+            "platform_config_sha256": self.configuration_ref.set_sha256,
+        }
+        freeze_command = StageCommand.create(
+            command_id="freeze-command",
+            run_id=PARENT,
+            stage="freeze",
+            idempotency_key=f"{PARENT}/freeze",
+            request=freeze_request,
+            input_artifacts=(self.source_ref, self.ruleset_ref, self.configuration_ref),
+            config_snapshot_sha256=self.configuration_ref.set_sha256,
+            contract_sha256=digest({"contract": "freeze"}),
+            policy_sha256=digest({"policy": "freeze"}),
+            expected_executor_sha256=digest({"executor": "freeze"}),
+            predecessor_decision_id=None,
+        )
+        freeze_claim = self._claim(freeze_command, "claim-freeze", fence=1)
+        freeze_workspace = self._materialized_workspace(
+            self.root / "freeze-workspace",
+            (self.source_ref, self.ruleset_ref, self.configuration_ref),
+        )
+        freeze_execution = FreezeHandler().execute(freeze_command, freeze_claim, freeze_workspace)
+        self.assertEqual(freeze_execution.outcome, "completed")
+        self.freeze_ref = self.store.seal_tree(
+            freeze_execution.candidate_root,
+            kind=FREEZE_RESULT_KIND,
+            producer_run_id=PARENT,
+            producer_stage="freeze",
+            producer_tool_sha256=freeze_command.expected_executor_sha256,
+        )
+
+        discover_request = self.stage_fixture.request(
+            freeze_artifact_id=self.freeze_ref.artifact_id,
+            source_set_artifact_id=self.source_ref.artifact_id,
+            ruleset_artifact_id=self.ruleset_ref.artifact_id,
+            configuration_artifact_id=self.configuration_ref.artifact_id,
+            ruleset_catalog_sha256=self.ruleset_ref.set_sha256,
+            platform_config_sha256=self.configuration_ref.set_sha256,
+        )
+        discover_command = StageCommand.create(
+            command_id="discover-command",
+            run_id=PARENT,
+            stage="discover",
+            idempotency_key=f"{PARENT}/discover",
+            request=discover_request,
+            input_artifacts=(
+                self.freeze_ref,
+                self.source_ref,
+                self.ruleset_ref,
+                self.configuration_ref,
+            ),
+            config_snapshot_sha256=self.configuration_ref.set_sha256,
+            contract_sha256=digest({"contract": "discover"}),
+            policy_sha256=digest({"policy": "discover"}),
+            expected_executor_sha256=digest({"executor": "discover"}),
+            predecessor_decision_id="freeze-decision",
+        )
+        discover_claim = self._claim(discover_command, "claim-discover", fence=1)
+        discover_workspace = self._materialized_workspace(
+            self.root / "discover-workspace",
+            (
+                self.freeze_ref,
+                self.source_ref,
+                self.ruleset_ref,
+                self.configuration_ref,
+            ),
+        )
+        discover_execution = DiscoverHandler(
+            self.stage_fixture.port(
+                reader=ClosureReader(transform=_capture_component_closure),
+                backend=CountingBackend(copy.deepcopy(self.stage_fixture.record))
+            )
+        ).execute(discover_command, discover_claim, discover_workspace)
+        if discover_execution.outcome != "completed":
+            self.fail(read_data(Path(discover_execution.candidate_root) / "failure.json"))
+        self.assertEqual(discover_execution.outcome, "completed", discover_execution.reason_code)
+        self.discover_output = Path(discover_execution.candidate_root)
+        self.discover_result = read_data(self.discover_output / "result.json")
+        self.discover_ref = self.store.seal_tree(
+            self.discover_output,
+            kind="stage_output:discover",
+            producer_run_id=PARENT,
+            producer_stage="discover",
+            producer_tool_sha256=discover_command.expected_executor_sha256,
+        )
+        self.package = self.discover_output / "prepared"
+        self.prepared_files = {
+            path.relative_to(self.package).as_posix(): file_digest(path)
+            for path in sorted(self.package.rglob("*"))
+            if path.is_file()
+        }
+        self.handoff_sha256 = digest(self.discover_result["selection"]["files"])
+        self.upload_sha256 = digest(self.stage_fixture.source_files)
+        self.capture_tool = build_capture_tool()
         self.command = self._command()
         self.claim = ExecutionClaim(
             claim_id="claim-capture",
@@ -75,6 +231,31 @@ class CaptureHandlerTests(unittest.TestCase):
             lane_key="native",
             expires_at=datetime(2026, 10, 25, tzinfo=UTC),
         )
+
+    @staticmethod
+    def _claim(command: StageCommand, claim_id: str, *, fence: int) -> ExecutionClaim:
+        return ExecutionClaim(
+            claim_id=claim_id,
+            command_id=command.command_id,
+            fence=fence,
+            owner_sha256=command.expected_executor_sha256,
+            lane_key="native",
+            expires_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+
+    def _materialized_workspace(
+        self,
+        root: Path,
+        artifacts: tuple[ArtifactRef, ...],
+    ) -> StageWorkspace:
+        root.mkdir()
+        inputs = {}
+        for artifact_value in artifacts:
+            inputs[artifact_value.artifact_id] = self.store.materialize(
+                artifact_value,
+                root / "inputs" / artifact_value.artifact_id,
+            )
+        return StageWorkspace(root=root, inputs=inputs)
 
     def _command(
         self,
@@ -90,11 +271,11 @@ class CaptureHandlerTests(unittest.TestCase):
             request=request
             or {
                 "effect_id": "effect-capture",
-                "handoff_sha256": self.fixture["handoff_sha256"],
+                "handoff_sha256": self.handoff_sha256,
                 "main_assembly": MAIN,
-                "native_tool_sha256": digest(self.fixture["native_tool"]),
-                "prepared_sha256": digest(self.fixture["prepared_files"]),
-                "upload_sha256": self.fixture["handoff_sha256"],
+                "native_tool_sha256": digest(self.capture_tool),
+                "prepared_sha256": digest(self.prepared_files),
+                "upload_sha256": self.upload_sha256,
             },
             input_artifacts=(self.freeze_ref, discover or self.discover_ref),
             config_snapshot_sha256=digest({"config": "capture"}),
@@ -122,14 +303,7 @@ class CaptureHandlerTests(unittest.TestCase):
     def workspace(self, *, discover_run_id: str = PARENT) -> StageWorkspace:
         discover = self._discover(producer_run_id=discover_run_id)
         root = self.root / f"workspace-{discover_run_id}"
-        root.mkdir()
-        return StageWorkspace(
-            root=root,
-            inputs={
-                self.freeze_ref.artifact_id: self.package / "cad",
-                discover.artifact_id: self.package,
-            },
-        )
+        return self._materialized_workspace(root, (self.freeze_ref, discover))
 
     def handler(
         self,
@@ -141,18 +315,21 @@ class CaptureHandlerTests(unittest.TestCase):
         effects = effects or _Effects()
         return CaptureHandler(
             backend_factory=lambda package: fixture_backend(package, MAIN),
-            native_tool_factory=lambda: tool or self.fixture["native_tool"],
+            native_tool_factory=lambda: tool or self.capture_tool,
             native_operation=native_operation,
             effect_authorizer=effects.authorize,
             effect_observer=effects.observe,
         )
 
-    def test_real_capture_seal_and_linux_admission_keep_producer_and_executor_separate(self) -> None:
+    def test_real_freeze_discover_artifact_store_then_capture_keeps_identities_separate(self) -> None:
         discovery_before = (self.package / "discovery/native-discovery.json").read_bytes()
         effects = _Effects()
-        with patch("description_pipeline.runtime.tool_record", return_value=self.fixture["native_tool"]):
+        with patch("description_pipeline.runtime.tool_record", return_value=self.capture_tool):
             execution = self.handler(effects=effects).execute(self.command, self.claim, self.workspace())
 
+        if execution.outcome != "completed":
+            failure = Path(execution.candidate_root) / "failure.json"
+            self.fail(read_data(failure) if failure.is_file() else execution.reason_code)
         self.assertEqual(execution.outcome, "completed")
         admitted = Path(execution.candidate_root)
         manifest = json.loads((admitted / "transfer-manifest.json").read_text(encoding="utf-8"))
@@ -189,7 +366,7 @@ class CaptureHandlerTests(unittest.TestCase):
             self.handler(native_operation=operation).execute(
                 command,
                 self.claim,
-                self.workspace(discover_run_id="a0000000-0000-4000-8000-000000000099"),
+                self.workspace(),
             )
         operation.assert_not_called()
 
@@ -197,7 +374,7 @@ class CaptureHandlerTests(unittest.TestCase):
         operation = Mock()
         handler = CaptureHandler(
             backend_factory=lambda package: fixture_backend(package, MAIN),
-            native_tool_factory=lambda: self.fixture["native_tool"],
+            native_tool_factory=lambda: self.capture_tool,
             native_operation=operation,
         )
         with self.assertRaisesRegex(Exception, "effect_gateway_required"):
@@ -215,7 +392,7 @@ class CaptureHandlerTests(unittest.TestCase):
         )
         handler = CaptureHandler(
             backend_factory=lambda package: fixture_backend(package, MAIN),
-            native_tool_factory=lambda: self.fixture["native_tool"],
+            native_tool_factory=lambda: self.capture_tool,
             native_operation=operation,
             effect_authorizer=authorizer,
             effect_observer=Mock(),
@@ -234,7 +411,7 @@ class CaptureHandlerTests(unittest.TestCase):
 
         handler = CaptureHandler(
             backend_factory=lambda package: fixture_backend(package, MAIN),
-            native_tool_factory=lambda: self.fixture["native_tool"],
+            native_tool_factory=lambda: self.capture_tool,
             native_operation=operation,
             effect_authorizer=unresolved,
             effect_observer=observer,
@@ -245,8 +422,12 @@ class CaptureHandlerTests(unittest.TestCase):
         observer.assert_not_called()
 
     def test_plan_must_cover_the_complete_active_object_set_before_native_operation(self) -> None:
-        package = self.root / "incomplete-plan"
-        shutil.copytree(self.package, package)
+        discover_root = self.store.materialize(
+            self.discover_ref,
+            self.root / "incomplete-discover-artifact",
+        )
+        (discover_root / "manifest.json").unlink()
+        package = discover_root / "prepared"
         plan_path = package / PLAN_FILE
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         plan["objects"].pop()
@@ -256,23 +437,32 @@ class CaptureHandlerTests(unittest.TestCase):
             for path in package.rglob("*")
             if path.is_file()
         }
+        result_path = discover_root / "result.json"
+        result = read_data(result_path)
+        result["prepared_sha256"] = digest(prepared)
+        result["prepared_files"] = prepared
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        incomplete_ref = self.store.seal_tree(
+            discover_root,
+            kind="stage_output:discover",
+            producer_run_id=PARENT,
+            producer_stage="discover",
+            producer_tool_sha256=self.discover_ref.producer_tool_sha256,
+        )
         command = self._command(
+            discover=incomplete_ref,
             request={**self.command.to_record()["request"], "prepared_sha256": digest(prepared)}
         )
-        workspace_root = self.root / "incomplete-workspace"
-        workspace_root.mkdir()
+        workspace = self._materialized_workspace(
+            self.root / "incomplete-workspace",
+            (self.freeze_ref, incomplete_ref),
+        )
         operation = Mock()
         with self.assertRaisesRegex(Exception, "complete|outside"):
             self.handler(native_operation=operation).execute(
                 command,
                 self.claim,
-                StageWorkspace(
-                    root=workspace_root,
-                    inputs={
-                        self.freeze_ref.artifact_id: package / "cad",
-                        self.discover_ref.artifact_id: package,
-                    },
-                ),
+                workspace,
             )
         operation.assert_not_called()
 
@@ -299,7 +489,7 @@ class CaptureHandlerTests(unittest.TestCase):
 
     def test_admission_rejects_tampered_upstream_identity_without_installing(self) -> None:
         workspace = self.workspace()
-        with patch("description_pipeline.runtime.tool_record", return_value=self.fixture["native_tool"]):
+        with patch("description_pipeline.runtime.tool_record", return_value=self.capture_tool):
             execution = self.handler().execute(self.command, self.claim, workspace)
         self.assertEqual(execution.outcome, "completed")
         archive = workspace.root / "capture-native" / "native-evidence.zip"
@@ -317,7 +507,7 @@ class CaptureHandlerTests(unittest.TestCase):
             "command_id": self.command.command_id,
             "effect_id": "effect-capture",
             "fence": self.claim.fence,
-            "native_tool_sha256": digest(self.fixture["native_tool"]),
+            "native_tool_sha256": digest(self.capture_tool),
             "owner_sha256": self.claim.owner_sha256,
             "run_id": self.command.run_id,
         }
@@ -326,12 +516,12 @@ class CaptureHandlerTests(unittest.TestCase):
                 archive,
                 destination,
                 expected_run_id=self.command.run_id,
-                expected_handoff_sha256=self.fixture["handoff_sha256"],
-                expected_upload_sha256=self.fixture["handoff_sha256"],
+                expected_handoff_sha256=self.handoff_sha256,
+                expected_upload_sha256=self.upload_sha256,
                 expected_main_assembly=MAIN,
-                expected_native_tool=self.fixture["native_tool"],
+                expected_native_tool=self.capture_tool,
                 expected_prepared_dir=str(self.package),
-                expected_prepared_files=self.fixture["prepared_files"],
+                expected_prepared_files=self.prepared_files,
                 expected_upstream_artifacts=expected_upstream,
                 expected_execution=execution_record,
             )

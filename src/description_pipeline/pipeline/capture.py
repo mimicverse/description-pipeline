@@ -18,15 +18,26 @@ from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, writable_output
 from ..io import (
     PipelineError,
     acquire_process_lock,
+    confined,
     digest,
     file_digest,
     inventory,
     read_data,
     write_json,
 )
+from .discover import (
+    ARTIFACT_MANIFEST_SCHEMA,
+    CONFIGURATION_KIND,
+    DISCOVER_CHECKS_SCHEMA,
+    DISCOVER_REQUEST_SCHEMA,
+    DISCOVER_RESULT_SCHEMA,
+    RULESET_KIND,
+    SOURCE_SET_KIND,
+)
 from ..sources.solidworks.discovery import DISCOVERY_FILE, native_component_identity
 from ..sources.solidworks.revision import package_inventory
-from ..stages import STAGE_IDS, stage_view
+from ..sources.solidworks.selection import selection_bindings
+from ..stages import stage_view
 from .contracts import ArtifactRef, ExecutionClaim, ProtocolError, StageCandidate, StageCommand, StageExecution
 from .engine import StageWorkspace
 
@@ -36,6 +47,45 @@ NativeOutcome = Literal["completed", "failed", "cancelled", "unknown"]
 
 class CaptureUnresolved(PipelineError):
     """The native operation has a possible external effect with no safe terminal fact."""
+
+
+def _artifact_files(root: Path, artifact: ArtifactRef, *, role: str) -> dict[str, str]:
+    """Validate one materialized ArtifactStore root and return its subject files."""
+
+    if not root.is_dir() or root.is_symlink() or root.is_junction():
+        raise ProtocolError("capture.artifact_invalid", {"role": role})
+    manifest_path = root / "manifest.json"
+    manifest = read_data(manifest_path) if manifest_path.is_file() else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != ARTIFACT_MANIFEST_SCHEMA
+        or manifest.get("artifact_id") != artifact.artifact_id
+        or manifest.get("kind") != artifact.kind
+        or manifest.get("set_sha256") != artifact.set_sha256
+    ):
+        raise ProtocolError("capture.artifact_manifest", {"role": role})
+    if manifest.get("producer") != {
+        "run_id": artifact.producer_run_id,
+        "stage": artifact.producer_stage,
+        "tool_sha256": artifact.producer_tool_sha256,
+    }:
+        raise ProtocolError("capture.artifact_producer", {"role": role})
+    files = {
+        path.relative_to(root).as_posix(): file_digest(path)
+        for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())
+        if path.is_file() and path.relative_to(root).as_posix() != "manifest.json"
+    }
+    members = [
+        {
+            "bytes": confined(root, path).stat().st_size,
+            "path": path,
+            "sha256": checksum,
+        }
+        for path, checksum in files.items()
+    ]
+    if not files or digest({"members": members}) != artifact.set_sha256:
+        raise ProtocolError("capture.artifact_changed", {"role": role})
+    return files
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +162,14 @@ class CaptureInputs:
                 "capture.producer_missing",
                 {"artifact_ids": [freeze.artifact_id, discover.artifact_id]},
             )
+        if freeze.producer_stage != "freeze" or discover.producer_stage != "discover":
+            raise ProtocolError(
+                "capture.producer_stage",
+                {
+                    "freeze": freeze.producer_stage,
+                    "discover": discover.producer_stage,
+                },
+            )
 
         roots = {}
         for artifact in (freeze, discover):
@@ -121,10 +179,126 @@ class CaptureInputs:
             if root.is_symlink() or root.is_junction() or not root.is_dir():
                 raise ProtocolError("capture.input_root_invalid", {"artifact_id": artifact.artifact_id})
             roots[artifact.artifact_id] = root
+        if set(workspace.inputs) != {freeze.artifact_id, discover.artifact_id}:
+            raise ProtocolError(
+                "capture.workspace_invalid",
+                {
+                    "missing": sorted({freeze.artifact_id, discover.artifact_id} - set(workspace.inputs)),
+                    "unknown": sorted(set(workspace.inputs) - {freeze.artifact_id, discover.artifact_id}),
+                },
+            )
 
-        package = roots[discover.artifact_id]
+        freeze_files = _artifact_files(roots[freeze.artifact_id], freeze, role="freeze")
+        discover_files = _artifact_files(roots[discover.artifact_id], discover, role="discover")
+        for name in ("request.json", "inputs.json", "checks.json"):
+            if name not in freeze_files:
+                raise ProtocolError("capture.freeze_incomplete", {"missing": name})
+        for name in ("request.json", "result.json", "checks.json", "native-observation/observation.json"):
+            if name not in discover_files:
+                raise ProtocolError("capture.discover_incomplete", {"missing": name})
+
+        freeze_request = read_data(roots[freeze.artifact_id] / "request.json")
+        freeze_inputs = read_data(roots[freeze.artifact_id] / "inputs.json")
+        discover_request = read_data(roots[discover.artifact_id] / "request.json")
+        discover_checks = read_data(roots[discover.artifact_id] / "checks.json")
+        discover_result = read_data(roots[discover.artifact_id] / "result.json")
+        if not all(
+            isinstance(record, dict)
+            for record in (freeze_request, freeze_inputs, discover_request, discover_checks, discover_result)
+        ):
+            raise ProtocolError("capture.adjacent_record_invalid", {"where": "freeze-or-discover"})
+        if discover_request.get("schema_version") != DISCOVER_REQUEST_SCHEMA:
+            raise ProtocolError("capture.discover_request_schema", {"where": "request.json"})
+        if discover_checks.get("schema_version") != DISCOVER_CHECKS_SCHEMA:
+            raise ProtocolError("capture.discover_checks_schema", {"where": "checks.json"})
+        if (
+            discover_result.get("schema_version") != DISCOVER_RESULT_SCHEMA
+            or discover_result.get("run_id") != discover.producer_run_id
+            or discover_result.get("command_id") != discover_checks.get("command_id")
+            or discover_result.get("request_digest") != discover_checks.get("request_digest")
+        ):
+            raise ProtocolError("capture.discover_result_identity", {"where": "result.json"})
+        if (
+            discover_request.get("freeze_artifact_id") != freeze.artifact_id
+            or discover_request.get("main_assembly") != request.main_assembly
+            or discover_request.get("source_inventory_sha256") != request.upload_sha256
+        ):
+            raise ProtocolError("capture.freeze_discover_binding", {"where": "discover request"})
+        if (
+            freeze_request.get("main_assembly") != request.main_assembly
+            or freeze_request.get("upload_inventory_sha256") != request.upload_sha256
+        ):
+            raise ProtocolError("capture.freeze_request_binding", {"where": "freeze request"})
+        freeze_artifacts = freeze_inputs.get("artifacts")
+        if not isinstance(freeze_artifacts, dict) or set(freeze_artifacts) != {
+            "originals",
+            "ruleset",
+            "configuration",
+        }:
+            raise ProtocolError("capture.freeze_inputs_invalid", {"where": "artifacts"})
+        if (
+            freeze_request.get("originals_artifact_id") != freeze_artifacts["originals"].get("artifact_id")
+            or freeze_request.get("ruleset_artifact_id") != freeze_artifacts["ruleset"].get("artifact_id")
+            or freeze_request.get("configuration_artifact_id")
+            != freeze_artifacts["configuration"].get("artifact_id")
+        ):
+            raise ProtocolError("capture.freeze_request_binding", {"where": "freeze request"})
+        for role, kind, result_key in (
+            ("originals", SOURCE_SET_KIND, "source_set_artifact"),
+            ("ruleset", RULESET_KIND, "ruleset_artifact"),
+            ("configuration", CONFIGURATION_KIND, "configuration_artifact"),
+        ):
+            freeze_artifact = freeze_artifacts[role]
+            discover_artifact = discover_result.get(result_key)
+            if freeze_artifact != discover_artifact:
+                raise ProtocolError(
+                    "capture.freeze_discover_binding",
+                    {"where": result_key},
+                )
+            try:
+                bound_artifact = ArtifactRef.from_record(discover_artifact)
+            except (PipelineError, TypeError, ValueError) as error:
+                raise ProtocolError("capture.discover_artifact_invalid", {"where": result_key}) from error
+            if bound_artifact.kind != kind:
+                raise ProtocolError("capture.discover_artifact_kind", {"where": result_key})
+
+        selection = discover_result.get("selection")
+        if not isinstance(selection, dict):
+            raise ProtocolError("capture.discover_selection", {"where": "selection"})
+        try:
+            selection_binding = selection_bindings(selection)
+        except PipelineError as error:
+            raise ProtocolError("capture.discover_selection", {"where": "selection"}) from error
+        selected_files = {str(name): str(value) for name, value in selection_binding["files"].items()}
+        if (
+            digest(selected_files) != request.handoff_sha256
+            or selection_binding["upload_sha256"] != request.upload_sha256
+        ):
+            raise ProtocolError("capture.handoff_mismatch", {"handoff_sha256": request.handoff_sha256})
+        upload_inventory = freeze_inputs.get("upload_inventory")
+        if not isinstance(upload_inventory, dict) or any(
+            upload_inventory.get(name) != checksum for name, checksum in selected_files.items()
+        ):
+            raise ProtocolError("capture.selection_source_mismatch", {"where": "freeze upload inventory"})
+
+        if discover_result.get("prepared_sha256") != request.prepared_sha256 or not isinstance(
+            discover_result.get("prepared_files"),
+            dict,
+        ):
+            raise ProtocolError("capture.prepared_binding", {"prepared_sha256": request.prepared_sha256})
+        if discover_result.get("native_observation_sha256") != file_digest(
+            roots[discover.artifact_id] / "native-observation/observation.json"
+        ):
+            raise ProtocolError("capture.native_observation_changed", {"where": "observation.json"})
+
+        package = roots[discover.artifact_id] / "prepared"
+        if not package.is_dir() or package.is_symlink() or package.is_junction():
+            raise ProtocolError("capture.prepared_missing", {"path": str(package)})
         prepared_files = package_inventory(package)
-        if digest(prepared_files) != request.prepared_sha256:
+        if (
+            prepared_files != {str(name): str(value) for name, value in discover_result["prepared_files"].items()}
+            or digest(prepared_files) != request.prepared_sha256
+        ):
             raise ProtocolError("capture.prepared_changed", {"prepared_sha256": request.prepared_sha256})
 
         from .. import steps
@@ -252,15 +426,11 @@ def _capture_receipt(
     *,
     resume: Mapping[str, Any] | None,
     handoff_sha256: str,
+    execution_scope: tuple[str, ...],
 ) -> dict[str, Any]:
     """Create a native-only receipt; prior events are accepted only by the legacy adapter."""
 
     events = [event for event in (prior_events or ()) if isinstance(event, dict)]
-    scope = [
-        stage
-        for stage in STAGE_IDS
-        if any(event.get("stage") == stage for event in events)
-    ] + ["capture"]
     receipt = {
         "schema_version": BUNDLE_SCHEMA,
         "pipeline_id": PIPELINE_ID,
@@ -268,7 +438,7 @@ def _capture_receipt(
         "handoff_sha256": handoff_sha256,
         "state": "failed",
         "events": events,
-        "execution_scope": scope,
+        "execution_scope": list(execution_scope),
     }
     if resume:
         receipt["resume"] = {
@@ -329,7 +499,7 @@ def _keep_capture_diagnostic(staging: Path, output: Path, receipt: dict[str, Any
 
 
 def _failed_capture(staging, output, receipt, event, error):
-    phase = receipt.get("stage", receipt["execution_scope"][0])
+    phase = receipt.get("stage") or "capture"
     if not receipt.get("events") or receipt["events"][-1]["state"] != "failed":
         with contextlib.suppress(Exception):
             event({"stage": phase, "state": "failed"})
@@ -443,6 +613,7 @@ def _capture_native_transaction(
     upstream_artifacts: tuple[dict[str, Any], ...] | None = None,
     execution: Mapping[str, Any] | None = None,
     native_tool_factory: Callable[[], dict[str, Any]] | None = None,
+    execution_scope: tuple[str, ...] = ("capture",),
 ) -> dict[str, Any]:
     """Run the real native Capture transaction and seal its artifact.
 
@@ -468,6 +639,7 @@ def _capture_native_transaction(
             prior_events,
             resume=dict(resume) if resume is not None else None,
             handoff_sha256=handoff_sha256,
+            execution_scope=execution_scope,
         )
         event = _capture_event_sink(receipt, on_event)
         try:

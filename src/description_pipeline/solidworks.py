@@ -328,6 +328,7 @@ def capture(
         upstream_artifacts=upstream_artifacts,
         execution=execution,
         native_tool_factory=(lambda: native_tool) if native_tool is not None else _native_tool_record,
+        execution_scope=tuple(_scope(prior_events, "capture")),
     )
 
 
