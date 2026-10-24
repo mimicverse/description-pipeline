@@ -30,7 +30,7 @@ from .freeze import (
     RULESET_KIND,
 )
 
-ADMISSION_SPEC_SCHEMA = "description-pipeline.admission-spec/v1"
+ADMISSION_SPEC_SCHEMA = "description-pipeline.admission-spec/v2"
 ARTIFACT_MANIFEST_SCHEMA = "description-pipeline.artifact-manifest/v1"
 CAPTURE_ARTIFACT_KIND = "stage_output:capture"
 GENERATE_ARTIFACT_KIND = "stage_output:generate"
@@ -47,7 +47,7 @@ _ADMISSION_FIELDS = frozenset(
         "executors",
         "from_stage",
         "main_assembly",
-        "native_tool_sha256",
+        "native_tool_source_sha256",
         "originals",
         "parent_run_id",
         "policy_sha256",
@@ -315,7 +315,7 @@ class AdmissionSpec:
     ruleset: VerifiedRuleset
     configuration: VerifiedArtifact
     executors: StageExecutors
-    native_tool_sha256: str
+    native_tool_source_sha256: str
     contract_sha256: str
     policy_sha256: str
     created_at: datetime
@@ -348,7 +348,7 @@ class AdmissionSpec:
             )
         if not isinstance(self.executors, StageExecutors):
             raise ProtocolError("admission.invalid", {"where": "executors"})
-        for field in ("native_tool_sha256", "contract_sha256", "policy_sha256"):
+        for field in ("native_tool_source_sha256", "contract_sha256", "policy_sha256"):
             _require_digest(getattr(self, field), "admission.invalid", field)
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise ProtocolError("admission.invalid", {"where": "created_at"})
@@ -366,7 +366,7 @@ class AdmissionSpec:
             "executors": self.executors.to_record(),
             "from_stage": self.from_stage,
             "main_assembly": self.main_assembly,
-            "native_tool_sha256": self.native_tool_sha256,
+            "native_tool_source_sha256": self.native_tool_source_sha256,
             "originals": self.originals.to_record(),
             "parent_run_id": self.parent_run_id,
             "policy_sha256": self.policy_sha256,
@@ -415,7 +415,7 @@ class AdmissionSpec:
             ruleset=ruleset,
             configuration=configuration,
             executors=StageExecutors.from_record(record["executors"]),
-            native_tool_sha256=record["native_tool_sha256"],
+            native_tool_source_sha256=record["native_tool_source_sha256"],
             contract_sha256=record["contract_sha256"],
             policy_sha256=record["policy_sha256"],
             created_at=datetime.fromisoformat(record["created_at"].replace("Z", "+00:00")),
@@ -524,7 +524,8 @@ class VerifiedDiscoverResult:
     upload_inventory_sha256: str
     main_assembly: str
     native_observation_sha256: str
-    native_tool_sha256: str
+    native_tool_source_sha256: str
+    native_tool_record_sha256: str
     source_set_artifact: ArtifactRef
     ruleset_artifact: ArtifactRef
     configuration_artifact: ArtifactRef
@@ -537,7 +538,8 @@ class VerifiedDiscoverResult:
             "selected_files_sha256",
             "upload_inventory_sha256",
             "native_observation_sha256",
-            "native_tool_sha256",
+            "native_tool_source_sha256",
+            "native_tool_record_sha256",
         ):
             _require_digest(getattr(self, field), "admission.discover_result_invalid", field)
         _require_text(self.main_assembly, "admission.discover_result_invalid", "main_assembly")
@@ -593,6 +595,12 @@ class VerifiedDiscoverResult:
         native_tool = record["native_tool"]
         if not isinstance(native_tool, Mapping) or not native_tool:
             raise ProtocolError("admission.discover_result_invalid", {"where": "native_tool"})
+        native_tool_source_sha256 = native_tool.get("source_sha256")
+        _require_digest(
+            native_tool_source_sha256,
+            "admission.discover_result_invalid",
+            "native_tool.source_sha256",
+        )
         return cls(
             predecessor=predecessor,
             prepared_sha256=record["prepared_sha256"],
@@ -600,7 +608,8 @@ class VerifiedDiscoverResult:
             upload_inventory_sha256=upload,
             main_assembly=main,
             native_observation_sha256=record["native_observation_sha256"],
-            native_tool_sha256=digest(dict(native_tool)),
+            native_tool_source_sha256=native_tool_source_sha256,
+            native_tool_record_sha256=digest(dict(native_tool)),
             source_set_artifact=ArtifactRef.from_record(record["source_set_artifact"]),
             ruleset_artifact=ArtifactRef.from_record(record["ruleset_artifact"]),
             configuration_artifact=ArtifactRef.from_record(record["configuration_artifact"]),
@@ -706,7 +715,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         "ruleset_catalog_sha256": spec.ruleset.artifact.ref.set_sha256,
         "platform_config_sha256": spec.configuration.ref.set_sha256,
         "submission_identity": _submission_identity(spec),
-        "expected_native_tool_sha256": spec.native_tool_sha256,
+        "expected_native_tool_sha256": spec.native_tool_source_sha256,
     }
     return _base_command(
         spec,
@@ -753,7 +762,7 @@ def build_capture_command(
         or discover_result.source_set_artifact != spec.originals.ref
         or discover_result.ruleset_artifact != spec.ruleset.artifact.ref
         or discover_result.configuration_artifact != spec.configuration.ref
-        or discover_result.native_tool_sha256 != spec.native_tool_sha256
+        or discover_result.native_tool_source_sha256 != spec.native_tool_source_sha256
     ):
         raise ProtocolError("admission.lineage_mismatch", {"stage": "capture"})
     effect_key = "native-capture:" + digest(
@@ -769,7 +778,7 @@ def build_capture_command(
         "upload_sha256": discover_result.upload_inventory_sha256,
         "prepared_sha256": discover_result.prepared_sha256,
         "main_assembly": discover_result.main_assembly,
-        "native_tool_sha256": discover_result.native_tool_sha256,
+        "native_tool_sha256": discover_result.native_tool_source_sha256,
     }
     return _base_command(
         spec,

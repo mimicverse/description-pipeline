@@ -118,7 +118,7 @@ class AdmissionHarness:
                 verify=digest({"executor": "verify"}),
                 publish=digest({"executor": "publish"}),
             ),
-            native_tool_sha256=digest({"executor": "native"}),
+            native_tool_source_sha256=digest({"executor": "native-source"}),
             contract_sha256=digest({"contract": 1}),
             policy_sha256=digest({"policy": 1}),
             created_at=datetime(2026, 10, 25, 9, 30, tzinfo=UTC),
@@ -412,12 +412,27 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {"executor": "native"},
+            "native_tool": {
+                "executor": "native",
+                "source_sha256": self.harness.spec.native_tool_source_sha256,
+            },
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
+        self.assertEqual(
+            discover_result.native_tool_source_sha256,
+            self.harness.spec.native_tool_source_sha256,
+        )
+        self.assertEqual(
+            discover_result.native_tool_record_sha256,
+            digest(discover_payload["native_tool"]),
+        )
+        self.assertNotEqual(
+            discover_result.native_tool_source_sha256,
+            discover_result.native_tool_record_sha256,
+        )
         capture_command = build_capture_command(
             self.harness.spec,
             freeze,
@@ -466,6 +481,10 @@ class AdmissionProjectionTests(unittest.TestCase):
             ),
         )
         self.assertEqual(capture_command.request["prepared_sha256"], discover_result.prepared_sha256)
+        self.assertEqual(
+            capture_command.request["native_tool_sha256"],
+            discover_result.native_tool_source_sha256,
+        )
         self.assertNotEqual(
             capture_command.expected_executor_sha256,
             capture_command.request["native_tool_sha256"],
@@ -581,7 +600,10 @@ class AdmissionProjectionTests(unittest.TestCase):
 
         wrong_native_record = {
             **discover_payload,
-            "native_tool": {"executor": "different-native"},
+            "native_tool": {
+                "executor": "different-native",
+                "source_sha256": digest({"executor": "different-native"}),
+            },
         }
         wrong_native_result = VerifiedDiscoverResult.from_record(discover, wrong_native_record)
         sends: list[str] = []
@@ -641,7 +663,10 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {"executor": "native"},
+            "native_tool": {
+                "executor": "native",
+                "source_sha256": self.harness.spec.native_tool_source_sha256,
+            },
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
@@ -674,7 +699,10 @@ class AdmissionProjectionTests(unittest.TestCase):
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
-            "native_tool": {"executor": "native"},
+            "native_tool": {
+                "executor": "native",
+                "source_sha256": self.harness.spec.native_tool_source_sha256,
+            },
             "passed": True,
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
