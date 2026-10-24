@@ -16,18 +16,58 @@ from description_pipeline.sources.solidworks.native import SolidWorksBackend, no
 
 PATH = r"C:\capture\prepared\robot.SLDASM"
 OTHER = r"C:\capture\prepared\other.SLDASM"
+LEFT = r"C:\capture\prepared\left.SLDASM"
+RIGHT = r"C:\capture\prepared\right.SLDASM"
+CHILD = r"C:\capture\prepared\child.SLDASM"
+GRANDCHILD = r"C:\capture\prepared\grandchild.SLDASM"
 CAPTURE_ROOT = normalize_document_path(os.path.abspath(PATH)).rsplit("\\", 2)[0]
 
 
 class _Configuration:
-    def __init__(self, name="默认", needs_rebuild=False):
+    def __init__(self, doc, name="默认", needs_rebuild=False):
+        self._doc = doc
         self.Name = name
         self.NeedsRebuild = needs_rebuild
+        self.AddRebuildSaveMark = False
+
+    def GetRootComponent3(self, _configuration):
+        return self._doc._root
 
 
 class _ConfigurationManager:
-    def __init__(self, name="默认", needs_rebuild=False):
-        self.ActiveConfiguration = _Configuration(name, needs_rebuild)
+    def __init__(self, doc):
+        self._doc = doc
+        self.ActiveConfiguration = _Configuration(doc, doc._configuration, doc._configuration_needs_rebuild)
+
+
+class _RootComponent:
+    def __init__(self, children):
+        self._children = list(children)
+
+    def GetChildren(self):
+        return list(self._children)
+
+
+class _Component:
+    def __init__(self, name, document, *, suppression_state=2, children=(), referenced_configuration=None):
+        self.Name2 = name
+        self.ReferencedConfiguration = (
+            document._configuration
+            if referenced_configuration is None
+            else referenced_configuration
+        )
+        self._document = document
+        self._suppression_state = suppression_state
+        self._children = list(children) if children else list(document._children)
+
+    def GetModelDoc2(self):
+        return self._document
+
+    def GetChildren(self):
+        return list(self._children)
+
+    def GetSuppression2(self):
+        return self._suppression_state
 
 
 class _Extension:
@@ -48,6 +88,10 @@ class _Extension:
             self._doc.needs_rebuild2 = 0
         if self._doc._rebuild_marks_dirty:
             self._doc._save_flag = True
+        if self._doc._rebuild_configuration is not None:
+            self._doc._configuration = self._doc._rebuild_configuration
+        if self._doc._rebuild_callback is not None:
+            self._doc._rebuild_callback()
         return self._doc._rebuild_result
 
 
@@ -67,6 +111,10 @@ class _Doc:
         rebuild_result=True,
         rebuild_exception=None,
         rebuild_marks_dirty=False,
+        children=(),
+        document_type=2,
+        rebuild_configuration=None,
+        rebuild_callback=None,
     ):
         self._path = path
         self._revoked = False
@@ -79,6 +127,12 @@ class _Doc:
         self._rebuild_exception = rebuild_exception
         self._rebuild_marks_dirty = rebuild_marks_dirty
         self._save_flag = False
+        self._children = list(children)
+        self._root = _RootComponent(self._children)
+        self._document_type = document_type
+        self.EnableAssemblyRebuild = False
+        self._rebuild_configuration = rebuild_configuration
+        self._rebuild_callback = rebuild_callback
         self.needs_rebuild2 = needs_rebuild2
         self.rebuild_calls = 0
         self.force_rebuild_calls = 0
@@ -107,10 +161,21 @@ class _Doc:
 
     @property
     def ConfigurationManager(self):
-        return _ConfigurationManager(
-            self._configuration,
-            self._configuration_needs_rebuild,
-        )
+        return _ConfigurationManager(self)
+
+    def GetConfigurationNames(self):
+        return [self._configuration]
+
+    def GetConfigurationByName(self, name):
+        if name != self._configuration:
+            raise ValueError(f"unknown configuration: {name}")
+        return self.ConfigurationManager.ActiveConfiguration
+
+    def GetType(self):
+        return self._document_type
+
+    def GetLightWeightComponentCount(self):
+        return 0
 
     def ForceRebuild3(self, flag):
         self.force_rebuild_calls += 1
@@ -123,11 +188,20 @@ class _Backend(SolidWorksBackend):
         self._refresh = refresh
         self.refresh_calls = []
 
-    def _document_by_path(self, path):
+    def _document_handle_by_path(self, path):
         self.refresh_calls.append(str(path))
         if isinstance(self._refresh, Exception):
             raise self._refresh
+        if isinstance(self._refresh, dict):
+            try:
+                value = self._refresh[str(path)]
+            except KeyError as error:
+                raise CadError("document_not_open", "missing test document") from error
+            return value.pop(0) if isinstance(value, list) else value
         return self._refresh() if callable(self._refresh) else self._refresh
+
+    def _document_by_path(self, path):
+        return self._document_handle_by_path(path)
 
     def _ensure_document(self, path):
         raise AssertionError("a missing document must never be reopened")
@@ -474,6 +548,224 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         ), self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(doc, PATH)
         self.assertEqual(caught.exception.code, "cad_capture_source_changed")
+
+    def test_pending_children_rebuild_once_before_top(self):
+        left = _Doc(LEFT, needs_rebuild2=1)
+        right = _Doc(RIGHT, needs_rebuild2=1)
+        top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("left-1", left), _Component("right-1", right)],
+        )
+        backend = _Backend({PATH: top, LEFT: left, RIGHT: right})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual([row["path"] for row in preparation["child_rebuilds"]], [LEFT, RIGHT])
+        self.assertEqual([left.rebuild_calls, right.rebuild_calls, top.rebuild_calls], [1, 1, 1])
+        self.assertIsNotNone(preparation["top_rebuild"])
+        self.assertEqual(preparation["needs_rebuild2_after"], 0)
+        self.assertIs(preparation["state_after"]["read_only"], True)
+        self.assertFalse(preparation["state_after"]["controls"]["enable_assembly_rebuild"])
+
+    def test_deepest_child_rebuilds_before_its_parent(self):
+        grandchild = _Doc(GRANDCHILD, needs_rebuild2=1)
+        child = _Doc(
+            CHILD,
+            needs_rebuild2=1,
+            children=[_Component("grandchild-1", grandchild)],
+        )
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child, GRANDCHILD: grandchild})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(
+            [row["path"] for row in preparation["child_rebuilds"]],
+            [GRANDCHILD, CHILD],
+        )
+        self.assertEqual([grandchild.rebuild_calls, child.rebuild_calls, top.rebuild_calls], [1, 1, 1])
+
+    def test_repeated_child_document_instance_rebuilds_once(self):
+        child = _Doc(CHILD, needs_rebuild2=1)
+        top = _Doc(
+            PATH,
+            children=[_Component("child-1", child), _Component("child-2", child)],
+        )
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="c" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(child.rebuild_calls, 1)
+        self.assertEqual(top.rebuild_calls, 0)
+        self.assertEqual(preparation["child_rebuilds"][0]["instances"], ["child-1", "child-2"])
+
+    def test_child_that_remains_pending_blocks_without_top_retry(self):
+        child = _Doc(CHILD, needs_rebuild2=1, rebuild_clears=False)
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["phase"], "child")
+        self.assertEqual(child.rebuild_calls, 1)
+        self.assertEqual(top.rebuild_calls, 0)
+
+    def test_suppressed_and_clean_dependencies_are_not_rebuilt(self):
+        suppressed = _Doc(LEFT, needs_rebuild2=1)
+        clean = _Doc(RIGHT)
+        top = _Doc(
+            PATH,
+            children=[
+                _Component("suppressed-1", suppressed, suppression_state=0),
+                _Component("clean-1", clean),
+            ],
+        )
+        backend = _Backend({PATH: top, LEFT: suppressed, RIGHT: clean})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="e" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual([suppressed.rebuild_calls, clean.rebuild_calls, top.rebuild_calls], [0, 0, 0])
+        self.assertEqual(preparation["child_rebuilds"], [])
+        self.assertIsNone(preparation["top_rebuild"])
+
+    def test_conflicting_configuration_for_one_child_document_blocks_before_mutation(self):
+        child = _Doc(CHILD, needs_rebuild2=1, configuration="默认")
+        top = _Doc(
+            PATH,
+            children=[
+                _Component("child-1", child, referenced_configuration="默认"),
+                _Component("child-2", child, referenced_configuration="Other"),
+            ],
+        )
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_state_unreadable")
+        self.assertEqual([child.rebuild_calls, top.rebuild_calls], [0, 0])
+
+    def test_unknown_child_state_blocks_before_any_rebuild(self):
+        child = _Doc(CHILD, needs_rebuild2=True)
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_state_unreadable")
+        self.assertEqual([child.rebuild_calls, top.rebuild_calls], [0, 0])
+
+    def test_child_configuration_change_is_rejected_before_top_rebuild(self):
+        child = _Doc(CHILD, needs_rebuild2=1, rebuild_configuration="Other")
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_configuration_mismatch")
+        self.assertEqual([child.rebuild_calls, top.rebuild_calls], [1, 0])
+
+    def test_child_source_change_after_rebuild_is_rejected(self):
+        child = _Doc(CHILD, needs_rebuild2=1)
+        top = _Doc(PATH, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child})
+        child_hash_calls = 0
+
+        def source_hash(path):
+            nonlocal child_hash_calls
+            if path != CHILD:
+                return "c" * 64
+            child_hash_calls += 1
+            return "c" * 64 if child_hash_calls == 1 else "d" * 64
+
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            side_effect=source_hash,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_source_changed")
+        self.assertEqual([child.rebuild_calls, top.rebuild_calls], [1, 0])
+
+    def test_top_rebuild_that_invalidates_a_child_blocks_without_another_rebuild(self):
+        child = _Doc(CHILD, needs_rebuild2=1)
+        top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        top._rebuild_callback = lambda: setattr(child, "needs_rebuild2", 1)
+        backend = _Backend({PATH: top, CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="e" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["path"], CHILD)
+        self.assertEqual([child.rebuild_calls, top.rebuild_calls], [1, 1])
+
+    def test_sibling_rebuild_can_clear_a_later_child_before_its_turn(self):
+        left = _Doc(LEFT, needs_rebuild2=1)
+        right = _Doc(RIGHT, needs_rebuild2=1)
+        top = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            children=[_Component("left-1", left), _Component("right-1", right)],
+        )
+        left._rebuild_callback = lambda: setattr(right, "needs_rebuild2", 0)
+        backend = _Backend({PATH: top, LEFT: left, RIGHT: right})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual([left.rebuild_calls, right.rebuild_calls, top.rebuild_calls], [1, 0, 1])
+        self.assertEqual([row["path"] for row in preparation["child_rebuilds"]], [LEFT])
+
+    def test_grandchild_rebuild_can_make_a_clean_parent_pending(self):
+        grandchild = _Doc(GRANDCHILD, needs_rebuild2=1)
+        child = _Doc(CHILD, needs_rebuild2=0, children=[_Component("grandchild-1", grandchild)])
+        grandchild._rebuild_callback = lambda: setattr(child, "needs_rebuild2", 1)
+        top = _Doc(PATH, needs_rebuild2=0, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: top, CHILD: child, GRANDCHILD: grandchild})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(top, PATH)
+        self.assertEqual(
+            [row["path"] for row in preparation["child_rebuilds"]],
+            [GRANDCHILD, CHILD],
+        )
+        self.assertEqual([grandchild.rebuild_calls, child.rebuild_calls, top.rebuild_calls], [1, 1, 0])
+
+    def test_top_rebuild_uses_the_handle_refreshed_after_children(self):
+        child = _Doc(CHILD, needs_rebuild2=1)
+        stale_top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        refreshed_top = _Doc(PATH, needs_rebuild2=1, children=[_Component("child-1", child)])
+        final_top = _Doc(PATH, children=[_Component("child-1", child)])
+        backend = _Backend({PATH: [refreshed_top, final_top], CHILD: child})
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ):
+            returned, preparation = backend._rebuild_capture_copy(stale_top, PATH)
+        self.assertIs(returned, final_top)
+        self.assertEqual([stale_top.rebuild_calls, refreshed_top.rebuild_calls, final_top.rebuild_calls], [0, 1, 0])
+        self.assertEqual(preparation["needs_rebuild2_after"], 0)
 
 
 if __name__ == "__main__":

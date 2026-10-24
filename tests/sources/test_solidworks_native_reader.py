@@ -364,9 +364,7 @@ class _ConfigurationManager:
     def __init__(self, doc):
         self._doc = doc
 
-    @property
-    def ActiveConfiguration(self):
-        name = self._doc.active_configuration
+    def _configuration(self, name):
         root = types.SimpleNamespace(
             Name2=os.path.splitext(os.path.basename(self._doc._path))[0],
             GetPathName=lambda: self._doc._path,
@@ -375,8 +373,13 @@ class _ConfigurationManager:
         return types.SimpleNamespace(
             Name=name,
             NeedsRebuild=False,
+            AddRebuildSaveMark=False,
             GetRootComponent3=lambda _visible: root,
         )
+
+    @property
+    def ActiveConfiguration(self):
+        return self._configuration(self._doc.active_configuration)
 
 
 class _Doc:
@@ -455,6 +458,17 @@ class _Doc:
 
     def GetComponents(self, _ignored):
         return list(self._children)
+
+    def GetConfigurationNames(self):
+        names = {
+            self.active_configuration,
+            *self._configuration_children,
+            *self._configuration_features,
+        }
+        return sorted(names)
+
+    def GetConfigurationByName(self, name):
+        return self.ConfigurationManager._configuration(name)
 
 
 class _App:

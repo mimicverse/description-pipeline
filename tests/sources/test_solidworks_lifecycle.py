@@ -94,15 +94,22 @@ class SessionTests(unittest.TestCase):
         configuration = SimpleNamespace(
             Name="Default",
             NeedsRebuild=False,
+            AddRebuildSaveMark=False,
+            GetRootComponent3=lambda _visible: SimpleNamespace(GetChildren=list),
         )
         doc = SimpleNamespace(
             ConfigurationManager=SimpleNamespace(
                 ActiveConfiguration=configuration,
             ),
             Extension=extension,
+            GetConfigurationNames=lambda: ["Default"],
+            GetConfigurationByName=lambda _name: configuration,
+            GetLightWeightComponentCount=lambda: 0,
             GetSaveFlag=False,
             GetPathName="/snapshot/source/robot.SLDASM",
+            GetType=lambda: 2,
             IsOpenedReadOnly=True,
+            EnableAssemblyRebuild=False,
             Save=Mock(),
             ForceRebuild3=Mock(spec=["__call__"], return_value=True),
         )
@@ -153,15 +160,25 @@ class SessionTests(unittest.TestCase):
             NeedsRebuild2=1,
             Rebuild=Mock(spec=["__call__"], return_value=1),
         )
-        configuration = SimpleNamespace(Name="Default", NeedsRebuild=False)
+        configuration = SimpleNamespace(
+            Name="Default",
+            NeedsRebuild=False,
+            AddRebuildSaveMark=False,
+            GetRootComponent3=lambda _visible: SimpleNamespace(GetChildren=list),
+        )
         doc = SimpleNamespace(
             ConfigurationManager=SimpleNamespace(
                 ActiveConfiguration=configuration,
             ),
             Extension=extension,
+            GetConfigurationNames=lambda: ["Default"],
+            GetConfigurationByName=lambda _name: configuration,
+            GetLightWeightComponentCount=lambda: 0,
             GetSaveFlag=False,
             GetPathName="/snapshot/source/robot.SLDASM",
+            GetType=lambda: 2,
             IsOpenedReadOnly=True,
+            EnableAssemblyRebuild=False,
         )
         backend._document_by_path = Mock(return_value=doc)
         with patch(
