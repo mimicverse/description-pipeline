@@ -862,12 +862,16 @@ def capture_handler_from_native_operation(
     artifact_store=None,
     timeout: float = 600.0,
     poll_interval: float = 0.2,
+    tool_provider: NativeOperationToolProvider | None = None,
 ):
     """Build CaptureHandler with the Windows port and no local CAD fallback."""
 
     from ..pipeline.capture import CaptureHandler
 
-    tool_provider = NativeOperationToolProvider(client)
+    if tool_provider is None:
+        tool_provider = NativeOperationToolProvider(client)
+    if not isinstance(tool_provider, NativeOperationToolProvider):
+        raise TypeError("tool_provider must be a NativeOperationToolProvider")
     return CaptureHandler(
         artifact_store=artifact_store,
         native_operation=NativeOperationCapturePort(
@@ -892,26 +896,44 @@ class NativeOperationDiscoverPort:
     """Discover port that owns one remote operation and never starts Capture."""
 
     client: NativeOperationClient
-    native_tool: Mapping[str, object]
+    native_tool: Mapping[str, object] | None
     timeout: float = 600.0
     poll_interval: float = 0.2
+    tool_provider: Callable[[], Mapping[str, object]] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.client, NativeOperationClient):
             raise TypeError("client must be a NativeOperationClient")
-        tool = dict(self.native_tool)
-        if not tool:
-            raise ValueError("native_tool must not be empty")
-        object.__setattr__(self, "native_tool", tool)
+        if self.native_tool is None:
+            if not callable(self.tool_provider):
+                raise ValueError(
+                    "native_tool or a callable tool_provider is required"
+                )
+        else:
+            tool = dict(self.native_tool)
+            if not tool:
+                raise ValueError("native_tool must not be empty")
+            object.__setattr__(self, "native_tool", tool)
         if self.timeout <= 0 or self.poll_interval <= 0:
             raise ValueError("timeout and poll_interval must be positive")
+
+    def _tool(self) -> dict[str, object]:
+        if self.tool_provider is None:
+            assert self.native_tool is not None
+            return copy.deepcopy(dict(self.native_tool))
+        tool = copy.deepcopy(dict(self.tool_provider()))
+        if not tool:
+            raise NativeOperationProtocolError(
+                "The native tool provider returned an empty record"
+            )
+        return tool
 
     def _validate_existing(self, view: NativeOperationView, request) -> None:
         request_record = request.to_record()
         if (
             view.kind != DISCOVER_KIND
             or view.request_sha256 != digest(request_record)
-            or view.native_tool_requirement_sha256 != digest(self.native_tool)
+            or view.native_tool_requirement_sha256 != digest(self._tool())
         ):
             raise NativeOperationClientConflict(
                 "native operation identity is bound to a different Discover request",
@@ -958,7 +980,7 @@ class NativeOperationDiscoverPort:
                 request=request.to_record(),
                 input_archive_sha256=file_digest(archive),
                 input_archive_bytes=archive.stat().st_size,
-                native_tool_requirement_sha256=digest(self.native_tool),
+                native_tool_requirement_sha256=digest(self._tool()),
                 output_contract=NATIVE_OBSERVATION_SCHEMA,
             )
             view = self.client.create_operation(envelope)

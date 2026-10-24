@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import stat
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping
@@ -16,6 +17,14 @@ from typing import Any, Protocol
 from ..artifacts import ArtifactStore
 from ..io import PipelineError, digest, read_data
 from ..platform.facts import FactStore
+from ..orchestration.native_operation_client import (
+    NativeOperationClient,
+    NativeOperationDiscoverPort,
+    NativeOperationEndpoint,
+    NativeOperationToolProvider,
+    NativeRemoteDiscoverAdapter,
+    capture_handler_from_native_operation,
+)
 from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
 from ..schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
@@ -106,6 +115,66 @@ def _portable_executor_sha256() -> str:
             "Portable runtime record carries no source identity",
         )
     return value
+
+
+def _native_client_from_environment(
+    source: Mapping[str, str],
+) -> NativeOperationClient:
+    """Build the loopback client without contacting the Windows endpoint."""
+
+    base_url = source.get("SOLIDWORKS_ENDPOINT_URL")
+    if not base_url:
+        port_text = source.get("TUNNEL_LOOPBACK_PORT")
+        if not port_text:
+            raise ApplicationError(
+                "application.native_endpoint_missing",
+                "SOLIDWORKS_ENDPOINT_URL or TUNNEL_LOOPBACK_PORT is required",
+            )
+        try:
+            port = int(port_text)
+        except ValueError as error:
+            raise ApplicationError(
+                "application.native_endpoint_invalid",
+                "TUNNEL_LOOPBACK_PORT must be a decimal port",
+            ) from error
+        if not 1 <= port <= 65535:
+            raise ApplicationError(
+                "application.native_endpoint_invalid",
+                "TUNNEL_LOOPBACK_PORT is outside the port range",
+            )
+        base_url = f"http://127.0.0.1:{port}"
+
+    token_value = source.get("ENDPOINT_TOKEN_FILE")
+    if not token_value:
+        raise ApplicationError(
+            "application.native_token_missing",
+            "ENDPOINT_TOKEN_FILE is required",
+        )
+    token_path = Path(token_value)
+    if not token_path.is_absolute():
+        raise ApplicationError(
+            "application.native_token_invalid",
+            "ENDPOINT_TOKEN_FILE must be absolute",
+        )
+    if token_path.is_symlink() or not token_path.is_file():
+        raise ApplicationError(
+            "application.native_token_invalid",
+            "ENDPOINT_TOKEN_FILE must be a regular file",
+        )
+    if os.name != "nt" and stat.S_IMODE(token_path.stat().st_mode) & 0o077:
+        raise ApplicationError(
+            "application.native_token_invalid",
+            "ENDPOINT_TOKEN_FILE must not grant group or other access",
+        )
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+        endpoint = NativeOperationEndpoint(base_url=base_url, token=token)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ApplicationError(
+            "application.native_endpoint_invalid",
+            str(error),
+        ) from error
+    return NativeOperationClient(endpoint)
 
 
 class AdmissionFactPort(Protocol):
@@ -748,6 +817,7 @@ def application_from_environment(
     publish_handler: StageHandler | None = None,
     handlers: Mapping[StageId, StageHandler] | None = None,
     builders: Mapping[StageId, CommandBuilder] | None = None,
+    native_operation_client: NativeOperationClient | None = None,
     clock: Callable[[], datetime] = _utc_now,
 ) -> StageApplication:
     """Compose implemented handlers; missing runtime capabilities remain explicit."""
@@ -772,16 +842,38 @@ def application_from_environment(
         ),
         clock=clock,
     )
+    if discover_adapter is None or capture_handler is None:
+        client = (
+            native_operation_client
+            if native_operation_client is not None
+            else _native_client_from_environment(source)
+        )
+        tool_provider = NativeOperationToolProvider(client)
+        if discover_adapter is None:
+            discover_adapter = NativeRemoteDiscoverAdapter(
+                port=NativeOperationDiscoverPort(
+                    client,
+                    native_tool=None,
+                    tool_provider=tool_provider,
+                ),
+                artifacts=artifacts,
+            )
+        if capture_handler is None:
+            capture_handler = capture_handler_from_native_operation(
+                client,
+                artifact_store=artifacts,
+                tool_provider=tool_provider,
+            )
     installed: dict[StageId, StageHandler] = {
         "freeze": FreezeHandler(),
         "generate": GenerateHandler(artifacts),
         "publish": PublishHandler(artifacts),
         "verify": VerifyHandler(),
     }
-    if discover_adapter is not None:
-        installed["discover"] = DiscoverHandler(discover_adapter)
-    if capture_handler is not None:
-        installed["capture"] = capture_handler
+    assert discover_adapter is not None
+    assert capture_handler is not None
+    installed["discover"] = DiscoverHandler(discover_adapter)
+    installed["capture"] = capture_handler
     if publish_handler is not None:
         installed["publish"] = publish_handler
     for stage, handler in (handlers or {}).items():

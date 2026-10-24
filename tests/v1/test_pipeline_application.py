@@ -525,10 +525,15 @@ class StageApplicationTests(unittest.TestCase):
 
     def test_environment_composition_uses_the_portable_source_identity(self):
         executor = "a" * 64
+        token = self.root / "endpoint.token"
+        token.write_text("t" * 40, encoding="utf-8")
+        token.chmod(0o600)
         environment = {
             "PLATFORM_ARTIFACT_ROOT": str(self.root / "factory-cas"),
             "PLATFORM_SERVICE_DSN": "postgresql://unused/unused",
             "PIPELINE_WORK_ROOT": str(self.root / "factory-work"),
+            "SOLIDWORKS_ENDPOINT_URL": "http://127.0.0.1:18765",
+            "ENDPOINT_TOKEN_FILE": str(token),
         }
         with patch(
             "description_pipeline.pipeline.application.tool_record",
@@ -536,8 +541,8 @@ class StageApplicationTests(unittest.TestCase):
         ):
             application = application_from_environment(environment)
         self.assertEqual(application.services.claim_policy.executor_sha256, executor)
-        self.assertNotIn("capture", application.handlers)
-        self.assertNotIn("discover", application.handlers)
+        self.assertIn("capture", application.handlers)
+        self.assertIn("discover", application.handlers)
         self.assertIsInstance(application.handlers["publish"], PublishHandler)
 
 
