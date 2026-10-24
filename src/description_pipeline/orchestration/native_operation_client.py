@@ -134,6 +134,37 @@ class NativeOperationWaitTimeout(NativeOperationClientError):
     """The operation has not reached a terminal fact before the client deadline."""
 
 
+def _require_native_executor(
+    view: NativeOperationView,
+    native_tool_requirement_sha256: str,
+) -> None:
+    """Require the native executor view to equal the observed executable tool."""
+
+    actual_tool = view.actual_native_tool_sha256
+    executor = view.executor_sha256
+    if (actual_tool is None) != (executor is None):
+        raise NativeOperationClientConflict(
+            "native operation tool observation and executor identities are incomplete",
+            status=409,
+            code="native_executor_mismatch",
+        )
+    if actual_tool is not None and actual_tool != executor:
+        raise NativeOperationClientConflict(
+            "native operation executor differs from the observed native tool",
+            status=409,
+            code="native_executor_mismatch",
+        )
+    if (
+        actual_tool is not None
+        and actual_tool != native_tool_requirement_sha256
+    ):
+        raise NativeOperationClientConflict(
+            "native operation status reports another native tool",
+            status=409,
+            code="native_tool_mismatch",
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class NativeOperationEndpoint:
     base_url: str
@@ -236,16 +267,10 @@ class NativeOperationStatusExpectation:
                 status=409,
                 code="native_operation_conflict",
             )
-        if (
-            view.actual_native_tool_sha256 is not None
-            and view.actual_native_tool_sha256
-            != self.native_tool_requirement_sha256
-        ):
-            raise NativeOperationClientConflict(
-                "native operation status reports another native tool",
-                status=409,
-                code="native_tool_mismatch",
-            )
+        _require_native_executor(
+            view,
+            self.native_tool_requirement_sha256,
+        )
         return view
 
 
@@ -1168,16 +1193,49 @@ class NativeOperationEffectObserver:
                 status=409,
                 code="native_operation_conflict",
             )
-        if (
-            view.actual_native_tool_sha256 is not None
-            and view.actual_native_tool_sha256
-            != native_tool_requirement_sha256
-        ):
-            raise NativeOperationClientConflict(
-                "Windows executed with a different full native tool record",
-                status=409,
-                code="native_tool_mismatch",
-            )
+        _require_native_executor(view, native_tool_requirement_sha256)
+
+    @staticmethod
+    def _identity_metadata(
+        view: NativeOperationView,
+        *,
+        platform_execution: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        """Keep platform origin and native runtime identities in separate roles."""
+
+        platform_origin = None
+        if platform_execution is not None:
+            platform_origin = {
+                name: platform_execution[name]
+                for name in (
+                    "claim_id",
+                    "fence",
+                    "owner_sha256",
+                    "executor_sha256",
+                )
+            }
+        native_owner = view.owner_sha256
+        return {
+            "schema_version": (
+                "description-pipeline.native-operation-identity/v1"
+            ),
+            "platform_origin": platform_origin,
+            "native_runtime": {
+                "owner_sha256": native_owner,
+                "owner_binding": (
+                    "native_claim_projection"
+                    if native_owner is not None
+                    else "unestablished"
+                ),
+                "actual_native_tool_sha256": (
+                    view.actual_native_tool_sha256
+                ),
+                "executor_sha256": view.executor_sha256,
+                "executor_binding": "tool_observed_and_archive",
+            },
+            "payload_sha256": view.payload_sha256,
+            "input_archive_sha256": view.input_archive_sha256,
+        }
 
     def _non_satisfied(
         self,
@@ -1344,6 +1402,10 @@ class NativeOperationEffectObserver:
                 "artifact_sha256": downloaded.sha256,
                 "request_sha256": observed.request_sha256,
                 "input_archive_sha256": observed.input_archive_sha256,
+                "identity": self._identity_metadata(
+                    observed,
+                    platform_execution=execution,
+                ),
             },
         )
 
@@ -1470,6 +1532,10 @@ class NativeOperationEffectObserver:
                 "source_archive_sha256": source_archive_sha256,
                 "artifact_sha256": downloaded.sha256,
                 "request_sha256": observed.request_sha256,
+                "identity": self._identity_metadata(
+                    observed,
+                    platform_execution=None,
+                ),
             },
         )
 
@@ -1638,6 +1704,8 @@ class NativeOperationCapturePort:
                 status=409,
                 code="native_operation_conflict",
             )
+        if view is not None:
+            _require_native_executor(view, full_tool_sha256)
         if not archive.is_file() or archive.is_symlink():
             raise NativeOperationProtocolError(
                 "The sealed Capture input archive is missing"
@@ -1671,13 +1739,7 @@ class NativeOperationCapturePort:
                 timeout=self.timeout,
                 poll_interval=self.poll_interval,
             )
-        if (
-            view.actual_native_tool_sha256 is not None
-            and view.actual_native_tool_sha256 != full_tool_sha256
-        ):
-            raise NativeOperationProtocolError(
-                "Windows executed Capture with a different full native tool record"
-            )
+        _require_native_executor(view, full_tool_sha256)
         receipt = view.to_record()
         if view.state == "satisfied":
             output.mkdir(parents=True, exist_ok=True)
@@ -1797,16 +1859,19 @@ class NativeOperationDiscoverPort:
 
     def _validate_existing(self, view: NativeOperationView, request) -> None:
         request_record = request.to_record()
+        native_tool_requirement_sha256 = digest(self._tool())
         if (
             view.kind != DISCOVER_KIND
             or view.request_sha256 != digest(request_record)
-            or view.native_tool_requirement_sha256 != digest(self._tool())
+            or view.native_tool_requirement_sha256
+            != native_tool_requirement_sha256
         ):
             raise NativeOperationClientConflict(
                 "native operation identity is bound to a different Discover request",
                 status=409,
                 code="native_operation_conflict",
             )
+        _require_native_executor(view, native_tool_requirement_sha256)
 
     @staticmethod
     def operation_id(request) -> str:
@@ -1860,6 +1925,7 @@ class NativeOperationDiscoverPort:
                 timeout=self.timeout,
                 poll_interval=self.poll_interval,
             )
+        self._validate_existing(view, request)
         if view.state == "unknown":
             raise NativeOperationRemoteUnknown(
                 view.failure.message if view.failure else "native Discover result is unknown",

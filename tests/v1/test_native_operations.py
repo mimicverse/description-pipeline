@@ -367,6 +367,22 @@ class NativeOperationRuntimeTests(unittest.TestCase):
                 )
             )
 
+        running = replace(
+            observed,
+            state="running",
+            actual_native_tool_sha256=expected.native_tool_requirement_sha256,
+            executor_sha256=expected.native_tool_requirement_sha256,
+        )
+        client.get_operation = mock.Mock(
+            return_value=replace(
+                running,
+                executor_sha256=digest({"foreign": "executor"}),
+            )
+        )
+        with self.assertRaises(NativeOperationClientConflict) as raised:
+            asyncio.run(client.probe_operation_status_async(expected))
+        self.assertEqual(raised.exception.code, "native_executor_mismatch")
+
     def test_async_status_probe_reports_missing_without_other_calls(self) -> None:
         client = NativeOperationClient(
             NativeOperationEndpoint("http://127.0.0.1:1", TOKEN)
@@ -1438,11 +1454,72 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             evidence.metadata["actual_native_tool_sha256"],
             digest(NATIVE_TOOL),
         )
+        identity = evidence.metadata["identity"]
+        self.assertIsNone(identity["platform_origin"])
+        self.assertEqual(
+            identity["native_runtime"]["owner_binding"],
+            "native_claim_projection",
+        )
+        self.assertEqual(
+            identity["native_runtime"]["executor_sha256"],
+            digest(NATIVE_TOOL),
+        )
+        self.assertEqual(
+            identity["native_runtime"]["executor_binding"],
+            "tool_observed_and_archive",
+        )
         self.assertEqual(reader.calls, 1)
         self.assertEqual(backend.calls, 1)
         client.create_operation.assert_not_called()
         client.upload_input.assert_not_called()
         client.cancel_operation.assert_not_called()
+
+    def test_effect_observer_rejects_foreign_discover_executor(self) -> None:
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = _CountingBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        port = NativeOperationDiscoverPort(
+            client,
+            NATIVE_TOOL,
+            timeout=5,
+            poll_interval=0.01,
+        )
+        workspace = self.root / "workspace-observer-foreign-executor"
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        request = self.request("discover-operation-foreign-executor")
+        port.invoke(archive, request, workspace / "operation")
+        command, intent, outbound = self.observer_fixture(
+            request.operation_id,
+            workspace,
+            archive=archive,
+        )
+        observed = client.get_operation(request.operation_id)
+        client.get_operation = mock.Mock(
+            return_value=replace(
+                observed,
+                executor_sha256=digest({"foreign": "discover-executor"}),
+            )
+        )
+        client.download_artifact = mock.Mock(
+            side_effect=AssertionError(
+                "executor mismatch must be rejected before artifact download"
+            )
+        )
+
+        with self.assertRaises(NativeOperationClientConflict) as raised:
+            NativeOperationEffectObserver(client).observe(
+                command=command,
+                intent=intent,
+                outbound_root=outbound,
+                workspace_root=workspace,
+            )
+
+        self.assertEqual(raised.exception.code, "native_executor_mismatch")
+        client.download_artifact.assert_not_called()
 
     def test_download_identity_recheck_rejects_a_changed_operation(self) -> None:
         reader = _ClosureReader(self.inventory, self.MAIN, self.edges)

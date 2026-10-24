@@ -53,6 +53,7 @@ from description_pipeline.orchestration.native_operation_client import (
     ArtifactDownload,
     NativeOperationClient,
     NativeOperationCapturePort,
+    NativeOperationClientConflict,
     NativeOperationEffectObserver,
     NativeOperationEndpoint,
     native_capture_operation_id,
@@ -990,6 +991,23 @@ class CaptureHandlerTests(unittest.TestCase):
             for item in self.effect_ledger.intents.values()
             if item.command_id == self.command.command_id
         )
+        operation_id = native_capture_operation_id(
+            run_id=self.command.run_id,
+            command_id=self.command.command_id,
+            effect_key="capture-native",
+        )
+        native_owner = digest(
+            {"native_operation_claim": operation_id}
+        )
+        native_executor = digest(self.current_native_tool)
+        self.assertNotEqual(
+            native_owner,
+            outbound["execution"]["owner_sha256"],
+        )
+        self.assertNotEqual(
+            native_executor,
+            outbound["execution"]["executor_sha256"],
+        )
         client, _operation_id = self._observer_client(
             archive=archive,
             outbound_root=outbound_root,
@@ -1014,10 +1032,142 @@ class CaptureHandlerTests(unittest.TestCase):
                 "request_sha256"
             ],
         )
+        identity = evidence.metadata["identity"]
+        self.assertEqual(identity["platform_origin"]["claim_id"], self.claim.claim_id)
+        self.assertEqual(identity["platform_origin"]["fence"], self.claim.fence)
+        self.assertEqual(
+            identity["platform_origin"]["owner_sha256"],
+            outbound["execution"]["owner_sha256"],
+        )
+        self.assertEqual(
+            identity["platform_origin"]["executor_sha256"],
+            self.stage_executor,
+        )
+        self.assertEqual(
+            identity["native_runtime"]["owner_sha256"],
+            native_owner,
+        )
+        self.assertEqual(
+            identity["native_runtime"]["owner_binding"],
+            "native_claim_projection",
+        )
+        self.assertEqual(
+            identity["native_runtime"]["actual_native_tool_sha256"],
+            native_executor,
+        )
+        self.assertEqual(
+            identity["native_runtime"]["executor_sha256"],
+            native_executor,
+        )
+        self.assertEqual(
+            identity["native_runtime"]["executor_binding"],
+            "tool_observed_and_archive",
+        )
         self.assertEqual(client.get_operation.call_count, 2)
         client.create_operation.assert_not_called()
         client.upload_input.assert_not_called()
         client.cancel_operation.assert_not_called()
+
+    def test_native_effect_observer_rejects_executor_not_actual_native_tool(self) -> None:
+        effects = self.effects()
+        workspace = self.workspace(name="workspace-foreign-native-executor")
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.current_native_tool,
+        ):
+            completed = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(completed.outcome, "completed")
+        payload = workspace.root / "capture-effect-payload"
+        archive = payload / "native-evidence.zip"
+        outbound_root = workspace.root / "capture-effect-outbound"
+        outbound = read_data(outbound_root / "outbound.json")
+        intent = next(
+            item
+            for item in self.effect_ledger.intents.values()
+            if item.command_id == self.command.command_id
+        )
+        operation_id = native_capture_operation_id(
+            run_id=self.command.run_id,
+            command_id=self.command.command_id,
+            effect_key="capture-native",
+        )
+        request = CaptureOperationRequest.from_record(
+            {
+                "schema_version": CAPTURE_OPERATION_SCHEMA,
+                "command_id": self.command.command_id,
+                "run_id": self.command.run_id,
+                "request_digest": self.command.request_digest,
+                "effect_key": "capture-native",
+                "handoff_sha256": outbound["handoff_sha256"],
+                "upload_sha256": outbound["upload_sha256"],
+                "prepared_sha256": outbound["prepared_sha256"],
+                "main_assembly": outbound["main_assembly"],
+                "package_files": outbound["prepared_files"],
+                "upstream_artifacts": outbound["upstream_artifacts"],
+                "execution": outbound["execution"],
+                "native_tool_source_sha256": (
+                    outbound["native_tool_source_sha256"]
+                ),
+                "request_evidence": outbound["request_evidence"],
+            }
+        )
+        native_tool = read_data(payload / "native-tool.json")
+        actual_tool = digest(native_tool)
+        now = datetime.now(UTC).isoformat()
+        view = NativeOperationView(
+            schema_version=OPERATION_VIEW_SCHEMA,
+            operation_id=operation_id,
+            kind=CAPTURE_KIND,
+            payload_sha256=digest({"operation": operation_id}),
+            state="satisfied",
+            request_sha256=digest(request.to_record()),
+            input_archive_sha256=digest({"input": operation_id}),
+            native_tool_requirement_sha256=actual_tool,
+            actual_native_tool_sha256=actual_tool,
+            owner_sha256=digest({"owner": "native-runtime-claim"}),
+            executor_sha256=self.stage_executor,
+            resource_terminated=True,
+            artifact=NativeArtifactView(
+                name=CAPTURE_ARCHIVE,
+                bytes=archive.stat().st_size,
+                sha256=file_digest(archive),
+                media_type="application/zip",
+            ),
+            failure=None,
+            created_at=now,
+            started_at=now,
+            finished_at=now,
+        )
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32)
+        )
+        client.get_operation = Mock(return_value=view)
+        client.download_artifact = Mock(
+            side_effect=AssertionError(
+                "executor mismatch must be rejected before artifact download"
+            )
+        )
+        observer_root = self.root / "capture-observer-foreign-executor"
+        observer_root.mkdir()
+
+        with self.assertRaises(NativeOperationClientConflict) as raised:
+            NativeOperationEffectObserver(client).observe(
+                command=self.command,
+                intent=intent,
+                outbound_root=outbound_root,
+                workspace_root=observer_root,
+            )
+
+        self.assertEqual(raised.exception.code, "native_executor_mismatch")
+        client.download_artifact.assert_not_called()
+        self.assertFalse(
+            any(observer_root.glob("admitted-capture-*"))
+        )
 
     def test_native_effect_observer_rejects_missing_request_evidence(self) -> None:
         effects = self.effects()
