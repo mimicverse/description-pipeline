@@ -152,7 +152,14 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             receipt=receipt,
         )
 
-    def legacy_discovery_fixture(self, root: Path) -> tuple[Path, dict, dict]:
+    def legacy_discovery_fixture(
+        self,
+        root: Path,
+        *,
+        main_assembly: str = "robot.SLDASM",
+        hardware_id: str | None = "m3.0",
+        robot_name_technical: str = "m3_0",
+    ) -> tuple[Path, dict, dict]:
         from description_pipeline import interface_records as ir
         from description_pipeline.delivery import PIPELINE_ID
         from description_pipeline.io import canonical, digest
@@ -165,29 +172,47 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             IDENTITY_SCHEMA,
             NAMESPACE,
             NATIVE_READER_GENERATOR,
+            PLAN_SCHEMA,
+            SOURCE_RECORD_SCHEMA,
         )
+        from description_pipeline.schemas import TOOL_SCHEMA
         from description_pipeline.stages import CONTRACT as STAGE_CONTRACT, CONTRACT_SHA256
         from tests.sources.selection_support import sealed_selection
 
         run_id = "run"
-        main_assembly = "robot.SLDASM"
         native_files = {
             "base.SLDPRT": hashlib.sha256(b"base").hexdigest(),
             main_assembly: hashlib.sha256(b"assembly").hexdigest(),
         }
         handoff_sha256 = digest(native_files)
         source_selection = sealed_selection(native_files, main_assembly, stage_root="C:\\stage")
+        request_record = {
+            "schema_version": ir.REQUEST_RECORD_SCHEMA,
+            "request_id": "fixture-request",
+            "purpose": "engineering",
+            "target_hardware": "m3.0",
+            "change_summary": "fixture summary",
+            "main_assembly": main_assembly,
+            "handoff_digest": source_selection["upload_sha256"],
+            "platform_config_digest": "b" * 64,
+        }
+        native_tool = {
+            "schema_version": TOOL_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "source_sha256": source_selection["reader_sha256"],
+            "runtime": {"role": "native", "system": "Windows"},
+        }
         identity_document = {
             "change_summary": "fixture summary",
             "control": None,
             "delivery_configuration": "Default",
-            "hardware_id": "m3.0",
+            "hardware_id": hardware_id,
             "main_assembly": main_assembly,
             "owner": None,
             "parent_revision": None,
             "revision": None,
             "robot_name": None,
-            "robot_name_technical": "m3_0",
+            "robot_name_technical": robot_name_technical,
         }
         raw_identity = {
             "change_summary": None,
@@ -243,18 +268,112 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 "notes": None,
                 "reference_axes": [],
                 "properties": {"document": {}, "components": {}, "mates": {}},
-                "document_state": {"before": {}, "after": {}, "used_api": "fixture"},
+                "document_state": {
+                    "before": {
+                        "configuration": "Default",
+                        "configuration_needs_rebuild": False,
+                        "needs_rebuild2_value": 1,
+                        "read_only": True,
+                        "save_flag": True,
+                    },
+                    "after": {
+                        "configuration": "Default",
+                        "configuration_needs_rebuild": False,
+                        "needs_rebuild2_value": 0,
+                        "read_only": True,
+                        "save_flag": True,
+                    },
+                    "used_api": "fixture",
+                },
                 "solidworks": {},
                 "exporter": {},
             },
             "findings": [finding],
         }
+        source_content = {
+            "kind": "source-revision",
+            "handoff_digest": request_record["handoff_digest"],
+            "main_assembly": main_assembly,
+            "configuration": "Default",
+            "hardware_id": hardware_id,
+            "records": [],
+        }
+        source_record = {
+            "schema_version": SOURCE_RECORD_SCHEMA,
+            "source_revision_id": digest(source_content),
+            "identity": source_content,
+            "selection": {
+                "main_assembly": main_assembly,
+                "configuration": "Default",
+                "hardware_id": hardware_id,
+                "hardware_source": "platform-config",
+            },
+            "metadata": {
+                "revision": None,
+                "owner": None,
+                "control": None,
+                "change_summary": "fixture summary",
+                "change_summary_source": "submission",
+            },
+        }
+        discovery_bytes = canonical(discovery)
+        source_bytes = canonical(source_record)
+        capture_plan = {
+            "schema_version": PLAN_SCHEMA,
+            "run_id": run_id,
+            "handoff_sha256": handoff_sha256,
+            "discovery_sha256": hashlib.sha256(discovery_bytes).hexdigest(),
+            "main_assembly": main_assembly,
+            "configuration": "Default",
+            "identity": {"hardware_id": hardware_id, "revision": None},
+            "selection": {"files": native_files},
+            "objects": [],
+            "groups": [],
+            "axis_requests": [],
+            "datums": [],
+            "evidence_requests": [
+                "evidence/capture.json",
+                "evidence/geometry/",
+                "evidence/native-runtime.json",
+            ],
+        }
+        handoff = {
+            "passed": True,
+            "errors": [],
+            "warnings": [],
+            "resolved": None,
+            "cad_revision": {
+                "change_summary": "fixture summary",
+                "control": None,
+                "hardware_id": hardware_id,
+                "owner": None,
+                "revision": None,
+            },
+            "main_assembly": main_assembly,
+            "configuration": "Default",
+            "input": {
+                "hardware_id": hardware_id,
+                "source": {"assembly": main_assembly, "configuration": "Default"},
+            },
+            "input_receipt": {"inventory": native_files},
+            "package_files": {
+                **{
+                    f"cad/{name}": checksum
+                    for name, checksum in native_files.items()
+                },
+                "source.json": hashlib.sha256(source_bytes).hexdigest(),
+            },
+        }
         tree, receipt = self.checkpoint_fixture(
             root,
             subject_files={
-                "evidence/discovery.json": canonical(discovery),
+                "evidence/discovery.json": discovery_bytes,
+                "evidence/capture-plan.json": canonical(capture_plan),
+                "input/handoff.json": canonical(handoff),
                 "input/cad/base.SLDPRT": b"base",
-                "input/cad/robot.SLDASM": b"assembly",
+                f"input/cad/{main_assembly}": b"assembly",
+                "input/request.json": canonical(request_record),
+                "input/source.json": source_bytes,
             },
         )
         findings_bytes = canonical(
@@ -267,13 +386,13 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             "schema_version": IDENTITY_SCHEMA,
             "run_id": run_id,
             "handoff_sha256": handoff_sha256,
-            "hardware_id": "m3.0",
+            "hardware_id": hardware_id,
             "parent_revision": None,
             "revision": None,
             "sources": {
                 "change_summary": "submission",
                 "control": "absent",
-                "hardware_id": "platform_configuration",
+                "hardware_id": "platform_configuration" if hardware_id is not None else "absent",
                 "owner": "absent",
                 "parent_revision": "absent",
                 "revision": "absent",
@@ -294,7 +413,21 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             "input/discovery/identity-resolution.json": hashlib.sha256(canonical(identity)).hexdigest(),
         }
         rows = [
-            {"id": stage["id"], "state": "not_run", "in_scope": False, "input_qc": [], "output_qc": []}
+            {
+                "id": stage["id"],
+                "state": "not_run",
+                "in_scope": False,
+                "inputs": [
+                    {**item, "files": {}, "availability": "not_produced"}
+                    for item in stage["inputs"]
+                ],
+                "outputs": [
+                    {**item, "files": {}, "availability": "not_produced"}
+                    for item in stage["outputs"]
+                ],
+                "input_qc": [],
+                "output_qc": [],
+            }
             for stage in STAGE_CONTRACT["stages"]
         ]
         by_id = {row["id"]: row for row in rows}
@@ -314,16 +447,31 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             ],
         )
         discover_details = by_id["discover"]["output_qc"][1]["details"]
+        common_files = {
+            "input/capture-plan.json": hashlib.sha256(
+                (tree / "evidence/capture-plan.json").read_bytes()
+            ).hexdigest(),
+            "input/source.json": hashlib.sha256(
+                (tree / "input/source.json").read_bytes()
+            ).hexdigest(),
+        }
         discover_details["files"] = {
             **{f"input/{name}": checksum for name, checksum in native_files.items()},
+            **common_files,
             **aliases,
         }
         discover_details["discovery_sha256"] = hashlib.sha256(
             (tree / "evidence/discovery.json").read_bytes()
         ).hexdigest()
         by_id["capture"].update(state="failed", in_scope=True)
-        by_id["verify"]["inputs"] = [{"files": dict(aliases)}]
-        by_id["publish"]["inputs"] = [{"files": dict(aliases)}]
+        by_id["verify"]["inputs"][0].update(
+            files=dict(aliases),
+            availability="recorded",
+        )
+        by_id["publish"]["inputs"][0].update(
+            files=dict(aliases),
+            availability="recorded",
+        )
         view = {
             "schema_version": "solidworks-to-urdf.stages/v1",
             "pipeline_id": PIPELINE_ID,
@@ -334,6 +482,7 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             "stages": rows,
         }
         native_stages = write(tree / "reports/native-stages.json", canonical(view))
+        native_tool_path = write(tree / "reports/native-tool.json", canonical(native_tool))
         native_stages_sha256 = hashlib.sha256(native_stages.read_bytes()).hexdigest()
         receipt = {
             **receipt,
@@ -349,6 +498,11 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 "path": "reports/native-stages.json",
                 "bytes": native_stages.stat().st_size,
                 "sha256": native_stages_sha256,
+            },
+            {
+                "path": "reports/native-tool.json",
+                "bytes": native_tool_path.stat().st_size,
+                "sha256": hashlib.sha256(native_tool_path.read_bytes()).hexdigest(),
             },
         ]
         return tree, receipt, view
@@ -402,6 +556,13 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                     update_aliases(item)
 
         update_aliases(view)
+        discover_files = view["stages"][1]["output_qc"][1]["details"]["files"]
+        discover_files["input/capture-plan.json"] = hashlib.sha256(
+            (tree / "evidence/capture-plan.json").read_bytes()
+        ).hexdigest()
+        discover_files["input/source.json"] = hashlib.sha256(
+            (tree / "input/source.json").read_bytes()
+        ).hexdigest()
         view["stages"][1]["output_qc"][1]["details"]["discovery_sha256"] = hashlib.sha256(
             (tree / "evidence/discovery.json").read_bytes()
         ).hexdigest()
@@ -416,6 +577,14 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 "sha256": native_stages_sha256,
             }
         )
+        native_tool = tree / "reports/native-tool.json"
+        updated["artifacts"].append(
+            {
+                "path": "reports/native-tool.json",
+                "bytes": native_tool.stat().st_size,
+                "sha256": hashlib.sha256(native_tool.read_bytes()).hexdigest(),
+            }
+        )
         return updated, view
 
     def copy_checkpoint_tree(self, source: Path, destination: Path) -> Path:
@@ -428,6 +597,211 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tree, receipt, _view = self.legacy_discovery_fixture(Path(directory))
             self.verify(tree, receipt)
+
+    def test_legacy_native_tool_may_omit_a_historical_system_field(self) -> None:
+        from description_pipeline.io import canonical
+
+        with tempfile.TemporaryDirectory() as directory:
+            tree, receipt, view = self.legacy_discovery_fixture(Path(directory))
+            native_tool_path = tree / "reports/native-tool.json"
+            native_tool = json.loads(native_tool_path.read_text())
+            native_tool["runtime"].pop("system")
+            write(native_tool_path, canonical(native_tool))
+            receipt, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            self.verify(tree, receipt)
+
+    def test_legacy_native_tool_accepts_an_exact_present_runtime_closure(self) -> None:
+        from packaging.utils import canonicalize_name
+        from description_pipeline.io import canonical
+        from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
+
+        with tempfile.TemporaryDirectory() as directory:
+            tree, receipt, view = self.legacy_discovery_fixture(Path(directory))
+            native_tool_path = tree / "reports/native-tool.json"
+            native_tool = json.loads(native_tool_path.read_text())
+            native_tool["runtime"].update(
+                python="3.12.10",
+                packages={
+                    canonicalize_name(name): RUNTIME_VERSIONS[name]
+                    for name in required_packages("native")
+                },
+            )
+            write(native_tool_path, canonical(native_tool))
+            receipt, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            self.verify(tree, receipt)
+
+    def test_legacy_handoff_accepts_the_exact_minimal_historical_shape(self) -> None:
+        from description_pipeline.io import canonical
+
+        with tempfile.TemporaryDirectory() as directory:
+            tree, receipt, view = self.legacy_discovery_fixture(Path(directory))
+            handoff_path = tree / "input/handoff.json"
+            handoff = json.loads(handoff_path.read_text())
+            write(
+                handoff_path,
+                canonical(
+                    {
+                        "passed": handoff["passed"],
+                        "package_files": handoff["package_files"],
+                        "input_receipt": handoff["input_receipt"],
+                    }
+                ),
+            )
+            receipt, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            self.verify(tree, receipt)
+
+    def test_legacy_stage_inventory_accepts_exact_historical_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, view = self.legacy_discovery_fixture(base / "complete")
+            discover_files = dict(view["stages"][1]["output_qc"][1]["details"]["files"])
+            inventory = recovery.inventory_tree(tree)
+            complete_files = {
+                **discover_files,
+                **{
+                    row["path"]: row["sha256"]
+                    for row in inventory
+                    if row["type"] == "file" and row["path"].startswith("input/cad/")
+                },
+                "input/handoff.json": hashlib.sha256(
+                    (tree / "input/handoff.json").read_bytes()
+                ).hexdigest(),
+            }
+            complete_view = copy.deepcopy(view)
+            complete_view["stages"][4]["inputs"][0]["files"] = dict(complete_files)
+            complete_view["stages"][5]["inputs"][0]["files"] = dict(complete_files)
+            self.verify(
+                tree,
+                self.rewrite_native_stages(tree, receipt, complete_view),
+            )
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "full")
+            discover_files = dict(view["stages"][1]["output_qc"][1]["details"]["files"])
+            inventory = recovery.inventory_tree(tree)
+            complete_files = {
+                **discover_files,
+                **{
+                    row["path"]: row["sha256"]
+                    for row in inventory
+                    if row["type"] == "file" and row["path"].startswith("input/cad/")
+                },
+                "input/handoff.json": hashlib.sha256(
+                    (tree / "input/handoff.json").read_bytes()
+                ).hexdigest(),
+            }
+            evidence_files = dict.fromkeys(
+                recovery._CAPTURE_INTEGRITY_FIXED,
+                "a" * 64,
+            )
+            evidence_files.update(
+                {
+                    f"evidence/source/{name}": "b" * 64
+                    for name in (
+                        row["path"].removeprefix("input/cad/")
+                        for row in inventory
+                        if row["type"] == "file"
+                        and row["path"].startswith("input/cad/")
+                    )
+                }
+            )
+            full_files = {**complete_files, **evidence_files}
+            full_view = copy.deepcopy(view)
+            from description_pipeline.stages import CONTRACT as STAGE_CONTRACT
+
+            capture_output_qc = [
+                {
+                    "id": check["id"],
+                    "state": "passed",
+                    "details": {"passed": True},
+                }
+                for check in next(
+                    stage for stage in STAGE_CONTRACT["stages"] if stage["id"] == "capture"
+                )["output_qc"]
+            ]
+            capture_output_qc[0]["details"]["files"] = evidence_files
+            full_view["stages"][2]["output_qc"] = capture_output_qc
+            full_view["stages"][4]["inputs"][0]["files"] = dict(full_files)
+            full_view["stages"][5]["inputs"][0]["files"] = dict(full_files)
+            self.verify(
+                tree,
+                self.rewrite_native_stages(tree, receipt, full_view),
+            )
+
+    def test_legacy_capture_integrity_is_exact_or_empty(self) -> None:
+        from description_pipeline.stages import CONTRACT as STAGE_CONTRACT
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            capture_definition = next(
+                stage for stage in STAGE_CONTRACT["stages"] if stage["id"] == "capture"
+            )
+            output_qc = [
+                {
+                    "id": check["id"],
+                    "state": "passed",
+                    "details": {"passed": True},
+                }
+                for check in capture_definition["output_qc"]
+            ]
+
+            def fixture_with_integrity(
+                name: str,
+                integrity: dict[str, str],
+                *,
+                geometry: dict[str, str] | None = None,
+            ) -> tuple[Path, dict]:
+                tree, receipt, view = self.legacy_discovery_fixture(base / name)
+                changed_view = copy.deepcopy(view)
+                changed_view["stages"][2]["output_qc"] = copy.deepcopy(output_qc)
+                changed_view["stages"][2]["output_qc"][0]["details"]["files"] = dict(
+                    integrity
+                )
+                if geometry is not None:
+                    changed_view["stages"][2]["outputs"][1].update(
+                        files=dict(geometry),
+                        availability="recorded",
+                    )
+                return tree, self.rewrite_native_stages(
+                    tree,
+                    receipt,
+                    changed_view,
+                )
+
+            tree, receipt, _view = self.legacy_discovery_fixture(base / "source-names")
+            source_names = [
+                row["path"].removeprefix("input/cad/")
+                for row in recovery.inventory_tree(tree)
+                if row["type"] == "file" and row["path"].startswith("input/cad/")
+            ]
+            exact = dict.fromkeys(recovery._CAPTURE_INTEGRITY_FIXED, "a" * 64)
+            exact.update(
+                {f"evidence/source/{name}": "b" * 64 for name in source_names}
+            )
+
+            tree, receipt = fixture_with_integrity("exact", exact)
+            self.verify(tree, receipt)
+
+            tree, receipt = fixture_with_integrity(
+                "ghost",
+                {**exact, "evidence/geometry/ghost.stl": "f" * 64},
+            )
+            with self.assertRaisesRegex(recovery.RecoveryError, "integrity inventory is not exact"):
+                self.verify(tree, receipt)
+
+            partial = dict(exact)
+            partial.pop(next(iter(partial)))
+            tree, receipt = fixture_with_integrity("partial", partial)
+            with self.assertRaisesRegex(recovery.RecoveryError, "integrity inventory is not exact"):
+                self.verify(tree, receipt)
+
+            geometry_path = "evidence/geometry/part.stl"
+            tree, receipt = fixture_with_integrity(
+                "forged-geometry",
+                {**exact, geometry_path: "f" * 64},
+                geometry={geometry_path: "a" * 64},
+            )
+            with self.assertRaisesRegex(recovery.RecoveryError, "geometry differs from its output authority"):
+                self.verify(tree, receipt)
 
     def test_legacy_discovery_sidecars_reject_tamper_unbound_unknown_and_third_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -454,7 +828,10 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                         strip_aliases(item)
 
             strip_aliases(unbound_view)
-            with self.assertRaisesRegex(recovery.RecoveryError, "not declared at every exact stage position"):
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "alias and its native-stage references differ",
+            ):
                 self.verify(unbound, self.rewrite_native_stages(unbound, receipt, unbound_view))
 
             unknown = self.copy_checkpoint_tree(tree, base / "unknown")
@@ -610,11 +987,42 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
         def raw_cad_value_drift(discovery: dict, _identity: dict) -> None:
             discovery["raw"]["identity"]["hardware_id"] = "forged"
 
+        def identity_empty_scalar(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = ""
+
+        def identity_whitespace_scalar(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = "   "
+
+        def identity_control_scalar(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = "invalid\nidentifier"
+
+        def property_empty_scalar(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["properties"]["document"]["dp.hardware_id"] = ""
+
+        def derivation_configuration_drift(discovery: dict, _identity: dict) -> None:
+            discovery["derivation"]["configuration"] = "Forged"
+
+        def top_frozen_name_drift(discovery: dict, _identity: dict) -> None:
+            discovery["frozen_names"]["forged"] = "forged_link"
+
+        def derivation_frozen_name_drift(discovery: dict, _identity: dict) -> None:
+            discovery["derivation"]["frozen_names"]["forged"] = "forged_link"
+
+        def both_frozen_name_drift(discovery: dict, _identity: dict) -> None:
+            discovery["frozen_names"]["forged"] = "forged_link"
+            discovery["derivation"]["frozen_names"]["forged"] = "forged_link"
+
         def source_selection_inventory_drift(discovery: dict, _identity: dict) -> None:
             discovery["raw"]["source_selection"]["files"]["base.SLDPRT"] = "e" * 64
 
         def source_selection_handoff_drift(discovery: dict, _identity: dict) -> None:
             discovery["raw"]["source_selection"]["handoff_sha256"] = "e" * 64
+
+        def source_selection_main_assembly_drift(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["source_selection"]["main_assembly"] = "other.SLDASM"
+
+        def source_selection_unknown_key(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["source_selection"]["unexpected"] = True
 
         def sources_list(_discovery: dict, identity: dict) -> None:
             identity["sources"] = []
@@ -624,6 +1032,29 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
 
         def source_value_mismatch(_discovery: dict, identity: dict) -> None:
             identity["sources"]["owner"] = "cad"
+
+        def cad_hardware_without_authored(discovery: dict, identity: dict) -> None:
+            identity["sources"]["hardware_id"] = "cad"
+
+        def platform_hardware_with_authored(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["hardware_id"] = "m3.0"
+
+        def cad_summary_without_authored(discovery: dict, identity: dict) -> None:
+            identity["sources"]["change_summary"] = "cad"
+
+        def submission_summary_with_authored(discovery: dict, _identity: dict) -> None:
+            discovery["raw"]["identity"]["change_summary"] = "fixture summary"
+
+        def platform_hardware_without_request_binding(
+            discovery: dict, identity: dict
+        ) -> None:
+            discovery["identity"]["hardware_id"] = "forged"
+            identity["hardware_id"] = "forged"
+
+        def submission_summary_without_request_binding(
+            discovery: dict, _identity: dict
+        ) -> None:
+            discovery["identity"]["change_summary"] = "forged"
 
         def invalid_source_origin(_discovery: dict, identity: dict) -> None:
             identity["sources"]["hardware_id"] = "submission"
@@ -652,6 +1083,46 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 "receipt-bound discovery evidence is invalid",
             ),
             (
+                "identity-empty-scalar",
+                identity_empty_scalar,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "identity-whitespace-scalar",
+                identity_whitespace_scalar,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "identity-control-scalar",
+                identity_control_scalar,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "property-empty-scalar",
+                property_empty_scalar,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "derivation-configuration",
+                derivation_configuration_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "top-frozen-name",
+                top_frozen_name_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "derivation-frozen-name",
+                derivation_frozen_name_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "both-frozen-name",
+                both_frozen_name_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
                 "source-selection-inventory",
                 source_selection_inventory_drift,
                 "receipt-bound discovery evidence is invalid",
@@ -661,12 +1132,52 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                 source_selection_handoff_drift,
                 "receipt-bound discovery evidence is invalid",
             ),
+            (
+                "source-selection-main-assembly",
+                source_selection_main_assembly_drift,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "source-selection-unknown-key",
+                source_selection_unknown_key,
+                "receipt-bound discovery evidence is invalid",
+            ),
             ("sources-list", sources_list, "legacy identity resolution is invalid"),
             ("unknown-source-key", unknown_source_key, "legacy identity resolution is invalid"),
             (
                 "source-value-mismatch",
                 source_value_mismatch,
                 "legacy identity resolution is invalid",
+            ),
+            (
+                "cad-hardware-without-authored",
+                cad_hardware_without_authored,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "platform-hardware-with-authored",
+                platform_hardware_with_authored,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "cad-summary-without-authored",
+                cad_summary_without_authored,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "submission-summary-with-authored",
+                submission_summary_with_authored,
+                "legacy identity resolution is invalid",
+            ),
+            (
+                "platform-hardware-without-request-binding",
+                platform_hardware_without_request_binding,
+                "receipt-bound discovery evidence is invalid",
+            ),
+            (
+                "submission-summary-without-request-binding",
+                submission_summary_without_request_binding,
+                "receipt-bound discovery evidence is invalid",
             ),
             (
                 "invalid-source-origin",
@@ -696,6 +1207,125 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
                     with self.assertRaisesRegex(recovery.RecoveryError, message):
                         self.verify(tree, receipt)
 
+    def test_legacy_discovery_summary_uses_multiline_authored_text_rules(self) -> None:
+        from description_pipeline.io import canonical
+
+        def rewrite_summary(root: Path, value: str) -> tuple[Path, dict]:
+            tree, receipt, view = self.legacy_discovery_fixture(root)
+            discovery = json.loads((tree / "evidence/discovery.json").read_text())
+            identity = json.loads(
+                (tree / "discovery/identity-resolution.json").read_text()
+            )
+            discovery["raw"]["identity"]["change_summary"] = value
+            discovery["identity"]["change_summary"] = value
+            identity["sources"]["change_summary"] = "cad"
+            write(tree / "evidence/discovery.json", canonical(discovery))
+            source_path = tree / "input/source.json"
+            source = json.loads(source_path.read_text())
+            source["metadata"]["change_summary"] = value
+            source["metadata"]["change_summary_source"] = "cad"
+            write(source_path, canonical(source))
+            handoff_path = tree / "input/handoff.json"
+            handoff = json.loads(handoff_path.read_text())
+            handoff["cad_revision"]["change_summary"] = value
+            handoff["package_files"]["source.json"] = hashlib.sha256(
+                source_path.read_bytes()
+            ).hexdigest()
+            write(handoff_path, canonical(handoff))
+            plan_path = tree / "evidence/capture-plan.json"
+            plan = json.loads(plan_path.read_text())
+            plan["discovery_sha256"] = hashlib.sha256(
+                (tree / "evidence/discovery.json").read_bytes()
+            ).hexdigest()
+            write(plan_path, canonical(plan))
+            write(
+                tree / "discovery/identity-resolution.json",
+                canonical(identity),
+            )
+            updated, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            return tree, updated
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt = rewrite_summary(base / "lf", "first line\nsecond line")
+            self.verify(tree, receipt)
+
+            tree, receipt = rewrite_summary(base / "control", "first line\tsecond line")
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "receipt-bound discovery evidence is invalid",
+            ):
+                self.verify(tree, receipt)
+
+    def test_legacy_technical_robot_name_uses_historical_hardware_rule(self) -> None:
+        from description_pipeline.io import canonical
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, _view = self.legacy_discovery_fixture(
+                base / "real",
+                main_assembly="M3.0.3_20261016.SLDASM",
+                robot_name_technical="m3_0",
+            )
+            self.verify(tree, receipt)
+
+            tree, receipt, _view = self.legacy_discovery_fixture(
+                base / "constructed",
+                main_assembly="Dex Hand.SLDASM",
+                robot_name_technical="m3_0",
+            )
+            self.verify(tree, receipt)
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "authored")
+            discovery = json.loads((tree / "evidence/discovery.json").read_text())
+            discovery["raw"]["identity"]["robot_name"] = "authored_robot"
+            discovery["identity"]["robot_name"] = "authored_robot"
+            discovery["identity"]["robot_name_technical"] = None
+            write(tree / "evidence/discovery.json", canonical(discovery))
+            plan_path = tree / "evidence/capture-plan.json"
+            plan = json.loads(plan_path.read_text())
+            plan["discovery_sha256"] = hashlib.sha256(
+                (tree / "evidence/discovery.json").read_bytes()
+            ).hexdigest()
+            write(plan_path, canonical(plan))
+            receipt, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            self.verify(tree, receipt)
+
+            tree, receipt, _view = self.legacy_discovery_fixture(
+                base / "main-derived",
+                main_assembly="M3.0.3_20261016.SLDASM",
+                robot_name_technical="m3_0_3_20261016",
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "receipt-bound discovery evidence is invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "authored-technical")
+            discovery = json.loads((tree / "evidence/discovery.json").read_text())
+            discovery["raw"]["identity"]["robot_name"] = "authored_robot"
+            discovery["identity"]["robot_name"] = "authored_robot"
+            write(tree / "evidence/discovery.json", canonical(discovery))
+            receipt, _view = self.rewrite_legacy_bindings(tree, receipt, view)
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "receipt-bound discovery evidence is invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt, _view = self.legacy_discovery_fixture(
+                base / "fallback",
+                main_assembly="---.SLDASM",
+                hardware_id=None,
+                robot_name_technical="m3_0",
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "receipt-bound discovery evidence is invalid",
+            ):
+                self.verify(tree, receipt)
+
     def test_legacy_discovery_files_require_canonical_json_bytes(self) -> None:
         def noncanonical(document: dict) -> bytes:
             return json.dumps(document, ensure_ascii=False, indent=2).encode()
@@ -704,6 +1334,11 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             base = Path(directory)
             cases = (
                 ("discovery", "evidence/discovery.json", "not canonical JSON"),
+                ("capture-plan", "evidence/capture-plan.json", "capture plan is not canonical JSON"),
+                ("handoff", "input/handoff.json", "frozen handoff is not canonical JSON"),
+                ("request", "input/request.json", "frozen request is not canonical JSON"),
+                ("source", "input/source.json", "source identity is not canonical JSON"),
+                ("native-tool", "reports/native-tool.json", "native tool is not canonical JSON"),
                 (
                     "identity",
                     "discovery/identity-resolution.json",
@@ -747,8 +1382,535 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             changed_view["stages"][1]["output_qc"][1]["details"]["files"][
                 "input/base.SLDPRT"
             ] = "f" * 64
-            with self.assertRaisesRegex(recovery.RecoveryError, "input/cad inventory"):
+            with self.assertRaisesRegex(recovery.RecoveryError, "inventory is not exact"):
                 self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "ghost-extra")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][4]["inputs"][0]["files"]["input/ghost.SLDPRT"] = "f" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "inventory is not an exact"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "ghost-publish")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][5]["inputs"][0]["files"]["input/ghost.SLDPRT"] = "f" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "inventory is not an exact"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "ghost-discover")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][1]["output_qc"][1]["details"]["files"][
+                "input/ghost.SLDPRT"
+            ] = "f" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "inventory is not exact"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "ghost-freeze-input")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][0]["inputs"] = [
+                {
+                    "path": "handoff/",
+                    "files": {"handoff/ghost.SLDASM": "f" * 64},
+                    "availability": "recorded",
+                }
+            ]
+            with self.assertRaisesRegex(recovery.RecoveryError, "authority"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "traversal-capture-output")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][2]["outputs"][0].update(
+                files={"evidence/geometry/../ghost.stl": "f" * 64},
+                availability="recorded",
+            )
+            with self.assertRaisesRegex(recovery.RecoveryError, "not confined"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "forged-discover-output")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][1]["outputs"][0].update(
+                files={"evidence/discovery.json": "f" * 64},
+                availability="recorded",
+            )
+            with self.assertRaisesRegex(recovery.RecoveryError, "hash differs from its authority"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            from description_pipeline.stages import CONTRACT as STAGE_CONTRACT
+
+            capture_input_qc = [
+                {
+                    "id": check["id"],
+                    "state": "passed",
+                    "details": {"passed": True},
+                }
+                for check in next(
+                    stage for stage in STAGE_CONTRACT["stages"] if stage["id"] == "capture"
+                )["input_qc"]
+            ]
+            tree, receipt, view = self.legacy_discovery_fixture(base / "ghost-qc")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][2]["input_qc"] = copy.deepcopy(capture_input_qc)
+            changed_view["stages"][2]["input_qc"][0]["details"]["files"] = {
+                "input/ghost.SLDPRT": "f" * 64
+            }
+            with self.assertRaisesRegex(recovery.RecoveryError, "capture input inventory is not exact"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "forged-qc")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][2]["input_qc"] = copy.deepcopy(capture_input_qc)
+            changed_view["stages"][2]["input_qc"][0]["details"]["files"] = {
+                "input/cad/base.SLDPRT": "f" * 64,
+                "input/source.json": hashlib.sha256(
+                    (tree / "input/source.json").read_bytes()
+                ).hexdigest(),
+            }
+            with self.assertRaisesRegex(recovery.RecoveryError, "capture input inventory is not exact"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "ghost-single-output")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][2]["outputs"][0].update(
+                files={"evidence/capture.json": "f" * 64},
+                availability="recorded",
+            )
+            with self.assertRaisesRegex(recovery.RecoveryError, "hash differs from its authority"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "repeated-wrong-hash")
+            changed_view = copy.deepcopy(view)
+            wrong_capture_hash = "f" * 64
+            changed_view["stages"][2]["outputs"][0].update(
+                files={"evidence/capture.json": wrong_capture_hash},
+                availability="recorded",
+            )
+            changed_view["stages"][3]["inputs"][0].update(
+                files={"evidence/capture.json": wrong_capture_hash},
+                availability="recorded",
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "capture.outputs\\[0\\]:evidence/capture.json",
+            ):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+            tree, receipt, view = self.legacy_discovery_fixture(base / "ghost-capture-output")
+            changed_view = copy.deepcopy(view)
+            changed_view["stages"][2]["outputs"][1].update(
+                files={"evidence/geometry/ghost.stl": "f" * 64},
+                availability="recorded",
+            )
+            with self.assertRaisesRegex(recovery.RecoveryError, "authority"):
+                self.verify(tree, self.rewrite_native_stages(tree, receipt, changed_view))
+
+    def test_legacy_capture_plan_binds_selectors_groups_axes_and_datums(self) -> None:
+        from description_pipeline.io import canonical
+
+        def fixture(name: str) -> tuple[Path, dict, dict]:
+            tree, receipt, view = self.legacy_discovery_fixture(base / name)
+            discovery_path = tree / "evidence/discovery.json"
+            discovery = json.loads(discovery_path.read_text())
+            raw = discovery["raw"]
+            raw["components"] = [
+                {
+                    "instance_id": "base-1",
+                    "name2": "base-1",
+                    "document": "base.SLDPRT",
+                    "configuration": "Default",
+                    "suppressed": False,
+                    "suppression_state": 2,
+                    "fixed": True,
+                },
+                {
+                    "instance_id": "base-2",
+                    "name2": "base-2",
+                    "document": "base.SLDPRT",
+                    "configuration": "Default",
+                    "suppressed": False,
+                    "suppression_state": 2,
+                    "fixed": False,
+                },
+            ]
+            selector = {
+                "component": "",
+                "feature_name": "a_joint",
+                "kind": "reference_axis",
+            }
+            raw["reference_axes"] = [
+                {
+                    "kind": "reference_axis",
+                    "selector": selector,
+                }
+            ]
+            raw["datums"] = [
+                {
+                    "name": "c_base",
+                    "owner": "",
+                    "configuration": "Default",
+                }
+            ]
+            write(discovery_path, canonical(discovery))
+
+            plan_path = tree / "evidence/capture-plan.json"
+            plan = json.loads(plan_path.read_text())
+            plan["discovery_sha256"] = hashlib.sha256(
+                discovery_path.read_bytes()
+            ).hexdigest()
+            plan["objects"] = [
+                {"name": "base-1", "document": "base.SLDPRT", "state": 2},
+                {"name": "base-2", "document": "base.SLDPRT", "state": 2},
+            ]
+            plan["groups"] = [
+                {
+                    "name": "base_link",
+                    "components": ["base-1", "base-2"],
+                }
+            ]
+            plan["axis_requests"] = [
+                {"name": "joint", "axis_reference": selector}
+            ]
+            plan["datums"] = ["c_base"]
+            write(plan_path, canonical(plan))
+            receipt, view = self.rewrite_legacy_bindings(tree, receipt, view)
+            return tree, receipt, view
+
+        def rewritten_plan(
+            name: str,
+            mutate,
+        ) -> tuple[Path, dict]:
+            tree, receipt, view = fixture(name)
+            plan_path = tree / "evidence/capture-plan.json"
+            plan = json.loads(plan_path.read_text())
+            mutate(plan)
+            write(plan_path, canonical(plan))
+            receipt, _view = self.rewrite_legacy_bindings(
+                tree,
+                receipt,
+                view,
+            )
+            return tree, receipt
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, _view = fixture("complete")
+            self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "forged-document",
+                lambda plan: plan["objects"][0].update(
+                    document="forged-selector.SLDPRT"
+                ),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "empty-groups",
+                lambda plan: plan.update(groups=[]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "partial-groups",
+                lambda plan: plan["groups"][0].update(components=["base-1"]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "empty-axes",
+                lambda plan: plan.update(axis_requests=[]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "forged-axis",
+                lambda plan: plan["axis_requests"][0].update(
+                    axis_reference={
+                        "component": "",
+                        "feature_name": "forged-axis",
+                        "kind": "reference_axis",
+                    }
+                ),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "empty-datums",
+                lambda plan: plan.update(datums=[]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+            tree, receipt = rewritten_plan(
+                "forged-datum",
+                lambda plan: plan.update(datums=["c_forged"]),
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryError,
+                "legacy recovery artifacts are invalid",
+            ):
+                self.verify(tree, receipt)
+
+    def test_legacy_recovery_binds_request_reader_and_native_observations(self) -> None:
+        from description_pipeline.io import canonical
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            def mutate_document(case_index: int, relative: str, mutate) -> object:
+                tree, receipt, view = self.legacy_discovery_fixture(
+                    base / f"case-{case_index}"
+                )
+                document = json.loads((tree / relative).read_text())
+                mutate(document)
+                write(tree / relative, canonical(document))
+                if relative == "input/source.json":
+                    handoff_path = tree / "input/handoff.json"
+                    handoff = json.loads(handoff_path.read_text())
+                    handoff["package_files"]["source.json"] = hashlib.sha256(
+                        (tree / relative).read_bytes()
+                    ).hexdigest()
+                    write(handoff_path, canonical(handoff))
+                receipt, view = self.rewrite_legacy_bindings(tree, receipt, view)
+                return tree, receipt
+
+            cases = (
+                (
+                    "request-target",
+                    "input/request.json",
+                    lambda document: document.update(target_hardware="forged"),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "request-summary",
+                    "input/request.json",
+                    lambda document: document.update(change_summary="forged"),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "request-upload",
+                    "input/request.json",
+                    lambda document: document.update(handoff_digest="f" * 64),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "native-reader",
+                    "reports/native-tool.json",
+                    lambda document: document.update(source_sha256="f" * 64),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "native-linux-host",
+                    "reports/native-tool.json",
+                    lambda document: document["runtime"].update(system="Linux"),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "native-python",
+                    "reports/native-tool.json",
+                    lambda document: document["runtime"].update(python="2.7"),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "native-packages",
+                    "reports/native-tool.json",
+                    lambda document: document["runtime"].update(packages={"bogus": "0"}),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "source-handoff",
+                    "input/source.json",
+                    lambda document: document["identity"].update(handoff_digest="f" * 64),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "source-main",
+                    "input/source.json",
+                    lambda document: document["identity"].update(main_assembly="forged.SLDASM"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "source-metadata",
+                    "input/source.json",
+                    lambda document: document["metadata"].update(revision="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "source-hardware-origin",
+                    "input/source.json",
+                    lambda document: document["selection"].update(hardware_source="cad"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-inventory",
+                    "input/handoff.json",
+                    lambda document: document["input_receipt"]["inventory"].pop("base.SLDPRT"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-package",
+                    "input/handoff.json",
+                    lambda document: document["package_files"].update({"cad/base.SLDPRT": "f" * 64}),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-main",
+                    "input/handoff.json",
+                    lambda document: document.update(main_assembly="forged.SLDASM"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-hardware",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(hardware_id="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-owner",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(owner="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-id",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(revision="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-control",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(control={"forged": True}),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-revision-summary",
+                    "input/handoff.json",
+                    lambda document: document["cad_revision"].update(change_summary="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-warnings",
+                    "input/handoff.json",
+                    lambda document: document.update(
+                        warnings=[
+                            {
+                                "code": "forged",
+                                "message": "forged",
+                                "detail": None,
+                            }
+                        ]
+                    ),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-resolved",
+                    "input/handoff.json",
+                    lambda document: document.update(resolved={}),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-input-unknown",
+                    "input/handoff.json",
+                    lambda document: document["input"].update(forged="value"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-input-source-unknown",
+                    "input/handoff.json",
+                    lambda document: document["input"]["source"].update(forged="value"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "handoff-unknown",
+                    "input/handoff.json",
+                    lambda document: document.update(forged=True),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "plan-run",
+                    "evidence/capture-plan.json",
+                    lambda document: document.update(run_id="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "plan-discovery",
+                    "evidence/capture-plan.json",
+                    lambda document: document.update(discovery_sha256="f" * 64),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "plan-main",
+                    "evidence/capture-plan.json",
+                    lambda document: document.update(main_assembly="forged.SLDASM"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "plan-selection-ghost",
+                    "evidence/capture-plan.json",
+                    lambda document: document["selection"]["files"].update(
+                        {"ghost.SLDPRT": "f" * 64}
+                    ),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "plan-identity",
+                    "evidence/capture-plan.json",
+                    lambda document: document["identity"].update(hardware_id="forged"),
+                    "legacy recovery artifacts are invalid",
+                ),
+                (
+                    "empty-document-state",
+                    "evidence/discovery.json",
+                    lambda document: document["raw"].update(
+                        document_state={"before": {}, "after": {}, "used_api": "fixture"}
+                    ),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "invalid-cad-scalar",
+                    "evidence/discovery.json",
+                    lambda document: document["raw"]["properties"]["document"].update(
+                        **{"dp.hardware_id": 123}
+                    ),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+                (
+                    "robot-technical-name",
+                    "evidence/discovery.json",
+                    lambda document: document["identity"].update(
+                        robot_name_technical="forged"
+                    ),
+                    "receipt-bound discovery evidence is invalid",
+                ),
+            )
+            for case_index, (name, relative, mutate, message) in enumerate(cases, 1):
+                with self.subTest(name=name):
+                    tree, receipt = mutate_document(case_index, relative, mutate)
+                    with self.assertRaisesRegex(recovery.RecoveryError, message):
+                        self.verify(tree, receipt)
 
     def test_discover_input_records_empty_directory_is_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
