@@ -40,7 +40,6 @@ SCHEMA_LITERAL_FIXTURES = {
     "tests/v1/test_quality.py",
     "tests/v1/test_stage_transfer.py",
     "tests/v1/test_structural_report.py",
-    "tests/v1/test_workflow.py",
 }
 
 

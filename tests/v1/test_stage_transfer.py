@@ -23,8 +23,11 @@ from description_pipeline.io import PipelineError, canonical, digest, file_diges
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
-from description_pipeline import steps, native_transfer
+from description_pipeline import native_transfer
 from description_pipeline.interface_records import record_archive_path
+from description_pipeline.sources.solidworks.capture_transaction import (
+    _archive_input,
+)
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.stages import stage_view as rendered_stage_view
 
@@ -1578,7 +1581,7 @@ class StageTransferTests(unittest.TestCase):
         (staging / "input/records").mkdir(parents=True)
         (staging / "input/records/record.txt").write_text("existing\n", encoding="utf-8")
         with self.assertRaisesRegex(PipelineError, "overwrite"):
-            steps._archive_input(package, staging)
+            _archive_input(package, staging)
 
     def test_input_valid_details_are_recomputed_from_archived_bytes(self) -> None:
         root = capture_root(self.base / "input-details")

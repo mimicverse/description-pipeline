@@ -3283,7 +3283,9 @@ class DerivationSplitTests(unittest.TestCase):
         )
 
     def test_derived_embedded_virtual_plan_is_consumed_by_the_capture_boundary(self) -> None:
-        from description_pipeline import steps
+        from description_pipeline.sources.solidworks.capture_package import (
+            consume_sealed_definition,
+        )
 
         source, records = self._scene()
         payload = record()
@@ -3351,7 +3353,7 @@ class DerivationSplitTests(unittest.TestCase):
         selector = next(item for item in plan["objects"] if item["name"] == "arm-1")
         self.assertNotIn("document", selector)
         self.assertIn("arm-1", next(item for item in plan["groups"] if item["name"] == "arm_link")["components"])
-        _source, consumed = steps._consume_sealed_definition(output)
+        _source, consumed = consume_sealed_definition(output)
         self.assertEqual(consumed, plan)
 
     def test_derivation_refuses_a_selected_main_outside_the_record(self) -> None:

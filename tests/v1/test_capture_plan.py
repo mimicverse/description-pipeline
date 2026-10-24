@@ -8,14 +8,25 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from description_pipeline import steps
 from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA
 from description_pipeline.sources.solidworks import discovery
+from description_pipeline.sources.solidworks.capture_package import (
+    consume_sealed_definition,
+)
+from description_pipeline.sources.solidworks.capture_transaction import (
+    _require_plan_against_capture,
+)
 from tests.sources.selection_support import sealed_selection
 
 MAIN = "cad/robot.SLDASM"
+
+steps = SimpleNamespace(
+    _consume_sealed_definition=consume_sealed_definition,
+    _require_plan_against_capture=_require_plan_against_capture,
+)
 
 
 def build_package(root: Path) -> Path:

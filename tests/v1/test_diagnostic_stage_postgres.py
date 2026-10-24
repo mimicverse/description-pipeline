@@ -18,6 +18,7 @@ except ImportError:
 from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline.io import digest
 from description_pipeline.pipeline.admission import VerifiedPredecessor
+from description_pipeline.pipeline.application import StageApplication
 from description_pipeline.pipeline.contracts import StageCommand, StageExecution, StageFailure
 from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
 from description_pipeline.pipeline.effects import EffectState
@@ -159,12 +160,12 @@ class DiagnosticStagePostgresTests(unittest.TestCase):
             cursor.execute(statement, parameters)
             return cursor.fetchall()
 
-    def _spec(self, suffix: str, *, input_artifact=None):
+    def _spec(self, suffix: str, *, input_artifact=None, target_stage="generate"):
         return DiagnosticAdmissionSpec(
             schema_version=DIAGNOSTIC_ADMISSION_SCHEMA,
             run_id=f"diagnostic-{suffix}",
             request_id=f"diagnostic-request-{suffix}",
-            target_stage="generate",
+            target_stage=target_stage,
             request={"schema_version": "diagnostic-fixture/v1", "operation": "read-input"},
             input_artifacts=(input_artifact or self.imported,),
             expected_executor_sha256=self.executor,
@@ -173,6 +174,68 @@ class DiagnosticStagePostgresTests(unittest.TestCase):
             policy_sha256=digest({"policy": 1}),
             created_at=self.now,
         )
+
+    def test_all_six_diagnostic_targets_execute_only_the_target_stage(self) -> None:
+        handlers = {
+            stage: _DiagnosticSuccessHandler()
+            for stage in (
+                "freeze",
+                "discover",
+                "capture",
+                "generate",
+                "verify",
+                "publish",
+            )
+        }
+        services = self._services(
+            build_diagnostic_command(self._spec("target-route"))
+        )
+        application = StageApplication(
+            services=services,
+            facts=self.facts,
+            artifacts=self.artifacts,
+            handlers=handlers,
+            builders={},
+            clock=lambda: self.now,
+        )
+
+        for stage, target in handlers.items():
+            with self.subTest(stage=stage):
+                spec = self._spec(
+                    f"target-{stage}",
+                    target_stage=stage,
+                )
+                command = build_diagnostic_command(spec)
+                self.facts.admit_diagnostic(spec, command)
+                for handler in handlers.values():
+                    handler.calls = 0
+                result = application.execute_registered_command(
+                    command.command_id
+                )
+                self.assertEqual(result.outcome, "completed")
+                self.assertEqual(
+                    result.diagnostic_scope,
+                    command.diagnostic_scope,
+                )
+                self.assertEqual(target.calls, 1)
+                self.assertEqual(
+                    {
+                        name: handler.calls
+                        for name, handler in handlers.items()
+                        if name != stage
+                    },
+                    dict.fromkeys(
+                        (name for name in handlers if name != stage),
+                        0,
+                    ),
+                )
+                self.assertEqual(
+                    self._query(
+                        "SELECT stage FROM command WHERE run_id = %s",
+                        (spec.run_id,),
+                    ),
+                    [(stage,)],
+                )
 
     def _services(self, command: StageCommand) -> CanonicalStageServices:
         return CanonicalStageServices(

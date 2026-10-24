@@ -118,7 +118,11 @@ class PortalSplitTests(unittest.TestCase):
 
     def test_native_complete_is_a_live_boundary_for_retry_and_delete(self) -> None:
         """The native boundary must stay retryable, deletable and visibly in progress."""
-        job = {"status": "native_complete", "result": {"native_complete": True}}
+        job = {
+            "status": "native_complete",
+            "native_status": "satisfied",
+            "result": {"native_complete": True},
+        }
         self.windows.job = job
         tasks = [
             {"task_id": "freeze", "state": "success"},

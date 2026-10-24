@@ -1103,7 +1103,15 @@ def _automatic_summary(job: dict | None) -> dict:
 
 
 _NATIVE_JOB_STATUSES = frozenset(
-    {"queued", "running", "passed", "native_complete", "failed"}
+    {
+        "accepted",
+        "awaiting_input",
+        "running",
+        "satisfied",
+        "failed",
+        "cancelled",
+        "unknown",
+    }
 )
 _RETRY_REFUSED_MESSAGES = {
     RECOVERY_UNKNOWN_PUBLICATION: (

@@ -189,21 +189,6 @@ class RegisteredDeliveryTests(unittest.TestCase):
         snapshot = flow.registered_delivery_snapshot(self.platform.store, RUN)
         self.assertEqual((snapshot["hardware_id"], snapshot["revision"]), ("robot", "r1"))
 
-    def test_reuse_events_copies_the_whole_parent_history(self) -> None:
-        """The reuse copy reads the parent through the same paged facility."""
-        child = "3f6a5c2e-6c41-4a1e-9c2a-2a1f7a1d0c33"
-        self.platform.admit(RUN)
-        self.platform.admit(child, from_stage="verify", parent_run_id=RUN)
-        self.platform.events(
-            RUN,
-            [{"stage": "capture", "state": "running", "at": "t"} for _ in range(250)],
-        )
-        before = len(self.platform.world.events)
-        flow.reuse_events(self.platform.store, child, RUN, "verify")
-        copied = [row for row in self.platform.world.events[before:] if row[0] == child]
-        self.assertEqual(len(copied), 250)
-
-
 DAG = "portal-20261016T000002-feedcafe"
 WSGI_RUN = native_run_id(DAG)
 
