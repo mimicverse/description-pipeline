@@ -237,13 +237,24 @@ class ApplicationOutcome:
 
 @dataclass(frozen=True, slots=True)
 class AdmissionOutcome:
-    """The atomically registered Freeze and technical Airflow commands."""
+    """The atomically registered run and its Freeze/dispatch commands."""
 
+    admission: RunAdmission
     freeze_command: StageCommand
     dispatch_command: DispatchCommand
 
     def to_record(self) -> dict[str, Any]:
         return {
+            "admission": {
+                "created_at": self.admission.created_at.isoformat(),
+                "from_stage": self.admission.from_stage,
+                "parent_run_id": self.admission.parent_run_id,
+                "request": _plain(self.admission.request),
+                "request_digest": self.admission.request_digest,
+                "request_id": self.admission.request_id,
+                "run_id": self.admission.run_id,
+                "schema_version": self.admission.schema_version,
+            },
             "dispatch_command": self.dispatch_command.to_record(),
             "freeze_command": self.freeze_command.to_record(),
         }
@@ -442,7 +453,11 @@ class StageApplication:
                 "application.admission_conflict",
                 "Stored admission commands differ from their deterministic projection",
             )
-        return AdmissionOutcome(freeze_command=stored_command, dispatch_command=stored_dispatch)
+        return AdmissionOutcome(
+            admission=admission,
+            freeze_command=stored_command,
+            dispatch_command=stored_dispatch,
+        )
 
     def _load_spec(self, run_id: str) -> tuple[AdmissionSpec, RunAdmission]:
         admission = self.facts.load_admission(run_id)

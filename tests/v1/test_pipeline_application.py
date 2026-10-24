@@ -16,6 +16,7 @@ from unittest.mock import patch
 from description_pipeline import cli
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import PipelineError, digest, write_json
+from description_pipeline.pipeline.admission import build_run_admission
 from description_pipeline.pipeline.application import (
     STAGES,
     ApplicationError,
@@ -340,9 +341,23 @@ class StageApplicationTests(unittest.TestCase):
 
     def test_admit_then_run_stage_uses_one_admission_and_real_engine(self):
         admitted = self.application.admit(self.harness.spec)
+        self.assertEqual(admitted.admission, build_run_admission(self.harness.spec))
         self.assertEqual(admitted.dispatch_command.freeze_command_id, admitted.freeze_command.command_id)
         self.assertEqual(admitted.dispatch_command.dag_id, "solidworks_to_urdf")
         self.assertEqual(admitted.dispatch_command.dag_run_id, self.harness.spec.request_id)
+        self.assertEqual(
+            admitted.to_record()["admission"],
+            {
+                "created_at": self.harness.spec.created_at.isoformat(),
+                "from_stage": self.harness.spec.from_stage,
+                "parent_run_id": self.harness.spec.parent_run_id,
+                "request": self.harness.spec.to_record(),
+                "request_digest": admitted.admission.request_digest,
+                "request_id": self.harness.spec.request_id,
+                "run_id": self.harness.spec.run_id,
+                "schema_version": "description-pipeline.run-admission/v1",
+            },
+        )
         self.assertEqual(
             self.harness.store.read_dispatch_conf(admitted.dispatch_command.conf_artifact).freeze_command_id,
             admitted.freeze_command.command_id,
@@ -491,6 +506,7 @@ class StageApplicationTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(code, 0)
         self.assertEqual(payload["outcome"], "admitted")
+        self.assertEqual(payload["admission"]["run_id"], self.harness.spec.run_id)
         self.assertIn("freeze_command", payload)
         self.assertIn("dispatch_command", payload)
         self.assertEqual(
