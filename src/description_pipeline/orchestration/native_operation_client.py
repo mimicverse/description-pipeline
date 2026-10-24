@@ -1576,13 +1576,19 @@ class NativeOperationCapturePort:
         upload_sha256: str,
         main_assembly: str,
         upstream_artifacts: tuple[Mapping[str, object], ...],
-        execution: Mapping[str, object],
         native_tool: Mapping[str, object],
+        sealed_dispatch=None,
     ) -> RemoteNativeCaptureResult:
         if backend is not None:
             raise NativeOperationProtocolError(
                 "The remote Capture adapter does not accept a Linux CAD backend"
             )
+        if sealed_dispatch is None:
+            raise NativeOperationProtocolError(
+                "The remote Capture adapter requires one sealed dispatch"
+            )
+        execution = dict(sealed_dispatch.execution)
+        archive = Path(sealed_dispatch.input_archive)
         request, current_tool = self._request_record(
             inputs,
             native_tool,
@@ -1603,6 +1609,22 @@ class NativeOperationCapturePort:
             command_id=request.command_id,
             effect_key=request.effect_key,
         )
+        sealed_operation = dict(sealed_dispatch.operation)
+        if (
+            sealed_dispatch.outbound["operation_id"] != operation_id
+            or sealed_dispatch.outbound["payload_sha256"]
+            != sealed_operation["payload_sha256"]
+            or sealed_dispatch.outbound["input_archive_sha256"]
+            != sealed_operation["input"]["archive_sha256"]
+            or sealed_dispatch.outbound["input_archive_bytes"]
+            != sealed_operation["input"]["archive_bytes"]
+            or sealed_operation["request"] != request.to_record()
+        ):
+            raise NativeOperationClientConflict(
+                "The sealed Capture dispatch differs from its canonical request",
+                status=409,
+                code="native_operation_conflict",
+            )
         view = observe_native_operation(self.client, operation_id)
         request_sha256 = digest(request.to_record())
         full_tool_sha256 = digest(current_tool)
@@ -1616,22 +1638,21 @@ class NativeOperationCapturePort:
                 status=409,
                 code="native_operation_conflict",
             )
-        archive = output.parent / f"{operation_id}-prepared.zip"
+        if not archive.is_file() or archive.is_symlink():
+            raise NativeOperationProtocolError(
+                "The sealed Capture input archive is missing"
+            )
+        if (
+            file_digest(archive)
+            != sealed_dispatch.outbound["input_archive_sha256"]
+            or archive.stat().st_size
+            != sealed_dispatch.outbound["input_archive_bytes"]
+        ):
+            raise NativeOperationProtocolError(
+                "The sealed Capture input archive changed"
+            )
         if view is None or view.state == "accepted":
-            archive.parent.mkdir(parents=True, exist_ok=True)
             expected_archive = None if view is None else view.input_archive_sha256
-            if not (
-                expected_archive is not None
-                and archive.is_file()
-                and not archive.is_symlink()
-                and file_digest(archive) == expected_archive
-            ):
-                archive.unlink(missing_ok=True)
-                archive = seal_source_archive(
-                    inputs.package,
-                    inputs.prepared_files,
-                    archive,
-                )
             if (
                 expected_archive is not None
                 and file_digest(archive) != expected_archive
@@ -1641,16 +1662,7 @@ class NativeOperationCapturePort:
                     status=409,
                     code="native_operation_conflict",
                 )
-            envelope = build_operation_record(
-                operation_id=operation_id,
-                kind=CAPTURE_KIND,
-                request=request.to_record(),
-                input_archive_sha256=file_digest(archive),
-                input_archive_bytes=archive.stat().st_size,
-                native_tool_requirement_sha256=full_tool_sha256,
-                output_contract=CAPTURE_TRANSFER_SCHEMA,
-            )
-            view = self.client.create_operation(envelope)
+            view = self.client.create_operation(sealed_operation)
         if view.state == "accepted":
             view = self.client.upload_input(operation_id, archive)
         if view.state not in _TERMINAL_STATES:

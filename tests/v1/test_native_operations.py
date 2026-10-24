@@ -38,6 +38,7 @@ from description_pipeline.orchestration.discover_protocol import seal_source_arc
 from description_pipeline.orchestration.native_operation_runtime import (
     CAPTURE_KIND,
     CAPTURE_OPERATION_SCHEMA,
+    CaptureOperationRequest,
     CaptureOperationExecutor,
     DISCOVER_KIND,
     DiscoverOperationExecutor,
@@ -47,6 +48,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     NativeOperationRuntime,
     build_operation_record,
 )
+from description_pipeline.pipeline.capture import CaptureEffectDispatch
 from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.pipeline.reconciliation import EffectReconciliationEvidence
 from description_pipeline.request_evidence import build_request_evidence
@@ -628,6 +630,66 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             timeout=5,
             poll_interval=0.01,
         )
+        input_archive = seal_source_archive(
+            package,
+            prepared_files,
+            self.root / "capture-adapter-input.zip",
+        )
+        request_digest = digest({"request": run_id})
+        handoff_sha256 = "b" * 64
+        upload_sha256 = "c" * 64
+        main_assembly = "cad/robot.SLDASM"
+        native_request = CaptureOperationRequest.from_record(
+            {
+                "schema_version": CAPTURE_OPERATION_SCHEMA,
+                "command_id": command_id,
+                "run_id": run_id,
+                "request_digest": request_digest,
+                "effect_key": effect_key,
+                "handoff_sha256": handoff_sha256,
+                "upload_sha256": upload_sha256,
+                "prepared_sha256": digest(prepared_files),
+                "main_assembly": main_assembly,
+                "package_files": prepared_files,
+                "upstream_artifacts": [
+                    freeze.to_record(),
+                    discover.to_record(),
+                ],
+                "execution": execution,
+                "native_tool_source_sha256": NATIVE_TOOL[
+                    "source_sha256"
+                ],
+                "request_evidence": REQUEST_EVIDENCE,
+            }
+        )
+        operation = build_operation_record(
+            operation_id=operation_id,
+            kind=CAPTURE_KIND,
+            request=native_request.to_record(),
+            input_archive_sha256=file_digest(input_archive),
+            input_archive_bytes=input_archive.stat().st_size,
+            native_tool_requirement_sha256=digest(NATIVE_TOOL),
+            output_contract=CAPTURE_TRANSFER_SCHEMA,
+        )
+        dispatch = CaptureEffectDispatch(
+            effect_id="effect-capture-adapter",
+            settlement=None,
+            outbound_root=self.root,
+            outbound={
+                "operation_id": operation_id,
+                "payload_sha256": operation["payload_sha256"],
+                "input_archive_sha256": operation["input"][
+                    "archive_sha256"
+                ],
+                "input_archive_bytes": operation["input"][
+                    "archive_bytes"
+                ],
+                "execution": execution,
+            },
+            operation=operation,
+            input_archive=input_archive,
+            execution=execution,
+        )
         self.assertIsNone(
             port.observe(
                 run_id=run_id,
@@ -649,12 +711,12 @@ class NativeOperationRuntimeTests(unittest.TestCase):
                 backend=None,
                 run_id=run_id,
                 request_digest=digest({"request": run_id}),
-                handoff_sha256="b" * 64,
-                upload_sha256="c" * 64,
-                main_assembly="cad/robot.SLDASM",
+                handoff_sha256=handoff_sha256,
+                upload_sha256=upload_sha256,
+                main_assembly=main_assembly,
                 upstream_artifacts=(freeze.to_record(), discover.to_record()),
-                execution=execution,
                 native_tool=NATIVE_TOOL,
+                sealed_dispatch=dispatch,
             )
             second = port(
                 inputs,
@@ -662,12 +724,12 @@ class NativeOperationRuntimeTests(unittest.TestCase):
                 backend=None,
                 run_id=run_id,
                 request_digest=digest({"request": run_id}),
-                handoff_sha256="b" * 64,
-                upload_sha256="c" * 64,
-                main_assembly="cad/robot.SLDASM",
+                handoff_sha256=handoff_sha256,
+                upload_sha256=upload_sha256,
+                main_assembly=main_assembly,
                 upstream_artifacts=(freeze.to_record(), discover.to_record()),
-                execution=execution,
                 native_tool=NATIVE_TOOL,
+                sealed_dispatch=dispatch,
             )
         self.assertEqual(first.outcome, "completed")
         self.assertEqual(second.outcome, "completed")

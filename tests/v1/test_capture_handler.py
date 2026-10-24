@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import shutil
 import tempfile
@@ -12,8 +13,10 @@ import zipfile
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from email.message import Message
 from pathlib import Path
 from unittest.mock import Mock, patch
+from urllib import error as urlerror
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import canonical, digest, file_digest, read_data
@@ -49,6 +52,7 @@ from description_pipeline.pipeline.freeze import FreezeHandler
 from description_pipeline.orchestration.native_operation_client import (
     ArtifactDownload,
     NativeOperationClient,
+    NativeOperationCapturePort,
     NativeOperationEffectObserver,
     NativeOperationEndpoint,
     native_capture_operation_id,
@@ -1126,6 +1130,202 @@ class CaptureHandlerTests(unittest.TestCase):
                 outbound_root=outbound_root,
                 workspace_root=observer_root,
             )
+
+    def test_prepared_effect_retry_sends_the_original_sealed_request_and_archive(
+        self,
+    ) -> None:
+        first_workspace = self.workspace(name="capture-prepared-origin")
+        first_effects = self.effects()
+        request = capture_module.CaptureRequest.from_command(self.command)
+        inputs = capture_module.CaptureInputs.resolve(
+            self.command,
+            first_workspace,
+            request,
+        )
+        effect_id, first_settlement = self.handler()._effect_state(
+            self.command,
+            self.claim,
+            first_workspace,
+            request,
+            inputs,
+            self.current_native_tool,
+            first_effects,
+        )
+        self.assertIsNone(first_settlement)
+        # Simulate the process crash after prepare_effect sealed the outbound
+        # artifact but before the original claim authorized dispatch.
+        first_effects.ledger.facts[effect_id] = []
+        first_effects.authorized.clear()
+        prepared = first_effects.effect_settlement_for_key("capture-native")
+        self.assertEqual(prepared.state, EffectState.PREPARED)
+        self.assertIsNotNone(prepared.outbound_artifact)
+        sealed_root = self.store.materialize(
+            prepared.outbound_artifact,
+            self.root / "prepared-effect-sealed",
+        )
+        sealed_outbound = read_data(sealed_root / "outbound.json")
+        sealed_archive = (
+            sealed_root / capture_module.CAPTURE_INPUT_ARCHIVE
+        )
+        self.assertTrue(sealed_archive.is_file())
+
+        operation_id = native_capture_operation_id(
+            run_id=self.command.run_id,
+            command_id=self.command.command_id,
+            effect_key="capture-native",
+        )
+        created: list[dict] = []
+        uploaded: list[bytes] = []
+        now = datetime.now(UTC).isoformat()
+
+        class Response:
+            def __init__(self, body: dict) -> None:
+                self.headers = Message()
+                self.headers["Content-Type"] = (
+                    "application/json; charset=utf-8"
+                )
+                self._body = io.BytesIO(
+                    (json.dumps(body, sort_keys=True) + "\n").encode()
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self._body.close()
+                return False
+
+            def read(self, limit: int = -1):
+                return self._body.read(limit)
+
+        def opener(request, *, timeout):
+            del timeout
+            method = request.get_method()
+            path = request.full_url
+            if method == "GET" and path.endswith(
+                f"/operations/{operation_id}"
+            ):
+                raise urlerror.HTTPError(
+                    request.full_url,
+                    404,
+                    "Not Found",
+                    Message(),
+                    io.BytesIO(b'{"error":"missing"}\n'),
+                )
+            if method == "POST" and path.endswith("/operations"):
+                envelope = json.loads(request.data.decode("utf-8"))
+                created.append(copy.deepcopy(envelope))
+                return Response(
+                    {
+                        "schema_version": OPERATION_VIEW_SCHEMA,
+                        "operation_id": envelope["operation_id"],
+                        "kind": envelope["kind"],
+                        "payload_sha256": envelope["payload_sha256"],
+                        "state": "accepted",
+                        "request_sha256": envelope["request_sha256"],
+                        "input_archive_sha256": envelope["input"][
+                            "archive_sha256"
+                        ],
+                        "native_tool_requirement_sha256": envelope[
+                            "native_tool"
+                        ]["requirement_sha256"],
+                        "actual_native_tool_sha256": None,
+                        "owner_sha256": None,
+                        "executor_sha256": None,
+                        "resource_terminated": False,
+                        "artifact": None,
+                        "failure": None,
+                        "created_at": now,
+                        "started_at": None,
+                        "finished_at": None,
+                    }
+                )
+            if method == "POST" and path.endswith(
+                f"/operations/{operation_id}/input"
+            ):
+                uploaded.append(request.data.read())
+                envelope = created[0]
+                return Response(
+                    {
+                        "schema_version": OPERATION_VIEW_SCHEMA,
+                        "operation_id": operation_id,
+                        "kind": CAPTURE_KIND,
+                        "payload_sha256": envelope["payload_sha256"],
+                        "state": "unknown",
+                        "request_sha256": envelope["request_sha256"],
+                        "input_archive_sha256": envelope["input"][
+                            "archive_sha256"
+                        ],
+                        "native_tool_requirement_sha256": envelope[
+                            "native_tool"
+                        ]["requirement_sha256"],
+                        "actual_native_tool_sha256": digest(
+                            self.current_native_tool
+                        ),
+                        "owner_sha256": digest(
+                            {
+                                "native_operation_claim": operation_id,
+                            }
+                        ),
+                        "executor_sha256": digest(
+                            self.current_native_tool
+                        ),
+                        "resource_terminated": True,
+                        "artifact": None,
+                        "failure": None,
+                        "created_at": now,
+                        "started_at": now,
+                        "finished_at": now,
+                    }
+                )
+            raise AssertionError(
+                f"unexpected native request: {method} {path}"
+            )
+
+        client = NativeOperationClient(
+            NativeOperationEndpoint(
+                "http://127.0.0.1:1",
+                "t" * 32,
+            ),
+            opener=opener,
+        )
+        replay_claim = self._claim(
+            self.command,
+            "claim-capture-after-prepared-crash",
+            fence=2,
+        )
+        remote_handler = CaptureHandler(
+            artifact_store=self.store,
+            native_operation=NativeOperationCapturePort(client),
+            native_tool_factory=lambda: self.current_native_tool,
+        )
+        with self.assertRaises(CaptureUnresolved):
+            remote_handler.execute(
+                self.command,
+                replay_claim,
+                self.workspace(name="capture-prepared-retry"),
+                effects=first_effects,
+            )
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(uploaded), 1)
+        self.assertEqual(
+            created[0]["request"]["execution"],
+            sealed_outbound["execution"],
+        )
+        self.assertEqual(
+            created[0]["payload_sha256"],
+            sealed_outbound["payload_sha256"],
+        )
+        self.assertEqual(
+            created[0]["input"]["archive_sha256"],
+            sealed_outbound["input_archive_sha256"],
+        )
+        self.assertEqual(
+            created[0]["input"]["archive_bytes"],
+            sealed_outbound["input_archive_bytes"],
+        )
+        self.assertEqual(uploaded[0], sealed_archive.read_bytes())
 
     def test_pending_capture_reconciles_producer_archive_then_replays_exact_outbound(
         self,

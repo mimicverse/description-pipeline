@@ -71,6 +71,19 @@ NativeOutcome = Literal["completed", "failed", "cancelled", "unknown"]
 CAPTURE_INPUT_ARCHIVE = "capture-input.zip"
 
 
+@dataclass(frozen=True, slots=True)
+class CaptureEffectDispatch:
+    """One exact sealed Capture dispatch reused across claims and recovery."""
+
+    effect_id: str
+    settlement: EffectSettlement | None
+    outbound_root: Path
+    outbound: Mapping[str, Any]
+    operation: Mapping[str, Any]
+    input_archive: Path
+    execution: Mapping[str, Any]
+
+
 class CaptureUnresolved(PipelineError):
     """The native operation has a possible external effect with no safe terminal fact."""
 
@@ -1157,12 +1170,18 @@ def _invoke_native_operation(
     upload_sha256: str,
     main_assembly: str,
     upstream_artifacts: tuple[dict[str, Any], ...],
-    execution: dict[str, Any],
     native_tool: dict[str, Any],
+    sealed_dispatch: CaptureEffectDispatch | None = None,
 ) -> NativeCaptureResult:
     """Call the production native reader, sealer and receipt writer."""
 
     del request_digest
+    if sealed_dispatch is None:
+        raise ProtocolError(
+            "capture.sealed_dispatch_missing",
+            {"command_id": run_id},
+        )
+    execution = dict(sealed_dispatch.execution)
     result = _capture_native_transaction(
         inputs.package,
         output,
@@ -1460,6 +1479,7 @@ class CaptureHandler:
         claim: ExecutionClaim,
         request: CaptureRequest,
         inputs: CaptureInputs,
+        expected_execution: Mapping[str, Any],
     ) -> StageExecution:
         execution_record = read_data(payload_root / "execution.json")
         tool = read_data(payload_root / "native-tool.json")
@@ -1469,6 +1489,7 @@ class CaptureHandler:
         if (
             execution_record.get("command_id") != command.command_id
             or execution_record.get("run_id") != command.run_id
+            or execution_record != dict(expected_execution)
             or execution_record.get("executor_sha256") != claim.executor_sha256
             or tool.get("source_sha256") != request.native_tool_source_sha256
             or digest(tool) != request.native_tool_record_sha256
@@ -1513,6 +1534,7 @@ class CaptureHandler:
         workspace: StageWorkspace,
         request: CaptureRequest,
         inputs: CaptureInputs,
+        dispatch: CaptureEffectDispatch,
     ) -> StageExecution:
         if self._artifact_store is None or settlement.payload_artifact is None:
             raise ProtocolError("capture.effect_payload_unavailable", {"effect_key": request.effect_key})
@@ -1526,6 +1548,46 @@ class CaptureHandler:
             claim=claim,
             request=request,
             inputs=inputs,
+            expected_execution=dispatch.execution,
+        )
+
+    def _dispatch_binding(
+        self,
+        *,
+        effect_id: str,
+        settlement: EffectSettlement | None,
+        command: StageCommand,
+        workspace: StageWorkspace,
+    ) -> CaptureEffectDispatch:
+        if settlement is None:
+            outbound_root = workspace.root / "capture-effect-outbound"
+        else:
+            if (
+                settlement.state
+                not in {EffectState.PREPARED, EffectState.SATISFIED}
+                or settlement.outbound_artifact is None
+                or self._artifact_store is None
+            ):
+                raise ProtocolError(
+                    "capture.effect_dispatch_unavailable",
+                    {"effect_id": settlement.effect_id},
+                )
+            outbound_root = self._artifact_store.materialize(
+                settlement.outbound_artifact,
+                workspace.root / "capture-recovery-outbound",
+            )
+        outbound = validate_capture_effect_outbound(
+            outbound_root,
+            command,
+        )
+        return CaptureEffectDispatch(
+            effect_id=effect_id,
+            settlement=settlement,
+            outbound_root=outbound_root,
+            outbound=outbound,
+            operation=_capture_operation_envelope(outbound),
+            input_archive=outbound_root / CAPTURE_INPUT_ARCHIVE,
+            execution=dict(outbound["execution"]),
         )
 
     @staticmethod
@@ -1575,7 +1637,6 @@ class CaptureHandler:
                 "capture.native_tool_mismatch",
                 {"where": "current-native-tool"},
             )
-        execution = _execution_record(command, claim, request, tool)
         effect_id, settlement = self._effect_state(
             command,
             claim,
@@ -1586,6 +1647,12 @@ class CaptureHandler:
             effects,
         )
         if settlement is not None and settlement.state == EffectState.SATISFIED:
+            dispatch = self._dispatch_binding(
+                effect_id=effect_id,
+                settlement=settlement,
+                command=command,
+                workspace=workspace,
+            )
             return self._reuse_satisfied_effect(
                 settlement=settlement,
                 command=command,
@@ -1593,6 +1660,7 @@ class CaptureHandler:
                 workspace=workspace,
                 request=request,
                 inputs=inputs,
+                dispatch=dispatch,
             )
         if settlement is not None and settlement.state == EffectState.DEFINITELY_FAILED:
             root = self._effect_failure_root(workspace, settlement, "capture.effect_definitely_failed")
@@ -1606,6 +1674,12 @@ class CaptureHandler:
                     "The Capture effect is definitely failed and will not be resent",
                 ),
             )
+        dispatch = self._dispatch_binding(
+            effect_id=effect_id,
+            settlement=settlement,
+            command=command,
+            workspace=workspace,
+        )
         backend = self._backend_factory(inputs.package) if self._backend_factory is not None else None
         output = workspace.root / "capture-native"
         native = self._native_operation(
@@ -1618,8 +1692,8 @@ class CaptureHandler:
             upload_sha256=request.upload_sha256,
             main_assembly=request.main_assembly,
             upstream_artifacts=upstream,
-            execution=execution,
             native_tool=tool,
+            sealed_dispatch=dispatch,
         )
         if native.outcome == "unknown":
             timeout_root = workspace.root / "capture-effect-unknown"
@@ -1676,7 +1750,10 @@ class CaptureHandler:
         effect_payload = workspace.root / "capture-effect-payload"
         effect_payload.mkdir(parents=True, exist_ok=False)
         shutil.copyfile(native.archive, effect_payload / "native-evidence.zip")
-        write_json(effect_payload / "execution.json", execution)
+        write_json(
+            effect_payload / "execution.json",
+            dict(dispatch.execution),
+        )
         write_json(effect_payload / "native-tool.json", tool)
         effects.record_response(effect_id, source="capture-handler", response_root=effect_payload)
         effects.record_observation(
@@ -1691,6 +1768,7 @@ class CaptureHandler:
             claim=claim,
             request=request,
             inputs=inputs,
+            expected_execution=dispatch.execution,
         )
 
     def validate_candidate(
