@@ -457,9 +457,10 @@ class LockAndScriptsTest(unittest.TestCase):
         for legacy in ("handoff_roots", "store_root", "repositories", "--token-file", "--port", "--host"):
             self.assertNotIn(legacy, source)
         dag = (DEPLOY / "dags" / "solidworks_to_urdf.py").read_text(encoding="utf-8")
-        self.assertIn('CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")', dag)
+        self.assertIn("application_from_environment()", dag)
+        self.assertNotIn("CONN_ID", dag)
         self.assertNotIn('"conn_id": Param(', dag)
-        self.assertIn("native_run_id(", dag)
+        self.assertNotIn("native_run_id(", dag)
 
 
 if __name__ == "__main__":

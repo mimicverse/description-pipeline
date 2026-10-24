@@ -18,6 +18,7 @@ from typing import Any, Literal
 from ..io import PipelineError, canonical, digest
 from ..schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
+    CANCEL_REQUEST_SCHEMA,
     DIAGNOSTIC_SCOPE_SCHEMA,
     DISPATCH_COMMAND_SCHEMA,
     FAILURE_ENVELOPE_SCHEMA,
@@ -354,7 +355,7 @@ class CancellationRequest:
     requested_at: datetime
 
     def __post_init__(self) -> None:
-        if self.schema_version != "description-pipeline.cancel-request/v1":
+        if self.schema_version != CANCEL_REQUEST_SCHEMA:
             raise ProtocolError("cancel.invalid", {"where": "schema_version"})
         for field in ("target_command_id", "target_run_id", "reason_code", "reason", "requested_by"):
             _require_text(getattr(self, field), "cancel.invalid", field)

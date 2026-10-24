@@ -48,6 +48,9 @@ from description_pipeline.pipeline.contracts import (
 )
 from description_pipeline.pipeline.engine import execute_cancellation
 from description_pipeline.pipeline.effects import EffectState
+from description_pipeline.pipeline.reconciliation import (
+    reconciliation_metadata_document,
+)
 from description_pipeline.pipeline.services import (
     CanonicalStageServices,
     ClaimPolicy,
@@ -453,30 +456,47 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         observation_root.mkdir()
         metadata_root.mkdir()
         write_json(observation_root / "result.json", {"complete": True})
-        write_json(metadata_root / "metadata.json", {"source": "fixture"})
+        observer_tool = digest({"observer": "fixture"})
+        observed_at = self.now + timedelta(minutes=2)
         payload = self.artifacts.seal_tree(
             observation_root,
             kind="effect_observation",
             producer_run_id=target.run_id,
             producer_stage=target.stage,
-            producer_tool_sha256=digest({"observer": "fixture"}),
+            producer_tool_sha256=observer_tool,
+        )
+        settlement = self.facts.effect_settlement(effect.effect_id)
+        self.assertIsNotNone(settlement.outbound_artifact)
+        write_json(
+            metadata_root / "metadata.json",
+            reconciliation_metadata_document(
+                command=target,
+                intent=effect,
+                fact_type="reconciled",
+                state_class="known",
+                metadata={"source": "fixture"},
+                outbound_artifact=settlement.outbound_artifact,
+                payload_artifact=payload,
+                observer_tool_sha256=observer_tool,
+                observed_at=observed_at,
+            ),
         )
         metadata = self.artifacts.seal_tree(
             metadata_root,
             kind="effect_reconciliation_metadata",
             producer_run_id=target.run_id,
             producer_stage=target.stage,
-            producer_tool_sha256=digest({"observer": "fixture"}),
+            producer_tool_sha256=observer_tool,
         )
         self.facts.append_reconciliation_fact(
             effect_id=effect.effect_id,
             fact_type="reconciled",
-            source="fixture-observer",
+            source="effect-reconciler:" + observer_tool,
             state_class="known",
             payload_artifact=payload,
             metadata_artifact=metadata,
             payload_digest=payload.set_sha256,
-            observed_at=self.now + timedelta(minutes=2),
+            observed_at=observed_at,
             fact_id="known-" + effect.effect_id,
             expected_command_id=target.command_id,
         )

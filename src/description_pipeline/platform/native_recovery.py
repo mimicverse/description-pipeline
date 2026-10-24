@@ -230,6 +230,9 @@ def build_discovery_tree_from_prepared(
     (tree / "input" / "cad").mkdir(parents=True)
     (tree / "input" / "records").mkdir()
     (tree / "evidence").mkdir()
+    (tree / "prepared").mkdir()
+    (tree / "native-observation").mkdir()
+    prepared_members: dict[str, bytes] = {}
     with zipfile.ZipFile(archive_path) as archive:
         try:
             discovery = json.loads(archive.read("discovery/native-discovery.json"))
@@ -262,6 +265,7 @@ def build_discovery_tree_from_prepared(
                 data = source.read_bytes()
             if hashlib.sha256(data).hexdigest() != expected:
                 raise PipelineError(f"The prepared member {name!r} differs from the native job")
+            prepared_members[name] = data
             if name == "source.json":
                 relative = "input/source.json"
             elif name == "capture-plan.json":
@@ -279,6 +283,10 @@ def build_discovery_tree_from_prepared(
             target = confined(tree, relative, exists=False)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
+    for name, data in prepared_members.items():
+        target = confined(tree / "prepared", name, exists=False)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
     native_handoff = digest(native_inventory)
     raw_record = discovery.get("raw") if isinstance(discovery, dict) else None
     if not isinstance(raw_record, dict):
@@ -323,6 +331,7 @@ def build_discovery_tree_from_prepared(
         or discovery.get("handoff_sha256") != native_handoff
     ):
         raise PipelineError("The prepared discovery record does not bind the native inventory")
+    write_json(tree / "native-observation" / "observation.json", discovery)
     package_files = {"source.json": prepared["source.json"]}
     package_files.update({f"cad/{name}": prepared[name] for name in native_names})
     package_files.update(

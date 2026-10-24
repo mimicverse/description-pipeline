@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..io import write_json
+from ..schemas import OPERATION_CANCEL_EFFECT_SCHEMA
 from .contracts import CancellationRequest, ProtocolError, StageCommand
 from .effects import EffectIntent, EffectState
 from .services import CanonicalStageServices, ClaimPolicy
@@ -120,13 +121,13 @@ class CancellationControlService:
             outbound / "request.json",
             {
                 "cancel_request": request.to_record(),
-                "schema_version": "description-pipeline.operation-cancel-effect/v1",
+                "schema_version": OPERATION_CANCEL_EFFECT_SCHEMA,
                 "target_command": target_command.to_record(),
                 "target_effect": target_effect.identity_record(),
             },
         )
         expected_state = {
-            "schema_version": "description-pipeline.operation-cancel-effect/v1",
+            "schema_version": OPERATION_CANCEL_EFFECT_SCHEMA,
             "cancel_request_accepted": True,
             "target_command_id": target_command.command_id,
             "target_effect_id": target_effect.effect_id,

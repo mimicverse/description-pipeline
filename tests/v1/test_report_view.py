@@ -221,7 +221,12 @@ class ReportViewTests(unittest.TestCase):
         self.assertIn("reverified", publish_rows["publication.git"]["summary"]["actual"])
         file_rows = stages["freeze"]["files"]
         self.assertEqual(file_rows[0]["boundary"], "input")
-        self.assertEqual(file_rows[0]["label"], "Saved SolidWorks engineering folder")
+        freeze = next(
+            stage
+            for stage in CONTRACT["stages"]
+            if stage["id"] == "freeze"
+        )
+        self.assertEqual(file_rows[0]["label"], freeze["inputs"][0]["label"])
         self.assertTrue(any(row["boundary"] == "output" for row in file_rows))
 
     def test_failed_discovery_meaning_is_safe_and_downstream_is_blocked(self) -> None:

@@ -29,7 +29,10 @@ from ..native_transfer import (
     CAPTURE_TRANSFER_SCHEMA,
     MAX_MANIFEST_BYTES,
 )
-from ..schemas import NATIVE_CAPTURE_EFFECT_SCHEMA
+from ..schemas import (
+    NATIVE_CAPTURE_EFFECT_SCHEMA,
+    NATIVE_OPERATION_OBSERVATION_SCHEMA,
+)
 from ..sources.solidworks.discover_stage import (
     NATIVE_OBSERVATION_SCHEMA,
     NativeDiscoverRefusal,
@@ -924,9 +927,7 @@ class NativeOperationEffectObserver:
         write_json(
             root / "operation.json",
             {
-                "schema_version": (
-                    "description-pipeline.native-operation-observation/v1"
-                ),
+                "schema_version": NATIVE_OPERATION_OBSERVATION_SCHEMA,
                 "operation_id": operation_id,
                 "state_class": state_class,
                 "reason": reason,
@@ -956,9 +957,7 @@ class NativeOperationEffectObserver:
         write_json(
             root / "operation.json",
             {
-                "schema_version": (
-                    "description-pipeline.native-operation-observation/v1"
-                ),
+                "schema_version": NATIVE_OPERATION_OBSERVATION_SCHEMA,
                 "operation_id": view.operation_id,
                 "state_class": "absent",
                 "reason": "terminated_without_artifact",

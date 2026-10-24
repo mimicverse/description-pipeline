@@ -48,6 +48,7 @@ from description_pipeline.pipeline.services import (
     ClaimPolicy,
 )
 from description_pipeline.platform.facts import FactStore, RunControlStore
+from description_pipeline.schemas import TOOL_SCHEMA
 from tests.sources.selection_support import sealed_selection
 from tests.v1.test_native_operations import _Server
 
@@ -250,12 +251,12 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
         self.work_root = self.root / "work"
         self.work_root.mkdir()
         self.tool_record = {
-            "schema_version": "solidworks-to-urdf.tool/v1",
+            "schema_version": TOOL_SCHEMA,
             "source_sha256": SOURCE_SHA256,
             "runtime": {"role": "portable"},
         }
         self.native_tool_record = {
-            "schema_version": "solidworks-to-urdf.tool/v1",
+            "schema_version": TOOL_SCHEMA,
             "source_sha256": digest({"native-source": 1}),
             "runtime": {"role": "native"},
         }

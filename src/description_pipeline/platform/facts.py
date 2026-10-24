@@ -62,6 +62,7 @@ from ..pipeline.effects import (
 )
 from ..schemas import (
     AIRFLOW_DISPATCH_EFFECT_SCHEMA,
+    CANCEL_REQUEST_SCHEMA,
     DIAGNOSTIC_ADMISSION_SCHEMA,
     DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
     RUN_ADMISSION_SCHEMA,
@@ -1405,7 +1406,7 @@ class FactStore(RunControlStore):
                     raise FactConflict("The target stage decision belongs to another command")
                 return decision
             request = CancellationRequest(
-                schema_version="description-pipeline.cancel-request/v1",
+                schema_version=CANCEL_REQUEST_SCHEMA,
                 target_command_id=target.command_id,
                 target_run_id=target.run_id,
                 target_stage=target.stage,
