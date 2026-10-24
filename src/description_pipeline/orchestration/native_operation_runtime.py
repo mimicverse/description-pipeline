@@ -597,6 +597,13 @@ class CaptureOperationRequest:
             raise NativeOperationError(
                 "Native Capture request evidence is invalid"
             ) from error
+        if (
+            request_evidence.get("main_assembly") != self.main_assembly
+            or request_evidence.get("handoff_digest") != self.upload_sha256
+        ):
+            raise NativeOperationError(
+                "Native Capture request evidence differs from the operation"
+            )
         object.__setattr__(self, "request_evidence", request_evidence)
 
     @classmethod

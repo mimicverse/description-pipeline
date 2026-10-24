@@ -96,9 +96,11 @@ def _replay_seeded_inputs(staging: Path) -> tuple[dict, dict]:
     """
 
     input_report = read_data(staging / "input/handoff.json")
-    from .steps import inspect_prepared_input
+    from .sources.solidworks.capture_transaction import (
+        inspect_prepared_package,
+    )
 
-    replayed = inspect_prepared_input(staging / "input")
+    replayed = inspect_prepared_package(staging / "input")
     if replayed.get("passed") is not True:
         raise PipelineError("Retained native inputs no longer pass static validation")
     retained_files = {

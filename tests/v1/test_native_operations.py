@@ -70,7 +70,7 @@ REQUEST_EVIDENCE = build_request_evidence(
     target_hardware="native_operation_test",
     change_summary="Exercise the native operation transport",
     main_assembly="cad/robot.SLDASM",
-    handoff_digest="b" * 64,
+    handoff_digest="c" * 64,
     platform_config_digest="c" * 64,
 )
 
@@ -445,11 +445,13 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             },
         )
         calls = 0
+        transaction_kwargs = {}
 
         def transaction(transaction_package, output, **kwargs):
-            nonlocal calls
+            nonlocal calls, transaction_kwargs
             calls += 1
-            del transaction_package, kwargs
+            del transaction_package
+            transaction_kwargs = kwargs
             Path(output).mkdir(parents=True)
             (Path(output) / CAPTURE_ARCHIVE).write_bytes(b"remote capture")
             return {
@@ -517,6 +519,10 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(first.outcome, "completed")
         self.assertEqual(second.outcome, "completed")
         self.assertEqual(calls, 1)
+        self.assertEqual(
+            transaction_kwargs["request_evidence"],
+            REQUEST_EVIDENCE,
+        )
         remote = port.observe(
             run_id=run_id,
             command_id=command_id,
