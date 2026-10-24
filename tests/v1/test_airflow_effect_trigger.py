@@ -270,6 +270,13 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 artifacts = SimpleNamespace(
                     objects=Path("/isolated/cas/objects"),
+                    read_metadata_member=Mock(
+                        side_effect=lambda _artifact, member, *, max_bytes: (
+                            b"{}",
+                            {"path": member},
+                            {"members": []},
+                        )
+                    ),
                     materialize=Mock(
                         side_effect=AssertionError(
                             "trigger must not materialize"
@@ -317,6 +324,13 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 artifacts.materialize.assert_not_called()
+                expected_metadata_reads = (
+                    2 if kind == "git_ref_update" else 1
+                )
+                self.assertEqual(
+                    artifacts.read_metadata_member.call_count,
+                    expected_metadata_reads,
+                )
 
     def test_small_member_read_does_not_materialize_or_hash_large_payload(self) -> None:
         with tempfile.TemporaryDirectory(

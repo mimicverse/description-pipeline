@@ -327,14 +327,27 @@ async def _prepare_publish_effect_probe(
     wait: StageEffectWait,
 ) -> EffectWaitProbe:
     from ..pipeline.stages.publish import (
+        PUBLICATION_PLAN,
         PublishGitStatusProbe,
         PublishPullRequestStatusProbe,
     )
+    from .native_operation_client import MAX_OPERATION_JSON_BYTES
 
     evidence = await asyncio.to_thread(_load_effect_evidence, wait)
     outbound = evidence.settlement.outbound_artifact
     if outbound is None:
         raise ValueError("The pending Publish effect has no outbound artifact")
+    evidence.artifacts.read_metadata_member(
+        outbound,
+        "request.json",
+        max_bytes=MAX_OPERATION_JSON_BYTES,
+    )
+    if wait.effect_kind == "git_ref_update":
+        evidence.artifacts.read_metadata_member(
+            outbound,
+            PUBLICATION_PLAN,
+            max_bytes=MAX_OPERATION_JSON_BYTES,
+        )
     outbound_root = evidence.artifacts.objects / outbound.artifact_id
     if wait.effect_kind == "git_ref_update":
         status_probe = await asyncio.to_thread(
