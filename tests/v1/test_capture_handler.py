@@ -1330,7 +1330,10 @@ class CaptureTransactionPreservationTests(unittest.TestCase):
                 raise RuntimeError("native reader failed")
 
             with (
-                patch("description_pipeline.steps.capture_evidence", side_effect=fail_evidence),
+                patch(
+                    "description_pipeline.pipeline.capture.capture_native_package",
+                    side_effect=fail_evidence,
+                ),
                 patch(
                     "description_pipeline.pipeline.capture._keep_capture_diagnostic",
                     side_effect=OSError("diagnostic install failed"),

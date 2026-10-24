@@ -118,9 +118,8 @@ class StageBoundaryTests(unittest.TestCase):
 
         with (
             patch.object(solidworks, "_native_tool_record", return_value=build_native_tool()),
-            patch.object(
-                steps,
-                "capture_evidence",
+            patch(
+                "description_pipeline.pipeline.capture.capture_native_package",
                 side_effect=self._fake_capture(
                     calls,
                     run_id=run_id,
@@ -153,9 +152,8 @@ class StageBoundaryTests(unittest.TestCase):
 
         with (
             patch.object(solidworks, "_native_tool_record", return_value=build_native_tool()),
-            patch.object(
-                steps,
-                "capture_evidence",
+            patch(
+                "description_pipeline.pipeline.capture.capture_native_package",
                 side_effect=self._fake_capture(
                     calls,
                     run_id=run_id,

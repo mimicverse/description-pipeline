@@ -36,6 +36,8 @@ from .discover import (
     SOURCE_SET_KIND,
 )
 from ..sources.solidworks.discovery import DISCOVERY_FILE, native_component_identity
+from ..sources.solidworks.capture_package import consume_sealed_definition
+from ..sources.solidworks.capture_transaction import capture_native_package
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import selection_bindings
 from ..schemas import (
@@ -442,9 +444,7 @@ class CaptureInputs:
         ):
             raise ProtocolError("capture.prepared_changed", {"prepared_sha256": request.prepared_sha256})
 
-        from .. import steps
-
-        _source, raw_plan = steps._consume_sealed_definition(package)
+        _source, raw_plan = consume_sealed_definition(package)
         plan = dict(raw_plan)
         discovery = read_data(package / DISCOVERY_FILE)
         if not isinstance(discovery, dict) or discovery.get("run_id") != discover.producer_run_id:
@@ -781,8 +781,6 @@ def _capture_native_transaction(
     endpoint adapter used by the currently deployed integration.
     """
 
-    from ..steps import capture_evidence
-
     package = Path(package)
     if package.is_symlink() or package.is_junction():
         raise PipelineError("The input package cannot be a symlink or junction")
@@ -803,7 +801,7 @@ def _capture_native_transaction(
         )
         event = _capture_event_sink(receipt, on_event)
         try:
-            _, input_report = capture_evidence(
+            _, input_report = capture_native_package(
                 package,
                 staging,
                 backend=backend,
