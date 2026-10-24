@@ -66,7 +66,8 @@ NATIVE_TOLERANT_EDGE_GAP_WARNING = (
 )
 NATIVE_TOLERANT_EDGE_WARNING_MESSAGE = (
     "Native tolerant-edge boundary projection used the closest-point U, the "
-    "native curve direction, and an independently replayed open-edge identity."
+    "native curve direction, and, where required, an independently replayed "
+    "open-edge identity."
 )
 NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS = frozenset(
     {
