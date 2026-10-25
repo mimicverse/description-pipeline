@@ -54,6 +54,7 @@ def _operation() -> dict[str, object]:
     return {
         "operation_id": "operation-capture",
         "kind": "capture",
+        "target_id": digest({"target": "capture"}),
         "request_sha256": digest({"request": "capture"}),
         "native_tool": {
             "requirement_sha256": digest({"tool": "capture"})
@@ -398,6 +399,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
         operation = _operation()
         expected = airflow_effect_trigger._expectation_from_operation(operation)
         self.assertEqual(expected.operation_id, "operation-capture")
+        self.assertEqual(expected.target_id, operation["target_id"])
         self.assertEqual(
             expected.input_archive_sha256,
             operation["input"]["archive_sha256"],

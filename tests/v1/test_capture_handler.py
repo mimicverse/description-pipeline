@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import zipfile
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime
 from email.message import Message
@@ -20,7 +21,13 @@ from urllib import error as urlerror
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import canonical, digest, file_digest, read_data
+from description_pipeline.io import (
+    canonical,
+    digest,
+    file_digest,
+    read_data,
+    write_json,
+)
 import description_pipeline.pipeline.capture as capture_module
 from description_pipeline.pipeline.capture import (
     CaptureHandler,
@@ -33,6 +40,8 @@ from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
     NativeTargetIdentity,
     StageCommand,
+    StageEffectWait,
+    StagePending,
 )
 from description_pipeline.pipeline.discover import (
     CONFIGURATION_KIND,
@@ -43,14 +52,21 @@ from description_pipeline.pipeline.discover import (
 from description_pipeline.pipeline.effects import (
     EffectFact,
     EffectIntent,
+    EffectResumePhase,
     EffectSettlement,
     EffectState,
     project_effect_settlement,
 )
 from description_pipeline.pipeline.freeze import FREEZE_REQUEST_SCHEMA
 from description_pipeline.pipeline.discover import DiscoverHandler
-from description_pipeline.pipeline.engine import StageWorkspace
+from description_pipeline.pipeline.engine import (
+    StageWorkspace,
+    execute_stage,
+)
 from description_pipeline.pipeline.freeze import FreezeHandler
+from description_pipeline.pipeline.reconciliation import (
+    EffectReconciliationResult,
+)
 from description_pipeline.orchestration.native_operation_client import (
     ArtifactDownload,
     NativeOperationClient,
@@ -77,7 +93,10 @@ from description_pipeline.orchestration.stage_transfer import (
     admit_capture,
 )
 from description_pipeline.sources.solidworks.discovery import PLAN_FILE
-from description_pipeline.schemas import NATIVE_TOOL_REQUIREMENT_KIND
+from description_pipeline.schemas import (
+    NATIVE_TOOL_REQUIREMENT_KIND,
+    STAGE_EFFECT_WAIT_SCHEMA,
+)
 
 from .split_capture_fixture import fixture_backend
 from .test_pipeline_discover import (
@@ -182,9 +201,23 @@ class _Effects:
         self.ledger.outbounds[intent.effect_id] = outbound
         return intent
 
-    def _append(self, effect_id, fact_type, *, source, payload=None, state_class=None):
+    def _append(
+        self,
+        effect_id,
+        fact_type,
+        *,
+        source,
+        payload=None,
+        state_class=None,
+        resume_phase=None,
+    ):
         facts = self.ledger.facts[effect_id]
-        claim_bound = fact_type in {"dispatch_authorized", "response", "timeout"}
+        claim_bound = fact_type in {
+            "dispatch_authorized",
+            "resume_authorized",
+            "response",
+            "timeout",
+        }
         fact = EffectFact(
             fact_id=f"fact-{effect_id}-{len(facts) + 1}",
             effect_id=effect_id,
@@ -197,6 +230,7 @@ class _Effects:
             payload_artifact_id=payload.artifact_id if payload is not None else None,
             payload_digest=payload.set_sha256 if payload is not None else digest({"fact": fact_type}),
             observed_at=datetime.now(UTC),
+            resume_phase=resume_phase,
         )
         facts.append(fact)
         if payload is not None:
@@ -209,6 +243,11 @@ class _Effects:
             raise RuntimeError("capture effect is not prepared")
         self.authorized.append((intent.effect_key, self.claim.claim_id, self.claim.fence))
         return self._append(effect_id, "dispatch_authorized", source=source)
+
+    def authorize_resume(self, effect_id, *, source):
+        intent = self.ledger.intents[effect_id]
+        self.authorized.append((intent.effect_key, self.claim.claim_id, self.claim.fence))
+        return self._append(effect_id, "resume_authorized", source=source)
 
     def _payload(self, root, kind):
         return self.ledger.store.seal_tree(
@@ -229,7 +268,15 @@ class _Effects:
         self.observed.append(("timeout", effect_id))
         return self._append(effect_id, "timeout", source=source, payload=payload)
 
-    def record_observation(self, effect_id, *, source, state_class, observation_root):
+    def record_observation(
+        self,
+        effect_id,
+        *,
+        source,
+        state_class,
+        observation_root,
+        resume_phase=None,
+    ):
         payload = self._payload(observation_root, "effect_observation")
         self.observed.append((state_class, effect_id))
         return self._append(
@@ -238,6 +285,7 @@ class _Effects:
             source=source,
             payload=payload,
             state_class=state_class,
+            resume_phase=resume_phase,
         )
 
     def reconcile_effect(self, effect_id, *, source, state_class, evidence_root):
@@ -265,6 +313,7 @@ class _Effects:
             decisive_fact=settlement.decisive_fact,
             payload_artifact=payload,
             outbound_artifact=self.ledger.outbounds[effect_id],
+            resume_phase=settlement.resume_phase,
         )
 
     def effect_state(self, effect_id):
@@ -278,6 +327,112 @@ class _Effects:
             if intent.command_id == self.command.command_id and intent.effect_key == effect_key:
                 return self._settlement(effect_id)
         return None
+
+
+class _TransferServices:
+    """Minimal engine services for the restricted Capture continuation path."""
+
+    def __init__(
+        self,
+        *,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        pending: StagePending,
+        effects: _Effects,
+    ) -> None:
+        self.command = command
+        self.claim = claim
+        self.workspace = workspace
+        self.pending = pending
+        self.effects = effects
+        self.discarded = False
+
+    def load_command(self, command_id):
+        if command_id != self.command.command_id:
+            raise AssertionError("engine loaded another command")
+        return self.command
+
+    def decision_for(self, command):
+        del command
+        return None
+
+    def cancellation_for(self, command):
+        del command
+        return None
+
+    def verify_pending_effect(self, command, pending):
+        if command != self.command or pending != self.pending:
+            raise AssertionError("engine used a foreign pending effect")
+        return pending
+
+    def acquire_transfer_resume_claim(self, command, effect_id):
+        if (
+            command != self.command
+            or effect_id != self.pending.wait.effect_id
+        ):
+            raise AssertionError("engine acquired the wrong transfer claim")
+        return self.claim
+
+    def acquire_claim(self, command):
+        del command
+        raise AssertionError("the transfer path must not acquire a general claim")
+
+    def materialize(self, command, claim, *, candidate):
+        if (
+            command != self.command
+            or claim != self.claim
+            or candidate is not None
+        ):
+            raise AssertionError("engine materialized the wrong transfer scope")
+        return self.workspace
+
+    def transfer_resume_gate(self, command, claim):
+        if command != self.command or claim != self.claim:
+            raise AssertionError("engine entered the wrong maintenance gate")
+        return nullcontext()
+
+    def transfer_effect_port(self, command, claim, workspace):
+        if (
+            command != self.command
+            or claim != self.claim
+            or workspace != self.workspace
+        ):
+            raise AssertionError("engine issued the wrong restricted port")
+        return self.effects
+
+    def yield_claim_for_effect(self, command, claim, effect_id):
+        if (
+            command != self.command
+            or claim != self.claim
+            or effect_id != self.pending.wait.effect_id
+        ):
+            raise AssertionError("engine yielded the wrong effect")
+        return self.pending
+
+    def discard_workspace(self, workspace):
+        if workspace != self.workspace:
+            raise AssertionError("engine discarded another workspace")
+        self.discarded = True
+
+
+class _TransferReconciler:
+    def __init__(self, effects: _Effects, pending: StagePending) -> None:
+        self.effects = effects
+        self.pending = pending
+
+    def reconcile_effect(self, *, command_id, effect_key):
+        settlement = self.effects.effect_settlement(
+            self.pending.wait.effect_id
+        )
+        return EffectReconciliationResult(
+            command_id=command_id,
+            effect_id=settlement.effect_id,
+            effect_key=effect_key,
+            fact=None,
+            settlement=settlement,
+            resume_phase=settlement.resume_phase,
+        )
 
 
 class CaptureHandlerTests(unittest.TestCase):
@@ -652,6 +807,74 @@ class CaptureHandlerTests(unittest.TestCase):
             claim or self.claim,
         )
 
+    def _pending_transfer(
+        self,
+        *,
+        name: str,
+    ) -> tuple[
+        StageWorkspace,
+        _Effects,
+        ExecutionClaim,
+        EffectIntent,
+        StageEffectWait,
+    ]:
+        workspace = self.workspace(name=name)
+        effects = self.effects()
+
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError("native response was lost")
+
+        with self.assertRaisesRegex(RuntimeError, "response was lost"):
+            self.handler(native_operation=unavailable).execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        intent = next(
+            item
+            for item in self.effect_ledger.intents.values()
+            if item.command_id == self.command.command_id
+        )
+        pending_root = workspace.root / "initial-transfer-pending"
+        pending_root.mkdir()
+        write_json(
+            pending_root / "operation.json",
+            {
+                "operation_id": intent.expected_state["operation_id"],
+                "state": "accepted",
+            },
+        )
+        effects.record_observation(
+            intent.effect_id,
+            source="observer",
+            state_class="unobservable",
+            observation_root=pending_root,
+            resume_phase=EffectResumePhase.INPUT_TRANSFER_PENDING,
+        )
+        claim = replace(
+            self.claim,
+            claim_id="claim-capture-transfer",
+            fence=2,
+            scope="transfer_resume",
+            effect_scope_id=intent.effect_id,
+        )
+        wait = StageEffectWait(
+            schema_version=STAGE_EFFECT_WAIT_SCHEMA,
+            run_id=self.command.run_id,
+            stage="capture",
+            command_id=self.command.command_id,
+            request_digest=self.command.request_digest,
+            effect_id=intent.effect_id,
+            effect_key=intent.effect_key,
+            effect_kind="native_operation",
+            intent_identity_digest=intent.identity_digest,
+            outbound_artifact_id=intent.outbound_artifact_id,
+            outbound_digest=intent.outbound_digest,
+            expected_state_digest=intent.expected_state_digest,
+        )
+        return workspace, effects, claim, intent, wait
+
     def _observer_client(
         self,
         *,
@@ -915,6 +1138,184 @@ class CaptureHandlerTests(unittest.TestCase):
             ),
             outbound,
         )
+
+    def test_transfer_resume_uses_only_the_sealed_archive_and_yields(self) -> None:
+        workspace, _effects, claim, intent, wait = self._pending_transfer(
+            name="capture-transfer-success"
+        )
+        resume_port = Mock()
+        resume_port.resume_input_transfer.return_value = NativeOperationView(
+            schema_version=OPERATION_VIEW_SCHEMA,
+            operation_id=intent.expected_state["operation_id"],
+            kind=CAPTURE_KIND,
+            target_id=CAPTURE_TARGET.target_id,
+            payload_sha256=intent.expected_state["payload_sha256"],
+            state="accepted",
+            request_sha256="e" * 64,
+            input_archive_sha256=intent.expected_state[
+                "input_archive_sha256"
+            ],
+            native_tool_requirement_sha256=self.native_tool_sha256,
+            actual_native_tool_sha256=None,
+            owner_sha256=None,
+            executor_sha256=None,
+            resource_terminated=False,
+            artifact=None,
+            failure=None,
+            created_at=datetime.now(UTC).isoformat(),
+            started_at=None,
+            finished_at=None,
+        )
+        transfer_effects = _Effects(self.effect_ledger, self.command, claim)
+        result = self.handler(native_operation=resume_port).resume_transfer(
+            self.command,
+            claim,
+            workspace,
+            effects=transfer_effects,
+            resume=wait,
+        )
+
+        self.assertEqual(result.effect_id, intent.effect_id)
+        resume_port.assert_not_called()
+        resume_port.resume_input_transfer.assert_called_once()
+        dispatch = resume_port.resume_input_transfer.call_args.args[0]
+        self.assertEqual(
+            file_digest(dispatch.input_archive),
+            intent.expected_state["input_archive_sha256"],
+        )
+        self.assertEqual(
+            resume_port.resume_input_transfer.call_args.kwargs[
+                "native_tool"
+            ],
+            self.current_native_tool,
+        )
+        self.assertEqual(
+            transfer_effects.authorized,
+            [(intent.effect_key, claim.claim_id, claim.fence)],
+        )
+        self.assertIn(("response", intent.effect_id), transfer_effects.observed)
+        settlement = transfer_effects.effect_settlement(intent.effect_id)
+        self.assertEqual(settlement.state, EffectState.UNKNOWN)
+        self.assertEqual(
+            settlement.resume_phase,
+            EffectResumePhase.INPUT_TRANSFER_PENDING,
+        )
+
+    def test_transfer_resume_without_observation_yields_without_create(
+        self,
+    ) -> None:
+        workspace, _effects, claim, intent, wait = self._pending_transfer(
+            name="capture-transfer-unobservable"
+        )
+        resume_port = Mock()
+        resume_port.resume_input_transfer.return_value = None
+        transfer_effects = _Effects(self.effect_ledger, self.command, claim)
+        result = self.handler(native_operation=resume_port).resume_transfer(
+            self.command,
+            claim,
+            workspace,
+            effects=transfer_effects,
+            resume=wait,
+        )
+
+        self.assertEqual(result.effect_id, intent.effect_id)
+        resume_port.assert_not_called()
+        resume_port.resume_input_transfer.assert_called_once()
+        self.assertIn(("timeout", intent.effect_id), transfer_effects.observed)
+        settlement = transfer_effects.effect_settlement(intent.effect_id)
+        self.assertEqual(settlement.state, EffectState.UNKNOWN)
+        self.assertEqual(
+            settlement.resume_phase,
+            EffectResumePhase.INPUT_TRANSFER_PENDING,
+        )
+
+    def test_engine_routes_capture_transfer_resume_through_the_narrow_port(
+        self,
+    ) -> None:
+        workspace, _effects, claim, intent, wait = self._pending_transfer(
+            name="capture-transfer-engine"
+        )
+        pending = StagePending(wait)
+        resume_port = Mock()
+        resume_port.resume_input_transfer.return_value = NativeOperationView(
+            schema_version=OPERATION_VIEW_SCHEMA,
+            operation_id=intent.expected_state["operation_id"],
+            kind=CAPTURE_KIND,
+            target_id=CAPTURE_TARGET.target_id,
+            payload_sha256=intent.expected_state["payload_sha256"],
+            state="accepted",
+            request_sha256="e" * 64,
+            input_archive_sha256=intent.expected_state[
+                "input_archive_sha256"
+            ],
+            native_tool_requirement_sha256=self.native_tool_sha256,
+            actual_native_tool_sha256=None,
+            owner_sha256=None,
+            executor_sha256=None,
+            resource_terminated=False,
+            artifact=None,
+            failure=None,
+            created_at=datetime.now(UTC).isoformat(),
+            started_at=None,
+            finished_at=None,
+        )
+        transfer_effects = _Effects(self.effect_ledger, self.command, claim)
+        services = _TransferServices(
+            command=self.command,
+            claim=claim,
+            workspace=workspace,
+            pending=pending,
+            effects=transfer_effects,
+        )
+        result = execute_stage(
+            command_id=self.command.command_id,
+            handler=self.handler(native_operation=resume_port),
+            services=services,
+            resume=wait,
+            resume_reconciler=_TransferReconciler(
+                transfer_effects,
+                pending,
+            ),
+        )
+
+        self.assertEqual(result, pending)
+        resume_port.assert_not_called()
+        resume_port.resume_input_transfer.assert_called_once()
+        self.assertTrue(services.discarded)
+        settlement = transfer_effects.effect_settlement(intent.effect_id)
+        self.assertEqual(settlement.state, EffectState.UNKNOWN)
+
+    def test_effect_outbound_rejects_native_target_drift(self) -> None:
+        workspace = self.workspace(name="capture-target-drift")
+        effects = self.effects()
+        request = capture_module.CaptureRequest.from_command(self.command)
+        inputs = capture_module.CaptureInputs.resolve(
+            self.command,
+            workspace,
+            request,
+        )
+        self.handler()._effect_state(
+            self.command,
+            self.claim,
+            workspace,
+            request,
+            inputs,
+            self.current_native_tool,
+            effects,
+        )
+        outbound_root = workspace.root / "capture-effect-outbound"
+        outbound = read_data(outbound_root / "outbound.json")
+        outbound["native_target_id"] = "f" * 64
+        write_json(outbound_root / "outbound.json", outbound)
+
+        with self.assertRaisesRegex(
+            capture_module.ProtocolError,
+            "capture.effect_outbound",
+        ):
+            capture_module.validate_capture_effect_outbound(
+                outbound_root,
+                self.command,
+            )
 
     def test_trigger_reads_capture_identity_without_materializing_archive(self) -> None:
         effects = self.effects()

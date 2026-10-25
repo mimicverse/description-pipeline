@@ -57,13 +57,17 @@ from .contracts import (
     ProtocolError,
     StageCandidate,
     StageCommand,
+    StageDeferral,
+    StageEffectWait,
     StageExecution,
     StageFailure,
 )
 from .effects import (
+    EffectResumePhase,
     EffectSettlement,
     EffectState,
     StageEffectPort,
+    TransferResumeEffectPort,
     require_native_transfer_target,
 )
 from .engine import StageWorkspace
@@ -275,6 +279,7 @@ def validate_capture_effect_outbound(
     ):
         raise ProtocolError("capture.effect_outbound", {"where": "outbound.json"})
     request = CaptureRequest.from_command(command)
+    expected_target = _capture_target(command, request)
     if (
         record.get("schema_version") != NATIVE_CAPTURE_EFFECT_SCHEMA
         or record.get("command_id") != command.command_id
@@ -289,6 +294,12 @@ def validate_capture_effect_outbound(
         != request.native_tool_source_sha256
         or record.get("native_tool_record_sha256")
         != request.native_tool_record_sha256
+        or record.get("native_target_identity")
+        != expected_target["native_target_identity"]
+        or record.get("native_target_id")
+        != expected_target["native_target_id"]
+        or record.get("target_binding_digest")
+        != expected_target["target_binding_digest"]
     ):
         raise ProtocolError("capture.effect_outbound", {"where": "request"})
     operation_id = record.get("operation_id")
@@ -1610,13 +1621,19 @@ class CaptureHandler:
         settlement: EffectSettlement | None,
         command: StageCommand,
         workspace: StageWorkspace,
+        allow_transfer_pending: bool = False,
     ) -> CaptureEffectDispatch:
         if settlement is None:
             outbound_root = workspace.root / "capture-effect-outbound"
         else:
+            allowed_states = {
+                EffectState.PREPARED,
+                EffectState.SATISFIED,
+            }
+            if allow_transfer_pending:
+                allowed_states.add(EffectState.UNKNOWN)
             if (
-                settlement.state
-                not in {EffectState.PREPARED, EffectState.SATISFIED}
+                settlement.state not in allowed_states
                 or settlement.outbound_artifact is None
                 or self._artifact_store is None
             ):
@@ -1821,6 +1838,153 @@ class CaptureHandler:
             request=request,
             inputs=inputs,
             expected_execution=dispatch.execution,
+        )
+
+    def resume_transfer(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: TransferResumeEffectPort,
+        resume: StageEffectWait,
+    ) -> StageDeferral:
+        """Continue only the exact native operation's unadmitted input upload."""
+
+        if (
+            claim.scope != "transfer_resume"
+            or claim.effect_scope_id != resume.effect_id
+        ):
+            raise ProtocolError(
+                "capture.transfer_claim_mismatch",
+                {"effect_id": resume.effect_id},
+            )
+        request = CaptureRequest.from_command(command)
+        if (
+            resume.command_id != command.command_id
+            or resume.effect_key != request.effect_key
+            or resume.effect_kind != "native_operation"
+        ):
+            raise ProtocolError(
+                "capture.transfer_wait_mismatch",
+                {"effect_id": resume.effect_id},
+            )
+        settlement = effects.effect_settlement(resume.effect_id)
+        if (
+            settlement.state is not EffectState.UNKNOWN
+            or settlement.resume_phase
+            is not EffectResumePhase.INPUT_TRANSFER_PENDING
+        ):
+            raise ProtocolError(
+                "capture.transfer_not_pending",
+                {
+                    "effect_id": resume.effect_id,
+                    "state": settlement.state.value,
+                },
+            )
+        dispatch = self._dispatch_binding(
+            effect_id=resume.effect_id,
+            settlement=settlement,
+            command=command,
+            workspace=workspace,
+            allow_transfer_pending=True,
+        )
+        if self._native_tool_factory is None:
+            raise ProtocolError(
+                "capture.native_tool_provider_missing",
+                {"command_id": command.command_id},
+            )
+        tool = self._native_tool_factory()
+        if (
+            tool.get("source_sha256")
+            != request.native_tool_source_sha256
+            or digest(tool) != request.native_tool_record_sha256
+        ):
+            raise ProtocolError(
+                "capture.native_tool_mismatch",
+                {"where": "transfer-resume"},
+            )
+        resume_operation = getattr(
+            self._native_operation,
+            "resume_input_transfer",
+            None,
+        )
+        if not callable(resume_operation):
+            raise ProtocolError(
+                "capture.transfer_resume_port_missing",
+                {"command_id": command.command_id},
+            )
+
+        effects.authorize_resume(
+            resume.effect_id,
+            source="capture-handler",
+        )
+        view = resume_operation(
+            dispatch,
+            native_tool=tool,
+        )
+        evidence_root = (
+            workspace.root
+            / f"capture-transfer-resume-{claim.fence}"
+        )
+        evidence_root.mkdir(parents=True, exist_ok=False)
+        if view is None:
+            write_json(
+                evidence_root / "unobservable.json",
+                {
+                    "operation_id": dispatch.operation["operation_id"],
+                    "reason_code": "capture.transfer_unobservable",
+                    "schema_version": CAPTURE_EFFECT_FAILURE_SCHEMA,
+                },
+            )
+            effects.record_timeout(
+                resume.effect_id,
+                source="capture-handler",
+                detail_root=evidence_root,
+            )
+            return StageDeferral(resume.effect_id)
+
+        receipt = view.to_record()
+        if receipt.get("operation_id") != dispatch.operation["operation_id"]:
+            raise ProtocolError(
+                "capture.transfer_operation_mismatch",
+                {"effect_id": resume.effect_id},
+            )
+        write_json(evidence_root / "operation-view.json", receipt)
+        effects.record_response(
+            resume.effect_id,
+            source="capture-handler",
+            response_root=evidence_root,
+        )
+        return StageDeferral(resume.effect_id)
+
+    def resume_stage(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
+        resume: StageEffectWait,
+    ) -> StageExecution:
+        """Consume a terminal observation with a fresh general execution claim."""
+
+        request = CaptureRequest.from_command(command)
+        settlement = effects.effect_settlement(resume.effect_id)
+        if (
+            resume.command_id != command.command_id
+            or resume.effect_key != request.effect_key
+            or settlement.effect_id != resume.effect_id
+        ):
+            raise ProtocolError(
+                "capture.terminal_resume_mismatch",
+                {"effect_id": resume.effect_id},
+            )
+        return self.execute(
+            command,
+            claim,
+            workspace,
+            effects=effects,
         )
 
     def validate_candidate(
