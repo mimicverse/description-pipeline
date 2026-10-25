@@ -297,6 +297,30 @@ def _native_wakeable(view: object | None) -> bool:
     }
 
 
+def _native_observation_retryable(error: Exception) -> bool:
+    from .native_operation_client import (
+        NativeOperationClientConflict,
+        NativeOperationClientError,
+        NativeOperationNotFound,
+        NativeOperationProtocolError,
+    )
+
+    if isinstance(error, NativeOperationNotFound):
+        return True
+    if not isinstance(error, NativeOperationClientError):
+        return False
+    if isinstance(error, NativeOperationProtocolError):
+        return True
+    if (
+        isinstance(error, NativeOperationClientConflict)
+        and error.code == "native_target_mismatch"
+    ):
+        return True
+    return error.status is None or (
+        isinstance(error.status, int) and error.status >= 500
+    )
+
+
 def _wakeup(wait: StageEffectWait, changed: bool) -> EffectWakeupHint:
     from ..pipeline.application import EffectWakeupHint
 
@@ -310,7 +334,7 @@ def _wakeup(wait: StageEffectWait, changed: bool) -> EffectWakeupHint:
 async def _prepare_native_effect_probe(
     wait: StageEffectWait,
 ) -> EffectWaitProbe:
-    from .native_operation_client import NativeOperationNotFound
+    from .native_operation_client import NativeOperationClientError
 
     client, expected = await asyncio.to_thread(
         _native_probe_from_environment,
@@ -325,8 +349,10 @@ async def _prepare_native_effect_probe(
                 client.get_operation,
                 expected.operation_id,
             )
-        except NativeOperationNotFound:
-            view = None
+        except NativeOperationClientError as error:
+            if _native_observation_retryable(error):
+                return _wakeup(wait, False)
+            raise
         if view is not None:
             expected.require(view)
         return _wakeup(wait, _native_wakeable(view))

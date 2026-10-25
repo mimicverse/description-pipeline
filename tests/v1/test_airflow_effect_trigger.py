@@ -19,6 +19,12 @@ from description_pipeline.orchestration.airflow_effect_trigger import (
     _native_wakeable,
     probe_effect_wait,
 )
+from description_pipeline.orchestration.native_operation_client import (
+    NativeOperationClientConflict,
+    NativeOperationClientError,
+    NativeOperationNotFound,
+    NativeOperationProtocolError,
+)
 from description_pipeline.pipeline.application import EffectWakeupHint
 from description_pipeline.pipeline.contracts import (
     ArtifactRef,
@@ -173,6 +179,123 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
         loader.assert_called_once_with(wait)
         self.assertEqual(client.get_operation.call_count, 2)
         sleep.assert_awaited_once_with(0.1)
+
+    async def test_transient_observation_errors_keep_the_same_wait_pending(self) -> None:
+        wait = _wait()
+        accepted = SimpleNamespace(
+            state="accepted",
+            resource_terminated=False,
+        )
+        expected = SimpleNamespace(
+            operation_id="operation-capture",
+            require=Mock(return_value=accepted),
+        )
+        client = Mock()
+        client.get_operation.side_effect = [
+            NativeOperationClientError("native endpoint is unreachable"),
+            NativeOperationProtocolError(
+                "native endpoint response was incomplete"
+            ),
+            NativeOperationClientConflict(
+                "routed to another target",
+                status=409,
+                code="native_target_mismatch",
+            ),
+            NativeOperationClientError(
+                "native endpoint is unavailable",
+                status=503,
+            ),
+            NativeOperationNotFound("operation has not arrived", status=404),
+            accepted,
+        ]
+
+        with (
+            patch.object(
+                airflow_effect_trigger,
+                "_native_probe_from_environment",
+                return_value=(client, expected),
+            ),
+            patch.object(
+                airflow_effect_trigger.asyncio,
+                "sleep",
+                new=AsyncMock(),
+            ) as sleep,
+        ):
+            event = await anext(
+                EffectPollTrigger(
+                    wait=wait.to_record(),
+                    poll_interval=0.1,
+                ).run()
+            )
+
+        self.assertEqual(event.payload, {"wait": wait.to_record()})
+        self.assertEqual(client.get_operation.call_count, 6)
+        self.assertEqual(sleep.await_count, 5)
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
+        client.cancel_operation.assert_not_called()
+
+    async def test_authorization_failure_aborts_observation(self) -> None:
+        wait = _wait()
+        expected = SimpleNamespace(operation_id="operation-capture")
+        client = Mock()
+        client.get_operation.side_effect = NativeOperationClientError(
+            "unauthorized",
+            status=401,
+        )
+
+        with (
+            patch.object(
+                airflow_effect_trigger,
+                "_native_probe_from_environment",
+                return_value=(client, expected),
+            ),
+            self.assertRaises(NativeOperationClientError),
+        ):
+            await anext(
+                EffectPollTrigger(
+                    wait=wait.to_record(),
+                    poll_interval=0.1,
+                ).run()
+            )
+
+    async def test_foreign_view_identity_aborts_without_target_switch(self) -> None:
+        wait = _wait()
+        view = SimpleNamespace(
+            state="accepted",
+            resource_terminated=False,
+        )
+        conflict = NativeOperationClientConflict(
+            "native operation differs from the frozen request",
+            status=409,
+            code="native_operation_conflict",
+        )
+        expected = SimpleNamespace(
+            operation_id="operation-capture",
+            require=Mock(side_effect=conflict),
+        )
+        client = Mock()
+        client.get_operation.return_value = view
+
+        with (
+            patch.object(
+                airflow_effect_trigger,
+                "_native_probe_from_environment",
+                return_value=(client, expected),
+            ),
+            self.assertRaises(NativeOperationClientConflict),
+        ):
+            await anext(
+                EffectPollTrigger(
+                    wait=wait.to_record(),
+                    poll_interval=0.1,
+                ).run()
+            )
+
+        expected.require.assert_called_once_with(view)
+        client.get_target_identity.assert_not_called()
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
 
     async def test_absence_and_nonterminal_status_do_not_wake(self) -> None:
         wait = _wait()
