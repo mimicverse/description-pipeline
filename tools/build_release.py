@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -139,6 +140,32 @@ def source_inventory(directory: Path, bound: SimpleNamespace) -> dict[str, str]:
     }
 
 
+def build_distributions(
+    source: Path,
+    output: Path,
+    *,
+    environment: Mapping[str, str],
+) -> None:
+    """Run the build frontend only inside the archived source staging tree."""
+
+    source = Path(source).resolve()
+    output = Path(output).resolve()
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--no-isolation",
+            "--outdir",
+            str(output),
+            str(source),
+        ],
+        cwd=source,
+        check=True,
+        env=dict(environment),
+    )
+
+
 def tracked_test_inventory(root: Path, bound: SimpleNamespace) -> dict[str, str]:
     """The complete tracked test tree, keyed by its source-archive path."""
 
@@ -181,11 +208,21 @@ def offline_bundle(source, output, wheel, platform, bound):
             name, version, _, _ = parse_wheel_filename(path.name)
             locked.append(f"{name}=={version} --hash=sha256:{bound.file_digest(path)}")
         (staging / "requirements.lock").write_text("\n".join(locked) + "\n", encoding="utf-8")
+        doctor_command = (
+            "description doctor"
+            if platform == "linux"
+            else (
+                "python -I -B -c \"import json; "
+                "from description_pipeline.runtime import tool_record; "
+                "from description_pipeline.solidworks import doctor; "
+                "print(json.dumps({'tool': tool_record(role='native'), 'doctor': doctor()}))\""
+            )
+        )
         (staging / "README.md").write_text(
             "# Offline installation\n\nRequires CPython 3.12, x86_64. Create a dedicated virtual environment, "
             "then run its Python from this directory:\n\n"
             "```sh\npython -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock\n"
-            "description doctor\n```\n\nFollow docs/deployment.md in the matching deployment archive.\n",
+            f"{doctor_command}\n```\n\nFollow docs/deployment.md in the matching deployment archive.\n",
             encoding="utf-8",
         )
         bound.write_json(staging / "files.json", bound.inventory(staging))
@@ -265,10 +302,10 @@ def build(root, output):
         }
         bound.write_json(package / "tool-release.json", identity)
         build_env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-        subprocess.run(
-            [sys.executable, "-m", "build", "--no-isolation", "--outdir", str(output), str(source)],
-            check=True,
-            env=build_env,
+        build_distributions(
+            source,
+            output,
+            environment=build_env,
         )
         (wheel,) = output.glob("*.whl")
         (sdist,) = output.glob("*.tar.gz")

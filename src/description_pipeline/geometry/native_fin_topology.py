@@ -39,10 +39,11 @@ def validate_native_edge_fin_relations(
     component: str,
     edge: Mapping,
     edge_fins: Sequence[int],
+    incident_face_facet_counts: Sequence[int],
     fins_by_id: Mapping[int, Mapping],
     vertices_by_id: Mapping[int, Sequence[float]],
 ) -> dict:
-    """Validate one edge's complete fin set against the v7 cofin contract."""
+    """Validate the fin set, including an explicitly untessellated sheet edge."""
 
     _require(
         type(edge["body_type"]) is int
@@ -59,12 +60,6 @@ def validate_native_edge_fin_relations(
         fin_ids=list(fin_ids),
     )
     normalized_ids = tuple(sorted(set(fin_ids)))
-    _require(
-        bool(normalized_ids),
-        f"{component}: a native edge did not return any fins",
-        component=component,
-        fin_ids=list(fin_ids),
-    )
     _require(
         len(fin_ids) == len(normalized_ids),
         f"{component}: a native edge repeats a fin ID",
@@ -90,6 +85,27 @@ def validate_native_edge_fin_relations(
         f"{component}: a native edge has non-manifold face incidence",
         component=component,
         face_indices=list(face_indices),
+    )
+    facet_counts = tuple(incident_face_facet_counts)
+    _require(
+        len(facet_counts) == incidence
+        and all(type(count) is int and count >= 0 for count in facet_counts),
+        f"{component}: a native edge has invalid incident face facet counts",
+        component=component,
+        face_indices=list(face_indices),
+        incident_face_facet_counts=list(facet_counts),
+    )
+    _require(
+        bool(normalized_ids)
+        or (
+            edge["body_type"] == 1
+            and all(count == 0 for count in facet_counts)
+        ),
+        f"{component}: a native edge did not return any fins",
+        component=component,
+        fin_ids=list(fin_ids),
+        face_indices=list(face_indices),
+        incident_face_facet_counts=list(facet_counts),
     )
 
     face_sense_rows = edge["face_senses"]

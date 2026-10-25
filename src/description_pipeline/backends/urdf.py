@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET
 
 from ..io import PipelineError, confined, file_digest, format_number
 from ..geometry.stl import MESH_PART_TRIANGLES_MAX
-from ..model import Robot
+from ..model import EngineeringModel
 from ..sources.solidworks.naming import fixed_joint_name, material_name, mesh_path, visual_name
 
 #: Consumers reject a single display mesh above this many triangles, so larger
@@ -68,18 +68,18 @@ def _export_mesh(original: Path, destination: Path, relative: str) -> list[str]:
     return names
 
 
-def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -> Path:
+def generate_urdf(model: EngineeringModel, source: Path, destination: Path) -> Path:
     """Generate only the URDF delivery; no consumer-specific conversions.
 
-    Input model data is copied by ``Robot.to_dict``. Original evidence meshes
+    Input model data is copied by ``EngineeringModel.to_dict``. Original evidence meshes
     remain untouched. Geometry and inertia use their explicitly defined link
     frames; this writer does not repair names, axes, units or physical values.
     A mesh above ``MESH_PART_TRIANGLE_LIMIT`` is delivered as lossless parts
     with one identically placed visual or collision element per part.
     """
 
-    data = robot.to_dict()
-    document = ET.Element("robot", name=name)
+    data = model.to_dict()
+    document = ET.Element("robot", name=model.name)
     for warning in data.get("provenance", {}).get("value_warnings", []):
         if isinstance(warning, dict) and warning.get("code"):
             objects = warning.get("objects")
@@ -126,7 +126,7 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
                     relative = shape.get("mesh_name") or mesh_path(
                         str(shape.get("sha256") or file_digest(original)),
                         category=tag,
-                        namespace=name,
+                        namespace=model.name,
                     )
                     meshes = _export_mesh(original, destination, relative.removeprefix("../"))
                 else:

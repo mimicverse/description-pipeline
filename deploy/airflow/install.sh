@@ -73,9 +73,14 @@ fi
 # pip check excludes optional dependencies. Exercise the Linux verifier before
 # installing configuration or migrating the service database.
 "$AIRFLOW_VENV/bin/description" doctor
+INSTALLED_AIRFLOW_VERSION="$("$AIRFLOW_VENV/bin/airflow" version 2>/dev/null)"
+[ "$INSTALLED_AIRFLOW_VERSION" = "3.3.2" ] \
+  || die "expected Airflow 3.3.2, found: ${INSTALLED_AIRFLOW_VERSION:-unknown}"
+"$AIRFLOW_VENV/bin/airflow" triggerer --help >/dev/null \
+  || die "the pinned Airflow runtime has no triggerer command"
 
 if [ "$MODE" = "--stage" ]; then
-  echo "Airflow runtime staged (no configuration switch, no migration): $("$AIRFLOW_VENV/bin/airflow" version)"
+  echo "Airflow runtime staged (no configuration switch, no migration): $INSTALLED_AIRFLOW_VERSION"
   exit 0
 fi
 
@@ -98,4 +103,4 @@ AIRFLOW_DB_URL="$AIRFLOW_RUNTIME_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$
   --home "$AIRFLOW_HOME" --venv "$AIRFLOW_VENV" \
   --template "$HERE/airflow.cfg.template" --dags-folder "$HERE/dags"
 # Installation preserves admission state. Only operatorctl start opens the DAG.
-echo "Airflow installed: $("$AIRFLOW_VENV/bin/airflow" version), home=$AIRFLOW_HOME"
+echo "Airflow installed: $INSTALLED_AIRFLOW_VERSION, home=$AIRFLOW_HOME"

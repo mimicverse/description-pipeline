@@ -211,11 +211,11 @@ class RerunUiContractTests(unittest.TestCase):
             "renderRerunPanel",
             "rerunFromStage",
             "shortRunId",
-            "Rerun from this stage",
             "Continue original job",
             "Only the initiator or a platform administrator can rerun.",
-            "This stage and downstream stages will be recomputed. The original run and "
-            "evidence remain, and the rerun is a new linked run.",
+            "Freeze creates a new request from the sealed originals; freeze and all later "
+            "stages rerun under the current rules and configuration. The original run and "
+            "evidence remain.",
             "Rerun from",
             "prerequisites",
             "recomputes",

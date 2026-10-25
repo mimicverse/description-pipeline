@@ -68,6 +68,12 @@
         {
           "filename": "geometry/parts/base.stl",
           "kind": "mesh",
+          "name": "base_link_base_stl_82ccfa10a3b3_visual",
+          "provenance": {
+            "fixture_input": true,
+            "rule_id": "fixture.collision",
+            "rule_version": "fixture-v1"
+          },
           "rgba": [
             0.7,
             0.7,
@@ -124,6 +130,13 @@
         {
           "filename": "geometry/parts/base.stl",
           "kind": "mesh",
+          "material": "base_link_base_stl_82ccfa10a3b3_material",
+          "name": "base_link_base_stl_82ccfa10a3b3_visual",
+          "provenance": {
+            "fixture_input": true,
+            "rule_id": "fixture.visual",
+            "rule_version": "fixture-v1"
+          },
           "rgba": [
             0.7,
             0.7,
@@ -153,6 +166,12 @@
         {
           "filename": "geometry/parts/arm.stl",
           "kind": "mesh",
+          "name": "arm_link_arm_stl_1341d07cdebb_visual",
+          "provenance": {
+            "fixture_input": true,
+            "rule_id": "fixture.collision",
+            "rule_version": "fixture-v1"
+          },
           "rgba": [
             0.7,
             0.7,
@@ -209,6 +228,13 @@
         {
           "filename": "geometry/parts/arm.stl",
           "kind": "mesh",
+          "material": "arm_link_arm_stl_1341d07cdebb_material",
+          "name": "arm_link_arm_stl_1341d07cdebb_visual",
+          "provenance": {
+            "fixture_input": true,
+            "rule_id": "fixture.visual",
+            "rule_version": "fixture-v1"
+          },
           "rgba": [
             0.7,
             0.7,
@@ -235,6 +261,12 @@
     }
   ],
   "name": "robot",
+  "semantic_identity": {
+    "capture_set_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_configuration": "Default",
+    "source_member": "input/cad/fixture_arm.SLDASM",
+    "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
   "provenance": {
     "expected_entities": [
       "base",
@@ -265,6 +297,6 @@
       }
     ]
   },
-  "schema_version": "solidworks-to-urdf.scene/v1",
+  "schema_version": "solidworks-to-urdf.engineering-model/v1",
   "units": "SI"
 }

@@ -346,6 +346,109 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(boundary["opened"]["path"], self.backend.collected_scene_calls[0])
         self.assertEqual(self.backend.retired_session_pids, [100])
 
+    def test_freeze_replaces_the_environment_with_the_recovered_session(self) -> None:
+        collect_scene = self.backend.collect_scene
+
+        def collect_with_recovery(*args, **kwargs):
+            scene = collect_scene(*args, **kwargs)
+            self.backend.session_pid = 102
+            self.backend.capture_session_pid = 102
+            old_identity = {"pid": 101, "state": "active", "role": "copy"}
+            new_identity = {"pid": 102, "state": "active", "role": "copy"}
+            scene.notes["capture_preparation"] = {
+                "session": {
+                    "role": "copy",
+                    "identity": new_identity,
+                    "temp_root": None,
+                },
+                "session_recovery": {
+                    "trigger": {
+                        "code": "cad_rebuild_incomplete",
+                        "path": str(args[0]),
+                        "phase": "rebuild",
+                        "depth": 0,
+                        "journal_sequence": 3,
+                        "elapsed_seconds": 7.2,
+                    },
+                    "first_attempt": {
+                        "session": {
+                            "role": "copy",
+                            "identity": old_identity,
+                            "temp_root": None,
+                        }
+                    },
+                    "retirement": {
+                        "role": "copy",
+                        "retired": True,
+                        "before": old_identity,
+                        "after": {
+                            "pid": 101,
+                            "state": "closed",
+                            "role": "copy",
+                        },
+                    },
+                    "reopen": {
+                        "opened": Path(args[0]).name,
+                        "path": str(args[0]),
+                        "read_only": True,
+                        "errors": 0,
+                        "warnings": 0,
+                    },
+                    "fresh_session": {
+                        "role": "copy",
+                        "identity": new_identity,
+                        "temp_root": None,
+                    },
+                    "checks": {
+                        "old_pid": 101,
+                        "fresh_pid": 102,
+                        "different_owned_processes": True,
+                    },
+                },
+            }
+            return scene
+
+        self.backend.collect_scene = collect_with_recovery
+        with patch(
+            "description_pipeline.build.tool_identity",
+            return_value={"fixture": True},
+        ):
+            freeze(
+                self.config,
+                self.destination,
+                backend=self.backend,
+                worker_version="test-worker",
+            )
+        before = json.loads(
+            (
+                self.destination
+                / "evidence"
+                / "capture-environment-before-recovery.json"
+            ).read_text(encoding="utf-8")
+        )
+        final = json.loads(
+            (
+                self.destination / "evidence" / "environment.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(before["solidworks"]["sessions"]["copy"]["pid"], 101)
+        self.assertEqual(final["solidworks"]["sessions"]["copy"]["pid"], 102)
+        self.assertEqual(
+            final["session_boundary"]["retirement"]["before"]["pid"],
+            100,
+        )
+        scene = json.loads(
+            (
+                self.destination / "raw" / "scene_raw.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            scene["notes"]["capture_preparation"]["session_recovery"][
+                "fresh_session"
+            ]["identity"]["pid"],
+            102,
+        )
+
     def test_fresh_session_rejects_a_different_active_configuration(self) -> None:
         backend, config = self._two_component_backend()
         read = backend.document_state
@@ -821,7 +924,7 @@ class FreezeTests(unittest.TestCase):
         _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         before = inventory(self.destination)
         scene = load_scene(self.destination)
-        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
+        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.engineering-model/v1")
         self.assertEqual(inventory(self.destination), before)
         self.assertNotIn("scene.json", before)
 
@@ -978,7 +1081,7 @@ class FreezeTests(unittest.TestCase):
         freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
         _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         scene = load_scene(self.destination)
-        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
+        self.assertEqual(scene["schema_version"], "solidworks-to-urdf.engineering-model/v1")
         self.assertEqual(scene["units"], "SI")
         links = {link["name"]: link for link in scene["links"]}
         self.assertEqual(sorted(links), ["arm_link", "base_link"])
@@ -2026,9 +2129,9 @@ class SharedModelContractTests(unittest.TestCase):
     """The snapshot scene must satisfy the pipeline-wide model contract."""
 
     def setUp(self) -> None:
-        from description_pipeline.model import Robot
+        from description_pipeline.model import EngineeringModel
 
-        self.robot_cls = Robot
+        self.model_cls = EngineeringModel
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-contract-"))
         self.assembly = support.make_cad_tree(self.tmp / "cad")
         self.backend = _Backend(
@@ -2091,10 +2194,10 @@ class SharedModelContractTests(unittest.TestCase):
         _compose_scene_inputs(destination, self.tmp / "cad", with_arm=True, with_joint=True)
         scene = load_scene(destination)
 
-        robot = self.robot_cls.from_dict(scene)
+        model = self.model_cls.from_dict(scene)
 
-        payload = robot.to_dict()
-        self.assertEqual(payload["schema_version"], "solidworks-to-urdf.scene/v1")
+        payload = model.to_dict()
+        self.assertEqual(payload["schema_version"], "solidworks-to-urdf.engineering-model/v1")
         self.assertEqual(payload["units"], "SI")
         self.assertEqual({link["name"] for link in payload["links"]}, {"base_link", "arm_link"})
         self.assertEqual([joint["name"] for joint in payload["joints"]], ["hinge_joint"])

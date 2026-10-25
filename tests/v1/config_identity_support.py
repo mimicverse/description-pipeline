@@ -153,7 +153,7 @@ def activate(root: Path, install_id: str, document: dict | None = None) -> tuple
     make_release(root)
     make_endpoint_identity(root)
     make_dag(root)
-    record = build_record(root)
+    record = build_record(root, install_id=install_id, snapshot_path=snapshot)
     record["install_id"] = install_id
     record["snapshot"]["install_id"] = install_id
     record["ends"]["linux"]["install_id"] = install_id

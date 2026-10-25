@@ -197,7 +197,8 @@ function Invoke-RestMethod {
   @{schema_version='solidworks-to-urdf.health/v1'; ready=$true; native_platform=$true;
     release=@{version='1.5.0'; source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
       source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'};
-    install=@{install_id='old-install'; config_digest='old-config'}}
+    install_id='old-install'; config_digest='old-config';
+    target_identity=@{target_id='old-target'}}
 }
 function Die { param([string]$code, [string]$message) throw ('DIE:' + $code + ':' + $message) }
 

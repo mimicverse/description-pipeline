@@ -1,0 +1,618 @@
+"""VerifyHandler tests over real GenerateHandler and ArtifactStore outputs."""
+
+from __future__ import annotations
+
+import copy
+import shutil
+import tempfile
+import unittest
+import uuid
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+try:
+    import pgserver
+    import psycopg2
+except ImportError:
+    pgserver = None
+    psycopg2 = None
+
+from description_pipeline.artifacts import ArtifactStore
+from description_pipeline.interface_records import check_policy_digest
+from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
+import description_pipeline.pipeline.verify as pipeline_verify
+from description_pipeline.pipeline.contracts import (
+    DiagnosticReplayScope,
+    ExecutionClaim,
+    StageCandidate,
+    StageCommand,
+    StageResult,
+)
+from description_pipeline.pipeline.diagnostic import (
+    DiagnosticAdmissionSpec,
+    build_diagnostic_command,
+)
+from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
+from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
+from description_pipeline.pipeline.stages.generate import (
+    GENERATE_OUTPUT_CONTRACT,
+    GENERATE_REQUEST_SCHEMA,
+    GENERATE_RECEIPT,
+    GenerateHandler,
+)
+from description_pipeline.pipeline.verify import (
+    NoExternalEffects,
+    CERTIFICATE_FILENAME,
+    EXECUTION_RECEIPT_FILENAME,
+    OUTPUT_CONTRACT,
+    REQUEST_SCHEMA,
+    VerifyHandler,
+    replay_verification,
+    validate_verification_certificate,
+)
+from description_pipeline.runtime import tool_record
+from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA, STAGE_RESULT_SCHEMA
+from description_pipeline.stages import CONTRACT_SHA256
+from description_pipeline.platform.facts import FactStore
+from tests.v1 import verification_fixture as hermetic
+
+PG_AVAILABLE = pgserver is not None and psycopg2 is not None
+PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / "schema.sql"
+
+
+class PipelineVerifyHandlerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = hermetic.HermeticNativeFixture()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.directory = tempfile.TemporaryDirectory(prefix="verify-generate-pair-")
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.store = ArtifactStore(self.root / "cas")
+        capture_source, _native = self.fixture._prepare_and_capture()
+        capture_executor = digest({"executor": "capture-tool"})
+        self.capture_ref = self.store.seal_tree(
+            capture_source,
+            kind="stage_output:capture",
+            producer_run_id="capture-run",
+            producer_stage="capture",
+            producer_tool_sha256=capture_executor,
+        )
+        self.capture_root = self.store.materialize(self.capture_ref, self.root / "capture")
+        self.frozen_request = read_data(self.capture_root / "input/request.json")
+        self.verify_attempt = 0
+        self.generate_executor = tool_record(role="portable")["source_sha256"]
+        self.generator_command = StageCommand.create(
+            command_id="generate-command",
+            run_id="generate-run",
+            stage="generate",
+            idempotency_key="generate-command",
+            request={
+                "schema_version": GENERATE_REQUEST_SCHEMA,
+                "capture_artifact_id": self.capture_ref.artifact_id,
+                "output_contract": GENERATE_OUTPUT_CONTRACT,
+            },
+            input_artifacts=(self.capture_ref,),
+            config_snapshot_sha256=str(self.frozen_request["platform_config_digest"]),
+            contract_sha256=CONTRACT_SHA256,
+            policy_sha256=check_policy_digest(),
+            expected_executor_sha256=self.generate_executor,
+            predecessor_decision_id="capture-decision",
+        )
+        generated = GenerateHandler(self.store).execute(
+            self.generator_command,
+            self._claim(
+                self.generator_command,
+                owner=digest({"process": "generate"}),
+                executor=self.generate_executor,
+            ),
+            StageWorkspace(
+                root=self.root / "generate-attempt",
+                inputs={self.capture_ref.artifact_id: self.capture_root},
+            ),
+            effects=NoExternalEffects(),
+        )
+        self.generate_source = Path(generated.candidate_root)
+        self.generate_ref = self.store.seal_tree(
+            self.generate_source,
+            kind="stage_output:generate",
+            producer_run_id=self.generator_command.run_id,
+            producer_stage="generate",
+            producer_tool_sha256=self.generate_executor,
+        )
+        self.generate_root = self.store.materialize(self.generate_ref, self.root / "generate")
+
+    @staticmethod
+    def _claim(
+        command: StageCommand,
+        *,
+        owner: str,
+        executor: str,
+        fence: int = 1,
+    ) -> ExecutionClaim:
+        return ExecutionClaim(
+            claim_id=f"claim-{command.command_id}-{fence}",
+            command_id=command.command_id,
+            fence=fence,
+            owner_sha256=owner,
+            executor_sha256=executor,
+            lane_key=None,
+            expires_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(hours=1),
+        )
+
+    def _verify_request(
+        self,
+        generate_ref=None,
+    ) -> tuple[StageCommand, ExecutionClaim, StageWorkspace]:
+        generate_ref = generate_ref or self.generate_ref
+        verifier = hermetic._portable_tool()
+        verifier_sha256 = verifier["source_sha256"]
+        command = StageCommand.create(
+            command_id="verify-command",
+            run_id="verify-run",
+            stage="verify",
+            idempotency_key="verify-command",
+            request={
+                "capture_artifact_id": self.capture_ref.artifact_id,
+                "generate_artifact_id": generate_ref.artifact_id,
+                "output_contract": OUTPUT_CONTRACT,
+                "purpose": self.frozen_request["purpose"],
+                "schema_version": REQUEST_SCHEMA,
+            },
+            input_artifacts=(generate_ref, self.capture_ref),
+            config_snapshot_sha256=str(self.frozen_request["platform_config_digest"]),
+            contract_sha256=CONTRACT_SHA256,
+            policy_sha256=check_policy_digest(),
+            expected_executor_sha256=verifier_sha256,
+            predecessor_decision_id="generate-decision",
+        )
+        claim = self._claim(
+            command,
+            owner=digest({"process": "verify"}),
+            executor=verifier_sha256,
+        )
+        self.verify_attempt += 1
+        if generate_ref == self.generate_ref:
+            generate_root = self.generate_root
+        else:
+            variant = self.root / f"variant-generate-{generate_ref.artifact_id[:8]}"
+            generate_root = variant if variant.exists() else self.store.materialize(generate_ref, variant)
+        workspace = StageWorkspace(
+            root=self.root / f"verify-{generate_ref.artifact_id[:8]}-{self.verify_attempt}",
+            inputs={
+                generate_ref.artifact_id: generate_root,
+                self.capture_ref.artifact_id: self.capture_root,
+            },
+        )
+        return command, claim, workspace
+
+    def _run_verify(self, generate_ref=None):
+        command, claim, workspace = self._verify_request(generate_ref)
+        execution = VerifyHandler(
+            identity_provider=hermetic._portable_tool,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        ).execute(command, claim, workspace, effects=NoExternalEffects())
+        output = Path(execution.candidate_root)
+        return (
+            command,
+            execution,
+            read_data(output / CERTIFICATE_FILENAME),
+            read_data(output / EXECUTION_RECEIPT_FILENAME),
+            (output / CERTIFICATE_FILENAME).read_bytes(),
+            command.input_artifacts[0],
+            claim,
+        )
+
+    def _seal_mutated_generate(self, name: str, mutate) -> object:
+        source = self.root / f"generate-source-{name}"
+        shutil.copytree(self.generate_source, source)
+        urdf = source / "urdf/robot.urdf"
+        urdf.write_text(mutate(urdf.read_text(encoding="utf-8")), encoding="utf-8")
+        receipt = read_data(source / GENERATE_RECEIPT)
+        receipt["urdf_sha256"] = file_digest(urdf)
+        write_json(source / GENERATE_RECEIPT, receipt)
+        return self.store.seal_tree(
+            source,
+            kind="stage_output:generate",
+            producer_run_id=self.generator_command.run_id,
+            producer_stage="generate",
+            producer_tool_sha256=self.generate_executor,
+        )
+
+    def test_real_generate_and_capture_pair_produces_deterministic_certificate(self) -> None:
+        first = self._run_verify()
+        second = self._run_verify()
+        first_execution, first_certificate, first_receipt = first[1], first[2], first[3]
+        second_certificate, second_receipt = second[2], second[3]
+        self.assertEqual(first_execution.outcome, "completed")
+        self.assertFalse(hasattr(first_execution, "required_effect_ids"))
+        self.assertEqual(first_certificate["actual_verifier_sha256"], first[6].executor_sha256)
+        self.assertNotEqual(first_certificate["actual_verifier_sha256"], first[6].owner_sha256)
+        self.assertEqual(first_certificate["actual_verifier"], hermetic._portable_tool())
+        self.assertEqual(first[3]["actual_verifier"], hermetic._portable_tool())
+        self.assertEqual(first[3]["actual_verifier_sha256"], first[6].executor_sha256)
+        self.assertEqual(first_certificate, second_certificate)
+        self.assertEqual(first[4], second[4])
+        self.assertNotEqual(first_receipt["execution_id"], second_receipt["execution_id"])
+        output = Path(first_execution.candidate_root)
+        self.assertEqual(
+            {path.name for path in output.iterdir()},
+            {CERTIFICATE_FILENAME, EXECUTION_RECEIPT_FILENAME},
+        )
+        self.assertFalse((output / "model").exists())
+        self.assertFalse((self.generate_root / "input").exists())
+        self.assertFalse((self.generate_root / "evidence").exists())
+
+    def test_real_verify_handler_runs_as_one_diagnostic_stage(self) -> None:
+        command, claim, workspace = self._verify_request()
+        scope = DiagnosticReplayScope.from_inputs(
+            "verify",
+            command.input_artifacts,
+        )
+        diagnostic = StageCommand.create(
+            command_id="diagnostic-verify",
+            run_id="diagnostic-verify-run",
+            stage="verify",
+            idempotency_key="diagnostic-verify/run",
+            request=command.to_record()["request"],
+            input_artifacts=command.input_artifacts,
+            config_snapshot_sha256=command.config_snapshot_sha256,
+            contract_sha256=command.contract_sha256,
+            policy_sha256=command.policy_sha256,
+            expected_executor_sha256=command.expected_executor_sha256,
+            predecessor_decision_id=None,
+            diagnostic_scope=scope,
+        )
+        diagnostic_claim = replace(
+            claim,
+            claim_id="diagnostic-verify-claim",
+            command_id=diagnostic.command_id,
+        )
+        execution = VerifyHandler(
+            identity_provider=hermetic._portable_tool,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        ).execute(
+            diagnostic,
+            diagnostic_claim,
+            workspace,
+            effects=NoExternalEffects(),
+        )
+        self.assertEqual(execution.outcome, "completed")
+        self.assertEqual(diagnostic.diagnostic_scope, scope)
+
+    def test_formal_verify_requires_a_predecessor_before_evaluation(self) -> None:
+        command, claim, workspace = self._verify_request()
+        formal = StageCommand.create(
+            command_id="verify-without-predecessor",
+            run_id="verify-without-predecessor-run",
+            stage="verify",
+            idempotency_key="verify-without-predecessor/run",
+            request=command.to_record()["request"],
+            input_artifacts=command.input_artifacts,
+            config_snapshot_sha256=command.config_snapshot_sha256,
+            contract_sha256=command.contract_sha256,
+            policy_sha256=command.policy_sha256,
+            expected_executor_sha256=command.expected_executor_sha256,
+            predecessor_decision_id=None,
+        )
+        formal_claim = replace(
+            claim,
+            claim_id="verify-no-predecessor",
+            command_id=formal.command_id,
+        )
+        with self.assertRaisesRegex(PipelineError, "predecessor_missing"):
+            VerifyHandler(
+                identity_provider=hermetic._portable_tool,
+            ).execute(
+                formal,
+                formal_claim,
+                workspace,
+                effects=NoExternalEffects(),
+            )
+        self.assertFalse((workspace.root / "output").exists())
+
+    def test_identity_provider_record_drift_is_rejected_after_source_match(self) -> None:
+        initial = hermetic._portable_tool()
+        cases = (
+            (
+                "source",
+                {**initial, "source_sha256": "0" * 64},
+            ),
+            (
+                "runtime",
+                {**initial, "release": {"schema_version": "drifted", "version": "9"}},
+            ),
+        )
+        for name, final in cases:
+            with self.subTest(name=name):
+                command, claim, workspace = self._verify_request()
+                records = iter((initial, final))
+                with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+                    VerifyHandler(identity_provider=lambda records=records: next(records)).execute(
+                        command,
+                        claim,
+                        workspace,
+                        effects=NoExternalEffects(),
+                    )
+                self.assertFalse((workspace.root / "output").exists())
+
+    def test_validate_candidate_only_checks_runtime_identity(self) -> None:
+        command, execution, certificate, _receipt, _bytes, _generate_ref, claim = self._run_verify()
+        output_ref = self.store.seal_tree(
+            execution.candidate_root,
+            kind="stage_output:verify",
+            producer_run_id=command.run_id,
+            producer_stage="verify",
+            producer_tool_sha256=claim.executor_sha256,
+        )
+        result = StageResult(
+            schema_version=STAGE_RESULT_SCHEMA,
+            command_id=command.command_id,
+            run_id=command.run_id,
+            stage="verify",
+            request_digest=command.request_digest,
+            outcome="completed",
+            output_artifact=output_ref,
+            actual_executor_sha256=claim.executor_sha256,
+            checks_sha256=digest(certificate),
+            resources_settled=True,
+        )
+        candidate = StageCandidate(result=result)
+        with patch.object(
+            pipeline_verify,
+            "evaluate_bundle",
+            side_effect=AssertionError("candidate validation must not replay mechanics"),
+        ):
+            validated = VerifyHandler(identity_provider=hermetic._portable_tool).validate_candidate(
+                command,
+                claim,
+                candidate,
+                effects=NoExternalEffects(),
+            )
+        self.assertIs(validated, candidate)
+
+    def test_certificate_consumer_rechecks_pair_without_mechanical_replay(self) -> None:
+        command, execution, certificate, _receipt, _bytes, generate_ref, _claim = self._run_verify()
+        with (
+            patch.object(pipeline_verify, "evaluate_bundle", side_effect=AssertionError("mechanical replay")),
+            patch.object(
+                pipeline_verify,
+                "require_qualified_report",
+                side_effect=AssertionError("mechanical replay"),
+            ),
+        ):
+            validated = validate_verification_certificate(
+                Path(execution.candidate_root),
+                generate_root=self.generate_root,
+                capture_root=self.capture_root,
+                generate_artifact=generate_ref,
+                capture_artifact=command.input_artifacts[1],
+            )
+        self.assertEqual(validated, certificate)
+
+    def test_wrong_generate_receipt_capture_ref_is_rejected_before_evaluation(self) -> None:
+        source = self.root / "generate-wrong-capture-ref"
+        shutil.copytree(self.generate_source, source)
+        receipt = read_data(source / GENERATE_RECEIPT)
+        receipt["capture_artifact"]["artifact_id"] = "f" * 64
+        write_json(source / GENERATE_RECEIPT, receipt)
+        wrong_ref = self.store.seal_tree(
+            source,
+            kind="stage_output:generate",
+            producer_run_id=self.generator_command.run_id,
+            producer_stage="generate",
+            producer_tool_sha256=self.generate_executor,
+        )
+        command, claim, workspace = self._verify_request(wrong_ref)
+        with (
+            patch.object(
+                pipeline_verify,
+                "evaluate_bundle",
+                side_effect=AssertionError("evaluation must not start"),
+            ),
+            self.assertRaisesRegex(PipelineError, "different Capture artifact"),
+        ):
+            VerifyHandler(identity_provider=hermetic._portable_tool).execute(
+                command,
+                claim,
+                workspace,
+                effects=NoExternalEffects(),
+            )
+
+    def test_original_xml_mutations_fail_and_certificate_is_deterministic(self) -> None:
+        def material_missing(payload: str) -> str:
+            start = payload.index("<material")
+            end = payload.index("</material>") + len("</material>")
+            return payload[:start] + payload[end:]
+
+        def visual_invalid_name(payload: str) -> str:
+            return payload.replace('visual name="', 'visual name="BAD-', 1)
+
+        def material_wrong_color(payload: str) -> str:
+            return payload.replace('rgba="0.7 0.7 0.7 1.0"', 'rgba="1 0 0 1"', 1)
+
+        for name, mutate in (
+            ("material-missing", material_missing),
+            ("visual-invalid-name", visual_invalid_name),
+            ("material-wrong-color", material_wrong_color),
+        ):
+            generate_ref = self._seal_mutated_generate(name, mutate)
+            _command, execution, certificate, _receipt, _bytes, _ref, _claim = self._run_verify(generate_ref)
+            self.assertEqual(execution.outcome, "failed")
+            self.assertEqual(certificate["decision"], "FAIL")
+            failed = {row["id"] for row in certificate["checks"] if row["passed"] is not True}
+            self.assertIn("urdf.syntax_names", failed)
+
+        first_ref = self._seal_mutated_generate("deterministic-a", material_missing)
+        first = self._run_verify(first_ref)
+        second_ref = self._seal_mutated_generate("deterministic-b", material_missing)
+        second = self._run_verify(second_ref)
+        self.assertEqual(first_ref.artifact_id, second_ref.artifact_id)
+        self.assertEqual(first[2], second[2])
+        self.assertEqual(first[4], second[4])
+        self.assertNotEqual(first[3]["execution_id"], second[3]["execution_id"])
+
+    def test_consumer_rejects_closure_mutation_and_tampered_certificate(self) -> None:
+        command, execution, certificate, _receipt, _bytes, generate_ref, _claim = self._run_verify()
+        changed = self.root / "generate-changed"
+        shutil.copytree(self.generate_root, changed)
+        urdf = changed / "urdf/robot.urdf"
+        urdf.write_bytes(urdf.read_bytes() + b"\n")
+        with self.assertRaises(PipelineError):
+            validate_verification_certificate(
+                Path(execution.candidate_root),
+                generate_root=changed,
+                capture_root=self.capture_root,
+                generate_artifact=generate_ref,
+                capture_artifact=command.input_artifacts[1],
+            )
+
+        certificate_path = Path(execution.candidate_root) / CERTIFICATE_FILENAME
+        signed = read_data(certificate_path)
+        tampered = copy.deepcopy(signed)
+        tampered["checks"][0]["passed"] = False
+        write_json(certificate_path, tampered)
+        with self.assertRaisesRegex(PipelineError, "proof digest differs"):
+            validate_verification_certificate(
+                Path(execution.candidate_root),
+                generate_root=self.generate_root,
+                capture_root=self.capture_root,
+                generate_artifact=generate_ref,
+                capture_artifact=command.input_artifacts[1],
+            )
+        write_json(certificate_path, certificate)
+
+    def test_explicit_replay_executes_handler_and_matches_saved_certificate(self) -> None:
+        command, _execution, certificate, _receipt, _bytes, generate_ref, _claim = self._run_verify()
+        with patch.object(
+            pipeline_verify,
+            "evaluate_bundle",
+            wraps=pipeline_verify.evaluate_bundle,
+        ) as evaluator:
+            replayed = replay_verification(
+                generate_root=self.generate_root,
+                capture_root=self.capture_root,
+                generate_artifact=generate_ref,
+                capture_artifact=command.input_artifacts[1],
+                identity_provider=hermetic._portable_tool,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+            )
+        self.assertEqual(replayed, certificate)
+        self.assertGreaterEqual(evaluator.call_count, 1)
+        self.assertFalse(hasattr(pipeline_verify, "publish"))
+
+
+@unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
+class VerifyIdentityPostgresTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server_root = tempfile.TemporaryDirectory(prefix="verify-identity-postgres-")
+        cls.server = pgserver.get_server(
+            Path(cls.server_root.name) / "pgdata",
+            cleanup_mode="delete",
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.cleanup()
+        cls.server_root.cleanup()
+
+    def setUp(self) -> None:
+        self.fixture = PipelineVerifyHandlerTests(methodName="runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.schema = "verify_identity_" + uuid.uuid4().hex
+        schema_sql = PLATFORM_SCHEMA.read_text(encoding="utf-8").replace(
+            ':"platform_schema"',
+            f'"{self.schema}"',
+        )
+        with psycopg2.connect(self.server.get_uri()) as connection, connection.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{self.schema}"')
+            cursor.execute(schema_sql)
+            cursor.execute(f'UPDATE "{self.schema}".admission SET state = %s WHERE id = 1', ("open",))
+
+        self.identity = hermetic._portable_tool()
+        self.executor = self.identity["source_sha256"]
+        base_command, _claim, _workspace = self.fixture._verify_request()
+        spec = DiagnosticAdmissionSpec(
+            schema_version=DIAGNOSTIC_ADMISSION_SCHEMA,
+            run_id="verify-identity-run",
+            request_id="verify-identity-request",
+            target_stage="verify",
+            request=base_command.to_record()["request"],
+            input_artifacts=(self.fixture.generate_ref, self.fixture.capture_ref),
+            expected_executor_sha256=self.executor,
+            config_snapshot_sha256=base_command.config_snapshot_sha256,
+            contract_sha256=base_command.contract_sha256,
+            policy_sha256=base_command.policy_sha256,
+            created_at=datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        self.command = build_diagnostic_command(spec)
+        self.facts = FactStore(self._connect, self.fixture.store)
+        self.facts.admit_diagnostic(spec, self.command)
+        self.services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.fixture.store,
+            work_root=self.fixture.root / "verify-identity-work",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": uuid.uuid4().hex}),
+                executor_sha256=self.executor,
+                lease=timedelta(minutes=5),
+                claim_id_factory=lambda: "verify-identity-" + uuid.uuid4().hex,
+            ),
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+
+    def _connect(self):
+        return psycopg2.connect(
+            self.server.get_uri(),
+            options=f"-c search_path={self.schema},public",
+        )
+
+    def _execute(self, provider):
+        return execute_stage(
+            command_id=self.command.command_id,
+            handler=VerifyHandler(
+                identity_provider=provider,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+            ),
+            services=self.services,
+        )
+
+    def test_constant_provider_preserves_source_executor_and_full_record(self) -> None:
+        result = self._execute(lambda: self.identity)
+        self.assertIsInstance(result, StageResult)
+        self.assertEqual(result.actual_executor_sha256, self.executor)
+        output = self.fixture.store.materialize(
+            result.output_artifact,
+            self.fixture.root / "verify-pg-output",
+        )
+        certificate = read_data(output / CERTIFICATE_FILENAME)
+        receipt = read_data(output / EXECUTION_RECEIPT_FILENAME)
+        for value in (certificate, receipt):
+            self.assertEqual(value["actual_verifier"], self.identity)
+            self.assertEqual(value["actual_verifier_sha256"], self.executor)
+        self.assertIsNotNone(self.facts.decision_for(self.command))
+
+    def test_source_drift_is_rejected_after_initial_source_match(self) -> None:
+        changed = {**self.identity, "source_sha256": "0" * 64}
+        records = iter((self.identity, changed))
+        with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+            self._execute(lambda: next(records))
+        self.assertIsNone(self.facts.decision_for(self.command))
+
+    def test_full_record_drift_with_same_source_is_rejected(self) -> None:
+        changed = {
+            **self.identity,
+            "release": {"schema_version": "drifted-runtime/v1", "version": "9"},
+        }
+        records = iter((self.identity, changed))
+        with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+            self._execute(lambda: next(records))
+        self.assertIsNone(self.facts.decision_for(self.command))
+
+
+if __name__ == "__main__":
+    unittest.main()

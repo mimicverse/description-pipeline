@@ -22,12 +22,20 @@ from pathlib import Path
 
 from description_pipeline import schemas
 from description_pipeline import interface_records as ir
+from description_pipeline.pipeline.contracts import NativeTargetIdentity
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
 from .contract_wheel import write_contract_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
+
+
+def native_target_identity(install_id: str) -> dict:
+    return NativeTargetIdentity.create(
+        install_id=install_id,
+        pipeline_id=ir.PIPELINE_ID,
+    ).to_record()
 
 
 _RENDER_MODULE: object | None = None
@@ -366,6 +374,7 @@ PY
             {
                 "install_id": "win-" + "1" * 32,
                 "config_digest": "d" * 64,
+                "target_identity": native_target_identity("win-" + "1" * 32),
                 "release": {
                     "version": release_document["version"],
                     "source_commit": release_document["source_commit"],
@@ -448,6 +457,7 @@ def status_env(tmp: Path, config_home: Path) -> dict[str, str]:
         "description-solidworks-tunnel",
         "description-airflow-dag-processor",
         "description-airflow-scheduler",
+        "description-airflow-triggerer",
         "description-airflow-api-server",
         "description-portal",
         "description-operator-proxy",
@@ -988,7 +998,7 @@ class LifecycleTests(unittest.TestCase):
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
-            "\"arguments\":\"-I -B -m description_pipeline serve --config "
+            "\"arguments\":\"-I -B -m description_pipeline.orchestration.windows serve --config "
             "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
             "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
@@ -1051,6 +1061,13 @@ class LifecycleTests(unittest.TestCase):
             'case "$*" in\n'
             "  *install_record.py*)\n"
             '    exec python3 "$@" ;;\n'
+            "  *reconcile-effect.py*)\n"
+            '    [ -n "${PLATFORM_ARTIFACT_ROOT:-}" ] || exit 71\n'
+            '    [ -n "${PIPELINE_WORK_ROOT:-}" ] || exit 72\n'
+            '    [ -n "${ENDPOINT_TOKEN_FILE:-}" ] || exit 73\n'
+            '    echo "effect_reconcile $* artifact=$PLATFORM_ARTIFACT_ROOT '
+            'work=$PIPELINE_WORK_ROOT token=$ENDPOINT_TOKEN_FILE" >> "$ORDER_LOG"\n'
+            "    printf '%s\\n' '{\"effect_state\":\"satisfied\"}' ; exit 0 ;;\n"
             '  "-m description_pipeline.orchestration.lifecycle_state"*)\n'
             "    python3 -c 'import json,os; from pathlib import Path; "
             'Path(os.environ["LIFECYCLE_ENV_LOG"]).write_text(json.dumps('
@@ -1098,19 +1115,6 @@ class LifecycleTests(unittest.TestCase):
             '    echo false > "$ADMISSION"\n'
             '    echo "platform open_admission" >> "$ORDER_LOG"\n'
             '    echo "admission=open revision=3" ;;\n'
-            "  *platform-reconcile*)\n"
-            '    [ -n "${RECONCILE_RUN_ID:-}" ] && [ -n "${RECONCILE_OUTCOME:-}" ] || exit 61\n'
-            '    if [ "$PLATFORM_SERVICE_DSN" != "$EXPECTED_PLATFORM_SERVICE_DSN" ]; then '
-            'echo "service=$PLATFORM_SERVICE_DSN expected=$EXPECTED_PLATFORM_SERVICE_DSN" >&2; exit 78; fi\n'
-            '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
-            '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
-            '    [ "$PLATFORM_CONFIG_DIGEST" = "$EXPECTED_PLATFORM_CONFIG_DIGEST" ] || exit 82\n'
-            '    echo "reconcile_env stage=${RECONCILE_STAGE} reported=${RECONCILE_REPORTED_STAGE:-} '
-            'native=${RECONCILE_NATIVE_RUN_ID:-} op=${RECONCILE_ORPHAN_OPERATION_ID:-} '
-            'task=${RECONCILE_ORPHAN_TASK_ID:-} map=${RECONCILE_ORPHAN_MAP_INDEX:-}" >> "$ORDER_LOG"\n'
-            '    echo "platform reconcile ${RECONCILE_RUN_ID}:${RECONCILE_STAGE}:${RECONCILE_OUTCOME}"'
-            ' >> "$ORDER_LOG"\n'
-            '    echo "reconciled=${RECONCILE_RUN_ID}:${RECONCILE_STAGE} outcome=${RECONCILE_OUTCOME}" ;;\n'
             "  *)\n"
             '    echo "airflow admission check" >> "$ORDER_LOG"\n'
             '    count=$(cat "$REGISTER_COUNT" 2>/dev/null || echo 0)\n'
@@ -1134,7 +1138,9 @@ class LifecycleTests(unittest.TestCase):
             "release": {"version": "1.4.0", "source_commit": "c" * 40, "source_sha256": "a" * 64, "role": "native"},
             "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
             "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_v1_digest()},
-            "install": {"config_digest": "d" * 64, "install_id": "win-" + "1" * 32},
+            "install_id": "win-" + "1" * 32,
+            "config_digest": "d" * 64,
+            "target_identity": native_target_identity("win-" + "1" * 32),
             "endpoint": {"port": 9765},
             "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
             "jobs": {"active": 0, "queued": 0, "unresolved": 0},
@@ -1238,7 +1244,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertNotIn("platform close_admission", lines, "a refused switch must not touch the admission")
             self.assertFalse([line for line in lines if line.startswith("airflow ") and "dags" in line])
 
-    def test_reconcile_binds_a_registered_operation_and_refuses_unbound_claims(self) -> None:
+    def test_reconcile_routes_native_effects_to_the_canonical_maintenance_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, env, _, order, control = self._admission_fixture(Path(tmp))
             refused = run(["bash", str(control), "reconcile", "--config", str(config_path)], env)
@@ -1247,131 +1253,67 @@ class LifecycleTests(unittest.TestCase):
             bad = run(
                 [
                     "bash", str(control), "reconcile", "--config", str(config_path),
-                    "--run-id", "run-1", "--stage", "capture", "--outcome", "unresolved",
-                    "--evidence", "receipt.json",
+                    "--run-id", "run-1", "--stage", "capture", "--outcome", "completed",
                 ],
                 env,
             )
-            self.assertEqual(bad.returncode, 1)
-            self.assertIn("unresolved is not a result", bad.stderr)
+            self.assertEqual(bad.returncode, 2)
             reconciled = run(
                 [
                     "bash", str(control), "reconcile", "--config", str(config_path),
-                    "--run-id", "run-1", "--stage", "capture", "--outcome", "completed",
-                    "--evidence", "receipt.json",
+                    "--run-id", "run-1", "--stage", "capture", "--effect-key", "native-capture",
                 ],
                 env,
             )
             self.assertEqual(reconciled.returncode, 0, reconciled.stdout + reconciled.stderr)
-            self.assertIn("reconciled=run-1:capture outcome=completed", reconciled.stdout)
+            self.assertIn('"effect_state":"satisfied"', reconciled.stdout)
+            order_text = order.read_text(encoding="utf-8")
             self.assertIn(
-                "platform reconcile run-1:capture:completed",
-                order.read_text(encoding="utf-8").splitlines(),
+                "reconcile-effect.py --run-id run-1 --stage capture --effect-key native-capture",
+                order_text,
             )
+            self.assertIn("artifact=", order_text)
+            self.assertIn("work=", order_text)
+            self.assertIn("token=", order_text)
+            self.assertNotIn("platform reconcile", order_text)
+            self.assertNotIn("PlatformStore", control.read_text(encoding="utf-8"))
 
-    def test_reconcile_forwards_reported_stage_with_the_bound_native_inputs(self) -> None:
+    def test_reconcile_accepts_only_canonical_native_effects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, env, _, order, control = self._admission_fixture(Path(tmp))
-            evidence = Path(tmp) / "native-receipt.json"
-            evidence.write_text("{}\n", encoding="utf-8")
             invalid = run(
                 [
                     "bash", str(control), "reconcile", "--config", str(config_path),
-                    "--run-id", "run-1", "--stage", "discover", "--outcome", "failed",
-                    "--evidence", str(evidence), "--reported-stage", "freeze",
+                    "--run-id", "run-1", "--stage", "unknown", "--effect-key", "native",
                 ],
                 env,
             )
             self.assertEqual(invalid.returncode, 1, invalid.stdout + invalid.stderr)
-            self.assertIn("orphan recovery requires", invalid.stderr)
+            self.assertIn("canonical pipeline stage", invalid.stderr)
             valid = run(
                 [
                     "bash", str(control), "reconcile", "--config", str(config_path),
-                    "--run-id", "run-1", "--stage", "discover", "--outcome", "failed",
-                    "--evidence", str(evidence), "--native-receipt", str(evidence),
-                    "--native-run-id", "3324bcb0-085a-5f77-8edc-a4c1be2f1a5a",
-                    "--orphan-operation-id", "e88a68da-6bac-49c6-a325-8f2f979daf76",
-                    "--orphan-task-id", "discover", "--orphan-map-index", "-1",
-                    "--reported-stage", "freeze",
+                    "--run-id", "run-1", "--stage", "publish", "--effect-key", "git-ref-update",
                 ],
                 env,
             )
             self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
             self.assertIn(
-                "reconcile_env stage=discover reported=freeze "
-                "native=3324bcb0-085a-5f77-8edc-a4c1be2f1a5a "
-                "op=e88a68da-6bac-49c6-a325-8f2f979daf76 task=discover map=-1",
+                "reconcile-effect.py --run-id run-1 --stage publish --effect-key git-ref-update",
                 order.read_text(encoding="utf-8"),
             )
-            control_text = control.read_text(encoding="utf-8")
-            self.assertIn('reconcile_frame["reported_stage"] = reported_stage', control_text)
-            self.assertIn('"params_digest": io.digest(reconcile_frame)', control_text)
 
-    def test_embedded_reconcile_digest_changes_with_reported_stage(self) -> None:
-        from description_pipeline import io
-        import io as standard_io
-        import types
-        from unittest import mock
-
+    def test_reconcile_has_no_embedded_legacy_store_writer(self) -> None:
         control_text = CONTROL.read_text(encoding="utf-8")
-        marker = control_text.index("# platform-reconcile")
-        start = control_text.index("\n", marker) + 1
-        end = control_text.index("\nPY\n", start)
-        script = control_text[start:end]
-        captured: dict = {}
-
-        class FakePlatformStore:
-            @classmethod
-            def from_environment(cls):
-                return cls()
-
-            def confirm_stage(self, **kwargs):
-                captured.update(kwargs)
-
-        fake_store = types.ModuleType("description_pipeline.platform.store")
-        fake_store.PlatformStore = FakePlatformStore
-        common = {
-            "RECONCILE_RUN_ID": "run-1",
-            "RECONCILE_STAGE": "discover",
-            "RECONCILE_OUTCOME": "failed",
-            "RECONCILE_EVIDENCE": json.dumps(["receipt.json"]),
-            "RECONCILE_NATIVE_RECEIPT": "receipt.json",
-            "RECONCILE_NATIVE_RUN_ID": "3324bcb0-085a-5f77-8edc-a4c1be2f1a5a",
-            "RECONCILE_ORPHAN_OPERATION_ID": "e88a68da-6bac-49c6-a325-8f2f979daf76",
-            "RECONCILE_ORPHAN_TASK_ID": "discover",
-            "RECONCILE_ORPHAN_MAP_INDEX": "-1",
-        }
-        frame = {
-            "outcome": "failed",
-            "evidence": ["receipt.json"],
-            "binding": {
-                "operation_id": common["RECONCILE_ORPHAN_OPERATION_ID"],
-                "task_id": "discover",
-                "map_index": -1,
-            },
-        }
-
-        def run_embedded(reported_stage: str) -> dict:
-            captured.clear()
-            environment = {**common, "RECONCILE_REPORTED_STAGE": reported_stage}
-            with (
-                mock.patch.dict(sys.modules, {"description_pipeline.platform.store": fake_store}),
-                mock.patch.dict(os.environ, environment, clear=False),
-                contextlib.redirect_stdout(standard_io.StringIO()),
-            ):
-                exec(compile(script, "<operatorctl-platform-reconcile>", "exec"), {"__name__": "__main__"})
-            return dict(captured["reconcile"])
-
-        classic = run_embedded("")
-        reported = run_embedded("freeze")
-        self.assertNotIn("reported_stage", classic)
-        self.assertEqual(reported["reported_stage"], "freeze")
-        self.assertEqual(classic["params_digest"], io.digest(frame))
-        self.assertEqual(
-            reported["params_digest"],
-            io.digest({**frame, "reported_stage": "freeze"}),
-        )
-        self.assertNotEqual(classic["params_digest"], reported["params_digest"])
+        self.assertNotIn("# platform-reconcile", control_text)
+        self.assertNotIn("PlatformStore", control_text)
+        self.assertIn('"$HERE/reconcile-effect.py"', control_text)
+        self.assertIn("PLATFORM_ARTIFACT_ROOT", control_text)
+        self.assertIn("PIPELINE_WORK_ROOT", control_text)
+        self.assertNotIn("--outcome", control_text)
+        self.assertNotIn("--reported-stage", control_text)
+        self.assertNotIn("--native-receipt", control_text)
+        self.assertNotIn("--orphan-operation-id", control_text)
 
     def test_windows_reconciliation_requires_exact_python_module_action(self) -> None:
         control_text = CONTROL.read_text(encoding="utf-8")
@@ -1386,7 +1328,9 @@ class LifecycleTests(unittest.TestCase):
         target = "C:/description-e2e/state/lifecycle/gen-2/generation"
         previous = "C:/description-e2e/state/instance-promotions/previous-0001"
         exact_arguments = (
-            '-I -B -m description_pipeline serve --config "' + target + '/endpoint.json"'
+            '-I -B -m description_pipeline.orchestration.windows serve --config "'
+            + target
+            + '/endpoint.json"'
         )
         binding = {
             "dir": "C:/description-e2e/state/lifecycle/gen-2",
@@ -2517,11 +2461,12 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(usage.returncode, 2)
         self.assertIn("--keep-admission-closed", usage.stderr)
 
-    def test_reconcile_exposes_the_supported_reported_stage_input(self) -> None:
+    def test_reconcile_exposes_only_the_canonical_effect_inputs(self) -> None:
         control = CONTROL.read_text(encoding="utf-8")
-        self.assertIn("--reported-stage STAGE", control)
-        self.assertIn('RECONCILE_REPORTED_STAGE="$REPORTED_STAGE"', control)
-        self.assertIn('reconcile["reported_stage"] = reported_stage', control)
+        self.assertIn("reconcile inputs: --run-id R --stage STAGE --effect-key KEY", control)
+        self.assertIn("StageApplication registry", control)
+        self.assertNotIn("--outcome", control)
+        self.assertNotIn("--native-receipt", control)
 
     def _project(self, env: dict, data: dict, rc: int) -> None:
         Path(env["PROJECTION_FILE"]).write_text(json.dumps(data), encoding="utf-8")
@@ -2650,10 +2595,8 @@ class LifecycleTests(unittest.TestCase):
                     "run-1",
                     "--stage",
                     "capture",
-                    "--outcome",
-                    "completed",
-                    "--evidence",
-                    "receipt.json",
+                    "--effect-key",
+                    "native-capture",
                 ],
             ),
         )
@@ -2757,6 +2700,7 @@ class LifecycleTests(unittest.TestCase):
                     "description-airflow-api-server.service",
                     "description-airflow-dag-processor.service",
                     "description-airflow-scheduler.service",
+                    "description-airflow-triggerer.service",
                     "description-operator-proxy.service",
                     "description-portal.service",
                     "description-postgres.service",
@@ -3270,6 +3214,7 @@ class LifecycleTests(unittest.TestCase):
             for unit in (
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
             ):
                 content = (target / f"{unit}.service").read_text(encoding="utf-8")
@@ -3494,6 +3439,7 @@ class InstallOrderingTests(unittest.TestCase):
             "  description-solidworks-tunnel\n"
             "  description-airflow-dag-processor\n"
             "  description-airflow-scheduler\n"
+            "  description-airflow-triggerer\n"
             "  description-airflow-api-server\n"
             ")\n"
             'stop_runtime() {\n'
@@ -3524,7 +3470,7 @@ class InstallOrderingTests(unittest.TestCase):
             '    mkdir -p "$target"\n'
             '    echo "services_render venv=$AIRFLOW_VENV derived=$OPERATOR_DERIVED_ENV" >> "$ORDER_LOG"\n'
             '    for unit in description-airflow-dag-processor description-airflow-scheduler '
-            'description-airflow-api-server; do\n'
+            'description-airflow-triggerer description-airflow-api-server; do\n'
             '      printf "[Service]\\nEnvironmentFile=%s\\nExecStart=%s/bin/airflow fixture\\n" '
             '"$OPERATOR_DERIVED_ENV" "$AIRFLOW_VENV" > "$target/$unit.service"\n'
             '    done\n'
@@ -3646,6 +3592,9 @@ class InstallOrderingTests(unittest.TestCase):
             "  *-c*description_pipeline.orchestration.portal*description_pipeline.orchestration.feishu_auth*)\n"
             '    echo "module_check" >> "$ORDER_LOG"\n'
             '    exit "${MODULE_CHECK_RC:-0}" ;;\n'
+            "  *reconcile-effect.py*)\n"
+            '    echo "effect_reconcile $*" >> "$ORDER_LOG"\n'
+            "    printf '%s\\n' '{\"effect_state\":\"satisfied\"}' ; exit 0 ;;\n"
             "  *.py|*.py\\ *)\n"
             '    exec python3 "$@" ;;\n'
             "esac\n"
@@ -3790,6 +3739,7 @@ class InstallOrderingTests(unittest.TestCase):
                 {
                     "install_id": "ep-7",
                     "config_digest": "d" * 64,
+                    "target_identity": native_target_identity("ep-7"),
                     "release": {
                         "version": "1.4.0",
                         "source_commit": "c" * 40,
@@ -4060,7 +4010,7 @@ class InstallOrderingTests(unittest.TestCase):
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
-            "\"arguments\":\"-I -B -m description_pipeline serve --config "
+            "\"arguments\":\"-I -B -m description_pipeline.orchestration.windows serve --config "
             "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
             "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
@@ -4181,6 +4131,7 @@ class InstallOrderingTests(unittest.TestCase):
                     "description-solidworks-tunnel",
                     "description-airflow-dag-processor",
                     "description-airflow-scheduler",
+                    "description-airflow-triggerer",
                     "description-airflow-api-server",
                     "description-portal",
                     "description-operator-proxy",
@@ -4707,7 +4658,9 @@ class InstallOrderingTests(unittest.TestCase):
             "release": {"version": "1.4.0", "source_commit": "c" * 40, "source_sha256": "a" * 64, "role": "native"},
             "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
             "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_v1_digest()},
-            "install": {"config_digest": "d" * 64, "install_id": "ep-7"},
+            "install_id": "ep-7",
+            "config_digest": "d" * 64,
+            "target_identity": native_target_identity("ep-7"),
             "endpoint": {"port": 9765},
             "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
             "jobs": {"active": 0, "queued": 0, "unresolved": 0},
@@ -4762,8 +4715,7 @@ class InstallOrderingTests(unittest.TestCase):
                 [
                     "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
                     "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
-                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
-                    "--evidence", "receipt.json",
+                    "--run-id", "portal-1", "--stage", "capture", "--effect-key", "native-capture",
                 ],
                 control_env,
             )
@@ -4792,8 +4744,6 @@ class InstallOrderingTests(unittest.TestCase):
                 self._maintenance(release, control_env, "stage", "gen-2").returncode,
                 0,
             )
-            evidence = Path(tmp) / "reconcile-input.json"
-            evidence.write_text("{}\n", encoding="utf-8")
             receipt_path = state / "promotions" / "gen-2" / "receipt.json"
             output_path = state / "promotions" / "gen-2" / "reconcile-schema-migration.out"
             (Path(tmp) / "admission").write_text("true", encoding="utf-8")
@@ -4808,16 +4758,14 @@ class InstallOrderingTests(unittest.TestCase):
                 "--run-id",
                 "portal-repeat",
                 "--stage",
-                "freeze",
-                "--outcome",
-                "failed",
-                "--evidence",
-                str(evidence),
+                "capture",
+                "--effect-key",
+                "native-capture",
             ]
             first = run(command, control_env)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertIn(
-                "reconciled=portal-repeat:freeze outcome=failed",
+                '"effect_state":"satisfied"',
                 first.stdout,
             )
             self.assertTrue(output_path.is_file())
@@ -4870,11 +4818,9 @@ class InstallOrderingTests(unittest.TestCase):
                     "--run-id",
                     "portal-repeat",
                     "--stage",
-                    "freeze",
-                    "--outcome",
-                    "failed",
-                    "--evidence",
-                    str(evidence),
+                    "capture",
+                    "--effect-key",
+                    "native-capture",
                 ],
                 control_env,
             )
@@ -4939,11 +4885,9 @@ class InstallOrderingTests(unittest.TestCase):
                         "--run-id",
                         "portal-1",
                         "--stage",
-                        "freeze",
-                        "--outcome",
-                        "failed",
-                        "--evidence",
-                        "receipt.json",
+                        "capture",
+                        "--effect-key",
+                        "native-capture",
                     ],
                     control_env,
                 )
@@ -5011,8 +4955,8 @@ class InstallOrderingTests(unittest.TestCase):
                         [
                             "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
                             "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
-                            "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
-                            "--evidence", "receipt.json",
+                            "--run-id", "portal-1", "--stage", "capture",
+                            "--effect-key", "native-capture",
                         ],
                         control_env,
                     )
@@ -5068,8 +5012,7 @@ class InstallOrderingTests(unittest.TestCase):
                 [
                     "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
                     "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
-                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
-                    "--evidence", "receipt.json",
+                    "--run-id", "portal-1", "--stage", "capture", "--effect-key", "native-capture",
                 ],
                 control_env,
             )
@@ -5132,8 +5075,8 @@ class InstallOrderingTests(unittest.TestCase):
                         [
                             "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
                             "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
-                            "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
-                            "--evidence", "receipt.json",
+                            "--run-id", "portal-1", "--stage", "capture",
+                            "--effect-key", "native-capture",
                         ],
                         control_env,
                     )
@@ -5180,8 +5123,7 @@ class InstallOrderingTests(unittest.TestCase):
                 [
                     "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
                     "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
-                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
-                    "--evidence", "receipt.json",
+                    "--run-id", "portal-1", "--stage", "capture", "--effect-key", "native-capture",
                 ],
                 control_env,
             )
@@ -5299,6 +5241,7 @@ class InstallOrderingTests(unittest.TestCase):
             for unit in (
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
                 "description-portal",
                 "description-operator-proxy",
@@ -5480,8 +5423,6 @@ class InstallOrderingTests(unittest.TestCase):
             foreign = root / "foreign"
             foreign.mkdir()
             shutil.copyfile(release.parent / "release.json", foreign / "release.json")
-            evidence = root / "reconcile-evidence.json"
-            evidence.write_text("{}\n", encoding="utf-8")
             commands = {
                 "promote": [
                     "bash", str(release / "operator" / "operatorctl.sh"), "promote",
@@ -5497,7 +5438,8 @@ class InstallOrderingTests(unittest.TestCase):
                     "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
                     "--config", str(release.parent / "platform.json"),
                     "--install-id", "gen-2", "--run-id", "portal-cross-tree",
-                    "--stage", "freeze", "--outcome", "failed", "--evidence", str(evidence),
+                    "--stage", "capture",
+                    "--effect-key", "native-capture",
                     "--release-file", str(foreign / "release.json"),
                 ],
             }
@@ -5676,6 +5618,7 @@ class InstallOrderingTests(unittest.TestCase):
             for unit in (
                 "description-airflow-dag-processor.service",
                 "description-airflow-scheduler.service",
+                "description-airflow-triggerer.service",
                 "description-airflow-api-server.service",
             ):
                 text = (unit_dir / unit).read_text(encoding="utf-8")
@@ -5701,7 +5644,7 @@ class InstallOrderingTests(unittest.TestCase):
             for pidfile in (Path(tmp) / "unit-state").glob("description-airflow-*.pid"):
                 pid = int(pidfile.read_text(encoding="utf-8").strip())
                 live_maps.append(Path(f"/proc/{pid}/maps").read_text(encoding="utf-8"))
-            self.assertEqual(len(live_maps), 3)
+            self.assertEqual(len(live_maps), 4)
             self.assertTrue(all(restored_venv in document for document in live_maps))
             self.assertTrue(all(candidate_venv not in document for document in live_maps))
             final_receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
@@ -6188,6 +6131,7 @@ class InstallOrderingTests(unittest.TestCase):
                 "description-solidworks-tunnel",
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
                 "description-portal",
                 "description-operator-proxy",
@@ -6206,6 +6150,7 @@ class InstallOrderingTests(unittest.TestCase):
                     "description-solidworks-tunnel": "inactive",
                     "description-airflow-dag-processor": "inactive",
                     "description-airflow-scheduler": "inactive",
+                    "description-airflow-triggerer": "inactive",
                     "description-airflow-api-server": "inactive",
                     "description-portal": "inactive",
                     "description-operator-proxy": "inactive",
@@ -6591,6 +6536,7 @@ class InstallOrderingTests(unittest.TestCase):
             for unit in (
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
             ):
                 self.assertTrue(any(unit in line for line in stopped), (unit, lines))
@@ -8341,46 +8287,14 @@ class NativePoolTests(unittest.TestCase):
         text = HEALTH.read_text(encoding="utf-8")
         self.assertIn("windows_native", text)
         self.assertIn("native pool windows_native is missing or its capacity is not 1", text)
+        self.assertIn('"$AIRFLOW_VENV/bin/airflow" version', text)
+        self.assertIn('"$AIRFLOW_VENV/bin/airflow" jobs check', text)
+        self.assertIn("--job-type TriggererJob --local --limit 1", text)
+        self.assertIn('conf.getint("triggerer", "capacity") == 64', text)
 
     def test_script_help_runs_without_airflow(self) -> None:
         result = run([sys.executable, str(self.SCRIPT), "--help"], {})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-
-class ScheduledSmokePreparationTests(unittest.TestCase):
-    """R02: the scheduled smoke prepares through the production pool entry and
-    verifies the capacity-1 pool's reschedule slot-release semantics.
-
-    The real scheduler run stays opt-in (RUN_SCHEDULED_AIRFLOW=1); these guards
-    keep the preparation and the sensor mode from regressing silently.
-    """
-
-    SMOKE = ROOT / "tools" / "scheduled_smoke.py"
-
-    def test_pool_preparation_uses_the_production_entry(self) -> None:
-        text = self.SMOKE.read_text(encoding="utf-8")
-        self.assertIn("ensure_pool.py", text)
-        self.assertLess(text.index('"db", "migrate"'), text.index("ensure_pool.py"))
-        # No bypass: the smoke must not fall back to the default pool for the native stage.
-        self.assertNotIn("default_pool", text)
-
-    def test_smoke_pins_reschedule_and_has_no_poke_override(self) -> None:
-        text = self.SMOKE.read_text(encoding="utf-8")
-        self.assertIn('SENSOR_MODE_REQUIRED = "reschedule"', text)
-        self.assertIn("SOLIDWORKS_SENSOR_MODE=SENSOR_MODE_REQUIRED", text)
-        self.assertNotIn('SOLIDWORKS_SENSOR_MODE="poke"', text)
-
-    def test_smoke_uses_only_the_current_six_task_ids(self) -> None:
-        text = self.SMOKE.read_text(encoding="utf-8")
-        self.assertNotIn("wait_for_job", text)
-        self.assertNotIn("confirm_job", text)
-
-    def test_smoke_requires_raw_task_reschedule_evidence(self) -> None:
-        text = self.SMOKE.read_text(encoding="utf-8")
-        self.assertIn("TaskReschedule", text)
-        self.assertIn('"reschedule_evidence"', text)
-        self.assertIn("up_for_reschedule", text)
-        self.assertIn("not proven", text)
 
 
 if __name__ == "__main__":

@@ -3,10 +3,11 @@
 # written; unrelated units in the same directory are left untouched.
 #
 #   render          write the description-* unit files (no systemctl; used by tests and for review)
-#   start           enable --now postgres (if configured), dag-processor, scheduler, api-server
+#   start           enable --now postgres (if configured), dag-processor, scheduler,
+#                   triggerer and api-server
 #   stop            disable --now every unit in reverse order (the full deployment stop)
 #   stop-executors  disable --now and prove stopped the execution units only (tunnel,
-#                   dag-processor, scheduler, api-server): the promotion window keeps the
+#                   dag-processor, scheduler, triggerer, api-server): the promotion window keeps the
 #                   shared PostgreSQL running and ready for its guarded migrations
 #   units ROLE      print the static managed-unit role inventory; read-only and env-free
 set -euo pipefail

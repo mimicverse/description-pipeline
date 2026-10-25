@@ -35,7 +35,7 @@ class SystemdUnitInventoryTests(unittest.TestCase):
             if path.is_file()
         }
         manifest_units = self.manifest.units_for_role("all")
-        self.assertEqual(len(unit_files), 7)
+        self.assertEqual(len(unit_files), 8)
         self.assertEqual(len(manifest_units), len(set(manifest_units)))
         self.assertEqual(set(manifest_units), unit_files)
 
@@ -46,6 +46,7 @@ class SystemdUnitInventoryTests(unittest.TestCase):
                 "description-solidworks-tunnel",
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
                 "description-operator-proxy",
                 "description-portal",
@@ -66,6 +67,14 @@ class SystemdUnitInventoryTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, role)
             self.assertEqual(tuple(result.stdout.splitlines()), self.manifest.units_for_role(role), role)
+
+    def test_triggerer_is_the_managed_deferred_effect_process(self) -> None:
+        unit = (ROOT / "deploy/airflow/systemd/description-airflow-triggerer.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ExecStart=@VENV@/bin/airflow triggerer", unit)
+        self.assertIn("Environment=AIRFLOW_HOME=@AIRFLOW_HOME@", unit)
+        self.assertIn("description-airflow-triggerer", self.manifest.units_for_role("airflow"))
 
     def test_unknown_missing_and_empty_roles_fail_closed(self) -> None:
         with self.assertRaisesRegex(self.manifest.UnitManifestError, "unknown unit role"):

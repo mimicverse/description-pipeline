@@ -35,6 +35,7 @@ const state = {
   assemblyChoice: null,
   uploading: false,
   uploadAbort: null,
+  submissionKey: null,
   blockedPick: false,
   targetsRetryPick: null,
   stages: [],
@@ -61,6 +62,7 @@ const RUN_STATES = {
   running: "Running",
   success: "Succeeded",
   failed: "Failed",
+  unresolved: "Unresolved",
 };
 const TASK_STATES = {
   success: "Succeeded",
@@ -365,6 +367,13 @@ function submitRun(pick, { onProgress } = {}) {
     request.open("POST", "/api/runs");
     request.withCredentials = true;
     request.setRequestHeader("Accept", "application/json");
+    if (!state.submissionKey) {
+      state.submissionKey =
+        typeof globalThis.crypto?.randomUUID === "function"
+          ? globalThis.crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    }
+    request.setRequestHeader("Idempotency-Key", state.submissionKey);
     if (state.csrf) request.setRequestHeader("X-CSRF-Token", state.csrf);
     request.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) onProgress(event.loaded / event.total);
@@ -402,6 +411,7 @@ function submitRun(pick, { onProgress } = {}) {
 
 function resetPick() {
   state.folderPick = null;
+  state.submissionKey = null;
   state.blockedPick = false;
   $("folder-input").value = "";
   $("folder-summary").hidden = true;
@@ -836,6 +846,7 @@ async function mutateRun(run, method, title) {
 function stageDotState(state) {
   if (state === "completed") return "ok";
   if (state === "failed") return "bad";
+  if (state === "unresolved") return "bad";
   if (state === "running") return "run";
   // Upstream-blocked and not-run stages stay neutral: nothing failed here.
   return "idle";
@@ -1875,6 +1886,10 @@ function renderRerunPanel(run) {
     host.hidden = true;
     return;
   }
+  if (stage.id !== "freeze") {
+    host.hidden = true;
+    return;
+  }
   host.hidden = false;
   const row = rows && rows.find((item) => item && item.stage === stage.id) || null;
   const runId = String(run.dag_run_id || "");
@@ -1882,8 +1897,7 @@ function renderRerunPanel(run) {
   const eligible = Boolean(row && row.eligible === true);
   const busy = state.rerunningRunId === runId;
   const deleted = run.deleted === true;
-  const isFreeze = stage.id === "freeze";
-  const options = isFreeze && row && Array.isArray(row.main_assembly_options)
+  const options = row && Array.isArray(row.main_assembly_options)
     ? row.main_assembly_options.filter((value) => typeof value === "string" && value)
     : [];
   const savedMain = typeof state.rerunMainByRun[runId] === "string" ? state.rerunMainByRun[runId] : "";
@@ -1896,47 +1910,43 @@ function renderRerunPanel(run) {
   line.className = "rerun-row";
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = busy
-    ? "Creating attempt..."
-    : (isFreeze ? "Create new request from Freeze" : "Rerun from this stage");
-  button.disabled = busy || !canManage || !eligible || deleted || (isFreeze && !selectedMain);
+  button.textContent = busy ? "Creating request..." : "Create new request from Freeze";
+  button.disabled = busy || !canManage || !eligible || deleted || !selectedMain;
   button.addEventListener("click", () => {
     void rerunFromStage(stage.id);
   });
 
-  if (isFreeze) {
-    const assemblyLine = document.createElement("div");
-    assemblyLine.className = "rerun-row rerun-assembly";
-    const label = document.createElement("label");
-    label.textContent = "New request from Freeze — main assembly in the sealed upload:";
-    const select = document.createElement("select");
-    select.setAttribute("aria-label", "Main assembly for the new request");
-    if (!options.length) {
-      const unavailable = document.createElement("option");
-      unavailable.value = "";
-      unavailable.textContent = "Verified main assembly list unavailable";
-      unavailable.selected = true;
-      select.append(unavailable);
-      select.disabled = true;
-    } else {
-      for (const name of options) {
-        const option = document.createElement("option");
-        option.value = name;
-        option.textContent = name;
-        select.append(option);
-      }
-      select.value = selectedMain;
-      select.disabled = busy || !canManage || deleted;
-      select.addEventListener("change", () => {
-        const value = String(select.value || "");
-        if (value) state.rerunMainByRun[runId] = value;
-        else delete state.rerunMainByRun[runId];
-        button.disabled = busy || !canManage || !eligible || deleted || !value;
-      });
+  const assemblyLine = document.createElement("div");
+  assemblyLine.className = "rerun-row rerun-assembly";
+  const label = document.createElement("label");
+  label.textContent = "New request from Freeze — main assembly in the sealed upload:";
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", "Main assembly for the new request");
+  if (!options.length) {
+    const unavailable = document.createElement("option");
+    unavailable.value = "";
+    unavailable.textContent = "Verified main assembly list unavailable";
+    unavailable.selected = true;
+    select.append(unavailable);
+    select.disabled = true;
+  } else {
+    for (const name of options) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      select.append(option);
     }
-    assemblyLine.append(label, select);
-    host.append(assemblyLine);
+    select.value = selectedMain;
+    select.disabled = busy || !canManage || deleted;
+    select.addEventListener("change", () => {
+      const value = String(select.value || "");
+      if (value) state.rerunMainByRun[runId] = value;
+      else delete state.rerunMainByRun[runId];
+      button.disabled = busy || !canManage || !eligible || deleted || !value;
+    });
   }
+  assemblyLine.append(label, select);
+  host.append(assemblyLine);
 
   line.append(button);
 
@@ -1952,9 +1962,7 @@ function renderRerunPanel(run) {
     // Canonical backend reason shown verbatim whenever the stage is not eligible.
     note.textContent = row.message;
   } else if (eligible) {
-    note.textContent = isFreeze
-      ? "Freeze creates a new request from the sealed originals; freeze and all later stages rerun. The original run and evidence remain."
-      : "This stage and downstream stages will be recomputed. The original run and evidence remain, and the rerun is a new linked run.";
+    note.textContent = "Freeze creates a new request from the sealed originals; freeze and all later stages rerun under the current rules and configuration. The original run and evidence remain.";
   } else {
     note.textContent = "Rerun conditions for this stage cannot be confirmed; refresh later.";
   }
@@ -2015,26 +2023,25 @@ function renderRerunPanel(run) {
 async function rerunFromStage(stageId) {
   const run = state.lastRun;
   const runId = state.dagRunId;
+  if (stageId !== "freeze") return;
   if (!run || !runId || state.rerunningRunId !== null || run.can_manage !== true || !stageId) return;
   const body = { stage: stageId };
   let selectedMain = "";
-  if (stageId === "freeze") {
-    const row = (Array.isArray(run.stage_reruns) ? run.stage_reruns : [])
-      .find((item) => item && item.stage === "freeze");
-    const options = row && Array.isArray(row.main_assembly_options)
-      ? row.main_assembly_options.filter((value) => typeof value === "string" && value)
-      : [];
-    selectedMain = typeof state.rerunMainByRun[runId] === "string"
-      ? state.rerunMainByRun[runId]
-      : String(run.main_assembly || "");
-    if (!options.includes(selectedMain)) {
-      state.rerunError = (row && row.message)
-        || "Select a verified main assembly from the sealed originals before creating a new request.";
-      renderRerunPanel(run);
-      return;
-    }
-    body.main_assembly = selectedMain;
+  const row = (Array.isArray(run.stage_reruns) ? run.stage_reruns : [])
+    .find((item) => item && item.stage === "freeze");
+  const options = row && Array.isArray(row.main_assembly_options)
+    ? row.main_assembly_options.filter((value) => typeof value === "string" && value)
+    : [];
+  selectedMain = typeof state.rerunMainByRun[runId] === "string"
+    ? state.rerunMainByRun[runId]
+    : String(run.main_assembly || "");
+  if (!options.includes(selectedMain)) {
+    state.rerunError = (row && row.message)
+      || "Select a verified main assembly from the sealed originals before creating a new request.";
+    renderRerunPanel(run);
+    return;
   }
+  body.main_assembly = selectedMain;
   state.rerunningRunId = runId;
   state.rerunNotice = "";
   state.rerunError = "";
@@ -2050,9 +2057,7 @@ async function rerunFromStage(stageId) {
     if (state.dagRunId !== runId) return; // the operator moved on; the list is refreshed
     if (!nextRunId) {
       const name = payload.resume_from_name || stageId;
-      state.rerunNotice = stageId === "freeze"
-        ? `Created a new request from ${name} with main ${selectedMain}; the original run and evidence remain.`
-        : `Created a new linked run from ${name}; the original run and evidence remain.`;
+      state.rerunNotice = `Created a new request from ${name} with main ${selectedMain}; the original run and evidence remain.`;
       if (!state.timer) {
         state.timer = window.setInterval(() => {
           void poll();
@@ -2478,7 +2483,11 @@ function renderPreviewDiagnostic(preview) {
   if (diagnostic.unverified) {
     const failure = document.createElement("p");
     failure.className = "preview-failure";
-    failure.textContent = "Engineering verification failed: this delivery is diagnostic only and must not be published.";
+    failure.textContent = diagnostic.reason === "run_unresolved"
+      ? "The run has unresolved external effects; this delivery has no current formal checkpoint qualification."
+      : diagnostic.mechanical_passed
+      ? "Mechanical verification passed, but this diagnostic replay has no formal checkpoint qualification and must not be published."
+      : "Engineering verification failed: this delivery is diagnostic only and must not be published.";
     node.append(failure);
   }
   const checks = Array.isArray(preview.failing_checks) ? preview.failing_checks : [];
@@ -2766,6 +2775,7 @@ function wire() {
       $("start-button").disabled = true;
       return;
     }
+    if (state.folderPick?.top !== picked.top) state.submissionKey = null;
     state.folderPick = picked;
     summary.hidden = false;
     summary.textContent = `${picked.top} · ${picked.count} files · ${formatBytes(picked.bytes)}`;

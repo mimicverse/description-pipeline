@@ -13,22 +13,6 @@ from xml.etree import ElementTree as ET
 import numpy as np
 
 from description_pipeline.io import PipelineError
-from description_pipeline.geometry.native_u import (
-    NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE,
-    NATIVE_OPEN_EDGE_SCOPE_RULE,
-    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
-    NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS,
-    NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
-    NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,
-    NATIVE_TOLERANT_EDGE_GAP_SOURCE,
-    NATIVE_TOLERANT_EDGE_GAP_WARNING,
-    NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
-    NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
-    NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
-    NATIVE_TOLERANT_EDGE_WARNING_REASON,
-    native_curve_topology_endpoint_set_assignment,
-    native_tolerant_edge_value_warning,
-)
 from description_pipeline.sources.solidworks.naming import (
     DISPLAY_MATERIAL_FALLBACK_NAME,
     DISPLAY_MATERIAL_FALLBACK_RGBA,
@@ -45,63 +29,6 @@ from description_pipeline.verification.solidworks_urdf import (
 )
 
 
-def native_tolerant_warning() -> dict:
-    source_sha256 = hashlib.sha256(b"native-source").hexdigest()
-    return {
-        "code": NATIVE_TOLERANT_EDGE_GAP_WARNING,
-        "blocking": False,
-        "message": NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
-        "component": "part-1",
-        "body_type": 1,
-        "body_index": 0,
-        "edge_reference_sha256": "a" * 64,
-        "fin_id": 329,
-        "fin_endpoint": "end",
-        "parameter_boundary": "u_max",
-        "point_roundtrip_rule": NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
-        "evaluate_rule_version": "native-curve-endpoint-float32-operation-v4",
-        "evaluate_metric": NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,
-        "evaluate_point_error_m": 1e-12,
-        "point_tolerance_m": 7.45e-9,
-        "projection_metric": NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
-        "projection_to_curve_l2_error_m": 4.98e-8,
-        "eligible_gap_m": 5e-7,
-        "gap_used": True,
-        "composed_projection_tolerance_m": 5e-7,
-        "gap_source_api": NATIVE_TOLERANT_EDGE_GAP_SOURCE,
-        "gap_cap_m": NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
-        "edge_tolerance_out_variant_type": 0x4005,
-        "field": "end_evidence.tolerant_edge_evidence",
-        "affected_fields": list(NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS),
-        "reason": NATIVE_TOLERANT_EDGE_WARNING_REASON,
-        "qualification": NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
-        "topology_endpoint_set": native_curve_topology_endpoint_set_assignment(
-            (0.0, 0.0, 0.0),
-            (1e-7, 0.0, 0.0),
-            (0.0, 0.0, 0.0),
-            (1e-7, 0.0, 0.0),
-        ),
-        "source_scope": {
-            "rule_version": NATIVE_OPEN_EDGE_SCOPE_RULE,
-            "component": "part-1",
-            "source_document_path": "C:/staged/source/Part.SLDPRT",
-            "source_copy_path": "source/Part.SLDPRT",
-            "source_document_sha256": source_sha256,
-            "source_copy_sha256": source_sha256,
-            "source_document_identity_sha256": source_sha256,
-            "source_document_identity_kind": "file_sha256",
-            "referenced_configuration": "Default",
-            "occurrence_scope": "part-1",
-            "virtual_owner": None,
-            "virtual_owner_sha256": None,
-            "virtual_session_document_path": None,
-            "virtual_session_temp_root": None,
-            "virtual_native_api_pid": None,
-        },
-        "open_edge_boundary_identity_sha256": hashlib.sha256(
-            NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE.encode("ascii")
-        ).hexdigest(),
-    }
 
 
 def metadata_value_warning() -> dict:
@@ -382,70 +309,7 @@ class ValueWarningTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             _value_warning_gate(self.root, source, model)
 
-    def test_native_open_edge_value_warning_is_rederived_and_required(self):
-        raw = native_tolerant_warning()
-        native = native_tolerant_edge_value_warning([raw])
-        model = copy.deepcopy(self.model)
-        model["provenance"]["value_warnings"].extend(native)
 
-        result = _value_warning_gate(
-            self.root,
-            self.source,
-            model,
-            native_warnings=[raw],
-        )
-        self.assertIn(NATIVE_TOLERANT_EDGE_GAP_WARNING, result["codes"])
-
-        missing = copy.deepcopy(model)
-        missing["provenance"]["value_warnings"] = [
-            item
-            for item in missing["provenance"]["value_warnings"]
-            if item["code"] != NATIVE_TOLERANT_EDGE_GAP_WARNING
-        ]
-        with self.assertRaises(PipelineError):
-            _value_warning_gate(
-                self.root,
-                self.source,
-                missing,
-                native_warnings=[raw],
-            )
-
-        forged = copy.deepcopy(model)
-        native_warning = next(
-            item
-            for item in forged["provenance"]["value_warnings"]
-            if item["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING
-        )
-        native_warning["objects"][0]["source_scope"][
-            "referenced_configuration"
-        ] = "Forged"
-        with self.assertRaises(PipelineError):
-            _value_warning_gate(
-                self.root,
-                self.source,
-                forged,
-                native_warnings=[raw],
-            )
-
-    def test_metadata_and_native_warnings_are_reconciled_together(self):
-        raw = native_tolerant_warning()
-        native = native_tolerant_edge_value_warning([raw])
-        metadata = metadata_value_warning()
-        model = copy.deepcopy(self.model)
-        model["provenance"]["value_warnings"].extend(
-            [copy.deepcopy(metadata), *native]
-        )
-
-        result = _value_warning_gate(
-            self.root,
-            self.source,
-            model,
-            native_warnings=[raw],
-            metadata_warnings=[metadata],
-        )
-        self.assertIn(NATIVE_TOLERANT_EDGE_GAP_WARNING, result["codes"])
-        self.assertIn("metadata.non_native", result["codes"])
-        self.assertEqual(result["objects"], 10)
 
     def test_model_cannot_self_claim_cad_material_when_raw_schema_has_no_appearance(self):
         model = copy.deepcopy(self.model)
@@ -1007,7 +871,7 @@ class ValueWarningTests(unittest.TestCase):
         )
         self.assertFalse(any(item["object_type"] == "frame" for item in formatted["objects"]))
 
-    def test_direction_rule_warning_preserves_an_unverified_authored_axis(self):
+    def test_direction_rule_warning_ignores_shared_aligned_status(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)
         source["joints"] = [
@@ -1016,7 +880,7 @@ class ValueWarningTests(unittest.TestCase):
                 "source_name": "left_shoulder_pitch_joint",
                 "type": "revolute",
                 "axis_provenance": {
-                    "status": "unverified",
+                    "status": "local_class_aligned",
                     "motion": "pitch",
                     "parent_axis": [0.0, -0.9396926208, -0.3420201433],
                     "rule_id": "direction.positive_semantics",

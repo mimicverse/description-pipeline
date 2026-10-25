@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from itertools import pairwise
 from pathlib import Path
 from unittest import mock
 
@@ -358,13 +359,25 @@ class RealAirflowConfigIdentityTests(unittest.TestCase):
         self.env["PLATFORM_CONFIG_DIGEST"] = self._config(None).config_digest
         with mock.patch.dict(os.environ, self.env, clear=False):
             spec.loader.exec_module(dag_module)
-            paths = dag_module._work_paths(
-                "solidworks_windows", "00000000-0000-4000-8000-000000000001", digest_a
-            )
+        from description_pipeline.orchestration.airflow_stage_operator import StageTaskOperator
+
+        dag = dag_module.solidworks_to_urdf_dag
+        self.assertEqual(dag.dag_id, "solidworks_to_urdf")
+        self.assertEqual(
+            set(dag.task_ids),
+            {"freeze", "discover", "capture", "generate", "verify", "publish"},
+        )
+        for task in dag.tasks:
+            self.assertIsInstance(task, StageTaskOperator)
+            self.assertEqual(task.stage, task.task_id)
+        chain = ("freeze", "discover", "capture", "generate", "verify", "publish")
+        for upstream, downstream in pairwise(chain):
+            self.assertEqual(dag.get_task(downstream).upstream_task_ids, {upstream})
+        self.assertFalse(hasattr(dag_module, "_work_paths"))
         snapshot_document = json.loads(snapshot_a.read_text(encoding="utf-8"))
         self.assertEqual(
-            paths.run_dir,
-            Path(snapshot_document["resolved"]["derived"]["store_root"]) / "00000000-0000-4000-8000-000000000001",
+            self._config(digest_a).store_root,
+            Path(snapshot_document["resolved"]["derived"]["store_root"]),
         )
 
         activate(self.root, "gen-1", document_a)

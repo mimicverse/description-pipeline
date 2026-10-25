@@ -152,7 +152,7 @@ class UrdfRobotLabelTests(unittest.TestCase):
         return root
 
     def test_robot_tag_must_match_the_definition_robot_name(self):
-        model = {"links": [{"name": "base"}], "frames": [], "joints": []}
+        model = {"name": "robot", "links": [{"name": "base"}], "frames": [], "joints": []}
         with tempfile.TemporaryDirectory() as directory:
             root = self._root(directory, "robot")
             definition = {"hardware_id": None, "source": {"robot_name": "robot"}}
@@ -172,6 +172,7 @@ class UrdfRobotLabelTests(unittest.TestCase):
             "objects": [{"object": "robot", "source": "native_derived", "field": "units"}],
         }
         model = {
+            "name": "robot",
             "links": [{"name": "base"}],
             "frames": [],
             "joints": [],

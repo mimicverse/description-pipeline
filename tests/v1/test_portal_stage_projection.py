@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 
@@ -9,6 +10,7 @@ from description_pipeline.orchestration.portal import PortalApp, PortalError
 from description_pipeline.orchestration.report_view import build_report
 from description_pipeline.stages import CONTRACT, stage_view
 from tests.v1.protocol_support import protocol_events
+from tests.v1.portal_read_support import RegisteredProjectionArtifacts
 
 RUN_ID = "7b7dbb68-b7ae-5545-859e-f351415e0fb9"
 SUBJECT = "a" * 64
@@ -25,24 +27,61 @@ def registered_report(run_id: str = RUN_ID) -> dict:
 
 
 class RegisteredStageProjectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.artifacts = RegisteredProjectionArtifacts()
+
     def app(self, report: dict) -> PortalApp:
         app = PortalApp.__new__(PortalApp)
         app._registered_stage_report = lambda projection, *, run_id, stage: report
         return app
 
-    def projection(self, states: dict[str, str]) -> dict:
+    def stage_members(
+        self,
+        stage: str,
+        *,
+        producer_run_id: str = RUN_ID,
+        payload: bytes = b"{}\n",
+    ) -> dict[str, dict]:
+        artifact = self.artifacts.register(
+            run_id=RUN_ID,
+            producer_run_id=producer_run_id,
+            stage=stage,
+            files={"reports/native-stages.json": payload},
+        )
         return {
-            "run": {"run_id": RUN_ID},
+            "reports/native-stages.json": {
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "artifact": artifact,
+            }
+        }
+
+    def projection(
+        self,
+        states: dict[str, str],
+        *,
+        parent_run_id: str | None = None,
+        producer_runs: dict[str, str] | None = None,
+    ) -> dict:
+        producer_runs = producer_runs or {}
+        return {
+            "run_id": RUN_ID,
+            "parent_run_id": parent_run_id,
             "stages": {
                 stage: {
                     "stage": stage,
                     "state": state,
-                    "reused_from_run": None,
                     "updated_at": "2026-10-20T02:49:41+08:00",
                 }
                 for stage, state in states.items()
             },
-            "by_stage": {},
+            "by_stage": {
+                stage: self.stage_members(
+                    stage,
+                    producer_run_id=producer_runs.get(stage, RUN_ID),
+                )
+                for stage in states
+            },
         }
 
     def test_complete_projection_keeps_native_checks_and_final_subject(self) -> None:
@@ -69,9 +108,20 @@ class RegisteredStageProjectionTests(unittest.TestCase):
 
     def test_registered_row_preserves_time_and_reuse_lineage(self) -> None:
         report = registered_report()
-        projection = self.projection({stage["id"]: "completed" for stage in CONTRACT["stages"]})
-        projection["stages"]["generate"]["reused_from_run"] = "source-run"
-        projection["stages"]["generate"]["checkpoint_uri"] = "store://sealed/source-run/generate"
+        projection = self.projection(
+            {
+                stage["id"]: "completed"
+                for stage in CONTRACT["stages"]
+            },
+            parent_run_id="origin-run",
+            producer_runs={"generate": "origin-run"},
+        )
+        projection["stages"]["generate"][
+            "reused_from_run"
+        ] = "legacy-forgery"
+        projection["stages"]["generate"][
+            "checkpoint_uri"
+        ] = "store://sealed/legacy-forgery/generate"
         projection["stages"]["generate"]["updated_at"] = "2026-10-20T03:00:00+08:00"
         job = {
             "run_id": RUN_ID,
@@ -89,55 +139,89 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         self.assertEqual(generate["at"], "2026-10-20T03:00:00+08:00")
         self.assertEqual(
             generate["reuse"],
-            {"parent_run": "source-run", "reused": True, "source_run": "source-run"},
+            {
+                "parent_run": "origin-run",
+                "reused": True,
+                "source_run": "origin-run",
+            },
         )
 
-    def test_reuse_report_may_bind_the_proven_checkpoint_origin(self) -> None:
-        for source, immediate_parent in (
-            ("parent-run", "parent-run"),
-            ("origin-run", "parent-run"),
-        ):
-            with self.subTest(source=source):
-                app = PortalApp.__new__(PortalApp)
-                payload = json.dumps(registered_report(source), sort_keys=True).encode("utf-8")
-
-                def member_bytes(path, member, data=payload):
-                    return data
-
-                app._registered_member_bytes = member_bytes
-                projection = {
-                    "run": {"run_id": RUN_ID},
-                    "stages": {
-                        "generate": {
-                            "stage": "generate",
-                            "state": "completed",
-                            "reused_from_run": immediate_parent,
-                            "checkpoint_uri": f"store://sealed/{source}/generate",
-                        }
-                    },
-                    "by_stage": {"generate": {"reports/native-stages.json": {"sha256": "a" * 64}}},
-                }
-                report = app._registered_stage_report(projection, run_id=RUN_ID, stage="generate")
-                self.assertEqual(report["run_id"], source)
-
-    def test_reuse_report_cannot_bind_an_unproven_source(self) -> None:
+    def test_reuse_report_binds_the_artifact_producer_run(self) -> None:
         app = PortalApp.__new__(PortalApp)
-        payload = json.dumps(registered_report("other-run"), sort_keys=True).encode("utf-8")
+        source_run = "origin-run"
+        payload = json.dumps(
+            registered_report(source_run),
+            sort_keys=True,
+        ).encode("utf-8")
         app._registered_member_bytes = lambda path, member: payload
-        projection = {
-            "run": {"run_id": RUN_ID},
-            "stages": {
-                "generate": {
-                    "stage": "generate",
-                    "state": "completed",
-                    "reused_from_run": "parent-run",
-                    "checkpoint_uri": "store://sealed/origin-run/generate",
-                }
-            },
-            "by_stage": {"generate": {"reports/native-stages.json": {"sha256": "a" * 64}}},
-        }
+        projection = self.projection(
+            {"generate": "completed"},
+            parent_run_id=source_run,
+            producer_runs={"generate": source_run},
+        )
+        projection["by_stage"]["generate"] = self.stage_members(
+            "generate",
+            producer_run_id=source_run,
+            payload=payload,
+        )
+
+        report = app._registered_stage_report(
+            projection,
+            run_id=RUN_ID,
+            stage="generate",
+        )
+
+        self.assertIsNotNone(report)
+        self.assertEqual(report["run_id"], source_run)
+
+    def test_reuse_requires_the_artifact_to_bind_the_proven_parent(
+        self,
+    ) -> None:
+        app = PortalApp.__new__(PortalApp)
+        app._registered_stage_report = (
+            lambda projection, *, run_id, stage: registered_report()
+        )
+        projection = self.projection(
+            {"generate": "completed"},
+            parent_run_id="parent-run",
+            producer_runs={"generate": "other-run"},
+        )
+
+        with self.assertRaisesRegex(
+            PortalError,
+            "no proven parent run",
+        ):
+            app._registered_stage_job(
+                {"run_id": RUN_ID},
+                projection,
+            )
+
+    def test_reuse_report_cannot_bind_another_artifact_producer(
+        self,
+    ) -> None:
+        app = PortalApp.__new__(PortalApp)
+        source_run = "origin-run"
+        payload = json.dumps(
+            registered_report("other-run"),
+            sort_keys=True,
+        ).encode("utf-8")
+        app._registered_member_bytes = lambda path, member: payload
+        projection = self.projection(
+            {"generate": "completed"},
+            parent_run_id=source_run,
+            producer_runs={"generate": source_run},
+        )
+        projection["by_stage"]["generate"] = self.stage_members(
+            "generate",
+            producer_run_id=source_run,
+            payload=payload,
+        )
+
         with self.assertRaisesRegex(PortalError, "conflicts with its run"):
-            app._registered_stage_report(projection, run_id=RUN_ID, stage="generate")
+            app._registered_stage_job(
+                {"run_id": RUN_ID},
+                projection,
+            )
 
     def test_partial_rows_cannot_turn_a_native_failure_into_success(self) -> None:
         events = protocol_events(subject=SUBJECT, failed_stage="capture")

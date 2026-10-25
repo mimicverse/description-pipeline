@@ -22,7 +22,7 @@ Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖
 
 | 主机 | 必需条件 |
 |---|---|
-| Linux | 发行清单支持的 x86_64 Linux、CPython、PostgreSQL、反向代理、Git/GitHub CLI、用户级 systemd；可访问 Windows SSH、飞书与模型仓库 |
+| Linux | 发行清单支持的 x86_64 Linux、CPython、正式默认 PostgreSQL 14、反向代理、Git/GitHub CLI、用户级 systemd；可访问 Windows SSH、飞书与模型仓库 |
 | Windows | 发行清单支持的 Windows、CPython x86_64、licensed SolidWorks 与原生 API；Windows PowerShell 5.1 Desktop（`powershell.exe`）、OpenSSH Server、专用登录桌面和独立工程暂存目录 |
 | 外部服务 | 可信 TLS、飞书企业应用及批准租户、私有模型仓库与存在的集成 base |
 
@@ -37,6 +37,15 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 `solidworks_windows` 连接的 `host`、`password` 为空，`port` 为 `null`，`extra` 恰含 `config_identity`；该引用只含快照的 `schema_version`、绝对 `path` 和 `sha256`。消费者按同一契约检查受控目录、普通非链接文件、`0600` 权限、快照格式及字节摘要。新接纳再核对当前安装记录；已冻结运行继续读取自己的配置身份，不能回退到当前连接的路由。
 
 安装、晋升和回退在关闭准入期间写入对应配置引用，完整核验后才能开放准入；失败保留原步骤证据。端点地址、目录、产品路由及凭据文件引用均从快照解析，不复制到连接字段。令牌轮换只更新受控凭据文件并验证认证，不重建旧式连接。
+
+Windows target 的生产接纳只读取一次 `PLATFORM_CONFIG_SNAPSHOT` exact bytes，并以同一
+组 bytes 校验 snapshot、state root 下的唯一 `install-record.json`、record 的
+snapshot 绝对 lexical path/digest/install ID 与 `ends.windows.target_identity`。
+`Application` 和 NativeOperationClient 必须使用该 target ID；DAG conf/XCom、trigger
+event、当前 `/health`、URL、环境变量、tool/release identity 和平台 claim 都不能自晋升
+expected target。`PreparedAdmission.register` 在 admit 前核对 application/client 与
+spec target；已存在 request 的重试先复用封存 Spec，不读取 later current registration
+改绑。
 
 最小配置如下，路径与标识在安装前替换为实际值：
 
@@ -98,7 +107,19 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 
 校验 Windows 离线运行档案与发行清单摘要，由受支持的 `stage` 在新安装代目录建立运行环境并安装 hash-locked 依赖，再通过 `promote` 切换既有受管任务。禁止向活动运行目录直接安装依赖或手工替换代码。`doctor` 验证安装身份、最小角色依赖及 SolidWorks/COM 就绪；实际作业仍须检查文件和会话。端点令牌的两端副本受控保存，原生端点只绑定 loopback：
 
-Windows 端点的新 generation 只使用解释器入口 `runtime\Scripts\python.exe`，参数固定为 `-I -B -m description_pipeline serve --config "<generation>\endpoint.json"`；其中 `-B` 禁止解释器向受管 generation 写入字节码缓存。stage receipt 必须声明 `launch_contract=python_module_v1`，promote 必须拒绝缺失或不同契约的候选。为完成从已部署 `140d39e5` generation 的一次性安全迁移，验证只可接受该固定 source commit 与 version 1.5.0 的精确旧形式 `-I -m description_pipeline serve --config "<generation>\endpoint.json"`；该兼容不得扩展到新 generation、其他来源或其他 action。不得依赖 pip 生成的 `description.exe` launcher；该 launcher 的代码完整性身份可能被主机 Device Guard/WDAC 策略拒绝，不能通过关闭策略、添加例外或复制旧可执行文件绕过。为完成从更早 generation 的一次性安全回滚，恢复只可接受无该契约历史 generation 的精确 `description.exe + serve --config "<generation>\endpoint.json"` 形式，并须记录 `legacy_pip_launcher_v0`；该过渡形式不得用于新 stage 或 promote。
+Windows 端点的新 generation 只使用解释器入口 `runtime\Scripts\python.exe`，参数固定为
+`-I -B -m description_pipeline.orchestration.windows serve --config "<generation>\endpoint.json"`；
+其中 `-B` 禁止解释器向受管 generation 写入字节码缓存。stage receipt 必须声明
+`launch_contract=python_module_v1`，promote 必须拒绝缺失或不同契约的候选。为完成从
+已部署 `140d39e5` generation 的一次性安全迁移，验证只可接受该固定 source commit
+与 version 1.5.0 的精确旧形式
+`-I -m description_pipeline serve --config "<generation>\endpoint.json"`；该兼容
+不得扩展到新 generation、其他来源或其他 action。不得依赖 pip 生成的
+`description.exe` launcher；该 launcher 的代码完整性身份可能被主机 Device
+Guard/WDAC 策略拒绝，不能通过关闭策略、添加例外或复制旧可执行文件绕过。为完成从
+更早 generation 的一次性安全回滚，恢复只可接受无该契约历史 generation 的精确
+`description.exe + serve --config "<generation>\endpoint.json"` 形式，并须记录
+`legacy_pip_launcher_v0`；该过渡形式不得用于新 stage 或 promote。
 
 Windows 的 canonical release archive 是不可变 lifecycle 输入，不进入可变 recovery snapshot/state。恢复只重建 runtime、配置和任务身份；archive 缺失、摘要漂移或 ReadOnly/protected ACL 不成立时必须从同一固定 release 重建并重新 stage，promote/rollback 复用前重新核验 ReadOnly、受保护 ACL 与摘要，不能静默恢复成可写归档。
 
@@ -163,7 +184,43 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 
 同版双端核验比较 `version`、`source_commit` 和 `source_sha256`。两端各自的 `install_id`、`config_digest` 必须匹配对应主机的安装记录和实际配置，不要求两端这些值相同；不能用同版发行身份代替每端的配置、角色和运行身份核验。
 
+Windows `/health.install_id` 必须位于顶层。模板的 expected `NativeTargetIdentity` 只来自
+已核验部署登记，不从环境变量、当前 health 自报或迁移后的 URL 推导。stage/promote
+分别核对身份与 readiness：`unresolved>0` 可使 `ready=false`，但只读 status、
+reconciliation 和 recovery 仍必须可用；不能因原 operation 正在运行或未决而拒绝
+查询。endpoint preparation 的顶层 `target_identity` 原样进入 install record 的
+`ends.windows.target_identity`，并由 record 的 snapshot path/digest 绑定配置；不回写
+platform snapshot。每个请求、响应与 original operation 保存并复验同一 target；服务端 upload
+同时校验 expected target、operation target 和当前 runtime，错误 target 在 admission
+与 create 前拒绝。URL 可迁移，同 install 重启可恢复；state root 变化、404、health
+不可达或错路由只保持原 operation UNKNOWN，不推断 absence。tool/release、平台
+origin claim 和 native worker owner 分别核验；同一 install 恢复仍排他，复制 install
+ID 不构成授权，并继续只使用一个既有部署登记来源。
+
 DAG 验收还须核对活动记录中的绝对路径与发行成员摘要、实际生效的 `core.dags_folder`、当前 `DagVersion` 和 `SerializedDag` 关联，以及序列化的文件和解析目录。唯一支持的 `dags-folder` 本地 bundle 使用空版本；不能因此省略已登记版本 UUID 与实际任务来源核对。真实监督任务日志记录加载的 DAG 路径、SHA-256 和 Python 包来源。历史目录即使存在同名字节，也不能代替当前发行绑定；身份不符时不得开放新准入。
+
+Airflow 发行固定为 3.3.2。DAG 的六个 task 均使用 `StageTaskOperator`，当前固定
+`max_active_runs=8`、`max_active_tasks=8`；这些值只限制调度并发，不能替代 physical
+CAD ownership、容量为一的 native pool 或 target/effect conflict。operator 的
+`execute()` 绑定真实 DagRun/TaskInstance 后调用 `StageApplication.run_stage()`；
+`StagePending` 以持久 `StageEffectWait` 调用 `defer()`。恢复由
+`StageTaskOperator.execute_complete()` 先核对 wait/event digest 与真实 task
+context，再调用 `StageApplication.resume_stage(wait)`。
+
+异步 `EffectPollTrigger` 只读取 canonical wait/effect/outbound 和精确
+operation/target，不取得 claim、不创建或上传 operation、不 seal payload、不写
+fact/decision、不取消外部操作。401/403、`native_operation_identity_mismatch` 及其他
+非 `native_target_mismatch` conflict 必须中止；404、缺 status transport error、
+可识别协议错误、5xx 或明确 `native_target_mismatch` 保持同一 wait 并继续只读 poll。
+错误 event/wait、foreign operation view、错 target、旧 fence 或 trigger 重启不得造成
+重复外发。
+
+发行安装必须包含 Airflow 3.3.2 triggerer，配置中显式设置
+`[triggerer] capacity = 64`、`job_heartbeat_sec = 5.0` 和
+`triggerer_health_check_threshold = 30.0`；受管单元
+`description-airflow-triggerer.service` 与 scheduler/executor 一同 stage、promote、
+start、stop、health 和 recovery。triggerer 缺失、版本不符、未运行或 job heartbeat
+不健康时部署保持失败；fake trigger、仅改 DAG 或只有同步 TaskFlow 不满足验收。
 
 ## 飞书与权限
 
@@ -178,12 +235,70 @@ DAG 验收还须核对活动记录中的绝对路径与发行成员摘要、实�
 开放服务前，在已安装发行上验证完整流程：
 
 1. 两端安装身份及 `doctor` 通过，配置一致、TLS 可信、真实飞书登录成功；未批准租户和越权运行管理被拒绝。
-2. 上传原生文件夹，选择主装配与产品目标，执行全部六阶段；请求、证据、报告、预览和 PR 绑定一致。
+2. 上传原生文件夹，选择主装配与产品目标，执行全部六阶段；请求、证据、报告、预览和
+   PR 绑定一致。Discover 与 Capture 分别核验本 operation archive、materialize 结果和
+   生产身份与同一 SourceSet 原件血缘一致；SourceSet 与 prepared 保持不同摘要。两个
+   operation 可以独立传输和物化，单 runtime/CAD owner 与 operation-local workspace
+   不变；不得新增跨 operation source cache 或把内容复用当作工程资格。
 3. Linux 推导、生成、验证、报告与发布不调用 Windows；验证/发布重跑不创建 CAD 操作，Windows 安装不包含可移植运行依赖。
-4. 同时提交、重复请求、断连与重启保持幂等；原生作业串行，未知 CAD 会话被拒绝且不被访问或终止。
-5. 缺失/包外来源、错误配置、坏证据及验证失败阻断下游；诊断与未验证预览的身份清晰。发布失败保留验证结果，未知外部结果通过对账恢复。
-6. 阶段重跑正确复用完整上游，保留原时间和生产身份；删除/恢复显示记录不移除证据。服务重启后请求、历史、准入和发布状态可恢复。
-7. 使用实际连接写入端与正式健康/DAG消费者验证同一配置引用，并证明切换后已冻结运行的配置身份不变；演练 stage/promote/rollback 与第二主机切换失败，注入配置漂移，核对仓库规则允许追加且禁止非 fast-forward，完成凭据轮换及备份恢复；全部维护路径使用同一生命周期和资源域。
+4. 同时提交、重复请求、断连与重启保持幂等；在全新进程中从已登记 command 和封存
+   artifact 重建 workspace，不依赖前一阶段内存、缓存或临时目录。native operation
+   串行，未知 CAD 会话被拒绝且不被访问或终止。
+5. 在锁定 Airflow 3.3.2 的 scheduler、triggerer 与 executor 上证明真实 deferred task
+   释放 worker/pool slot，并由新 worker 恢复同一 command；另一无冲突 run 可推进，
+   同时 CAD ownership 不重叠。覆盖 worker/triggerer 重启、重复或错身份 event、旧
+   fence、丢 ACK、UNKNOWN、timeout 与取消，证明无重复外发或虚假 qualification。
+   直接混入 401/403、foreign operation view、`native_operation_identity_mismatch`
+   和非 target conflict 必须使 trigger 明确中止；404、transport、5xx 或
+   `native_target_mismatch` 保持同一 wait 继续 poll，不得切换到其他 operation。
+6. 缺失/包外来源、错误配置、坏证据及验证失败阻断下游；诊断与未验证预览的身份清晰。
+   发布失败保留验证结果，未知外部结果通过对账恢复。
+7. 新的正式重跑或 Freeze successor 始终从 `freeze` 接纳；只复用父运行已验证
+   `freeze_originals`，当前 rules/config/target/Git/native requirement 与双端工具
+   重新封存，不继承父 Discover 及后续 decision、成功或 qualification。已登记 command
+   的安全重试保留原证据时间、producer、effect 及封存请求身份；当前执行权按
+   canonical claim 规则取得新 fence，不改写外部请求中的旧 fence。删除/恢复显示
+   台账不移除证据。每次 successor/claim/decision/send 都重算 immediate 与 supporting
+   predecessor qualification、result/failure metadata 和 effect ledger；跨运行复用只
+   经已验证父 Freeze originals 的新请求进行。
+   服务重启后请求、历史、准入和发布状态从 canonical facts 经唯一共同业务 projector
+   恢复；单个诊断目标不能计入正式六阶段。
+8. 使用实际连接写入端与正式健康/DAG消费者验证同一配置引用，并证明切换后已冻结运行的配置身份不变；演练 stage/promote/rollback 与第二主机切换失败，注入配置漂移，核对仓库规则允许追加且禁止非 fast-forward，完成凭据轮换及备份恢复；全部维护路径使用同一生命周期和资源域。
+9. 为 native 输入传输注入一种可恢复窗口：原 operation 已 accepted、input 未 admitted、
+   传输响应丢失。验证只有同一 command/effect/envelope/request/payload/archive/tool 且
+   祖先、取消和维护门仍允许，且旧 claim 已 yielded/stale 时，共同 engine 才取得
+   narrow `transfer_resume` claim；不得接管未过期的 live claim。handler 重建原字节后，
+   必须由独立 `authorize_resume` 事务再次核验当前事实并提交发送授权。验证两个事务
+   之间的取消、祖先变化、租约到期和物化失败均不外发。服务端对原
+   operation 只放行原 archive，input admission 与
+   executor 各一次，原外部 request 内 claim/fence、producer 与工具身份不变。覆盖
+   worker/triggerer 重启、lost ACK、重复 event 与 timeout；注入 404、observer
+   failure、错 archive/tool/effect identity、重复 ACK 和 cancel 竞争，证明前者保持
+   未知或拒绝且绝不 create，后者只保真实先后事实；ACK 与 trigger event 均不证明
+   native success。另证明 Git ref/PR upsert 的 UNKNOWN 不能取得
+   `resume_transfer`、重传或普通 handler 重跑，只由 git/gh 只读 hint 唤醒 worker 的
+   权威 reconciliation。
+10. 用新 wire/schema 的真实组合验证 NativeTargetIdentity：两个 same tool/release 但
+    不同 install target 的端点不能串用 upload、operation、observation 或恢复；同一
+    install 在 URL 迁移和合法重启后只能恢复原 operation。注入 health 到 upload
+    之间的 target/runtime 切换、错误路由、state root 变化、404、health 不可达及并发
+    request，证明服务端而不是客户端执行 expected/operation/runtime 三方核对，错误
+    target 不 admit、不 create、不启动 executor，原 operation 保持未决。另证明
+    `ready=false` 或 `unresolved>0` 不封锁只读观察、对账和恢复，且 same tool、平台
+    origin claim、native worker owner 与 install target 分别核验。
+11. 使用 root-approved `native-tessellation/v13` source 验证一次 whole-body analysis
+    tessellation：唯一 `IBody2.GetTessellation` 请求恰有一个显式
+    `VARIANT(VT_EMPTY, None)`，参数数量、VARIANT 类型和空值均被独立复核；六个严格属性
+    均在唯一 `Tessellate` 前设置并逐 body 回读，
+    `ImprovedQuality` 只请求一次，`NeedErrorList` 的五项 byref VARIANT 和不支持接口的
+    诊断行为符合合同。`Tessellate=false` 必须在 `GetFaceFacets` 前失败，失败后零计数
+    或 `null` 不得成为空几何；独立 consumer 复算六属性及失败证据。
+12. 注入 `GetFaceFacets=None`、`GetEdgeFins=None`、直接空数组、重复/嵌套/标量 ID、
+    跨 face 重叠、facet/fin 总量不足或超出、错误 incident ownership、solid body 与
+    COM 读取失败：只有严格 sheet body、完整 face/facet/fin 集合闭合成立时才接受派生空
+    set，并核对原始 nullable、`raw/source_scopes`、typed 对象身份、具体 rule 和
+    `cad_face_facet_ids_derived_by_body_global_closure` /
+    `cad_edge_fin_ids_derived_by_empty_incident_faces` warning。其余情况全部拒绝。
 
 保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
@@ -193,20 +308,99 @@ DAG 验收还须核对活动记录中的绝对路径与发行成员摘要、实�
 
 操作员在同一入口明确选择工程或检查预览用途；冻结记录使用唯一 `request/v2` 并保留选择。逐组核验输入、请求、运行、报告、实际关节预览与 `main` 候选 PR 的绑定，不能跨用途代跑。两种用途均以当前 CAD 和明确的适用规则建立交付；检查预览可按[用途契约](contracts.md#purpose)的 `inspection_rotation_full_turn/v1` 使用全周窗口，必须验证适用条件并显式显示原生范围缺项与策略来源，不得抄入手工结果或冒称机械限位。已有有效 CAD 范围不得被窗口覆盖。缺失驱动不显示为零能力；报告、预览和 PR 一致显示参数来源与资格。必需检查和原生事实要求不因用途减弱。不同用途的候选与发布恢复身份按[发布协议](contracts.md#publication)隔离。
 
-方向验收绑定本次 CAD、规则版本、固定代码提交及实际交付：先核对全部关节的原值、作者声明绑定、必要坐标转换和未解决项，再通过门户预览执行有效范围内的非零运动，验证 CAD 运动语义、零位及范围的一致性。当前不发布基于右手定则或功能动作的新正向推导规则，历史试算不作为通过证据。生成与独立工程验证只取得 CAD 和规则输入，固定手工参考由最终对比单独读取，并保留参考不可访问及扰动反例。方向与手工参考的纯符号差异不阻塞发布；未解决的命名、范围或其他真实一致性缺陷，以及 CAD 轴向、坐标转换和原生运动错误仍阻塞。不得以试算、旧运行或健康状态替代发布验收。
+需要从已有运行改用封存 CAD 原件时，`/api/runs/<parent>/attempts` 只接受
+`stage=freeze`，调用 `load_production_freeze_successor(...)`。该入口通过
+`StageApplication.load_verified_freeze_origins(parent)` 重验父 Freeze
+decision/result、`inputs.json`、originals ref 和 CAS bytes，只复用
+`spec.originals`；当前 rules、config snapshot、target、RepositorySnapshot、Git
+baseline、native requirement、portable/native closure 与六阶段 executor 重新接纳，
+随后调用同一 `StageApplication.admit`。返回的 technical dispatch command 交给同一
+`StageApplication.dispatch(command_id, adapter)` facade；facade 内的
+`TechnicalDispatchService` 先取得 claim/fence、提交 `dispatch_authorized`，再调用
+Airflow trigger。实际 Freeze task 只绑定启动后的真实 task context，不授权自己的
+创建。Portal 不接收或构造 `VerifiedArtifact`，不实例化第二 Factory，不保留 Discover
+及后续阶段起点旁路。
+
+方向验收绑定本次 CAD、规则版本、固定代码提交及实际交付：先核对全部关节的原值、作者声明绑定、必要坐标转换和未解决项，再通过门户预览执行有效范围内的非零运动，验证 CAD 运动语义、零位及范围的一致性。当前不发布基于右手定则或功能动作的新正向推导规则，历史试算不作为通过证据。必须注入共享 `status=local_class_aligned` 而作者正向证据仍缺失的负例，证明 Discovery、Generate、独立验证、模型来源、URDF、报告、预览和 PR 均保留同一
+`direction.semantics_unresolved` warning；同时核对 axis／xyz／rpy／limits、封存
+Capture bytes 和 `machine_qualification` 不受 warning 影响。生成与独立工程验证只取得
+CAD 和规则输入，固定手工参考由最终对比单独读取，并保留参考不可访问及扰动反例。方向与
+手工参考的纯符号差异不阻塞发布；未解决的命名、范围或其他真实一致性缺陷，以及 CAD
+轴向、坐标转换和原生运动错误仍阻塞。不得以试算、旧运行或健康状态替代发布验收。
 
 <a id="lifecycle"></a>
 ## 维护、升级与恢复
 
-生命周期命令为 `validate / install / start / drain / stop / status / health / reconcile / stage / promote / rollback`，统一读取同一配置及安装记录。`drain` 关闭新提交和 DAG 准入，保留在途执行；返回全部活动、未确认与发布中操作。`stop` 仅在已排空且状态已知时停止全部管理服务，禁止通过杀进程代替排空。
+生命周期命令为 `validate / install / start / drain / stop / status / health / reconcile / stage / promote / rollback`，统一读取同一配置及安装记录。`drain` 关闭新提交和 DAG 准入，保留在途执行；返回全部活动、未确认与发布中操作。`drain`、`stop` 和成功显示共用唯一共同业务 projector 及真实 Airflow 关联，不得读取独立 SQL reducer 或仅凭 Freeze decision 推断正式运行成功。`stop` 仅在已排空且状态已知时停止全部管理服务，禁止通过杀进程代替排空。
 
 备份维护使用 `stop --keep-database` 停止受支持写者并保留 PostgreSQL，随后核验实际 Linux 服务和 Windows 任务停止状态。备份从 `drain` 前至归档、清单及收据完成一直持有状态根下的 `locks/maintenance.lock`；`start / drain / stop / reconcile / stage / promote / rollback` 使用同一锁。嵌套调用须验证继承的锁及属主，不能仅凭环境变量绕过加锁。
 
-维护查询账户只获准读取准入与生命周期视图，无平台写入权或 Airflow schema 访问权。关闭与重开准入经平台受控事务入口执行，使用明确的写入授权；只读凭据不能执行这些变更。维护查询采用[架构定义的一致快照](design.md#持久化与一致性)，缺绑定、未知状态或权威不可读时拒绝停止和切换。
+维护查询账户 `operator_ro` 的只读面按共同 projector 的实际依赖固定为：
 
-平台编排在启动与有界退避重试时对账，维护人员也可调用 `reconcile`。对账查询调度意图、阶段收据、Windows 操作及远端 Git/PR，确认已发生结果后登记或安全继续；不能重复未知副作用。未决状态未消除时，排空不算完成。
+| 权限 | 对象 | 边界 |
+|---|---|---|
+| `SELECT` | `lifecycle_projection`、`admission_projection` | 仅真实 Airflow 关联、drain/stop bucket 与准入投影 |
+| `SELECT` | `run_admission`、`command`、`stage_decision`、`effect_intent`、`effect_fact`、`execution_claim` | 同一只读 repeatable-read snapshot 供 `read_admitted_runs` 复算共同状态 |
+| 禁止 | 六个事实表的写入、`run_display_metadata` 写入及 Airflow schema 直接访问 | `operator_ro` 无 `INSERT`、`UPDATE`、`DELETE` 或 DDL |
 
-缺少调度绑定或平台漏记结果的已登记派发，按[恢复契约](contracts.md#recovery)由同一 `reconcile` 处理。先关闭准入，保全原运行/操作/阶段/事件、生命周期投影、实际 Airflow 全键及适用的原始故障证据；冻结失败且后继从未派发时保全 Airflow 原始诊断，已有原生执行时保全端点终态原件；只读预演输出唯一目标、证据摘要和精确预期差异。正式执行重新核验同一事实，仅补缺失绑定并登记已发生结果。先逐笔核对，再重复提交证明幂等，确认实际调度与业务均已结算，`report --require-settled --require-admission-closed` 才能通过。不得手工 SQL 改终态、删除记录、使用空的平行数据库、重跑 CAD 或豁免未知行来排空。
+这六表只读权限是 `read_admitted_runs` 在同一快照消费 canonical facts 的最小必要
+条件；显示 metadata 由受控写者管理，不由 `operator_ro` 写。
+`RunControlStore` 通过 `read_admitted_runs` 的
+`project_effect_state/project_stage_status/project_run_status` 共同投影读取当前
+运行状态，并只写 `run_display_metadata`。SQL `lifecycle_projection` 仅提供真实
+Airflow scheduling/DagRun 关联和 drain/stop bucket，不能聚合 stage decision 或
+effect。该 store 不能写 command、claim、candidate、decision、effect 或
+qualification，不能成为第二 stage 状态权威。显示名、隐藏与恢复只改变显示台账，
+不改变运行状态、阶段结论或证据。正式成功必须来自六个 formal stage 的 complete
+decision 与满足的 effect ledger；diagnostic 目标与正式六阶段隔离。
+关闭与重开准入只经窄 `AdmissionControlStore` 事务 API 执行，使用明确的写入授权；
+operator 不构造 `PlatformStore`、artifact reader 或第二状态机。只读凭据不能执行这些
+变更。维护查询采用[架构定义的一致快照](design.md#持久化与一致性)，缺绑定、未知状态
+或权威不可读时拒绝停止和切换。
+
+旧 `platform.storage` filesystem checkpoint writer/URI resolver、native discovery
+reconstruction builder、receipt 和 seal/confirm surface 不属于部署。Historical root
+recovery 只导入 `validate_native_discovery_stage` 校验既有纯原生 stage evidence；
+显式一次性 Capture migration 使用 `ArtifactStore.seal_tree()`。不得恢复
+`store://sealed` 文件权威、旧 Store 写者或为旧 test 保留不可调用接口。
+
+Portal、平台编排启动和后台有界退避重试直接调用
+`StageApplication.reconcile_effect(command_id, effect_key)`，不通过 shell。
+维护人员使用 `operatorctl reconcile --run-id <run> --stage <stage> --effect-key
+<key>`；该 CLI adapter 只解析 canonical run、stage 和显式 effect key，没有
+kind-to-observer 映射。同版 `deploy/operator/reconcile-effect.py` 读取唯一的 command
+后调用生产 application。该入口按 `command_id`、`effect_key`、不可变 outbound 和
+原始 provider identity 选择待结算 effect，只覆盖 native operation、Git ref 与 PR
+upsert；technical Airflow dispatch 的 UNKNOWN 由 `StageApplication.dispatch`/
+`TechnicalDispatchService` 观察原 DagRun/conf。两类 path 不互相替代，不提供
+native-capture、release、stage 或 publisher 专用恢复命令。正式发行必须不包含
+`deploy/operator/reconcile-native-capture.py`，且不得为该已删除脚本保留 fallback。
+未决状态未消除时，排空和停止都不算完成。
+
+生产 composition 的唯一明确入口为 `application_from_environment()`。它安装
+application registry，并由 application 按原 `EffectIntent.effect_kind` 选择
+native/Git/PR adapter；Portal、自动重试和维护 adapter 不各自构造 observer、硬编码
+NativeObserver、接收 provider 输出或 evidence 旁路，也不建立第二套 effect-kind
+映射。
+
+正式执行前先关闭准入并生成只读预演，列出原 command/effect、目标 provider、证据摘要
+和唯一预期事实。native observer 只 GET 原 operation，不 create/upload/trigger/cancel
+或打开 CAD；Git observer 在临时 clone 中验证原 bundle/base/branch，不 prepare 或
+push；PR observer 只按原 repository/base/head/candidate 查询，不 create/update。
+精确 known payload 可建立 SAT；普通单次 404、空查询或 `unobservable` 不足以证明
+sent effect 不存在。只有完整资源范围、完整原 operation identity 和无遗漏搜索结果均
+闭合的精确 absent reconciliation 可建立 `definitely_failed`。multiple、conflict 或
+content mismatch 保持未决。完整观察目录、原始响应、metadata 和未封存 workspace 在
+service seal/fact 提交成功前始终保留；失败不清理证据，所有结果均不得盲重发。
+
+reconcile 无 claim/fence，不创建 reconcile command，也不发送授权。其短事务只锁定
+当前 `effect_intent`/`effect_fact` sequence，并只读重验原 command、outbound/artifact
+identity 与 metadata closure；外部观察在事务外执行。普通 successor/claim/send/
+decision 则先持当前 command 边界，再从根 predecessor 到叶复核有界 decision/result 与
+effect ledger，最后进入当前 claim/fence、cancellation/effect 与 candidate/decision
+边界；不得引用已删除的 run 表锁。相同 reconcile 输入返回原结果，冲突事实拒绝。后到
+旧 fence response/timeout 只能追加审计事实，不能覆盖 reconcile 终态。不得手工 SQL
+改终态、删除记录、使用空的平行数据库、重跑 CAD 或豁免未知行来排空。
 
 该能力属于固定候选的维护完整性，必须在合并前完成实现、隔离反例与真实数据库验证；生产执行只使用已验证的完整发行或其正式维护路径，不向活动安装目录补拷修复代码。
 
@@ -230,11 +424,77 @@ Windows 候选配置由正式 `stage` 按当前端点 schema 确定性生成。�
 
 备份前关闭准入、排空并确认无未决副作用，在同一维护锁内停止写者，取得平台与 Airflow schema 的同一数据库快照，再按该快照引用复制冻结原件、交付/诊断、安装记录、配置与密钥并核验清单。备份加密、访问受控，按部署恢复目标保留；升级前须有已验证的恢复演练。备份成功或中途失败后均明确报告服务停止与准入状态，由受控生命周期入口恢复运行。恢复在关闭准入状态下核验清单和引用，查询两端作业与远端发布结果后重建投影，先证明完整再开启服务。
 
-恢复工具仅消费 v6 清单及 v3 目标计划，工作进程协议为 v5。旧格式在状态目录创建、解包和目标写入前拒绝并保留原件。不得把旧包更名、改版本或移除检查后强制恢复。目标计划除了固定绝对路径和清单摘要，还必须带同源闭包摘要；恢复完成收据和 marker 的绑定必须一致，finalize 再次核验后才能启动服务。
+恢复 runtime 必须用自身的 Python 3.12 虚拟环境完成 package identity、
+`description`／`airflow` entry probe 与 `pip check`。probe 从 caller 仅去除
+`PYTHONPATH`、`PYTHONHOME`、`VIRTUAL_ENV`，设置 `PYTHONNOUSERSITE=1`，并保留
+`PATH`、`LD_LIBRARY_PATH`、`SSL_CERT_FILE` 等系统运行变量；解释器和
+`pip check` 使用 `-I -B`。必须同时验证真实缺失依赖负例失败、caller package shadow
+不可见、恢复包 member/source digest 属于该虚拟环境。不得通过增加 test-only package
+或放宽 `pip check` 掩盖发行错误。
 
-正式目标计划统一由同版 `recovery.py target-plan --manifest <v6清单> --host-id <目标身份> --postgres-config <目标数据库参数JSON> --out <新计划>` 生成。数据库参数必须显式给出 `bin_dir`、`library_dir`、`socket_dir`、`data_dir`、`port` 和 `bootstrap_role`。生成器先验证真实清单和外部摘要，再复制 closure、原绝对 root 路径及 Windows 身份，生成 v3 并复验；输出必须是新文件。旧审查目录中的 v2 `prepare_target.py` / `derive-target-plan.py` 仅作历史证据，不得用于新发行，不修改其旧原件。
+恢复工具仅消费 v7 清单、v2 selection 及 v3 目标计划，工作进程协议为 v5。旧恢复
+清单、来源选择、目标计划及更早协议在状态目录创建、解包和目标写入前拒绝并保留原件。
+不得把旧包更名、改版本或移除检查后强制恢复。目标计划除了固定绝对路径和清单摘要，
+还必须带同一 typed fact-root 与来源范围的闭包摘要；恢复完成收据和 marker 的绑定必须
+一致，finalize 再次核验后才能启动服务。
 
-快照先在持有的数据库事务中发布原始引用及摘要，随后计算和复制精确闭包。runs 只保留被引用的 sealed 生产者树；多个消费者共享一份物理树，失败检查点作为失败原件保存。状态侧保留固定配置和小型安装元数据，仅按当前/上一代 journal 的 typed 引用保存 promotions 文件及必要的外部证据，不递归复制整个 promotions，也不复制历史 `backup.tar.enc`。原路径、原权限和摘要均受验证。历史元数据不意味着历史回滚可用；所需密文或证据缺失时，在关闭准入、切换指针、数据库、Windows 和服务操作之前明确拒绝。
+正式目标计划统一由同版
+`recovery.py target-plan --manifest <v7清单> --host-id <目标身份> --postgres-config <目标数据库参数JSON> --out <新计划>`
+生成。数据库参数必须显式给出 `bin_dir`、`library_dir`、`socket_dir`、`data_dir`、
+`port` 和 `bootstrap_role`。生成器先验证真实清单和外部摘要，再复制 closure、原绝对
+root 路径及 Windows 身份，生成 v3 并复验；输出必须是新文件。任何其他 target-plan
+脚本或配置副本都不是支持入口。
+
+快照先在持有的数据库事务中发布完整 canonical typed 根及摘要，随后计算和复制精确
+闭包。根必须覆盖 `run_admission.request` 与 `command.request` 内嵌 artifact 引用
+（包括未来阶段输入和 dispatch conf）、`command_input_artifact`、
+`effect_intent` outbound、`effect_fact` payload 与 reconciliation metadata、无
+decision 的 `stage_candidate` output/result、已决 `stage_decision` result、
+FailureEnvelope evidence，以及未决 claim、未封存故障 workspace 与 typed
+`retained_locations`。缺项、摘要漂移或类型不明时不得形成可恢复清单。
+
+CAS artifact root 只复制该 typed 根实际引用的 object；共享 object 只复制一次，只有
+完整事实根证明无任何引用的孤儿才可排除。未知 effect、未决 candidate、已授权但响应
+未知的 outbound、失败或取消原件和未封存 workspace 都必须保留，不能因没有 decision
+而省略。恢复后 ArtifactRef、StageResult、candidate、effect ledger 与 claim/fence
+身份必须逐项复验；未知外部结果仍须精确 observation 或 reconciliation，恢复动作不得
+重发。状态侧保留固定配置和小型安装元数据，仅按当前/上一代 journal 的 typed 引用
+保存 promotions 文件及必要的外部证据，不递归复制整个 promotions，也不复制历史
+`backup.tar.enc`。原路径、原权限和摘要均受验证。历史元数据不意味着历史回滚可用；
+所需密文或证据缺失时，在关闭准入、切换指针、数据库、Windows 和服务操作之前明确
+拒绝。
+
+旧 `request/run/stage/operation/run_event` 五表的删除只能在排空和所有受支持写者停止后
+执行。切换前必须在一致快照中绑定真实 source database、platform schema、完整
+DDL/ACL/rows、逐成员大小与 SHA-256、aggregate digest、所有未决 command/effect/native
+关联及切换操作身份，并从该回执实际完成独立 restore/读取复核。任意文件 hash 或自报
+`verified` 不构成证明；错源、缺表、遗漏未决事实、摘要冲突、快照后并发变化或缺少
+restore 证据均拒绝。
+
+正式部署依赖 Ubuntu 22.04 的 PostgreSQL 14 发行包和
+`deploy/airflow/scripts/install_postgres.sh` 默认布局；`recovery.py` 也固定核对
+major 14。PostgreSQL 16 仅用于 CI/pgserver 测试，相关结果必须标为
+`postgres16`，不得被解释成正式环境支持。最终部署必须在 PostgreSQL 14 上重新执行
+archive、independent restore、错误 target 拒绝、fresh apply 与 cutover。
+
+receipt 还必须绑定 PostgreSQL cluster `system_identifier`、database OID、platform
+schema OID、migration role、server version、database encoding、collation provider、
+locale 与 ctype；相同 database/schema 名称或相同 locator 不能跨 cluster 或不同
+collation 环境复用。archive/evidence 使用 v3 schema，并记录 ICU locale/rules、
+collation binding 及 recorded/actual version；旧 v1 receipt 不得自动升级。归档的 plain
+schema/ACL SQL 在维护锁内与 live 重新导出比较；PG14 随机外部
+`\restrict`/`\unrestrict` token 只允许严格配对后为比较归一化，不改变 dump 内容。
+独立 `initdb` restore cluster 必须使用源 encoding/provider/locale/ctype、ICU
+locale/rules 与兼容 server version，从 `template0` 建库并核对全部源 locale identity。
+relation row evidence 使用显式 `COLLATE "C"` 排序，restore 后另在测试表证明源默认
+collation 顺序恢复且不同于 C 顺序；单行、多行和多字节值不得在两种环境改变接受结果。只有
+archive、manifest、evidence、receipt、live catalog/rows/ACL 与 restore 全部一致，才
+允许在 serializable cutover 事务中重新观察和切换。
+
+只有 `apply.sh --legacy-archive-receipt <receipt>` 按同一 typed contract 验证上述回执
+后才能删除。schema migration 在没有有效回执时拒绝；删除不得使用 `CASCADE`，任何遗漏
+view、grant 或其他依赖必须显式失败并保留目标。该门不得扩大部署权限，也不得作为永久
+保留旧 Store 的理由。
 
 执行前按实际闭包大小及文件系统可用空间检查 staging、密文、数据库和恢复副本的容量与余量；不能采用固定 GB 阈值。归档逐文件完整流式校验，不为验证再生成一份完整解密树。恢复解包只作用于私有目录，并在完整校验 tar header 和 payload 后恢复已登记权限，再执行原路径目标复制。任何来源变化、漏项、额外成员或摘要冲突均失败且保留原件。
 
@@ -242,7 +502,12 @@ Windows 恢复验证继续要求任务 Disabled、端点停止、CAD 无所有�
 
 端点令牌轮换在排空后更新两端受控副本，验证认证与配置身份再开启准入；飞书和 Git 凭据轮换同样使用受控配置切换与实测登录/访问。秘密值不进入日志、命令行或发行档案。
 
-显示记录删除不回收存储。Linux 封存证据默认不自动删除，显式保留策略只作用于无引用证据；Windows 已确认导入缓存的释放遵循[交换契约](contracts.md#exchange)。已被运行、发布或工程批准引用的文件不得自动清除。日志提供稳定错误码、操作身份、对象与证据位置；日志轮换不删除封存证据。
+显示记录删除不回收存储。Linux 封存证据默认不自动删除，显式保留策略只作用于无引用
+证据。旧 `/v1/jobs` cache import/release、import confirmation 和 cache-release
+receipt 接口不进入生产部署；native operation create/upload/get/resume/cancel/ACK、
+sealed archive/receipt 消费、独立 `admit_capture`/`verify_transfer` 和资源收口保留。
+已被运行、发布或工程批准引用的文件不得自动清除。日志提供稳定错误码、操作身份、对象
+与证据位置；日志轮换不删除封存证据。
 
 ## 端点停止与重启（settle 规程与锁拒绝）
 

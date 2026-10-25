@@ -10,7 +10,6 @@ from description_pipeline import interface_records as ir
 from description_pipeline.delivery import (
     SUBJECT_DIRECTORIES,
     SUBJECT_FILES,
-    check_layout,
     read_delivery_manifest,
     read_recovery_delivery_manifest,
     read_source_record,
@@ -66,19 +65,19 @@ class DeliveryTests(unittest.TestCase):
         for name in SUBJECT_FILES:
             (self.root / name).write_text(name)
         (self.root / "reports").mkdir()
-        (self.root / "reports/quality.json").write_text('{"passed": true}')
+        (self.root / "reports/verification-execution.json").write_text('{"passed": true}')
         (self.root / "input/source.json").write_text("{}")
         self.contract = {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256}
         self.policy = {"schema_version": CHECK_POLICY_SCHEMA, "digest": ir.check_policy_digest()}
         write_delivery_manifest(self.root, contract=self.contract, policy=self.policy)
 
-    def test_subject_binds_assets_and_excludes_manifest_and_quality_report(self):
+    def test_subject_binds_assets_and_excludes_manifest_and_reports(self):
         files = subject_inventory(self.root)
         self.assertIn("tool.json", files)
         self.assertNotIn("manifest.json", files)
-        self.assertNotIn("reports/quality.json", files)
+        self.assertNotIn("reports/verification-execution.json", files)
         before = subject_digest(self.root)
-        (self.root / "reports/quality.json").write_text('{"passed": false}')
+        (self.root / "reports/verification-execution.json").write_text('{"passed": false}')
         self.assertEqual(subject_digest(self.root), before)
         (self.root / "meshes/subject.txt").write_text("changed")
         self.assertNotEqual(subject_digest(self.root), before)
@@ -154,14 +153,6 @@ class DeliveryTests(unittest.TestCase):
             read_delivery_manifest(self.root)
         target.write_text("meshes")
         read_delivery_manifest(self.root)
-
-    def test_layout_refuses_unregistered_files(self):
-        check_layout(self.root)
-        (self.root / "README.md").write_text("legacy layout file")
-        with self.assertRaisesRegex(PipelineError, "Unregistered"):
-            check_layout(self.root)
-        (self.root / "README.md").unlink()
-        check_layout(self.root)
 
     def test_source_record_reader_validates_content_identity(self):
         record = source_record()

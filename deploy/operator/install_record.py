@@ -9,9 +9,10 @@ equality.  The record's release identity is bound to the deployment's ``release.
 package digests with a different ``source_commit`` are a mismatch, never a pass.
 
 The Windows end's identity is an explicit input: the endpoint preparation produces
-``{install_id, config_digest, release{version, source_commit, source_sha256, role: native}}`` and
-this module refuses to write a record without it (fail closed) - no fabricated placeholder
-generation is ever recorded.
+``{install_id, config_digest, release{version, source_commit, source_sha256, role: native},
+target_identity{schema_version, install_id, pipeline_id, target_id}}`` and this module refuses
+to write a record without it (fail closed) - no fabricated placeholder generation is ever
+recorded.
 
 Like the other deploy-side modules this one is standalone (stdlib only); the terminal
 ``tests/v1/test_install_record.py`` holds the parity guards against
@@ -173,16 +174,40 @@ def verify_artifacts(root: Path, artifacts: list[dict]) -> int:
     return verified
 
 
+def _native_target_contract():
+    """Load the canonical target identity owner from the installed release."""
+
+    try:
+        from description_pipeline.delivery import PIPELINE_ID  # noqa: PLC0415
+        from description_pipeline.pipeline.contracts import NativeTargetIdentity  # noqa: PLC0415
+    except ImportError as error:
+        die(f"cannot import the canonical native target contract: {error}")
+    return NativeTargetIdentity, PIPELINE_ID
+
+
 def endpoint_identity(document) -> dict:
     """The isolated endpoint's own generation identity (produced by the endpoint preparation)."""
 
     require(isinstance(document, dict), "endpoint identity must be an object")
     require(
-        set(document) == {"install_id", "config_digest", "release"},
-        "endpoint identity must carry exactly install_id, config_digest, release",
+        set(document) == {"install_id", "config_digest", "release", "target_identity"},
+        "endpoint identity must carry exactly install_id, config_digest, release, target_identity",
     )
     install_id = _text(document["install_id"], "endpoint identity install_id")
     config_digest = _hex64(document["config_digest"], "endpoint identity config_digest")
+    target_contract, pipeline_id = _native_target_contract()
+    try:
+        target = target_contract.from_record(document["target_identity"])
+    except Exception as error:
+        die(f"endpoint target identity is invalid: {error}")
+    require(
+        target.install_id == install_id,
+        "endpoint target identity install_id differs from the endpoint install_id",
+    )
+    require(
+        target.pipeline_id == pipeline_id,
+        f"endpoint target pipeline_id must be {pipeline_id}",
+    )
     release = document["release"]
     require(isinstance(release, dict), "endpoint identity release must be an object")
     require(
@@ -198,6 +223,7 @@ def endpoint_identity(document) -> dict:
         "install_id": install_id,
         "config_digest": config_digest,
         "release": {"version": version, "source_commit": commit, "source_sha256": source_sha, "role": "native"},
+        "target_identity": target.to_record(),
     }
 
 
@@ -372,6 +398,13 @@ def build_install_record(
     triple = {key: release[key] for key in ("version", "source_commit", "source_sha256")}
     windows_release = endpoint["release"]
     require_matching_release(release, endpoint)
+    target_contract, pipeline_id = _native_target_contract()
+    try:
+        target = target_contract.from_record(endpoint["target_identity"])
+    except Exception as error:
+        die(f"endpoint target identity is invalid: {error}")
+    require(target.install_id == endpoint["install_id"], "endpoint target identity names another install_id")
+    require(target.pipeline_id == pipeline_id, f"endpoint target pipeline_id must be {pipeline_id}")
 
     deployment_root = Path(deployment_root)
     require(
@@ -442,6 +475,7 @@ def build_install_record(
                 "install_id": endpoint["install_id"],
                 "config_digest": endpoint["config_digest"],
                 "release": dict(windows_release),
+                "target_identity": target.to_record(),
             },
         },
         "previous": previous,
@@ -516,9 +550,10 @@ def validate_endpoint_health(health_document, release: dict) -> tuple[dict, dict
         die(f"endpoint health invalid: {error}")
     require_matching_release(release, {"release": health["release"]})
     identity = {
-        "install_id": health["install"]["install_id"],
-        "config_digest": health["install"]["config_digest"],
+        "install_id": health["install_id"],
+        "config_digest": health["config_digest"],
         "release": {key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")},
+        "target_identity": dict(health["target_identity"]),
     }
     return identity, health
 
@@ -611,11 +646,12 @@ def main(argv: list[str] | None = None) -> int:
                 detail = getattr(error, "detail", None)
                 die(f"endpoint does not match the active record: {error} {detail if detail else ''}")
             endpoint = {
-                "install_id": health["install"]["install_id"],
-                "config_digest": health["install"]["config_digest"],
+                "install_id": health["install_id"],
+                "config_digest": health["config_digest"],
                 "release": {
                     key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")
                 },
+                "target_identity": dict(health["target_identity"]),
             }
         else:
             endpoint, health = validate_endpoint_health(health_document, release)

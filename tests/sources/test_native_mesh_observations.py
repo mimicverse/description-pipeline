@@ -7,6 +7,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from . import _paths  # noqa: F401
 from . import support
@@ -19,9 +20,17 @@ from description_pipeline.geometry.native_fin_topology import (
     NativeFinRelationError,
     validate_native_edge_fin_relations,
 )
-from description_pipeline.geometry.native_u import native_curve_domain_transform
+from description_pipeline.geometry.native_u import (
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
+    native_curve_domain_transform,
+)
 from description_pipeline.io import PipelineError
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
+from description_pipeline.schemas import (
+    NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.native_mesh_observations import verify_native_mesh_observations
 
@@ -185,7 +194,7 @@ class NativeMeshObservationTests(unittest.TestCase):
                     "facet_count": 0,
                     "area_m2": 2e-13,
                     "tessellate_result": False,
-                    "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                    "used_api": NATIVE_FACETLESS_EVIDENCE_API,
                 }
             ],
             triangle_vertices=triangles,
@@ -231,6 +240,20 @@ class NativeMeshObservationTests(unittest.TestCase):
         self.assertEqual(warning["code"], "cad_sheet_face_untessellated")
         self.assertFalse(warning["tessellate_result"])
         self.assertIn("unqualified", warning["qualification"])
+
+    def test_source_scope_rejection_is_not_swallowed_by_mesh_consumer(self):
+        with (
+            patch(
+                "description_pipeline.verification.native_mesh_observations."
+                "evidence.source_scopes",
+                side_effect=PipelineError("source scope evidence mismatch"),
+            ),
+            self.assertRaisesRegex(
+                PipelineError,
+                "source scope evidence mismatch",
+            ),
+        ):
+            self.verify()
 
     def test_collapsed_fin_warning_is_separate_from_untessellated_area(self):
         from .test_solidworks_native_fin_capture import NativeFinCaptureTests  # noqa: PLC0415
@@ -336,6 +359,40 @@ class NativeMeshObservationTests(unittest.TestCase):
                 self.row["tessellation"]["no_facets_faces"][0][key] = value
                 with self.assertRaises(PipelineError):
                     self.verify()
+
+    def test_untessellated_source_claims_bind_the_actual_native_records(self):
+        valid = copy.deepcopy(self.row)
+        edge = valid["tessellation"]["native_edges"][0]
+
+        forged_face_warning = copy.deepcopy(valid)
+        forged_face_warning["tessellation"]["no_facets_faces"][0][
+            "warnings"
+        ] = [NATIVE_FACE_FACET_IDS_DERIVED]
+        self.row = forged_face_warning
+        with self.assertRaisesRegex(
+            PipelineError,
+            "untessellated face source evidence is inconsistent",
+        ):
+            self.verify()
+
+        forged_edge_reference = copy.deepcopy(valid)
+        forged_edge_reference["tessellation"]["no_facets_faces"][0][
+            "derived_empty_edges"
+        ] = [
+            {
+                "edge_reference_sha256": edge["edge_reference_sha256"],
+                "source_rule": (
+                    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                ),
+                "warnings": [NATIVE_EDGE_FIN_IDS_DERIVED],
+            }
+        ]
+        self.row = forged_edge_reference
+        with self.assertRaisesRegex(
+            PipelineError,
+            "derived empty-edge source evidence is inconsistent",
+        ):
+            self.verify()
 
     def test_missing_native_accounting_fails(self):
         self.row.pop("tessellation")
@@ -534,6 +591,59 @@ class NativeMeshObservationTests(unittest.TestCase):
                 "properties are incomplete",
             ),
             (
+                "property-request",
+                lambda row: row["tessellation"]["itessellation"][
+                    "property_requests"
+                ].__setitem__("need_edge_fin_map", False),
+                "property requests are incomplete",
+            ),
+            (
+                "property-request-false",
+                lambda row: row["tessellation"]["itessellation"].__setitem__(
+                    "property_requests",
+                    {
+                        **support.NATIVE_TESSELLATION_PROPERTIES,
+                        "need_error_list": False,
+                    },
+                ),
+                "property requests are incomplete",
+            ),
+            (
+                "missing-property-requests",
+                lambda row: row["tessellation"]["itessellation"].pop(
+                    "property_requests"
+                ),
+                "ITessellation evidence is missing",
+            ),
+            (
+                "improved-quality",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "improved_quality", False
+                ),
+                "properties are incomplete",
+            ),
+            (
+                "improved-quality-int",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "improved_quality", 1
+                ),
+                "properties are incomplete",
+            ),
+            (
+                "need-error-list",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "need_error_list", False
+                ),
+                "properties are incomplete",
+            ),
+            (
+                "need-error-list-int",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "need_error_list", 1
+                ),
+                "properties are incomplete",
+            ),
+            (
                 "property-int",
                 lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
                     "need_edge_fin_map", 1
@@ -579,6 +689,10 @@ class NativeMeshObservationTests(unittest.TestCase):
             item = body(row)
             item["faces"][1]["facet_ids"].append(item["faces"][0]["facet_ids"][0])
             item["faces"][1]["facet_ids"].sort()
+            item["faces"][1]["facet_count"] = len(item["faces"][1]["facet_ids"])
+            item["faces"][1]["raw_facet_ids"] = list(
+                item["faces"][1]["facet_ids"]
+            )
 
         def missing_fin(row):
             body(row)["facets"][0]["fin_ids"].pop()
@@ -608,19 +722,85 @@ class NativeMeshObservationTests(unittest.TestCase):
             )
 
         def partial_face_list(row):
-            body(row)["request"]["face_list"]["face_count"] = 1
+            body(row)["request"]["face_list"]["value"] = 0
+
+        def legacy_face_list_request(row):
+            body(row)["request"] = {
+                "api": "IBody2.GetTessellation",
+                "argument_count": 1,
+                "face_list": {
+                    "scope": "whole_body",
+                    "variant_type": "VT_ARRAY|VT_DISPATCH",
+                    "face_count": 1,
+                    "first_face_reference_sha256": "0" * 64,
+                    "last_face_reference_sha256": "0" * 64,
+                },
+            }
+
+        def boolean_argument_count(row):
+            body(row)["request"]["argument_count"] = True
 
         def missing_match_type_evidence(row):
             body(row)["properties"].pop("match_type")
 
+        def body_improved_quality_int(row):
+            body(row)["properties"]["improved_quality"] = 1
+
+        def body_need_error_list_int(row):
+            body(row)["properties"]["need_error_list"] = 1
+
+        def body_match_type_bool(row):
+            body(row)["properties"]["match_type"] = False
+
+        def body_conflicting_need_error_list(row):
+            body(row)["properties"]["need_error_list"] = False
+
         cases = (
-            ("misowned", misowned_facet, "has misowned facets"),
+            ("misowned", misowned_facet, "face arrays do not close"),
             ("three-fins", missing_fin, "facet 0 is malformed"),
             ("fin-vertices", duplicate_fin_vertex, "fin 0 is malformed"),
             ("fin-sides", fin_side_from_other_facet, "facet 1 is malformed"),
             ("reversed-fin", reversed_fin, "not a directed three-cycle"),
-            ("partial-face-list", partial_face_list, "is incomplete"),
-            ("missing-match-type", missing_match_type_evidence, "is incomplete"),
+            (
+                "nonempty-empty-value",
+                partial_face_list,
+                "unsupported tessellation request",
+            ),
+            (
+                "legacy-face-list",
+                legacy_face_list_request,
+                "unsupported tessellation request",
+            ),
+            (
+                "boolean-argument-count",
+                boolean_argument_count,
+                "unsupported tessellation request",
+            ),
+            (
+                "missing-match-type",
+                missing_match_type_evidence,
+                "properties differ from the request",
+            ),
+            (
+                "body-improved-quality-int",
+                body_improved_quality_int,
+                "properties differ from the request",
+            ),
+            (
+                "body-need-error-list-int",
+                body_need_error_list_int,
+                "properties differ from the request",
+            ),
+            (
+                "body-match-type-bool",
+                body_match_type_bool,
+                "properties differ from the request",
+            ),
+            (
+                "body-conflicting-need-error-list",
+                body_conflicting_need_error_list,
+                "properties differ from the request",
+            ),
         )
         for label, mutate, message in cases:
             with self.subTest(label=label):
@@ -652,12 +832,22 @@ class NativeMeshObservationTests(unittest.TestCase):
 
         missing_edge_fin = copy.deepcopy(original)
         missing_edge_fin["tessellation"]["native_edges"][0]["fin_ids"].pop()
+        missing_edge_fin["tessellation"]["native_edges"][0][
+            "raw_fin_ids"
+        ] = list(
+            missing_edge_fin["tessellation"]["native_edges"][0]["fin_ids"]
+        )
 
         extra_internal_fin = copy.deepcopy(original)
         extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"].append(
             internal_fin["fin_id"]
         )
         extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"].sort()
+        extra_internal_fin["tessellation"]["native_edges"][0][
+            "raw_fin_ids"
+        ] = list(
+            extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"]
+        )
 
         edge_fin = next(
             fin for fin in body["fins"] if fin["edge_reference_sha256"] == edge["edge_reference_sha256"]
@@ -1029,6 +1219,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         edge = tessellation["native_edges"][0]
         fin_ids = set(edge["fin_ids"])
         edge["fin_ids"] = []
+        edge["raw_fin_ids"] = []
         for fin in tessellation["itessellation"]["bodies"][0]["fins"]:
             if fin["fin_id"] not in fin_ids:
                 continue
@@ -1054,7 +1245,6 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         ):
             evidence["u"] = value
             evidence["closest_point_on_raw"][3] = value
-            evidence["parameter_raw"][0] = value
 
     def test_open_edge_accepts_one_boundary_fin_and_summarizes_it(self):
         tessellation, triangles = self.boundary_fixture()
@@ -1300,6 +1490,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
             component="validator",
             edge=edge,
             edge_fins=[1],
+            incident_face_facet_counts=[1],
             fins_by_id={1: fin},
             vertices_by_id=vertices,
         )
@@ -1308,6 +1499,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                 component="validator",
                 edge=edge,
                 edge_fins=[True],
+                incident_face_facet_counts=[1],
                 fins_by_id={1: fin},
                 vertices_by_id=vertices,
             )
@@ -1317,8 +1509,43 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                 component="validator",
                 edge=bool_body_edge,
                 edge_fins=[1],
+                incident_face_facet_counts=[1],
                 fins_by_id={1: fin},
                 vertices_by_id=vertices,
+            )
+        empty_edge = {**edge, "fin_ids": []}
+        relation = validate_native_edge_fin_relations(
+            component="validator",
+            edge=empty_edge,
+            edge_fins=[],
+            incident_face_facet_counts=[0],
+            fins_by_id={},
+            vertices_by_id={},
+        )
+        self.assertEqual(relation["collapsed_pairs"], [])
+        with self.assertRaisesRegex(
+            NativeFinRelationError,
+            "did not return any fins",
+        ):
+            validate_native_edge_fin_relations(
+                component="validator",
+                edge=empty_edge,
+                edge_fins=[],
+                incident_face_facet_counts=[1],
+                fins_by_id={},
+                vertices_by_id={},
+            )
+        with self.assertRaisesRegex(
+            NativeFinRelationError,
+            "did not return any fins",
+        ):
+            validate_native_edge_fin_relations(
+                component="validator",
+                edge={**empty_edge, "body_type": 0},
+                edge_fins=[],
+                incident_face_facet_counts=[0],
+                fins_by_id={},
+                vertices_by_id={},
             )
 
     def test_parser_and_summary_reject_boolean_native_identity_fields(self):
@@ -1587,7 +1814,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
 
     def test_curved_native_edge_rejects_same_u_direction(self):
         tessellation, triangles = self.fixture()
-        edge, external_fins = self.edge_fins(tessellation)
+        _edge, external_fins = self.edge_fins(tessellation)
         by_id = {
             fin["fin_id"]: fin
             for fin in tessellation["itessellation"]["bodies"][0]["fins"]
@@ -1610,10 +1837,6 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                     support._u_evidence(
                         fin[f"{endpoint}_u"],
                         point,
-                        domain_lower=edge["u_min"],
-                        domain_upper=edge["u_max"],
-                        curve_start=edge["curve_start_point_m"],
-                        curve_end=edge["curve_end_point_m"],
                     )
                 )
         for index in (3, 4, 5):

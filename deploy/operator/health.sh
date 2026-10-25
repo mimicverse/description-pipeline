@@ -207,6 +207,35 @@ else
   report FAIL "native pool cannot be verified: AIRFLOW_VENV is not executable"
 fi
 
+# Deferred effects require the pinned triggerer to be both installed and alive. A merely
+# active systemd unit is insufficient: Airflow's own TriggererJob heartbeat must be healthy.
+if [ -x "${AIRFLOW_VENV:-}/bin/airflow" ]; then
+  airflow_version="$(AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/airflow" version 2>/dev/null || true)"
+  [ "$airflow_version" = "3.3.2" ] \
+    && report PASS "Airflow runtime version is 3.3.2" \
+    || report FAIL "Airflow runtime version is not pinned 3.3.2: ${airflow_version:-unknown}"
+  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - <<'PY'
+from airflow.configuration import conf
+
+assert conf.getint("triggerer", "capacity") == 64
+assert conf.getfloat("triggerer", "job_heartbeat_sec") == 5.0
+assert conf.getfloat("triggerer", "triggerer_health_check_threshold") == 30.0
+PY
+  then
+    report PASS "Airflow triggerer capacity and health thresholds match the frozen contract"
+  else
+    report FAIL "Airflow triggerer capacity or health thresholds differ from the frozen contract"
+  fi
+  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/airflow" jobs check \
+      --job-type TriggererJob --local --limit 1 >/dev/null 2>&1; then
+    report PASS "Airflow TriggererJob heartbeat is healthy on this host"
+  else
+    report FAIL "Airflow TriggererJob is missing or unhealthy on this host"
+  fi
+else
+  report FAIL "Airflow triggerer health cannot be verified: AIRFLOW_VENV/bin/airflow is missing"
+fi
+
 command -v systemctl >/dev/null 2>&1 || { report FAIL "systemctl unavailable"; exit 1; }
 for unit in "${UNITS[@]}"; do
   state="$(systemctl --user is-active "$unit.service" 2>/dev/null || true)"

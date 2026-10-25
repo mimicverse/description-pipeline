@@ -612,7 +612,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         sealed = classify(
             "failed",
             {"freeze": "success", "discover": "success", "capture": "failed"},
-            "native_complete",
+            "satisfied",
         )
         self.assertTrue(sealed.eligible)
         self.assertEqual(sealed.classification, run_ownership.RECOVERY_EVIDENCE_CORRUPTION)
@@ -630,7 +630,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
             ("failed", {"other_task": "failed"}, None, "unknown_failed_task"),
             ("failed", {"discover": run_ownership.AMBIGUOUS_TASK_STATE}, None, "unknown_failed_task"),
             ("failed", {"discover": "failed"}, "failed", "native_terminal_failure"),
-            ("failed", {"publish": "failed"}, "native_complete", "publication_response_unknown"),
+            ("failed", {"publish": "failed"}, "satisfied", "publication_response_unknown"),
         ):
             with self.subTest(state=state, tasks=tasks, status=status):
                 assessment = classify(state, tasks, status)
@@ -648,7 +648,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
                 "generate": "upstream_failed",
                 "verify": "failed",
             },
-            "native_complete",
+            "satisfied",
         )
         self.assertTrue(portable.eligible)
         self.assertEqual(portable.classification, run_ownership.RECOVERY_TEMPORARY_DISCONNECTION)
@@ -662,7 +662,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
                 "capture": "success",
                 "publish": "failed",
             },
-            "native_complete",
+            "satisfied",
         )
         self.assertFalse(attempted.eligible)
         self.assertEqual(attempted.classification, run_ownership.RECOVERY_UNKNOWN_PUBLICATION)

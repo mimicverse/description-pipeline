@@ -3242,16 +3242,16 @@ def _apply_mate_direction(record: dict, bodies: list[dict], joints: list[dict], 
             rule_id=semantic["rule_id"],
             rule_version=semantic["rule_version"],
         )
-        if semantic["status"] != "local_class_aligned":
-            findings.append(
-                _finding(
-                    "direction.semantics_unresolved",
-                    f"joint:{joint['name']}",
-                    "the authored CAD axis is preserved; its motion class is not proven",
-                    semantic,
-                    blocking=False,
-                )
+        # The v3 audit never establishes author-positive semantics.
+        findings.append(
+            _finding(
+                "direction.semantics_unresolved",
+                f"joint:{joint['name']}",
+                "the authored CAD axis is preserved; its motion class is not proven",
+                semantic,
+                blocking=False,
             )
+        )
 
 
 def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str, str], dict]:
@@ -3545,16 +3545,16 @@ def _exporter_axis(
             )
         )
         return axis, selector
-    if semantic["status"] != "local_class_aligned":
-        findings.append(
-            _finding(
-                "direction.semantics_unresolved",
-                obj,
-                "the authored CAD axis is preserved; its motion class is not proven",
-                semantic,
-                blocking=False,
-            )
+    # The v3 audit never establishes author-positive semantics.
+    findings.append(
+        _finding(
+            "direction.semantics_unresolved",
+            obj,
+            "the authored CAD axis is preserved; its motion class is not proven",
+            semantic,
+            blocking=False,
         )
+    )
     delivered_local = semantic["delivered_local_axis"]
     canonical_assembly = signed
     origin = [transform[3], transform[7], transform[11]]

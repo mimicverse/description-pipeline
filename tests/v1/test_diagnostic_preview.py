@@ -10,11 +10,9 @@ registered platform projection:
 * anything the registration does not carry is never served and never invented;
 * the preview UI labels the diagnostic and forbids publication.
 
-The store-level binding tests of the retired Linux store moved with its
-product surface: the registration oracle owns sealed-byte binding
-(``test_platform_store``, ``test_airflow_dag``) and the portal projection owns
-the served refusals (``test_portal``, ``test_registered_delivery``).
-Nothing here publishes or deploys: the diagnostic preview never authorizes publication.
+Artifact registration owns sealed-byte binding and the portal projection owns
+the served refusals. Nothing here publishes or deploys: the diagnostic preview
+never authorizes publication.
 """
 
 from __future__ import annotations
@@ -29,10 +27,9 @@ from pathlib import Path
 from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
 from description_pipeline.io import write_json
 from description_pipeline.orchestration import portal as portal_module
-from description_pipeline.orchestration.airflow_client import EndpointError, native_run_id
-from tests.v1.test_platform_store import build_sealed_delivery
+from description_pipeline.orchestration.airflow_client import native_run_id
 
-from .portal_read_support import RegisteredPlatform
+from .portal_read_support import RegisteredPlatform, build_sealed_delivery
 
 DAG_RUN_ID = "portal-20261010T000000-abcdef01"
 RUN = native_run_id(DAG_RUN_ID)
@@ -130,11 +127,6 @@ class _PermissiveAirflow:
         return {"dag_run_id": dag_run_id, "state": "failed"}
 
 
-class _DownEndpoint:
-    def get_job(self, run_id):
-        raise EndpointError("windows down")
-
-
 class DiagnosticPreviewTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="diagnostic-preview-"))
@@ -193,8 +185,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -216,8 +207,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -241,8 +231,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -272,8 +261,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -291,8 +279,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -318,8 +305,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -338,8 +324,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -347,7 +332,25 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertIs(preview["verified"], False)
         self.assertEqual(preview["state"], "unverified")
         self.assertEqual(preview["reason"], "verification_failed")
-        self.assertEqual(preview["subject_sha256"], hashlib.sha256(URDF).hexdigest())
+        projection = platform.fact_projection(RUN)
+        certificate_member = projection["by_stage"]["verify"]["verification-certificate.json"]
+        certificate = json.loads(
+            platform.projection_artifacts.objects[
+                certificate_member["artifact"]["artifact_id"]
+            ]["verification-certificate.json"]
+        )
+        self.assertEqual(
+            preview["subject_sha256"],
+            certificate["generate_artifact"]["set_sha256"],
+        )
+        self.assertEqual(
+            preview["generate_artifact_id"],
+            certificate["generate_artifact"]["artifact_id"],
+        )
+        self.assertEqual(
+            preview["capture_artifact_id"],
+            certificate["capture_artifact"]["artifact_id"],
+        )
         self.assertEqual(preview["urdf"], "urdf/robot.urdf")
         self.assertIn("urdf/robot.urdf", preview["files"])
         self.assertEqual(
@@ -389,23 +392,18 @@ class DiagnosticPreviewTests(unittest.TestCase):
         child_dag = "portal-20261010T000001-abcdef02"
         child = native_run_id(child_dag)
         platform.admit(child, from_stage="verify", parent_run_id=RUN)
-        parent_row = platform.store.stage_records(RUN)["capture"]
-        # The real reuse registration: the writer itself validates the completed
-        # source row and re-verifies its sealed receipt.
-        platform.store.confirm_stage(
-            run_id=child,
-            stage="capture",
-            state="completed",
+        parent_row = platform.facts.stage_records(RUN)["capture"]
+        platform.stage(
+            child,
+            "capture",
             receipt=parent_row["receipt"],
-            checkpoint_uri=parent_row["checkpoint_uri"],
-            reused_from_run=RUN,
+            reuse_from=(RUN, "capture"),
         )
         self._register_child_failed_verify(platform, child)
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")
@@ -431,7 +429,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         """The child's own executed-and-failed verify stage, registered through the writer."""
         tree = platform.sealed(f"store://sealed/{child}/verify")
         tree.mkdir(parents=True)
-        build_sealed_delivery(tree)
+        build_sealed_delivery(tree, run_id=child)
         manifest = read_delivery_manifest(tree)
         write_json(
             tree / "reports/quality.json",
@@ -457,7 +455,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "sha256": hashlib.sha256(report).hexdigest(),
             }
         ]
-        platform.store.confirm_stage(
+        platform.facts.confirm_stage(
             run_id=child,
             stage="verify",
             state="failed",
@@ -472,7 +470,6 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "subject_sha256": manifest["subject"]["digest"],
                 "artifacts": artifacts,
             },
-            checkpoint_uri=f"store://sealed/{child}/verify",
         )
 
     def test_a_success_labelled_failed_report_is_refused(self) -> None:
@@ -483,8 +480,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
-                endpoint=lambda: _DownEndpoint(),
-                platform_store=platform.store,
+                run_control_store=platform.run_control,
             )
         )
         session = app.sessions.create("user", "token")

@@ -2,10 +2,37 @@
   "type": "object",
   "properties": {
     "schema_version": {
-      "$comment": "One current id per document: the shared solidworks-to-urdf.scene/v1 structure; the retired robot id is refused.",
+      "$comment": "One current id per document: the canonical engineering model; retired scene and robot ids are refused.",
       "enum": [
-        "solidworks-to-urdf.scene/v1"
+        "solidworks-to-urdf.engineering-model/v1"
       ]
+    },
+    "semantic_identity": {
+      "type": "object",
+      "properties": {
+        "capture_set_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_member": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_configuration": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capture_set_sha256",
+        "source_member",
+        "source_sha256",
+        "source_configuration"
+      ],
+      "additionalProperties": false
     },
     "name": {
       "type": "string",
@@ -577,6 +604,7 @@
   },
   "required": [
     "schema_version",
+    "semantic_identity",
     "name",
     "units",
     "links",
@@ -586,5 +614,5 @@
   ],
   "additionalProperties": false,
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://mimicverse.org/description/robot-v1.schema.json"
+  "$id": "https://mimicverse.org/description/engineering-model-v1.schema.json"
 }

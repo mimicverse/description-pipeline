@@ -65,6 +65,16 @@ from urllib.parse import parse_qs, unquote, urlsplit
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 sys.dont_write_bytecode = True
 
+RELEASE_SOURCE = Path(__file__).resolve().parents[2] / "src"
+release_source = str(RELEASE_SOURCE)
+sys.path[:] = [
+    release_source,
+    *(entry for entry in sys.path if entry != release_source),
+]
+
+from description_pipeline.pipeline.contracts import RunStatus  # noqa: E402
+from description_pipeline.platform.facts import read_admitted_runs  # noqa: E402
+
 try:
     import backup
     import install_record
@@ -80,13 +90,13 @@ except ImportError as error:  # pragma: no cover - exercised by deployment layou
     ) from error
 
 
-MANIFEST_SCHEMA = "solidworks-to-urdf.recovery-manifest/v6"
+MANIFEST_SCHEMA = "solidworks-to-urdf.recovery-manifest/v7"
 TARGET_SCHEMA = "solidworks-to-urdf.recovery-target/v3"
 MARKER_SCHEMA = "solidworks-to-urdf.recovery-marker/v1"
 RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-receipt/v1"
 MAINTENANCE_RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-maintenance/v1"
 SNAPSHOT_WORKER_SCHEMA = "solidworks-to-urdf.recovery-snapshot-worker/v5"
-SELECTION_SCHEMA = "solidworks-to-urdf.recovery-selection/v1"
+SELECTION_SCHEMA = "solidworks-to-urdf.recovery-selection/v2"
 SNAPSHOT_READY_SCHEMA = "solidworks-to-urdf.recovery-snapshot-ready/v1"
 WINDOWS_RECOVERY_SCHEMA = "solidworks-to-urdf.windows-recovery/v1"
 WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
@@ -106,14 +116,6 @@ APPLICATION_ROLES = (
     "airflow_migrate",
     "airflow_runtime",
 )
-PLATFORM_CORE_TABLES = (
-    "admission",
-    "request",
-    "run",
-    "stage",
-    "operation",
-    "run_event",
-)
 ARCHIVE_TOP_LEVEL = {
     "database",
     "maintenance",
@@ -128,6 +130,7 @@ ARCHIVE_TOP_LEVEL = {
     "journal-files",
     "inventory",
     "windows",
+    "workspace-preserved",
 }
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 GIT_OBJECT = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -1396,16 +1399,6 @@ SELECT json_build_object(
     )
     FROM platform.admission
     WHERE id = 1
-  ),
-  'settled', NOT EXISTS (
-    SELECT 1
-    FROM platform.lifecycle_projection
-    WHERE object_kind <> 'request' AND bucket <> 'terminal'
-  ),
-  'unsettled_count', (
-    SELECT count(*)
-    FROM platform.lifecycle_projection
-    WHERE object_kind <> 'request' AND bucket <> 'terminal'
   )
 )
 """
@@ -1464,6 +1457,20 @@ def _roles_settings_snapshot(connection) -> dict:
 
 def _maintenance_probe(connection) -> dict:
     status = _connection_json(connection, MAINTENANCE_QUERY)
+    run_rows = read_admitted_runs(connection)
+    scheduling_rows = _connection_json(
+        connection,
+        """
+        SELECT COALESCE(json_agg(json_build_object(
+          'object_kind', object_kind,
+          'object_id', object_id,
+          'run_id', run_id,
+          'state', state,
+          'bucket', bucket
+        )), '[]'::json)
+        FROM platform.lifecycle_projection
+        """,
+    )
     sessions = _connection_json(
         connection,
         ACTIVE_APPLICATION_SESSIONS_QUERY,
@@ -1473,15 +1480,32 @@ def _maintenance_probe(connection) -> dict:
     require(
         isinstance(status, dict)
         and isinstance(status.get("admission"), dict)
-        and isinstance(status.get("settled"), bool)
-        and type(status.get("unsettled_count")) is int
+        and isinstance(scheduling_rows, list)
         and isinstance(sessions, list)
         and isinstance(wal_lsn, str),
         "recovery_database_readback_failed",
         "maintenance/read quiescence probe is malformed",
     )
+    terminal_runs = {
+        RunStatus.SUCCEEDED.value,
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+    }
+    unsettled = [
+        {"object_kind": "run", "object_id": run.run_id, "state": run.state}
+        for run in run_rows
+        if run.state not in terminal_runs
+    ]
+    unsettled.extend(
+        row
+        for row in scheduling_rows
+        if isinstance(row, dict) and row.get("bucket") != "terminal"
+    )
     return {
-        **status,
+        "admission": status["admission"],
+        "settled": not unsettled,
+        "unsettled_count": len(unsettled),
+        "unsettled": unsettled[:100],
         "active_application_sessions": sessions,
         "wal_lsn": wal_lsn,
     }
@@ -1757,16 +1781,121 @@ def verify_sequence_dump_positions(
     )
 
 
-CHECKPOINT_REFERENCES_QUERY = (
+_DECISION_REFERENCES_QUERY = (
     "SELECT COALESCE(json_agg(json_build_object("
-    "'run_id', s.run_id, 'stage', s.stage, 'stage_state', s.state, "
-    "'request_id', r.request_id, 'run_parent_run_id', r.parent_run_id, "
-    "'reused_from_run', s.reused_from_run, "
-    "'original_executed_at', s.original_executed_at, "
-    "'checkpoint_uri', s.checkpoint_uri, 'receipt', s.receipt "
-    ") ORDER BY s.run_id, s.stage), '[]'::json) "
-    "FROM platform.stage s JOIN platform.run r ON r.run_id = s.run_id "
-    "WHERE s.state = 'completed' OR (s.checkpoint_uri IS NOT NULL AND s.checkpoint_uri <> '')"
+    "'run_id', d.run_id, 'stage', d.stage, 'outcome', d.outcome, "
+    "'request_id', a.request_id, 'parent_run_id', a.parent_run_id, "
+    "'decision_id', d.decision_id, 'command_id', d.command_id, "
+    "'result_digest', d.result_digest, "
+    "'actual_executor_sha256', d.actual_executor_sha256, "
+    "'original_producer_decision_id', d.original_producer_decision_id, "
+    "'failure_digest', d.failure_digest, "
+    "'result_record_artifact', CASE WHEN rr.artifact_id IS NULL THEN NULL ELSE "
+    "json_build_object("
+    "'artifact_id', rr.artifact_id, 'kind', rr.kind, 'locator', rr.locator, "
+    "'manifest_sha256', rr.manifest_sha256, 'set_sha256', rr.set_sha256, "
+    "'producer_run_id', rr.producer_run_id, 'producer_stage', rr.producer_stage, "
+    "'producer_tool_sha256', rr.producer_tool_sha256"
+    ") END, "
+    "'output_artifact', CASE WHEN output_artifact.artifact_id IS NULL THEN NULL ELSE "
+    "json_build_object("
+    "'artifact_id', output_artifact.artifact_id, "
+    "'kind', output_artifact.kind, "
+    "'locator', output_artifact.locator, "
+    "'manifest_sha256', output_artifact.manifest_sha256, "
+    "'set_sha256', output_artifact.set_sha256, "
+    "'producer_run_id', output_artifact.producer_run_id, "
+    "'producer_stage', output_artifact.producer_stage, "
+    "'producer_tool_sha256', output_artifact.producer_tool_sha256"
+    ") END "
+    ") ORDER BY d.run_id, d.stage), '[]'::json) "
+    "FROM platform.stage_decision d "
+    "JOIN platform.run_admission a ON a.run_id = d.run_id "
+    "JOIN platform.command c ON c.command_id = d.command_id "
+    "LEFT JOIN platform.artifact rr ON rr.artifact_id = d.result_record_artifact_id "
+    "LEFT JOIN platform.stage_candidate candidate ON candidate.command_id = d.command_id "
+    "LEFT JOIN platform.artifact output_artifact "
+    "ON output_artifact.artifact_id = candidate.output_artifact_id"
+)
+CHECKPOINT_REFERENCES_QUERY = _DECISION_REFERENCES_QUERY
+
+RECOVERY_ROOT_QUERY = (
+    "WITH referenced_ids AS ("
+    "SELECT artifact_id FROM platform.command_input_artifact "
+    "UNION SELECT output_artifact_id FROM platform.stage_candidate "
+    "UNION SELECT result_record_artifact_id FROM platform.stage_candidate "
+    "UNION SELECT result_record_artifact_id FROM platform.stage_decision "
+    "WHERE result_record_artifact_id IS NOT NULL "
+    "UNION SELECT outbound_artifact_id FROM platform.effect_intent "
+    "UNION SELECT payload_artifact_id FROM platform.effect_fact "
+    "WHERE payload_artifact_id IS NOT NULL "
+    "UNION SELECT metadata_artifact_id FROM platform.effect_fact "
+    "WHERE metadata_artifact_id IS NOT NULL "
+    "UNION SELECT ref.value #>> '{}' FROM platform.run_admission admission "
+    "CROSS JOIN LATERAL jsonb_path_query(admission.request, '$.**.artifact_id') AS ref(value) "
+    "UNION SELECT ref.value #>> '{}' FROM platform.command command "
+    "CROSS JOIN LATERAL jsonb_path_query(command.request, '$.**.artifact_id') AS ref(value) "
+    "UNION SELECT ref.value #>> '{}' FROM platform.stage_decision decision "
+    "CROSS JOIN LATERAL "
+    "jsonb_path_query(decision.failure_envelope, '$.**.artifact_id') AS ref(value) "
+    "WHERE decision.failure_envelope IS NOT NULL "
+    "UNION SELECT ref.value #>> '{}' FROM platform.effect_intent intent "
+    "CROSS JOIN LATERAL jsonb_path_query(intent.target, '$.**.artifact_id') AS ref(value) "
+    "UNION SELECT ref.value #>> '{}' FROM platform.effect_intent intent "
+    "CROSS JOIN LATERAL jsonb_path_query(intent.expected_state, '$.**.artifact_id') AS ref(value)"
+    "), referenced AS ("
+    "SELECT artifact_row.* FROM platform.artifact artifact_row "
+    "WHERE artifact_row.artifact_id IN (SELECT artifact_id FROM referenced_ids)"
+    "), missing AS ("
+    "SELECT artifact_id FROM referenced_ids "
+    "WHERE artifact_id IS NOT NULL AND artifact_id NOT IN (SELECT artifact_id FROM referenced)"
+    ") "
+    "SELECT json_build_object("
+    "'decisions', (" + _DECISION_REFERENCES_QUERY + "), "
+    "'artifacts', (SELECT COALESCE(json_agg(json_build_object("
+    "'artifact_id', artifact_row.artifact_id, "
+    "'kind', artifact_row.kind, 'locator', artifact_row.locator, "
+    "'manifest_sha256', artifact_row.manifest_sha256, "
+    "'set_sha256', artifact_row.set_sha256, "
+    "'producer_run_id', artifact_row.producer_run_id, "
+    "'producer_stage', artifact_row.producer_stage, "
+    "'producer_tool_sha256', artifact_row.producer_tool_sha256"
+    ") ORDER BY artifact_row.artifact_id), '[]'::json) FROM referenced artifact_row), "
+    "'missing_artifact_ids', (SELECT COALESCE(json_agg(artifact_id ORDER BY artifact_id), "
+    "'[]'::json) FROM missing), "
+    "'candidates', (SELECT COALESCE(json_agg(json_build_object("
+    "'candidate_id', candidate.candidate_id, "
+    "'command_id', candidate.command_id, "
+    "'claim_id', candidate.claim_id, "
+    "'fence', candidate.fence, "
+    "'output_artifact_id', candidate.output_artifact_id, "
+    "'result_record_artifact_id', candidate.result_record_artifact_id, "
+    "'result_digest', candidate.result_digest, "
+    "'outcome', candidate.outcome, "
+    "'reason_code', candidate.reason_code, "
+    "'created_at', candidate.created_at"
+    ") ORDER BY candidate.candidate_id), '[]'::json) "
+    "FROM platform.stage_candidate candidate), "
+    "'retained_locations', (SELECT COALESCE(json_agg(location ORDER BY location), '[]'::json) "
+    "FROM (SELECT DISTINCT location.value AS location "
+    "FROM platform.stage_decision decision CROSS JOIN LATERAL "
+    "jsonb_array_elements_text(COALESCE("
+    "decision.failure_envelope->'retained_locations', '[]'::jsonb"
+    ")) location WHERE decision.failure_envelope IS NOT NULL) retained), "
+    "'workspace_commands', (SELECT COALESCE(json_agg(command.command_id "
+    "ORDER BY command.command_id), '[]'::json) FROM platform.command command "
+    "WHERE command.kind = 'stage' AND NOT EXISTS ("
+    "SELECT 1 FROM platform.stage_decision decision "
+    "WHERE decision.command_id = command.command_id"
+    ") AND ("
+    "EXISTS (SELECT 1 FROM platform.execution_claim claim "
+    "WHERE claim.command_id = command.command_id) "
+    "OR EXISTS (SELECT 1 FROM platform.stage_candidate candidate "
+    "WHERE candidate.command_id = command.command_id) "
+    "OR EXISTS (SELECT 1 FROM platform.effect_intent intent "
+    "WHERE intent.command_id = command.command_id)"
+    "))"
+    ")"
 )
 
 
@@ -1778,6 +1907,67 @@ def _checkpoint_references(connection) -> list[dict]:
         "checkpoint reference readback is malformed",
     )
     return rows
+
+
+def validate_recovery_root(root: object) -> dict:
+    require(
+        isinstance(root, dict)
+        and set(root)
+        == {
+            "decisions",
+            "artifacts",
+            "missing_artifact_ids",
+            "candidates",
+            "retained_locations",
+            "workspace_commands",
+        },
+        "recovery_database_readback_failed",
+        "canonical recovery root is malformed",
+    )
+    require(
+        isinstance(root["decisions"], list)
+        and isinstance(root["artifacts"], list)
+        and all(
+            isinstance(item, dict) and set(item) == _ARTIFACT_FIELDS
+            for item in root["artifacts"]
+        )
+        and root["missing_artifact_ids"] == []
+        and isinstance(root["candidates"], list)
+        and all(
+            isinstance(item, dict) and set(item) == _CANDIDATE_FIELDS
+            for item in root["candidates"]
+        )
+        and isinstance(root["retained_locations"], list)
+        and all(isinstance(value, str) and value for value in root["retained_locations"])
+        and isinstance(root["workspace_commands"], list)
+        and all(isinstance(value, str) and value for value in root["workspace_commands"]),
+        "recovery_database_readback_failed",
+        "canonical recovery root has missing references or malformed values",
+        {"missing_artifact_ids": root.get("missing_artifact_ids")},
+    )
+    require(
+        len({item.get("artifact_id") for item in root["artifacts"] if isinstance(item, dict)})
+        == len(root["artifacts"])
+        and len(set(root["retained_locations"])) == len(root["retained_locations"])
+        and len({item.get("candidate_id") for item in root["candidates"] if isinstance(item, dict)})
+        == len(root["candidates"])
+        and len(set(root["workspace_commands"])) == len(root["workspace_commands"]),
+        "recovery_database_readback_failed",
+        "canonical recovery root carries duplicate identities",
+    )
+    checkpoint_origins(root["decisions"])
+    return root
+
+
+def _recovery_root(connection) -> dict:
+    root = validate_recovery_root(_connection_json(connection, RECOVERY_ROOT_QUERY))
+    decisions = _checkpoint_references(connection)
+    require(
+        root["decisions"] == decisions,
+        "recovery_database_readback_failed",
+        "canonical recovery root decisions differ from the decision read model",
+    )
+    return root
 
 
 def _discovered_table_fingerprints(connection) -> dict[str, dict]:
@@ -1826,7 +2016,7 @@ def _live_database_data(connection) -> dict:
     }
 
 
-def _database_baseline_snapshot(connection) -> tuple[dict, dict, list[dict]]:
+def _database_baseline_snapshot(connection) -> tuple[dict, dict, dict]:
     legacy_catalog = _connection_json(connection, CATALOG_QUERY)
     full_catalog = _connection_json(connection, FULL_CATALOG_QUERY)
     require(
@@ -1851,7 +2041,7 @@ def _database_baseline_snapshot(connection) -> tuple[dict, dict, list[dict]]:
         "catalog": full_catalog,
     }
     data = _live_database_data(connection)
-    return catalog, data, _checkpoint_references(connection)
+    return catalog, data, _recovery_root(connection)
 
 
 def pg_control(path: Path, context: CommandContext) -> dict:
@@ -2157,7 +2347,10 @@ SELECT json_build_object(
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE (n.nspname = 'platform' AND c.relname IN (
-      'admission', 'request', 'run', 'stage', 'operation', 'run_event'
+      'admission', 'run_admission', 'artifact', 'command',
+      'command_input_artifact', 'execution_claim', 'stage_decision',
+      'stage_candidate', 'effect_intent', 'effect_fact',
+      'run_display_metadata', 'lifecycle_projection', 'admission_projection'
     ))
     OR (n.nspname = 'airflow' AND c.relname IN (
       'alembic_version', 'connection', 'slot_pool', 'feishu_auth_state'
@@ -2353,11 +2546,16 @@ WHERE n.nspname IN ('platform', 'airflow')
 
 DATA_TABLES = (
     ("platform", "admission"),
-    ("platform", "request"),
-    ("platform", "run"),
-    ("platform", "stage"),
-    ("platform", "operation"),
-    ("platform", "run_event"),
+    ("platform", "run_admission"),
+    ("platform", "artifact"),
+    ("platform", "command"),
+    ("platform", "command_input_artifact"),
+    ("platform", "execution_claim"),
+    ("platform", "stage_decision"),
+    ("platform", "stage_candidate"),
+    ("platform", "effect_intent"),
+    ("platform", "effect_fact"),
+    ("platform", "run_display_metadata"),
     ("airflow", "alembic_version"),
     ("airflow", "connection"),
 )
@@ -2843,158 +3041,520 @@ def verify_checkpoint_tree(
         )
 
 
+_REFERENCE_FIELDS = {
+    "run_id",
+    "stage",
+    "outcome",
+    "request_id",
+    "parent_run_id",
+    "decision_id",
+    "command_id",
+    "result_digest",
+    "actual_executor_sha256",
+    "original_producer_decision_id",
+    "failure_digest",
+    "result_record_artifact",
+    "output_artifact",
+}
+_ARTIFACT_FIELDS = {
+    "artifact_id",
+    "kind",
+    "locator",
+    "manifest_sha256",
+    "set_sha256",
+    "producer_run_id",
+    "producer_stage",
+    "producer_tool_sha256",
+}
+_CANDIDATE_FIELDS = {
+    "candidate_id",
+    "command_id",
+    "claim_id",
+    "fence",
+    "output_artifact_id",
+    "result_record_artifact_id",
+    "result_digest",
+    "outcome",
+    "reason_code",
+    "created_at",
+}
+_REFERENCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}\Z")
+
+
+def _validate_artifact_reference(
+    record: object,
+    *,
+    role: str,
+    run_id: str,
+    stage: str,
+    actual_executor_sha256: str,
+) -> dict | None:
+    if record is None:
+        return None
+    require(
+        isinstance(record, dict) and set(record) == _ARTIFACT_FIELDS,
+        "recovery_reference_invalid",
+        f"{role} artifact fields are malformed",
+    )
+    for key in ("artifact_id", "kind", "locator", "manifest_sha256", "set_sha256", "producer_tool_sha256"):
+        require(
+            isinstance(record[key], str) and bool(record[key]),
+            "recovery_reference_invalid",
+            f"{role} artifact {key} is malformed",
+        )
+    require(
+        bool(_REFERENCE_ID.fullmatch(record["artifact_id"]))
+        and record["locator"] == f"cas://artifact/{record['artifact_id']}"
+        and bool(HEX64.fullmatch(record["manifest_sha256"]))
+        and bool(HEX64.fullmatch(record["set_sha256"]))
+        and bool(HEX64.fullmatch(record["producer_tool_sha256"])),
+        "recovery_reference_invalid",
+        f"{role} artifact identity is malformed",
+    )
+    require(
+        record["producer_run_id"] == run_id
+        and record["producer_stage"] == stage
+        and record["producer_tool_sha256"] == actual_executor_sha256,
+        "recovery_reference_invalid",
+        f"{role} artifact producer differs from its stage decision",
+    )
+    if role == "result_record":
+        require(record["kind"] == "stage_result", "recovery_reference_invalid", "result record has the wrong kind")
+    else:
+        require(record["kind"] != "stage_result", "recovery_reference_invalid", "output is the result record")
+    return record
+
+
 def checkpoint_origins(references: list[dict]) -> dict[tuple[str, str], str]:
-    """Resolve explicit stage reuse using only rows from one DB snapshot."""
-    from description_pipeline.delivery import BUNDLE_SCHEMA
-    from description_pipeline.io import PipelineError
-    from description_pipeline.platform.storage import parse_sealed_uri
-    from description_pipeline.stages import CONFIRMED_STAGE_PASSED, CONFIRMED_STAGE_STATES
+    """Validate canonical decisions and resolve explicit original producers."""
 
     require(isinstance(references, list), "recovery_reference_invalid", "checkpoint references must be a list")
     by_key = {}
+    by_decision = {}
     for row in references:
         require(
-            isinstance(row, dict)
-            and set(row)
-            == {
-                "run_id",
-                "stage",
-                "stage_state",
-                "request_id",
-                "run_parent_run_id",
-                "reused_from_run",
-                "original_executed_at",
-                "checkpoint_uri",
-                "receipt",
-            },
+            isinstance(row, dict) and set(row) == _REFERENCE_FIELDS,
             "recovery_reference_invalid",
             "checkpoint reference fields are malformed",
         )
-        for key in ("run_id", "stage", "request_id"):
-            value = row[key]
+        for key in ("run_id", "stage", "request_id", "decision_id", "command_id"):
             require(
-                isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}", value)),
+                isinstance(row[key], str) and bool(_REFERENCE_ID.fullmatch(row[key])),
                 "recovery_reference_invalid",
                 f"invalid checkpoint {key}",
             )
+        require(
+            row["outcome"] in {"completed", "failed", "cancelled"}
+            and bool(HEX64.fullmatch(row["actual_executor_sha256"])),
+            "recovery_reference_invalid",
+            "checkpoint decision identity is malformed",
+        )
+        if row["original_producer_decision_id"] is not None:
+            require(
+                isinstance(row["original_producer_decision_id"], str)
+                and bool(_REFERENCE_ID.fullmatch(row["original_producer_decision_id"])),
+                "recovery_reference_invalid",
+                "original producer decision is malformed",
+            )
+        if row["result_digest"] is not None:
+            require(
+                bool(HEX64.fullmatch(row["result_digest"])),
+                "recovery_reference_invalid",
+                "checkpoint result digest is malformed",
+            )
+        if row["failure_digest"] is not None:
+            require(
+                bool(HEX64.fullmatch(row["failure_digest"])),
+                "recovery_reference_invalid",
+                "checkpoint failure digest is malformed",
+            )
+        result_record = _validate_artifact_reference(
+            row["result_record_artifact"],
+            role="result_record",
+            run_id=row["run_id"],
+            stage=row["stage"],
+            actual_executor_sha256=row["actual_executor_sha256"],
+        )
+        output = _validate_artifact_reference(
+            row["output_artifact"],
+            role="output",
+            run_id=row["run_id"],
+            stage=row["stage"],
+            actual_executor_sha256=row["actual_executor_sha256"],
+        )
+        sealed_result = result_record is not None or output is not None
+        require(
+            (result_record is None) == (output is None)
+            and (result_record is None) == (row["result_digest"] is None),
+            "recovery_reference_invalid",
+            "result record and output artifact are not one closure",
+        )
+        if row["outcome"] == "completed":
+            require(
+                sealed_result and row["failure_digest"] is None,
+                "recovery_reference_invalid",
+                "completed checkpoint has no sealed result",
+            )
+        else:
+            require(
+                (sealed_result and row["failure_digest"] is None)
+                or (not sealed_result and row["failure_digest"] is not None),
+                "recovery_reference_invalid",
+                "failed checkpoint has neither one result closure nor one failure envelope",
+            )
+            require(
+                row["original_producer_decision_id"] is None,
+                "recovery_reference_invalid",
+                "non-completed checkpoint cannot reuse an original producer",
+            )
         key = (row["run_id"], row["stage"])
-        require(key not in by_key, "recovery_reference_invalid", "duplicate logical checkpoint")
         require(
-            row["stage_state"] in {"completed", "failed", "cancelled", "unknown", "unresolved"}
-            and isinstance(row["receipt"], dict),
+            key not in by_key and row["decision_id"] not in by_decision,
             "recovery_reference_invalid",
-            "checkpoint must carry an auditable terminal stage receipt",
-        )
-        try:
-            producer, uri_stage = parse_sealed_uri(row["checkpoint_uri"])
-        except PipelineError as error:
-            raise RecoveryError("recovery_reference_invalid", "invalid sealed checkpoint URI") from error
-        receipt = row["receipt"]
-        require(
-            uri_stage == row["stage"]
-            and receipt.get("schema_version") == BUNDLE_SCHEMA
-            and receipt.get("run_id") == producer
-            and receipt.get("stage") == row["stage"],
-            "recovery_reference_invalid",
-            "checkpoint receipt identity differs from its producer",
-        )
-        expected_states = (
-            CONFIRMED_STAGE_STATES[row["stage"]] if row["stage_state"] == "completed" else {row["stage_state"]}
-        )
-        expected_passed = CONFIRMED_STAGE_PASSED[row["stage"]] if row["stage_state"] == "completed" else False
-        require(
-            receipt.get("state") in expected_states
-            and receipt.get("passed") is expected_passed
-            and isinstance(receipt.get("artifacts"), list),
-            "recovery_reference_invalid",
-            "checkpoint receipt outcome differs from stage state",
-        )
-        require(
-            row["stage_state"] == "completed" or row["reused_from_run"] is None,
-            "recovery_reference_invalid",
-            "non-completed checkpoint cannot reuse a parent",
+            "duplicate logical checkpoint",
         )
         by_key[key] = row
+        by_decision[row["decision_id"]] = row
     origins = {}
     for key, row in by_key.items():
         current = row
         seen = set()
-        while True:
-            run_id = current["run_id"]
+        while current["original_producer_decision_id"] is not None:
             require(
-                run_id not in seen and len(seen) < 256,
+                current["decision_id"] not in seen and len(seen) < 256,
                 "recovery_reference_invalid",
                 "checkpoint reuse cycle or depth limit",
             )
-            seen.add(run_id)
-            parent = current["reused_from_run"]
-            if parent is None:
-                break
+            seen.add(current["decision_id"])
+            source = by_decision.get(current["original_producer_decision_id"])
             require(
-                parent == current["run_parent_run_id"] and (parent, row["stage"]) in by_key,
+                source is not None
+                and source["stage"] == row["stage"]
+                and source["outcome"] == "completed"
+                and source["run_id"] == current["parent_run_id"],
                 "recovery_reference_invalid",
-                "checkpoint reuse is not bound to its registered parent",
-            )
-            source = by_key[(parent, row["stage"])]
-            require(
-                source["stage_state"] == "completed"
-                and source["checkpoint_uri"] == row["checkpoint_uri"]
-                and source["receipt"] == row["receipt"]
-                and source["original_executed_at"] == row["original_executed_at"],
-                "recovery_reference_invalid",
-                "checkpoint reuse source identity differs",
+                "checkpoint reuse is not bound to its completed parent decision",
             )
             current = source
-        require(
-            row["checkpoint_uri"] == f"store://sealed/{current['run_id']}/{row['stage']}",
-            "recovery_reference_invalid",
-            "checkpoint URI differs from its proven producer",
-        )
         origins[key] = current["run_id"]
     return origins
 
 
-def checkpoint_index(references: list[dict], store_root: Path) -> list[dict]:
-    origins = checkpoint_origins(references)
-    indexed = []
-    physical = {}
-    for reference in references:
-        uri = reference.get("checkpoint_uri")
-        run_id = reference.get("run_id")
-        stage = reference.get("stage")
-        producer = origins[(run_id, stage)]
-        tree = store_root / "sealed" / producer / stage
-        tree_relative = Path("sealed", producer, stage).as_posix()
-        if tree_relative not in physical:
-            files = inventory_tree(tree)
-            verify_checkpoint_tree(tree, files, receipt=reference.get("receipt"), check_inventory=False)
-            physical[tree_relative] = files
-        files = physical[tree_relative]
-        indexed.append(
+def checkpoint_artifact_selection(recovery_root: dict) -> list[str]:
+    """The exact CAS object directories required by the canonical fact root."""
+
+    checkpoint_origins(recovery_root["decisions"])
+    artifact_ids = {record["artifact_id"] for record in recovery_root["artifacts"]}
+    return sorted(f"objects/{artifact_id}" for artifact_id in artifact_ids)
+
+
+def preserved_workspace_roots(
+    context: BackupContext,
+    recovery_root: dict,
+    *,
+    include_contract: bool = True,
+) -> list[dict]:
+    """Typed failure/workspace roots that cannot be reconstructed from clean Git."""
+
+    workspace_root = Path(context.resolved["storage"]["workspace_root"])
+    candidates = []
+    for command_id in recovery_root["workspace_commands"]:
+        path = workspace_root / command_id
+        if path_exists(path):
+            candidates.append(path)
+    for raw in recovery_root["retained_locations"]:
+        path = Path(absolute_text(raw, "retained workspace location"))
+        require(
+            ".." not in path.parts,
+            "recovery_reference_invalid",
+            "retained workspace location contains a parent traversal",
+        )
+        candidates.append(path)
+    ordered = sorted({str(path): path for path in candidates}.values(), key=lambda path: (len(path.parts), str(path)))
+    selected = []
+    for path in ordered:
+        if any(path == parent or path.is_relative_to(parent) for parent in selected):
+            continue
+        selected.append(path)
+    for path in selected:
+        require_real_dir(path, f"preserved workspace {path}", "recovery_reference_invalid")
+    roots = [
+        {
+            "name": f"preserved_workspace_{index}",
+            "path": str(path),
+            "archive": f"workspace-preserved/{index:04d}",
+        }
+        for index, path in enumerate(selected)
+    ]
+    if include_contract:
+        for root in roots:
+            root["class"] = "failure-workspace"
+            root["required"] = True
+    return roots
+
+
+def checkpoint_index(recovery_root: dict, artifact_root: Path) -> dict:
+    """Bind every typed canonical fact to its exact immutable CAS artifacts."""
+
+    from description_pipeline.artifacts.store import ArtifactStore
+    from description_pipeline.pipeline.contracts import ArtifactRef
+
+    require(
+        isinstance(recovery_root, dict)
+        and set(recovery_root)
+        == {
+            "decisions",
+            "artifacts",
+            "missing_artifact_ids",
+            "candidates",
+            "retained_locations",
+            "workspace_commands",
+        }
+        and recovery_root["missing_artifact_ids"] == [],
+        "recovery_reference_invalid",
+        "canonical recovery root is malformed",
+    )
+    checkpoint_origins(recovery_root["decisions"])
+    if not recovery_root["artifacts"]:
+        require(
+            recovery_root["candidates"] == [],
+            "recovery_reference_invalid",
+            "canonical candidates are present without their artifacts",
+        )
+        return {
+            "decisions": [
+                {"run_id": reference["run_id"], "stage": reference["stage"], "artifacts": []}
+                for reference in recovery_root["decisions"]
+            ],
+            "artifacts": [],
+            "candidates": [],
+            "retained_locations": recovery_root["retained_locations"],
+            "workspace_commands": recovery_root["workspace_commands"],
+        }
+    require_real_dir(artifact_root, "artifact root", "recovery_reference_invalid")
+    require_real_dir(artifact_root / "objects", "artifact object root", "recovery_reference_invalid")
+    store = ArtifactStore(artifact_root)
+    artifact_index = []
+    artifacts_by_id = {}
+    for record in recovery_root["artifacts"]:
+        require(
+            isinstance(record, dict) and set(record) == _ARTIFACT_FIELDS,
+            "recovery_reference_invalid",
+            "fact-root artifact fields are malformed",
+        )
+        artifact = ArtifactRef.from_record(record)
+        require(
+            artifact.artifact_id not in artifacts_by_id,
+            "recovery_reference_invalid",
+            "fact-root artifact is duplicated",
+        )
+        tree_relative = Path("objects", artifact.artifact_id).as_posix()
+        tree = artifact_root / tree_relative
+        try:
+            store.verify(artifact)
+        except Exception as error:
+            raise RecoveryError(
+                "recovery_reference_invalid",
+                f"canonical artifact {artifact.artifact_id!r} failed verification",
+                {"artifact_id": artifact.artifact_id, "error": str(error)},
+            ) from error
+        indexed = {
+            "artifact": record,
+            "tree_relative": tree_relative,
+            "files": inventory_tree(tree),
+        }
+        artifact_index.append(indexed)
+        artifacts_by_id[artifact.artifact_id] = indexed
+    candidates = []
+    for candidate in recovery_root["candidates"]:
+        require(
+            isinstance(candidate["candidate_id"], str)
+            and bool(_REFERENCE_ID.fullmatch(candidate["candidate_id"]))
+            and isinstance(candidate["command_id"], str)
+            and bool(_REFERENCE_ID.fullmatch(candidate["command_id"]))
+            and isinstance(candidate["claim_id"], str)
+            and bool(_REFERENCE_ID.fullmatch(candidate["claim_id"]))
+            and type(candidate["fence"]) is int
+            and candidate["fence"] > 0
+            and isinstance(candidate["result_digest"], str)
+            and bool(HEX64.fullmatch(candidate["result_digest"]))
+            and candidate["outcome"] in {"completed", "failed", "cancelled"}
+            and (
+                candidate["outcome"] == "completed"
+                or (isinstance(candidate["reason_code"], str) and candidate["reason_code"])
+            )
+            and isinstance(candidate["created_at"], str),
+            "recovery_reference_invalid",
+            "canonical candidate identity is malformed",
+        )
+        output_record = artifacts_by_id.get(candidate["output_artifact_id"], {}).get("artifact")
+        result_record = artifacts_by_id.get(candidate["result_record_artifact_id"], {}).get("artifact")
+        require(
+            output_record is not None and result_record is not None,
+            "recovery_reference_invalid",
+            "canonical candidate artifact is absent from the fact root",
+        )
+        output_artifact = ArtifactRef.from_record(output_record)
+        result_artifact = ArtifactRef.from_record(result_record)
+        try:
+            result = store.read_result(result_artifact)
+        except Exception as error:
+            raise RecoveryError(
+                "recovery_reference_invalid",
+                f"canonical candidate result {result_artifact.artifact_id!r} failed verification",
+                {"artifact_id": result_artifact.artifact_id, "error": str(error)},
+            ) from error
+        require(
+            result.command_id == candidate["command_id"]
+            and result.digest == candidate["result_digest"]
+            and result.outcome == candidate["outcome"]
+            and result.reason_code == candidate["reason_code"]
+            and result.output_artifact == output_artifact,
+            "recovery_reference_invalid",
+            "canonical candidate differs from its sealed StageResult",
+        )
+        candidates.append(candidate)
+    decisions = []
+    for reference in recovery_root["decisions"]:
+        stage_artifacts = []
+        for role in ("result_record_artifact", "output_artifact"):
+            record = reference[role]
+            if record is None:
+                continue
+            artifact = ArtifactRef.from_record(record)
+            require(
+                artifact.artifact_id in artifacts_by_id,
+                "recovery_reference_invalid",
+                "stage decision artifact is absent from the fact root",
+            )
+            stage_artifacts.append({"role": role, "artifact_id": artifact.artifact_id})
+        if reference["result_record_artifact"] is not None:
+            result_artifact = ArtifactRef.from_record(reference["result_record_artifact"])
+            output_artifact = ArtifactRef.from_record(reference["output_artifact"])
+            try:
+                result = store.read_result(result_artifact)
+            except Exception as error:
+                raise RecoveryError(
+                    "recovery_reference_invalid",
+                    f"canonical result record {result_artifact.artifact_id!r} failed verification",
+                    {"artifact_id": result_artifact.artifact_id, "error": str(error)},
+                ) from error
+            require(
+                result.digest == reference["result_digest"]
+                and result.command_id == reference["command_id"]
+                and result.run_id == reference["run_id"]
+                and result.stage == reference["stage"]
+                and result.outcome == reference["outcome"]
+                and result.actual_executor_sha256 == reference["actual_executor_sha256"]
+                and result.output_artifact == output_artifact,
+                "recovery_reference_invalid",
+                "canonical StageResult differs from its stage decision and output",
+            )
+        decisions.append(
             {
-                "run_id": run_id,
-                "stage": stage,
-                "checkpoint_uri": uri,
-                "tree_relative": tree_relative,
-                "files": files,
+                "run_id": reference["run_id"],
+                "stage": reference["stage"],
+                "artifacts": stage_artifacts,
             }
         )
-    return indexed
+    return {
+        "decisions": decisions,
+        "artifacts": artifact_index,
+        "candidates": candidates,
+        "retained_locations": recovery_root["retained_locations"],
+        "workspace_commands": recovery_root["workspace_commands"],
+    }
 
 
-def verify_checkpoint_index(index: list[dict], store_root: Path) -> None:
-    checked = {}
-    for row in index:
-        tree = store_root / row["tree_relative"]
-        if row["tree_relative"] in checked:
+def verify_checkpoint_index(index: dict, artifact_root: Path) -> None:
+    from description_pipeline.artifacts.store import ArtifactStore
+    from description_pipeline.pipeline.contracts import ArtifactRef
+
+    require(
+        isinstance(index, dict)
+        and set(index)
+        == {"decisions", "artifacts", "candidates", "retained_locations", "workspace_commands"}
+        and isinstance(index["decisions"], list)
+        and isinstance(index["artifacts"], list)
+        and isinstance(index["candidates"], list)
+        and isinstance(index["retained_locations"], list)
+        and isinstance(index["workspace_commands"], list),
+        "recovery_reference_invalid",
+        "checkpoint index must carry the complete canonical root",
+    )
+    if not index["artifacts"]:
+        require(
+            all(not row["artifacts"] for row in index["decisions"])
+            and index["candidates"] == [],
+            "recovery_reference_invalid",
+            "checkpoint decision names an absent artifact index",
+        )
+        return
+    require_real_dir(artifact_root, "artifact root", "recovery_reference_invalid")
+    require_real_dir(artifact_root / "objects", "artifact object root", "recovery_reference_invalid")
+    store = ArtifactStore(artifact_root)
+    artifact_ids = set()
+    for item in index["artifacts"]:
+        require(
+            isinstance(item, dict)
+            and set(item) == {"artifact", "tree_relative", "files"}
+            and isinstance(item["artifact"], dict)
+            and isinstance(item["tree_relative"], str)
+            and isinstance(item["files"], list),
+            "recovery_reference_invalid",
+            "checkpoint artifact index is malformed",
+        )
+        artifact = ArtifactRef.from_record(item["artifact"])
+        require(
+            artifact.artifact_id not in artifact_ids
+            and item["tree_relative"] == Path("objects", artifact.artifact_id).as_posix(),
+            "recovery_reference_invalid",
+            "artifact index path differs from its immutable id",
+        )
+        try:
+            store.verify(artifact)
+        except Exception as error:
+            raise RecoveryError(
+                "recovery_reference_invalid",
+                f"canonical artifact {artifact.artifact_id!r} failed verification",
+                {"artifact_id": artifact.artifact_id, "error": str(error)},
+            ) from error
+        tree = artifact_root / item["tree_relative"]
+        require(
+            inventory_tree(tree) == item["files"],
+            "recovery_member_hash_mismatch",
+            "checkpoint inventory differs",
+        )
+        artifact_ids.add(artifact.artifact_id)
+    for candidate in index["candidates"]:
+        require(
+            isinstance(candidate, dict)
+            and set(candidate) == _CANDIDATE_FIELDS
+            and candidate["output_artifact_id"] in artifact_ids
+            and candidate["result_record_artifact_id"] in artifact_ids,
+            "recovery_reference_invalid",
+            "candidate index names an absent artifact",
+        )
+    for row in index["decisions"]:
+        require(
+            isinstance(row, dict)
+            and set(row) == {"run_id", "stage", "artifacts"}
+            and isinstance(row["run_id"], str)
+            and isinstance(row["stage"], str)
+            and isinstance(row["artifacts"], list),
+            "recovery_reference_invalid",
+            "checkpoint decision index is malformed",
+        )
+        for item in row["artifacts"]:
             require(
-                checked[row["tree_relative"]] == row["files"],
-                "recovery_member_hash_mismatch",
-                "shared checkpoint inventories differ",
+                isinstance(item, dict)
+                and set(item) == {"role", "artifact_id"}
+                and item["role"] in {"result_record_artifact", "output_artifact"}
+                and isinstance(item["artifact_id"], str)
+                and item["artifact_id"] in artifact_ids,
+                "recovery_reference_invalid",
+                "checkpoint decision artifact is absent from the root index",
             )
-            continue
-        require(inventory_tree(tree) == row["files"], "recovery_member_hash_mismatch", "checkpoint inventory differs")
-        checked[row["tree_relative"]] = row["files"]
 
 
 def copy_tree_strict(source: Path, destination: Path) -> None:
@@ -4074,7 +4634,12 @@ def capture_secret_files(context: BackupContext, staging: Path) -> tuple[list[di
     }
 
 
-def root_contract(context: BackupContext, release_root_record: dict) -> list[dict]:
+def root_contract(
+    context: BackupContext,
+    release_root_record: dict,
+    *,
+    recovery_root: dict | None = None,
+) -> list[dict]:
     resolved = context.snapshot["resolved"]
     storage = resolved["storage"]
     roots = [
@@ -4121,12 +4686,19 @@ def root_contract(context: BackupContext, release_root_record: dict) -> list[dic
                 "required": True,
             }
         )
+    if recovery_root is not None:
+        roots.extend(preserved_workspace_roots(context, recovery_root))
     return roots
 
 
 def capture_checkpoint_store(source: Path, staging: Path, *, selection: dict) -> None:
     scope = next(row for row in selection["root_scopes"] if row["name"] == "store_root")
     copy_selected_root(source, staging / "state" / "runs", scope["selection"])
+
+
+def capture_artifact_store(source: Path, staging: Path, *, selection: dict) -> None:
+    scope = next(row for row in selection["root_scopes"] if row["name"] == "artifact_root")
+    copy_selected_root(source, staging / "artifacts", scope["selection"])
 
 
 def derived_dump_member(staging: Path, name: str) -> dict:
@@ -4139,7 +4711,7 @@ def derived_dump_member(staging: Path, name: str) -> dict:
     }
 
 
-def backup_source_checks(context: BackupContext, *, references: list[dict], journal: list[dict]) -> list[dict]:
+def backup_source_checks(context: BackupContext, *, recovery_root: dict, journal: list[dict]) -> list[dict]:
     state_root = Path(context.resolved["storage"]["state_root"])
     archive_root = context.archive_root
     checks = [
@@ -4173,9 +4745,7 @@ def backup_source_checks(context: BackupContext, *, references: list[dict], jour
         {
             "name": "store_root",
             "path": context.resolved["derived"]["store_root"],
-            "selection": sorted(
-                {f"sealed/{producer}/{stage}" for (_run, stage), producer in checkpoint_origins(references).items()}
-            ),
+            "selection": [],
         },
         {
             "name": "handoff_root",
@@ -4184,6 +4754,7 @@ def backup_source_checks(context: BackupContext, *, references: list[dict], jour
         {
             "name": "artifact_root",
             "path": context.resolved["storage"]["artifact_root"],
+            "selection": checkpoint_artifact_selection(recovery_root),
         },
         {"name": "release_json", "path": str(archive_root / "release.json")},
         {"name": "platform_config", "path": str(context.config_path)},
@@ -4230,6 +4801,7 @@ def backup_source_checks(context: BackupContext, *, references: list[dict], jour
     }
     for index, row in enumerate(extra.values()):
         checks.append({"name": f"journal_file_{index}", "path": row["source_path"], "archive": row["member"]})
+    checks.extend(preserved_workspace_roots(context, recovery_root, include_contract=False))
     return checks
 
 
@@ -4238,6 +4810,7 @@ def closure_binding(selection: dict) -> dict:
         "schema_version": SELECTION_SCHEMA,
         "selection_sha256": _digest_document(selection),
         "checkpoint_refs_sha256": selection["checkpoint_refs_sha256"],
+        "fact_root_sha256": selection["fact_root_sha256"],
         "root_scopes_sha256": _digest_document(selection["root_scopes"]),
     }
 
@@ -4335,7 +4908,24 @@ def validate_selected_members(manifest: dict) -> None:
     base_names.update(f"secret_{index}" for index, _ in enumerate(manifest["secrets"]))
     base_names.update(name for name in roots if name.startswith("specification_root_"))
     extras = {name for name in scopes if name.startswith("journal_file_")}
+    preserved = sorted(name for name in scopes if name.startswith("preserved_workspace_"))
+    base_names.update(preserved)
     require(set(scopes) == base_names | extras, "recovery_manifest_invalid", "source scope set differs")
+    workspace_root = Path(manifest["reconstructibles"]["workspace_root"]["path"])
+    retained = set(manifest["selection"]["fact_root"]["retained_locations"])
+    command_paths = {
+        str(workspace_root / command_id)
+        for command_id in manifest["selection"]["fact_root"]["workspace_commands"]
+    }
+    for index, name in enumerate(preserved):
+        scope = scopes[name]
+        require(
+            name == f"preserved_workspace_{index}"
+            and scope.get("archive") == f"workspace-preserved/{index:04d}"
+            and (scope["path"] in retained or scope["path"] in command_paths),
+            "recovery_manifest_invalid",
+            "preserved workspace scope differs from the typed recovery root",
+        )
     for name in extras:
         scope = scopes[name]
         require(
@@ -4405,17 +4995,20 @@ def validate_selected_members(manifest: dict) -> None:
                 "recovery_manifest_invalid",
                 "external journal target is missing",
             )
-    selected_trees = scopes["store_root"]["selection"]
-    allowed_run_members = {"state/runs"}
-    for reference in manifest["references"]:
-        prefix = "state/runs/" + reference["tree_relative"]
-        allowed_run_members.add(prefix)
-        allowed_run_members.update(prefix + "/" + row["path"] for row in reference["files"])
-        allowed_run_members.update(
-            parent.as_posix() for parent in Path(prefix).parents if parent.as_posix().startswith("state/runs")
-        )
-    actual_run_members = {member for member in members if member == "state/runs" or member.startswith("state/runs/")}
-    require(actual_run_members == allowed_run_members, "recovery_manifest_invalid", "checkpoint member closure differs")
+    for artifact in manifest["references"]["artifacts"]:
+        prefix = "artifacts/" + artifact["tree_relative"]
+        for expected in artifact["files"]:
+            member = prefix + "/" + expected["path"]
+            row = members.get(member)
+            require(
+                row is not None
+                and row.get("type") == expected["type"]
+                and row.get("bytes") == expected["bytes"]
+                and row.get("sha256") == expected["sha256"]
+                and row.get("mode") == expected["mode"],
+                "recovery_manifest_invalid",
+                "checkpoint artifact member differs",
+            )
     allowed_promotion_members = {"config/state/promotions", *allowed_promotion}
     for member in allowed_promotion:
         allowed_promotion_members.update(
@@ -4438,13 +5031,6 @@ def validate_selected_members(manifest: dict) -> None:
             continue
         if member.startswith("config/state/promotions/"):
             require(member in allowed_promotion, "recovery_manifest_invalid", "unselected promotion file")
-        if member.startswith("state/runs/"):
-            relative = member.removeprefix("state/runs/")
-            require(
-                any(relative.startswith(tree + "/") for tree in selected_trees),
-                "recovery_manifest_invalid",
-                "unselected checkpoint file",
-            )
 
 
 def verify_selection_archive(manifest: dict, extracted: Path) -> None:
@@ -4456,7 +5042,7 @@ def verify_selection_archive(manifest: dict, extracted: Path) -> None:
     )
     state_root = Path(next(row["path"] for row in manifest["roots"] if row["name"] == "state_root"))
     journal_selection(state_root, extracted=extracted, expected=selection["journal_entries"])
-    indexed = checkpoint_index(selection["checkpoint_refs"], extracted / "state" / "runs")
+    indexed = checkpoint_index(selection["fact_root"], extracted / "artifacts")
     require(
         indexed
         == manifest["references"]
@@ -4474,6 +5060,8 @@ def validate_selection(selection: object) -> dict:
             "snapshot_id",
             "checkpoint_refs",
             "checkpoint_refs_sha256",
+            "fact_root",
+            "fact_root_sha256",
             "root_scopes",
             "journal_entries",
             "source_members",
@@ -4487,11 +5075,17 @@ def validate_selection(selection: object) -> dict:
         "recovery_manifest_invalid",
         "invalid selection identity",
     )
-    checkpoint_origins(selected["checkpoint_refs"])
+    recovery_root = validate_recovery_root(selected["fact_root"])
     require(
         selected["checkpoint_refs_sha256"] == _digest_document(selected["checkpoint_refs"]),
         "recovery_manifest_invalid",
         "selection reference digest differs",
+    )
+    require(
+        selected["fact_root_sha256"] == _digest_document(recovery_root)
+        and recovery_root["decisions"] == selected["checkpoint_refs"],
+        "recovery_manifest_invalid",
+        "selection fact root differs from its decision references",
     )
     require(
         isinstance(selected["root_scopes"], list) and isinstance(selected["journal_entries"], list),
@@ -4532,15 +5126,15 @@ def validate_selection(selection: object) -> dict:
     require({"promotions", "store_root"} <= names, "recovery_manifest_invalid", "missing filtered scopes")
     store = next(scope for scope in selected["root_scopes"] if scope["name"] == "store_root")
     require(
-        store.get("selection")
-        == sorted(
-            {
-                f"sealed/{producer}/{stage}"
-                for (_run, stage), producer in checkpoint_origins(selected["checkpoint_refs"]).items()
-            }
-        ),
+        store.get("selection") == [],
         "recovery_manifest_invalid",
-        "store scope differs from checkpoint references",
+        "legacy sealed store must remain empty after the canonical cutover",
+    )
+    artifacts = next(scope for scope in selected["root_scopes"] if scope["name"] == "artifact_root")
+    require(
+        artifacts.get("selection") == checkpoint_artifact_selection(recovery_root),
+        "recovery_manifest_invalid",
+        "artifact scope differs from the canonical fact root",
     )
     for row in selected["journal_entries"]:
         _exact_keys(
@@ -4684,7 +5278,8 @@ def _snapshot_worker(request_path: Path) -> int:
         snapshot = _db_connect(database)
         snapshot_id = _begin_exported_snapshot(snapshot)
         roles_snapshot_before = _roles_settings_snapshot(snapshot)
-        catalog, data, checkpoint_rows = _database_baseline_snapshot(snapshot)
+        catalog, data, recovery_root = _database_baseline_snapshot(snapshot)
+        checkpoint_rows = recovery_root["decisions"]
         sequence_before = data["sequences"]
         atomic_write(
             control / "sequence-before.json",
@@ -4718,6 +5313,8 @@ def _snapshot_worker(request_path: Path) -> int:
                     "snapshot_id": snapshot_id,
                     "checkpoint_refs": checkpoint_rows,
                     "checkpoint_refs_sha256": _digest_document(checkpoint_rows),
+                    "recovery_root": recovery_root,
+                    "recovery_root_sha256": _digest_document(recovery_root),
                     "database_bytes": int(_connection_scalar(snapshot, "SELECT pg_database_size(current_database())")),
                     "roles_sha256": _digest_document(roles_snapshot_before),
                     "created_at": utc_now(),
@@ -4735,14 +5332,15 @@ def _snapshot_worker(request_path: Path) -> int:
         require(
             selection["snapshot_id"] == snapshot_id
             and selection["checkpoint_refs"] == checkpoint_rows
+            and selection["fact_root"] == recovery_root
             and inventory_marker.get("closure") == binding
             and files_marker.get("closure") == binding,
             "recovery_snapshot_worker_failed",
             "snapshot selection markers differ",
         )
         indexed_checkpoints = checkpoint_index(
-            checkpoint_rows,
-            staging / "state" / "runs",
+            recovery_root,
+            staging / "artifacts",
         )
         write_json_once(
             database_dir / "reference-index.json",
@@ -4750,7 +5348,7 @@ def _snapshot_worker(request_path: Path) -> int:
         )
         verify_checkpoint_index(
             indexed_checkpoints,
-            staging / "state" / "runs",
+            staging / "artifacts",
         )
 
         dump_path = database_dir / "airflow_meta.dump"
@@ -6295,12 +6893,13 @@ def _validate_windows_recovery_state(document: object) -> dict:
     transition_python_action = (
         identity["release_identity_sha256"] == WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
         and normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
-        and normalized_action["arguments"] == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
+        and normalized_action["arguments"]
+        == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
     )
     python_module_action = (
         normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
         and normalized_action["arguments"]
-        == f'-I -B -m description_pipeline serve --config "{normalized["config_path"]}"'
+        == f'-I -B -m description_pipeline.orchestration.windows serve --config "{normalized["config_path"]}"'
     ) or transition_python_action
     legacy_launcher_action = (
         normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/description.exe"
@@ -7592,14 +8191,22 @@ def _backup_command_claimed(
             "recovery_snapshot_worker_failed",
             "snapshot references are malformed",
         )
-        checkpoint_origins(snapshot_ready["checkpoint_refs"])
+        recovery_root = validate_recovery_root(snapshot_ready.get("recovery_root"))
+        require(
+            snapshot_ready.get("recovery_root_sha256") == _digest_document(recovery_root)
+            and recovery_root["decisions"] == snapshot_ready["checkpoint_refs"],
+            "recovery_snapshot_worker_failed",
+            "snapshot recovery root differs from its decision references",
+        )
         journal = journal_selection(Path(context.resolved["storage"]["state_root"]))
-        source_checks = backup_source_checks(context, references=snapshot_ready["checkpoint_refs"], journal=journal)
+        source_checks = backup_source_checks(context, recovery_root=recovery_root, journal=journal)
         selection = {
             "schema_version": SELECTION_SCHEMA,
             "snapshot_id": snapshot_ready["snapshot_id"],
             "checkpoint_refs": snapshot_ready["checkpoint_refs"],
             "checkpoint_refs_sha256": snapshot_ready["checkpoint_refs_sha256"],
+            "fact_root": recovery_root,
+            "fact_root_sha256": snapshot_ready["recovery_root_sha256"],
             "root_scopes": source_checks,
             "journal_entries": journal,
         }
@@ -7637,13 +8244,19 @@ def _backup_command_claimed(
         )
         # File copying remains strictly inside the exported DB snapshot window.
         copy_release_capture = copy_release_tree(context, staging)
-        roots = root_contract(context, copy_release_capture)
+        roots = root_contract(context, copy_release_capture, recovery_root=recovery_root)
         copy_state_configuration(
             Path(context.resolved["storage"]["state_root"]),
             context.install_record["install_id"],
             staging,
             selection=selection,
         )
+        for root in roots:
+            if root["name"].startswith("preserved_workspace_"):
+                copy_required_tree(
+                    Path(root["path"]),
+                    staging / root["archive"],
+                )
         require(
             stat.S_IMODE(context.config_path.stat().st_mode) & 0o077 == 0,
             "recovery_release_missing",
@@ -7663,9 +8276,10 @@ def _backup_command_claimed(
             Path(context.resolved["storage"]["handoff_root"]),
             staging / "handoff",
         )
-        copy_required_tree(
+        capture_artifact_store(
             Path(context.resolved["storage"]["artifact_root"]),
-            staging / "artifacts",
+            staging,
+            selection=selection,
         )
         for index, root in enumerate(context.resolved["specifications"]["record_roots"]):
             copy_required_tree(
@@ -8994,40 +9608,104 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         "recovery_manifest_invalid",
         "maintenance receipt and snapshot worker observed different database states",
     )
-    references = doc["references"]
+    references = _exact_keys(
+        doc["references"],
+        {"decisions", "artifacts", "candidates", "retained_locations", "workspace_commands"},
+        "references",
+    )
     require(
-        isinstance(references, list),
+        isinstance(references["decisions"], list)
+        and isinstance(references["artifacts"], list)
+        and isinstance(references["candidates"], list)
+        and isinstance(references["retained_locations"], list)
+        and isinstance(references["workspace_commands"], list),
         "recovery_manifest_invalid",
         "recovery reference index is malformed",
     )
-    for index, row in enumerate(references):
+    for index, row in enumerate(references["decisions"]):
         require(
             isinstance(row, dict)
-            and set(row)
-            == {
-                "run_id",
-                "stage",
-                "checkpoint_uri",
-                "tree_relative",
-                "files",
-            }
+            and set(row) == {"run_id", "stage", "artifacts"}
             and isinstance(row["run_id"], str)
             and isinstance(row["stage"], str)
-            and row["checkpoint_uri"] == f"store://{row['tree_relative']}"
-            and isinstance(row["tree_relative"], str)
-            and isinstance(row["files"], list),
+            and isinstance(row["artifacts"], list),
             "recovery_manifest_invalid",
             f"reference[{index}] is malformed",
         )
-    expected_origins = checkpoint_origins(selection["checkpoint_refs"])
-    require(len(references) == len(expected_origins), "recovery_manifest_invalid", "checkpoint index count differs")
-    for row in references:
-        producer = expected_origins.get((row["run_id"], row["stage"]))
+        seen_roles = set()
+        for item in row["artifacts"]:
+            require(
+                isinstance(item, dict)
+                and set(item) == {"role", "artifact_id"}
+                and item["role"] in {"result_record_artifact", "output_artifact"}
+                and item["role"] not in seen_roles
+                and isinstance(item["artifact_id"], str),
+                "recovery_manifest_invalid",
+                f"reference[{index}] artifact is malformed",
+            )
+            seen_roles.add(item["role"])
+    artifact_ids = set()
+    for index, item in enumerate(references["artifacts"]):
         require(
-            producer is not None and row["tree_relative"] == f"sealed/{producer}/{row['stage']}",
+            isinstance(item, dict)
+            and set(item) == {"artifact", "tree_relative", "files"}
+            and isinstance(item["artifact"], dict)
+            and set(item["artifact"]) == _ARTIFACT_FIELDS
+            and isinstance(item["tree_relative"], str)
+            and isinstance(item["files"], list),
             "recovery_manifest_invalid",
-            "checkpoint index producer differs",
+            f"reference artifact[{index}] is malformed",
         )
+        artifact_id = item["artifact"]["artifact_id"]
+        require(
+            isinstance(artifact_id, str)
+            and artifact_id not in artifact_ids
+            and item["tree_relative"] == Path("objects", artifact_id).as_posix(),
+            "recovery_manifest_invalid",
+            f"reference artifact[{index}] identity is malformed or duplicated",
+        )
+        artifact_ids.add(artifact_id)
+    for index, candidate in enumerate(references["candidates"]):
+        require(
+            isinstance(candidate, dict)
+            and set(candidate) == _CANDIDATE_FIELDS,
+            "recovery_manifest_invalid",
+            f"reference candidate[{index}] is malformed",
+        )
+    expected_origins = checkpoint_origins(selection["checkpoint_refs"])
+    require(
+        len(references["decisions"]) == len(expected_origins),
+        "recovery_manifest_invalid",
+        "checkpoint index count differs",
+    )
+    require(
+        {(row["run_id"], row["stage"]) for row in references["decisions"]} == set(expected_origins),
+        "recovery_manifest_invalid",
+        "checkpoint index decisions differ",
+    )
+    index_by_key = {(row["run_id"], row["stage"]): row for row in references["decisions"]}
+    for reference in selection["checkpoint_refs"]:
+        indexed = index_by_key[(reference["run_id"], reference["stage"])]
+        expected_artifacts = {
+            role: reference[role]["artifact_id"]
+            for role in ("result_record_artifact", "output_artifact")
+            if reference[role] is not None
+        }
+        actual_artifacts = {item["role"]: item["artifact_id"] for item in indexed["artifacts"]}
+        require(
+            actual_artifacts == expected_artifacts,
+            "recovery_manifest_invalid",
+            "checkpoint index artifacts differ from the canonical decisions",
+        )
+    require(
+        artifact_ids
+        == {item["artifact_id"] for item in selection["fact_root"]["artifacts"]}
+        and references["candidates"] == selection["fact_root"]["candidates"]
+        and references["retained_locations"] == selection["fact_root"]["retained_locations"]
+        and references["workspace_commands"] == selection["fact_root"]["workspace_commands"],
+        "recovery_manifest_invalid",
+        "reference index differs from the complete canonical fact root",
+    )
     require(
         selection["snapshot_id"] == doc["database"]["snapshot"]["id"]
         and doc["consistency"].get("closure") == doc["closure"],
@@ -10810,6 +11488,11 @@ def validate_workspace_targets(
     verify_only: bool,
 ) -> None:
     root, plan = _workspace_plan(manifest, extracted)
+    preserved = [
+        Path(scope["path"])
+        for scope in manifest["selection"]["root_scopes"]
+        if scope["name"].startswith("preserved_workspace_")
+    ]
     require(
         not is_link(root),
         "recovery_target_path_unsafe",
@@ -10818,6 +11501,16 @@ def validate_workspace_targets(
     seen = set()
     for raw in plan["repositories"]:
         target, row = _workspace_row(root, raw)
+        require(
+            not any(
+                target == preserved_path
+                or target.is_relative_to(preserved_path)
+                or preserved_path.is_relative_to(target)
+                for preserved_path in preserved
+            ),
+            "recovery_manifest_invalid",
+            f"preserved workspace overlaps a reconstructed checkout: {row['repository_slug']}",
+        )
         require(
             target not in seen,
             "recovery_manifest_invalid",
@@ -11830,6 +12523,16 @@ def _verify_deployment_files(
         )
 
 
+def _recovered_runtime_environment() -> dict[str, str]:
+    """Return only the caller environment needed to probe a recovered runtime."""
+
+    environment = os.environ.copy()
+    for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        environment.pop(name, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    return environment
+
+
 def verify_release_runtime(
     *,
     manifest: dict,
@@ -11883,6 +12586,7 @@ def verify_release_runtime(
         "recovery_release_missing",
         "recovered interpreter is not a real CPython environment",
     )
+    runtime_environment = _recovered_runtime_environment()
     completed = subprocess.run(
         [
             str(python),
@@ -11902,6 +12606,7 @@ def verify_release_runtime(
         text=True,
         timeout=60,
         check=False,
+        env=runtime_environment,
     )
     require(
         completed.returncode == 0,
@@ -11940,6 +12645,7 @@ def verify_release_runtime(
         text=True,
         timeout=60,
         check=False,
+        env=runtime_environment,
     )
     try:
         runtime_identity = json.loads(probe.stdout)
@@ -12009,11 +12715,12 @@ def verify_release_runtime(
         "recovered description entry point is missing or not executable",
     )
     pip_check = subprocess.run(
-        [str(python), "-m", "pip", "check"],
+        [str(python), "-I", "-B", "-m", "pip", "check"],
         capture_output=True,
         text=True,
         timeout=120,
         check=False,
+        env=runtime_environment,
     )
     require(
         pip_check.returncode == 0,
@@ -12029,6 +12736,7 @@ def verify_release_runtime(
             text=True,
             timeout=120,
             check=False,
+            env=runtime_environment,
         )
         require(
             entry_probe.returncode == 0 and bool(entry_probe.stdout.strip()),
@@ -12147,7 +12855,7 @@ def rehydrate_release_runtime(
         "recovery_release_missing",
         "release runtime rehydration requires the CPython 3.12 controller",
     )
-    env = os.environ.copy()
+    env = _recovered_runtime_environment()
     env.update(
         {
             "AIRFLOW_VENV": str(airflow_venv),
@@ -12392,7 +13100,7 @@ def restore_command(
                 manifest["database"]["reference_index"]["member"],
                 "checkpoint reference index",
             ),
-            extracted / "state" / "runs",
+            extracted / "artifacts",
         )
         receipt.update(
             {
@@ -12454,7 +13162,7 @@ def restore_command(
                 manifest["database"]["reference_index"]["member"],
                 "checkpoint reference index",
             ),
-            Path(plan["roots"]["store_root"]),
+            Path(plan["roots"]["artifact_root"]),
         )
         state_root = next(Path(root["path"]) for root in manifest["roots"] if root["name"] == "state_root")
         airflow_cfg = state_root / "airflow-home" / "airflow.cfg"

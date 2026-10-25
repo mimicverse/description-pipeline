@@ -1,0 +1,2524 @@
+"""Strict client and Discover adapter for Windows native operations."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import tempfile
+import threading
+import time
+import zipfile
+from collections.abc import Callable, Mapping
+from contextlib import suppress
+from dataclasses import dataclass, field as dataclass_field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
+
+from ..io import (
+    PipelineError,
+    canonical,
+    confined,
+    digest,
+    file_digest,
+    parse_data,
+    write_json,
+)
+from ..native_transfer import (
+    CAPTURE_MANIFEST,
+    CAPTURE_TRANSFER_SCHEMA,
+    MAX_MANIFEST_BYTES,
+)
+from ..pipeline.contracts import NativeTargetIdentity
+from ..schemas import (
+    NATIVE_CAPTURE_EFFECT_SCHEMA,
+    NATIVE_OPERATION_IDENTITY_SCHEMA,
+    NATIVE_OPERATION_OBSERVATION_SCHEMA,
+)
+from ..sources.solidworks.discover_stage import (
+    NATIVE_OBSERVATION_SCHEMA,
+    NativeDiscoverRefusal,
+    NativeDiscoverRequest,
+    NativeObservation,
+    admit_native_observation,
+)
+from .discover_protocol import (
+    OBSERVATION_ARCHIVE,
+    SOURCE_ARCHIVE,
+    admit_observation_bundle,
+    seal_source_archive,
+)
+from .native_operation_runtime import (
+    CAPTURE_KIND,
+    CAPTURE_OPERATION_SCHEMA,
+    DISCOVER_KIND,
+    CaptureOperationRequest,
+    NativeOperationCreate,
+    NativeOperationError,
+    NativeOperationView,
+    build_operation_record,
+)
+from .native_operation_server import NATIVE_TOOL_IDENTITY_SCHEMA
+from .stage_transfer import CAPTURE_ARCHIVE, admit_capture
+
+if TYPE_CHECKING:
+    from ..pipeline.contracts import StageCommand
+    from ..pipeline.effects import EffectIntent
+    from ..pipeline.reconciliation import EffectReconciliationEvidence
+
+MAX_OPERATION_JSON_BYTES = 8 * 1024**2
+MAX_OPERATION_ARCHIVE_BYTES = 16 * 1024**3
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+_TERMINAL_STATES = frozenset({"satisfied", "failed", "cancelled", "unknown"})
+_KINDS = frozenset({DISCOVER_KIND, CAPTURE_KIND})
+_OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
+
+
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def _internal_opener(request: urlrequest.Request, *, timeout: float):
+    opener = urlrequest.build_opener(
+        urlrequest.ProxyHandler({}),
+        _NoRedirect(),
+    )
+    return opener.open(request, timeout=timeout)
+
+
+class NativeOperationClientError(RuntimeError):
+    """An authenticated native operation endpoint refused a request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        code: str | None = None,
+        detail: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.detail = dict(detail or {})
+
+
+class NativeOperationClientConflict(NativeOperationClientError):
+    """The same operation identity is bound to different immutable content."""
+
+
+class NativeOperationIdentityConflict(NativeOperationClientConflict):
+    """The endpoint returned a valid view for a different operation identity."""
+
+
+class NativeOperationNotFound(NativeOperationClientError):
+    """The native operation identity is not known to the endpoint."""
+
+
+class NativeOperationProtocolError(NativeOperationClientError):
+    """The endpoint returned an invalid or inconsistent wire record."""
+
+
+class NativeOperationRemoteUnknown(NativeOperationClientError):
+    """The remote side-effect result requires reconciliation."""
+
+
+class NativeOperationWaitTimeout(NativeOperationClientError):
+    """The operation has not reached a terminal fact before the client deadline."""
+
+
+def _require_native_executor(
+    view: NativeOperationView,
+    native_tool_requirement_sha256: str,
+) -> None:
+    """Require the native executor view to equal the observed executable tool."""
+
+    actual_tool = view.actual_native_tool_sha256
+    executor = view.executor_sha256
+    if (actual_tool is None) != (executor is None):
+        raise NativeOperationClientConflict(
+            "native operation tool observation and executor identities are incomplete",
+            status=409,
+            code="native_executor_mismatch",
+        )
+    if actual_tool is not None and actual_tool != executor:
+        raise NativeOperationClientConflict(
+            "native operation executor differs from the observed native tool",
+            status=409,
+            code="native_executor_mismatch",
+        )
+    if (
+        actual_tool is not None
+        and actual_tool != native_tool_requirement_sha256
+    ):
+        raise NativeOperationClientConflict(
+            "native operation status reports another native tool",
+            status=409,
+            code="native_tool_mismatch",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOperationEndpoint:
+    base_url: str
+    token: str = dataclass_field(repr=False)
+    timeout: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token, str) or len(self.token) < 32:
+            raise ValueError("token must contain at least 32 characters")
+        if not self.token.isascii() or any(character.isspace() for character in self.token):
+            raise ValueError("token must contain non-whitespace ASCII characters")
+        parsed = urlparse.urlsplit(self.base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError("base_url must be one HTTP(S) origin without credentials or a path")
+        if parsed.scheme == "http" and parsed.hostname not in _LOOPBACK:
+            raise ValueError("plaintext HTTP is allowed only for loopback native operation endpoints")
+        if type(self.timeout) not in {int, float} or self.timeout <= 0:
+            raise ValueError("timeout must be positive")
+        object.__setattr__(self, "base_url", f"{parsed.scheme}://{parsed.netloc}")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactDownload:
+    operation_id: str
+    path: Path
+    name: str
+    bytes: int
+    sha256: str
+    media_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOperationStatusExpectation:
+    """The immutable remote-operation identity that a status probe must match."""
+
+    operation_id: str
+    kind: str
+    target_id: str
+    request_sha256: str
+    native_tool_requirement_sha256: str
+    input_archive_sha256: str
+    payload_sha256: str
+
+    def __post_init__(self) -> None:
+        NativeOperationClient._operation_id(self.operation_id)
+        if self.kind not in _KINDS:
+            raise ValueError("kind is not a native operation kind")
+        for name in (
+            "target_id",
+            "request_sha256",
+            "native_tool_requirement_sha256",
+            "input_archive_sha256",
+            "payload_sha256",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+
+    @classmethod
+    def from_create(cls, intent: NativeOperationCreate) -> NativeOperationStatusExpectation:
+        if not isinstance(intent, NativeOperationCreate):
+            raise TypeError("intent must be a NativeOperationCreate")
+        return cls(
+            operation_id=intent.operation_id,
+            kind=intent.kind,
+            target_id=intent.target_id,
+            request_sha256=intent.request_sha256,
+            native_tool_requirement_sha256=intent.native_tool_requirement_sha256,
+            input_archive_sha256=intent.input_archive_sha256,
+            payload_sha256=intent.payload_sha256,
+        )
+
+    def require(self, view: NativeOperationView) -> NativeOperationView:
+        """Reject an endpoint view that names another immutable operation."""
+
+        if not isinstance(view, NativeOperationView):
+            raise NativeOperationProtocolError(
+                "native operation status is not a canonical view"
+            )
+        if (
+            view.operation_id != self.operation_id
+            or view.kind != self.kind
+            or view.target_id != self.target_id
+            or view.request_sha256 != self.request_sha256
+            or view.native_tool_requirement_sha256
+            != self.native_tool_requirement_sha256
+            or view.input_archive_sha256 != self.input_archive_sha256
+            or view.payload_sha256 != self.payload_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "native operation status differs from the frozen request",
+                status=409,
+                code="native_operation_conflict",
+            )
+        _require_native_executor(
+            view,
+            self.native_tool_requirement_sha256,
+        )
+        return view
+
+
+@dataclass(frozen=True, slots=True)
+class NativeToolIdentity:
+    schema_version: str
+    tool: Mapping[str, object]
+    tool_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != NATIVE_TOOL_IDENTITY_SCHEMA:
+            raise NativeOperationProtocolError(
+                "native tool identity schema is unsupported"
+            )
+        if not isinstance(self.tool, Mapping) or not self.tool:
+            raise NativeOperationProtocolError("native tool identity is empty")
+        tool = copy.deepcopy(dict(self.tool))
+        if digest(tool) != self.tool_sha256:
+            raise NativeOperationProtocolError(
+                "native tool identity digest differs from its record"
+            )
+        object.__setattr__(self, "tool", tool)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> NativeToolIdentity:
+        if not isinstance(record, Mapping) or set(record) != {
+            "schema_version",
+            "tool",
+            "tool_sha256",
+        }:
+            raise NativeOperationProtocolError(
+                "native tool identity fields are invalid"
+            )
+        return cls(
+            schema_version=record["schema_version"],
+            tool=record["tool"],
+            tool_sha256=record["tool_sha256"],
+        )
+
+
+class NativeOperationToolProvider:
+    """Read the full Windows native tool record once and reuse the observation."""
+
+    def __init__(self, client: NativeOperationClient) -> None:
+        if not isinstance(client, NativeOperationClient):
+            raise TypeError("client must be a NativeOperationClient")
+        self.client = client
+        self._identity: NativeToolIdentity | None = None
+        self._lock = threading.Lock()
+
+    def __call__(self) -> dict[str, object]:
+        with self._lock:
+            if self._identity is None:
+                self._identity = self.client.get_native_tool()
+            return copy.deepcopy(dict(self._identity.tool))
+
+    @property
+    def identity(self) -> NativeToolIdentity:
+        self()
+        with self._lock:
+            assert self._identity is not None
+            return self._identity
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteNativeCaptureResult:
+    """CaptureHandler-compatible result returned by the Linux client adapter."""
+
+    outcome: str
+    output: Path | None
+    archive: Path | None
+    receipt: Mapping[str, object]
+    resources_settled: bool
+    reason_code: str | None = None
+
+
+class NativeOperationClient:
+    """Small strict JSON/stream client with an injectable HTTP opener."""
+
+    def __init__(
+        self,
+        endpoint: NativeOperationEndpoint,
+        *,
+        target_id: str,
+        opener: Callable[..., Any] | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not isinstance(endpoint, NativeOperationEndpoint):
+            raise TypeError("endpoint must be a NativeOperationEndpoint")
+        if (
+            not isinstance(target_id, str)
+            or len(target_id) != 64
+            or any(character not in "0123456789abcdef" for character in target_id)
+        ):
+            raise ValueError("target_id must be a lowercase SHA-256 digest")
+        self.endpoint = endpoint
+        self.target_id = target_id
+        self._opener = opener or _internal_opener
+        self._sleep = sleeper
+        self._clock = clock
+        self._target_lock = threading.Lock()
+        self._target_verified = False
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.endpoint.token}",
+            "Cache-Control": "no-store",
+            "X-Native-Target-ID": self.target_id,
+        }
+
+    def _open(self, request: urlrequest.Request):
+        try:
+            return self._opener(request, timeout=self.endpoint.timeout)
+        except urlerror.HTTPError as error:
+            self._raise_http_error(error)
+        except urlerror.URLError as error:
+            raise NativeOperationClientError(
+                f"native operation endpoint is unreachable: {error.reason}"
+            ) from error
+        except (TimeoutError, OSError) as error:
+            raise NativeOperationClientError(
+                f"native operation endpoint transport is unavailable: {type(error).__name__}"
+            ) from error
+
+    def _raise_http_error(self, error: urlerror.HTTPError) -> None:
+        code = None
+        detail: dict[str, object] = {}
+        message = f"native operation endpoint returned HTTP {error.code}"
+        with suppress(Exception):
+            raw = error.read(MAX_OPERATION_JSON_BYTES)
+            body = json.loads(raw.decode("utf-8"))
+            if isinstance(body, dict):
+                code = body.get("error_code") if isinstance(body.get("error_code"), str) else None
+                if isinstance(body.get("detail"), dict):
+                    detail = dict(body["detail"])
+                if isinstance(body.get("error"), str) and body["error"]:
+                    message = body["error"]
+        error_type = (
+            NativeOperationClientConflict
+            if error.code == 409
+            else NativeOperationNotFound
+            if error.code == 404
+            else NativeOperationClientError
+        )
+        raise error_type(
+            message,
+            status=error.code,
+            code=code,
+            detail=detail,
+        )
+
+    def _response_json(self, response) -> dict:
+        self._require_response_target(response)
+        content_type = response.headers.get_content_type()
+        if content_type != "application/json":
+            raise NativeOperationProtocolError(
+                "native operation endpoint returned a non-JSON response"
+            )
+        try:
+            raw = response.read(MAX_OPERATION_JSON_BYTES + 1)
+        except (OSError, http.client.HTTPException) as error:
+            raise NativeOperationProtocolError(
+                "native operation response transport failed"
+            ) from error
+        if len(raw) > MAX_OPERATION_JSON_BYTES:
+            raise NativeOperationProtocolError("native operation response exceeds its JSON limit")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise NativeOperationProtocolError(
+                "native operation endpoint returned invalid UTF-8 JSON"
+            ) from error
+        if not isinstance(value, dict):
+            raise NativeOperationProtocolError(
+                "native operation endpoint response is not a JSON object"
+            )
+        return value
+
+    def _require_response_target(self, response) -> None:
+        received = response.headers.get("X-Native-Target-ID")
+        if received != self.target_id:
+            raise NativeOperationClientConflict(
+                "native operation response carries another target",
+                status=409,
+                code="native_target_mismatch",
+            )
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Mapping[str, object] | None = None,
+        source: Any = None,
+        source_size: int | None = None,
+        content_type: str = "application/json",
+    ) -> dict:
+        if payload is not None and source is not None:
+            raise ValueError("a native operation request cannot contain JSON and a file body")
+        headers = {
+            **self._headers,
+            "Accept": "application/json",
+            "Content-Type": content_type,
+        }
+        body: bytes | Any = None
+        size = 0
+        if payload is not None:
+            try:
+                body = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                raise NativeOperationProtocolError(
+                    "native operation request is not canonical JSON"
+                ) from error
+            size = len(body)
+        elif source is not None:
+            if source_size is None or source_size <= 0:
+                raise ValueError("source_size is required for a file body")
+            body = source
+            size = source_size
+        if body is not None:
+            headers["Content-Length"] = str(size)
+        request = urlrequest.Request(
+            self.endpoint.base_url + path,
+            data=body,
+            method=method,
+            headers=headers,
+        )
+        with self._open(request) as response:
+            return self._response_json(response)
+
+    @staticmethod
+    def _operation_id(operation_id: str) -> str:
+        if (
+            not isinstance(operation_id, str)
+            or _OPERATION_ID.fullmatch(operation_id) is None
+            or operation_id.endswith(".")
+            or operation_id.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES
+        ):
+            raise ValueError("operation_id is not path-safe")
+        return operation_id
+
+    def _view(self, value: Mapping[str, object]) -> NativeOperationView:
+        try:
+            view = NativeOperationView.from_record(value)
+        except NativeOperationError as error:
+            raise NativeOperationProtocolError(
+                f"native operation endpoint returned an invalid view: {error}"
+            ) from error
+        if view.target_id != self.target_id:
+            raise NativeOperationClientConflict(
+                "native operation view belongs to another target",
+                status=409,
+                code="native_target_mismatch",
+            )
+        return view
+
+    def get_native_tool(self) -> NativeToolIdentity:
+        self._ensure_target()
+        response = self._request_json("GET", "/native-tool")
+        return NativeToolIdentity.from_record(response)
+
+    def get_target_identity(self) -> NativeTargetIdentity:
+        response = self._request_json("GET", "/target")
+        try:
+            identity = NativeTargetIdentity.from_record(response)
+        except Exception as error:
+            raise NativeOperationProtocolError(
+                "native endpoint health has no canonical target identity"
+            ) from error
+        if (
+            identity.target_id != self.target_id
+            or response.get("install_id") != identity.install_id
+            or response.get("pipeline_id") != identity.pipeline_id
+        ):
+            raise NativeOperationClientConflict(
+                "native endpoint health names another target",
+                status=409,
+                code="native_target_mismatch",
+            )
+        return identity
+
+    def _ensure_target(self) -> None:
+        with self._target_lock:
+            if self._target_verified:
+                return
+            self.get_target_identity()
+            self._target_verified = True
+
+    def create_operation(self, envelope: Mapping[str, object]) -> NativeOperationView:
+        self._ensure_target()
+        try:
+            intent = NativeOperationCreate.from_record(envelope)
+        except NativeOperationError as error:
+            raise NativeOperationProtocolError(str(error)) from error
+        response = self._request_json(
+            "POST",
+            "/operations",
+            payload=intent.to_record(),
+        )
+        view = self._view(response)
+        if (
+            view.operation_id != intent.operation_id
+            or view.kind != intent.kind
+            or view.target_id != intent.target_id
+            or view.payload_sha256 != intent.payload_sha256
+            or view.request_sha256 != intent.request_sha256
+            or view.input_archive_sha256 != intent.input_archive_sha256
+            or view.native_tool_requirement_sha256
+            != intent.native_tool_requirement_sha256
+        ):
+            raise NativeOperationProtocolError(
+                "native operation endpoint returned a different operation identity"
+            )
+        return view
+
+    def upload_input(self, operation_id: str, archive: str | Path) -> NativeOperationView:
+        self._ensure_target()
+        canonical_id = self._operation_id(operation_id)
+        source = Path(archive)
+        if not source.is_file() or source.is_symlink():
+            raise ValueError("input archive must be one regular file")
+        size = source.stat().st_size
+        if not 0 < size <= MAX_OPERATION_ARCHIVE_BYTES:
+            raise ValueError("input archive has an invalid size")
+        source_sha256 = file_digest(source)
+        with source.open("rb") as stream:
+            response = self._request_json(
+                "POST",
+                f"/operations/{canonical_id}/input",
+                source=stream,
+                source_size=size,
+                content_type="application/zip",
+            )
+        if (
+            source.stat().st_size != size
+            or file_digest(source) != source_sha256
+        ):
+            raise NativeOperationProtocolError(
+                "input archive changed while it was uploaded"
+            )
+        view = self._view(response)
+        if (
+            view.operation_id != canonical_id
+            or view.input_archive_sha256 != source_sha256
+        ):
+            raise NativeOperationProtocolError(
+                "native operation endpoint admitted a different input archive"
+            )
+        return view
+
+    def get_operation(self, operation_id: str) -> NativeOperationView:
+        self._ensure_target()
+        operation_id = self._operation_id(operation_id)
+        response = self._request_json(
+            "GET",
+            f"/operations/{operation_id}",
+        )
+        view = self._view(response)
+        if view.operation_id != operation_id:
+            raise NativeOperationIdentityConflict(
+                "native operation endpoint answered for another operation",
+                status=409,
+                code="native_operation_identity_mismatch",
+            )
+        return view
+
+    def submit_operation(
+        self,
+        envelope: Mapping[str, object],
+        archive: str | Path,
+    ) -> NativeOperationView:
+        """Submit once when needed, then return the current durable state without polling."""
+
+        try:
+            intent = NativeOperationCreate.from_record(envelope)
+        except NativeOperationError as error:
+            raise NativeOperationProtocolError(str(error)) from error
+        expected = NativeOperationStatusExpectation.from_create(intent)
+        try:
+            view = self.get_operation(intent.operation_id)
+        except NativeOperationNotFound:
+            view = None
+        if view is None or view.state == "accepted":
+            source = Path(archive)
+            if not source.is_file() or source.is_symlink():
+                raise ValueError("input archive must be one regular file")
+            if (
+                source.stat().st_size != intent.input_archive_bytes
+                or file_digest(source) != intent.input_archive_sha256
+            ):
+                raise NativeOperationClientConflict(
+                    "local input archive differs from the sealed operation intent",
+                    status=409,
+                    code="input_archive_mismatch",
+                )
+        if view is None:
+            view = self.create_operation(envelope)
+            expected.require(view)
+        else:
+            expected.require(view)
+        if view.state == "accepted":
+            view = self.upload_input(intent.operation_id, archive)
+            expected.require(view)
+        return view
+
+    def resume_input_transfer(
+        self,
+        envelope: Mapping[str, object],
+        archive: str | Path,
+    ) -> NativeOperationView | None:
+        """Resume upload only when the exact existing operation never admitted input."""
+
+        try:
+            intent = NativeOperationCreate.from_record(envelope)
+        except NativeOperationError as error:
+            raise NativeOperationProtocolError(str(error)) from error
+        expected = NativeOperationStatusExpectation.from_create(intent)
+        try:
+            view = self.get_operation(intent.operation_id)
+        except NativeOperationNotFound:
+            return None
+        expected.require(view)
+        if view.state != "accepted":
+            return view
+        source = Path(archive)
+        if (
+            not source.is_file()
+            or source.is_symlink()
+            or source.stat().st_size != intent.input_archive_bytes
+            or file_digest(source) != intent.input_archive_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "local input archive differs from the existing accepted operation",
+                status=409,
+                code="input_archive_mismatch",
+            )
+        view = self.upload_input(intent.operation_id, source)
+        return expected.require(view)
+
+    async def probe_operation_status_async(
+        self,
+        expected: NativeOperationStatusExpectation,
+    ) -> NativeOperationView | None:
+        """Perform one read-only status GET without blocking the event loop."""
+
+        if not isinstance(expected, NativeOperationStatusExpectation):
+            raise TypeError("expected must be a NativeOperationStatusExpectation")
+        try:
+            view = await asyncio.to_thread(
+                self.get_operation,
+                expected.operation_id,
+            )
+        except NativeOperationNotFound:
+            return None
+        return expected.require(view)
+
+    def cancel_operation(self, operation_id: str) -> NativeOperationView:
+        self._ensure_target()
+        operation_id = self._operation_id(operation_id)
+        response = self._request_json(
+            "POST",
+            f"/operations/{operation_id}/cancel",
+        )
+        view = self._view(response)
+        if view.operation_id != operation_id:
+            raise NativeOperationProtocolError(
+                "native operation endpoint cancelled another operation"
+            )
+        return view
+
+    def wait_for_terminal(
+        self,
+        operation_id: str,
+        *,
+        timeout: float = 600.0,
+        poll_interval: float = 0.2,
+    ) -> NativeOperationView:
+        if timeout <= 0 or poll_interval <= 0:
+            raise ValueError("timeout and poll_interval must be positive")
+        deadline = self._clock() + timeout
+        while True:
+            view = self.get_operation(operation_id)
+            if view.state in _TERMINAL_STATES:
+                return view
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise NativeOperationWaitTimeout(
+                    "native operation did not reach a terminal state before the client deadline",
+                    code="native_operation_wait_timeout",
+                    detail={"last_state": view.state},
+                )
+            self._sleep(min(poll_interval, remaining))
+
+    def download_artifact(
+        self,
+        operation_id: str,
+        destination: str | Path,
+        *,
+        limit: int = MAX_OPERATION_ARCHIVE_BYTES,
+    ) -> ArtifactDownload:
+        view = self.get_operation(operation_id)
+        artifact = view.artifact
+        if artifact is None or not view.resource_terminated:
+            raise NativeOperationClientError(
+                "native operation has no complete sealed artifact",
+                status=409,
+                code="native_artifact_unavailable",
+            )
+        if artifact.media_type != "application/zip":
+            raise NativeOperationProtocolError("native artifact has an unsupported media type")
+        if type(limit) is not int or limit <= 0 or artifact.bytes > limit:
+            raise NativeOperationProtocolError("native artifact exceeds the configured download limit")
+        target = Path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        request = urlrequest.Request(
+            self.endpoint.base_url + f"/operations/{operation_id}/artifact",
+            method="GET",
+            headers={**self._headers, "Accept": "application/zip"},
+        )
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            dir=target.parent,
+        )
+        temporary = Path(temporary_name)
+        hasher = hashlib.sha256()
+        size = 0
+        try:
+            with os.fdopen(descriptor, "wb") as stream, self._open(request) as response:
+                self._require_response_target(response)
+                if response.headers.get_content_type() != "application/zip":
+                    raise NativeOperationProtocolError(
+                        "native artifact response has a different media type"
+                    )
+                if response.headers.get("X-Artifact-SHA256") != artifact.sha256:
+                    raise NativeOperationProtocolError(
+                        "native artifact response carries a different digest"
+                    )
+                try:
+                    declared = int(response.headers.get("Content-Length", ""))
+                except ValueError as error:
+                    raise NativeOperationProtocolError(
+                        "native artifact response has no valid Content-Length"
+                    ) from error
+                if declared != artifact.bytes:
+                    raise NativeOperationProtocolError(
+                        "native artifact response size differs from its view"
+                    )
+                while block := response.read(1024 * 1024):
+                    size += len(block)
+                    if size > artifact.bytes:
+                        raise NativeOperationProtocolError(
+                            "native artifact response exceeds its declared size"
+                        )
+                    hasher.update(block)
+                    stream.write(block)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if size != artifact.bytes or hasher.hexdigest() != artifact.sha256:
+                raise NativeOperationProtocolError(
+                    "native artifact response differs from its size or digest"
+                )
+            os.replace(temporary, target)
+        except (OSError, http.client.HTTPException) as error:
+            raise NativeOperationClientError(
+                f"native artifact transport is unavailable: {type(error).__name__}"
+            ) from error
+        finally:
+            temporary.unlink(missing_ok=True)
+        return ArtifactDownload(
+            operation_id=operation_id,
+            path=target,
+            name=artifact.name,
+            bytes=artifact.bytes,
+            sha256=artifact.sha256,
+            media_type=artifact.media_type,
+        )
+
+
+def native_capture_operation_id(
+    *,
+    run_id: str,
+    command_id: str,
+    effect_key: str,
+) -> str:
+    """The exact path-safe identity for one Capture native effect."""
+
+    for field, value in (
+        ("run_id", run_id),
+        ("command_id", command_id),
+        ("effect_key", effect_key),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{field} is required")
+    return "capture-" + digest(
+        {
+            "run_id": run_id,
+            "command_id": command_id,
+            "effect_key": effect_key,
+        }
+    )
+
+
+def native_discover_operation_id(
+    *,
+    run_id: str,
+    command_id: str,
+    request_digest: str,
+) -> str:
+    """The exact path-safe identity for one Discover native command."""
+
+    for field, value in (
+        ("run_id", run_id),
+        ("command_id", command_id),
+        ("request_digest", request_digest),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{field} is required")
+    return "discover-" + digest(
+        {
+            "run_id": run_id,
+            "command_id": command_id,
+            "request_digest": request_digest,
+        }
+    )
+
+
+def observe_native_operation(
+    client: NativeOperationClient,
+    operation_id: str,
+) -> NativeOperationView | None:
+    """Read one exact operation identity without creating or sending anything."""
+
+    try:
+        return client.get_operation(operation_id)
+    except NativeOperationNotFound:
+        return None
+
+
+def native_operation_input_was_admitted(view: NativeOperationView) -> bool:
+    """Whether submission no longer needs to upload the immutable input."""
+
+    if not isinstance(view, NativeOperationView):
+        raise TypeError("view must be a NativeOperationView")
+    return view.state != "accepted"
+
+
+def _capture_archive_manifest(archive: Path) -> dict[str, object]:
+    try:
+        with zipfile.ZipFile(archive) as source:
+            info = source.getinfo(CAPTURE_MANIFEST)
+            if info.file_size > MAX_MANIFEST_BYTES:
+                raise NativeOperationProtocolError(
+                    "native artifact transfer manifest exceeds its size limit"
+                )
+            record = parse_data(source.read(info), Path(CAPTURE_MANIFEST))
+    except (KeyError, zipfile.BadZipFile, OSError) as error:
+        raise NativeOperationProtocolError(
+            "native artifact is not a readable Capture transfer"
+        ) from error
+    if not isinstance(record, dict):
+        raise NativeOperationProtocolError(
+            "native artifact transfer manifest is not an object"
+        )
+    return record
+
+
+@dataclass(frozen=True, slots=True)
+class SealedNativeOperationRequest:
+    """The canonical request identity reconstructed from a sealed outbound."""
+
+    operation_id: str
+    kind: str
+    target_id: str
+    request: CaptureOperationRequest | NativeDiscoverRequest
+    request_sha256: str
+    payload_sha256: str | None
+    native_tool_requirement_sha256: str
+    input_archive: Path | None = None
+    input_archive_sha256: str | None = None
+
+
+def _effect_target_identity(intent: EffectIntent) -> NativeTargetIdentity:
+    from ..pipeline.effects import require_native_transfer_target
+
+    require_native_transfer_target(intent.target)
+    return NativeTargetIdentity.from_record(
+        intent.target["native_target_identity"]
+    )
+
+
+def _validate_discover_source_archive(
+    archive: Path,
+    source_files: Mapping[str, str],
+) -> None:
+    """Require one canonical SourceSet archive with exactly its registered bytes."""
+
+    from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="description-discover-source-"
+        ) as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            with zipfile.ZipFile(archive) as source:
+                members = source.infolist()
+                names = [item.filename for item in members]
+                if (
+                    len(names) != len(set(names))
+                    or set(names) != set(source_files)
+                    or any(
+                        item.is_dir() or item.flag_bits & 0x1
+                        for item in members
+                    )
+                    or sum(item.file_size for item in members)
+                    > MAX_HANDOFF_BYTES
+                ):
+                    raise NativeOperationProtocolError(
+                        "Discover source archive has invalid members"
+                    )
+                for item in members:
+                    target = confined(
+                        root,
+                        item.filename,
+                        exists=False,
+                    )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    hasher = hashlib.sha256()
+                    with source.open(item) as input_stream, target.open(
+                        "xb"
+                    ) as output_stream:
+                        while block := input_stream.read(1024 * 1024):
+                            hasher.update(block)
+                            output_stream.write(block)
+                    if hasher.hexdigest() != source_files[item.filename]:
+                        raise NativeOperationProtocolError(
+                            "Discover source archive member differs from its inventory"
+                        )
+            rebuilt = Path(directory) / "rebuilt.zip"
+            seal_source_archive(root, source_files, rebuilt)
+            if file_digest(rebuilt) != file_digest(archive):
+                raise NativeOperationProtocolError(
+                    "Discover source archive is not canonical"
+                )
+    except NativeOperationProtocolError:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        raise NativeOperationProtocolError(
+            "Discover source archive is invalid"
+        ) from error
+
+
+def read_sealed_native_operation_request(
+    command: StageCommand,
+    intent: EffectIntent,
+    outbound_root: Path,
+) -> SealedNativeOperationRequest:
+    """Read one canonical native request from immutable effect evidence."""
+
+    if command.stage == "capture":
+        from ..pipeline.capture import (
+            CAPTURE_INPUT_ARCHIVE,
+            CaptureRequest,
+            _outbound_tree_sha256,
+            capture_effect_target,
+            validate_capture_effect_outbound,
+        )
+
+        outbound = validate_capture_effect_outbound(outbound_root, command)
+        request = CaptureRequest.from_command(command)
+        target = _effect_target_identity(intent)
+        if dict(intent.target) != capture_effect_target(command, request):
+            raise NativeOperationProtocolError(
+                "Capture reconciliation effect intent differs from the frozen command"
+            )
+        objects = outbound["objects"]
+        expected_upstream = [
+            artifact.to_record()
+            for artifact in sorted(
+                (
+                    item
+                    for item in command.input_artifacts
+                    if item.producer_stage in {"freeze", "discover"}
+                ),
+                key=lambda item: (str(item.producer_stage), item.artifact_id),
+            )
+        ]
+        expected_state = {
+            "command_id": command.command_id,
+            "effect_key": request.effect_key,
+            "handoff_sha256": request.handoff_sha256,
+            "input_archive_bytes": outbound["input_archive_bytes"],
+            "input_archive_sha256": outbound["input_archive_sha256"],
+            "main_assembly": request.main_assembly,
+            "native_target_id": target.target_id,
+            "native_tool_record_sha256": request.native_tool_record_sha256,
+            "native_tool_source_sha256": request.native_tool_source_sha256,
+            "object_set_sha256": digest(objects),
+            "operation_id": outbound["operation_id"],
+            "outbound_sha256": _outbound_tree_sha256(
+                outbound,
+                outbound_root / CAPTURE_INPUT_ARCHIVE,
+            ),
+            "payload_sha256": outbound["payload_sha256"],
+            "prepared_sha256": request.prepared_sha256,
+            "request_digest": command.request_digest,
+            "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
+            "upload_sha256": request.upload_sha256,
+        }
+        if (
+            outbound["upstream_artifacts"] != expected_upstream
+            or outbound["native_target_id"] != target.target_id
+            or dict(intent.expected_state) != expected_state
+        ):
+            raise NativeOperationProtocolError(
+                "Capture reconciliation outbound differs from the frozen command"
+            )
+        request_record = {
+            "schema_version": CAPTURE_OPERATION_SCHEMA,
+            "command_id": command.command_id,
+            "run_id": command.run_id,
+            "request_digest": command.request_digest,
+            "effect_key": request.effect_key,
+            "handoff_sha256": outbound["handoff_sha256"],
+            "upload_sha256": outbound["upload_sha256"],
+            "prepared_sha256": request.prepared_sha256,
+            "main_assembly": outbound["main_assembly"],
+            "package_files": outbound["prepared_files"],
+            "upstream_artifacts": outbound["upstream_artifacts"],
+            "execution": outbound["execution"],
+            "native_tool_source_sha256": request.native_tool_source_sha256,
+            "request_evidence": outbound["request_evidence"],
+        }
+        try:
+            native_request = CaptureOperationRequest.from_record(request_record)
+            operation = build_operation_record(
+                operation_id=outbound["operation_id"],
+                kind=CAPTURE_KIND,
+                request=native_request.to_record(),
+                input_archive_sha256=outbound["input_archive_sha256"],
+                input_archive_bytes=outbound["input_archive_bytes"],
+                native_tool_requirement_sha256=(
+                    request.native_tool_record_sha256
+                ),
+                output_contract=CAPTURE_TRANSFER_SCHEMA,
+                target_id=target.target_id,
+            )
+        except Exception as error:
+            raise NativeOperationProtocolError(
+                "Capture reconciliation outbound is not a canonical native request"
+            ) from error
+        if (
+            outbound["operation_id"] != operation["operation_id"]
+            or outbound["payload_sha256"] != operation["payload_sha256"]
+            or outbound["native_target_id"] != operation["target_id"]
+        ):
+            raise NativeOperationProtocolError(
+                "Capture reconciliation outbound operation identity is inconsistent"
+            )
+        return SealedNativeOperationRequest(
+            operation_id=outbound["operation_id"],
+            kind=CAPTURE_KIND,
+            target_id=target.target_id,
+            request=native_request,
+            request_sha256=digest(native_request.to_record()),
+            payload_sha256=outbound["payload_sha256"],
+            native_tool_requirement_sha256=request.native_tool_record_sha256,
+            input_archive=outbound_root / CAPTURE_INPUT_ARCHIVE,
+            input_archive_sha256=outbound["input_archive_sha256"],
+        )
+
+    if command.stage == "discover":
+        from ..pipeline.discover import (
+            discover_effect_expected_state,
+            discover_effect_target,
+        )
+
+        command_target = NativeTargetIdentity.from_record(
+            command.request.get("native_target_identity")
+        )
+        intent_target = _effect_target_identity(intent)
+        if intent_target != command_target:
+            raise NativeOperationProtocolError(
+                "Discover reconciliation intent differs from the registered target"
+            )
+        request_path = outbound_root / "request.json"
+        request_raw = request_path.read_bytes()
+        request = NativeDiscoverRequest.from_record(
+            parse_data(request_raw, request_path)
+        )
+        if request_raw != canonical(request.to_record()) + b"\n":
+            raise NativeOperationProtocolError(
+                "Discover reconciliation request is not canonical"
+            )
+        expected_target = discover_effect_target(
+            command,
+            command.request,
+            command_target,
+        )
+        if dict(intent.target) != expected_target:
+            raise NativeOperationProtocolError(
+                "Discover reconciliation effect intent differs from the frozen command"
+            )
+        source_path = outbound_root / "source.json"
+        source_raw = source_path.read_bytes()
+        source = parse_data(source_raw, source_path)
+        archive = outbound_root / SOURCE_ARCHIVE
+        if (
+            source_raw != canonical(source) + b"\n"
+            or source
+            != {
+                "source_files": dict(request.source_files),
+                "source_inventory_sha256": request.source_inventory_sha256,
+            }
+            or request.command_id != command.command_id
+            or request.run_id != command.run_id
+            or request.request_digest != command.request_digest
+            or request.operation_id != expected_target["operation_id"]
+            or request.source_files != command.request.get("source_files")
+            or request.source_inventory_sha256
+            != command.request.get("source_inventory_sha256")
+            or request.main_assembly != command.request.get("main_assembly")
+            or request.purpose != command.request.get("purpose")
+            or request.expected_native_tool_sha256
+            != command.request.get("expected_native_tool_sha256")
+            or request.expected_native_tool_record_sha256
+            != command.request.get("expected_native_tool_record_sha256")
+            or request.native_tool_requirement_artifact_id
+            != command.request.get("native_tool_requirement_artifact_id")
+            or not archive.is_file()
+            or archive.is_symlink()
+        ):
+            raise NativeOperationProtocolError(
+                "Discover reconciliation outbound differs from the frozen command"
+            )
+        _validate_discover_source_archive(
+            archive,
+            request.source_files,
+        )
+        source_archive_sha256 = file_digest(archive)
+        if dict(intent.expected_state) != discover_effect_expected_state(
+            command,
+            command.request,
+            source_archive_sha256,
+            command_target,
+        ):
+            raise NativeOperationProtocolError(
+                "Discover reconciliation outbound differs from its effect intent"
+            )
+        operation = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=source_archive_sha256,
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=(
+                request.expected_native_tool_record_sha256
+            ),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=command_target.target_id,
+        )
+        return SealedNativeOperationRequest(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            target_id=command_target.target_id,
+            request=request,
+            request_sha256=digest(request.to_record()),
+            payload_sha256=operation["payload_sha256"],
+            native_tool_requirement_sha256=(
+                request.expected_native_tool_record_sha256
+            ),
+            input_archive=archive,
+            input_archive_sha256=source_archive_sha256,
+        )
+
+    raise NativeOperationProtocolError(
+        "native reconciliation supports only Discover and Capture"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOperationEffectObserver:
+    """Read one exact native operation as domain reconciliation evidence."""
+
+    client: NativeOperationClient
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.client, NativeOperationClient):
+            raise TypeError("client must be a NativeOperationClient")
+
+    def observe(
+        self,
+        *,
+        command: StageCommand,
+        intent: EffectIntent,
+        outbound_root: Path,
+        workspace_root: Path,
+    ) -> EffectReconciliationEvidence:
+        if not isinstance(outbound_root, Path) or not outbound_root.is_dir():
+            raise NativeOperationProtocolError(
+                "native reconciliation outbound root is missing"
+            )
+        if not isinstance(workspace_root, Path) or not workspace_root.is_dir():
+            raise NativeOperationProtocolError(
+                "native reconciliation workspace is missing"
+            )
+        if (
+            intent.effect_kind != "native_operation"
+            or intent.command_id != command.command_id
+        ):
+            raise NativeOperationProtocolError(
+                "native reconciliation intent belongs to another command"
+            )
+        if command.stage == "capture":
+            return self._observe_capture(
+                command=command,
+                intent=intent,
+                outbound_root=outbound_root,
+                workspace_root=workspace_root,
+            )
+        if command.stage == "discover":
+            return self._observe_discover(
+                command=command,
+                intent=intent,
+                outbound_root=outbound_root,
+                workspace_root=workspace_root,
+            )
+        raise NativeOperationProtocolError(
+            "native reconciliation supports only Discover and Capture"
+        )
+
+    def _operation(
+        self,
+        operation_id: str,
+        *,
+        workspace_root: Path,
+    ) -> NativeOperationView | EffectReconciliationEvidence:
+        try:
+            return self.client.get_operation(operation_id)
+        except NativeOperationNotFound:
+            return self._unknown_evidence(
+                workspace_root,
+                operation_id=operation_id,
+                state_class="absent",
+                reason="operation_not_found",
+                metadata={"http_status": 404},
+            )
+        except NativeOperationClientError as error:
+            if error.status is not None and error.status < 500:
+                raise
+            return self._unknown_evidence(
+                workspace_root,
+                operation_id=operation_id,
+                state_class="unobservable",
+                reason="operation_unreachable",
+                metadata={
+                    "error_type": type(error).__name__,
+                    "http_status": error.status,
+                },
+            )
+
+    @staticmethod
+    def _unknown_evidence(
+        workspace_root: Path,
+        *,
+        operation_id: str,
+        state_class: str,
+        reason: str,
+        metadata: Mapping[str, object],
+        view: NativeOperationView | None = None,
+    ) -> EffectReconciliationEvidence:
+        from ..pipeline.reconciliation import EffectReconciliationEvidence
+
+        root = workspace_root / f"native-{state_class}-{operation_id}"
+        root.mkdir(parents=True, exist_ok=False)
+        write_json(
+            root / "operation.json",
+            {
+                "schema_version": NATIVE_OPERATION_OBSERVATION_SCHEMA,
+                "operation_id": operation_id,
+                "state_class": state_class,
+                "reason": reason,
+                "operation": None if view is None else view.to_record(),
+            },
+        )
+        return EffectReconciliationEvidence(
+            fact_type="observation",
+            state_class=state_class,
+            payload_root=root,
+            metadata={
+                "operation_id": operation_id,
+                "reason": reason,
+                **dict(metadata),
+            },
+        )
+
+    @staticmethod
+    def _terminal_absence(
+        workspace_root: Path,
+        view: NativeOperationView,
+        *,
+        terminal_basis: str,
+    ) -> EffectReconciliationEvidence:
+        from ..pipeline.reconciliation import EffectReconciliationEvidence
+
+        root = workspace_root / f"native-absent-{view.operation_id}"
+        root.mkdir(parents=True, exist_ok=False)
+        write_json(
+            root / "operation.json",
+            {
+                "schema_version": NATIVE_OPERATION_OBSERVATION_SCHEMA,
+                "operation_id": view.operation_id,
+                "state_class": "absent",
+                "reason": terminal_basis,
+                "operation": view.to_record(),
+            },
+        )
+        return EffectReconciliationEvidence(
+            fact_type="reconciled",
+            state_class="absent",
+            payload_root=root,
+            metadata={
+                "operation_id": view.operation_id,
+                "state": view.state,
+                "resource_terminated": True,
+                "artifact": None,
+                "terminal_basis": terminal_basis,
+                "started_at": view.started_at,
+                "actual_native_tool_sha256": (
+                    view.actual_native_tool_sha256
+                ),
+                "owner_sha256": view.owner_sha256,
+                "executor_sha256": view.executor_sha256,
+            },
+        )
+
+    @staticmethod
+    def _transfer_pending(
+        workspace_root: Path,
+        view: NativeOperationView,
+        *,
+        resume_target_digest: str,
+    ) -> EffectReconciliationEvidence:
+        from ..pipeline.effects import EffectResumePhase
+        from ..pipeline.reconciliation import EffectReconciliationEvidence
+
+        root = workspace_root / f"native-transfer-pending-{view.operation_id}"
+        root.mkdir(parents=True, exist_ok=False)
+        write_json(
+            root / "operation.json",
+            {
+                "schema_version": NATIVE_OPERATION_OBSERVATION_SCHEMA,
+                "operation_id": view.operation_id,
+                "state": view.state,
+                "operation": view.to_record(),
+            },
+        )
+        return EffectReconciliationEvidence(
+            fact_type="observation",
+            state_class="unobservable",
+            payload_root=root,
+            resume_phase=EffectResumePhase.INPUT_TRANSFER_PENDING,
+            resume_target_digest=resume_target_digest,
+            metadata={
+                "operation_id": view.operation_id,
+                "state": view.state,
+                "target_id": view.target_id,
+            },
+        )
+
+    @staticmethod
+    def _view_identity(
+        view: NativeOperationView,
+        *,
+        operation_id: str,
+        kind: str,
+        target_id: str,
+        request_sha256: str,
+        native_tool_requirement_sha256: str,
+        payload_sha256: str | None = None,
+        input_archive_sha256: str | None = None,
+    ) -> None:
+        if (
+            view.operation_id != operation_id
+            or view.kind != kind
+            or view.target_id != target_id
+            or view.request_sha256 != request_sha256
+            or view.native_tool_requirement_sha256
+            != native_tool_requirement_sha256
+            or (
+                payload_sha256 is not None
+                and view.payload_sha256 != payload_sha256
+            )
+            or (
+                input_archive_sha256 is not None
+                and view.input_archive_sha256 != input_archive_sha256
+            )
+        ):
+            raise NativeOperationClientConflict(
+                "native operation differs from the sealed outbound request",
+                status=409,
+                code="native_operation_conflict",
+            )
+        _require_native_executor(view, native_tool_requirement_sha256)
+
+    @staticmethod
+    def _identity_metadata(
+        view: NativeOperationView,
+        *,
+        platform_execution: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        """Keep platform origin and native runtime identities in separate roles."""
+
+        platform_origin = None
+        if platform_execution is not None:
+            platform_origin = {
+                name: platform_execution[name]
+                for name in (
+                    "claim_id",
+                    "fence",
+                    "owner_sha256",
+                    "executor_sha256",
+                )
+            }
+        native_owner = view.owner_sha256
+        return {
+            "schema_version": NATIVE_OPERATION_IDENTITY_SCHEMA,
+            "target_id": view.target_id,
+            "platform_origin": platform_origin,
+            "native_runtime": {
+                "owner_sha256": native_owner,
+                "owner_binding": (
+                    "native_claim_projection"
+                    if native_owner is not None
+                    else "unestablished"
+                ),
+                "actual_native_tool_sha256": (
+                    view.actual_native_tool_sha256
+                ),
+                "executor_sha256": view.executor_sha256,
+                "executor_binding": "tool_observed_and_archive",
+            },
+            "payload_sha256": view.payload_sha256,
+            "input_archive_sha256": view.input_archive_sha256,
+        }
+
+    def _non_satisfied(
+        self,
+        view: NativeOperationView,
+        *,
+        workspace_root: Path,
+    ) -> EffectReconciliationEvidence:
+        tool_bound_terminal_absence = (
+            view.state in {"failed", "cancelled", "unknown"}
+            and view.resource_terminated
+            and view.artifact is None
+            and view.actual_native_tool_sha256
+            == view.native_tool_requirement_sha256
+        )
+        pre_execution_cancel = (
+            view.state == "cancelled"
+            and view.resource_terminated
+            and view.artifact is None
+            and view.started_at is None
+            and view.actual_native_tool_sha256 is None
+            and view.owner_sha256 is None
+            and view.executor_sha256 is None
+            and view.failure is not None
+            and view.failure.code == "native_operation_cancelled"
+        )
+        if pre_execution_cancel:
+            return self._terminal_absence(
+                workspace_root,
+                view,
+                terminal_basis=(
+                    "pre_execution_cancel_without_native_claim"
+                ),
+            )
+        if tool_bound_terminal_absence:
+            return self._terminal_absence(
+                workspace_root,
+                view,
+                terminal_basis="native_tool_bound_terminal_absence",
+            )
+        return self._unknown_evidence(
+            workspace_root,
+            operation_id=view.operation_id,
+            state_class="unobservable",
+            reason=(
+                "operation_not_terminal"
+                if view.state not in {"failed", "cancelled", "unknown"}
+                else "resource_termination_unproven"
+            ),
+            metadata={
+                "state": view.state,
+                "resource_terminated": view.resource_terminated,
+                "artifact_present": view.artifact is not None,
+            },
+            view=view,
+        )
+
+    def _observe_capture(
+        self,
+        *,
+        command: StageCommand,
+        intent: EffectIntent,
+        outbound_root: Path,
+        workspace_root: Path,
+    ) -> EffectReconciliationEvidence:
+        from ..pipeline.capture import CaptureRequest
+        from ..pipeline.reconciliation import EffectReconciliationEvidence
+        from .native_operation_runtime import CaptureOperationRequest
+
+        identity = read_sealed_native_operation_request(
+            command,
+            intent,
+            outbound_root,
+        )
+        if (
+            identity.kind != CAPTURE_KIND
+            or not isinstance(identity.request, CaptureOperationRequest)
+        ):
+            raise NativeOperationProtocolError(
+                "Capture reconciliation resolved another request kind"
+            )
+        request = CaptureRequest.from_command(command)
+        native_request = identity.request
+        execution = dict(native_request.execution)
+        upstream = [
+            dict(record) for record in native_request.upstream_artifacts
+        ]
+        prepared_files = dict(native_request.package_files)
+        operation_id = identity.operation_id
+        observed = self._operation(
+            operation_id,
+            workspace_root=workspace_root,
+        )
+        if isinstance(observed, EffectReconciliationEvidence):
+            return observed
+        self._view_identity(
+            observed,
+            operation_id=operation_id,
+            kind=CAPTURE_KIND,
+            target_id=identity.target_id,
+            request_sha256=identity.request_sha256,
+            native_tool_requirement_sha256=request.native_tool_record_sha256,
+            payload_sha256=identity.payload_sha256,
+            input_archive_sha256=identity.input_archive_sha256,
+        )
+        if observed.state == "accepted":
+            from ..pipeline.effects import (
+                native_transfer_target_digest,
+            )
+
+            return self._transfer_pending(
+                workspace_root,
+                observed,
+                resume_target_digest=(
+                    native_transfer_target_digest(intent.target)
+                ),
+            )
+        if observed.state != "satisfied" and not (
+            observed.state == "unknown"
+            and observed.artifact is not None
+            and observed.resource_terminated
+        ):
+            return self._non_satisfied(
+                observed,
+                workspace_root=workspace_root,
+            )
+        download_root = workspace_root / f"native-download-{operation_id}"
+        download_root.mkdir(parents=True, exist_ok=False)
+        try:
+            downloaded = self.client.download_artifact(
+                operation_id,
+                download_root / CAPTURE_ARCHIVE,
+            )
+        except NativeOperationClientError as error:
+            if error.status is not None and error.status < 500:
+                raise
+            return self._unknown_evidence(
+                workspace_root,
+                operation_id=operation_id,
+                state_class="unobservable",
+                reason="artifact_unreachable",
+                metadata={
+                    "error_type": type(error).__name__,
+                    "http_status": error.status,
+                },
+                view=observed,
+            )
+        if (
+            downloaded.name != CAPTURE_ARCHIVE
+            or self.client.get_operation(operation_id) != observed
+        ):
+            raise NativeOperationClientConflict(
+                "Capture operation changed while its artifact was observed",
+                status=409,
+                code="native_operation_conflict",
+            )
+        manifest = _capture_archive_manifest(downloaded.path)
+        native_tool = manifest.get("native_tool")
+        if not isinstance(native_tool, dict):
+            raise NativeOperationProtocolError(
+                "Capture transfer carries no native tool record"
+            )
+        native_tool_sha256 = digest(native_tool)
+        if (
+            native_tool.get("source_sha256")
+            != request.native_tool_source_sha256
+            or native_tool_sha256 != request.native_tool_record_sha256
+            or observed.actual_native_tool_sha256 != native_tool_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "Capture transfer native tool differs from the frozen requirement",
+                status=409,
+                code="native_tool_mismatch",
+            )
+        admitted_root = workspace_root / f"admitted-capture-{operation_id}"
+        admit_capture(
+            downloaded.path,
+            admitted_root,
+            expected_run_id=command.run_id,
+            expected_handoff_sha256=request.handoff_sha256,
+            expected_upload_sha256=request.upload_sha256,
+            expected_main_assembly=request.main_assembly,
+            expected_native_tool=native_tool,
+            expected_prepared_dir=None,
+            expected_prepared_files=prepared_files,
+            expected_upstream_artifacts=upstream,
+            expected_execution=execution,
+        )
+        payload = workspace_root / f"capture-evidence-{operation_id}"
+        payload.mkdir(parents=True, exist_ok=False)
+        shutil.copyfile(downloaded.path, payload / CAPTURE_ARCHIVE)
+        write_json(payload / "execution.json", execution)
+        write_json(payload / "native-tool.json", native_tool)
+        return EffectReconciliationEvidence(
+            fact_type="reconciled",
+            state_class="known",
+            payload_root=payload,
+            metadata={
+                "operation_id": operation_id,
+                "operation_state": observed.state,
+                "resource_terminated": observed.resource_terminated,
+                "native_tool_requirement_sha256": native_tool_sha256,
+                "actual_native_tool_sha256": observed.actual_native_tool_sha256,
+                "artifact_sha256": downloaded.sha256,
+                "request_sha256": observed.request_sha256,
+                "input_archive_sha256": observed.input_archive_sha256,
+                "identity": self._identity_metadata(
+                    observed,
+                    platform_execution=execution,
+                ),
+            },
+        )
+
+    def _observe_discover(
+        self,
+        *,
+        command: StageCommand,
+        intent: EffectIntent,
+        outbound_root: Path,
+        workspace_root: Path,
+    ) -> EffectReconciliationEvidence:
+        from ..pipeline.reconciliation import EffectReconciliationEvidence
+
+        identity = read_sealed_native_operation_request(
+            command,
+            intent,
+            outbound_root,
+        )
+        if (
+            identity.kind != DISCOVER_KIND
+            or not isinstance(identity.request, NativeDiscoverRequest)
+            or identity.input_archive is None
+            or identity.input_archive_sha256 is None
+        ):
+            raise NativeOperationProtocolError(
+                "Discover reconciliation resolved another request kind"
+            )
+        request = identity.request
+        source_archive_sha256 = identity.input_archive_sha256
+        operation_id = identity.operation_id
+        observed = self._operation(
+            operation_id,
+            workspace_root=workspace_root,
+        )
+        if isinstance(observed, EffectReconciliationEvidence):
+            return observed
+        self._view_identity(
+            observed,
+            operation_id=operation_id,
+            kind=DISCOVER_KIND,
+            target_id=identity.target_id,
+            request_sha256=identity.request_sha256,
+            native_tool_requirement_sha256=(
+                identity.native_tool_requirement_sha256
+            ),
+            payload_sha256=identity.payload_sha256,
+            input_archive_sha256=source_archive_sha256,
+        )
+        if observed.state == "accepted":
+            from ..pipeline.effects import (
+                native_transfer_target_digest,
+            )
+
+            return self._transfer_pending(
+                workspace_root,
+                observed,
+                resume_target_digest=(
+                    native_transfer_target_digest(intent.target)
+                ),
+            )
+        if observed.state != "satisfied" and not (
+            observed.state == "unknown"
+            and observed.artifact is not None
+            and observed.resource_terminated
+        ):
+            return self._non_satisfied(
+                observed,
+                workspace_root=workspace_root,
+            )
+        download_root = workspace_root / f"native-download-{operation_id}"
+        download_root.mkdir(parents=True, exist_ok=False)
+        try:
+            downloaded = self.client.download_artifact(
+                operation_id,
+                download_root / OBSERVATION_ARCHIVE,
+            )
+        except NativeOperationClientError as error:
+            if error.status is not None and error.status < 500:
+                raise
+            return self._unknown_evidence(
+                workspace_root,
+                operation_id=operation_id,
+                state_class="unobservable",
+                reason="artifact_unreachable",
+                metadata={
+                    "error_type": type(error).__name__,
+                    "http_status": error.status,
+                },
+                view=observed,
+            )
+        if (
+            downloaded.name != OBSERVATION_ARCHIVE
+            or self.client.get_operation(operation_id) != observed
+        ):
+            raise NativeOperationClientConflict(
+                "Discover operation changed while its artifact was observed",
+                status=409,
+                code="native_operation_conflict",
+            )
+        evidence_root = workspace_root / f"discover-evidence-{operation_id}"
+        observation = admit_observation_bundle(
+            downloaded.path,
+            evidence_root,
+            request=request,
+        )
+        native_tool = dict(observation.native_tool)
+        native_tool_sha256 = digest(native_tool)
+        if (
+            native_tool.get("source_sha256")
+            != request.expected_native_tool_sha256
+            or native_tool_sha256
+            != request.expected_native_tool_record_sha256
+            or observed.actual_native_tool_sha256 != native_tool_sha256
+            or observation.manifest.get("source_archive_sha256")
+            != source_archive_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "Discover observation differs from the frozen tool or input closure",
+                status=409,
+                code="native_operation_conflict",
+            )
+        return EffectReconciliationEvidence(
+            fact_type="reconciled",
+            state_class="known",
+            payload_root=observation.root,
+            metadata={
+                "operation_id": operation_id,
+                "operation_state": observed.state,
+                "resource_terminated": observed.resource_terminated,
+                "native_tool_requirement_sha256": native_tool_sha256,
+                "actual_native_tool_sha256": observed.actual_native_tool_sha256,
+                "source_archive_sha256": source_archive_sha256,
+                "artifact_sha256": downloaded.sha256,
+                "request_sha256": observed.request_sha256,
+                "identity": self._identity_metadata(
+                    observed,
+                    platform_execution=None,
+                ),
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOperationCapturePort:
+    """CaptureHandler-native-operation adapter over one Windows operation."""
+
+    client: NativeOperationClient
+    timeout: float = 600.0
+    poll_interval: float = 0.2
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.client, NativeOperationClient):
+            raise TypeError("client must be a NativeOperationClient")
+        if self.timeout <= 0 or self.poll_interval <= 0:
+            raise ValueError("timeout and poll_interval must be positive")
+
+    @staticmethod
+    def operation_id(
+        *,
+        run_id: str,
+        command_id: str,
+        effect_key: str,
+    ) -> str:
+        return native_capture_operation_id(
+            run_id=run_id,
+            command_id=command_id,
+            effect_key=effect_key,
+        )
+
+    def observe(
+        self,
+        *,
+        run_id: str,
+        command_id: str,
+        effect_key: str,
+    ) -> NativeOperationView | None:
+        return observe_native_operation(
+            self.client,
+            self.operation_id(
+                run_id=run_id,
+                command_id=command_id,
+                effect_key=effect_key,
+            ),
+        )
+
+    def resume_input_transfer(
+        self,
+        sealed_dispatch,
+        *,
+        native_tool: Mapping[str, object],
+    ) -> NativeOperationView | None:
+        """Continue only the sealed operation's unadmitted input transfer.
+
+        A missing operation, an unavailable endpoint, or a different native
+        target remains unresolved. Local operation, archive, tool, or
+        protocol conflicts are not converted to a resend.
+        """
+
+        try:
+            intent, _request, archive, _tool = self._sealed_request(
+                sealed_dispatch,
+                native_tool,
+            )
+            return self.client.resume_input_transfer(
+                intent.to_record(),
+                archive,
+            )
+        except NativeOperationNotFound:
+            return None
+        except NativeOperationClientError as error:
+            if (
+                error.status is None
+                or error.status >= 500
+                or error.code == "native_target_mismatch"
+            ):
+                return None
+            raise
+
+    @staticmethod
+    def _request_record(
+        inputs,
+        current_native_tool: Mapping[str, object],
+        *,
+        run_id: str,
+        request_digest: str,
+        handoff_sha256: str,
+        upload_sha256: str,
+        main_assembly: str,
+        upstream_artifacts: tuple[Mapping[str, object], ...],
+        execution: Mapping[str, object],
+    ) -> tuple[CaptureOperationRequest, dict[str, object]]:
+        current_tool = copy.deepcopy(dict(current_native_tool))
+        full_tool_sha256 = digest(current_tool)
+        source_sha256 = current_tool.get("source_sha256")
+        if not isinstance(source_sha256, str):
+            raise NativeOperationProtocolError(
+                "The current native tool carries no source identity"
+            )
+        if execution.get("native_tool_sha256") != full_tool_sha256:
+            raise NativeOperationProtocolError(
+                "Capture execution does not bind the current full native tool"
+            )
+        record = {
+            "schema_version": CAPTURE_OPERATION_SCHEMA,
+            "command_id": execution["command_id"],
+            "run_id": run_id,
+            "request_digest": request_digest,
+            "effect_key": execution["effect_key"],
+            "handoff_sha256": handoff_sha256,
+            "upload_sha256": upload_sha256,
+            "prepared_sha256": digest(dict(inputs.prepared_files)),
+            "main_assembly": main_assembly,
+            "package_files": dict(inputs.prepared_files),
+            "upstream_artifacts": [
+                dict(record) for record in upstream_artifacts
+            ],
+            "execution": copy.deepcopy(dict(execution)),
+            "native_tool_source_sha256": source_sha256,
+            "request_evidence": copy.deepcopy(
+                dict(inputs.request_evidence)
+            ),
+        }
+        request = CaptureOperationRequest.from_record(record)
+        return request, current_tool
+
+    def _sealed_request(
+        self,
+        sealed_dispatch,
+        current_native_tool: Mapping[str, object],
+    ) -> tuple[
+        NativeOperationCreate,
+        CaptureOperationRequest,
+        Path,
+        dict[str, object],
+    ]:
+        operation = getattr(sealed_dispatch, "operation", None)
+        archive_value = getattr(sealed_dispatch, "input_archive", None)
+        execution_value = getattr(sealed_dispatch, "execution", None)
+        if (
+            not isinstance(operation, Mapping)
+            or not isinstance(execution_value, Mapping)
+            or archive_value is None
+        ):
+            raise NativeOperationProtocolError(
+                "sealed Capture dispatch is incomplete"
+            )
+        try:
+            intent = NativeOperationCreate.from_record(operation)
+            request = CaptureOperationRequest.from_record(intent.request)
+        except Exception as error:
+            raise NativeOperationProtocolError(
+                "sealed Capture dispatch is not a canonical operation"
+            ) from error
+        if intent.kind != CAPTURE_KIND:
+            raise NativeOperationProtocolError(
+                "sealed dispatch names another native operation kind"
+            )
+        if intent.target_id != self.client.target_id:
+            raise NativeOperationClientConflict(
+                "sealed operation names another native target",
+                status=409,
+                code="native_target_mismatch",
+            )
+        execution = copy.deepcopy(dict(execution_value))
+        if execution != dict(request.execution):
+            raise NativeOperationClientConflict(
+                "sealed platform execution differs from the operation request",
+                status=409,
+                code="native_operation_conflict",
+            )
+        tool = copy.deepcopy(dict(current_native_tool))
+        if (
+            digest(tool) != intent.native_tool_requirement_sha256
+            or request.native_tool_source_sha256 != tool.get("source_sha256")
+        ):
+            raise NativeOperationClientConflict(
+                "sealed operation names another native tool",
+                status=409,
+                code="native_tool_mismatch",
+            )
+        archive = Path(archive_value)
+        if (
+            not archive.is_file()
+            or archive.is_symlink()
+            or archive.stat().st_size != intent.input_archive_bytes
+            or file_digest(archive) != intent.input_archive_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "sealed input archive differs from the operation request",
+                status=409,
+                code="input_archive_mismatch",
+            )
+        return intent, request, archive, tool
+
+    def __call__(
+        self,
+        inputs,
+        output: Path,
+        *,
+        backend,
+        run_id: str,
+        request_digest: str,
+        handoff_sha256: str,
+        upload_sha256: str,
+        main_assembly: str,
+        upstream_artifacts: tuple[Mapping[str, object], ...],
+        native_tool: Mapping[str, object],
+        sealed_dispatch=None,
+    ) -> RemoteNativeCaptureResult:
+        if backend is not None:
+            raise NativeOperationProtocolError(
+                "The remote Capture adapter does not accept a Linux CAD backend"
+            )
+        if sealed_dispatch is None:
+            raise NativeOperationProtocolError(
+                "The remote Capture adapter requires one sealed dispatch"
+            )
+        intent, request, archive, _current_tool = self._sealed_request(
+            sealed_dispatch,
+            native_tool,
+        )
+        operation_id = self.operation_id(
+            run_id=request.run_id,
+            command_id=request.command_id,
+            effect_key=request.effect_key,
+        )
+        expected_upstream = tuple(
+            dict(record) for record in upstream_artifacts
+        )
+        if (
+            intent.operation_id != operation_id
+            or request.run_id != run_id
+            or request.request_digest != request_digest
+            or request.handoff_sha256 != handoff_sha256
+            or request.upload_sha256 != upload_sha256
+            or request.main_assembly != main_assembly
+            or tuple(request.upstream_artifacts) != expected_upstream
+            or (
+                inputs is not None
+                and dict(request.package_files)
+                != dict(inputs.prepared_files)
+            )
+        ):
+            raise NativeOperationClientConflict(
+                "The sealed Capture dispatch differs from the current command",
+                status=409,
+                code="native_operation_conflict",
+            )
+        expected = NativeOperationStatusExpectation.from_create(intent)
+        view = observe_native_operation(self.client, operation_id)
+        if view is not None:
+            expected.require(view)
+        else:
+            view = self.client.create_operation(intent.to_record())
+            expected.require(view)
+        if view.state == "accepted":
+            view = self.client.upload_input(operation_id, archive)
+            expected.require(view)
+        if view.state not in _TERMINAL_STATES:
+            view = self.client.wait_for_terminal(
+                operation_id,
+                timeout=self.timeout,
+                poll_interval=self.poll_interval,
+            )
+        expected.require(view)
+        receipt = view.to_record()
+        if view.state == "satisfied":
+            output.mkdir(parents=True, exist_ok=True)
+            downloaded = self.client.download_artifact(
+                operation_id,
+                output / CAPTURE_ARCHIVE,
+            )
+            return RemoteNativeCaptureResult(
+                outcome="completed",
+                output=output,
+                archive=downloaded.path,
+                receipt=receipt,
+                resources_settled=True,
+            )
+        if view.state in {"failed", "cancelled"}:
+            failure_output = output.with_name(output.name + "-remote-failure")
+            failure_output.mkdir(parents=True, exist_ok=False)
+            write_json(failure_output / "native-result.json", receipt)
+            return RemoteNativeCaptureResult(
+                outcome=view.state,
+                output=failure_output,
+                archive=None,
+                receipt=receipt,
+                resources_settled=view.resource_terminated,
+                reason_code=(
+                    view.failure.code
+                    if view.failure is not None
+                    else f"capture.{view.state}"
+                ),
+            )
+        failure = view.failure
+        return RemoteNativeCaptureResult(
+            outcome="unknown",
+            output=None,
+            archive=None,
+            receipt=receipt,
+            resources_settled=view.resource_terminated,
+            reason_code=(
+                failure.code
+                if failure is not None
+                else "capture.native_unknown"
+            ),
+        )
+
+
+def capture_handler_from_native_operation(
+    client: NativeOperationClient,
+    *,
+    artifact_store=None,
+    timeout: float = 600.0,
+    poll_interval: float = 0.2,
+    tool_provider: NativeOperationToolProvider | None = None,
+):
+    """Build CaptureHandler with the Windows port and no local CAD fallback."""
+
+    from ..pipeline.capture import CaptureHandler
+
+    if tool_provider is None:
+        tool_provider = NativeOperationToolProvider(client)
+    if not isinstance(tool_provider, NativeOperationToolProvider):
+        raise TypeError("tool_provider must be a NativeOperationToolProvider")
+    return CaptureHandler(
+        artifact_store=artifact_store,
+        native_operation=NativeOperationCapturePort(
+            client,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        ),
+        native_tool_factory=tool_provider,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOperationDiscoverPort:
+    """Discover port that owns one remote operation and never starts Capture."""
+
+    client: NativeOperationClient
+    native_tool: Mapping[str, object] | None
+    timeout: float = 600.0
+    poll_interval: float = 0.2
+    tool_provider: Callable[[], Mapping[str, object]] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.client, NativeOperationClient):
+            raise TypeError("client must be a NativeOperationClient")
+        if self.native_tool is None:
+            if not callable(self.tool_provider):
+                raise ValueError(
+                    "native_tool or a callable tool_provider is required"
+                )
+        else:
+            tool = dict(self.native_tool)
+            if not tool:
+                raise ValueError("native_tool must not be empty")
+            object.__setattr__(self, "native_tool", tool)
+        if self.timeout <= 0 or self.poll_interval <= 0:
+            raise ValueError("timeout and poll_interval must be positive")
+
+    def _tool(self) -> dict[str, object]:
+        if self.tool_provider is None:
+            assert self.native_tool is not None
+            return copy.deepcopy(dict(self.native_tool))
+        tool = copy.deepcopy(dict(self.tool_provider()))
+        if not tool:
+            raise NativeOperationProtocolError(
+                "The native tool provider returned an empty record"
+            )
+        return tool
+
+    def _validate_existing(self, view: NativeOperationView, request) -> None:
+        request_record = request.to_record()
+        native_tool_requirement_sha256 = digest(self._tool())
+        if (
+            view.kind != DISCOVER_KIND
+            or view.request_sha256 != digest(request_record)
+            or view.native_tool_requirement_sha256
+            != native_tool_requirement_sha256
+        ):
+            raise NativeOperationClientConflict(
+                "native operation identity is bound to a different Discover request",
+                status=409,
+                code="native_operation_conflict",
+            )
+        _require_native_executor(view, native_tool_requirement_sha256)
+
+    @staticmethod
+    def operation_id(request) -> str:
+        return request.operation_id
+
+    def observe(self, request) -> NativeOperationView | None:
+        return observe_native_operation(
+            self.client,
+            self.operation_id(request),
+        )
+
+    def submit(
+        self,
+        source_archive: Path,
+        request,
+        target: NativeTargetIdentity,
+        workspace: Path,
+    ) -> NativeObservation | None:
+        if target.target_id != self.client.target_id:
+            raise NativeOperationClientConflict(
+                "Discover adapter target differs from its client",
+                status=409,
+                code="native_target_mismatch",
+            )
+        archive = Path(source_archive)
+        workspace = Path(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        if not archive.is_file() or archive.is_symlink():
+            raise NativeOperationProtocolError(
+                "Discover requires the complete sealed SourceSet archive"
+            )
+        envelope = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=file_digest(archive),
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=digest(self._tool()),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=target.target_id,
+        )
+        try:
+            view = self.client.submit_operation(envelope, archive)
+        except NativeOperationClientError as error:
+            if error.status is None or error.status >= 500:
+                return None
+            raise
+        return self._observation_from_view(
+            view,
+            request,
+            workspace,
+        )
+
+    def resume_transfer(
+        self,
+        source_archive: Path,
+        request,
+        target: NativeTargetIdentity,
+        workspace: Path,
+    ) -> NativeObservation | None:
+        """Continue only the original operation's unadmitted input transfer."""
+
+        if target.target_id != self.client.target_id:
+            return None
+
+        archive = Path(source_archive)
+        workspace = Path(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        if not archive.is_file() or archive.is_symlink():
+            raise NativeOperationProtocolError(
+                "Discover requires the complete sealed SourceSet archive"
+            )
+        envelope = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=file_digest(archive),
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=digest(self._tool()),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=target.target_id,
+        )
+        try:
+            view = self.client.resume_input_transfer(envelope, archive)
+        except NativeOperationNotFound:
+            return None
+        except NativeOperationClientError as error:
+            if (
+                error.status is None
+                or error.status >= 500
+                or error.code == "native_target_mismatch"
+            ):
+                return None
+            raise
+        if view is None:
+            return None
+        return self._observation_from_view(
+            view,
+            request,
+            workspace,
+        )
+
+    def _observation_from_view(
+        self,
+        view: NativeOperationView,
+        request: NativeDiscoverRequest,
+        workspace: Path,
+    ) -> NativeObservation | None:
+        self._validate_existing(view, request)
+        if view.state in {"failed", "cancelled"}:
+            failure = view.failure
+            raise NativeDiscoverRefusal(
+                failure.code if failure else f"discover.{view.state}",
+                failure.message if failure else f"native Discover ended {view.state}",
+            )
+        if view.state != "satisfied":
+            return None
+        downloaded = self.client.download_artifact(
+            request.operation_id,
+            workspace / f"{request.operation_id}-{OBSERVATION_ARCHIVE}",
+        )
+        observation_root = workspace / f"native-observation-{request.operation_id}"
+        if observation_root.exists():
+            try:
+                observation = admit_native_observation(
+                    observation_root,
+                    request=request,
+                )
+            except PipelineError:
+                shutil.rmtree(observation_root)
+                observation = admit_observation_bundle(
+                    downloaded.path,
+                    observation_root,
+                    request=request,
+                )
+        else:
+            observation = admit_observation_bundle(
+                downloaded.path,
+                observation_root,
+                request=request,
+            )
+        return observation
+
+@dataclass(frozen=True, slots=True)
+class NativeRemoteDiscoverAdapter:
+    """DiscoverDomainAdapter over the Windows operation client."""
+
+    port: NativeOperationDiscoverPort
+    artifacts: object
+
+    def submit(
+        self,
+        source_archive: Path,
+        request,
+        target: NativeTargetIdentity,
+        workspace: Path,
+    ) -> NativeObservation | None:
+        return self.port.submit(source_archive, request, target, workspace)
+
+    def resume_transfer(
+        self,
+        source_archive: Path,
+        request,
+        target: NativeTargetIdentity,
+        workspace: Path,
+    ) -> NativeObservation | None:
+        return self.port.resume_transfer(
+            source_archive,
+            request,
+            target,
+            workspace,
+        )
+
+    def materialize(
+        self,
+        artifact,
+        request,
+        destination: Path,
+    ) -> NativeObservation:
+        root = self.artifacts.materialize(artifact, destination)
+        return admit_native_observation(
+            root,
+            request=request,
+            artifact_ref=artifact,
+            resources_settled=True,
+        )
+
+
+def discover_adapter_from_native_operation(
+    client: NativeOperationClient,
+    tool_provider: NativeOperationToolProvider,
+    artifacts,
+    *,
+    timeout: float = 600.0,
+    poll_interval: float = 0.2,
+) -> NativeRemoteDiscoverAdapter:
+    """Build Discover with one observed full Windows tool record."""
+
+    if not isinstance(tool_provider, NativeOperationToolProvider):
+        raise TypeError("tool_provider must be a NativeOperationToolProvider")
+    if not callable(getattr(artifacts, "materialize", None)):
+        raise TypeError("artifacts must provide materialize()")
+    return NativeRemoteDiscoverAdapter(
+        port=NativeOperationDiscoverPort(
+            client,
+            tool_provider(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+        ),
+        artifacts=artifacts,
+    )
+
+
+__all__ = [
+    "MAX_OPERATION_ARCHIVE_BYTES",
+    "MAX_OPERATION_JSON_BYTES",
+    "ArtifactDownload",
+    "NativeOperationCapturePort",
+    "NativeOperationClient",
+    "NativeOperationClientConflict",
+    "NativeOperationClientError",
+    "NativeOperationDiscoverPort",
+    "NativeOperationEffectObserver",
+    "NativeOperationEndpoint",
+    "NativeOperationIdentityConflict",
+    "NativeOperationNotFound",
+    "NativeOperationProtocolError",
+    "NativeOperationRemoteUnknown",
+    "NativeOperationStatusExpectation",
+    "NativeOperationToolProvider",
+    "NativeOperationWaitTimeout",
+    "NativeRemoteDiscoverAdapter",
+    "NativeToolIdentity",
+    "RemoteNativeCaptureResult",
+    "SealedNativeOperationRequest",
+    "capture_handler_from_native_operation",
+    "discover_adapter_from_native_operation",
+    "native_capture_operation_id",
+    "native_discover_operation_id",
+    "native_operation_input_was_admitted",
+    "observe_native_operation",
+    "read_sealed_native_operation_request",
+]

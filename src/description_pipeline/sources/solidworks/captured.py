@@ -1,4 +1,4 @@
-"""Derive the portable scene from an already verified immutable CAD snapshot.
+"""Derive the Generate input from an already verified immutable CAD snapshot.
 
 This module never loads a native CAD library or modifies the capture. Windows
 seals native observations and their source configuration; Linux constructs the
@@ -8,11 +8,11 @@ link-frame scene when generation consumes those observations.
 from pathlib import Path
 from types import SimpleNamespace
 
-from ...io import PipelineError, confined, read_data
+from ...io import PipelineError, confined, digest, inventory, read_data
 
 
-def derive_scene(root: Path, manifest: dict) -> dict:
-    """Construct a scene using only members of a verified SolidWorks snapshot."""
+def derive_engineering_input(root: Path, manifest: dict) -> dict:
+    """Construct Generate input using only a verified SolidWorks snapshot."""
     from .evidence import (
         REWRITE_ENVIRONMENT_EVIDENCE,
         RUNTIME_EVIDENCE,
@@ -73,6 +73,17 @@ def derive_scene(root: Path, manifest: dict) -> dict:
     files = manifest.get("files")
     if not isinstance(files, dict):
         raise PipelineError("Captured evidence manifest has no file inventory")
+    assembly_member = "input/cad/" + main
+    input_files = {f"input/{path}": checksum for path, checksum in inventory(delivery / "input").items()}
+    if assembly_member not in input_files:
+        raise PipelineError("Captured source assembly is not in the archived input closure")
+    evidence_files = {f"evidence/{path}": checksum for path, checksum in files.items()}
+    scene["semantic_identity"] = {
+        "capture_set_sha256": digest({**input_files, **evidence_files}),
+        "source_member": assembly_member,
+        "source_sha256": input_files[assembly_member],
+        "source_configuration": str(manifest["identity"].get("configuration") or ""),
+    }
 
     def evidence_source(delivery_path: str, snapshot_path: str) -> tuple[dict, str]:
         digest = files.get(snapshot_path)
@@ -103,6 +114,10 @@ def derive_scene(root: Path, manifest: dict) -> dict:
         closure_top_level=str(closure.get("top_level") or ""),
     )
     provenance = scene.setdefault("provenance", {})
+    # Native producer paths remain in raw evidence. The model retains only a
+    # location-independent member reference so moving an identical artifact
+    # cannot change its semantic identity.
+    provenance["assembly"] = assembly_member
     existing = provenance.get("value_warnings")
     if existing is None:
         existing = []

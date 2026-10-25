@@ -14,11 +14,9 @@ from description_pipeline.orchestration import uploads
 from description_pipeline.schemas import exporter_declaration_present
 from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import (
-    DELIVERY_STAGES,
     FIXED_REQUIRED_CHECKS,
     HOST_BY_STAGE,
     PORTABLE_STAGES,
-    STAGE_IDS,
     required_rows_complete,
 )
 from description_pipeline.verification import native_discovery, solidworks_urdf
@@ -34,14 +32,11 @@ SCHEMA_LITERAL_FIXTURES = {
     "tests/sources/test_solidworks_freeze.py",
     "tests/sources/test_solidworks_link_group_selections.py",
     "tests/sources/test_verify_declarations.py",
-    "tests/v1/endpoint_support.py",
     "tests/v1/test_diagnostic_preview.py",
-    "tests/v1/test_discovery_transfer.py",
     "tests/v1/test_effective_instance_integration.py",
     "tests/v1/test_quality.py",
     "tests/v1/test_stage_transfer.py",
     "tests/v1/test_structural_report.py",
-    "tests/v1/test_workflow.py",
 }
 
 
@@ -93,12 +88,6 @@ class ContractConvergenceTests(unittest.TestCase):
         self.assertEqual(PORTABLE_STAGES, ("freeze", "generate", "verify", "publish"))
         self.assertEqual(tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",)), PORTABLE_STAGES)
 
-    def test_delivery_stages_split_the_native_boundary_from_report_rendering(self) -> None:
-        """Report rendering keys on delivery stages, not on every portable stage."""
-        self.assertEqual(DELIVERY_STAGES, ("generate", "verify", "publish"))
-        self.assertLessEqual(set(DELIVERY_STAGES), set(PORTABLE_STAGES))
-        self.assertEqual(tuple(stage for stage in STAGE_IDS if stage in DELIVERY_STAGES), DELIVERY_STAGES)
-
     def test_owned_schema_ids_are_never_retyped_as_literals(self) -> None:
         owned = {
             name: value for name, value in vars(schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
@@ -111,9 +100,6 @@ class ContractConvergenceTests(unittest.TestCase):
                 "LINK_GROUP_MASS_SCHEMA",
                 "HEALTH_SCHEMA",
                 "RESOURCE_POLICY_SCHEMA",
-                "CACHE_RELEASE_SCHEMA",
-                "CACHE_RELEASE_RECEIPT_SCHEMA",
-                "CACHE_IMPORT_CONFIRMATION_SCHEMA",
                 "CONFIG_SNAPSHOT_SCHEMA",
                 "INSTALL_RECORD_SCHEMA",
                 "DELIVERY_MANIFEST_SCHEMA",

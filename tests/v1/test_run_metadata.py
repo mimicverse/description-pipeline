@@ -8,10 +8,11 @@ import tempfile
 import threading
 import unittest
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from wsgiref.simple_server import make_server
 
-from tests.v1.test_airflow_client import JOB_SCHEMA, MockEndpoint, PIPELINE_ID
 from tests.v1.test_portal import (
     ADMIN_TOKEN,
     AIRFLOW_TOKEN,
@@ -26,15 +27,95 @@ from tests.v1.test_portal import (
     _QuietHandler,
     _ThreadingWSGIServer,
 )
-from tests.v1.test_platform_store import NOW, FakeWorld
 
-from description_pipeline.orchestration.airflow_client import (
-    EndpointConfig,
-    WindowsEndpoint,
-    native_run_id,
-)
+from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.portal import AirflowApi, PortalApp, PortalConfig
-from description_pipeline.platform.store import PlatformStore, PlatformStoreError
+from description_pipeline.platform.facts import (
+    FactStoreError,
+    RunDisplayMetadata,
+    RunNotAdmittedError,
+)
+
+NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
+
+
+class _RunWorld:
+    def __init__(self) -> None:
+        self.run_display_rows: dict[str, list] = {}
+        self.run_states: dict[str, str] = {}
+
+
+class FakeRunControlStore:
+    """Canonical run-control surface backed by the fixture's display rows."""
+
+    def __init__(self, rows: dict[str, list]) -> None:
+        self.rows = rows
+
+    def admission(self):
+        return SimpleNamespace(state="open")
+
+    def _display(self, run_id: str) -> RunDisplayMetadata:
+        row = self.rows.get(run_id)
+        if row is None:
+            raise RunNotAdmittedError("The run is not admitted")
+        return RunDisplayMetadata(run_id, *row)
+
+    def list_run_display_metadata(self) -> dict[str, RunDisplayMetadata]:
+        return {
+            run_id: RunDisplayMetadata(run_id, *row)
+            for run_id, row in self.rows.items()
+            if row[0] is not None or row[1] is not None
+        }
+
+    def get_run_display_metadata(self, run_id: str) -> RunDisplayMetadata | None:
+        row = self.rows.get(run_id)
+        return RunDisplayMetadata(run_id, *row) if row is not None else None
+
+    def rename_run(self, run_id: str, display_name: str | None) -> RunDisplayMetadata:
+        row = self.rows.get(run_id)
+        if row is None:
+            raise RunNotAdmittedError("The run is not admitted")
+        row[0] = display_name
+        row[3] = NOW
+        return RunDisplayMetadata(run_id, *row)
+
+    def hide_run(self, run_id: str, *, actor: str) -> RunDisplayMetadata:
+        row = self.rows.get(run_id)
+        if row is None:
+            raise RunNotAdmittedError("The run is not admitted")
+        row[1] = row[1] or NOW
+        row[2] = row[2] or actor
+        row[3] = NOW
+        return RunDisplayMetadata(run_id, *row)
+
+    def restore_run(self, run_id: str) -> RunDisplayMetadata:
+        row = self.rows.get(run_id)
+        if row is None:
+            raise RunNotAdmittedError("The run is not admitted")
+        row[1] = None
+        row[2] = None
+        row[3] = NOW
+        return RunDisplayMetadata(run_id, *row)
+
+
+class UnavailableRunControlStore:
+    def admission(self):
+        raise FactStoreError("canonical storage unavailable")
+
+    def list_run_display_metadata(self):
+        raise FactStoreError("canonical storage unavailable")
+
+    def get_run_display_metadata(self, run_id: str):
+        raise FactStoreError("canonical storage unavailable")
+
+    def rename_run(self, run_id: str, display_name: str | None):
+        raise FactStoreError("canonical storage unavailable")
+
+    def hide_run(self, run_id: str, *, actor: str):
+        raise FactStoreError("canonical storage unavailable")
+
+    def restore_run(self, run_id: str):
+        raise FactStoreError("canonical storage unavailable")
 
 
 class RunMetadataTests(unittest.TestCase):
@@ -42,27 +123,24 @@ class RunMetadataTests(unittest.TestCase):
         self.airflow = MockAirflow()
         self.airflow.__enter__()
         self.addCleanup(self.airflow.__exit__, None, None, None)
-        self.world = FakeWorld()
-        self.platform = PlatformStore(self.world.connect)
+        self.world = _RunWorld()
+        self.run_control = FakeRunControlStore(self.world.run_display_rows)
+        self.projection_metadata = {}
         self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))
         self.addCleanup(shutil.rmtree, self.upload_root, ignore_errors=True)
-        self.endpoint_server = MockEndpoint()
-        self.endpoint_server.__enter__()
-        self.addCleanup(self.endpoint_server.__exit__, None, None, None)
-        self.endpoint = WindowsEndpoint(EndpointConfig(base_url=self.endpoint_server.url, token="test-token"))
         self.static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         self.server = self._serve()
         self.client = PortalClient(f"http://127.0.0.1:{self.server.server_address[1]}")
         self.client.login()
 
     # ------------------------------------------------------------------ helpers
-    def _serve(self, *, endpoint=None, store=None):
+    def _serve(self, *, store=None):
         config = PortalConfig(
             airflow=AirflowApi(self.airflow.url),
-            endpoint=endpoint or (lambda: self.endpoint),
             static_dir=self.static_dir,
             upload_root=self.upload_root,
-            platform_store=store if store is not None else self.platform,
+            run_control_store=store if store is not None else self.run_control,
+            run_projection_factory=self._projection,
             pipeline_targets=TEST_TARGETS,
             config_identity_provider=lambda: "c" * 64,
         )
@@ -72,6 +150,49 @@ class RunMetadataTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(self._stop, server)
         return server
+
+    def _projection(self, run_id: str) -> dict | None:
+        dag_run_id = next(
+            (
+                dag_id
+                for dag_id in self.airflow.dag_runs
+                if native_run_id(dag_id) == run_id
+            ),
+            None,
+        )
+        if dag_run_id is None:
+            return None
+        metadata = self.projection_metadata.get(run_id, {})
+        state = self.world.run_states.get(run_id, "succeeded")
+        stages = [
+            {
+                "stage": stage,
+                "state": "waiting",
+                "decision": None,
+                "receipt": {"artifacts": []},
+            }
+            for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")
+        ]
+        return {
+            "run_id": run_id,
+            "request_id": f"portal-{dag_run_id}",
+            "parent_run_id": metadata.get("parent_run_id"),
+            "from_stage": metadata.get("from_stage"),
+            "request": metadata.get("request", {}),
+            "purpose": "engineering",
+            "scope": {
+                "kind": "formal",
+                "target_stage": None,
+                "formal_eligible": state == "succeeded",
+            },
+            "formal_eligible": state == "succeeded",
+            "state": state,
+            "events": [],
+            "stages": stages,
+            "by_stage": {stage: {} for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")},
+            "members": {},
+            "technical": {"commands": [], "claims": [], "effects": []},
+        }
 
     @staticmethod
     def _stop(server) -> None:
@@ -107,6 +228,25 @@ class RunMetadataTests(unittest.TestCase):
             {"task_id": f"task-{index}", "state": value} for index, value in enumerate(tasks)
         ]
         self.world.run_display_rows[native_run_id(dag_run_id)] = [None, None, None, NOW]
+        native_id = native_run_id(dag_run_id)
+        self.world.run_states[native_id] = {
+            "success": "succeeded",
+            "failed": "failed",
+            "running": "running",
+            "unresolved": "unresolved",
+        }.get(state, state)
+        conf = conf or {}
+        parent = conf.get("parent_dag_run_id")
+        self.projection_metadata[native_id] = {
+            "parent_run_id": native_run_id(parent) if isinstance(parent, str) and parent else None,
+            "from_stage": conf.get("resume_from"),
+            "request": {
+                "change_summary": conf.get("change_summary"),
+                "main_assembly": conf.get("main_assembly"),
+                "purpose": conf.get("purpose"),
+                "target_hardware": conf.get("target_hardware"),
+            },
+        }
         return dag_run_id
 
     @staticmethod
@@ -149,8 +289,8 @@ class RunMetadataTests(unittest.TestCase):
         self.assertEqual(status, 409, body)
         self.assertEqual(json.loads(body)["reason"], "deleted")
         status, _, body = self.client.request("POST", f"/api/runs/{run_id}/attempts", {"stage": "verify"})
-        self.assertEqual(status, 409, body)
-        self.assertEqual(json.loads(body)["reason"], "deleted")
+        self.assertEqual(status, 400, body)
+        self.assertIn("start from Freeze", json.loads(body)["error"])
 
         # Renaming a deleted record is allowed (display-only) and restore brings it back.
         status, _, body = self.client.request("PATCH", f"/api/runs/{run_id}", {"title": "装配线 A（待恢复）"})
@@ -237,34 +377,24 @@ class RunMetadataTests(unittest.TestCase):
         unknown_task = self._seed(self._uuid(), tasks=("success", None))
         status, _, body = self.client.request("DELETE", f"/api/runs/{unknown_task}")
         self.assertEqual(json.loads(body)["reason"], "unconfirmed")
-        # Native job still running.
-        job_run = self._seed(self._uuid())
-        native_id = native_run_id(job_run)
-        self.endpoint_server.jobs[native_id] = {
-            "schema_version": JOB_SCHEMA,
-            "pipeline_id": PIPELINE_ID,
-            "run_id": native_id,
-            "status": "running",
-            "events": [{"stage": "job", "state": "running", "at": "t0"}],
-            "result": None,
-            "error": None,
-            "request": {"run_id": native_id, "package": "handoff/x", "handoff_sha256": "a" * 64},
-            "pokes": 0,
-        }
-        status, _, body = self.client.request("DELETE", f"/api/runs/{job_run}")
+        # Canonical run facts still report active work.
+        active_fact = self._seed(self._uuid())
+        self.world.run_states[native_run_id(active_fact)] = "running"
+        status, _, body = self.client.request("DELETE", f"/api/runs/{active_fact}")
         self.assertEqual(json.loads(body)["reason"], "run_active")
+        unresolved = self._seed(self._uuid())
+        self.world.run_states[native_run_id(unresolved)] = "unresolved"
+        status, _, body = self.client.request("DELETE", f"/api/runs/{unresolved}")
+        self.assertEqual(json.loads(body)["reason"], "reconciliation_required")
         # An authoritative 404 (no native job ever existed) allows hiding a terminal record.
         no_job = self._seed(self._uuid(), state="failed", tasks=("failed",))
         status, _, body = self.client.request("DELETE", f"/api/runs/{no_job}")
         self.assertEqual(status, 200, body)
         self.assertTrue(json.loads(body)["deleted"])
-        # An unreachable endpoint refuses instead of assuming no job exists.
-        dead = WindowsEndpoint(EndpointConfig(base_url="http://127.0.0.1:1", token="test-token"))
-        dead_server = self._serve(endpoint=lambda: dead)
-        dead_client = PortalClient(f"http://127.0.0.1:{dead_server.server_address[1]}")
-        dead_client.login()
-        unreachable = self._seed(self._uuid())
-        status, _, body = dead_client.request("DELETE", f"/api/runs/{unreachable}")
+        # An unrecognized canonical state fails closed.
+        unknown = self._seed(self._uuid())
+        self.world.run_states[native_run_id(unknown)] = "mystery"
+        status, _, body = self.client.request("DELETE", f"/api/runs/{unknown}")
         self.assertEqual(status, 409, body)
         self.assertEqual(json.loads(body)["reason"], "unconfirmed")
 
@@ -345,11 +475,7 @@ class RunMetadataTests(unittest.TestCase):
 
     def test_an_unavailable_platform_fails_the_run_surfaces_closed(self) -> None:
         run_id = self._seed(self._uuid())
-
-        def refusing_connect():
-            raise PlatformStoreError("platform store unavailable")
-
-        restarted = self._serve(store=PlatformStore(refusing_connect))
+        restarted = self._serve(store=UnavailableRunControlStore())
         client = PortalClient(f"http://127.0.0.1:{restarted.server_address[1]}")
         client.login()
         status, _, body = client.request("GET", "/api/runs")
@@ -384,9 +510,9 @@ class RunMetadataTests(unittest.TestCase):
         from description_pipeline.orchestration.portal import AirflowApi as PortalAirflowApi
         from description_pipeline.orchestration.portal import AirflowApiError
 
-        # A native job whose status is neither active nor terminal cannot be hidden.
-        with mock.patch.object(WindowsEndpoint, "get_job", return_value={"status": "mystery"}):
-            status, _, body = self.client.request("DELETE", f"/api/runs/{run_id}")
+        # A canonical state that is neither active nor terminal cannot be hidden.
+        self.world.run_states[native_run_id(run_id)] = "mystery"
+        status, _, body = self.client.request("DELETE", f"/api/runs/{run_id}")
         self.assertEqual(status, 409, body)
         self.assertEqual(json.loads(body)["reason"], "unconfirmed")
         # An Airflow list failure is an actionable 503, never a silently truncated history.
@@ -422,25 +548,12 @@ class RunMetadataTests(unittest.TestCase):
         row = next(item for item in payload["runs"] if item["dag_run_id"] == child)
         self.assertEqual(row["parent_dag_run_id"], parent)
         self.assertFalse(row["deleted"])
-        # Starting a new attempt from the deleted parent is refused...
+        # Old arbitrary-stage resume is rejected for the parent...
         status, _, body = self.client.request("POST", f"/api/runs/{parent}/attempts", {"stage": "verify"})
-        self.assertEqual(status, 409, body)
-        self.assertEqual(json.loads(body)["reason"], "deleted")
-        # ...while the existing child still starts its own linked attempt.
-        child_native = native_run_id(child)
-        self.endpoint_server.jobs[child_native] = {
-            "schema_version": JOB_SCHEMA,
-            "pipeline_id": PIPELINE_ID,
-            "run_id": child_native,
-            "status": "failed",
-            "events": [{"stage": "job", "state": "failed", "at": "t0"}],
-            "result": None,
-            "error": "verification failed",
-            "request": {"run_id": child_native, "package": "handoff/x", "handoff_sha256": "a" * 64},
-            "pokes": 0,
-        }
+        self.assertEqual(status, 400, body)
+        # ...and so is every downstream attempt from the child.
         status, _, body = self.client.request("POST", f"/api/runs/{child}/attempts", {"stage": "publish"})
-        self.assertEqual(status, 202, body)
+        self.assertEqual(status, 400, body)
 
 
 if __name__ == "__main__":

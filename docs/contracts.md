@@ -16,15 +16,31 @@ CAD 提供工程事实，版本化规则负责规范化、派生与有依据的�
 | 阶段收据 `handoff_sha256` | `freeze` 绑定完整上传索引；原生阶段及其生成、验证、发布后继绑定原生传输选择身份。复用保留原生产者的同一绑定 |
 | `source_revision_id` | 工程内容身份：完整上传清单摘要、主装配、交付配置、选定硬件标识及实际引用的受控记录摘要的规范对象之 SHA-256；使用完整 64 位十六进制值 |
 | 工程修订 | CAD/PDM 编写的版本标签及受控原件引用；保持原值与缺项，不用内容摘要冒充工程修订 |
-| `request_id` | 一次认证提交的稳定标识；请求封存后不可变，绑定用途、目标配置、工具发行身份、契约/检查/资源策略摘要与发布前置基线 |
-| `run_id` | 一次工程执行的 UUID；重跑生成新值，保留父运行与起始阶段 |
-| `operation_id` | 一次有副作用操作的持久幂等键，绑定运行、阶段和完整操作参数摘要 |
+| `request_id` | 一次认证提交的稳定标识；请求封存后不可变，绑定用途、目标配置、六阶段 executor、native tool source/record、契约/检查/资源策略摘要与发布前置基线 |
+| `run_id` | 一次工程执行的 UUID；正式新接纳固定从 `freeze` 开始，关联运行保留父运行但形成新的准入与下游身份 |
+| `NativeTargetIdentity` | 既有部署登记证明的 Windows runtime 目标；精确字段为 `schema_version/install_id/pipeline_id/target_id`，不由 URL、health readiness、tool、release 或 worker owner 合成 |
+| `target_binding_digest` | 单个 native effect target 对 operation identity、main assembly、tool source digest、完整 target identity 与 target ID 的规范摘要；不替代 command、request、archive、tool record 或 payload 摘要 |
+| `command_id` | 一个不可变 stage、dispatch 或 cancel command；reconciliation 是 claim-free 操作，不创建 reconcile command |
+| `claim_id` / `fence` | 一个命令的一次执行权；owner 是具体进程身份，executor 是工具发行身份，旧 fence 不能提交或关闭新执行 |
+| `effect_id` / `effect_key` | 一个已封存外部副作用及其 outbound；effect facts 只追加，UNKNOWN 只能由精确只读观察或 reconciliation 结算 |
+| `StageEffectWait` / `StagePending` | 一个未决 effect 的非秘密 locator 与要求调用方 defer 的控制结果；不是 StageResult、failure、decision、checkpoint 或第二状态权威 |
+| `artifact_id` | ArtifactStore 中一个不可变 tree；绑定 manifest、member set、producer run/stage/tool 身份 |
+| `stage_decision` / `StageQualification` | 每个 run/stage 唯一终态及由其 command、admission、result/failure 重算出的 formal 或 diagnostic 资格 |
 | `subject_digest` | 一份完整交付的不可变文件主体摘要；验证只针对该主体 |
 | 发布身份 | 仓库、硬件、base、候选分支、前置提交、交付主体及最终 commit/PR |
 
 内容摘要对象的固定字段为 `kind="source-revision"`、`handoff_digest`、`main_assembly`、`configuration`、`hardware_id`、`records`。`records` 是实际引用的 `{reference, file_sha256}` 列表，按完整引用排序且唯一，无引用时为 `[]`；路径是包内相对路径，字符串保持封存值，不以临时绝对路径替代。按照本契约的规范 JSON 序列化求摘要，未引用规格的变化不影响结果。
 
 `source_revision_id` 不含运行 UUID、时间、显示名或工具版本。重复运行相同工程内容保持同一内容身份；新工具与新原生观察仍可产生不同交付主体。完整摘要用于机器判断，页面可展示短前缀；分支与文件名不得依赖拼接工程标签形成无界长度。
+
+摘要必须按对象域分别解释。`target_id` 只摘要
+`{schema_version,install_id,pipeline_id}`；`target_binding_digest` 只摘要该 native
+effect 的 operation/tool/target 绑定；command 的 `request_digest`、effect 的
+`expected_state_digest`/`intent_identity_digest`、artifact 的 `set_sha256`、operation
+的 request/archive/payload 摘要、tool 的 `source_sha256` 与完整
+`native_tool_record_sha256` 均各有独立对象。禁止把 health、release、URL 或一个摘要
+强等为另一个；完整 tool record 与 source digest 也不能跨域比较。规范 JSON 的 metadata
+编码由所属写端契约决定，编码正确或改变不改变已定义 semantic digest 的字段集合。
 
 字段按下表解析。Windows 只返回原生值、属性查询状态和实际配置；来源合并、冲突判定及发布就绪在 Linux 完成。缺失与读取失败分别记录，不以空值推定成功读取且不存在。
 
@@ -42,7 +58,7 @@ CAD 提供工程事实，版本化规则负责规范化、派生与有依据的�
 
 提交的变更说明为必填（可多行，行尾统一为 LF）。候选 PR 的行政说明优先采用 CAD 已录说明（来源记为 `cad`），缺失时采用提交说明（来源记为 `submission`）；两者均缺失时 `discover` 记为 `discovery.summary_missing`，发布就绪不成立。
 
-请求固定发布目标、其配置摘要和基线读取结果。读取失败明确标记为未解析，不能当作首次交付；允许采集与验证，发布前须在新请求中固定已解析的基线，完整上游可按复用规则沿用。请求变更、主装配变更或目标变更形成新请求。显示名修改不改变请求。
+请求固定发布目标、其配置摘要和基线读取结果。读取失败明确标记为未解析，不能当作首次交付；发布前须在新请求中固定已解析基线。新请求从 Freeze 接纳，只允许按下述规则复用父运行原件，不继承旧下游成功。请求变更、主装配变更或目标变更形成新请求。显示名修改不改变请求。
 
 `freeze` 在调用推导或生成器之前，将已接纳请求封存为 `input/request.json`，schema 为 `solidworks-to-urdf.request/v2`。记录包含 `schema_version`、`purpose`、`request_id`、`target_hardware`、`change_summary`、`main_assembly`、`handoff_digest` 和 `platform_config_digest`；分别固定记录版本、用途、本次请求、经配置校验的所选硬件、规范 LF 的原始提交说明、明确的主装配、完整上传索引与实际平台配置快照身份。记录不包含秘密或凭据，冻结收据绑定其文件摘要，后续阶段原字节沿用，完整交付必须携带该件。
 
@@ -50,9 +66,52 @@ CAD 提供工程事实，版本化规则负责规范化、派生与有依据的�
 
 配置引用遵守单一边界：新接纳请求校验当前安装快照；已接纳请求按其 `platform_config_digest` 解析并校验原快照，不因连接或当前安装切换而改写身份。引用缺失、文件越界、符号链接、权限错误、摘要不符或旧式路由副本均拒绝，不回退到环境中的另一组业务参数。凭据只保留受控文件引用，不封存秘密值。
 
+`AdmissionSpec` 当前为 v3，并封存 exact `NativeTargetIdentity`。生产 factory 从
+`PLATFORM_CONFIG_SNAPSHOT` 首次读取并校验的同一组 bytes 定位
+`<state_root>/install-record.json`，核对 snapshot lexical path/digest/install ID、
+Linux config digest、state root 与 `ends.windows.target_identity`；该 target 写入
+Freeze、Discover、Capture command 的 request projection、native effect、operation
+wire/view/expectation 和入站 upload admission。不得在 `run_stage`、trigger、Portal
+展示或 retry 时重读当前 health/env 改绑已接纳 target。`PreparedAdmission.register`
+还须在 admit 前拒绝 application/client target 与 spec target 不一致；现有 request
+重试先复用已封存 spec，再考虑当前登记。
+
+正式新运行只从 `freeze` 起点开始。需要复用父运行 CAD 原件时，接纳对象携带
+`parent_run_id`，由 `ProductionFreezeSuccessorRequest` 表达新运行、请求、主装配、
+目标、用途、说明和提交主体，并调用
+`load_production_freeze_successor(...)`。该入口必须通过
+`StageApplication.load_verified_freeze_origins(parent_run_id)` 读取父 Freeze
+decision/result、`inputs.json`、`freeze_originals` 引用及 ArtifactStore 实际字节，
+并只原样复用 `spec.originals`。当前 rules、configuration snapshot、target、
+RepositorySnapshot、Git actor/base、native requirement、portable/native release
+与六阶段 executor 必须重新接纳并封存；历史 producer 与本次消费者身份分别保留。
+
+新运行不得引用父 Discover、Capture、Generate、Verify 或 Publish decision，
+不得复制任何下游成功、qualification 或 effect 状态。父上传目录和 work root 可以
+删除，父来源收据或字节缺失、漂移、错绑时拒绝。相同 `run_id` 的同类请求只在完整
+行政意图与 originals artifact ref 完全一致时返回原接纳；改变父运行、主装配、目标、
+用途、说明、主体或原件身份均拒绝。普通上传接纳不接受 `parent_run_id`，以
+Discover 或更后阶段为起点的旧 resume 不进入生产；已登记不可变 command 的安全重试
+仍走共同 engine，UNKNOWN effect 必须先只读 reconciliation。
+
+隔离诊断仍可使用显式 `DiagnosticReplayScope` 执行一个目标阶段，但它只引用完整
+输入 closure，不伪造上游 decision，不登记正式 checkpoint，也不产生可被普通后继
+消费的 formal qualification。诊断输出必须保留 scope 与原 producer 身份，不能晋升为正式下游输入。
+后续正式运行重新从 Freeze 接纳并建立自己的完整祖先事实。
+
+`platform_config` artifact 恰含 `config-snapshot.json`。Freeze 与 Discover 从
+artifact 校验快照结构并复算 canonical snapshot digest，再与 request 和 command 的
+`platform_config_sha256` 比较；CAS member-set 摘要证明 bytes 完整性，但不代替
+快照自身身份。
+
+同一六资产 release 可包含不同的 Linux 与 Windows artifact digest。每个阶段只使用
+`AdmissionSpec.executors.for_stage(stage)` 中自己的 executor；`native_tool_source_sha256`
+和 `native_tool_record_sha256` 表达 Windows 原生闭包，不替代任何 Linux stage
+executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 role 摘要相等。
+
 独立验证从原生读数与该请求证据重算硬件和说明来源，并核对主装配及上传摘要；不能以 `input/source.json` 与发现结果两份生成声明相等替代来源证明。CAD 属性确证缺失才允许对应回退，读取失败、无效值或冲突保持拒绝。即使生成声明被同时修改并重新封装，原请求不变时仍须检出差异。
 
-关联运行的当前请求与发布基线仍由数据库固定。有效工程输入不变、只有本次请求或运行标识及发布基线变化时，可沿用原交付中的冻结请求证据，保留原 `request_id`；数据库核验当前请求的用途、目标、说明、主装配、完整上传摘要和配置身份与该证据一致，并登记来源阶段和原收据。不能为换成本次 UUID 重写已验证主体，也不能把沿用记录伪造成本次执行。用途变化形成新请求并重新冻结、生成和验证；不能跨用途沿用旧验证结论。字段变化使对应检查点输入不再一致时，从足以重新形成该证据与下游结果的阶段执行，不得在复用的交付中直接改值后沿用旧验证结论。
+同一已登记 command 的恢复保留原请求与证据；新的 run/request 则重新生成并封存本次请求记录，不能沿用旧交付的 `request_id` 或下游验证结论。Freeze successor 保留父 originals 的 producer 身份，同时记录本次消费者；原始字节复用不等于请求、阶段结果或资格复用。用途、发布基线及其他输入发生变化时，均通过新的 Freeze 请求建立完整下游，不在既有交付上改值后沿用旧证书。
 
 <a id="naming"></a>
 ## 工程交付标识与模型命名
@@ -138,34 +197,214 @@ CAD 提供工程事实，版本化规则负责规范化、派生与有依据的�
 
 | 阶段 | 执行 | 输入与输入检查 | 封存输出与输出检查 |
 |---|---|---|---|
-| `freeze` 冻结输入 | Linux | 已完成上传、认证主体、主装配、配置目标、用途及必填提交说明；路径、文件类型、大小和选择有效 | 不可变请求、上传清单与原件；清单闭合、字节及摘要一致；不启动 CAD |
-| `discover` 解析结构 | Windows 原生观察 + Linux 推导 | 冻结工程及同版工具；原生解析状态和来源绑定有效 | 原始发现、实际采用的规则／记录快照、工程内容身份和采集计划；模式明确、结构可解、对象引用唯一且计划绑定原始观察 |
-| `capture` 采集证据 | Windows 原生读取 + Linux 传输核验 | 封存计划及同一工程副本；工具、计划摘要、已保存配置和实例身份一致；身份按逐字段规则核对，不设置全部 `dp.*` 齐备的前置门 | 完整原生证据；重建、原生状态读取、临时选择/配置恢复、几何覆盖和源文件稳定检查通过，传输闭合 |
-| `generate` 生成 URDF | Linux | 完整封存证据；清单、schema、来源与工具身份有效 | 规范化模型、URDF、网格及交付主体；模型合法、文件完整并绑定来源 |
-| `verify` 独立验证 | Linux | 原始证据和实际产物；交付主体未变 | 确定性质量报告；所有必需且适用的检查通过，报告绑定主体与策略 |
-| `publish` 提交评审 PR | Linux | 完整重验、配置目标、发布前置基线和干净工作区有效 | 候选 commit 与 PR 收据；复制、Git blobs、远端 head/base 与验证主体一致 |
+| `freeze` 冻结输入 | Linux | originals、ruleset、platform configuration、认证主体、主装配、配置目标、用途及必填说明；artifact closure、路径、文件类型、大小和选择有效 | `stage-request.json`、`request.json`、`inputs.json`、`ruleset.json`、`configuration.json`、`checks.json`；清单闭合、字节及摘要一致；不启动 CAD |
+| `discover` 解析结构 | Windows 原生观察 + Linux 推导 | 已验证 Freeze 输出、SourceSet、ruleset/configuration identity 和准入的 native tool source/record identity；artifact 与工具身份一致 | `native-observation/`、`prepared/`、`request.json`、`checks.json`、`result.json`；原生观察、selection、ruleset 和 prepared bytes 一致 |
+| `capture` 采集证据 | Windows 原生读取 + Linux 传输核验 | 已验证 Freeze/Discover 输出和同版 native tool requirement；prepared bytes、source inventory、tool identity 与对象归属一致 | admitted tree 的 `input/`、`evidence/`、`reports/native-tool.json`、`reports/native-stages.json`、`transfer-manifest.json`；重建、原生读取、状态恢复、几何覆盖和资源结算通过 |
+| `generate` 生成 URDF | Linux | 精确 committed Capture artifact；snapshot、schema、provenance、source warning、source binding 与 tool identity 有效 | `model/robot.json`、`urdf/robot.urdf`、`meshes/`、`tool.json`、`reports/generate.json`；确定性、完整并绑定 Capture |
+| `verify` 独立验证 | Linux | 精确 committed Generate/Capture pair；原始证据和实际生成字节未变 | `verification-certificate.json`、`verification-execution.json`；全部必需且适用的检查通过，并绑定 pair、verifier、contract、policy 与 subject |
+| `publish` 提交评审 PR | Linux | Generate/Capture/Verify artifacts 与 sealed RepositorySnapshot；重验、配置目标、前置基线和干净工作区有效 | `publication-receipt.json` 与 fenced Git/PR effects；copied bytes、committed tree、remote head/base、PR 和 verified subject 一致 |
 
-Airflow 的任务标识依次为 `freeze / discover / capture / generate / verify / publish`，与此表一一对应，手动触发，不设周期调度或 catchup。上传、原生操作派发、结果等待和传输核验均位于所属工程任务内，不作为另一套阶段。原生操作使用容量为一的资源池。任务重试保留操作身份；阶段重做只通过关联运行命令发起，不用 backfill 或直接 clear 改写工程历史。等待原生结果释放 Airflow 执行槽。页面、日志与机器收据消费同一阶段定义。
+Airflow 的任务标识依次为 `freeze / discover / capture / generate / verify / publish`，与此表一一对应，手动触发，不设周期调度或 catchup。六个 task 都实例化
+`StageTaskOperator`，其 `execute()` 绑定真实 DagRun/TaskInstance 后调用
+`StageApplication.run_stage()`；`StagePending` 经 `defer()` 交给
+`EffectPollTrigger`，`execute_complete()` 校验持久 wait 与 event digest 后调用
+`StageApplication.resume_stage()`。Airflow 固定为 3.3.2，并运行受管 triggerer。
+上传、原生操作派发、结果等待和传输核验均位于所属工程任务内，不作为另一套阶段。
+原生操作使用容量为一的资源池，任务重试保留操作身份；阶段重做只通过关联运行命令
+发起，不用 backfill 或直接 clear 改写工程历史。DAG 当前设置
+`max_active_runs=8` 与 `max_active_tasks=8`，只约束调度并发；CAD 排他由 physical
+ownership、native pool 与 target/effect 冲突分别执行，不能把 scheduler 并发字段
+当作 CAD mutex。页面、日志与机器收据消费同一阶段定义。
 
 冻结以数据库已接纳请求为比较基准，核对原件摘要、文件数量与总字节数、主装配、目标、用途和平台配置身份；不能从待检查的目录重新计算一份期望值并据此自行证明接纳。实际冻结检查事件与封存收据一并登记，已确认阶段的同键重放不重复产生检查事件。Windows 只执行 `discover` 与 `capture` 的原生部分，不另行执行或确认冻结。
 
-平台事务登记运行与阶段、执行范围、输入摘要、固定工具/契约/策略身份、执行起止、检查结果和封存产物或诊断引用。内容存储只保存不可变文件及清单，阶段是否完成由平台数据库登记决定。复用登记引用原生产收据并保留原运行、身份和检查时间，不伪造本次执行。所有消费者核验绑定与文件摘要；文件存在、Airflow 成功或端点完成不能单独建立检查点。
+初始接纳在同一事务登记 `RunAdmission`、Freeze `StageCommand`、technical
+`DispatchCommand`/conf 与 prepared dispatch effect。Portal 调用
+`StageApplication.dispatch(command_id, adapter)` facade；facade 内部由既有
+`TechnicalDispatchService` 先取得 technical command claim/fence 并提交
+`dispatch_authorized`，再调用 Airflow trigger。真实 Freeze task 只在实际启动后绑定
+`dag_id/dag_run_id/task_id/map_index`，不能首次授权自己的创建。响应或超时未知时按
+dispatch effect 进行 reconciliation，禁止绕过该顺序重新 trigger。
+
+### 唯一阶段事实与祖先资格
+
+`StageApplication` 是六阶段的唯一生产入口。`RunAdmission` 是不可变接纳事实；
+`StageCommand` 绑定完整请求、输入 ArtifactRef、配置、契约、策略、executor 和
+immediate predecessor；`ExecutionClaim` 提供 owner/executor/fence；external
+work 由 append-only `EffectIntent`/`EffectFact` 表达；handler 只产出 candidate，
+唯一 `StageDecision` 才形成阶段终态。ArtifactStore 保存不可变 bytes 和 manifest，
+平台数据库只保存其引用与结构化 metadata。
+
+每个 successor builder 必须从同一 admission 与当前已验证 predecessor 集合重建
+command；`FactStore.create_command` 在同一 `run_admission` 行锁内逐项重读 command、
+decision、sealed StageResult、输出 artifact 与 supporting predecessors，并调用
+`qualify_stage/require_formal_qualification` 重算资格。全部祖先的 admission
+request digest、command/request digest、result/failure digest、executor、artifact
+ref、diagnostic scope 和 effect ledger 必须与当前事实一致。缓存、页面摘要、
+`formal_eligible` 布尔或证书自报值不能替代本次重算。
+当前六阶段只沿同一 run 的 bounded command/predecessor decision 链验证 immediate 与
+supporting predecessors；`command_input_artifact.position` 保留输入顺序。跨运行复用
+只允许通过父 Freeze originals 建立新的正式运行，不定义通用的多跳 checkpoint 或
+producer lineage 兼容链。不得仅凭相同 artifact 摘要省略 command、decision、
+metadata 或 producer 身份。
+该复核在 successor command 创建、claim 获取、已决结果读取/提交和 effect
+authorization 边界分别执行，防止另一个进程已使祖先冲突后仍由缓存继续外发。
+
+阶段事务只保存事实和引用：result/failure artifact、candidate output/result、
+effect outbound、payload、reconciliation metadata 与 FailureEnvelope evidence
+各自保留 producer 身份和摘要。任何 metadata artifact 都与 payload 分开登记并进入
+恢复根；inline failure 同时保存 canonical bytes 的 digest。文件存在、Airflow task
+成功或 endpoint job 完成不能单独建立 stage qualification。
+
+阶段间不传递进程内对象、隐藏缓存、可变临时目录或调度器内存作为业务输入。阶段只从
+command、ArtifactRef、StageResult/FailureEnvelope 与 canonical facts 重建本阶段
+workspace；重启后的同一 command、独立复跑和新组合测试都必须得到相同输入闭包。
+上一阶段的任务成功或同进程残留不能替代当前输入登记与资格复核。
+
+等待外部 effect 的统一协议为：只有完整不可变 command/effect、sealed 可重建 outbound
+和当前 claim/fence 可进入 pending-effect yield。共同 engine 返回
+`StagePending(StageEffectWait)`；这不是 `StageResult`、failure、decision、checkpoint
+或第二状态权威。让渡必须原子关闭旧 owner 的发送、owner 事实追加和 decision 权限。
+`StageTaskOperator` 在真实 Airflow task context 中执行普通 stage 或恢复，并把
+`StagePending` 转成 defer；`EffectPollTrigger` 只按精确
+effect/operation/request/outbound/tool/target identity 观察并给出 wake-up hint。
+trigger 不取得 claim、不发送命令、不 seal payload、不写平台 fact/decision。
+
+native trigger 的 401/403、同 target 但错 operation 的
+`native_operation_identity_mismatch` 及其他非 `native_target_mismatch` conflict
+必须中止；404、缺 status 的 transport error、可识别协议错误、5xx 或明确的
+`native_target_mismatch` 保持同一 wait 且 `changed=false` 继续观察。错误 target、
+错误 operation 或过期 wait 不能被吞成仍可唤醒。trigger 重启、迁移、超时或清理不得
+取消外部操作或释放仍工作的 CAD lease；event 内容、XCom、serialized kwargs、工作目录
+及 trigger 自身失败均不建立工程资格。
+
+`StageTaskOperator.execute_complete()` 必须核对 persisted wait 与 trigger event
+digest，随后使用新的真实 Airflow task context 调用
+`StageApplication.resume_stage(wait)`。application 重验同一 command、effect、request、
+outbound artifact、工具、外部 target 与当前祖先资格；无 claim 的权威 observation
+只在 worker 边界封存 payload/metadata/fact。terminal effect 随后进入独立 handler
+`resume_stage()`；只有 canonical `input_transfer_pending` 才进入窄
+`resume_transfer()`。重复、陈旧、错绑或伪造 event、丢失 ACK、UNKNOWN 和 observer
+outage 均不得造成重复 native/Git/PR 外发或伪造成功。原 external request 内的旧
+claim/fence、native producer 与工具身份不变。即时完成的 Git/PR 可以直接结束，不强制
+等待。
+
+### 受限 transfer continuation
+
+`EffectResumePhase.external_pending` 与 `input_transfer_pending` 不是新的阶段状态、
+effect 状态、持久业务 enum 或补偿队列；它们只由 canonical facts 和权威只读观察推导，
+用于选择 worker 内部 resume 路由。`external_pending` 只走 terminal
+`resume_stage()`；只有 `input_transfer_pending` 可选择 narrow
+`resume_transfer()`。该 phase 不进入 `StageEffectWait` 的持久字段；wait 仍只绑定原
+command/effect/request/outbound，phase 在恢复时从当前 canonical facts 重新推导。
+生产判定至少同时要求：
+
+1. 只针对 `native_operation` effect，权威正观察证明原 operation 已 accepted；
+2. 原 effect 的 input 尚未 admitted，且没有返回 absence 或从空结果猜出的终态；
+3. 原 command、effect、envelope、request、payload、archive 与 tool identity 精确
+   绑定，封存 outbound 闭包 byte-for-byte 可复原；
+4. 当前 admission、祖先资格、cancel、维护和 owner/resource 条件仍允许此命令；
+5. 原 claim 已让渡，或过期后由 claim 事务核验并关闭；新的受限 claim 绑定同一
+   command/effect 并递增 fence。未过期的 live claim 不可接管，不建立第二 command
+   或 effect。取得 claim 本身不授予发送权。
+
+共同 engine 取得受限 claim 后，在维护共享锁内调用 `resume_transfer()`。handler
+先重建并核对原 outbound/archive，再调用 `authorize_resume()`；后者以独立短事务
+重读当前祖先资格、cancel、claim/fence、租约、effect 与 outbound，追加
+`resume_authorized`。该事务提交后才能外发；claim 取得后发生的取消、祖先冲突或
+租约到期仍须拒绝，物化失败也不能外发。两个事务之间崩溃保留原 claim 和证据，
+恢复须重新走同一核验边界。该端口只提供对原 operation 上传原 archive 的能力，
+不能新建 effect、普通发送、创建
+candidate、提交 decision/failure 或扩大成 general execution。handler 成功返回只能是
+`StageDeferral`；上传 ACK 后由 engine 再次 yield 同一 effect。原 external request 内的
+platform claim/fence、producer 与实际工具身份保持原字节；新 fence 只授权该传输
+continuation，不扩大为普通 handler、CAD、Git 或 PR 发送权限。trigger、event、
+phase、日志、XCom 或页面观察均不授权 transfer。
+
+404、空查询、observer failure、错误 operation/archive/tool/effect
+identity 或其他不可唯一核定的结果保持 UNKNOWN 或明确拒绝，不得触发 create、重新
+接纳 operation 或构造新 archive。上传可能激活 native 执行，因而必须通过服务端原子
+幂等保证 input admission 与 executor 各一次。ACK 只是传输事实，不证明 native
+success；ACK 后必须再次 yield，由后续 observer/admission 形成终态。后续取得的瞬时
+终态若已有完整原始证据，可直接走权威 settlement。
+
+未授权的 cancel 不能执行；`resume_authorized` 提交前发现已登记 cancel 时必须拒绝。
+发送授权与 cancel/observation 竞争时，只追加真实顺序和原件，不以较晚事件覆盖已发生
+权限；cancel ACK 只结算 cancel effect，target native effect 仍需 claim-free
+canonical reconciliation。Git ref 与 PR upsert 的
+UNKNOWN 永远不能使用 `resume_transfer`、重传或普通 handler 重跑解决；git/gh 只读
+probe 的 wake hint 同样不授予权限。
+
+Discover 的 `request.json`/`source.json` 与 Capture 的 `outbound.json` 使用各自既有的
+metadata 写端编码。当前 Discover 两件均为 canonical JSON 加恰一个 LF，Capture
+`outbound.json` 为 canonical JSON 无尾随 LF；consumer 逐字节核对，不执行 `strip()`、
+任意 whitespace、key 重排或双读宽松。该 encoding 差异不改变 HTTP wire 或 semantic
+digest，但错误编码不得被解释为不同语义后继续外发。
+
+接纳事务以 admission gate 与 `run_admission` 为边界。已存在当前 command 时，
+successor、claim、send 或 decision 操作先持有 command 边界，再从根 predecessor 到叶
+重验有界 decision/result 与 effect ledger，随后进入当前 claim/fence、
+cancellation/effect、candidate/decision 边界。不得引用已删除的 run 表锁。
+immutable intent/fact/decision 只追加，不原地改义。外部 CAD、Airflow、Git、PR、
+HTTP 调用不得持有数据库事务；dispatch authorization 已提交后才允许发送。
+reconciliation 不取得 claim/fence，也不创建 command；它只锁定当前
+`effect_intent`/`effect_fact` sequence，并重验原 command、outbound、artifact 与
+metadata closure。同一 command/effect 恢复复用原 intent 与 outbound；外部请求中
+已封存的旧 claim/fence 保持原字节，新执行权则由 canonical claim 规则产生新的 fence，
+不能把历史请求身份当作当前发送权，也不能并行建立第二套状态。
 
 <a id="recovery"></a>
 ## 状态与恢复
 
+`project_stage_status` 与 `project_run_status` 是唯一业务状态投影。它们只消费
+canonical facts 的真实阶段 decision/effect 以及实际 Airflow task/DagRun 关联；
+SQL view、Portal、operator 和 display metadata 均不得另写状态 reducer。正式运行
+要求六个 formal stage decision 按序全部 `completed` 且全部 effect 为 `satisfied`；
+任一当前未收口的 UNKNOWN/CONFLICT 为 `unresolved`；合法 reconciliation 可以按原
+effect identity 追加 settlement，历史 fact 不得使已收口结果永久冲突。缺少任一
+formal stage 为 `incomplete`。
+`DiagnosticReplayScope` 只产生目标 stage 的 diagnostic 结果，不能填入这六个 formal
+outcome，也不能让正式运行或下游取得成功资格。
+
+`read_admitted_runs` 从 canonical command、decision 与 effect facts 调用
+`project_effect_state/project_stage_status/project_run_status`。SQL
+`lifecycle_projection` 只提供真实 Airflow scheduling/DagRun 关联和 drain/stop
+bucket，不是 run、stage 或 effect reducer。`RunControlStore` 只提供运行查询与显示
+控制：通过上述共同业务投影读取当前运行状态及必要 Airflow 关联，只写
+`run_display_metadata`。其显示名、隐藏、恢复方法不得写 command、claim、candidate、
+decision、effect 或 qualification，不能作为第二状态权威。隐藏台账只控制页面可见性，
+不删除、停用或改变原运行、证据、资格及生命周期关联。
+
+维护 `operator_ro` 仅可 `SELECT` `run_admission`、`command`、`stage_decision`、
+`effect_intent`、`effect_fact`、`execution_claim`，以及
+`lifecycle_projection`/`admission_projection`。六表用于同一只读
+repeatable-read snapshot 中的 `read_admitted_runs` 复算；该角色不得写这些事实、
+`run_display_metadata`、其他平台对象或直接访问 Airflow schema。
+
 | 状态对象 | 规则 |
 |---|---|
-| 运行 | `queued → running → succeeded / failed / cancelled`；副作用结果未知为 `unresolved`，只能经对账恢复；完整发布收据确认后才可成功 |
-| 阶段 | `pending → running → completed / failed / cancelled`；副作用结果未知为 `unresolved`，前提失败为 `blocked`，未进入执行的任务不得标记通过 |
+| 运行 | 由共同 projector 读取六个 formal stage decision、完整 effect ledger 和真实 Airflow 关联，投影为 `incomplete → succeeded / failed / cancelled / unresolved`；不保存第二份可变 run 状态 |
+| 阶段 | 由 command、claim、effect 与 decision 投影为 `waiting / active / blocked / completed / failed / cancelled / unresolved`；每个 run/stage 最多一个终态 decision |
+| 外部 effect | `prepared / unknown / satisfied / definitely_failed / conflict`；只有 `prepared` 可在当前 claim/fence 下首次授权发送 |
+| command/candidate | immutable command 绑定输入；sealed candidate 在 decision 前保留 output/result；decision 不得从未封存文件重建 |
 | 检查 | `passed / failed / not_run / not_applicable`；不适用必须有策略定义的条件和证据 |
 | 警告 | 独立诊断，包含对象、事实、来源及资格影响；不改变必需检查的判定 |
-| 执行范围 | `executed / reused / out_of_scope`；复用只在验证原收据和完整输入后成立 |
-| 受控操作 | 原生执行与发布使用 `queued / running / succeeded / failed / cancelled / unresolved`；每个终态不可变且绑定封存结果或诊断 |
+| 执行范围 | `executed / reused / out_of_scope`；复用只从原 decision/result artifact 与其完整祖先事实重建 |
 
-运行状态、阶段收据与终态事件原子登记。通信不可用时保留最后确认状态和更新时间；无法确认副作用结果时登记 `unresolved`，阻断后续阶段、删除、排空完成和部署切换，不改写为成功、失败或可清理。取消先登记命令意图，确认所有自有操作结束且外部结果已核对后才登记取消终态；不能取消已完成发布的结果。
+运行和阶段显示状态是只读投影，不能作为可写业务权威。无 decision 且存在当前 open
+claim 为 `active`；无 open claim 且前置完成但尚未创建/执行后继为 `waiting`；
+已登记 effect 为 UNKNOWN/CONFLICT 或未封存 candidate 保留为 `unresolved`；已证明
+前置失败且后继未执行为 `blocked`。completed `StageDecision` 必须绑定 completed
+`StageResult`、满足的完整 effect ledger 与相同 executor；failed/cancelled decision
+必须保留 failure/result 原件，未知 effect 不得被隐藏为确定失败。终态不复写。
 
-失败归属实际执行阶段。原生主装配打开或选择失败登记为 `discover` 失败，保留已完成的冻结收据；收敛重放不覆盖已有终态或诊断，但必须补齐尚缺失的后继阻断记录，并结算对应运行与原生操作。不得因失败行已存在就跳过未完成的收敛。
+裁决提交在同一短事务内重读 command、cancellation、claim/fence、完整 effect ledger、
+candidate 与所有祖先资格。completed decision 要求 ledger 与 result 声明完全相等且
+全部 SAT；failed/cancelled decision 拒绝 UNKNOWN/CONFLICT。迟到的 response/timeout
+只能追加审计事实，不能把已提交终态改回成功。首次外部调用必须发生在 dispatch
+authorization 事务提交之后，数据库锁不得跨 HTTP、CAD、Git 或 PR 调用。
+
+失败归属实际执行阶段。原生主装配打开或选择失败登记为 `discover` 失败，保留已完成的冻结收据。未执行后继由共同 projector 根据前置失败投影为 `blocked`，不补造后继执行或第二份阻断状态。对账保留已有 decision 和诊断，并核验尚未结算的真实 effect。
 
 关闭准入阻止新请求与新运行；已准入运行的合法后继、同键重试、取消、对账和释放继续按原身份与前提执行。已知前提失败的 `blocked` 阶段不是活动操作。停止服务要求准入已关闭，且业务与实际调度均无活动、未决或未知；仅有业务终态或暂停 DAG 不满足此条件。
 
@@ -173,37 +412,188 @@ Airflow 的任务标识依次为 `freeze / discover / capture / generate / verif
 
 部署生命周期调用同时核对 SSH 退出状态与动作匹配的结构化回执：只有退出为 `0` 且 `passed=true` 才是成功；退出为 `0` 或 `1`，且回执动作一致、`passed=false` 并有明确错误码时，记录确定拒绝。连接错误、缺失或损坏回执、动作不匹配、退出状态与回执矛盾均记为未知；不能把非零退出一律当作运输中断，也不能用断连前的回执残片确认结果。原始输出、退出状态和分类分别留证；确定拒绝本身不授予不受控重试权限。
 
-传输重试使用同一 `operation_id` 和参数摘要：相同请求返回已有操作，不同参数返回冲突。Linux 重启后从数据库恢复并查询已有操作，不重复打开 CAD。原生执行器重启后，未封存的在途操作终止为失败并保留部分诊断，不从未知的 COM 状态续算。
+同一 command 的传输重试复用原 command、effect intent 与封存外部请求；当前执行权
+按 claim/fence 规则重新核验。相同请求返回已登记事实，不同参数拒绝。Linux 重启后从 canonical facts 恢复并查询原外部
+operation，不重复打开 CAD。原生执行器重启后，未封存的在途操作终止为失败并保留
+原始响应、outbound 和诊断；未知 COM 状态不能续算或获得清理授权。
 
-工程重跑创建新请求与关联运行，从指定阶段执行至发布。复用按内容而非 `request_id` 判断：冻结使用上传摘要和主装配，发现再绑定配置、原生发现、实际采用的规则／记录快照与计划摘要，采集绑定计划和原生证据摘要，生成绑定完整证据，验证绑定交付主体与报告摘要。所有复用均要求同一工具发行版本和契约／策略、授权有效及所选硬件一致；失败或部分证据不满足条件。新请求固定自己的发布基线，不复用旧发布意图。工具、CAD 输入或适用规则／记录变化从冻结开始，不能替换旧检查点中的来源记录。
+同一 command 已有成功决定时，只有原 `StageDecision`、sealed StageResult、output
+artifact、完整祖先及 effect 仍通过核验，才可返回原结果。新的正式请求及 Freeze
+successor 均从 Freeze 开始，只复用父 originals，不引用父下游 decision。父失败、
+取消、未决证据和原 producer 不得覆盖；工具、CAD 输入、规则、配置、目标或 native
+requirement 变化必须形成新请求及其下游执行。
 
-已有封存原件需要改选主装配时，使用同一门户的冻结重跑动作显式选择，形成新请求与新运行。服务端先验证原运行的不可变请求及完整原件身份，再验证新主装配确为该清单中的装配文件；新请求保存新选择，父请求和失败证据保持原样。仅复用原件字节，六阶段均重新执行，不沿用旧冻结或原生检查点。发现及其后继阶段的重跑不得改选主装配；已有活动或未决子运行仍按同一数据库准入与防重规则处理，不增加另一条上传或执行链。
-
-传输断连后恢复同一操作；终态失败后重跑阶段。对已推送或已创建 PR 的未知响应，先核对远端实际结果再决定继续；禁止以超时为依据重做不受控的副作用。
+传输断连后恢复同一 effect。同一不可变 command 可在当前输入、工具、祖先资格和
+owner/fence 约束下安全重试或恢复；已有终态决定时只复核并复用，不新建决定。新的
+正式重做只能创建从 Freeze 开始的新运行；显式指定 target 的诊断只产生非 formal
+结果，不能续成一个正式旧阶段。对已发送的 native 或 Git/PR effect，UNKNOWN 状态下
+原 handler 不得取得普通 execution claim 或自行重发；先通过
+`StageApplication.reconcile_effect` 的精确观察处理。唯一传输例外是已证明
+`input_transfer_pending` 的原生 operation，按受限续传协议取得窄 claim 与独立发送授权。
+technical dispatch UNKNOWN 仅由
+`StageApplication.dispatch`/`TechnicalDispatchService` 观察原 DagRun/conf。
 
 恢复判断使用当前阶段及其受控操作，不保留已删除任务的状态兼容表。工程失败、运输中断、产物损坏和外部结果未知分别记录；运输恢复不得改写工程失败或重复原生执行。门户、重跑授权、维护和后台对账读取同一平台权威及实际调度关联。
 
-对账也覆盖已登记原派发仍为 `queued`、阶段行缺失而外部已确定终止的孤立意图。通过既有 `reconcile` 明确原运行、原操作及阶段，核验原派发中的 DAG 身份和实际 Airflow DagRun/任务全键；已发生原生执行时，还须核验对应端点作业及终态收据摘要。原操作已知绑定保持不变，只能补齐经实际唯一记录证明的缺项；不能从当前阶段名猜任务名，不能默认 `map_index=-1`，不能把旧记录标成已执行当前六阶段。原始错误阶段与当前意图的阶段分别保留来源。
+共同程序 API 固定为
+`StageApplication.reconcile_effect(command_id, effect_key)`；Portal、后台自动重试和
+其他进程内调用直接使用该 API，不调用 shell。维护人员使用同版
+`operatorctl reconcile --run-id <run> --stage <stage> --effect-key <key>` 作为唯一
+外部 CLI adapter；它通过 `FactStore.load_stage_command(run_id, stage)` 取得唯一
+command，再调用上述 API。该 API 只处理 native operation、Git ref 与 PR upsert；
+technical Airflow dispatch 由 `StageApplication.dispatch` 的独立 path 观察原
+DagRun/conf。不得新增 native-capture、release、stage 或 publisher 专用对账命令。
+正式发行只携带 `deploy/operator/reconcile-effect.py` 这一应用包装入口，必须删除
+`deploy/operator/reconcile-native-capture.py`；旧脚本不得作为 fallback。只读预演
+输出原 command/effect、目标 provider、证据摘要和唯一预期变更；正式执行重新读取同一
+事实。
 
-门户接纳时登记唯一初始派发意图，其逻辑阶段保存请求的重跑起点。所有新建及关联运行均由 DAG 的实际 `freeze` 入口开始；入口在任何工程副作用前读取真实任务上下文，用已登记的原幂等键绑定 `dag_id`、`dag_run_id`、`task_id=freeze` 和实际 `map_index`。逻辑重跑起点不能替代执行任务。缺失、错误或部分上下文以及已知绑定冲突均拒绝，不新建第二份派发意图。
+公共调用面固定为 `EffectReconciliationAdapter.observe(command, intent,
+outbound_root, workspace_root)`。adapter 只返回完整 domain payload 或已有
+ArtifactRef，不接收 authorize/send/fact-write 能力；`EffectReconciliationService`
+负责验证 outbound、封存 payload/metadata、追加 fact 和重新投影 settlement。
+生产 composition 有唯一明确入口 `application_from_environment()`；它安装
+`native_operation`、`git_ref_update` 与 `pr_upsert` 的 reconciliation adapter，并由
+application 按原 intent 的 `effect_kind` 选择。该 registry 不接受
+`airflow_dispatch`。Portal 与自动重试持有该 application 并直接调用
+`reconcile_effect`；operator CLI adapter 只解析 run/stage 与显式 effect key。各调用方
+不各自构造 observer、持有 kind 映射或复制第二套 reconciliation lifecycle。
 
-若运行尚为 `queued`、没有阶段结果且初始派发意图尚未认领和绑定，同一对账事务可依据原始 Airflow 故障日志及一致数据库快照补齐早期失败。必须证明真实 `freeze` 任务和 DagRun 已失败、后五任务唯一且均为 `upstream_failed`，并核对原派发的 DAG 身份与故障日志的完整任务键。记录原派发和冻结失败、后继阻断及运行失败；即使逻辑重跑起点是后继阶段，实际绑定仍来自执行过的冻结任务，不能借用未执行的后继键或记为未派发取消。不制造原生回执、端点作业或新执行。
+生产面不保留旧 `PlatformStore` 或其 eager export、`WindowsEndpoint` 的
+`get_job()`/`rerun_plan()`、旧 job schema/state/client，也不保留 Portal/query 的
+`checkpoint_uri`、`reused_from_run` 或 `store://sealed` 资格。stage report 的来源和
+bytes 只从当前 `by_stage` 的 immutable `ArtifactRef.producer_run_id`、member record
+与 materialized CAS bytes 得到。旧 `platform.storage` filesystem writer/URI
+resolver、discovery reconstruction builder、receipt 与 seal/confirm API 已删除。
+Historical recovery 只保留 `validate_native_discovery_stage` 纯 validator；
+`tools/migrate_historical_capture_input.py` 通过 `ArtifactStore.seal_tree()` 生成受控
+diagnostic artifacts，不读取或写入旧 filesystem checkpoint 表示。
 
-绑定补齐、结果确认、原操作与运行结算以及对账事件在同一短事务内完成。写端锁定原记录，校验完整绑定后通过既有生命周期关联核对实际调度终态；证据与外部状态矛盾、任务仍在途、绑定不唯一、任何已知字段冲突或必需原件缺失时整笔拒绝，不留半次补写。不得伪造 `unresolved` 过渡、改任务状态、clear 重跑或调用 CAD 来取得可结算状态。已证明失败只登记失败；完成态仍须满足全部封存、原生和独立验证资格。
+三类外部 observer 均只做查询：
 
-对账保留原运行与操作身份、既有原件和收据，追加有摘要绑定的维护证据与事件；不建立另一份状态权威。相同原操作、证据、绑定和结果重复提交返回已登记结果，不追加重复事件或副作用；冲突提交拒绝。缺绑定或未决对象仍出现在同一视图，未经证明不得退役、忽略或由排空门豁免。
+- native observer 按原 operation/effect identity 执行精确 GET，不 create、upload、
+  trigger、cancel 或打开 CAD；
+- Git observer 在干净临时 clone 中验证原 candidate bundle、plan、base 和 branch，
+  不 prepare、authorize 或 push；
+- PR observer 仅以原 repository/base/head/candidate identity 调用 `observe`，
+  不 create、update、reopen 或 comment。
 
-原生操作已绑定并运行、但对应阶段行缺失时，同一对账事务可依据原始失败回执及真实调度终态补齐结果。须同时验证原生请求的运行 UUID、主装配、完整上传身份与数据库请求一致，原操作已有的阶段和任务全键不变，任务及 DagRun 均实际失败。若回执将原生选择失败误记为冻结，只能在原件明确记录选择读取中及选择错误、原操作绑定 `discover`、冻结已确认的情况下判定实际失败属于 `discover`；收据同时保留原报告阶段、实际阶段和原件摘要。补齐发现失败、后继阻断及原操作/运行结算，不覆盖冻结，不改写原回执，也不推广为阶段名称兼容映射。
+observer 返回的完整 domain payload 必须沿用原 outbound 布局，使真实 handler 在
+effect SAT 后直接消费而不重算或重发。精确 known 可建立 SAT；普通单次 404、空查询
+或 `unobservable` 不证明 sent effect 不存在，仍为 UNKNOWN。只有适配器给出完整资源
+范围、完整原 operation identity 和无遗漏搜索结果时，精确 absent reconciliation 才可
+建立 `definitely_failed`。multiple、content mismatch、conflict 或其他不可唯一核定的
+结果保持未决；所有情况均禁止盲重发。
 
-对账发现唯一冻结派发意图已成功但缺少任务绑定时，可在关闭准入并锁定原运行和操作的同一事务内补齐。发现阶段缺行或已登记为失败均可适用；后者须核对原生失败回执与既有失败的错误码、错误正文和诊断一致，且绑定的原生操作已失败。已登记阶段和原始失败保持不变。必须重验该运行直接封存的冻结检查点、收据和完整字节，核对不可变请求、派发的 DAG 运行身份及其到平台运行的对应关系，并由真实 Airflow 记录证明冻结任务唯一且成功、DagRun 已失败。已有绑定冲突、部分绑定或多条映射任务均拒绝。保持冻结阶段、派发成功状态及原始失败不变，只追加绑定证据；重复相同对账仍重验封存与调度事实，完整匹配时不追加事件。新任务的同键登记则从真实执行上下文补齐待执行派发的缺失键，任何已知身份冲突均拒绝。
+reconciliation 追加 fact 与 metadata 前重读原 effect ledger；相同证据重复提交返回
+原结果，不覆盖终态。它无 claim/fence、不创建 command、不授权发送；事务边界只覆盖
+当前 `effect_intent`/`effect_fact` sequence，并对原 command、outbound/artifact identity
+和 metadata closure 做只读重验。外部观察在事务外执行。失败保留原始响应、outbound、
+payload 和 workspace，不能因解析、seal、metadata 或 fact 写入失败而清理。完成后原
+command 仅在尚无可复用唯一 `StageDecision` 时作为中断命令由共同 engine 安全恢复，
+并在 unresolved effect 消除后取得普通 execution claim；精确 input-transfer-pending
+观察只允许上述受限续传 claim。已有终态决定则按当前事实复核复用，不强制新 claim。后到的旧 fence response/timeout 只能追加审计证据，不能改写 reconcile
+已建立的终态。
 
 ### 灾难恢复
 
 备份绑定固定发行、配置、安装身份及源目录清单。整个维护窗口持有同一排他锁：先关闭准入、排空并停止受支持的 Linux/Airflow 写者和 Windows 原生任务，再对保持运行的 PostgreSQL 建立一致快照，完成文件封存、加密归档、清单核验和收据。受支持的启动、对账及切代操作不能在该窗口内重新启用写者；前后状态相同或数据库 advisory lock 本身不能证明这一点。
 
-恢复清单只接受 `solidworks-to-urdf.recovery-manifest/v6`，目标计划只接受 `solidworks-to-urdf.recovery-target/v3`，快照工作进程使用 v5 协议。旧清单 v5、目标计划 v2 及更早版本在创建状态目录、解包或写入目标之前明确拒绝；保留原件，不迁移、不兼容重解释。目标计划必须绑定清单摘要以及同一 selection、检查点引用和来源范围摘要。
+恢复清单只接受 `solidworks-to-urdf.recovery-manifest/v7`，来源选择只接受
+`solidworks-to-urdf.recovery-selection/v2`，目标计划只接受
+`solidworks-to-urdf.recovery-target/v3`，快照工作进程使用 v5 协议。旧恢复清单、
+来源选择、目标计划及更早协议在创建状态目录、解包或写入目标之前明确拒绝；保留原件，
+不迁移、不兼容重解释。目标计划必须绑定清单摘要，以及同一 selection、canonical
+fact-root 和来源范围摘要。
 
-平台与 Airflow 共用数据库的全表、完整目录、角色、成员关系、权限、配置和 sequence 状态，以及冻结原件、被引用检查点、发行、工作区重建材料与秘密文件，均须进入同一可核验恢复计划。数据库先建立并持有同一只读可重复读快照，再发布原始检查点引用及摘要；同一选择驱动来源前后清单、复制、封存和恢复复核。只复制被引用的 `sealed/<producer>/<stage>`，不递归复制 runs 工作目录、孤儿检查点或历史恢复目录。复用须逐跳证明父子关系、相同 URI、收据及原执行时间，链条有界且无环；生产者可不同于逻辑消费者。失败或取消阶段的已登记检查点保留原始证据，但不能成为成功复用来源。未决活动的排空门仍然有效，不能借归档绕过对账。
+平台与 Airflow 共用数据库的全表、完整目录、角色、成员关系、权限、配置和 sequence
+状态，以及冻结原件、发行、工作区重建材料与秘密文件，均须进入同一可核验恢复计划。
+数据库先建立并持有同一只读可重复读快照，再从该快照生成 canonical typed 根闭包。
+根闭包至少包括 `run_admission.request` 与 `command.request` 内嵌的完整 artifact
+引用（含尚未创建 command 的未来阶段输入和 dispatch conf）、
+`command_input_artifact`、`effect_intent` 的 outbound、`effect_fact` 的 payload 与
+reconciliation metadata、尚无 decision 的 `stage_candidate` output/result、已决
+`stage_decision` 的 result、FailureEnvelope evidence，以及未决 claim、未封存故障
+workspace 和 typed `retained_locations`。每个引用都必须命中原不可变 CAS object；
+缺项、摘要漂移或引用类型不明时 fail closed。
+
+同一选择驱动来源前后清单、复制、封存和恢复复核。共享 CAS object 只复制一次；只有
+完整 typed 根闭包证明没有任何事实引用的孤儿才可排除。未知 effect、未决 candidate、
+已授权但响应未知的 outbound、失败或取消证据以及未封存 workspace 均不得当作垃圾删除，
+也不得因尚无 StageDecision 而省略。恢复后必须保持原 ArtifactRef、StageResult、
+candidate、effect ledger 与 claim/fence 身份；未知外部结果仍须经过精确 observation
+或 reconciliation，不能由恢复动作重发。未决活动的排空门仍然有效，不能借归档绕过对账。
+
+旧 `request/run/stage/operation/run_event` 五表的删除只能在维护排空与所有支持写者
+停止形成的一致性边界内执行。切换回执不得由任意文件 hash 或自报 `verified` 代替：
+它须绑定真实 source database、platform schema、精确 DDL/ACL、每张表的完整 rows、
+未决 command/effect/native 关联、逐成员大小与 SHA-256、成员摘要集合的 aggregate
+digest，以及同一回执对应的独立 restore/读取复核结果和切换操作身份。错源、缺表、
+遗漏未决事实、rows/DDL/ACL/digest 不符、维护快照后并发变化、缺失 restore 证据或
+回执自报与原件矛盾均拒绝。
+
+固定 archive schema 与 evidence schema 分别为
+`solidworks-to-urdf.legacy-lifecycle-archive/v3` 和
+`solidworks-to-urdf.legacy-lifecycle-evidence/v3`。receipt 拒绝缺项、额外字段与旧
+v1 数据，精确字段为
+`schema_version/archive_sha256/cluster_system_identifier/database_name/database_oid/
+migration_role/platform_schema/platform_schema_oid/evidence_sha256/manifest_sha256/
+server_version_num/database_encoding/database_locale_metadata_version/
+database_locale_provider/database_locale_provider_source/database_collate/database_ctype/
+database_icu_locale/database_icu_rules/database_collation_binding/
+database_collation_binding_source/database_collation_version/
+database_collation_version_source/database_collation_actual_version/
+database_collation_actual_version_source`。
+cluster 身份取 `pg_control_system().system_identifier`，database 与 schema 身份取 OID，
+host、socket 和 port 只作为连接 locator。archive manifest 逐成员记录 `kind/bytes/sha256`
+并覆盖 `evidence.json/platform.dump/schema.sql/toc.txt`，且 manifest、evidence 和 archive
+分别与 receipt 的对应摘要绑定。
+
+PostgreSQL 14 从源 `pg_database` 读取 encoding、`datcollate` 与 `datctype`，provider
+明确记录为从 PG14 database-default libc 语义推导的 `libc`。非 C locale 必须绑定精确
+`pg_collation` libc 定义，并使 recorded 与 actual collation version 相等；稳定 C-family
+locale 无精确 named row 时，才可使用 PG14 default catalog collation OID 100 并记录该
+推导。PostgreSQL 16 的 provider、ICU locale/rules、binding、recorded version 与 actual
+version 也必须按 catalog 原值记录。未知 provider、缺项、版本漂移、非稳定 C 的缺失版本或
+无法复现的源 locale 均拒绝。
+
+归档和复核使用 `search_path=pg_catalog` 以及固定 UTC、ISO/YMD、postgres interval、
+hex bytea 和三位额外浮点输出。`schema.sql` 是 platform 与 Airflow schema 的完整 plain
+schema-only dump；receipt verification 必须在维护窗口内重新生成 live schema-only SQL，
+与归档逐字节相同，再比较整个 evidence。SQL literal、comment、default、constraint、
+index、trigger、policy 与 view definition 不得经 schema 名替换或普通化；schema 名统一
+由 `pg_control_system` search path 下 PostgreSQL 自身 deparse。PG14 plain dump 外部
+随机 `\restrict`/`\unrestrict` token 只允许在严格配对和文档边界核验后作比较规范化，SQL
+literal、comment、default、constraint、index、trigger、policy、view definition 与 dump
+内容不得改写。独立 restore 的 `initdb` 与
+`createdb --template=template0` 必须使用源 encoding、provider、locale、ctype、ICU
+locale/rules 及版本参数，不能硬编码 UTF8/C 或 `--no-locale`；restored identity 的全部
+locale 字段与 actual version 必须等于源，否则拒绝。比较 schema catalog、functions、
+types、sequences、relations、Airflow relations、unresolved facts 及完整 schema/ACL SQL。
+relation row evidence 使用显式 `COLLATE "C"` 排序以获得稳定摘要；测试另行证明源默认
+collation 与显式 C 排序确实不同且 restore 后源默认顺序恢复，单行、多行与多字节值不得在
+两种环境间改变接受结果。archive 前后 live evidence 变化或 restore 仅在单行/多行之间
+出现不同接受结果均拒绝。
+
+`apply.sh --legacy-archive-receipt <receipt>` 必须先由同一合同验证该 typed receipt，
+再允许 schema 删除；仅检查“receipt 文件 hash 是 64 hex”不构成保全。删除不得使用
+`CASCADE`，任何遗漏 view、grant 或其他依赖必须显式失败并保留目标。该规则不允许为
+迁移方便保留永久旧 Store 或静默遗失未决事实，也不扩大部署及现场权限。
+
+真正切换在一个 serializable 事务内完成：持有维护 `flock`，锁住 PostgreSQL
+catalog、platform/Airflow 全部表以及相关 namespace/rewrite/procedure 行，再次以
+locked live evidence 验证 receipt、archive 与 independent restore。事务把 receipt 身份
+写入本地 `description.legacy_*` settings，只在事务内收窄到 migration role，然后执行
+schema/views/roles 并核对精确 canonical relations、唯一允许函数、无额外 user type 或
+sequence；任一错误整体回滚。archive 创建、receipt 发布和 cutover 均是本次操作的新文件
+与原子替换，不覆盖另一 cluster/database/schema 的已有 receipt。
+
+正式部署数据库版本由 `install_postgres.sh` 和 `recovery.py` 的默认 PostgreSQL 14
+约束决定。PostgreSQL 16 的 CI/pgserver 结果只证明带 `postgres16` 标签的测试范围，
+不扩展正式支持版本；任何仅依赖 16 的 catalog 行为、目录结构或 SQL 必须拒绝。最终
+发行必须在部署目标的 PostgreSQL 14 上重新执行 archive、independent restore、
+wrong-target rejection、fresh apply 与 cutover，并以实际 `PG_VERSION`、server version、
+encoding 和 collation identity 绑定证据。
 
 状态闭包包含固定配置、全部小型 install-records、snapshots 和 derived，以及当前和直接上一代 journal 实际引用的精确文件。journal 必须通过正式记录契约，逐条追踪 promotion receipt、from/to、release manifest、步骤 evidence/digest 和 evidence-map 的 source/snapshot；校验身份、路径、摘要、类型及权限并按原路径恢复。promotions 不递归复制，历史密文 `backup.tar.enc` 不归档。更早代记录仅作为元数据保留，不授予历史运行或回滚资格；缺少证据不得激活，普通回滚需要已排除密文时必须在副作用前拒绝。finalize 启动服务前重新核验完整 typed journal 与清单、目标计划、恢复收据和 marker 的同源绑定。
 
@@ -213,26 +603,163 @@ MVCC 快照不能代替非事务 sequence 和文件的一致性保护。秘密�
 
 恢复先验证归档、清单、引用及目标计划，再向符合契约的空目标恢复数据库与文件。部分恢复失败保持关闭准入，保留已发生动作与失败证据；不能把部分目标当作全新目标重试。成功后的只读核验须幂等，不重复导入、覆盖文件或启动任务。
 
-完整恢复成功须证明真实数据库消费者、Airflow 配置与密钥、发行与工作区、既有 Windows 任务定义、ACL、令牌、配置和安装身份均可用，并核对未决原生作业与外部发布事实。文件复制、数据库导入、服务替身测试或健康检查单独通过，均不能替代真实双端恢复与端到端验收。
+恢复 runtime 的解释器、包身份、依赖角色入口、`description` 入口与
+`pip check` 必须使用专用 probe environment。该环境从 caller 复制非 Python 运行上下文，
+只删除 `PYTHONPATH`、`PYTHONHOME`、`VIRTUAL_ENV` 并设置
+`PYTHONNOUSERSITE=1`；`PATH`、`LD_LIBRARY_PATH`、`SSL_CERT_FILE` 等保留。解释器和
+`pip check` 使用 `-I -B`，并要求 executable/prefix/base_prefix/CPython 3.12 身份、
+安装包 source digest、wheel/member inventory、Airflow 与 description entry 均来自恢复
+出的虚拟环境。真实缺包必须使 `pip check` 非零；不得因 caller `PYTHONPATH`、user-site、
+test fixture 添加的依赖或环境清理而放宽。
+
+完整恢复成功须证明真实数据库消费者、Airflow 配置与密钥、发行与工作区、既有 Windows
+任务定义、ACL、令牌、配置和安装身份均可用，并核对未决 native operation 与外部发布
+事实。文件复制、数据库导入、服务替身测试或健康检查单独通过，均不能替代真实双端恢复
+与端到端验收。
 
 Windows 恢复回传实际读取的 state 对象，由 Linux 按唯一排序紧凑 UTF-8 JSON 加 LF 规则重算摘要；不信任回传的期望摘要，不改变任务语义身份哈希。状态传输保留嵌套结构和类型，bundle 与传输 JSON 都拒绝重复键。
 
 <a id="exchange"></a>
 ## 原生交换协议
 
-Linux 是工程任务的唯一发起者。Windows 接口只提供健康查询、一次工程上传、原生发现、按计划采集、状态/活动查询、封存结果读取、自有作业取消及已导入缓存释放。接口不能接受任意代码、主机路径、仓库或机械参数默认值。
+Linux 是工程任务的唯一发起者。Windows 接口只提供健康查询，以及 canonical native
+operation 的 create、upload、get/status、resume、cancel 与 ACK；Capture 仍以
+prepared/Discover producer 校验、sealed archive/receipt 消费和独立
+`admit_capture`/`verify_transfer` 完成产物与传输资格。旧
+`POST /v1/jobs/<run_id>/cache/release`、cache import confirmation、cache-release
+receipt 与旧 job confirmation 不属于生产接口，必须删除且不得保留 fallback。接口不能
+接受任意代码、主机路径、仓库或机械参数默认值。
 
-有副作用调用绑定操作身份、参数摘要、发行身份与契约摘要；查询只返回已确认身份与状态。契约领域拥有 `solidworks-to-urdf.resource-policy` 机器定义，限定上传文件数量、单文件/总长度、解包大小、容量和超时，摘要进入请求；页面、Linux 准入与 Windows 传输消费同一固定策略。工程传输包含闭合文件清单、长度及 SHA-256；Windows 验证完整性后原子接纳。发现结果绑定工程清单、主装配与实际配置。采集计划绑定该发现结果及原生对象身份；结果绑定计划、工程和原生运行环境。Linux 对这些绑定逐层复核。
+有副作用调用绑定 operation/effect identity、参数摘要、发行身份与契约摘要；查询只返回
+已确认身份与状态。契约领域拥有 `solidworks-to-urdf.resource-policy` 机器定义，限定
+上传文件数量、单文件/总长度、解包大小、容量和超时，摘要进入请求；页面、Linux 准入与
+Windows 传输消费同一固定策略。工程传输包含闭合文件清单、长度及 SHA-256；Windows
+验证完整性后原子接纳。Discover result 绑定工程清单、主装配、实际配置、native
+observation、selection、ruleset 与 prepared bytes；Capture result 绑定该 result、
+同版 native requirement、prepared inventory 与原生运行环境。Linux 对这些绑定逐层复核。
+Discover 与 Capture 可以各自传输并 materialize 自己的封存输入 closure。前者使用
+SourceSet archive，后者使用由同一 SourceSet 原件血缘派生的 prepared archive；
+SourceSet 与 prepared 分别保存不同摘要。每个 operation 必须绑定原请求、上游
+artifacts、同版 native tool 和本次 archive；同一 operation 重试先观察原结果，
+UNKNOWN 不得触发第二次 CAD 执行或静默创建新 operation。Windows 继续只有一个 native
+operation runtime 和一个 CAD resource owner，workspace 是 operation-local 临时物化；
+本版不新增共享 source cache、兼容链或第二生命周期。未来内容复用只能是可丢弃字节
+优化，不能改变工程资格或替代阶段独立 admission。
+
+### Native tessellation v13
+
+当前 Capture `itessellation` 证据使用
+`solidworks-to-urdf.native-tessellation/v13`；
+`solidworks-to-urdf.capture-preparation/v3` 与
+`solidworks-to-urdf.rebuild-session-recovery/v3` 保持不变。旧 v8、v9、v10、v11 或 v12
+对象不得自动转换、重标或作为 v13 兼容输入；历史事实只按原 schema 保全。
+
+每个 body 恰使用一次 whole-body analysis tessellation。唯一一次
+`IBody2.GetTessellation` 请求必须精确包含一个显式
+`VARIANT(VT_EMPTY, None)` 参数；request 原件记录参数数量 `1`、
+`variant_type=VT_EMPTY` 与空值，consumer 拒绝裸 `None`、零长度 SAFEARRAY 或全 face
+数组。唯一一次 `Tessellate` 前 request 和 observed block 必须分别精确包含
+`improved_quality=true`、`match_type=0`、
+`need_error_list=true`、`need_face_facet_map=true`、`need_edge_fin_map=true`、
+`need_vertex_params=true`；字段集、精确 `bool`/`int` 类型和值在顶层及每个 body 均须
+一致。`MatchType` 是严格整数 0，其余布尔属性不得用整数 0/1 替代。失败后不得重设质量
+模式或采样参数再次 tessellate。
+
+`Tessellate` 必须返回严格布尔。`false` 是 body 原生失败：在读取 `GetFaceFacets` 前
+停止成功路径，不得从失败后的零计数、空数组或 `null` 形成空几何。允许从同次对象保存
+五个 `GetErrorList` automation `VT_BYREF|VT_VARIANT` 输出、返回状态、face canonical
+IUnknown 诊断身份／面积和不完整全局数量，但这些只是失败诊断；`None`、不可读、映射
+失败或后处理异常均不得转换成空列表、成功或替代首因。
+
+`GetFaceFacets` 与 `GetEdgeFins` 必须保存同次成功 tessellation 的原始返回和 typed
+face/edge 绑定。直接 list/tuple 必须为扁平、无重复、非负的严格整数数组，raw order
+原样保存后再做规范化；不得先递归展平、去重或排序再判断。`GetFacetFins` 必须返回恰好
+三个不同非负严格整数。嵌套数组、标量、未知类型、重复 ID、错误对象或 COM 读取失败
+均拒绝，不切换备用 API 或第二 tessellation。
+
+成功 nullable 数组只有经完整集合闭包才可归一化为狭义空集合：
+
+1. `GetFaceFacets(face) -> None` 仅允许严格 `body_type=1`、`Tessellate=true`、属性
+   request 与 observed 全部正确、完整 face inventory 已读，且全部成功 facet arrays
+   跨 face 不重叠、facet ID 总数与并集大小均等于同次原生 `GetFacetCount`。此时保留
+   `raw_facet_ids=null`，派生 `facet_ids=[]`、`facet_count=0`、
+   `facet_ids_source=native-body-global-null-zero`，并在该 face 字段记录
+   `cad_face_facet_ids_derived_by_body_global_closure` warning。
+2. `GetEdgeFins(edge) -> None` 仅允许同一 body 的一或两个唯一 incident faces 都已由
+   (1) 证明为零 facet，且全部 `GetFacetFins` 关系完整、唯一归属、fin 总数等于同次
+   `GetFinCount`。此时保留 `raw_fin_ids=null`，派生 `fin_ids=[]`、
+   `fin_ids_source=native-incident-faces-null-zero`，并记录
+   `cad_edge_fin_ids_derived_by_empty_incident_faces` warning。
+3. 成功直接空数组保留 `native-flat-array` 来源和空 raw array。solid body、另一 body、
+   缺失/额外 face、错误 incident ownership、任何未覆盖 facet/fin、总量不符或任何
+   warning 不自洽均拒绝。
+
+这两条规则只表达原生闭包证明的真实 facet/fin 缺失；不得生成 fin、cofin、U interval，
+不得删除 edge，不得声称已经读取 `GetFacetFace`/`GetFinEdge`，也不得给零 facet face
+最终曲面距离、完整拓扑或参考几何资格。face 的实例、正面积、原生身份与
+`cad_sheet_face_untessellated` warning 继续保留，交付网格与最终 50 µm 曲面验收保持。
+`raw/source_scopes.json` 沿 v3 preparation/session-recovery 规则，与 discovery、scene、
+capture、geometry、dependency closure 及实际冻结字节逐层交叉核验。
+
+更详细的质量门由 root-owned `docs/quality.md` 定义；本 proposal 不覆盖该文件的
+`native-tessellation/v13` 文本。
+
+### Native target identity
+
+端点 `/health` 的顶层 `install_id` 是 Windows 安装目标身份的一部分；`ready` 只描述
+当前调度就绪，不是身份，也不得因 `unresolved>0` 而禁止对原 operation 的只读观察、
+对账或恢复。expected `NativeTargetIdentity` 只从已核验部署登记取得，不能由环境变量、
+当前 health 自报或迁移后的 URL 自行晋升为新的权威。系统继续消费该既有登记，不新增
+target registry。
+
+经过核验的 endpoint preparation 在 `endpoint-identity.json` 顶层记录
+`target_identity={schema_version,install_id,pipeline_id,target_id}`，并保留原有
+`install_id`、`config_digest` 与 release identity。写入 install record 时将该完整
+record 原样放入 `ends.windows.target_identity`；`target_identity.install_id` 必须与
+Windows end install ID 相同，`pipeline_id` 固定为 `solidworks-to-urdf`，`target_id`
+由 common typed schema 重算。`schema_version` 固定为
+`solidworks-to-urdf.native-target-identity/v1`，`target_id` 是
+`{schema_version,install_id,pipeline_id}` canonical record 的 SHA-256。runtime target
+不回写 platform snapshot；install record 的
+`snapshot.path/digest` 继续逐字节绑定既有 platform snapshot。
+
+每个原生请求携带 expected target；每个响应回带同一 target；original operation 在
+服务端保存 admitted target。服务端在入站 upload 时同时核对请求 expected target、
+operation 已保存 target 与当前运行 runtime target。只在客户端 health 查询之后再发起
+upload 不能关闭 TOCTOU；任一不一致都必须在 input admission、executor 启动及所有
+create 之前拒绝。错误 target 不产生新 operation，也不能被归为原 target 的 absence。
+
+端点 URL 可以合法迁移；同一 install 在重启后仍可按原 operation 恢复。变更 state root、
+错误路由、health 不可达或 404 都只使原 operation 保持 UNKNOWN/未决，不能据此创建、
+重派或把原 target 标成 absent。tool/release identity、平台 origin claim/admission 与
+Windows native worker owner 分别记录和验证，任一相同或不同都不能替代其他身份。
+同一 install 的恢复仍受单一资源所有权与排他锁约束；复制或自报 install ID 不自动取得
+启动、上传、恢复或 native execution 权限。
 
 状态、健康及漂移查询不得安装、下载或修复持久工具链文件。已绑定的工具缺失或不可执行时如实报告，不通过自动安装掩盖漂移。
 
 选择闭包的 `virtual_components` 单独记录内嵌虚拟组件：`state=embedded_virtual_component`、`binding=owner_embedded_geometry`、`kind=native_embedded_virtual_component`。每项保留 `IComponent2.GetPathName/GetImportedPath/IsVirtual` 的直接读取依据，要求 `is_virtual=true`，并绑定可达上传图中的 `owner` 及其 SHA-256、精确 `instance`、可空的 `owner_anchor`、引用 `configuration`、`session_document_path`、`session_temp_root` 和正整数 `native_api_pid`。原生端从实际 SolidWorks API 读取进程 ID，并核对它与会话根 `swxNNNN` 的进程编号一致；文档须位于该受控会话的 `VC~~` 内，路径形状本身不是归属证明。不得携带非空作者导入路径或读取错误，不得与 `imports` 中的 `IC~~` 缓存共享实例身份。后续会话可以产生不同临时路径，但须重新读取原生对象，并以相同所属装配字节、实例与配置对应封存记录；原生采集和独立验证双向核对当前对象与封存清单，拒绝遗漏、额外对象和冲突绑定。临时文档不进入上传文件图，Linux 只验证封存证据，不访问 Windows 临时目录。
 
-采集计划由 Linux 依据封存原生发现及已绑定的适用规则生成，在原生采集前封存并传给 Windows。Windows 核验并消费同一份计划，只将受约束的相对路径定位到已登记工程副本，不重新推导结构。计划只保存原生对象、选择集合、基准和证据项目；不另存完整机器人模型，也不在采集结束后从配置或结果倒造计划。
+Discover 由 Windows 执行一次精确 native observation，再由 Linux 依据已绑定 ruleset
+形成 prepared source package 与 `result.json`。Capture 核验并消费该 result 与 prepared
+inventory，只将受约束的相对路径定位到已登记工程副本，不重新推导结构。Discover result
+只保存 selection、原生对象、规则、证据和 prepared bytes 身份，不另存完整机器人模型；
+不得在采集结束后从配置或结果倒造新的计划。
 
 原生记录仅包含直接读数、API 状态、原生引用、配置、保存状态、环境及网格。长度、角度、质量和惯量转换为 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法。适配器只在 COM 边界转换单位和厂商矩阵布局；推导、闭包比较、几何统计、诊断解释与报告渲染全部在 Linux 完成。格式校验和封存摘要计算属于传输职责。
 
 当前方向处理不引入基于右手定则的新正向选择或符号推导规则，也不引入屈曲、外展等功能动作推导正向。输出遵循 URDF 既定格式和坐标约定，并按[《MimicVerse URDF 工程标准 v1》](https://hcnd2fgke1pv.feishu.cn/docx/N3iSdpYxGo151UxgBz6csCthnSb)检查表达一致性；这些约定不能用来绕过 CAD 已有有向轴及有效作者声明。斜轴保留真实机械轴，不吸附到主轴。名称、全局向量分量或镜像标记不能单独决定正向。
+
+方向规则的 `status`／`direction_relation` 是共享审计结果，不是独立的作者正向证据。
+v3 审计未建立作者正运动语义时，即使该共享值为 `local_class_aligned`，Discovery、
+scene、Generate、独立声明验证和质量 warning gate 仍必须产生唯一的对象级
+`direction.semantics_unresolved`。旧基于
+`status/direction_relation != local_class_aligned` 的 success-warning 抑制旁路必须实际
+删除，不得以共享状态短路或跨模块互相核销 warning。
+warning 记录原始 CAD 轴、运动类别、规则、delivered axis 和未解决状态；它是当前非阻塞
+来源 warning，不改变已交付 axis／xyz／rpy／limits，也不改变
+`machine_qualification=unqualified`。模型来源、URDF、质量报告、预览和 PR 使用同一
+warning；只有独立、可复算的作者正向证据才能关闭该 warning。
 
 本次导出的方向以已保存 CAD 有向轴及有据的坐标转换为依据。与固定手工参考是否同号属于非阻塞对比项：真实端到端报告须保留差异，不强求通过规则生成相同符号，也不得复制参考值。原生轴缺失、读取失败、无效向量、坐标转换或轴线／对象绑定错误，以及不符合原生非零运动证据仍是阻塞缺陷。
 
@@ -258,9 +785,11 @@ CAD 唯一工程来源的边界保持：本次冻结 CAD 缺少实际驱动／�
 
 交付配置的证明同时要求：封存选择中的原件摘要与读取后的原件摘要完整相等；读取前后均为只读，实际 `IConfiguration.Name` 与已选交付配置一致，`IConfiguration.NeedsRebuild` 明确为 `false`。`IModelDocExtension.NeedsRebuild2` 按整数枚举解释：`0` 为完全重建，`1` 为非冻结特征需重建，`2` 为冻结特征需重建；布尔值、未知值及缺失均拒绝。允许受控读取从初值 `1` 或 `2` 完成解析，但最终值必须为 `0`。`GetSaveFlag` 保留原始诊断值，不作为原件是否已保存的判据；不得用它掩盖原件变化或配置、重建证据缺失。推导与独立验证分别从原始证据检验这些条件。
 
-采集准备从当前配置的实际实例拓扑建立参与装配清单，分别保留实例和共享文档身份。按依赖深度先处理子装配；每个文档执行前重新读取当前状态，仅对待重建文档调用一次 `IModelDocExtension.Rebuild(2)`，立即核对收敛，最后用刷新后的顶层句柄按需重建。此前子装配使父装配新变为待重建，或使兄弟装配自动清零时，以当时的原生状态决策；不能把动态状态强制等同于最初观察。顶层打开与完成均须明确只读；依赖文档保留实际读取的只读状态，不为制造一致读数改写其状态。全程不保存原件、不调用 `ForceRebuild3`、不写 `EnableAssemblyRebuild`。诊断属性不可读时保留失败事实，不将其擅自解释成新的机械状态。
+采集准备从当前配置的实际实例拓扑建立参与装配清单，分别保留实例和共享文档身份。正常执行与恢复后的新会话共用同一有界重建流程：按当前图的依赖深度先处理子装配；每个候选文档执行前重新读取当前状态，仅对仍待重建的文档在本自有 CAD 会话中调用一次 `IModelDocExtension.Rebuild(2)`，立即核对收敛；明确清零的候选不调用。子装配处理结束后，重新读取顶层状态并取得当前会话中的顶层句柄，仅在顶层仍待重建时最多调用一次重建。此前子装配使父装配新变为待重建，或使兄弟装配自动清零时，以当时的原生状态决策；不能把动态状态强制等同于最初观察，也不能扩大到无关兄弟装配反复级联重建。顶层打开与完成均须明确只读；依赖文档保留实际读取的只读状态，不为制造一致读数改写其状态。全程不保存原件、不调用 `ForceRebuild3`、不写 `EnableAssemblyRebuild`。诊断属性不可读时保留失败事实，不将其擅自解释成新的机械状态。
 
-重建前须完成文件范围、配置及 session 文档的所属进程、受控临时根和对象绑定校验；归属未知、冲突或不可读均在重建前拒绝。重建后重新遍历实际拓扑，核对实例、路径、文档类型、配置、深度、抑制状态、存储及来源分类，同时要求参与装配及其配置全部清零、源文件字节和 session 依赖集合不变。合法文档复用和作者抑制保留既有语义；它们不能因按文档去重而丢失实例证明，也不能被误判为拓扑冲突。准备证据记录在同一原生采集中，由独立验证对照原始发现、选择闭包、源摘要及实际字节复算，不另建工程模型或状态权威。
+仅当本轮已成功重建至少一个子装配，顶层 `Rebuild(2)` 明确返回 `true`、配置的 `NeedsRebuild=false`，但顶层文档的 `NeedsRebuild2` 仍为 `1` 或 `2` 时，允许一次有界的自有会话恢复。先完整保留首次失败、逐次调用、耗时及当时环境，确认旧自有 CAD 进程和文档已关闭，再通过既有排他及所有权机制，在不同的新自有进程中以同一配置只读重开同一 collected copy。新旧会话不得重叠；清场未知、文件或对象归属未知均不得继续。源文件字节、实例及配置、受控 session 对象与所有者绑定、稳定拓扑和已加载文档集合必须保持一致；临时路径的合法重物化须绑定各自进程与受控根，不以删除任意路径前缀代替证明。新会话须重新建立实际图，并按上述同一流程对其本次候选逐一读取当前状态、按需执行一次子装配重建，随后读取子装配完成后的顶层状态并按需最多执行一次顶层恢复重建；不得因历史会话曾重建子装配，就跳过新会话中实际仍待重建的同一文档。已明确清零时不再重建；任一子装配失败即终止，不继续顶层，也不触发嵌套恢复。不在旧会话中重复调用，不创建第三次尝试，不保存或重新采集另一份副本替换失败对象。收据保留新旧会话各自的图、候选、实际调用顺序、原始状态、耗时、跳过理由及各自的字节和进程身份；独立验证从这些原始事实复核同一有界流程。其余错误及恢复后未完全收敛均拒绝。
+
+重建前须完成文件范围、配置及 session 文档的所属进程、受控临时根和对象绑定校验；归属未知、冲突或不可读均在重建前拒绝。重建后重新遍历实际拓扑，核对实例、路径、文档类型、配置、深度、抑制状态、存储及来源分类，同时要求所有已加载装配和零件的文档级 `NeedsRebuild2=0`、实际使用的配置均明确无需重建，且源文件字节和 session 依赖集合不变。合法文档复用和作者抑制保留既有语义；它们不能因按文档去重而丢失实例证明，也不能被误判为拓扑冲突。准备证据记录在同一原生采集中；发生恢复时分开保留首次失败与最终成功会话、旧进程关闭及新进程身份、重开和全部不变量证明，后续读取与交付环境绑定最终会话。独立验证对照原始发现、选择闭包、源摘要及实际字节复算，不接受自报恢复成功，不另建工程模型或状态权威。
 
 原生 API 错误保留调用名、返回值和完整整数位码、可解析的枚举名、SolidWorks/API 版本、文档/配置、失败操作及已取得的引用信息。位码不是错误数量。缺少具体引用绑定时明确记为未定位，不能据此宣称缺失文件数、原件损坏或工程师交错材料。路径诊断记录主装配、工作目录、搜索路径以及原生返回的存储/解析路径，秘密与无关工程信息不得外泄。阶段按实际执行归属记录；原生打开位于 `discover`，不能记成纯文件冻结失败。
 
@@ -288,38 +817,51 @@ Windows 端点以操作系统互斥锁保护一个 state root，以独占租约�
 
 ```text
 manifest.json                  # 主体清单、主体摘要、契约与策略身份
-input/handoff.json             # 原生输入检查收据及完整制备包成员清单
-input/request.json             # 生成器执行前封存的原请求证据
-input/source.json              # 工程内容身份、选择与元数据来源
-input/cad/                     # 原生依赖闭包的封存原件
-input/records/                 # Applied rules and source records
-evidence/discovery.json        # 原始发现
-evidence/capture-plan.json     # 绑定发现摘要的原生采集计划
-evidence/capture.json          # 实例、状态与原生测量记录
-evidence/geometry/             # 唯一原生网格目录
-evidence/native-runtime.json   # 原生 API、环境与会话身份
+input/                         # Freeze/Capture 封存的请求、来源与原件闭包
+evidence/                      # Discover/Capture 原生观察与实际证据
 model/robot.json               # 唯一规范化模型
 urdf/robot.urdf
 meshes/                        # 交付视觉网格
 tool.json                      # 源码、包文件、依赖及执行角色身份
-reports/quality.json           # 确定性独立验证报告
+reports/verification-certificate.json
+reports/verification-execution.json
 ```
 
 每个原生文件、观察、实例、物理读数和网格都必须能够追溯到主装配、配置和对应来源。完整上传清单留存所有上传字节的身份；模型交付只携带经原生绑定核验的依赖闭包。完整上传原件另外保存在平台冻结存储中。
 
-捕获的 `input/handoff.json.package_files` 列出完整制备包，逐项绑定 `input/<制备包相对路径>`；其中包括归档原生件、生成的内容身份及实际采用的规则／记录，不能用其摘要推断原生传输身份。该收据的 `input_receipt.inventory` 绑定原生选择，逐项核验 `input/cad/<原始相对路径>`，并与原生发现、传输清单和平台登记身份一致。完整制备包清单与原生清单均须核验，不能互相代替。原始相对路径保持原样，上传路径本含 `cad/` 时，交付的 `input/cad/cad/` 是合法定位。原生收据和传输清单封存后不改写；Linux 原请求由独立登记的冻结原件携带，不改成原生成员。
+`input/` 与 `evidence/` 由 Capture admitted tree 原字节提供；Generate 只增加 `model/`、
+`urdf/`、`meshes/` 和 `tool.json`，Verify 只增加两个 verification 文件。Publish
+在复制后重验这些 bytes 并生成 `manifest.json`，不得从当前 worktree、手工目录或
+第二模型重建内容。原生收据和 transfer manifest 在封存后不改写；完整制备包清单、
+原生选择清单和平台 ArtifactRef 分别核验，不能互相代替。
 
-主体清单覆盖 `input/`、`evidence/`、`model/`、`urdf/`、`meshes/` 与 `tool.json` 的全部文件。主体外只允许 `manifest.json` 和 `reports/quality.json`；未登记的额外文件拒绝。质量报告绑定主体与检查策略，但不将自身纳入主体，避免循环摘要。发布有效载荷另绑定清单与质量报告的文件摘要。
+主体清单覆盖 `input/`、`evidence/`、`model/`、`urdf/`、`meshes/` 与 `tool.json`
+的全部文件。`manifest.json` 和阶段自有的 `reports/` 收据不进入主体；它们由各自
+schema、receipt 与 artifact identity 验证，不能把自身纳入摘要形成循环。Verify
+certificate 绑定 Generate/Capture pair、verifier、contract、policy 与 subject；
+execution receipt 绑定该 certificate。Publish receipt 再绑定 publication subject、
+publication plan、候选 commit/tree 与 Git/PR effect。
 
-运行、活动、诊断和 PR 收据保存在平台运行存储中，引用交付摘要，不进入模型主体。所有阶段的失败诊断由该阶段生产、Linux 编排登记，包含可用输入/产物摘要、失败检查、原生环境及部分证据清单。验证失败保留其失败质量报告和可安全读取产物用于未验证预览；这些文件位于运行的独立诊断目录，不是成功检查点，不能占用完整交付的命名空间。
+运行投影、活动、维护 reconciliation metadata 和 PR effect observation 保存在
+平台 facts/CAS 中，引用交付摘要，不进入模型主体。所有阶段的失败诊断由该阶段生产、
+Linux 编排登记，包含可用输入/产物摘要、失败检查、原生环境及部分证据清单。验证失败
+保留失败的 verification certificate/execution receipt 和可安全读取产物用于未验证
+预览；这些文件位于运行的独立诊断目录，不是成功检查点，不能占用完整交付的命名空间。
 
-原生传输与发布前重验使用同一个收据及字节验证边界：工具原始字节、原生阶段事件、传输清单、运行与冻结身份、源记录、原生发现和实际输入／证据逐项闭合。拒绝缺失或部分收据、未知 schema、非法运行身份、错误事件顺序／时间／检查内容、清单或字节冲突，以及重新封存后仍自洽但属于另一输入的声明。原始收据由磁盘读取或由平台传入不可变字节，不产生两套严格度不同的验证逻辑。发布重验继续绑定相同交付主体和这些收据，不将平台收据复制进模型主体以绕过格式要求。
+原生传输与发布前重验使用同一个收据及字节验证边界：工具原始字节、原生阶段事件、
+transfer manifest、run/Freeze identity、源记录、原生发现和实际 input/evidence
+逐项闭合。拒绝缺失或部分收据、未知 schema、非法运行身份、错误事件顺序/时间/检查
+内容、artifact manifest/字节冲突，以及重新封存后仍自洽但属于另一输入的声明。
+原始收据由 ArtifactStore 读取或由平台传入不可变 bytes，不产生两套验证逻辑。
 
 清单路径为相对 POSIX 路径，按 UTF-8 字节排序。JSON 使用 UTF-8、键排序、无多余空白、禁止 NaN/Infinity；模型 JSON、报告与 URDF 数值使用与 locale 无关、可精确往返 binary64 的最短十进制，统一零值格式，不截断有效位；每条文件记录包含路径、字节长度和 SHA-256。摘要对规范序列化对象求 SHA-256，并以对象类型区分用途。清单及其父目录不允许符号链接、junction、路径逃逸或大小写冲突。
 
-Linux 提供只读 `description check <delivery>` 和输出到新目录的 `description rebuild <delivery> --output <directory>`。重建只执行生成与验证，保留原生证据，声明范围；输出用于维护复核，不注册为平台发布检查点，不能改变原交付、导入发布或隐式发布。需要新的候选时，从平台保留证据重跑生成阶段。发布和恢复始终通过受控 Airflow 流程。
-
-上述维护入口须可消费符合格式的自包含交付，包括已提交模型仓库的交付；不得隐式依赖未随交付保存的运行目录。它们从主体中的原始证据复算全部适用工程、来源与工具检查；不因没有平台收据而放宽这些检查，也不由本地通过推断平台阶段完成或发布资格。平台导入、恢复和发布仍须核验原收据、封存字节及真实执行事实；状态优先重放也不能跳过这些绑定。
+Linux 维护人员对已登记 Verify command 使用
+`description stage <verify-command-id>`。该入口从 canonical facts 取得原
+Generate/Capture artifact closure，重算 verification certificate 与 execution
+receipt，并保留原生证据；不提供直接 check/rebuild 任意交付目录的第二入口，不注册
+正式检查点，也不能导入发布或改变原交付。新建候选从 Freeze 重新接纳并执行规定阶段；
+发布和恢复始终走同一 StageApplication/effect/fact 流程。
 
 <a id="publication"></a>
 ## 发布协议
@@ -330,8 +872,20 @@ Linux 提供只读 `description check <delivery>` 和输出到新目录的 `desc
 
 发布在独立干净工作区执行，核验仓库身份及配置目标，完整重验交付；复制后再次重验。Git 属性必须保持交付字节，实际 staged 和 committed blobs 必须等于验证有效载荷。远端候选 head 更新同时要求已确认前置提交的条件写入与 fast-forward，禁止非 fast-forward 写入或覆盖人工提交。base 在写前和最终确认时重检；base 变化时，即使候选 commit 已推送也不能报告发布成功，须保留已发生结果并对账。仓库检出 refspec 不影响按明确远端 ref 获取基线。
 
-推送后读取远端 commit，再创建或更新 PR，核验仓库、head、base、commit、主体和报告摘要。全部确认后封存发布收据；尚有无法确认的外部结果则保持未完成并可对账恢复。
+Publish 使用两个独立 effect：`publish.branch / git_ref_update` 与
+`publish.pull-request / pr_upsert`。每个 effect 在调用前封存完整 outbound、
+target、expected state 与 expected digest，取得当前 command/claim/fence 的 dispatch
+authorization 后才执行。Git outbound 保存 candidate bundle、publication plan 和
+exact request；PR outbound 保存 repository/base/head、candidate、subject、title、
+body digest 与已有 PR identity。
+
+推送后只读确认真实 remote commit/base，再创建或更新 PR，并核验 repository、head、
+base、commit、verified subject、certificate、title 与 body。全部确认后封存
+`publication-receipt.json`；任一 effect UNKNOWN 时 stage 保持未决。恢复通过原
+effect intent/outbound 和只读 Git/PR observer 完成，不重建 publication、不重新
+push、不重复 create/update。candidate bundle 与 publication plan 是原恢复证据，
+不得作为垃圾删除，也不得替换为从当前 scratch 重新生成的文件。
 
 已合并 PR 的后续交付从确认包含该候选的当前 base 建立新基线，沿受管理分支 fast-forward 并创建下一评审 PR。已关闭且未合并的候选禁止自动重新开启，由目标负责人处理撤回原因。
 
-相同目标与有效载荷的重复发布复用已确认结果。新运行可以产生新原生证据；若有效载荷变化，按同一基线规则形成新候选提交。远端基线变化时，建立固定新基线的新请求与关联运行并重验交付；完整上游可按复用规则沿用，原收据不改写。
+同一已登记 Publish command 的恢复可在重验原 effect 与证据后复用已确认结果。新运行按自身已验证有效载荷和固定基线发布；远端基线变化必须形成绑定新基线的新 Freeze 请求，最多复用父 originals，不能继承旧下游成功。原发布收据与已发生的远端结果完整保留。

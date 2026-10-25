@@ -53,10 +53,10 @@ KNOWN_TASKS = ADMISSION_TASKS | NATIVE_TASKS | PORTABLE_TASKS | PUBLICATION_TASK
 FAILED_STATES = frozenset({"failed", "upstream_failed"})
 #: Sentinel for a task id that appears with several map indices; eligibility is then unprovable.
 AMBIGUOUS_TASK_STATE = "ambiguous_mapped_indices"
-#: Native job statuses that never prove a terminal CAD outcome.
-NATIVE_IN_FLIGHT = frozenset({"queued", "selecting", "running", "awaiting_definition"})
-#: Native job statuses that prove the sealed capture exists.
-NATIVE_SEALED = frozenset({"passed", "native_complete"})
+#: Native operation states that never prove a terminal CAD outcome.
+NATIVE_IN_FLIGHT = frozenset({"accepted", "awaiting_input", "running"})
+#: Native operation states that prove the sealed capture exists.
+NATIVE_SEALED = frozenset({"satisfied"})
 #: The four recovery classes of the stage/operation model.
 RECOVERY_TEMPORARY_DISCONNECTION = "temporary_disconnection"
 RECOVERY_EVIDENCE_CORRUPTION = "evidence_corruption"
@@ -182,7 +182,7 @@ def classify_recovery(
         # A failed admission cannot resume native or portable operations: their
         # frozen request never resolved.
         return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "admission_failed", ())
-    if native_status == "failed":
+    if native_status in {"failed", "cancelled"}:
         return RecoveryAssessment(False, RECOVERY_ENGINEERING_TERMINAL, "native_terminal_failure", ())
     if real_failed & NATIVE_TASKS:
         if native_status in NATIVE_SEALED:

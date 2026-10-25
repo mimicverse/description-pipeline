@@ -1,8 +1,7 @@
 """Machine schemas for records crossing the platform / endpoint boundary.
 
 Single owner module for the W1 frozen interfaces (frozen-interfaces-v1.1):
-resource policy (IF-04), endpoint health (IF-09), cache-release request,
-import confirmation and immutable receipt (IF-10), connection config identity
+resource policy (IF-04), endpoint health (IF-09), connection config identity
 (IF-11), config snapshot and install record (IF-16), plus the delivery-tree
 records ``manifest.json`` and ``input/source.json`` (IF-13).
 
@@ -28,8 +27,6 @@ from .delivery import PIPELINE_ID
 from .io import PipelineError, artifact_path_parts, confined, digest, file_digest, parse_data
 from .runtime import LINUX_GLIBC_BASELINE, RUNTIME_HOSTS, RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
 from .schemas import (
-    CACHE_IMPORT_CONFIRMATION_SCHEMA,
-    CACHE_RELEASE_RECEIPT_SCHEMA,
     CHECK_POLICY_SCHEMA,
     CONFIG_SNAPSHOT_SCHEMA,
     DELIVERY_MANIFEST_SCHEMA,
@@ -58,7 +55,12 @@ KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
 #: owner modules whose machine key sets and field rules define every boundary
 #: record (health, policies, snapshots, receipts, ...).  The digest is over these
 #: definitions, never over the id strings.
-SCHEMA_DEFINITION_FILES = ("model/schema.json", "schemas.py", "interface_records.py")
+SCHEMA_DEFINITION_FILES = (
+    "model/schema.json",
+    "schemas.py",
+    "interface_records.py",
+    "pipeline/contracts.py",
+)
 
 
 def schema_definition_digest(definition_root=None) -> str:
@@ -108,7 +110,9 @@ HEALTH_KEYS = (
     "release",
     "contract",
     "resource_policy",
-    "install",
+    "install_id",
+    "config_digest",
+    "target_identity",
     "endpoint",
     "cad",
     "jobs",
@@ -551,9 +555,32 @@ def validate_health(payload) -> dict:
         {"where": "resource_policy.schema_version"},
     )
     _hex64(payload["resource_policy"]["digest"], code, "resource_policy.digest")
-    _exact_keys(payload["install"], {"config_digest", "install_id"}, code, "install")
-    _hex64(payload["install"]["config_digest"], code, "install.config_digest")
-    _text(payload["install"]["install_id"], code, "install.install_id")
+    _text(payload["install_id"], code, "install_id")
+    _hex64(payload["config_digest"], code, "config_digest")
+    try:
+        from .pipeline.contracts import NativeTargetIdentity  # noqa: PLC0415
+
+        target = NativeTargetIdentity.from_record(payload["target_identity"])
+    except Exception as error:
+        raise InterfaceRecordError(
+            code,
+            {"where": "target_identity", "reason": str(error)},
+        ) from error
+    _require(
+        target.to_record() == payload["target_identity"],
+        code,
+        {"where": "target_identity"},
+    )
+    _require(
+        target.install_id == payload["install_id"],
+        code,
+        {"rule": "target_identity install_id equals health install_id"},
+    )
+    _require(
+        target.pipeline_id == payload["pipeline_id"] == PIPELINE_ID,
+        code,
+        {"where": "target_identity.pipeline_id"},
+    )
     _exact_keys(payload["endpoint"], {"port"}, code, "endpoint")
     port = payload["endpoint"]["port"]
     _require(type(port) is int and 0 < port < 65536, code, {"where": "endpoint.port"})
@@ -597,173 +624,6 @@ def validate_health(payload) -> dict:
         _text(reason, code, "readiness.reason_code")
     _reject_secrets(payload, code=code)
     return payload
-
-
-def validate_cache_production_identity(block) -> dict:
-    """Native production operation/cache identity (never the release operation)."""
-
-    code = "cache_release_invalid"
-    _exact_keys(block, {"run_id", "operation_id"}, code, "production")
-    _text(block["run_id"], code, "production.run_id")
-    _text(block["operation_id"], code, "production.operation_id")
-    return block
-
-
-def cache_import_confirmation_digest(confirmation) -> str:
-    """Canonical recompute digest over the full confirmation content."""
-
-    payload = {key: value for key, value in confirmation.items() if key != "digest"}
-    return digest(payload)
-
-
-def validate_cache_import_confirmation(record) -> dict:
-    """The complete minimal import confirmation (IF-10, frozen final).
-
-    Carries the imported closed inventory (path/bytes/sha256 records - content,
-    not counts), the native production identity, the Linux sealed confirmation,
-    and a recompute digest over the whole payload; the endpoint verifies it
-    against its sealed cache/production ledger and deletes nothing on mismatch.
-    """
-
-    code = "cache_import_confirmation_invalid"
-    _exact_keys(record, {"schema_version", "imported", "production", "sealed", "digest"}, code, "confirmation")
-    _require(record["schema_version"] == CACHE_IMPORT_CONFIRMATION_SCHEMA, code, {"where": "schema_version"})
-    imported = record["imported"]
-    _require(isinstance(imported, list) and imported, code, {"where": "confirmation.imported"})
-    paths: list[str] = []
-    for index, entry in enumerate(imported):
-        where = f"confirmation.imported[{index}]"
-        _exact_keys(entry, {"path", "bytes", "sha256"}, code, where)
-        name = entry["path"]
-        _require(isinstance(name, str), code, {"where": f"{where}.path"})
-        artifact_path_parts(name)
-        paths.append(name)
-        _non_negative_int(entry["bytes"], code, f"{where}.bytes")
-        _hex64(entry["sha256"], code, f"{where}.sha256")
-    _require(paths == sorted(set(paths)), code, {"where": "confirmation.imported", "reason": "closed, sorted, unique"})
-    validate_cache_production_identity(record["production"])
-    _exact_keys(record["sealed"], {"confirmed_at", "receipt_sha256"}, code, "confirmation.sealed")
-    _utc(record["sealed"]["confirmed_at"], code, "confirmation.sealed.confirmed_at")
-    _hex64(record["sealed"]["receipt_sha256"], code, "confirmation.sealed.receipt_sha256")
-    _hex64(record["digest"], code, "confirmation.digest")
-    _require(
-        record["digest"] == cache_import_confirmation_digest(record),
-        code,
-        {"where": "confirmation.digest", "reason": "must recompute over the confirmation content"},
-    )
-    return record
-
-
-def validate_cache_import_block(import_block) -> dict:
-    """The request import: Linux run + native production + full confirmation."""
-
-    code = "cache_release_invalid"
-    _exact_keys(import_block, {"linux_run_id", "production", "confirmation"}, code, "import")
-    _text(import_block["linux_run_id"], code, "import.linux_run_id")
-    production = validate_cache_production_identity(import_block["production"])
-    confirmation = validate_cache_import_confirmation(import_block["confirmation"])
-    _require(
-        confirmation["production"] == production,
-        code,
-        {"rule": "the imported confirmation must bind the requested production identity"},
-    )
-    return import_block
-
-
-def cache_release_params_digest(import_block) -> str:
-    """The parameter digest bound by a cache-release operation id.
-
-    The import block is the frozen three-way identity (Linux run, native
-    production, complete confirmation); a receipt binds ``operation_id`` +
-    ``params_sha256`` + this same object, so replaying one operation id with the
-    same parameters returns the original receipt unchanged.
-    """
-
-    validate_cache_import_block(import_block)
-    return digest({"operation": "cache.release", "import": import_block})
-
-
-def validate_cache_release_request(request) -> dict:
-    """``POST /v1/jobs/<run_id>/cache/release`` request (IF-10 frozen final)."""
-
-    code = "cache_release_invalid"
-    _exact_keys(request, {"operation_id", "binding", "import"}, code, "request")
-    _text(request["operation_id"], code, "operation_id")
-    _exact_keys(request["binding"], {"release", "contract"}, code, "binding")
-    validate_release_identity(request["binding"]["release"], code=code)
-    _exact_keys(request["binding"]["contract"], {"schema_version", "digest"}, code, "binding.contract")
-    _require(
-        request["binding"]["contract"]["schema_version"] == CONTRACT["schema_version"],
-        code,
-        {"where": "binding.contract.schema_version", "expected": CONTRACT["schema_version"]},
-    )
-    _hex64(request["binding"]["contract"]["digest"], code, "binding.contract.digest")
-    import_block = validate_cache_import_block(request["import"])
-    _require(
-        request["operation_id"] != import_block["production"]["operation_id"],
-        code,
-        {"rule": "the release operation cannot impersonate the production operation"},
-    )
-    return request
-
-
-def cache_release_receipt_digest(receipt) -> str:
-    """Digest of the immutable receipt payload (the ``receipt_sha256`` field excluded)."""
-
-    payload = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
-    return digest(payload)
-
-
-def validate_cache_release_receipt(receipt) -> dict:
-    """Immutable cache-release receipt (IF-10); any edit breaks ``receipt_sha256``."""
-
-    code = "cache_release_receipt_invalid"
-    _exact_keys(
-        receipt,
-        {
-            "schema_version",
-            "status",
-            "operation_id",
-            "params_sha256",
-            "import",
-            "released",
-            "retained",
-            "released_at",
-            "identity",
-            "receipt_sha256",
-        },
-        code,
-        "receipt",
-    )
-    _require(receipt["schema_version"] == CACHE_RELEASE_RECEIPT_SCHEMA, code, {"where": "schema_version"})
-    _require(receipt["status"] in {"released", "already_released"}, code, {"where": "status"})
-    _text(receipt["operation_id"], code, "operation_id")
-    _hex64(receipt["params_sha256"], code, "params_sha256")
-    validate_cache_import_block(receipt["import"])
-    _require(
-        receipt["params_sha256"] == cache_release_params_digest(receipt["import"]),
-        code,
-        {"rule": "receipt binds operation params to the released import"},
-    )
-    _exact_keys(receipt["released"], {"files", "bytes"}, code, "released")
-    _non_negative_int(receipt["released"]["files"], code, "released.files")
-    _non_negative_int(receipt["released"]["bytes"], code, "released.bytes")
-    if receipt["status"] == "released":
-        # A claimed release that deleted nothing is refused; a replay of an
-        # already released import keeps its original (possibly zero) counts.
-        _positive_int(receipt["released"]["files"], code, "released.files")
-    retained = receipt["retained"]
-    _require(
-        isinstance(retained, list) and all(isinstance(item, str) and item for item in retained),
-        code,
-        {"where": "retained"},
-    )
-    _utc(receipt["released_at"], code, "released_at")
-    validate_release_identity(receipt["identity"], role="native", code=code)
-    _hex64(receipt["receipt_sha256"], code, "receipt_sha256")
-    expected = cache_release_receipt_digest(receipt)
-    _require(receipt["receipt_sha256"] == expected, "cache_release_receipt_mismatch", {"expected": expected})
-    return receipt
 
 
 def validate_connection_config_identity(connection) -> dict:
@@ -1074,7 +934,7 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
     """Linux-side active install record (IF-16).
 
     ``ends.linux.config_digest`` is only ever compared with this host;
-    ``ends.windows.config_digest`` only with the endpoint ``/health.install``.
+    ``ends.windows.config_digest`` only with the endpoint ``/health``.
     The two ends are per-host generations, so this validator never requires the
     digests to be equal (or different) - cross-end equality checks are banned.
     """
@@ -1137,9 +997,38 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
     _exact_keys(record["ends"], {"linux", "windows"}, code, "ends")
     for side, role in END_ROLES:
         end = record["ends"][side]
-        _exact_keys(end, {"install_id", "config_digest", "release"}, code, f"ends.{side}")
+        expected_end_keys = {"install_id", "config_digest", "release"}
+        if side == "windows":
+            expected_end_keys.add("target_identity")
+        _exact_keys(end, expected_end_keys, code, f"ends.{side}")
         _text(end["install_id"], code, f"ends.{side}.install_id")
         _hex64(end["config_digest"], code, f"ends.{side}.config_digest")
+        if side == "windows":
+            target = end["target_identity"]
+            try:
+                from .pipeline.contracts import NativeTargetIdentity  # noqa: PLC0415
+
+                normalized_target = NativeTargetIdentity.from_record(target).to_record()
+            except Exception as error:
+                raise InterfaceRecordError(
+                    code,
+                    {"where": "ends.windows.target_identity", "reason": str(error)},
+                ) from error
+            _require(
+                normalized_target == target,
+                code,
+                {"where": "ends.windows.target_identity"},
+            )
+            _require(
+                target["install_id"] == end["install_id"],
+                code,
+                {"rule": "windows runtime target install_id equals Windows end install_id"},
+            )
+            _require(
+                target["pipeline_id"] == PIPELINE_ID,
+                code,
+                {"where": "ends.windows.target_identity.pipeline_id"},
+            )
         validate_release_identity(end["release"], role=role, code=code)
     require_same_release_identity(record["release"], record["ends"]["linux"]["release"])
     # The common release identity spans both ends (same source release); the
@@ -1209,16 +1098,26 @@ def require_endpoint_matches_install_record(health, record) -> None:
     validate_health(health)
     validate_install_record(record)
     end = record["ends"]["windows"]
+    _require(
+        health["pipeline_id"] == end["target_identity"]["pipeline_id"],
+        "endpoint_end_mismatch",
+        {"field": "pipeline_id"},
+    )
     require_same_release_identity(end["release"], health["release"])
     _require(
-        end["install_id"] == health["install"]["install_id"],
+        end["install_id"] == health["install_id"],
         "endpoint_end_mismatch",
         {"field": "install_id"},
     )
     _require(
-        end["config_digest"] == health["install"]["config_digest"],
+        end["config_digest"] == health["config_digest"],
         "endpoint_end_mismatch",
         {"field": "config_digest"},
+    )
+    _require(
+        end["target_identity"] == health["target_identity"],
+        "endpoint_end_mismatch",
+        {"field": "target_identity"},
     )
     _require(
         health["ready"] is True,

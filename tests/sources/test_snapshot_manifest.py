@@ -36,19 +36,20 @@ class RetiredNamespaceTests(unittest.TestCase):
                 load_scene(root)
 
     def test_retired_model_ids_are_refused(self) -> None:
-        from description_pipeline.model import validate_scene_schema
+        from description_pipeline.model import validate_engineering_model
 
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "v1" / "mesh-source" / "scene.json"
         model = json.loads(fixture.read_text(encoding="utf-8"))
-        validate_scene_schema(model)
+        validate_engineering_model(model)
         for retired in (
             "description.scene/v1",
             "description.robot/v1",
             "description.scene/v2",
             "solidworks-to-urdf.robot/v1",
+            "solidworks-to-urdf.scene/v1",
         ):
             with self.subTest(schema=retired), self.assertRaises(PipelineError):
-                validate_scene_schema({**model, "schema_version": retired})
+                validate_engineering_model({**model, "schema_version": retired})
 
 
 class WriteManifestTests(unittest.TestCase):

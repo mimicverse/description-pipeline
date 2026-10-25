@@ -19,16 +19,16 @@ ROOT = Path(__file__).resolve().parents[2]
 APPLY = ROOT / "deploy/platform/apply.sh"
 PLATFORM_DIR = ROOT / "deploy/platform"
 PYTHON_SQL_OWNERS = (
-    ROOT / "src/description_pipeline/platform/store.py",
+    ROOT / "src/description_pipeline/platform/facts.py",
     ROOT / "src/description_pipeline/orchestration/lifecycle_state.py",
+    ROOT / "src/description_pipeline/pipeline/cancellation.py",
 )
 
 
 def fake_psql(log: Path) -> Path:
     script = log.parent / "fake-psql"
     script.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$@" >> "{log}"\n',
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "{log}"\n',
         encoding="utf-8",
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
@@ -133,16 +133,28 @@ class SchemaQualifierTests(unittest.TestCase):
             "the platform-service reconcile reads the terminal attempt number",
         )
 
-    def test_unbound_cancel_controls_do_not_fabricate_a_scheduling_row(self) -> None:
+    def test_lifecycle_view_keeps_only_real_airflow_scheduling_evidence(self) -> None:
         text = (PLATFORM_DIR / "views.sql").read_text(encoding="utf-8")
-        self.assertIn(
-            "o.kind <> 'cancel'\n"
-            "          OR o.dag_id IS NOT NULL\n"
-            "          OR o.dag_run_id IS NOT NULL\n"
-            "          OR o.task_id IS NOT NULL\n"
-            "          OR o.map_index IS NOT NULL\n",
-            text,
-        )
+        for token in (
+            ':"platform_schema".command',
+            ':"platform_schema".execution_claim',
+            ':"airflow_schema".task_instance',
+            ':"airflow_schema".dag_run',
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, text)
+        for token in (
+            ':"platform_schema".run_admission',
+            ':"platform_schema".stage_decision',
+            ':"platform_schema".effect_intent',
+            ':"platform_schema".effect_fact',
+        ):
+            with self.subTest(absent=token):
+                self.assertNotIn(token, text)
+        self.assertIn("task.dag_id = claim.dag_id", text)
+        self.assertIn("task.task_id = claim.task_id", text)
+        self.assertIn("task.run_id = claim.dag_run_id", text)
+        self.assertIn("task.map_index = claim.map_index", text)
 
     def test_operatorctl_uses_the_single_airflow_grants_owner(self) -> None:
         text = (ROOT / "deploy/operator/operatorctl.sh").read_text(encoding="utf-8")
@@ -154,6 +166,138 @@ class SchemaQualifierTests(unittest.TestCase):
         pattern = re.compile(r"\b(FROM|INTO|UPDATE|WHERE|JOIN) platform\.")
         for path in PYTHON_SQL_OWNERS:
             self.assertIsNone(pattern.search(path.read_text(encoding="utf-8")), str(path))
+
+
+class CanonicalFactSchemaTests(unittest.TestCase):
+    def test_legacy_business_tables_are_absent(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        for table in ("request", "run", "stage", "operation", "run_event"):
+            with self.subTest(table=table):
+                self.assertNotRegex(
+                    text,
+                    rf'CREATE TABLE IF NOT EXISTS :"platform_schema"\.{table}\b',
+                )
+                self.assertIn(f'DROP TABLE IF EXISTS :"platform_schema".{table}', text)
+        self.assertIn('CREATE TABLE IF NOT EXISTS :"platform_schema".admission', text)
+
+    def test_six_stage_decisions_are_unique_and_never_store_unresolved(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        decision = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_decision', 1)[1]
+        decision = decision.split(");", 1)[0]
+        self.assertIn("UNIQUE (run_id, stage)", decision)
+        self.assertIn("command_id text NOT NULL UNIQUE", decision)
+        self.assertIn("outcome IN ('completed', 'failed', 'cancelled')", decision)
+        self.assertNotIn("unresolved", decision)
+
+    def test_claims_are_fenced_and_effect_facts_are_ordered(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        self.assertIn(
+            "CREATE UNIQUE INDEX IF NOT EXISTS execution_claim_one_open_command",
+            text,
+        )
+        self.assertIn("UNIQUE (command_id, fence)", text)
+        self.assertIn("executor_sha256 char(64) NOT NULL", text)
+        self.assertIn("CHECK (owner_sha256 <> executor_sha256)", text)
+        self.assertIn("scope IN ('execution', 'transfer_resume')", text)
+        self.assertIn("execution_claim_effect_scope_id_fkey", text)
+        self.assertIn("UNIQUE (effect_id, seq)", text)
+        self.assertIn("yield_effect_id text", text)
+        self.assertIn("closure_code IS NOT DISTINCT FROM 'yielded'", text)
+        self.assertIn(
+            'DROP INDEX IF EXISTS :"platform_schema".execution_claim_one_yield_per_effect',
+            text,
+        )
+        self.assertIn(
+            "REFERENCES :\"platform_schema\".effect_intent (effect_id)",
+            text,
+        )
+        self.assertIn("resume_authorized", text)
+        self.assertIn("resume_phase = 'input_transfer_pending'", text)
+        self.assertIn("state_class IN ('known', 'absent', 'unobservable')", text)
+        self.assertIn("metadata_artifact_id text REFERENCES", text)
+        candidate = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate', 1)[1]
+        candidate = candidate.split(");", 1)[0]
+        self.assertIn("command_id text NOT NULL UNIQUE", candidate)
+        self.assertIn("output_artifact_id text NOT NULL", candidate)
+        self.assertIn("result_record_artifact_id text NOT NULL UNIQUE", candidate)
+        self.assertIn("output_artifact_id <> result_record_artifact_id", candidate)
+        decision = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".stage_decision', 1)[1]
+        decision = decision.split(");", 1)[0]
+        self.assertIn("failure_envelope jsonb", decision)
+        self.assertIn("failure_digest char(64)", decision)
+
+    def test_technical_dispatch_is_separate_from_stage_commands_and_unique_per_run(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        command = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".command', 1)[1]
+        command = command.split(");", 1)[0]
+        self.assertIn("kind IN ('stage', 'dispatch', 'cancel', 'reconcile')", command)
+        self.assertIn("CHECK (kind <> 'stage' OR stage IS NOT NULL)", command)
+        self.assertIn(
+            "CREATE UNIQUE INDEX IF NOT EXISTS command_dispatch_once",
+            text,
+        )
+        self.assertIn("WHERE kind = 'dispatch';", text)
+        self.assertIn(
+            "CREATE UNIQUE INDEX IF NOT EXISTS command_cancel_target_once",
+            text,
+        )
+        self.assertIn("WHERE kind = 'cancel';", text)
+
+    def test_artifact_producer_is_descriptive_and_has_no_local_run_fk(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        artifact = text.split('CREATE TABLE IF NOT EXISTS :"platform_schema".artifact', 1)[1]
+        artifact = artifact.split(");", 1)[0]
+        self.assertIn("producer_run_id text,", artifact)
+        self.assertNotIn("producer_run_id text REFERENCES", artifact)
+
+    def test_immutable_facts_have_no_service_update_grant(self) -> None:
+        text = (PLATFORM_DIR / "roles.sql").read_text(encoding="utf-8")
+        immutable = re.search(
+            r"GRANT SELECT, INSERT ON\s+"
+            r":\"platform_schema\"\.run_admission.*?"
+            r"TO platform_service;",
+            text,
+            re.S,
+        )
+        self.assertIsNotNone(immutable)
+        self.assertNotIn("UPDATE", immutable.group(0))
+        self.assertIn(
+            "GRANT UPDATE (last_seen_at, closed_at, closure_code, yield_effect_id)\n"
+            '    ON :"platform_schema".execution_claim TO platform_service;',
+            text,
+        )
+        self.assertNotRegex(
+            text, r"GRANT SELECT, INSERT, UPDATE ON\s+[^;]*execution_claim"
+        )
+        for table in ("request", "run", "stage", "operation", "run_event"):
+            self.assertNotRegex(
+                text,
+                rf":\"platform_schema\"\.{table}\b",
+            )
+
+    def test_immutable_fact_tables_reject_update_delete_and_truncate(self) -> None:
+        text = (PLATFORM_DIR / "schema.sql").read_text(encoding="utf-8")
+        self.assertIn(
+            'CREATE OR REPLACE FUNCTION :"platform_schema".reject_immutable_fact_mutation()',
+            text,
+        )
+        self.assertIn("BEFORE UPDATE OR DELETE", text)
+        self.assertIn("BEFORE TRUNCATE", text)
+        for table in (
+            "run_admission",
+            "artifact",
+            "command",
+            "command_input_artifact",
+            "stage_decision",
+            "stage_candidate",
+            "effect_intent",
+            "effect_fact",
+        ):
+            with self.subTest(table=table):
+                self.assertIn(
+                    f'ON :"platform_schema".{table}',
+                    text,
+                )
 
 
 if __name__ == "__main__":

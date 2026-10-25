@@ -26,7 +26,11 @@ from pathlib import Path
 from unittest import mock
 
 from cryptography.fernet import Fernet
-from description_pipeline.schemas import INSTALL_RECORD_SCHEMA
+from description_pipeline.pipeline.contracts import NativeTargetIdentity
+from description_pipeline.schemas import (
+    INSTALL_RECORD_SCHEMA,
+    STAGE_RESULT_SCHEMA,
+)
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
@@ -54,6 +58,7 @@ class UnitInventoryTests(unittest.TestCase):
                 "description-solidworks-tunnel",
                 "description-airflow-dag-processor",
                 "description-airflow-scheduler",
+                "description-airflow-triggerer",
                 "description-airflow-api-server",
                 "description-operator-proxy",
                 "description-portal",
@@ -68,6 +73,76 @@ def write(path: Path, payload: str | bytes, mode: int = 0o600) -> Path:
     path.write_bytes(payload.encode() if isinstance(payload, str) else payload)
     path.chmod(mode)
     return path
+
+
+def canonical_checkpoint_reference(
+    artifact_root: Path,
+    *,
+    run_id: str = "producer",
+    stage: str = "capture",
+    parent_run_id: str | None = None,
+    outcome: str = "completed",
+) -> dict:
+    from description_pipeline.artifacts.store import ArtifactStore
+    from description_pipeline.io import digest
+    from description_pipeline.pipeline.contracts import StageResult
+
+    tool = digest({"tool": stage})
+    store = ArtifactStore(artifact_root)
+    if outcome == "completed":
+        with tempfile.TemporaryDirectory(prefix="output-artifact-") as directory:
+            source = Path(directory)
+            (source / "delivery.json").write_text(
+                json.dumps({"run_id": run_id, "stage": stage}) + "\n",
+                encoding="utf-8",
+            )
+            output_artifact = store.seal_tree(
+                source,
+                kind=f"{stage}_delivery",
+                producer_run_id=run_id,
+                producer_stage=stage,
+                producer_tool_sha256=tool,
+            )
+        result_digest = digest({"request": run_id, "stage": stage})
+        result = StageResult(
+            schema_version=STAGE_RESULT_SCHEMA,
+            command_id=f"command-{run_id}-{stage}",
+            run_id=run_id,
+            stage=stage,
+            request_digest=result_digest,
+            outcome="completed",
+            output_artifact=output_artifact,
+            actual_executor_sha256=tool,
+            checks_sha256=digest({"checks": run_id, "stage": stage}),
+            resources_settled=True,
+        )
+        result_artifact = store.seal_stage_result(result)
+        result_record = result_artifact.to_record()
+        output = output_artifact.to_record()
+        result_digest = result.digest
+        failure_digest = None
+    else:
+        result_record = None
+        output = None
+        result_digest = None
+        failure_digest = digest({"failure": run_id, "stage": stage})
+    return {
+        "run_id": run_id,
+        "stage": stage,
+        "outcome": outcome,
+        "request_id": f"request-{run_id}",
+        "parent_run_id": parent_run_id,
+        "decision_id": f"decision-{run_id}-{stage}",
+        "command_id": f"command-{run_id}-{stage}",
+        "result_digest": result_digest,
+        "actual_executor_sha256": tool,
+        "original_producer_decision_id": (
+            f"decision-{parent_run_id}-{stage}" if parent_run_id is not None else None
+        ),
+        "failure_digest": failure_digest,
+        "result_record_artifact": result_record,
+        "output_artifact": output,
+    }
 
 
 def install_record_fixture(state: Path, install_id: str, snapshot: Path) -> dict:
@@ -92,6 +167,10 @@ def install_record_fixture(state: Path, install_id: str, snapshot: Path) -> dict
                 "install_id": "win-" + "a" * 32,
                 "config_digest": "a" * 64,
                 "release": {**triple, "role": "native"},
+                "target_identity": NativeTargetIdentity.create(
+                    install_id="win-" + "a" * 32,
+                    pipeline_id="solidworks-to-urdf",
+                ).to_record(),
             },
         },
         "previous": None,
@@ -917,7 +996,9 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             },
             "action": {
                 "execute": generation + "/runtime/Scripts/python.exe",
-                "arguments": '-I -B -m description_pipeline serve --config "' + generation + '/endpoint.json"',
+                "arguments": '-I -B -m description_pipeline.orchestration.windows serve --config "'
+                + generation
+                + '/endpoint.json"',
                 "working_directory": "C:/description/state",
             },
             "settings": {"multiple_instances": "IgnoreNew"},
@@ -1117,7 +1198,29 @@ catalog = {
             "owner": "platform_migrate",
             "acl": [],
         }
-        for name in ("admission", "operation", "request", "run", "run_event", "stage")
+        for name in (
+            "admission",
+            "run_admission",
+            "artifact",
+            "command",
+            "command_input_artifact",
+            "execution_claim",
+            "stage_decision",
+            "stage_candidate",
+            "effect_intent",
+            "effect_fact",
+            "run_display_metadata",
+        )
+    ]
+    + [
+        {
+            "schema": "platform",
+            "name": name,
+            "kind": "v",
+            "owner": "platform_migrate",
+            "acl": [],
+        }
+        for name in ("lifecycle_projection", "admission_projection")
     ]
     + [
         {
@@ -1185,11 +1288,16 @@ if query:
             {"schema": schema, "table": table}
             for schema, table in (
                 ("platform", "admission"),
-                ("platform", "request"),
-                ("platform", "run"),
-                ("platform", "stage"),
-                ("platform", "operation"),
-                ("platform", "run_event"),
+                ("platform", "run_admission"),
+                ("platform", "artifact"),
+                ("platform", "command"),
+                ("platform", "command_input_artifact"),
+                ("platform", "execution_claim"),
+                ("platform", "stage_decision"),
+                ("platform", "stage_candidate"),
+                ("platform", "effect_intent"),
+                ("platform", "effect_fact"),
+                ("platform", "run_display_metadata"),
                 ("airflow", "alembic_version"),
                 ("airflow", "connection"),
             )
@@ -1211,7 +1319,30 @@ if query:
             "password": "__FERNET_TOKEN__",
             "extra": None,
         }
-    elif "FROM platform.stage" in query:
+    elif "WITH referenced_ids AS" in query:
+        fixture = next((parent / "checkpoint-root-fixture.json" for parent in pathlib.Path(socket_dir).parents
+                        if (parent / "checkpoint-root-fixture.json").is_file()), None)
+        reference_fixture = next((parent / "checkpoint-fixture.json" for parent in pathlib.Path(socket_dir).parents
+                                  if (parent / "checkpoint-fixture.json").is_file()), None)
+        references = json.loads(reference_fixture.read_text()) if reference_fixture is not None else []
+        payload = json.loads(fixture.read_text()) if fixture is not None else {
+            "decisions": references,
+            "artifacts": [
+                artifact
+                for artifact_id, artifact in sorted({
+                    artifact["artifact_id"]: artifact
+                    for reference in references
+                    for role in ("result_record_artifact", "output_artifact")
+                    for artifact in (reference[role],)
+                    if artifact is not None
+                }.items())
+            ],
+            "missing_artifact_ids": [],
+            "candidates": [],
+            "retained_locations": [],
+            "workspace_commands": [],
+        }
+    elif "FROM platform.stage_decision d" in query:
         fixture = next((parent / "checkpoint-fixture.json" for parent in pathlib.Path(socket_dir).parents
                         if (parent / "checkpoint-fixture.json").is_file()), None)
         payload = json.loads(fixture.read_text()) if fixture is not None else []
@@ -1288,6 +1419,23 @@ import recovery
 request = json.loads(pathlib.Path(args[args.index("--request") + 1]).read_text())
 reference_fixture = pathlib.Path(args[args.index("--request") + 1]).parents[2] / "checkpoint-fixture.json"
 references = json.loads(reference_fixture.read_text()) if reference_fixture.is_file() else []
+root_fixture = pathlib.Path(args[args.index("--request") + 1]).parents[2] / "checkpoint-root-fixture.json"
+recovery_root = json.loads(root_fixture.read_text()) if root_fixture.is_file() else {
+    "decisions": references,
+    "artifacts": [],
+    "missing_artifact_ids": [],
+    "candidates": [],
+    "retained_locations": [],
+    "workspace_commands": [],
+}
+if not recovery_root["artifacts"]:
+    by_id = {}
+    for reference in references:
+        for role in ("result_record_artifact", "output_artifact"):
+            artifact = reference[role]
+            if artifact is not None:
+                by_id[artifact["artifact_id"]] = artifact
+    recovery_root["artifacts"] = [by_id[key] for key in sorted(by_id)]
 control = pathlib.Path(request["control_dir"])
 staging = pathlib.Path(request["staging"])
 
@@ -1352,7 +1500,29 @@ catalog = {
             "owner": "platform_migrate",
             "acl": [],
         }
-        for name in ("admission", "operation", "request", "run", "run_event", "stage")
+        for name in (
+            "admission",
+            "run_admission",
+            "artifact",
+            "command",
+            "command_input_artifact",
+            "execution_claim",
+            "stage_decision",
+            "stage_candidate",
+            "effect_intent",
+            "effect_fact",
+            "run_display_metadata",
+        )
+    ]
+    + [
+        {
+            "schema": "platform",
+            "name": name,
+            "kind": "v",
+            "owner": "platform_migrate",
+            "acl": [],
+        }
+        for name in ("lifecycle_projection", "admission_projection")
     ]
     + [
         {
@@ -1385,11 +1555,16 @@ full_catalog = {
 }
 table_names = (
     "platform.admission",
-    "platform.request",
-    "platform.run",
-    "platform.stage",
-    "platform.operation",
-    "platform.run_event",
+    "platform.run_admission",
+    "platform.artifact",
+    "platform.command",
+    "platform.command_input_artifact",
+    "platform.execution_claim",
+    "platform.stage_decision",
+    "platform.stage_candidate",
+    "platform.effect_intent",
+    "platform.effect_fact",
+    "platform.run_display_metadata",
     "airflow.alembic_version",
     "airflow.connection",
 )
@@ -1480,11 +1655,13 @@ try:
         {"schema_version": recovery.SNAPSHOT_READY_SCHEMA,
          "status": "ready", "snapshot_id": "00000001-00000001-1",
          "checkpoint_refs": references, "checkpoint_refs_sha256": recovery._digest_document(references),
+         "recovery_root": recovery_root,
+         "recovery_root_sha256": recovery._digest_document(recovery_root),
          "database_bytes": 0},
     )
     wait("inventory.complete.json")
     wait("files.complete.json")
-    write_json(database / "reference-index.json", recovery.checkpoint_index(references, staging / "state/runs"))
+    write_json(database / "reference-index.json", recovery.checkpoint_index(recovery_root, staging / "artifacts"))
     selection = json.loads((staging / "inventory/selection.json").read_text())
     (database / "airflow_meta.dump").write_bytes(b"fake custom dump")
     (database / "dump.toc").write_text("; fake toc\n", encoding="utf-8")
@@ -2080,80 +2257,119 @@ class ArchiveMemberBindingTests(unittest.TestCase):
 
 
 class RecoverySelectionTests(unittest.TestCase):
-    def reference(self, run="producer", parent=None, state="completed"):
+    def reference(
+        self,
+        artifact_root: Path,
+        *,
+        run: str = "producer",
+        parent: str | None = None,
+        outcome: str = "completed",
+    ) -> dict:
+        return canonical_checkpoint_reference(
+            artifact_root,
+            run_id=run,
+            parent_run_id=parent,
+            outcome=outcome,
+        )
+
+    def recovery_root(self, references: list[dict], *, extra_artifacts=()) -> dict:
+        artifacts = {
+            artifact["artifact_id"]: artifact
+            for reference in references
+            for role in ("result_record_artifact", "output_artifact")
+            for artifact in (reference[role],)
+            if artifact is not None
+        }
+        artifacts.update({artifact["artifact_id"]: artifact for artifact in extra_artifacts})
         return {
-            "run_id": run,
-            "stage": "capture",
-            "stage_state": state,
-            "request_id": "request-1",
-            "run_parent_run_id": parent,
-            "reused_from_run": parent,
-            "original_executed_at": "2026-10-22T00:00:00Z",
-            "checkpoint_uri": "store://sealed/producer/capture",
-            "receipt": {
-                "schema_version": "solidworks-to-urdf.bundle/v1",
-                "run_id": "producer",
-                "stage": "capture",
-                "state": "native_complete" if state == "completed" else state,
-                "passed": False,
-                "artifacts": [],
-            },
+            "decisions": references,
+            "artifacts": [artifacts[key] for key in sorted(artifacts)],
+            "missing_artifact_ids": [],
+            "candidates": [],
+            "retained_locations": [],
+            "workspace_commands": [],
         }
 
-    def test_multihop_reuse_resolves_one_physical_producer(self):
-        refs = [self.reference(), self.reference("child", "producer"), self.reference("grandchild", "child")]
-        self.assertEqual(set(recovery.checkpoint_origins(refs).values()), {"producer"})
+    def test_multihop_reuse_resolves_one_original_producer_and_exact_cas_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "runs"
-            tree = source / "sealed/producer/capture"
-            from description_pipeline.delivery import SUBJECT_DIRECTORIES, write_delivery_manifest
-            from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
-            from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+            source = Path(directory) / "artifacts"
+            refs = [
+                self.reference(source),
+                self.reference(source, run="child", parent="producer"),
+                self.reference(source, run="grandchild", parent="child"),
+            ]
+            from description_pipeline.artifacts.store import ArtifactStore
+            from description_pipeline.io import digest
 
-            for name in SUBJECT_DIRECTORIES:
-                (tree / name).mkdir(parents=True, exist_ok=True)
-            write(tree / "tool.json", "{}")
-            manifest = write_delivery_manifest(
-                tree,
-                contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
-                policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+            with tempfile.TemporaryDirectory(prefix="admission-requirement-") as item_directory:
+                item_root = Path(item_directory)
+                (item_root / "native-requirement.json").write_text(
+                    '{"requirement":"future-stage"}\n',
+                    encoding="utf-8",
+                )
+                extra_artifact = ArtifactStore(source).seal_tree(
+                    item_root,
+                    kind="admission_input",
+                    producer_run_id=None,
+                    producer_stage=None,
+                    producer_tool_sha256=digest({"tool": "portal-admission"}),
+                )
+            root = self.recovery_root(refs, extra_artifacts=(extra_artifact.to_record(),))
+            self.assertEqual(set(recovery.checkpoint_origins(refs).values()), {"producer"})
+            indexed = recovery.checkpoint_index(root, source)
+            self.assertEqual(
+                len(indexed["artifacts"]),
+                7,
             )
-            for ref in refs:
-                ref["receipt"]["artifacts"] = manifest["subject"]["files"]
-            write(source / "sealed/orphan/capture/large.bin", b"x" * 10000)
-            indexed = recovery.checkpoint_index(refs, source)
-            destination = Path(directory) / "copy"
-            recovery.copy_selected_root(source, destination, sorted({row["tree_relative"] for row in indexed}))
-            self.assertEqual(len(list(destination.rglob("tool.json"))), 1)
-            self.assertFalse((destination / "sealed/orphan").exists())
-            write(tree / "unregistered.bin", "unexpected")
+            self.assertIn(
+                f"objects/{extra_artifact.artifact_id}",
+                recovery.checkpoint_artifact_selection(root),
+            )
+            recovery.verify_checkpoint_index(indexed, source)
+            artifact = refs[0]["output_artifact"]
+            artifact_path = source / "objects" / artifact["artifact_id"] / "delivery.json"
+            artifact_path.write_text("changed\n", encoding="utf-8")
             with self.assertRaises(recovery.RecoveryError):
-                recovery.checkpoint_index(refs, source)
+                recovery.checkpoint_index(root, source)
 
     def test_failed_checkpoint_is_preserved_but_cannot_be_reused(self):
-        failed = self.reference(state="failed")
-        self.assertEqual(recovery.checkpoint_origins([failed]), {("producer", "capture"): "producer"})
-        with self.assertRaises(recovery.RecoveryError):
-            recovery.checkpoint_origins([failed, self.reference("child", "producer")])
-        changed = self.reference("child", "producer", "failed")
-        with self.assertRaises(recovery.RecoveryError):
-            recovery.checkpoint_origins([self.reference(), changed])
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "artifacts"
+            failed = self.reference(source, outcome="failed")
+            self.assertEqual(recovery.checkpoint_origins([failed]), {("producer", "capture"): "producer"})
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.checkpoint_origins([failed, self.reference(source, run="child", parent="producer")])
+            changed = self.reference(source, run="child", parent="producer", outcome="failed")
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.checkpoint_origins([self.reference(source), changed])
 
-    def test_reuse_wrong_parent_receipt_uri_and_cycle_are_rejected(self):
-        cases = []
-        child = self.reference("child", "producer")
-        for field, value in (
-            ("run_parent_run_id", "other"),
-            ("receipt", {"changed": True}),
-            ("checkpoint_uri", "store://sealed/other/capture"),
-            ("original_executed_at", "changed"),
-        ):
-            cases.append([self.reference(), {**child, field: value}])
-        cases.append([self.reference("a", "b"), self.reference("b", "a")])
-        cases.append([child])
-        for refs in cases:
-            with self.subTest(refs=refs), self.assertRaises(recovery.RecoveryError):
-                recovery.checkpoint_origins(refs)
+    def test_reuse_wrong_parent_artifact_and_cycle_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "artifacts"
+            producer = self.reference(source)
+            child = self.reference(source, run="child", parent="producer")
+            cases = [
+                [producer, {**child, "parent_run_id": "other"}],
+                [producer, {**child, "original_producer_decision_id": "missing"}],
+                [
+                    producer,
+                    {
+                        **child,
+                        "output_artifact": {
+                            **child["output_artifact"],
+                            "producer_run_id": "foreign",
+                        },
+                    },
+                ],
+                [
+                    self.reference(source, run="a", parent="b"),
+                    self.reference(source, run="b", parent="a"),
+                ],
+                [child],
+            ]
+            for refs in cases:
+                with self.subTest(refs=refs), self.assertRaises(recovery.RecoveryError):
+                    recovery.checkpoint_origins(refs)
 
     def test_journal_selection_keeps_only_typed_edges_and_replays_offline(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2437,6 +2653,27 @@ class RecoveryControlFlowTests(unittest.TestCase):
             dir=HERE,
         )
         self.root = Path(self.temporary.name)
+        external_runtime_source = self.root / "external-runtime-source"
+        write(
+            external_runtime_source / "description_pipeline" / "__init__.py",
+            'VERSION = "1.5.0"\n',
+        )
+        write(
+            external_runtime_source
+            / "mimicverse_description-1.5.0.dist-info"
+            / "METADATA",
+            "Metadata-Version: 2.1\n"
+            "Name: mimicverse-description\n"
+            "Version: 1.5.0\n"
+            "Requires-Dist: packaging==26.3\n",
+        )
+        python_path = mock.patch.dict(
+            os.environ,
+            {"PYTHONPATH": str(external_runtime_source)},
+            clear=False,
+        )
+        python_path.start()
+        self.addCleanup(python_path.stop)
         self.fake_bin = install_fake_pg(
             self.root / "fake-bin",
             Fernet(Fernet.generate_key()).encrypt(b"unused").decode(),
@@ -3030,41 +3267,54 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         recovery.verify_selection_archive(manifest, extracted)
 
-    def test_failed_checkpoint_roundtrip_and_unreferenced_store_exclusion(self):
-        from description_pipeline.delivery import SUBJECT_DIRECTORIES, write_delivery_manifest
-        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
-        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
-
-        tree = Path(self.context.resolved["derived"]["store_root"]) / "sealed/failed-run/discover"
-        for name in SUBJECT_DIRECTORIES:
-            (tree / name).mkdir(parents=True, exist_ok=True)
-        write(tree / "tool.json", "{}")
-        delivery = write_delivery_manifest(
-            tree,
-            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
-            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+    def test_canonical_checkpoint_roundtrip_and_legacy_store_exclusion(self):
+        artifact_root = Path(self.context.resolved["storage"]["artifact_root"])
+        completed = canonical_checkpoint_reference(
+            artifact_root,
+            run_id="completed-run",
+            stage="capture",
         )
-        reference = {
-            "run_id": "failed-run",
-            "stage": "discover",
-            "stage_state": "failed",
-            "request_id": "request-1",
-            "run_parent_run_id": None,
-            "reused_from_run": None,
-            "original_executed_at": None,
-            "checkpoint_uri": "store://sealed/failed-run/discover",
-            "receipt": {
-                "schema_version": "solidworks-to-urdf.bundle/v1",
-                "run_id": "failed-run",
-                "stage": "discover",
-                "state": "failed",
-                "passed": False,
-                "artifacts": delivery["subject"]["files"],
-            },
+        failed = canonical_checkpoint_reference(
+            artifact_root,
+            run_id="failed-run",
+            stage="discover",
+            outcome="failed",
+        )
+        references = [completed, failed]
+        write(self.root / "checkpoint-fixture.json", json.dumps(references))
+        workspace_root = Path(self.context.resolved["storage"]["workspace_root"])
+        retained_workspace = workspace_root / "failure-command"
+        write(retained_workspace / "raw-native-response.bin", b"unsealed-native-response")
+        recovery_root = {
+            "decisions": references,
+            "artifacts": [
+                artifact
+                for artifact_id, artifact in sorted({
+                    artifact["artifact_id"]: artifact
+                    for reference in references
+                    for role in ("result_record_artifact", "output_artifact")
+                    for artifact in (reference[role],)
+                    if artifact is not None
+                }.items())
+            ],
+            "missing_artifact_ids": [],
+            "candidates": [],
+            "retained_locations": [],
+            "workspace_commands": ["failure-command"],
         }
-        write(self.root / "checkpoint-fixture.json", json.dumps([reference]))
+        write(self.root / "checkpoint-root-fixture.json", json.dumps(recovery_root))
         out, manifest = self.backup()
-        self.assertEqual(manifest["selection"]["checkpoint_refs"], [reference])
+        self.assertEqual(manifest["selection"]["checkpoint_refs"], references)
+        self.assertEqual(
+            {
+                item["artifact"]["artifact_id"]
+                for item in manifest["references"]["artifacts"]
+            },
+            {
+                completed["result_record_artifact"]["artifact_id"],
+                completed["output_artifact"]["artifact_id"],
+            },
+        )
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
@@ -3073,8 +3323,14 @@ class RecoveryControlFlowTests(unittest.TestCase):
             manifest_path=manifest_path, key=self.key, target_plan_path=plan, status_dir=self.root / "failed-roundtrip"
         )
         self.assertEqual(result["status"], "succeeded")
-        self.assertTrue((tree / "tool.json").is_file())
+        restored_artifact = Path(roots["artifact_root"]) / "objects" / completed["output_artifact"]["artifact_id"]
+        self.assertTrue((restored_artifact / "delivery.json").is_file())
+        self.assertFalse((Path(roots["artifact_root"]) / "artifact.bin").exists())
         self.assertFalse((Path(roots["store_root"]) / "sealed/run-1").exists())
+        self.assertEqual(
+            (retained_workspace / "raw-native-response.bin").read_bytes(),
+            b"unsealed-native-response",
+        )
 
     def test_workspace_bundle_roundtrip_is_offline_and_verified(self) -> None:
         extracted, origin, manifest = self.workspace_bundle()
@@ -3484,6 +3740,66 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 verify_only=False,
             )
         self.assertEqual(raised.exception.code, "recovery_target_path_unsafe")
+
+    def test_recovered_runtime_environment_strips_python_context(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTHONPATH": "/caller/python-path",
+                "PYTHONHOME": "/caller/python-home",
+                "VIRTUAL_ENV": "/caller/venv",
+                "PATH": "/runtime/bin",
+                "LD_LIBRARY_PATH": "/runtime/lib",
+                "SSL_CERT_FILE": "/runtime/ca.pem",
+            },
+            clear=False,
+        ):
+            environment = recovery._recovered_runtime_environment()
+        for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+            self.assertNotIn(name, environment)
+        self.assertEqual(environment["PYTHONNOUSERSITE"], "1")
+        self.assertEqual(environment["PATH"], "/runtime/bin")
+        self.assertEqual(environment["LD_LIBRARY_PATH"], "/runtime/lib")
+        self.assertEqual(environment["SSL_CERT_FILE"], "/runtime/ca.pem")
+
+    def test_recovered_runtime_environment_does_not_relax_pip_check(self) -> None:
+        venv = self.root / "missing-package-venv"
+        environment = recovery._recovered_runtime_environment()
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv)],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        site_packages = venv / "lib" / "python3.12" / "site-packages"
+        write(
+            site_packages / "missing_requirement-1.0.dist-info" / "METADATA",
+            "Metadata-Version: 2.1\n"
+            "Name: missing-requirement\n"
+            "Version: 1.0\n"
+            "Requires-Dist: intentionally-missing-runtime-package==1\n",
+        )
+        checked = subprocess.run(
+            [
+                str(venv / "bin" / "python"),
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "check",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertIn(
+            "intentionally-missing-runtime-package",
+            checked.stdout + checked.stderr,
+        )
 
     def test_release_runtime_rehydrates_from_offline_role_archives(self) -> None:
         release_root = self.root / "runtime-release"
@@ -5534,7 +5850,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
     def test_member_digest_tamper_is_refused(self) -> None:
         out, manifest = self.backup()
         self.isolate_source()
-        member = next(row for row in manifest["members"] if row["member"] == "artifacts/artifact.bin")
+        member = next(row for row in manifest["members"] if row["member"] == "release/release.json")
         member["sha256"] = "0" * 64
         manifest_path = out / "recovery-manifest.json"
         manifest_bytes = recovery.canonical_json(manifest)
