@@ -158,14 +158,19 @@ def make_dag(root: Path) -> Path:
     return path
 
 
-def build_record(root: Path) -> dict:
+def build_record(
+    root: Path,
+    *,
+    install_id: str = "gen-1",
+    snapshot_path: Path | None = None,
+) -> dict:
     release_document = json.loads((root / "distribution" / "release.json").read_text())
     release = install_record.release_identity(release_document)
     endpoint = install_record.endpoint_identity(json.loads((root / "endpoint-identity.json").read_text()))
     return install_record.build_install_record(
-        install_id="gen-1",
+        install_id=install_id,
         timestamp=TIMESTAMP,
-        snapshot_path=root / "state" / "snapshots" / "gen-1.json",
+        snapshot_path=snapshot_path or root / "state" / "snapshots" / "gen-1.json",
         release=release,
         endpoint=endpoint,
         services=list(SERVICES),

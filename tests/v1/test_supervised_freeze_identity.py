@@ -176,7 +176,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
         from description_pipeline.platform.facts import FactStore
         from description_pipeline.stages import CONTRACT_SHA256
-        from tests.v1.config_identity_support import prepare_root, write_snapshot
+        from tests.v1.config_identity_support import activate
         from tests.v1.test_install_record import platform_document
 
         cls.digest = staticmethod(digest)
@@ -235,7 +235,6 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         cls.portable_tool = tool_record("portable", "Linux")
         cls.native_tool = tool_record("native", "Windows")
 
-        prepare_root(cls.root)
         _initialize_repository(cls.root)
         record = cls.root / "specifications" / "joints.json"
         record.parent.mkdir(parents=True, exist_ok=True)
@@ -243,7 +242,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             '{"limits":{"lower":-1,"upper":1}}\n',
             encoding="utf-8",
         )
-        cls.snapshot = write_snapshot(
+        cls.snapshot, cls.install_record = activate(
             cls.root,
             "supervised",
             platform_document(cls.root),
@@ -332,6 +331,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             AIRFLOW_CONN_SOLIDWORKS_WINDOWS=json.dumps(database_connection),
             PLATFORM_ARTIFACT_ROOT=str(cls.artifacts.root),
             PLATFORM_SERVICE_DSN=SUPERVISED["platform_dsn"],
+            PLATFORM_CONFIG_SNAPSHOT=str(cls.snapshot),
             PIPELINE_WORK_ROOT=str(cls.root / "airflow-work"),
             PIPELINE_CLAIM_LEASE_SECONDS="600",
             SOLIDWORKS_ENDPOINT_URL="http://127.0.0.1:9",
@@ -410,6 +410,10 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         request, dag_run_id = cls._request(label)
         work = cls.root / "admission-work" / f"{label}-{uuid.uuid4().hex}"
         outcome = cls._factory(work_root=work).admit(cls.application, request)
+        if outcome.freeze_command.request["native_target_identity"] != (
+            cls.install_record["ends"]["windows"]["target_identity"]
+        ):
+            raise AssertionError("the Freeze command differs from the registered native target")
         conf = cls.artifacts.read_dispatch_conf(outcome.dispatch_command.conf_artifact)
         if (
             outcome.dispatch_command.dag_id != DAG_ID
