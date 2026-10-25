@@ -121,7 +121,7 @@ provider 选择发生在任何 `Tessellate` 之前。不符合限定几何域且
 
 平面 BRep 证明的主体是本次原生 API 实际观测并封存的 raw binary64 nominal 模型。对拓扑顶点 V，以原始法向绝对值最大分量对应轴作精确有理投影 Q，再显式转换为 Q64 和最终 binary32 STL 顶点 S；选轴不得使用归一化后的舍入法向。分别向外计算并记录原生 plane residual、V→Q 构造位移、Q→Q64 舍入、已定身份对应的跨 API 位移、完整 tangent 段位移及 Q64→S 编码位移，总和须不超过 `50 µm`。原生 plane residual 与构造位移部分重复，保守保留，不用减项放宽。切向投影采用原始非零 tangent 的有理投影，核验整个有限段和两端。原值、构造规则、位移和字段 warning 均保留，consumer 从原始事实独立复算。该界针对 `observed_native_nominal_model`；不宣称厂商未公开的 hidden-kernel 精度或实物误差资格，不新增经验 EPS 或逐对象特例。
 
-平面读取链在调用前把 `IFace2.GetLoops` 的元素显式绑定为 `ILoop2`，把 `GetFirstCoEdge` 和每次 `GetNext` 的结果显式绑定为 `ICoEdge`；`QueryInterface` 失败不退回默认 dispatch。coedge 只读取 `GetEdge`、`GetCurve`、`GetCurveParams`、`GetSense` 和 `GetNext`，不依赖其 `Evaluate2`。局部参数必须有限且区分两端，同一参数对应不同端点仍是硬错误；局部参数不与另一 API 的参数域数值比较。`native_curve_domain_transform` 和 ITessellation fin 的 edge-local U 规则保持独立。
+平面读取链在调用前把 `IFace2.GetLoops` 的元素显式绑定为 `ILoop2`，把 `GetFirstCoEdge` 和每次 `GetNext` 的结果显式绑定为 `ICoEdge`；`QueryInterface` 失败不退回默认 dispatch。coedge 指针只作为当前进程中仍存活 COM 对象的身份比较值；遍历须强持有全部已访问接口，直到完整数量、唯一边覆盖和精确闭回首对象均核验完成，再随作用域释放，不能把已释放对象的数值地址当作永久身份。coedge 只读取 `GetEdge`、`GetCurve`、`GetCurveParams`、`GetSense` 和 `GetNext`，不依赖其 `Evaluate2`。局部参数必须有限且区分两端，同一参数对应不同端点仍是硬错误；局部参数不与另一 API 的参数域数值比较。`native_curve_domain_transform` 和 ITessellation fin 的 edge-local U 规则保持独立。
 
 对合格平面域以确定性有向 fan `[0,i+1,i+2]` 生成 `n-2` 三角形。独立消费者对 Q 和实际 S 分别证明顶点唯一、全边界严格凸、无交叉、有向面积正确、外边界完整一致、内部边反向成对，以及该固定 fan 的完整覆盖；不能只再次调用 producer 的 triangulator。定向、相交和非退化判据采用精确有理数，覆盖三个轴及正负法向。实际 binary32 STL 必须逐顶点、逐有向三角形绑定；配对顶点的最大 L2 位移通过同 barycentric 组合覆盖对应整块三角曲面。L∞ 点界和 U 的 ULP 身份不能冒称 L2 曲面证明。量化后的顶点合并、边界交叉、退化、翻向或拓扑变化独立拒绝，即使距离小于 `50 µm` 也不能通过；不得删除原生边或顶点以制造资格。
 

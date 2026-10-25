@@ -1570,6 +1570,83 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(len(body.tessellation_face_lists), before)
         self.assertEqual(entry["tessellation_sources"], [NATIVE_PLANAR_BREP_PROVIDER])
 
+    def test_planar_walk_keeps_live_com_identities_until_complete_loop_validation(self):
+        from weakref import WeakValueDictionary  # noqa: PLC0415
+
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        backend = _backend(component)
+        loop = body._faces[0]._loops[0]
+        states = WeakValueDictionary()
+        free_addresses = []
+        allocations = []
+
+        class NativeState:
+            def __init__(self, target):
+                self.pointer = free_addresses.pop() if free_addresses else 0x1000 + len(allocations)
+                self.target = target
+                allocations.append(self.pointer)
+
+            def __del__(self):
+                free_addresses.append(self.pointer)
+
+        class EphemeralCoedge:
+            def __init__(self, target):
+                key = id(target)
+                state = states.get(key)
+                if state is None:
+                    state = NativeState(target)
+                    states[key] = state
+                self.state = state
+
+            def __repr__(self):
+                return f"<Coedge with obj at 0x{self.state.pointer:x}>"
+
+            def __getattr__(self, name):
+                return getattr(self.state.target, name)
+
+            def GetNext(self):  # noqa: N802 - SolidWorks API name
+                return EphemeralCoedge(self.state.target._next)
+
+        loop.GetFirstCoEdge = lambda: EphemeralCoedge(loop._coedges[0])
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(len(allocations), 4)
+        self.assertEqual(len(set(allocations)), 4)
+        self.assertEqual(len(states), 0)
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+
+    def test_planar_walk_still_rejects_real_coedge_repetition(self):
+        for repeated_index in (0, 1):
+            with self.subTest(repeated_index=repeated_index):
+                component, body, _edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+                loop = body._faces[0]._loops[0]
+                loop._coedges[2]._next = loop._coedges[repeated_index]
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                with self.assertRaisesRegex(CadError, "repeats a coedge before closure"):
+                    backend.export_component_meshes({"pcb-1": self.dest})
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_planar_walk_rejects_wrong_tail_and_repeated_edge_with_distinct_coedges(self):
+        for issue in ("wrong_tail", "repeated_edge"):
+            with self.subTest(issue=issue):
+                component, body, _edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+                loop = body._faces[0]._loops[0]
+                if issue == "wrong_tail":
+                    loop._coedges[3]._next = loop._coedges[1]
+                    message = "does not return to its first coedge"
+                else:
+                    loop._coedges[3]._edge = loop._coedges[2]._edge
+                    message = "does not map one-to-one to a native body edge"
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                with self.assertRaisesRegex(CadError, message):
+                    backend.export_component_meshes({"pcb-1": self.dest})
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
     def test_planar_coedge_query_interface_failure_is_fatal(self):
         component, body, _edges = _planar_sheet(
             [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])

@@ -7977,7 +7977,9 @@ class SolidWorksBackend(CadBackend):
             first_coedge = _dynamic(first_coedge)
             first_pointer = _com_iunknown_pointer(first_coedge)
             current = first_coedge
-            seen_coedges = set()
+            # Pointer identity is valid only while the corresponding COM
+            # object is alive. Keep every traversed interface until closure.
+            seen_coedges = {}
             seen_edge_indices = set()
             coedge_rows = []
             source_displacements = []
@@ -7990,9 +7992,14 @@ class SolidWorksBackend(CadBackend):
                     raise CadError(
                         "cad_native_tessellation_unreadable",
                         "the outer loop repeats a coedge before closure",
-                        {**base, "coedge_index": coedge_index},
+                        {
+                            **base,
+                            "coedge_index": coedge_index,
+                            "first_seen_coedge_index": seen_coedges[pointer][0],
+                            "coedge_iunknown_pointer": pointer,
+                        },
                     )
-                seen_coedges.add(pointer)
+                seen_coedges[pointer] = (coedge_index, current)
                 raw_edge = call(
                     "ICoEdge.GetEdge",
                     lambda value=current: _method(value, "GetEdge"),
