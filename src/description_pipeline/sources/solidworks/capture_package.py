@@ -12,7 +12,6 @@ from .discovery import (
     PLAN_SCHEMA,
     SOURCE_FILE,
     native_component_identity,
-    sealed_cached_import_materialization,
     sealed_embedded_virtual_document,
 )
 from .selection import selection_bindings
@@ -60,6 +59,24 @@ def _require_selector_state(item: dict, component: object) -> None:
     ):
         raise PipelineError(
             "The sealed capture plan does not bind the native suppression state"
+        )
+
+
+def _require_supported_source_kind(component: object) -> None:
+    """Reject the source class this capture runtime does not implement."""
+
+    provenance = (
+        component.get("source_provenance")
+        if isinstance(component, dict)
+        and isinstance(component.get("source_provenance"), dict)
+        else {}
+    )
+    if (
+        provenance.get("kind") == "native_import_materialization"
+        or provenance.get("state") == "cached_materialization"
+    ):
+        raise PipelineError(
+            "Cached-import materialization is not supported by Capture"
         )
 
 
@@ -191,9 +208,10 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
             raise PipelineError(
                 "The sealed capture plan names instances outside the sealed record"
             )
+        component = raw_components.get(name)
+        _require_supported_source_kind(component)
         document = item.get("document")
         if document is None:
-            component = raw_components.get(name)
             virtual = isinstance(
                 component, dict
             ) and sealed_embedded_virtual_document(
@@ -201,15 +219,7 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 name,
                 expected_files,
             )
-            cached = isinstance(
-                component, dict
-            ) and sealed_cached_import_materialization(
-                component,
-                name,
-                expected_files,
-                raw_selection,
-            )
-            if component is None or not (virtual or cached):
+            if component is None or not virtual:
                 raise PipelineError(
                     "The sealed capture plan omits a native selector document without complete session proof"
                 )
@@ -219,10 +229,6 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 else {}
             )
             closure = (record.get("source_selection") or {}).get("closure")
-            if cached:
-                _require_selector_state(item, component)
-                names.append(name)
-                continue
             virtuals = (
                 closure.get("virtual_components")
                 if isinstance(closure, dict)
@@ -287,18 +293,6 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                     "The sealed closure does not bind the embedded-virtual occurrence"
                 )
         if document is not None:
-            component = raw_components.get(name)
-            if isinstance(
-                component, dict
-            ) and sealed_cached_import_materialization(
-                component,
-                name,
-                expected_files,
-                raw_selection,
-            ):
-                raise PipelineError(
-                    "The sealed capture plan carries a cached-import session document"
-                )
             if not isinstance(document, str) or not document:
                 raise PipelineError(
                     "The sealed capture plan carries an unusable selector document"
