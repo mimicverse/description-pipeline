@@ -646,63 +646,34 @@ operation runtime 和一个 CAD resource owner，workspace 是 operation-local �
 本版不新增共享 source cache、兼容链或第二生命周期。未来内容复用只能是可丢弃字节
 优化，不能改变工程资格或替代阶段独立 admission。
 
-### Native tessellation v13
+### 原生三角形事实
 
-当前 Capture `itessellation` 证据使用
-`solidworks-to-urdf.native-tessellation/v13`；
-`solidworks-to-urdf.capture-preparation/v3` 与
-`solidworks-to-urdf.rebuild-session-recovery/v3` 保持不变。旧 v8、v9、v10、v11 或 v12
-对象不得自动转换、重标或作为 v13 兼容输入；历史事实只按原 schema 保全。
+当前 Capture 使用唯一的 `native-triangles/v1` 事实契约。原生会话沿
+`occurrence.GetBodies2 → GetFaces → GetTessTriangles(True)` 读取已保存配置的实际
+body、face 和三角形；每个 face 的直接返回按原始次序保留，不切换备用几何链。
+旧几何与准备收据按原 schema 保全，不能重标版本、填充新字段或自动晋升为当前输入。
 
-每个 body 恰使用一次 whole-body analysis tessellation。唯一一次
-`IBody2.GetTessellation` 请求必须精确包含一个显式
-`VARIANT(VT_EMPTY, None)` 参数；request 原件记录参数数量 `1`、
-`variant_type=VT_EMPTY` 与空值，consumer 拒绝裸 `None`、零长度 SAFEARRAY 或全 face
-数组。唯一一次 `Tessellate` 前 request 和 observed block 必须分别精确包含
-`improved_quality=true`、`match_type=0`、
-`need_error_list=true`、`need_face_facet_map=true`、`need_edge_fin_map=true`、
-`need_vertex_params=true`；字段集、精确 `bool`/`int` 类型和值在顶层及每个 body 均须
-一致。`MatchType` 是严格整数 0，其余布尔属性不得用整数 0/1 替代。失败后不得重设质量
-模式或采样参数再次 tessellate。
+原始三角形每项为九个有限 `binary64` 数值，单位为米、坐标位于 component-local。
+封存字节保留原值与顺序，严格核验格式版本、数量和文件长度，拒绝截断、尾随字节、
+非有限值和无效三角形。body/face inventory 与连续、正数量的 face spans 必须完整
+覆盖同一 raw stream，不允许重叠、遗漏、未知归属或把读取失败转为空几何。
 
-`Tessellate` 必须返回严格布尔。`false` 是 body 原生失败：在读取 `GetFaceFacets` 前
-停止成功路径，不得从失败后的零计数、空数组或 `null` 形成空几何。允许从同次对象保存
-五个 `GetErrorList` automation `VT_BYREF|VT_VARIANT` 输出、返回状态、face canonical
-IUnknown 诊断身份／面积和不完整全局数量，但这些只是失败诊断；`None`、不可读、映射
-失败或后处理异常均不得转换成空列表、成功或替代首因。
+每份事实绑定 occurrence、配置、原始 placement、body/face、source scope 和冻结
+字节。由本次 source scope、实体类型及原生遍历索引派生的局部对象身份，必须保留
+规则和字段级来源 warning；不能冒称原生持久引用，也不能要求所有对象具有辅助
+persistent reference。scene 保留实际 placement，不能为简化转换替换为单位矩阵。
 
-`GetFaceFacets` 与 `GetEdgeFins` 必须保存同次成功 tessellation 的原始返回和 typed
-face/edge 绑定。直接 list/tuple 必须为扁平、无重复、非负的严格整数数组，raw order
-原样保存后再做规范化；不得先递归展平、去重或排序再判断。`GetFacetFins` 必须返回恰好
-三个不同非负严格整数。嵌套数组、标量、未知类型、重复 ID、错误对象或 COM 读取失败
-均拒绝，不切换备用 API 或第二 tessellation。
+`prepare_prepared_capture` 只绑定已封存 prepared 的 root/configuration，不打开
+COM；Freeze 保留初次准备职责。Capture 读取 scene 与内存几何事实后，按唯一会话
+所有权协议释放 CAD，再离线执行原值投影、raw/STL 序列化和封包。STL 从同一 raw
+三角形派生，保留 component-local 坐标，明确法向量和浮点编码的派生来源，不能重复
+应用 occurrence placement。原生错误及已取得的 partial facts 保全，不被离线异常替代。
 
-成功 nullable 数组只有经完整集合闭包才可归一化为狭义空集合：
-
-1. `GetFaceFacets(face) -> None` 仅允许严格 `body_type=1`、`Tessellate=true`、属性
-   request 与 observed 全部正确、完整 face inventory 已读，且全部成功 facet arrays
-   跨 face 不重叠、facet ID 总数与并集大小均等于同次原生 `GetFacetCount`。此时保留
-   `raw_facet_ids=null`，派生 `facet_ids=[]`、`facet_count=0`、
-   `facet_ids_source=native-body-global-null-zero`，并在该 face 字段记录
-   `cad_face_facet_ids_derived_by_body_global_closure` warning。
-2. `GetEdgeFins(edge) -> None` 仅允许同一 body 的一或两个唯一 incident faces 都已由
-   (1) 证明为零 facet，且全部 `GetFacetFins` 关系完整、唯一归属、fin 总数等于同次
-   `GetFinCount`。此时保留 `raw_fin_ids=null`，派生 `fin_ids=[]`、
-   `fin_ids_source=native-incident-faces-null-zero`，并记录
-   `cad_edge_fin_ids_derived_by_empty_incident_faces` warning。
-3. 成功直接空数组保留 `native-flat-array` 来源和空 raw array。solid body、另一 body、
-   缺失/额外 face、错误 incident ownership、任何未覆盖 facet/fin、总量不符或任何
-   warning 不自洽均拒绝。
-
-这两条规则只表达原生闭包证明的真实 facet/fin 缺失；不得生成 fin、cofin、U interval，
-不得删除 edge，不得声称已经读取 `GetFacetFace`/`GetFinEdge`，也不得给零 facet face
-最终曲面距离、完整拓扑或参考几何资格。face 的实例、正面积、原生身份与
-`cad_sheet_face_untessellated` warning 继续保留，交付网格与最终 50 µm 曲面验收保持。
-`raw/source_scopes.json` 沿 v3 preparation/session-recovery 规则，与 discovery、scene、
-capture、geometry、dependency closure 及实际冻结字节逐层交叉核验。
-
-更详细的质量门由 root-owned `docs/quality.md` 定义；本 proposal 不覆盖该文件的
-`native-tessellation/v13` 文本。
+独立 consumer 从 raw 字节、face spans、原始 placement、物性和基准读数复算实际
+输出，核验源绑定、单位、坐标、对象归属及派生 warning，不能只比较生产者的投影。
+三角网格拓扑和 raw/STL 一致性不自动建立原生 BRep、光滑曲面距离或最终工程资格；
+最终 50 µm 双向曲面上界、覆盖、朝向及其他质量要求仍按 `docs/quality.md` 验收，
+未建立项如实保持未通过，不借用历史几何证明或未验证预览豁免。
 
 ### Native target identity
 
@@ -746,7 +717,7 @@ inventory，只将受约束的相对路径定位到已登记工程副本，不�
 只保存 selection、原生对象、规则、证据和 prepared bytes 身份，不另存完整机器人模型；
 不得在采集结束后从配置或结果倒造新的计划。
 
-原生记录仅包含直接读数、API 状态、原生引用、配置、保存状态、环境及网格。长度、角度、质量和惯量转换为 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法。适配器只在 COM 边界转换单位和厂商矩阵布局；推导、闭包比较、几何统计、诊断解释与报告渲染全部在 Linux 完成。格式校验和封存摘要计算属于传输职责。
+原生记录保留直接读数、API 状态、原生引用、配置、保存状态、环境及原始几何。厂商矩阵布局、单位和原始数值先如实保全；释放 CAD 后从固定事实离线投影到 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法，保留原值到结果的规则和来源 warning。工程模型生成、闭包比较、独立工程验证、诊断解释与报告渲染在 Linux 完成；格式校验和封存摘要计算属于传输职责。
 
 当前方向处理不引入基于右手定则的新正向选择或符号推导规则，也不引入屈曲、外展等功能动作推导正向。输出遵循 URDF 既定格式和坐标约定，并按[《MimicVerse URDF 工程标准 v1》](https://hcnd2fgke1pv.feishu.cn/docx/N3iSdpYxGo151UxgBz6csCthnSb)检查表达一致性；这些约定不能用来绕过 CAD 已有有向轴及有效作者声明。斜轴保留真实机械轴，不吸附到主轴。名称、全局向量分量或镜像标记不能单独决定正向。
 

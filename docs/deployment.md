@@ -286,19 +286,15 @@ start、stop、health 和 recovery。triggerer 缺失、版本不符、未运行
     target 不 admit、不 create、不启动 executor，原 operation 保持未决。另证明
     `ready=false` 或 `unresolved>0` 不封锁只读观察、对账和恢复，且 same tool、平台
     origin claim、native worker owner 与 install target 分别核验。
-11. 使用 root-approved `native-tessellation/v13` source 验证一次 whole-body analysis
-    tessellation：唯一 `IBody2.GetTessellation` 请求恰有一个显式
-    `VARIANT(VT_EMPTY, None)`，参数数量、VARIANT 类型和空值均被独立复核；六个严格属性
-    均在唯一 `Tessellate` 前设置并逐 body 回读，
-    `ImprovedQuality` 只请求一次，`NeedErrorList` 的五项 byref VARIANT 和不支持接口的
-    诊断行为符合合同。`Tessellate=false` 必须在 `GetFaceFacets` 前失败，失败后零计数
-    或 `null` 不得成为空几何；独立 consumer 复算六属性及失败证据。
-12. 注入 `GetFaceFacets=None`、`GetEdgeFins=None`、直接空数组、重复/嵌套/标量 ID、
-    跨 face 重叠、facet/fin 总量不足或超出、错误 incident ownership、solid body 与
-    COM 读取失败：只有严格 sheet body、完整 face/facet/fin 集合闭合成立时才接受派生空
-    set，并核对原始 nullable、`raw/source_scopes`、typed 对象身份、具体 rule 和
-    `cad_face_facet_ids_derived_by_body_global_closure` /
-    `cad_edge_fin_ids_derived_by_empty_incident_faces` warning。其余情况全部拒绝。
+11. 使用固定候选的真实生产方法验证 `native-triangles/v1`：从 occurrence/body/face
+    的原生返回读取 raw 三角形、实际 placement、物性与基准值，证明 CAD 释放先于
+    离线投影、STL 序列化和封包。质量、质心及两种参考点的惯量须从同一实际原生
+    物性对象读取；测试不得用 support fixture 预填缺失原值来替代生产读取。
+12. 注入原生读取失败、原始矩阵和惯量缺失或篡改、非法数量、截断/尾随字节、非有限
+    三角形、错误 occurrence/configuration/source scope、face span 遗漏或重叠、
+    错误 placement 和 STL 派生字节。独立 consumer 必须从 raw 复算并拒绝，保留
+    primary 错误及 partial facts；正例覆盖合法原生读取、释放后的离线转换和原值复核。
+    raw/STL 一致性不替代最终工程验证及 50 µm 参考几何资格。
 
 保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
