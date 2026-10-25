@@ -11,6 +11,7 @@ number in ``raw/`` comes from the CAD API during this capture.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -37,6 +38,7 @@ from .jsonio import digest_json, read_json, sha256_file, write_json
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
 from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA, NATIVE_TESSELLATION_SCHEMA
+from ...geometry.native_planar_brep import NATIVE_PLANAR_BREP_SCHEMA
 
 #: Freeze/capture record ids live in the ``solidworks-to-urdf.*`` family only.
 #: Sealed evidence from before the XC-01 rename is replayed with its era
@@ -2003,6 +2005,7 @@ def _export_geometry(
                 "native_edges",
                 "no_facets_faces",
                 "itessellation",
+                "planar_brep",
             }
             or tessellation.get("schema_version") != NATIVE_TESSELLATION_SCHEMA
             or not isinstance(tessellation.get("faces"), int)
@@ -2010,6 +2013,17 @@ def _export_geometry(
             or not isinstance(tessellation.get("native_edges"), list)
             or not isinstance(tessellation.get("no_facets_faces"), list)
             or not isinstance(tessellation.get("itessellation"), dict)
+            or not (
+                isinstance(tessellation.get("planar_brep"), dict)
+                and set(tessellation["planar_brep"])
+                == {"schema_version", "bodies"}
+                and tessellation["planar_brep"]["schema_version"]
+                == NATIVE_PLANAR_BREP_SCHEMA
+                and isinstance(
+                    tessellation["planar_brep"]["bodies"],
+                    list,
+                )
+            )
         ):
             raise BridgeError(
                 "cad_mesh_export_failed",
@@ -2606,6 +2620,45 @@ def _freeze_local(
         stage = "readings"
         _capture_note(activity, "readings")
         scene, raw = _capture_readings(backend, cfg, closure, staging / "source", activity=activity)
+        preparation = (scene.notes or {}).get("capture_preparation")
+        recovery = (
+            preparation.get("session_recovery")
+            if isinstance(preparation, dict)
+            else None
+        )
+        if recovery is not None:
+            # Keep the environment observed before the failure and replace the
+            # delivery environment with the session that actually produced the
+            # final readings.
+            write_json(
+                staging / "evidence" / "capture-environment-before-recovery.json",
+                environment,
+            )
+            final_environment = capture_environment(backend, worker_version)
+            final_copy = (
+                (final_environment.get("solidworks") or {}).get("sessions") or {}
+            ).get("copy")
+            if (
+                not isinstance(final_copy, dict)
+                or final_copy != preparation["session"]["identity"]
+            ):
+                raise BridgeError(
+                    "cad_rebuild_recovery_environment",
+                    "The final capture environment does not bind the recovered session",
+                    {
+                        "preparation_session": preparation.get("session"),
+                        "environment_copy": final_copy,
+                    },
+                    exit_code=3,
+                )
+            final_environment["session_boundary"] = copy.deepcopy(
+                environment["session_boundary"]
+            )
+            environment = final_environment
+            write_json(
+                staging / "evidence" / "environment.json",
+                environment,
+            )
         write_json(staging / "raw" / "scene_raw.json", raw)
         write_json(staging / "raw" / "document_state.json", state)
         write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])
@@ -2663,6 +2716,10 @@ def _freeze_local(
             _capture_note(activity, "geometry")
             geometry_entries = _export_geometry(backend, cfg, staging / "geometry", components, activity=activity)
             write_json(staging / "raw" / "geometry.json", geometry_entries)
+            selections = (getattr(backend, "notes", None) or {}).get("geometry_provider_selection")
+            if isinstance(selections, dict):
+                scene.notes["geometry_provider_selection"] = copy.deepcopy(selections)
+                write_json(staging / "raw" / "scene_raw.json", _raw_scene_payload(scene, cfg, staging / "source"))
 
         stage = "verify_sources"
         _capture_note(activity, "verify_sources")

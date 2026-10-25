@@ -715,6 +715,9 @@ def _mesh_body(faces, key: str):
     face_by_id = {id(face): index for index, face in enumerate(faces)}
 
     class _MeshTessellation:
+        ImprovedQuality = True
+        MatchType = 0
+        NeedErrorList = True
         NeedFaceFacetMap = True
         NeedEdgeFinMap = True
         NeedVertexParams = True
@@ -772,6 +775,7 @@ def _com_stubs():
     pythoncom.VT_BSTR = 8
     pythoncom.VT_BOOL = 11
     pythoncom.VT_I4 = 3
+    pythoncom.VT_EMPTY = 0
     pythoncom.VT_DISPATCH = 9
     pythoncom.VT_ARRAY = 0x2000
     pythoncom.COINIT_APARTMENTTHREADED = 2

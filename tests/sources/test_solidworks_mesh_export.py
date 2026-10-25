@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
+import math
 import shutil
 import struct
 import tempfile
@@ -18,6 +20,24 @@ from . import support
 
 from description_pipeline.geometry.stl import read as read_stl  # noqa: E402
 from description_pipeline.geometry.stl import vertices as stl_vertices  # noqa: E402
+from description_pipeline.geometry.native_planar_brep import (  # noqa: E402
+    NATIVE_PLANAR_BREP_PROVIDER,
+)
+from description_pipeline.geometry.native_u import (  # noqa: E402
+    NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+    NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+)
+from description_pipeline.geometry.native_tessellation import (  # noqa: E402
+    parse_native_tessellation,
+)
+from description_pipeline.io import PipelineError  # noqa: E402
+from description_pipeline.verification.native_mesh_observations import (  # noqa: E402
+    _verify_planar_stl_normals,
+    verify_native_mesh_observations,
+)
+from description_pipeline.verification.solidworks_urdf import native_gate_warning_diagnostics  # noqa: E402
+from description_pipeline.sources.snapshot import write_manifest  # noqa: E402
+from description_pipeline.schemas import NATIVE_FACETLESS_EVIDENCE_API  # noqa: E402
 from description_pipeline.sources.solidworks import native as native_module  # noqa: E402
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import SolidWorksBackend  # noqa: E402
@@ -32,9 +52,10 @@ def _packed_success_status():
     return struct.unpack("<d", struct.pack("<Q", 1))[0]
 
 
-def _fake_whole_body_face_list(_faces, face_reference_sha256):
-    return "VT_ARRAY|VT_DISPATCH", support.native_tessellation_request(
-        face_reference_sha256
+def _fake_whole_body_tessellation_argument():
+    return (
+        SimpleNamespace(varianttype=0, value=None),
+        support.native_tessellation_request(),
     )
 
 
@@ -53,13 +74,27 @@ class FakeCurve:
         self.end_params_calls.append((start, end, is_closed, is_periodic))
         for output, value_type, value in (
             (start, NATIVE_VT_BYREF_R8, 0.0),
-            (end, NATIVE_VT_BYREF_R8, 1.0),
+            (end, NATIVE_VT_BYREF_R8, self._edge._u_max),
             (is_closed, NATIVE_VT_BYREF_BOOL, False),
             (is_periodic, NATIVE_VT_BYREF_BOOL, False),
         ):
+            if output is start:
+                value = self._edge._u_min
             output.varianttype = value_type
             output.value = value
         return True
+
+    def IsLine(self):  # noqa: N802 - SolidWorks API name
+        return True
+
+    @property
+    def LineParams(self):  # noqa: N802 - SolidWorks API name
+        start = self._edge._start._point
+        end = self._edge._end._point
+        return [
+            *start,
+            *(end[axis] - start[axis] for axis in range(3)),
+        ]
 
 
 def _read_fake_end_params(curve):
@@ -77,10 +112,7 @@ def _read_fake_end_params(curve):
         "end": end.value,
         "is_closed": is_closed.value,
         "is_periodic": is_periodic.value,
-        "raw_outputs": [
-            {"value_type": output.varianttype, "value": output.value}
-            for output in outputs
-        ],
+        "raw_outputs": [{"value_type": output.varianttype, "value": output.value} for output in outputs],
     }
 
 
@@ -116,9 +148,12 @@ class FakeEdge:
         self._owner = None
         self._faces = []
         self._curve = FakeCurve(self)
+        self._in_face_sense = True
         self.is_tolerant = False
         self.tolerant_gap_m = 0.0
         self.tolerance_calls = 0
+        self._u_min = 0.0
+        self._u_max = 1.0
 
     def GetStartVertex(self):  # noqa: N802 - SolidWorks API name
         return self._start
@@ -142,8 +177,8 @@ class FakeEdge:
 
     def GetCurveParams3(self):  # noqa: N802 - SolidWorks API name
         return SimpleNamespace(
-            UMinValue=0.0,
-            UMaxValue=1.0,
+            UMinValue=self._u_min,
+            UMaxValue=self._u_max,
             StartPoint=self._start._point,
             EndPoint=self._end._point,
             Sense=True,
@@ -151,10 +186,10 @@ class FakeEdge:
         )
 
     def EdgeInFaceSense(self, face):  # noqa: N802 - SolidWorks API name
-        return face is self._faces[-1]
+        return face is self._faces[-1] and self._in_face_sense
 
     def IEdgeInFaceSense2(self, face):  # noqa: N802 - SolidWorks API name
-        return face is self._faces[-1]
+        return face is self._faces[-1] and self._in_face_sense
 
     def _u(self, x, y, z):
         start = self._start._point
@@ -163,24 +198,26 @@ class FakeEdge:
         length_squared = sum(value * value for value in axis)
         if length_squared == 0.0:
             return 0.0
-        return sum(
-            (point - origin) * direction
-            for point, origin, direction in zip(
-                (x, y, z),
-                start,
-                axis,
-                strict=True,
+        fraction = (
+            sum(
+                (point - origin) * direction
+                for point, origin, direction in zip(
+                    (x, y, z),
+                    start,
+                    axis,
+                    strict=True,
+                )
             )
-        ) / length_squared
+            / length_squared
+        )
+        return self._u_min + fraction * (self._u_max - self._u_min)
 
     def GetClosestPointOn(self, x, y, z):  # noqa: N802 - SolidWorks API name
         parameter = self._u(x, y, z)
+        fraction = (parameter - self._u_min) / (self._u_max - self._u_min)
         start = self._start._point
         end = self._end._point
-        point = [
-            start[index] + parameter * (end[index] - start[index])
-            for index in range(3)
-        ]
+        point = [start[index] + fraction * (end[index] - start[index]) for index in range(3)]
         return [*point, parameter, 0.0]
 
     def GetParameter(self, x, y, z):  # noqa: N802 - SolidWorks API name
@@ -189,11 +226,9 @@ class FakeEdge:
     def Evaluate2(self, parameter, _derivatives):  # noqa: N802 - SolidWorks API name
         start = self._start._point
         end = self._end._point
+        fraction = (parameter - self._u_min) / (self._u_max - self._u_min)
         return [
-            *(
-                start[index] + parameter * (end[index] - start[index])
-                for index in range(3)
-            ),
+            *(start[index] + fraction * (end[index] - start[index]) for index in range(3)),
             0.0,
             0.0,
             0.0,
@@ -213,25 +248,20 @@ class FakeFace:
         area=0.0,
         edges=None,
         facet_triangles=None,
+        loops=None,
     ):
         self._triangles = triangles
-        self._facet_triangles = (
-            list(triangles)
-            if facet_triangles is None
-            else list(facet_triangles)
-        )
-        self._surface = surface
+        self._facet_triangles = list(triangles) if facet_triangles is None else list(facet_triangles)
+        self._surface = surface or FakeSurface((0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0))
         self.Name = "Face3"
         self._feature = feature
         # Raw native value types are preserved verbatim so tests can pin the
         # evidence-type rejection (a boolean is not an integer count or area).
-        self._triangle_count = (
-            triangle_count
-            if triangle_count is not None
-            else len(self._facet_triangles) // 9
-        )
+        self._triangle_count = triangle_count if triangle_count is not None else len(self._facet_triangles) // 9
         self._area = area
         self._edges = list(edges or ())
+        self._loops = list(loops or ())
+        self._face_in_surface_sense = False
         self._owner = None
         self.triangle_calls = 0
         self._persist_reference = b"face-" + FakeFace._next_reference.to_bytes(8, "little")
@@ -259,10 +289,122 @@ class FakeFace:
     def GetBody(self):  # noqa: N802 - SolidWorks API name
         return self._owner
 
+    def GetLoopCount(self):  # noqa: N802 - SolidWorks API name
+        return len(self._loops)
+
+    def GetLoops(self):  # noqa: N802 - SolidWorks API name
+        return list(self._loops)
+
+    def FaceInSurfaceSense(self):  # noqa: N802 - SolidWorks API name
+        return self._face_in_surface_sense
+
 
 class FakeSurface:
     def __init__(self, params):
         self.CylinderParams = list(params)
+
+    def IsPlane(self):  # noqa: N802 - SolidWorks API name
+        return False
+
+
+class FakePlanarSurface:
+    def __init__(self, normal=(0.0, 0.0, 1.0), root=(0.0, 0.0, 0.0)):
+        self.PlaneParams = [*normal, *root]
+
+    def IsPlane(self):  # noqa: N802 - SolidWorks API name
+        return True
+
+
+class FakeCoEdge:
+    def __init__(
+        self,
+        edge,
+        index=0,
+        *,
+        reverse=False,
+        curve_present=True,
+    ):
+        self._edge = edge
+        self._index = index
+        self._next = None
+        self._reverse = reverse
+        self._curve_present = curve_present
+
+    def GetEdge(self):  # noqa: N802 - SolidWorks API name
+        return self._edge
+
+    def GetCurve(self):  # noqa: N802 - SolidWorks API name
+        return self._edge._curve if self._curve_present else None
+
+    def GetCurveParams(self):  # noqa: N802 - SolidWorks API name
+        start = self._edge._end if self._reverse else self._edge._start
+        end = self._edge._start if self._reverse else self._edge._end
+        start_parameter = self._edge._u_max if self._reverse else self._edge._u_min
+        end_parameter = self._edge._u_min if self._reverse else self._edge._u_max
+        return [
+            *start._point,
+            *end._point,
+            start_parameter,
+            end_parameter,
+            False,
+            False,
+        ]
+
+    def GetSense(self):  # noqa: N802 - SolidWorks API name
+        return not self._reverse
+
+    def Evaluate2(  # noqa: N802 - SolidWorks API name
+        self,
+        parameter,
+        derivative_count,
+    ):
+        if derivative_count != 1:
+            raise ValueError("fixture supports one derivative")
+        start = self._edge._start._point
+        end = self._edge._end._point
+        point_direction = [end[axis] - start[axis] for axis in range(3)]
+        fraction = (parameter - self._edge._u_min) / (self._edge._u_max - self._edge._u_min)
+        tangent = [-value for value in point_direction] if self._reverse else point_direction
+        return [
+            *(start[axis] + fraction * point_direction[axis] for axis in range(3)),
+            *tangent,
+        ]
+
+    def GetNext(self):  # noqa: N802 - SolidWorks API name
+        return self._next
+
+
+class FakePlanarLoop:
+    def __init__(
+        self,
+        edges,
+        *,
+        reverse=False,
+        coedge_curve_present=True,
+    ):
+        self._coedges = [
+            FakeCoEdge(
+                edge,
+                index,
+                reverse=reverse,
+                curve_present=coedge_curve_present,
+            )
+            for index, edge in enumerate(edges)
+        ]
+        for index, coedge in enumerate(self._coedges):
+            coedge._next = self._coedges[(index + 1) % len(self._coedges)]
+
+    def IsOuter(self):  # noqa: N802 - SolidWorks API name
+        return True
+
+    def GetEdgeCount(self):  # noqa: N802 - SolidWorks API name
+        return len(self._coedges)
+
+    def GetCoEdgeCount(self):  # noqa: N802 - SolidWorks API name
+        return len(self._coedges)
+
+    def GetFirstCoEdge(self):  # noqa: N802 - SolidWorks API name
+        return self._coedges[0]
 
 
 class FakeBody:
@@ -314,7 +456,9 @@ class FakeTessellation:
 
     def __setattr__(self, name, value):
         if name in {
+            "ImprovedQuality",
             "MatchType",
+            "NeedErrorList",
             "NeedFaceFacetMap",
             "NeedEdgeFinMap",
             "NeedVertexParams",
@@ -330,53 +474,26 @@ class FakeTessellation:
         body = tessellation["itessellation"]["bodies"][0]
         self._graph = tessellation
         self._facets_by_face = {
-            id(face): next(
-                row["facet_ids"]
-                for row in body["faces"]
-                if row["face_index"] == face_index
-            )
+            id(face): next(row["facet_ids"] for row in body["faces"] if row["face_index"] == face_index)
             for face_index, face in enumerate(faces)
         }
         self._facets_by_reference = {
             hashlib.sha256(face._persist_reference).hexdigest(): values
-            for face, values in (
-                (face, self._facets_by_face[id(face)]) for face in faces
-            )
+            for face, values in ((face, self._facets_by_face[id(face)]) for face in faces)
         }
-        self._fins_by_facet = {
-            row["facet_id"]: row["fin_ids"] for row in body["facets"]
-        }
-        edge_rows = {
-            row["edge_reference_sha256"]: row
-            for row in tessellation["native_edges"]
-        }
+        self._fins_by_facet = {row["facet_id"]: row["fin_ids"] for row in body["facets"]}
+        edge_rows = {row["edge_reference_sha256"]: row for row in tessellation["native_edges"]}
         self._fins_by_edge = {
-            id(edge): list(
-                edge_rows[
-                    hashlib.sha256(edge._persist_reference).hexdigest()
-                ]["fin_ids"]
-            )
-            for edge in edges
+            id(edge): list(edge_rows[hashlib.sha256(edge._persist_reference).hexdigest()]["fin_ids"]) for edge in edges
         }
         self._fins_by_edge_reference = {
             hashlib.sha256(edge._persist_reference).hexdigest(): values
-            for edge, values in (
-                (edge, self._fins_by_edge[id(edge)]) for edge in edges
-            )
+            for edge, values in ((edge, self._fins_by_edge[id(edge)]) for edge in edges)
         }
         fins = {row["fin_id"]: row for row in body["fins"]}
-        self._fin_vertices = {
-            fin_id: list(row["vertex_ids"]) for fin_id, row in fins.items()
-        }
-        self._vertex_points = {
-            row["vertex_id"]: row["point_m"]
-            for row in tessellation["itessellation"]["vertices"]
-        }
-        self._cofins = {
-            fin_id: row["cofin_id"]
-            for fin_id, row in fins.items()
-            if row["cofin_id"] is not None
-        }
+        self._fin_vertices = {fin_id: list(row["vertex_ids"]) for fin_id, row in fins.items()}
+        self._vertex_points = {row["vertex_id"]: row["point_m"] for row in tessellation["itessellation"]["vertices"]}
+        self._cofins = {fin_id: row["cofin_raw_id"] for fin_id, row in fins.items() if row["cofin_raw_id"] is not None}
 
     def Tessellate(self):  # noqa: N802 - SolidWorks API name
         if self.raises:
@@ -389,9 +506,7 @@ class FakeTessellation:
             values = self._facets_by_face.get(id(face))
             if values is None:
                 reference = getattr(face, "_persist_reference", b"")
-                values = self._facets_by_reference[
-                    hashlib.sha256(reference).hexdigest()
-                ]
+                values = self._facets_by_reference[hashlib.sha256(reference).hexdigest()]
             return list(values)
         return list(range(1, int(self._facets or 0) + 1))
 
@@ -558,30 +673,19 @@ def _configure_fake_body(body, extension):
             face_triangles = []
         else:
             face_triangles = [
-                tuple(
-                    tuple(values[offset : offset + 3])
-                    for offset in range(triangle_start, triangle_start + 9, 3)
-                )
+                tuple(tuple(values[offset : offset + 3]) for offset in range(triangle_start, triangle_start + 9, 3))
                 for triangle_start in range(0, len(values), 9)
             ]
         triangle_start = len(triangles)
         triangles.extend(face_triangles)
-        face_reference = hashlib.sha256(
-            bytes(extension.GetPersistReference3(face))
-        ).hexdigest()
-        span_triangles = [
-            point
-            for triangle in face_triangles
-            for point in triangle
-        ]
+        face_reference = hashlib.sha256(bytes(extension.GetPersistReference3(face))).hexdigest()
+        span_triangles = [point for triangle in face_triangles for point in triangle]
         spans.append(
             {
                 "body_type": 0,
                 "body_index": 0,
                 "body_name": body.Name,
-                "body_reference_sha256": hashlib.sha256(
-                    bytes(extension.GetPersistReference3(body))
-                ).hexdigest(),
+                "body_reference_sha256": hashlib.sha256(bytes(extension.GetPersistReference3(body))).hexdigest(),
                 "face_index": face_index,
                 "face_reference_sha256": face_reference,
                 "face_owner_id": face_index + 1,
@@ -589,17 +693,14 @@ def _configure_fake_body(body, extension):
                 "triangle_start": triangle_start,
                 "triangle_count": len(face_triangles),
                 "triangle_records_sha256": hashlib.sha256(
-                    b"".join(
-                        struct.pack("<3f", *point)
-                        for point in span_triangles
-                    )
+                    b"".join(struct.pack("<3f", *point) for point in span_triangles)
                 ).hexdigest(),
             }
         )
 
     edge_rows = []
     for edge in edges.values():
-        if len(edge._faces) != 2:
+        if len(edge._faces) not in (1, 2):
             continue
         reference = hashlib.sha256(edge._persist_reference).hexdigest()
         face_indices = sorted(faces.index(face) for face in edge._faces)
@@ -610,12 +711,8 @@ def _configure_fake_body(body, extension):
                 "body_type": 0,
                 "body_index": 0,
                 "edge_reference_sha256": reference,
-                "start_vertex_reference_sha256": hashlib.sha256(
-                    edge._start._persist_reference
-                ).hexdigest(),
-                "end_vertex_reference_sha256": hashlib.sha256(
-                    edge._end._persist_reference
-                ).hexdigest(),
+                "start_vertex_reference_sha256": hashlib.sha256(edge._start._persist_reference).hexdigest(),
+                "end_vertex_reference_sha256": hashlib.sha256(edge._end._persist_reference).hexdigest(),
                 "start_point_m": list(edge._start._point),
                 "end_point_m": list(edge._end._point),
                 "face_indices": face_indices,
@@ -623,7 +720,10 @@ def _configure_fake_body(body, extension):
         )
 
     tessellation = body.GetTessellation(None)
-    if tessellation.automatic and faces:
+    planar_fixture = not triangles and bool(edges) and all(len(edge._faces) == 1 for edge in edges.values())
+    if planar_fixture:
+        tessellation._facets = 0
+    elif tessellation.automatic and faces:
         graph = support.native_tessellation_fixture(
             spans,
             edge_rows,
@@ -655,9 +755,7 @@ def _backend(component, name="pcb-1") -> SolidWorksBackend:
     backend._sessions["source"] = SimpleNamespace(
         app=SimpleNamespace(
             GetOpenDocumentByName=lambda requested: (
-                component._document
-                if requested == part_path
-                else doc if requested == path else None
+                component._document if requested == part_path else doc if requested == path else None
             )
         ),
         process=SimpleNamespace(alive=lambda: True),
@@ -676,6 +774,49 @@ def _backend(component, name="pcb-1") -> SolidWorksBackend:
     return backend
 
 
+def _planar_sheet(
+    points,
+    *,
+    normal=(0.0, 0.0, 1.0),
+    face_in_surface_sense=False,
+):
+    area_vector = [
+        sum(
+            points[index][(axis + 1) % 3] * points[(index + 1) % len(points)][(axis + 2) % 3]
+            - points[index][(axis + 2) % 3] * points[(index + 1) % len(points)][(axis + 1) % 3]
+            for index in range(len(points))
+        )
+        / 2.0
+        for axis in range(3)
+    ]
+    area = math.sqrt(sum(value**2 for value in area_vector))
+    edges = [
+        FakeEdge(
+            f"planar-edge-{index}".encode(),
+            points[index],
+            points[(index + 1) % len(points)],
+        )
+        for index in range(len(points))
+    ]
+    for index, edge in enumerate(edges):
+        edge._end = edges[(index + 1) % len(edges)]._start
+    loop = FakePlanarLoop(edges)
+    face = FakeFace(
+        [],
+        surface=FakePlanarSurface(normal=normal, root=points[0]),
+        area=area,
+        edges=edges,
+        loops=[loop],
+    )
+    face._face_in_surface_sense = face_in_surface_sense
+    body = FakeBody([face], name="planar-sheet")
+    component = FakeComponent(
+        FakeDocument([]),
+        {0: [], 1: [body]},
+    )
+    return component, body, edges
+
+
 class ComponentMeshExportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-mesh-"))
@@ -691,33 +832,41 @@ class ComponentMeshExportTests(unittest.TestCase):
             self.addCleanup(end_params_patch.stop)
         face_list_patch = patch.object(
             native_module,
-            "_whole_body_face_list",
-            _fake_whole_body_face_list,
+            "_whole_body_tessellation_argument",
+            _fake_whole_body_tessellation_argument,
         )
         face_list_patch.start()
         self.addCleanup(face_list_patch.stop)
-        production_read_edge_tolerance = native_module._read_edge_tolerance
 
-        class EdgeToleranceVariant:
-            def __init__(self, varianttype, value):
-                self.varianttype = varianttype
-                self.value = value
-
-        def read_edge_tolerance(edge):
-            return production_read_edge_tolerance(
-                edge,
-                variant_factory=EdgeToleranceVariant,
-                vt_byref=0x4000,
-                vt_r8=5,
-            )
-
-        tolerance_patch = patch.object(
-            native_module,
-            "_read_edge_tolerance",
-            side_effect=read_edge_tolerance,
+    def _planar_export(
+        self,
+        points=None,
+        *,
+        normal=(0.0, 0.0, 1.0),
+        face_in_surface_sense=False,
+        area_observation=None,
+    ):
+        points = points or [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+        component, body, edges = _planar_sheet(
+            points,
+            normal=normal,
+            face_in_surface_sense=face_in_surface_sense,
         )
-        tolerance_patch.start()
-        self.addCleanup(tolerance_patch.stop)
+        if area_observation is not None:
+            body._faces[0]._area = area_observation
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        triangle_vertices = [
+            tuple(tuple(float(value) for value in point) for point in record)
+            for record in stl_vertices(self.dest).reshape(-1, 3, 3)
+        ]
+        return entry, triangle_vertices, body, edges, tessellation_calls
 
     def test_sheet_only_part_exports_its_faces(self):
         body = FakeBody([FakeFace(TRIANGLE)])
@@ -731,23 +880,1270 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(entry["bodies"], {"solid": 0, "sheet": 1})
         self.assertIn("ITessellation", entry["used_api"])
         self.assertEqual(component.body_calls, [(0,), (1,), (1,)])
-        self.assertEqual(
-            body.tessellation_face_lists[-1],
-            "VT_ARRAY|VT_DISPATCH",
-        )
+        argument = body.tessellation_face_lists[-1]
+        self.assertEqual(argument.varianttype, 0)
+        self.assertIsNone(argument.value)
+        self.assertIs(body._tessellation.requested["ImprovedQuality"], True)
         self.assertEqual(body._tessellation.requested["MatchType"], 0)
+        self.assertIs(body._tessellation.requested["NeedErrorList"], True)
         self.assertEqual(
             entry["tessellation"]["itessellation"]["bodies"][0]["request"],
-            support.native_tessellation_request(
-                span["face_reference_sha256"]
-                for span in entry["tessellation"]["face_spans"]
-            ),
+            support.native_tessellation_request(),
         )
         self.assertEqual(
             entry["tessellation"]["itessellation"]["bodies"][0]["properties"],
             support.NATIVE_TESSELLATION_PROPERTIES,
         )
         self.assertEqual(read_stl(self.dest).triangles, 1)
+
+    def test_planar_brep_sheet_uses_one_provider_without_tessellation(self):
+        entry, triangle_vertices, body, _edges, tessellation_calls = self._planar_export()
+
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+        self.assertEqual(entry["triangles"], 2)
+        self.assertEqual(
+            entry["tessellation_sources"],
+            [NATIVE_PLANAR_BREP_PROVIDER],
+        )
+        planar = entry["tessellation"]["planar_brep"]
+        self.assertEqual(len(planar["bodies"]), 1)
+        self.assertEqual(
+            planar["bodies"][0]["provider"],
+            NATIVE_PLANAR_BREP_PROVIDER,
+        )
+        self.assertEqual(
+            planar["bodies"][0]["warnings"],
+            [
+                NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+                NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+            ],
+        )
+        self.assertEqual(
+            len(planar["bodies"][0]["loop"]["coedges"]),
+            4,
+        )
+        spans = parse_native_tessellation(
+            "pcb-1",
+            entry["tessellation"],
+            entry["bodies"],
+            entry["triangles"],
+            triangle_vertices,
+        )
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["triangle_count"], 2)
+        self.assertEqual(len(entry["tessellation"]["native_edges"]), 4)
+        _verify_planar_stl_normals(
+            self.dest,
+            entry["tessellation"],
+            spans,
+        )
+
+    def test_planar_consumer_rejects_inward_stored_stl_normal(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
+        spans = parse_native_tessellation(
+            "pcb-1",
+            entry["tessellation"],
+            entry["bodies"],
+            entry["triangles"],
+            triangle_vertices,
+        )
+        payload = bytearray(self.dest.read_bytes())
+        payload[84:96] = struct.pack("<3f", 0.0, 0.0, -1.0)
+        self.dest.write_bytes(payload)
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "outward triangle winding",
+        ):
+            _verify_planar_stl_normals(
+                self.dest,
+                entry["tessellation"],
+                spans,
+            )
+
+    def test_planar_bundle_projects_field_warnings_from_verified_bytes(self):
+        entry, _triangles, _body, _edges, _calls = self._planar_export(area_observation=1.00000000001)
+        bundle = self.dest.parent / "planar-bundle"
+        row = {**entry, "component": "pcb-1", "path": "geometry/planar.stl"}
+        row.pop("written")
+        row["sha256"] = hashlib.sha256(self.dest.read_bytes()).hexdigest()
+        support.write_target_delivery(bundle, capture={"collection": {}, "geometry": [row]})
+        target = bundle / "evidence" / row["path"]
+        target.parent.mkdir(parents=True)
+        shutil.copyfile(self.dest, target)
+        (bundle / "evidence/raw/scene_raw.json").write_text('{"scene": "fixture"}', encoding="utf-8")
+        write_manifest(
+            bundle / "evidence",
+            kind="solidworks",
+            identity={"capture": {"evidence_class": "cad"}},
+            evidence_class="cad",
+        )
+        support.seal_delivery(bundle)
+        details = verify_native_mesh_observations(bundle)
+        projected = native_gate_warning_diagnostics(details)
+        codes = {NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED, NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED}
+        warnings = [row for row in projected if row["code"] in codes]
+        self.assertEqual({row["code"] for row in warnings}, codes)
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(all(row["object"] == "pcb-1:body:1/0" for row in warnings))
+        self.assertEqual({row["detail"]["field"] for row in warnings}, {"face_normal_unit", "triangles"})
+        area = next(row["detail"] for row in warnings if row["detail"]["field"] == "triangles")
+        self.assertEqual(area["native_face_area_api"], "IFace2.GetArea")
+        self.assertEqual(area["native_face_area_approx_m2"], 1.00000000001)
+        self.assertEqual(area["derived_boundary_area_m2"], 1.0)
+        self.assertAlmostEqual(area["native_minus_derived_area_m2"], 1e-11, places=15)
+
+    def test_mixed_native_providers_seal_admit_and_verify_actual_bytes(self):
+        from tests.v1 import test_stage_transfer as transfer_fixture  # noqa: PLC0415
+        from description_pipeline import native_transfer  # noqa: PLC0415
+        from description_pipeline.io import read_data, write_json  # noqa: PLC0415
+
+        component, planar_body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        for coedge in planar_body._faces[0]._loops[0]._coedges:
+            raw = coedge.GetCurveParams()
+            raw[6:8] = [-11.0, -10.0]
+            evaluate = coedge.Evaluate2
+            coedge._curve_present = False
+            coedge.GetCurveParams = lambda values=raw: values
+            coedge.Evaluate2 = lambda u, derivatives, read=evaluate: read(u + 11.0, derivatives)
+        shared = FakeEdge(b"mixed-shared-edge", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        component._bodies[1].append(FakeBody(
+            [FakeFace(TRIANGLE, edges=[shared]), FakeFace(REVERSED_TRIANGLE, edges=[shared])],
+            name="tessellated-sheet",
+        ))
+        _fallback_component, fallback_body, fallback_edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+
+        class NonExactLine(FakeCurve):
+            @property
+            def LineParams(self):  # noqa: N802 - SolidWorks API name
+                return [0.0, 2**-48, 0.0, 1.0, 0.0, 0.0]
+
+        fallback_edges[0]._curve = NonExactLine(fallback_edges[0])
+        fallback_body._faces[0]._facet_triangles = [
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+        ]
+        component._bodies[1].append(fallback_body)
+        backend = _backend(component)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(set(entry["tessellation_sources"]), {NATIVE_PLANAR_BREP_PROVIDER, "sheet_itessellation"})
+        root = transfer_fixture.capture_root(self.tmp / "mixed-transfer")
+        row = {key: value for key, value in entry.items() if key != "written"}
+        row.update(path="geometry/base.stl", sha256=hashlib.sha256(self.dest.read_bytes()).hexdigest())
+        (root / "evidence/geometry/base.stl").write_bytes(self.dest.read_bytes())
+        capture = read_data(root / "evidence/capture.json")
+        capture["geometry"] = [row]
+        write_json(root / "evidence/capture.json", capture)
+        raw_scene = read_data(root / "evidence/raw/scene_raw.json")
+        raw_scene.setdefault("notes", {})["geometry_provider_selection"] = backend.notes["geometry_provider_selection"]
+        write_json(root / "evidence/raw/scene_raw.json", raw_scene)
+        manifest = read_data(root / "evidence/manifest.json")
+        write_manifest(root / "evidence", kind=manifest["kind"], identity=manifest["identity"],
+                       evidence_class=manifest["evidence_class"])
+        events = transfer_fixture._capture_events(
+            root, handoff=transfer_fixture.HANDOFF, upload=transfer_fixture.HANDOFF,
+            upload_files=transfer_fixture.NATIVE_FILES, main=transfer_fixture.MAIN_ASSEMBLY,
+            native_files=transfer_fixture.NATIVE_FILES,
+        )
+        write_json(root / "reports/native-stages.json", transfer_fixture.stage_view(
+            run_id=transfer_fixture.RUN_ID, handoff=transfer_fixture.HANDOFF, events=events,
+        ))
+        archive = self.tmp / "mixed-transfer.zip"
+        transfer_fixture.seal(root, archive)
+        destination = self.tmp / "mixed-admitted"
+        transfer_fixture.admit(archive, destination)
+        admitted_notes = read_data(destination / "evidence/raw/scene_raw.json")["notes"]
+        self.assertEqual(admitted_notes["geometry_provider_selection"],
+                         json.loads(json.dumps(backend.notes["geometry_provider_selection"])))
+        self.assertEqual(admitted_notes["geometry_provider_selection"]["pcb-1"]["1/1"]["selection_result"],
+                         "not_applicable")
+        plane_selection = admitted_notes["geometry_provider_selection"]["pcb-1"]["1/2"]
+        self.assertIn("exact-line", plane_selection["miss_reason"])
+        self.assertEqual(plane_selection["surface"]["plane_params"], [0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+        self.assertEqual(plane_selection["current_edge_fact"]["edge_line_params"],
+                         [0.0, 2**-48, 0.0, 1.0, 0.0, 0.0])
+        self.assertEqual(plane_selection["line_domain_predicate"]["trim_line_residual_upper_bound_m"],
+                         [2**-48, 2**-48])
+        self.assertEqual(native_transfer.verify_transfer(destination)["main_assembly"], transfer_fixture.MAIN_ASSEMBLY)
+        result = verify_native_mesh_observations(destination)
+        self.assertEqual(result["components"], 1)
+        self.assertEqual(len(result["topologies"][0]["bodies"]), 3)
+        damaged = self.tmp / "mixed-damaged.zip"
+        transfer_fixture.repack(archive, damaged, {"evidence/geometry/base.stl": b"invalid mesh bytes"})
+        refused = self.tmp / "mixed-refused"
+        with self.assertRaises(PipelineError):
+            transfer_fixture.admit(damaged, refused)
+        self.assertFalse(refused.exists())
+
+    def test_planar_consumer_rejects_noncollinear_endpoint_tangents(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
+        for endpoint in (0, 1):
+            with self.subTest(endpoint=endpoint):
+                mutated = copy.deepcopy(entry["tessellation"])
+                evaluations = mutated["planar_brep"]["bodies"][0]["loop"]["coedges"][0]["evaluations"]
+                evaluations[endpoint]["tangent"] = [1.0, 1.0, 0.0]
+                with self.assertRaisesRegex(PipelineError, "boundary line"):
+                    parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], triangle_vertices)
+
+    def test_planar_consumer_rejects_nonexact_closure_inside_endpoint_bound(self):
+        entry, triangles, _body, _edges, _calls = self._planar_export()
+        mutated = copy.deepcopy(entry["tessellation"])
+        incoming = mutated["planar_brep"]["bodies"][0]["loop"]["coedges"][0]
+        delta = 2**-24
+        incoming["end_point_m"][0] += delta
+        incoming["curve_params_raw"][3] += delta
+        incoming["evaluations"][1]["point_m"][0] += delta
+        incoming["end_vertex_point_error_m"] = delta
+        with self.assertRaisesRegex(PipelineError, "loop is open|contradicts edge direction"):
+            parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], triangles)
+
+    def test_planar_producer_excludes_nonexact_loop_closure(self):
+        points = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
+        component, body, edges = _planar_sheet(points)
+        delta = 2**-24
+        trims = [(points[0], (1.0 + delta, 0.0, 0.0)),
+                 ((1.0 - delta, 0.0, 0.0), points[2]), (points[2], points[0])]
+
+        class TrimLine(FakeCurve):
+            @property
+            def LineParams(self):  # noqa: N802 - SolidWorks API name
+                start, end = self.trim
+                return [*start, *(end[axis] - start[axis] for axis in range(3))]
+
+        for coedge, edge, (start, end) in zip(body._faces[0]._loops[0]._coedges, edges, trims, strict=True):
+            edge._curve = TrimLine(edge)
+            edge._curve.trim = start, end
+            coedge.GetCurveParams = lambda a=start, b=end: [*a, *b, 0.0, 1.0, False, False]
+            coedge.Evaluate2 = lambda parameter, derivatives, a=start, b=end: [
+                *(a[axis] + parameter * (b[axis] - a[axis]) for axis in range(3)),
+                *(b[axis] - a[axis] for axis in range(3)),
+            ]
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before + 1)
+        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
+
+    def test_exact_tangent_domain_excludes_nonzero_subnormal_offsets(self):
+        for perpendicular, domain_miss in ((-0.0, False), (math.ulp(0.0), True), (2 * math.ulp(0.0), True)):
+            with self.subTest(perpendicular=perpendicular):
+                component, body, _edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                coedge = body._faces[0]._loops[0]._coedges[0]
+                evaluate = coedge.Evaluate2
+                coedge.Evaluate2 = lambda parameter, derivatives, read=evaluate, y=perpendicular: [
+                    *read(parameter, derivatives)[:3], 1.0, y, 0.0
+                ]
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                target = self.tmp / f"subnormal-{perpendicular.hex()}.stl"
+                if perpendicular == 0.0:
+                    backend.export_component_meshes({"pcb-1": target})
+                    self.assertEqual(len(body.tessellation_face_lists), before)
+                else:
+                    with self.assertRaises(CadError) as caught:
+                        backend.export_component_meshes({"pcb-1": target})
+                    self.assertEqual(len(body.tessellation_face_lists), before + int(domain_miss))
+                    self.assertEqual("planar_brep_evidence" in caught.exception.detail, not domain_miss)
+
+    def test_planar_consumer_recomputes_evaluate_tolerance(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
+        mutated = copy.deepcopy(entry["tessellation"])
+        evaluation = mutated["planar_brep"]["bodies"][0]["loop"]["coedges"][0]["evaluations"][0]
+        evaluation["point_tolerance_m"] += 1.0
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "evaluation bound is not reproducible",
+        ):
+            parse_native_tessellation(
+                "pcb-1",
+                mutated,
+                entry["bodies"],
+                entry["triangles"],
+                triangle_vertices,
+            )
+
+    def test_planar_consumer_rejects_line_parameter_conflict(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
+        mutated = copy.deepcopy(entry["tessellation"])
+        mutated["planar_brep"]["bodies"][0]["loop"]["coedges"][0]["coedge_line_params"][4] = 0.25
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "edge, coedge, and trim lines differ",
+        ):
+            parse_native_tessellation(
+                "pcb-1",
+                mutated,
+                entry["bodies"],
+                entry["triangles"],
+                triangle_vertices,
+            )
+
+    def test_planar_consumer_rejects_self_reported_double_area(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
+        mutated = copy.deepcopy(entry["tessellation"])
+        mutated["planar_brep"]["bodies"][0]["triangulation"]["boundary_area_m2"] *= 2.0
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "boundary area is not reproducible",
+        ):
+            parse_native_tessellation(
+                "pcb-1",
+                mutated,
+                entry["bodies"],
+                entry["triangles"],
+                triangle_vertices,
+            )
+
+    def test_native_approximate_area_does_not_replace_boundary_proof(self):
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        body._faces[0]._area = 1.00000000001
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        planar = entry["tessellation"]["planar_brep"]["bodies"][0]
+        self.assertEqual(planar["face_area_m2"], 1.00000000001)
+        self.assertEqual(planar["triangulation"]["boundary_area_m2"], 1.0)
+        vertices = [tuple(tuple(float(value) for value in point) for point in triangle)
+                    for triangle in stl_vertices(self.dest).reshape(-1, 3, 3)]
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+        for invalid in (None, True, -1.0, 0.0, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid):
+                mutated = copy.deepcopy(entry["tessellation"])
+                mutated["planar_brep"]["bodies"][0]["face_area_m2"] = invalid
+                with self.assertRaisesRegex(PipelineError, "body.*malformed"):
+                    parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], vertices)
+        forged = copy.deepcopy(entry["tessellation"])
+        forged["planar_brep"]["bodies"][0]["native_face_reference_sha256"] = "0" * 64
+        with self.assertRaisesRegex(PipelineError, "does not bind one face"):
+            parse_native_tessellation("pcb-1", forged, entry["bodies"], entry["triangles"], vertices)
+
+    def test_planar_consumer_rejects_forged_loop_identity(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
+        mutated = copy.deepcopy(entry["tessellation"])
+        mutated["planar_brep"]["bodies"][0]["loop"]["reference_sha256"] = "0" * 64
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "loop identity is not reproducible",
+        ):
+            parse_native_tessellation(
+                "pcb-1",
+                mutated,
+                entry["bodies"],
+                entry["triangles"],
+                triangle_vertices,
+            )
+
+    def test_planar_consumer_rejects_duplicate_triangle_coverage(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
+        mutated = copy.deepcopy(entry["tessellation"])
+        triangulation = mutated["planar_brep"]["bodies"][0]["triangulation"]
+        triangulation["triangles"][1] = copy.deepcopy(triangulation["triangles"][0])
+        triangulation["triangles"][1]["triangle_index"] = 1
+        triangle_vertices[1] = triangle_vertices[0]
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "boundary edge|preserve boundary area",
+        ):
+            parse_native_tessellation(
+                "pcb-1",
+                mutated,
+                entry["bodies"],
+                entry["triangles"],
+                triangle_vertices,
+            )
+
+    def test_planar_consumer_rejects_inward_error_bound(self):
+        points = [
+            (0.0, 0.0, 0.0),
+            (0.1, 0.0, 0.0),
+            (0.1, 0.2, 0.0),
+            (0.0, 0.2, 0.0),
+        ]
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export(points)
+        mutated = copy.deepcopy(entry["tessellation"])
+        triangulation = mutated["planar_brep"]["bodies"][0]["triangulation"]
+        triangulation["surface_error_upper_bound_m"] = math.nextafter(
+            triangulation["surface_error_upper_bound_m"],
+            0.0,
+        )
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "surface bound is not reproducible",
+        ):
+            parse_native_tessellation(
+                "pcb-1",
+                mutated,
+                entry["bodies"],
+                entry["triangles"],
+                triangle_vertices,
+            )
+
+    def test_planar_consumer_rejects_native_plane_conflict(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
+        mutated = copy.deepcopy(entry["tessellation"])
+        body = mutated["planar_brep"]["bodies"][0]
+        for coedge in body["loop"]["coedges"]:
+            coedge["start_point_m"][2] = 4.0e-5
+            coedge["end_point_m"][2] = 4.0e-5
+            coedge["curve_params_raw"][2] = 4.0e-5
+            coedge["curve_params_raw"][5] = 4.0e-5
+            coedge["edge_line_params"][2] = 4.0e-5
+            coedge["coedge_line_params"][2] = 4.0e-5
+            coedge["start_vertex_point_m"][2] = 4.0e-5
+            coedge["end_vertex_point_m"][2] = 4.0e-5
+            for endpoint in ("start", "end"):
+                trim_point = coedge[f"{endpoint}_point_m"]
+                vertex_point = coedge[f"{endpoint}_vertex_point_m"]
+                coedge[f"{endpoint}_vertex_point_error_m"] = native_module.native_point_error(
+                    trim_point,
+                    vertex_point,
+                )
+                coedge[f"{endpoint}_vertex_point_tolerance_m"] = native_module.native_point_roundtrip_tolerance(
+                    trim_point,
+                    vertex_point,
+                )
+            for evaluation in coedge["evaluations"]:
+                evaluation["point_m"][2] = 4.0e-5
+            for endpoint, expected_point, opposite_point in (
+                (
+                    "start",
+                    coedge["start_point_m"],
+                    coedge["end_point_m"],
+                ),
+                (
+                    "end",
+                    coedge["end_point_m"],
+                    coedge["start_point_m"],
+                ),
+            ):
+                evaluation = next(row for row in coedge["evaluations"] if row["endpoint"] == endpoint)
+                evaluation["point_error_m"] = native_module.native_point_error(
+                    expected_point,
+                    evaluation["point_m"],
+                )
+                evaluation["point_tolerance_m"] = native_module.native_curve_endpoint_operation_tolerance(
+                    expected_point,
+                    evaluation["point_m"],
+                    opposite_point,
+                )
+        for vertex in body["boundary_vertices"]:
+            vertex["point_m"][2] = 4.0e-5
+        for edge in mutated["native_edges"]:
+            edge["start_point_m"][2] = 4.0e-5
+            edge["end_point_m"][2] = 4.0e-5
+            edge["curve_start_point_m"][2] = 4.0e-5
+            edge["curve_end_point_m"][2] = 4.0e-5
+            for endpoint, expected_point, opposite_point in (
+                (
+                    "start",
+                    edge["curve_start_point_m"],
+                    edge["curve_end_point_m"],
+                ),
+                (
+                    "end",
+                    edge["curve_end_point_m"],
+                    edge["curve_start_point_m"],
+                ),
+            ):
+                evaluation = edge["curve_endpoint_evaluations"][endpoint]
+                evaluation["payload"][2] = 4.0e-5
+                evaluation["point_error_m"] = native_module.native_point_error(
+                    expected_point,
+                    evaluation["payload"][:3],
+                )
+                evaluation["point_tolerance_m"] = native_module.native_curve_endpoint_operation_tolerance(
+                    expected_point,
+                    evaluation["payload"][:3],
+                    opposite_point,
+                )
+        for vertex in mutated["itessellation"]["solidworks_vertex_identities"]:
+            vertex["point_m"][2] = 4.0e-5
+        support.refresh_topology_endpoint_assignment(mutated)
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "conflicts with its plane",
+        ):
+            parse_native_tessellation(
+                "pcb-1",
+                mutated,
+                entry["bodies"],
+                entry["triangles"],
+                triangle_vertices,
+            )
+
+    def test_planar_short_edge_uses_native_sense_instead_of_distance(self):
+        width = 4.9e-7
+        points = [
+            (10.0, 10.0, 0.0),
+            (10.0 + width, 10.0, 0.0),
+            (10.0 + width, 10.5, 0.0),
+            (10.0, 10.5, 0.0),
+        ]
+        component, body, _edges = _planar_sheet(points)
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+        self.assertEqual(entry["triangles"], 2)
+        self.assertEqual(
+            entry["tessellation_sources"],
+            [NATIVE_PLANAR_BREP_PROVIDER],
+        )
+
+    def test_planar_endpoint_identity_is_independent_of_iedge_return_labels(self):
+        for swapped in (False, True):
+            with self.subTest(swapped=swapped):
+                component, _body, edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                if swapped:
+                    for edge in edges:
+                        edge.GetStartVertex = lambda edge=edge: edge._end
+                        edge.GetEndVertex = lambda edge=edge: edge._start
+                target = self.tmp / f"unordered-{swapped}.stl"
+                entry = _backend(component).export_component_meshes({"pcb-1": target})["pcb-1"]
+                vertices = [tuple(tuple(float(value) for value in point) for point in triangle)
+                            for triangle in stl_vertices(target).reshape(-1, 3, 3)]
+                parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+                self.assertEqual(entry["tessellation_sources"], [NATIVE_PLANAR_BREP_PROVIDER])
+                coedges = entry["tessellation"]["planar_brep"]["bodies"][0]["loop"]["coedges"]
+                for coedge, edge in zip(coedges, edges, strict=True):
+                    self.assertTrue(coedge["same_direction_as_edge"])
+                    self.assertEqual(coedge["start_point_m"], edge._start._point)
+                coedges[0]["start_vertex_reference_sha256"] = "0" * 64
+                with self.assertRaisesRegex(PipelineError, "unordered native vertex set"):
+                    parse_native_tessellation(
+                        "pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices,
+                    )
+
+    def test_planar_wrong_coedge_sense_is_not_hidden_by_unordered_vertices(self):
+        component, _body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        for edge in edges:
+            edge.GetStartVertex = lambda edge=edge: edge._end
+            edge.GetEndVertex = lambda edge=edge: edge._start
+        _body._faces[0]._loops[0]._coedges[0].GetSense = lambda: False
+        with self.assertRaises(CadError) as caught:
+            _backend(component).export_component_meshes({"pcb-1": self.dest})
+        self.assertIn("orientations disagree", caught.exception.message)
+
+    def test_planar_normal_coedges_do_not_require_transient_curve(self):
+        points = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+        component, body, edges = _planar_sheet(points)
+        body._faces[0]._loops = [FakePlanarLoop(edges, coedge_curve_present=False)]
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+
+        coedges = entry["tessellation"]["planar_brep"]["bodies"][0]["loop"]["coedges"]
+        self.assertTrue(
+            all(
+                row["coedge_curve_present"] is False
+                and row["coedge_line_params"] is None
+                and row["line_orientation"] == "not_observed"
+                for row in coedges
+            )
+        )
+        triangle_vertices = [
+            tuple(tuple(float(value) for value in point) for point in record)
+            for record in stl_vertices(self.dest).reshape(-1, 3, 3)
+        ]
+        parse_native_tessellation(
+            "pcb-1",
+            entry["tessellation"],
+            entry["bodies"],
+            entry["triangles"],
+            triangle_vertices,
+        )
+
+    def test_planar_consumer_accepts_sloped_plane(self):
+        points = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 1.0),
+            (1.0, 1.0, 2.0),
+            (0.0, 1.0, 1.0),
+        ]
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export(
+            points,
+            normal=(-1.0, -1.0, 1.0),
+        )
+
+        spans = parse_native_tessellation(
+            "pcb-1",
+            entry["tessellation"],
+            entry["bodies"],
+            entry["triangles"],
+            triangle_vertices,
+        )
+        self.assertEqual(len(spans), 1)
+
+    def test_planar_surface_opposite_sense_preserves_face_normal(self):
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export(
+            normal=(0.0, 0.0, -1.0),
+            face_in_surface_sense=True,
+        )
+
+        spans = parse_native_tessellation(
+            "pcb-1",
+            entry["tessellation"],
+            entry["bodies"],
+            entry["triangles"],
+            triangle_vertices,
+        )
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(
+            entry["tessellation"]["planar_brep"]["bodies"][0]["triangulation"]["face_normal"],
+            [0.0, 0.0, 1.0],
+        )
+
+    def test_planar_negative_normal_uses_reversed_outer_loop(self):
+        points = [
+            (0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (1.0, 0.0, 0.0),
+        ]
+        entry, triangle_vertices, _body, _edges, _calls = self._planar_export(
+            points,
+            normal=(0.0, 0.0, -1.0),
+        )
+
+        spans = parse_native_tessellation(
+            "pcb-1",
+            entry["tessellation"],
+            entry["bodies"],
+            entry["triangles"],
+            triangle_vertices,
+        )
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(
+            entry["tessellation"]["planar_brep"]["bodies"][0]["triangulation"]["face_normal"],
+            [0.0, 0.0, -1.0],
+        )
+
+    def test_planar_reverse_coedges_allow_decreasing_trim_parameters(self):
+        points = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+        component, body, edges = _planar_sheet(
+            points,
+            normal=(0.0, 0.0, -1.0),
+        )
+        face = body._faces[0]
+        for edge in edges:
+            edge._u_min, edge._u_max = -3.0, -1.0
+        face._loops = [
+            FakePlanarLoop(
+                [edges[0], edges[3], edges[2], edges[1]],
+                reverse=True,
+            )
+        ]
+        for edge in edges:
+            edge._in_face_sense = False
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+        coedges = entry["tessellation"]["planar_brep"]["bodies"][0]["loop"]["coedges"]
+        self.assertTrue(all(row["parameter_order"] == "decreasing" for row in coedges))
+        self.assertTrue(all(row["start_parameter"] == -1.0 and row["end_parameter"] == -3.0 for row in coedges))
+        triangle_vertices = [
+            tuple(tuple(float(value) for value in point) for point in record)
+            for record in stl_vertices(self.dest).reshape(-1, 3, 3)
+        ]
+        spans = parse_native_tessellation(
+            "pcb-1",
+            entry["tessellation"],
+            entry["bodies"],
+            entry["triangles"],
+            triangle_vertices,
+        )
+        self.assertEqual(len(spans), 1)
+
+    def test_planar_forward_coedges_accept_negative_parameter_domain(self):
+        component, body, edges = _planar_sheet([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        for edge in edges:
+            edge._u_min, edge._u_max = -3.0, -1.0
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+        rows = entry["tessellation"]["planar_brep"]["bodies"][0]["loop"]["coedges"]
+        self.assertTrue(all(row["start_parameter"] == -3.0 and row["end_parameter"] == -1.0 for row in rows))
+        vertices = [
+            tuple(tuple(float(value) for value in point) for point in triangle)
+            for triangle in stl_vertices(self.dest).reshape(-1, 3, 3)
+        ]
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+
+    def test_coedge_parameter_must_evaluate_to_its_own_trim_point(self):
+        component, body, edges = _planar_sheet([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        for edge in edges:
+            edge._u_min, edge._u_max = -3.0, -1.0
+        coedge = body._faces[0]._loops[0]._coedges[0]
+        raw = coedge.GetCurveParams()
+        raw[6] = -4.0
+        coedge.GetCurveParams = lambda: raw
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertIn("trim", str(caught.exception))
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+
+    def test_rounded_plane_domain_miss_uses_itessellation_once(self):
+        point = (-0.8 * 0.3, 0.6 * 0.3, 0.0)
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), point, (*point[:2], 1.0), (0.0, 0.0, 1.0)],
+            normal=(0.6, 0.8, 0.0),
+        )
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls + 1)
+        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
+
+    def test_rounded_tangent_domain_miss_precedes_plane_domain(self):
+        point = (-0.8 * 0.3, 0.6 * 0.3, 0.0)
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), point, (*point[:2], 1.0), (0.0, 0.0, 1.0)],
+            normal=(0.6, 0.8, 0.0),
+        )
+        coedge = body._faces[0]._loops[0]._coedges[0]
+        evaluate = coedge.Evaluate2
+        coedge.Evaluate2 = lambda parameter, derivatives: [*evaluate(parameter, derivatives)[:3], -0.8, 0.6, 0.0]
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls + 1)
+        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
+
+    def test_planar_miss_facts_survive_the_primary_tessellate_failure(self):
+        point = (-0.8 * 0.3, 0.6 * 0.3, 0.0)
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), point, (*point[:2], 1.0), (0.0, 0.0, 1.0)],
+            normal=(0.6, 0.8, 0.0),
+        )
+        backend = _backend(component)
+        body._tessellation.tessellate_result = False
+        before = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(caught.exception.message, "ITessellation.Tessellate returned false")
+        self.assertIs(caught.exception.detail["tessellate_result"], False)
+        selection = caught.exception.detail["planar_provider_selection"]
+        self.assertEqual(selection["selection_result"], "not_applicable")
+        self.assertIn("exact-plane", selection["miss_reason"])
+        self.assertEqual(selection["surface"]["plane_params"][:3], [0.6, 0.8, 0.0])
+        self.assertEqual(len(selection["coedge_facts"]), 4)
+        self.assertEqual(len(body.tessellation_face_lists), before + 1)
+        json.dumps(caught.exception.detail, allow_nan=False)
+
+    def test_simple_provider_miss_survives_tessellation_api_exception(self):
+        body = FakeBody([FakeFace(TRIANGLE)])
+        backend = _backend(FakeComponent(FakeDocument([]), {0: [], 1: [body]}))
+        body._tessellation.raises = True
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        selection = caught.exception.detail["planar_provider_selection"]
+        self.assertEqual(selection["miss_reason"], "native_surface_is_not_a_plane")
+        self.assertEqual(selection["surface"], {"is_plane": False})
+        self.assertEqual(caught.exception.detail["api"], "ITessellation.Tessellate")
+
+    def test_planar_producer_excludes_unproved_noncollinear_end_tangent(self):
+        component, body, _edges = _planar_sheet([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        coedge = body._faces[0]._loops[0]._coedges[0]
+        evaluate = coedge.Evaluate2
+        coedge.Evaluate2 = lambda parameter, derivatives: (
+            [*evaluate(parameter, derivatives)[:3], 1.0, 1.0, 0.0]
+            if parameter == 1.0
+            else evaluate(parameter, derivatives)
+        )
+        backend = _backend(component)
+        body._tessellation.tessellate_result = False
+        tessellation_calls = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
+        self.assertEqual(caught.exception.detail["planar_provider_selection"]["miss_reason"],
+                         "tangent_is_outside_exact_line_provider_domain")
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls + 1)
+
+    def test_observed_reverse_tangent_precedes_noncollinear_domain_in_both_orders(self):
+        for reverse_endpoint in (0.0, 1.0):
+            with self.subTest(reverse_endpoint=reverse_endpoint):
+                component, body, _edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                coedge = body._faces[0]._loops[0]._coedges[0]
+                evaluate = coedge.Evaluate2
+                coedge.Evaluate2 = lambda parameter, derivatives, read=evaluate, reverse=reverse_endpoint: [
+                    *read(parameter, derivatives)[:3],
+                    *([-1.0, 0.0, 0.0] if parameter == reverse else [1.0, 1.0, 0.0]),
+                ]
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                with self.assertRaisesRegex(CadError, "tangent reverses") as caught:
+                    backend.export_component_meshes({"pcb-1": self.dest})
+                self.assertEqual(caught.exception.detail["endpoint"], "start" if reverse_endpoint == 0.0 else "end")
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_observed_reverse_tangent_precedes_nonexact_vertex_pairing(self):
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        coedge = body._faces[0]._loops[0]._coedges[0]
+        raw = coedge.GetCurveParams()
+        raw[3] += 2**-24
+        coedge.GetCurveParams = lambda: raw
+        coedge.Evaluate2 = lambda parameter, derivatives: [
+            *(raw[:3] if parameter == 0.0 else raw[3:6]),
+            *([1.0, 0.0, 0.0] if parameter == 0.0 else [-1.0, 0.0, 0.0]),
+        ]
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "tangent reverses"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_same_coedge_parameter_cannot_name_distinct_points_before_domain_miss(self):
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        coedge = body._faces[0]._loops[0]._coedges[0]
+        raw = coedge.GetCurveParams()
+        raw[4] = math.ulp(1.0)
+        raw[7] = raw[6]
+        coedge.GetCurveParams = lambda: raw
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "one coedge parameter identifies distinct trim endpoints"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_coedge_local_parameter_still_requires_finite_numeric_values(self):
+        for index in (6, 7):
+            for invalid in (True, "0", float("nan"), float("inf")):
+                with self.subTest(index=index, invalid=repr(invalid)):
+                    component, body, _edges = _planar_sheet(
+                        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                    )
+                    coedge = body._faces[0]._loops[0]._coedges[0]
+                    raw = coedge.GetCurveParams()
+                    raw[index] = invalid
+                    coedge.GetCurveParams = lambda values=raw: values
+                    backend = _backend(component)
+                    before = len(body.tessellation_face_lists)
+                    with self.assertRaisesRegex(CadError, "GetCurveParams did not return the documented values"):
+                        backend.export_component_meshes({"pcb-1": self.dest})
+                    self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_coedge_local_parameter_origin_and_direction_are_independent_of_edge_u(self):
+        for origin, scale in ((100.0, 2.0), (100.0, -2.0), (-100.0, 0.5), (-100.0, -0.5)):
+            with self.subTest(origin=origin, scale=scale):
+                component, body, _edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                for coedge in body._faces[0]._loops[0]._coedges:
+                    raw = coedge.GetCurveParams()
+                    raw[6], raw[7] = origin, origin + scale
+                    evaluate = coedge.Evaluate2
+                    coedge._curve_present = False
+                    coedge.GetCurveParams = lambda values=raw: values
+                    coedge.Evaluate2 = lambda u, derivatives, read=evaluate, a=origin, b=scale: read(
+                        (u - a) / b, derivatives,
+                    )
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                target = self.tmp / f"local-u-{origin}-{scale}.stl"
+                entry = backend.export_component_meshes({"pcb-1": target})["pcb-1"]
+                vertices = stl_vertices(target).reshape(-1, 3, 3).tolist()
+                parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+                rows = entry["tessellation"]["planar_brep"]["bodies"][0]["loop"]["coedges"]
+                self.assertTrue(all(row["start_parameter"] == origin and row["end_parameter"] == origin + scale
+                                    for row in rows))
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_observed_a42_parameters_reach_exact_line_domain_selection(self):
+        start = (0.031987069790850996, -0.000599999998052, -0.053373733962836)
+        end = (0.031987069790850996, -0.000599999998052, -0.052817323706427)
+        line = [0.031987069790851, -0.000599999998052, -0.055476906273812, -0.0, -0.0, -1.0]
+        raw = [*start, *end, -0.0021031723109760023, -0.0026595825673850007, 0.0, 0.0]
+
+        class ObservedLine(FakeCurve):
+            @property
+            def LineParams(self):  # noqa: N802 - SolidWorks API name
+                return list(line)
+
+        component, body, edges = _planar_sheet(
+            [start, end, (end[0], -0.000699999998052, end[2]),
+             (start[0], -0.000699999998052, start[2])], normal=(1.0, 0.0, 0.0),
+        )
+        edges[0]._curve = ObservedLine(edges[0])
+        edges[0]._u_min, edges[0]._u_max = 0.0021031723109760023, 0.0026595825673850007
+        coedge = body._faces[0]._loops[0]._coedges[0]
+        coedge.GetCurveParams = lambda: list(raw)
+        coedge._curve_present = False
+        backend = _backend(component)
+        body._tessellation.tessellate_result = False
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "Tessellate returned false") as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        selection = caught.exception.detail["planar_provider_selection"]
+        self.assertIn("exact-line", selection["miss_reason"])
+        self.assertEqual(selection["current_edge_fact"]["curve_params_raw"], raw)
+        self.assertEqual(selection["current_edge_fact"]["edge_line_params"], line)
+        self.assertEqual(len(body.tessellation_face_lists), before + 1)
+
+    def test_coedge_curve_can_have_an_independent_line_origin_and_direction(self):
+        class LocalLine(FakeCurve):
+            @property
+            def LineParams(self):  # noqa: N802 - SolidWorks API name
+                base = super().LineParams
+                return [*(base[i] - 10.0 / self.scale * base[i + 3] for i in range(3)),
+                        *(base[i + 3] / self.scale for i in range(3))]
+
+        for scale in (1.0, -1.0):
+            with self.subTest(scale=scale):
+                component, body, edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                for coedge, edge in zip(body._faces[0]._loops[0]._coedges, edges, strict=True):
+                    curve = LocalLine(edge)
+                    curve.scale = scale
+                    coedge.GetCurve = lambda value=curve: value
+                    raw = coedge.GetCurveParams()
+                    raw[6], raw[7] = 10.0, 10.0 + scale
+                    coedge.GetCurveParams = lambda values=raw: values
+                    evaluate = coedge.Evaluate2
+                    coedge.Evaluate2 = lambda u, derivatives, read=evaluate, s=scale: read(
+                        (u - 10.0) / s, derivatives,
+                    )
+                backend = _backend(component)
+                target = self.tmp / f"coedge-line-{scale}.stl"
+                entry = backend.export_component_meshes({"pcb-1": target})["pcb-1"]
+                vertices = stl_vertices(target).reshape(-1, 3, 3).tolist()
+                parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+
+    def test_coedge_consumer_keeps_local_parameter_and_identity_proofs_strict(self):
+        entry, vertices, _body, _edges, _calls = self._planar_export()
+        for mutation in ("repeated_u", "raw_u", "evaluation_u", "evaluation_point", "edge_ref", "vertex_ref"):
+            with self.subTest(mutation=mutation):
+                changed = copy.deepcopy(entry["tessellation"])
+                row = changed["planar_brep"]["bodies"][0]["loop"]["coedges"][0]
+                if mutation == "repeated_u":
+                    row["end_parameter"] = row["start_parameter"]
+                    row["curve_params_raw"][7] = row["start_parameter"]
+                    row["evaluations"][1]["parameter"] = row["start_parameter"]
+                elif mutation == "raw_u":
+                    row["curve_params_raw"][6] += 10.0
+                elif mutation == "evaluation_u":
+                    row["evaluations"][0]["parameter"] += 10.0
+                elif mutation == "evaluation_point":
+                    row["evaluations"][0]["point_m"][1] += 0.1
+                elif mutation == "edge_ref":
+                    row["edge_reference_sha256"] = "0" * 64
+                else:
+                    row["start_vertex_reference_sha256"] = "0" * 64
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation("pcb-1", changed, entry["bodies"], entry["triangles"], vertices)
+
+    def test_observed_invalid_face_sense_precedes_nonexact_line_domain(self):
+        for invalid in ("invalid-face-sense", 1, None, RuntimeError("unreadable face sense")):
+            with self.subTest(invalid=repr(invalid)):
+                component, body, edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                coedge = body._faces[0]._loops[0]._coedges[0]
+                raw = coedge.GetCurveParams()
+                raw[4] = 2**-48
+                coedge.GetCurveParams = lambda values=raw: values
+
+                def read_sense(_face, value=invalid):
+                    if isinstance(value, RuntimeError):
+                        raise value
+                    return value
+
+                edges[0].EdgeInFaceSense = read_sense
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                with self.assertRaisesRegex(CadError, "primary face sense is unreadable") as caught:
+                    backend.export_component_meshes({"pcb-1": self.dest})
+                self.assertIsNotNone(caught.exception.detail["face_senses"][0]["EdgeInFaceSense"]["error"])
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_observed_d534_line_residual_is_outside_exact_provider_domain(self):
+        start = (0.009999356023198996, -0.006164722832204, -0.055676906273813)
+        end = (0.009968943104147997, -0.00608019051360702, -0.055676906273813)
+        line = [*start, -0.33853503429773646, 0.9409537876819618, -0.0]
+
+        class ObservedLine(FakeCurve):
+            @property
+            def LineParams(self):  # noqa: N802 - SolidWorks API name
+                return list(line)
+
+        component, body, edges = _planar_sheet([start, end, (end[0] - 0.001, end[1], end[2])])
+        edges[0]._curve = ObservedLine(edges[0])
+        edges[0]._u_max = 8.983684395938969e-05
+        body._faces[0]._loops[0]._coedges[0]._curve_present = False
+        backend = _backend(component)
+        body._tessellation.tessellate_result = False
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "Tessellate returned false") as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        selection = caught.exception.detail["planar_provider_selection"]
+        self.assertIn("exact-line", selection["miss_reason"])
+        self.assertEqual(selection["current_edge_fact"]["edge_line_params"], line)
+        residual = selection["line_domain_predicate"]["trim_line_residual_upper_bound_m"][1]
+        self.assertGreater(residual, 6.45e-18)
+        self.assertLess(residual, 6.46e-18)
+        self.assertEqual(len(body.tessellation_face_lists), before + 1)
+
+    def test_observed_invalid_secondary_sense_precedes_provider_selection(self):
+        for invalid in (False, 1, None, RuntimeError("unreadable secondary sense")):
+            with self.subTest(invalid=repr(invalid)):
+                component, body, edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+
+                def read_sense(_face, value=invalid):
+                    if isinstance(value, RuntimeError):
+                        raise value
+                    return value
+
+                edges[0].IEdgeInFaceSense2 = read_sense
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                with self.assertRaisesRegex(CadError, "secondary face sense is invalid"):
+                    backend.export_component_meshes({"pcb-1": self.dest})
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_observed_write_only_secondary_sense_remains_allowed(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        write_only_error = type("com_error", (RuntimeError,), {})
+
+        def read_sense(_face):
+            raise write_only_error(61836, "write-only property", None, None)
+
+        edges[0].IEdgeInFaceSense2 = read_sense
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_observed_equal_coface_directions_precede_provider_selection(self):
+        shared = FakeEdge(b"same-sense-edge", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        shared.EdgeInFaceSense = lambda _face: True
+        shared.IEdgeInFaceSense2 = lambda _face: True
+        body = FakeBody([FakeFace(TRIANGLE, edges=[shared]), FakeFace(REVERSED_TRIANGLE, edges=[shared])])
+        backend = _backend(FakeComponent(FakeDocument([]), {0: [], 1: [body]}))
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "cofaces have the same orientation"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_planar_and_itessellation_bodies_share_one_canonical_stream(self):
+        points = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+        component, _planar_body, _edges = _planar_sheet(points)
+        component._bodies[0] = [FakeBody([FakeFace(TRIANGLE)], name="solid")]
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+
+        self.assertEqual(entry["triangles"], 3)
+        self.assertEqual(
+            entry["tessellation_sources"],
+            ["solid_itessellation", NATIVE_PLANAR_BREP_PROVIDER],
+        )
+        self.assertEqual(
+            len(entry["tessellation"]["itessellation"]["bodies"]),
+            1,
+        )
+        self.assertEqual(
+            len(entry["tessellation"]["planar_brep"]["bodies"]),
+            1,
+        )
+        triangle_vertices = [
+            tuple(tuple(float(value) for value in point) for point in record)
+            for record in stl_vertices(self.dest).reshape(-1, 3, 3)
+        ]
+        spans = parse_native_tessellation(
+            "pcb-1",
+            entry["tessellation"],
+            entry["bodies"],
+            entry["triangles"],
+            triangle_vertices,
+        )
+        self.assertEqual(
+            [(span["body_type"], span["triangle_count"]) for span in spans],
+            [(0, 1), (1, 2)],
+        )
+
+    def test_planar_invalid_line_flag_never_becomes_provider_miss(self):
+        class InvalidLineCurve(FakeCurve):
+            def IsLine(self):  # noqa: N802 - SolidWorks API name
+                return 1
+
+        points = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+        component, body, edges = _planar_sheet(points)
+        edges[0]._curve = InvalidLineCurve(edges[0])
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn(
+            "did not return a boolean",
+            caught.exception.message,
+        )
+        evidence = caught.exception.detail["planar_brep_evidence"]
+        json.dumps(evidence)
+        self.assertEqual(evidence["surface"]["is_plane"], True)
+        self.assertEqual(len(evidence["edge_facts"]), 4)
+        self.assertEqual(evidence["current_edge_fact"]["edge_index"], 0)
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+        self.assertFalse(self.dest.exists())
+
+    def test_complete_curve_type_selection_precedes_line_checks_for_every_loop_start(self):
+        class GuardedLine(FakeCurve):
+            @property
+            def LineParams(self):  # noqa: N802 - SolidWorks API name
+                raise AssertionError("line qualification ran before complete type selection")
+
+        class NonLine(GuardedLine):
+            def IsLine(self):  # noqa: N802 - SolidWorks API name
+                return False
+
+        for start in range(4):
+            with self.subTest(loop_start=start):
+                component, body, edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                for index, edge in enumerate(edges):
+                    edge._curve = NonLine(edge) if index == 3 else GuardedLine(edge)
+                body._faces[0]._loops = [FakePlanarLoop(edges[start:] + edges[:start])]
+                backend = _backend(component)
+                body._tessellation.tessellate_result = False
+                before = len(body.tessellation_face_lists)
+                with self.assertRaises(CadError) as caught:
+                    backend.export_component_meshes({"pcb-1": self.tmp / f"curve-types-{start}.stl"})
+                self.assertEqual(caught.exception.message, "ITessellation.Tessellate returned false")
+                selection = caught.exception.detail["planar_provider_selection"]
+                self.assertEqual(selection["miss_reason"], "native_boundary_contains_non_line_edges")
+                self.assertEqual([row["is_line"] for row in selection["edge_type_facts"]], [True, True, True, False])
+                self.assertEqual(len(body.tessellation_face_lists), before + 1)
+
+    def test_valid_but_out_of_scope_loop_uses_itessellation_once(self):
+        class MismatchedLoop(FakePlanarLoop):
+            def GetEdgeCount(self):  # noqa: N802 - SolidWorks API name
+                return len(self._coedges) + 1
+
+        points = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+        component, body, edges = _planar_sheet(points)
+        face = body._faces[0]
+        face._loops = [MismatchedLoop(edges)]
+        face._facet_triangles = list(TRIANGLE)
+        face._triangle_count = 1
+        face._edges = []
+        backend = _backend(component)
+        face._edges = edges
+        for edge in edges:
+            edge._owner = body
+            edge._faces = [face]
+        tessellation_calls = len(body.tessellation_face_lists)
+
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+
+        self.assertGreater(
+            len(body.tessellation_face_lists),
+            tessellation_calls,
+        )
+        self.assertEqual(
+            caught.exception.message,
+            "a native edge did not return any fins",
+        )
+        self.assertNotIn(
+            "planar_brep_evidence",
+            caught.exception.detail,
+        )
+
+    def test_planar_boundary_direction_contradiction_is_fatal(self):
+        points = [
+            (0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (1.0, 0.0, 0.0),
+        ]
+        component, body, _edges = _planar_sheet(points)
+        backend = _backend(component)
+        tessellation_calls = len(body.tessellation_face_lists)
+
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn("contradicts face orientation", caught.exception.message)
+        evidence = caught.exception.detail["planar_brep_evidence"]
+        json.dumps(evidence)
+        self.assertEqual(evidence["surface"]["is_plane"], True)
+        self.assertEqual(len(evidence["coedge_facts"]), 4)
+        for coedge in evidence["coedge_facts"]:
+            self.assertEqual(len(coedge["evaluations"]), 2)
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+        self.assertFalse(self.dest.exists())
 
     def test_native_face_spans_carry_shared_edge_incidence(self):
         shared = FakeEdge(
@@ -938,21 +2334,32 @@ class ComponentMeshExportTests(unittest.TestCase):
                     "facet_count": 0,
                     "area_m2": 1.871564249915375e-13,
                     "tessellate_result": True,
-                    "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                    "used_api": NATIVE_FACETLESS_EVIDENCE_API,
+                    "source_rule": "native-flat-array",
+                    "warnings": [],
+                    "derived_empty_edges": [],
                 }
             ],
         )
         self.assertIn("mesh_tessellation:pcb-1", backend.notes)
 
-    def test_sheet_empty_face_with_tessellate_refusal_is_recorded_not_failed(self):
+    def test_sheet_empty_face_with_tessellate_refusal_is_a_primary_failure(self):
         tessellation = FakeTessellation(facets=0, tessellate_result=False)
         backend = self._sheet_facetless_backend(
             FakeFace([], triangle_count=0, area=7.486257000421631e-13), tessellation
         )
-        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
-        row = entry["tessellation"]["no_facets_faces"][0]
-        self.assertIs(row["tessellate_result"], False)
-        self.assertEqual(row["area_m2"], 7.486257000421631e-13)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(
+            caught.exception.detail["api"],
+            "ITessellation.Tessellate",
+        )
+        self.assertIs(caught.exception.detail["tessellate_result"], False)
+        self.assertEqual(
+            caught.exception.detail["face_diagnostics"][0]["area_m2"]["value"],
+            7.486257000421631e-13,
+        )
+        self.assertFalse(self.dest.exists())
 
     def test_sheet_empty_face_with_positive_facets_fails_until_reconstruction_is_validated(self):
         tessellation = FakeTessellation(facets=1, tessellate_result=True)
@@ -1025,9 +2432,7 @@ class ComponentMeshExportTests(unittest.TestCase):
                 ],
             },
         )
-        entry = _backend(component).export_component_meshes(
-            {"pcb-1": self.dest}
-        )["pcb-1"]
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 2)
         self.assertEqual(entry["tessellation"]["no_facets_faces"], [])
         self.assertTrue(tessellation.tessellated)
@@ -1036,8 +2441,7 @@ class ComponentMeshExportTests(unittest.TestCase):
     def test_all_no_facet_rows_travel_without_truncation(self):
         tessellation = FakeTessellation(facets=0, tessellate_result=True)
         sheet_bodies = [
-            FakeTessellationBody([FakeFace([], triangle_count=0, area=1e-13)], tessellation)
-            for _ in range(55)
+            FakeTessellationBody([FakeFace([], triangle_count=0, area=1e-13)], tessellation) for _ in range(55)
         ]
         component = FakeComponent(
             FakeDocument([]),
@@ -1051,9 +2455,7 @@ class ComponentMeshExportTests(unittest.TestCase):
 
     def test_boolean_native_triangle_count_is_not_accepted_as_zero(self):
         tessellation = FakeTessellation(facets=0, tessellate_result=True)
-        backend = self._sheet_facetless_backend(
-            FakeFace([], triangle_count=False, area=1e-12), tessellation
-        )
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=False, area=1e-12), tessellation)
         with self.assertRaises(CadError) as caught:
             backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
@@ -1061,9 +2463,7 @@ class ComponentMeshExportTests(unittest.TestCase):
 
     def test_boolean_area_is_not_accepted_as_zero(self):
         tessellation = FakeTessellation(facets=0, tessellate_result=True)
-        backend = self._sheet_facetless_backend(
-            FakeFace([], triangle_count=0, area=False), tessellation
-        )
+        backend = self._sheet_facetless_backend(FakeFace([], triangle_count=0, area=False), tessellation)
         with self.assertRaises(CadError) as caught:
             backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
@@ -1081,13 +2481,10 @@ class ComponentMeshExportTests(unittest.TestCase):
             _backend(component).export_component_meshes({"missing-1": self.dest})
         self.assertEqual(caught.exception.code, "cad_missing_component")
 
-
     def test_display_triangle_read_is_not_part_of_graph_export(self):
         face = FakeFace(TRIANGLE, facet_triangles=REVERSED_TRIANGLE)
         component = FakeComponent(FakeDocument([]), {0: [FakeBody([face])], 1: []})
-        entry = _backend(component).export_component_meshes(
-            {"pcb-1": self.dest}
-        )["pcb-1"]
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 1)
         self.assertEqual(face.triangle_calls, 0)
         self.assertEqual(
@@ -1105,9 +2502,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         body = FakeTessellationBody([face], tessellation)
         component = FakeComponent(FakeDocument([]), {0: [body], 1: []})
         with _silence_retry_sleep():
-            entry = _backend(component).export_component_meshes(
-                {"pcb-1": self.dest}
-            )["pcb-1"]
+            entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 1)
         self.assertGreaterEqual(tessellation.calls, 2)
         self.assertEqual(face.triangle_calls, 0)
@@ -1373,9 +2768,9 @@ class AxisReferenceTests(unittest.TestCase):
         self.assertEqual(component.body_calls, [(0,)])
 
 
-
 if __name__ == "__main__":
     unittest.main()
+
 
 class NoFullScanExportTests(unittest.TestCase):
     """The native boundary writes and receipts meshes without a full STL scan."""
@@ -1441,9 +2836,18 @@ class NoFullScanExportTests(unittest.TestCase):
                 )
         self.assertEqual(len(exported), 1)
         row = exported[0]
-        self.assertEqual(set(row), {
-            "component", "path", "triangles", "used_api", "sha256", "bodies", "tessellation",
-        })
+        self.assertEqual(
+            set(row),
+            {
+                "component",
+                "path",
+                "triangles",
+                "used_api",
+                "sha256",
+                "bodies",
+                "tessellation",
+            },
+        )
         self.assertEqual(row["triangles"], 2)
         self.assertEqual(row["sha256"], hashlib.sha256(payload).hexdigest())
 
@@ -1475,11 +2879,7 @@ class NoFullScanExportTests(unittest.TestCase):
             triangle_vertices=triangles,
         )
         payload = valid.stl_bytes
-        five_key = {
-            key: value
-            for key, value in valid.items()
-            if key != "itessellation"
-        }
+        five_key = {key: value for key, value in valid.items() if key != "itessellation"}
         legacy_v2 = {
             **valid,
             "schema_version": "solidworks-to-urdf.native-tessellation/v2",
@@ -1526,4 +2926,3 @@ class NoFullScanExportTests(unittest.TestCase):
                         Path(tmp) / "evidence" / "geometry",
                         ["pcb-1"],
                     )
-

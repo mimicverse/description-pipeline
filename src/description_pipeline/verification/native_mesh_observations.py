@@ -3,6 +3,7 @@
 import hashlib
 import math
 import struct
+from fractions import Fraction
 from pathlib import Path
 
 from ..geometry.native_tessellation import (
@@ -10,8 +11,21 @@ from ..geometry.native_tessellation import (
     parse_native_tessellation,
     summarize_native_topology,
 )
-from ..geometry.native_u import native_tolerant_edge_value_warning
+from ..geometry.native_u import (
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
+    NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+    NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+    native_binary64_unit_vector,
+)
 from ..io import PipelineError, confined
+from ..geometry.native_planar_brep import NATIVE_PLANAR_COEDGE_VERTEX_RULE
+from ..schemas import (
+    NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+)
 from ..sources.snapshot import verify_snapshot
 from . import native_discovery as evidence
 
@@ -88,9 +102,66 @@ def _stl_triangle_vertices(path: Path, triangles: int) -> list[tuple[tuple[float
     ]
 
 
+def _verify_planar_stl_normals(
+    path: Path,
+    tessellation: dict,
+    spans: list[dict],
+) -> None:
+    """Bind every planar STL normal to its actual outward triangle winding."""
+
+    data = path.read_bytes()
+    spans_by_face = {
+        (
+            span["body_type"],
+            span["body_index"],
+            span["face_index"],
+        ): span
+        for span in spans
+    }
+    for body in tessellation["planar_brep"]["bodies"]:
+        key = (
+            body["body_type"],
+            body["body_index"],
+            body["face_index"],
+        )
+        span = spans_by_face[key]
+        for local_index, triangle in enumerate(body["triangulation"]["triangles"]):
+            record_offset = 84 + 50 * (span["triangle_start"] + local_index)
+            stored_normal = struct.unpack_from(
+                "<3f",
+                data,
+                record_offset,
+            )
+            vertices = tuple(tuple(float(value) for value in point) for point in triangle["stl_points"])
+            first, second = (
+                tuple(vertices[1][axis] - vertices[0][axis] for axis in range(3)),
+                tuple(vertices[2][axis] - vertices[0][axis] for axis in range(3)),
+            )
+            cross = (
+                first[1] * second[2] - first[2] * second[1],
+                first[2] * second[0] - first[0] * second[2],
+                first[0] * second[1] - first[1] * second[0],
+            )
+            _require(
+                any(cross) and all(math.isfinite(value) for value in stored_normal),
+                "a planar STL triangle has an invalid stored normal",
+            )
+            expected_normal = struct.unpack(
+                "<3f",
+                struct.pack(
+                    "<3f",
+                    *native_binary64_unit_vector(cross),
+                ),
+            )
+            _require(
+                stored_normal == expected_normal,
+                "a planar STL normal does not follow its outward triangle winding",
+            )
+
+
 def verify_native_mesh_observations(bundle: Path) -> dict:
     manifest = verify_snapshot(Path(bundle) / "evidence")
-    source_scopes = evidence.source_scopes(bundle)
+    evidence.source_scopes(bundle)
     native = ((manifest.get("identity") or {}).get("capture") or {}).get("evidence_class") == "cad"
     rows = evidence.geometry(bundle)
     warnings = []
@@ -126,15 +197,79 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             _stl_triangle_vertices(path, triangles),
             native_fin_resolutions=native_fin_resolutions,
             native_identity_warnings=native_identity_warnings,
-            expected_source_scope=source_scopes.get(component),
         )
         warnings.extend(native_fin_resolutions)
         warnings.extend(native_identity_warnings)
+        for planar_body in tessellation["planar_brep"]["bodies"]:
+            body_key = (
+                planar_body["body_type"],
+                planar_body["body_index"],
+            )
+            object_id = f"{component}:body:{body_key[0]}/{body_key[1]}"
+            common = {
+                "component": component,
+                "entity_kind": "body",
+                "body_type": body_key[0],
+                "body_index": body_key[1],
+                "face_index": planar_body["face_index"],
+                "provider": planar_body["provider"],
+                "native_body_reference_sha256": planar_body["native_body_reference_sha256"],
+                "native_face_reference_sha256": planar_body["native_face_reference_sha256"],
+            }
+            for code, field, message, extra in (
+                (
+                    NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+                    "face_normal_unit",
+                    "Planar BRep face normal is derived from the native surface normal and face sense.",
+                    {
+                        "plane_params": planar_body["surface"]["plane_params"],
+                        "face_in_surface_sense": planar_body["surface"]["face_in_surface_sense"],
+                        "face_normal_raw": planar_body["surface"]["face_normal_raw"],
+                        "face_normal_unit": planar_body["surface"]["face_normal_unit"],
+                    },
+                ),
+                (
+                    NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+                    "triangles",
+                    "Planar BRep mesh triangles are derived from the native plane, ordered boundary, and trim facts.",
+                    {
+                        "rule_version": planar_body["triangulation"]["rule_version"],
+                        "native_face_area_api": "IFace2.GetArea",
+                        "vertex_identity_rule": NATIVE_PLANAR_COEDGE_VERTEX_RULE,
+                        "native_face_area_approx_m2": planar_body["face_area_m2"],
+                        "derived_boundary_area_m2": planar_body["triangulation"]["boundary_area_m2"],
+                        "native_minus_derived_area_m2": float(
+                            Fraction(planar_body["face_area_m2"])
+                            - Fraction(planar_body["triangulation"]["boundary_area_m2"])
+                        ),
+                        "triangle_count": len(planar_body["triangulation"]["triangles"]),
+                        "error_components_m": planar_body["triangulation"]["error_components_m"],
+                        "surface_error_upper_bound_m": planar_body["triangulation"]["surface_error_upper_bound_m"],
+                        "surface_error_limit_m": planar_body["triangulation"]["surface_error_limit_m"],
+                        "boundary_vertex_reference_sha256": [
+                            row["vertex_reference_sha256"] for row in planar_body["boundary_vertices"]
+                        ],
+                    },
+                ),
+            ):
+                warnings.append(
+                    {
+                        "code": code,
+                        "blocking": False,
+                        "severity": "warning",
+                        "message": message,
+                        "object": object_id,
+                        "detail": {
+                            **common,
+                            "field": field,
+                            **extra,
+                        },
+                    }
+                )
         topology = summarize_native_topology(
             tessellation,
             spans,
             component=component,
-            expected_source_scope=source_scopes.get(component),
         )
         _require(
             topology["status"] == "evidence_complete",
@@ -142,13 +277,41 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         )
         topologies.append({"component": component, **topology})
         _span_digests(path, spans)
+        _verify_planar_stl_normals(path, tessellation, spans)
         seen = set()
         component_untessellated = []
-        base = {"body_type", "body_index", "face_index", "triangle_count", "area_m2", "used_api"}
+        face_evidence = {
+            (
+                body["body_type"],
+                body["body_index"],
+                face["face_index"],
+            ): face
+            for body in tessellation["itessellation"]["bodies"]
+            for face in body["faces"]
+        }
+        edge_evidence = {
+            (
+                edge["body_type"],
+                edge["body_index"],
+                edge["edge_reference_sha256"],
+            ): edge
+            for edge in tessellation["native_edges"]
+        }
+        base = {
+            "body_type",
+            "body_index",
+            "face_index",
+            "triangle_count",
+            "area_m2",
+            "used_api",
+            "source_rule",
+            "warnings",
+            "derived_empty_edges",
+        }
         for face in omitted:
             keys = set(face) if isinstance(face, dict) else None
             _require(
-                keys in (base | {"facet_count", "tessellate_result"}, base | {"tessellate_probe_error"}),
+                keys == base | {"facet_count", "tessellate_result"},
                 component + ": malformed untessellated-face observation",
             )
             _require(
@@ -174,32 +337,95 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                 type(face["area_m2"]) in (int, float) and math.isfinite(face["area_m2"]) and face["area_m2"] >= 0,
                 component + ": invalid untessellated native area",
             )
-            if "tessellate_result" in face:
-                _require(
-                    type(face["facet_count"]) is int and face["facet_count"] == 0,
-                    component + ": native facets cannot be omitted",
-                )
-                _require(
-                    type(face["tessellate_result"]) is bool, component + ": native tessellation result is unreadable"
-                )
-            else:
-                # A persistent DISP_E_EXCEPTION on geometrically degenerate faces is
-                # recorded as a probe error instead of a result: both facet_count and
-                # tessellate_result are products of the probe that failed, so the
-                # variant carries neither; it is admissible only for numerically zero
-                # area and never loosens any other check.
-                probe_error = face["tessellate_probe_error"]
-                _require(
-                    isinstance(probe_error, str) and probe_error.startswith("com_error"),
-                    component + ": native tessellation probe error is unreadable",
-                )
-                _require(
-                    face["area_m2"] <= 1e-12,
-                    component + ": a degenerate-face probe error is only admissible at zero native area",
-                )
             _require(
-                face["used_api"] == "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                type(face["facet_count"]) is int and face["facet_count"] == 0,
+                component + ": native facets cannot be omitted",
+            )
+            body_evidence = next(
+                body
+                for body in tessellation["itessellation"]["bodies"]
+                if (body["body_type"], body["body_index"]) == key[:2]
+            )
+            _require(
+                face["tessellate_result"] is body_evidence["tessellate_result"] is True,
+                component + ": untessellated face contradicts its successful body tessellation",
+            )
+            _require(
+                face["used_api"] == NATIVE_FACETLESS_EVIDENCE_API,
                 component + ": unsupported untessellated-face evidence API",
+            )
+            evidence_face = face_evidence.get(key)
+            _require(
+                isinstance(evidence_face, dict),
+                component + ": untessellated face has no native face evidence",
+            )
+            _require(
+                face["source_rule"] == evidence_face["facet_ids_source"]
+                and face["warnings"] == evidence_face["warnings"]
+                and face["source_rule"]
+                in {
+                    NATIVE_ID_ARRAY_SOURCE_FLAT,
+                    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+                }
+                and face["warnings"]
+                == (
+                    [NATIVE_FACE_FACET_IDS_DERIVED]
+                    if face["source_rule"]
+                    == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                    else []
+                )
+                and isinstance(face["derived_empty_edges"], list),
+                component + ": untessellated face source evidence is inconsistent",
+            )
+            derived_references = []
+            for derived in face["derived_empty_edges"]:
+                reference = (
+                    derived.get("edge_reference_sha256")
+                    if isinstance(derived, dict)
+                    else None
+                )
+                edge = edge_evidence.get(
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        reference,
+                    )
+                )
+                _require(
+                    isinstance(derived, dict)
+                    and set(derived)
+                    == {
+                        "edge_reference_sha256",
+                        "source_rule",
+                        "warnings",
+                    }
+                    and isinstance(edge, dict)
+                    and face["face_index"] in edge["face_indices"]
+                    and derived["source_rule"]
+                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                    and derived["warnings"]
+                    == [NATIVE_EDGE_FIN_IDS_DERIVED]
+                    and edge["fin_ids_source"] == derived["source_rule"]
+                    and edge["warnings"] == derived["warnings"],
+                    component + ": derived empty-edge source evidence is inconsistent",
+                )
+                derived_references.append(reference)
+            expected_derived_references = sorted(
+                reference
+                for (body_type, body_index, reference), edge
+                in edge_evidence.items()
+                if (
+                    body_type == face["body_type"]
+                    and body_index == face["body_index"]
+                    and face["face_index"] in edge["face_indices"]
+                    and edge["fin_ids_source"]
+                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                )
+            )
+            _require(
+                derived_references == expected_derived_references,
+                component
+                + ": derived empty-edge references do not exactly cover incident empty-fin edges",
             )
             component_untessellated.append(
                 {
@@ -233,15 +459,3 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             row["area_m2"] for row in untessellated_warnings
         ),
     }
-
-
-def native_geometry_value_warnings(bundle: Path) -> list[dict]:
-    """Return canonical value warnings re-derived from native geometry evidence."""
-
-    details = verify_native_mesh_observations(Path(bundle))
-    try:
-        return native_tolerant_edge_value_warning(details["warnings"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise PipelineError(
-            "Native geometry value warnings are not reproducible"
-        ) from error

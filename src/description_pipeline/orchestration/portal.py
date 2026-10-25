@@ -52,7 +52,6 @@ from ..stages import (
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     native_scope_warning_details_match,
-    native_tolerant_edge_warning_set_matches,
 )
 from .airflow_client import (
     EndpointConfig,
@@ -333,13 +332,6 @@ def _quality_warnings(report: dict | None) -> list[dict]:
         if isinstance(item, dict)
         and str(item.get("code")) in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
-    if not native_tolerant_edge_warning_set_matches(
-        diagnostics,
-        native_gate_warnings or [],
-    ):
-        raise PipelineError(
-            "Native tolerant-edge warnings differ from gate evidence"
-        )
     if (native_gate_passed and native_gate_warnings is None) or (
         (native_scope or raw_scope)
         and (

@@ -12,7 +12,24 @@ INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 TOOL_SCHEMA = "solidworks-to-urdf.tool/v1"
 EFFECTIVE_INSTANCES_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
-NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v8"
+NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v14"
+NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP = "native-planar-brep-boundary"
+NATIVE_ID_ARRAY_SOURCE_FLAT = "native-flat-array"
+NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO = (
+    "native-body-global-null-zero"
+)
+NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO = (
+    "native-incident-faces-null-zero"
+)
+NATIVE_FACETLESS_EVIDENCE_API = (
+    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets/"
+    "GetFacetFins/GetEdgeFins/GetFacetCount/GetFinCount"
+)
+NATIVE_MESH_CAPTURE_API = (
+    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets/"
+    "GetFacetFins/GetEdgeFins/GetFinVertices/GetVertexPoint/"
+    "GetFacetCount/GetFinCount/GetVertexCount"
+)
 NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
 NATIVE_DISCOVERY_FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
 NATIVE_IDENTITY_RESOLUTION_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"

@@ -115,11 +115,11 @@ def _capture_events(
         for name, checksum in inventory(root / "input").items()
         if name not in {"handoff.json", "request.json"}
     }
-    binding_files = {
-        f"input/{name}": checksum
+    prepared_files = {
+        (name.removeprefix("cad/") if name.startswith("cad/") else name): checksum
         for name, checksum in input_inventory.items()
     }
-    prepared_files = dict(input_inventory)
+    binding_files = {"input/" + name: checksum for name, checksum in prepared_files.items()}
     capture_plan = root / "evidence/capture-plan.json"
     if capture_plan.is_file():
         plan_sha256 = file_digest(capture_plan)
@@ -276,8 +276,8 @@ def _capture_events(
                 "capture.input_stability",
                 {
                     "files": {
-                        f"input/{Path(name).name}": checksum
-                        for name, checksum in input_inventory.items()
+                        "input/" + name: checksum
+                        for name, checksum in prepared_files.items()
                     }
                 },
             ),
@@ -475,6 +475,21 @@ def capture_root(
     write_json(evidence / "native-runtime.json", environment)
     (evidence / "geometry").mkdir()
     (evidence / "geometry/base.stl").write_bytes(b"STL-BYTES")
+    write_json(evidence / "capture-plan.json", {
+        "schema_version": "solidworks-to-urdf.capture-plan/v1",
+        "run_id": run_id,
+        "handoff_sha256": handoff,
+        "discovery_sha256": file_digest(root / "input/discovery/native-discovery.json"),
+        "main_assembly": main,
+        "configuration": "Default",
+        "identity": {"hardware_id": "fixture", "revision": "r1"},
+        "selection": {"files": native_files},
+        "objects": [{"name": "base-1", "document": main, "state": 2}],
+        "groups": [{"name": "base_link", "components": ["base-1"]}],
+        "axis_requests": [],
+        "datums": ["base_datum"],
+        "evidence_requests": ["evidence/capture.json", "evidence/geometry/", "evidence/native-runtime.json"],
+    })
     write_manifest(
         evidence,
         kind="solidworks",
@@ -1180,7 +1195,19 @@ class StageTransferTests(unittest.TestCase):
                 capture / "input/discovery/native-discovery.json",
                 native_discovery,
             )
+            plan = read_data(self.root / "evidence/capture-plan.json")
+            plan.update(
+                handoff_sha256=handoff_sha256,
+                discovery_sha256=file_digest(capture / "input/discovery/native-discovery.json"),
+                selection={"files": native_files},
+                objects=[{"name": "base-1", "document": "base.SLDPRT", "state": 2},
+                         {"name": "arm-1", "document": "arm.SLDPRT", "state": 2}],
+                groups=[{"name": "base_link", "components": ["base-1"]},
+                        {"name": "arm_link", "components": ["arm-1"]}],
+            )
+            write_json(capture / "evidence/capture-plan.json", plan)
             manifest = read_data(capture / "evidence" / "manifest.json")
+            manifest["files"]["capture-plan.json"] = file_digest(capture / "evidence/capture-plan.json")
             manifest["files"]["capture.json"] = file_digest(capture / "evidence/capture.json")
             manifest["files"]["discovery.json"] = file_digest(capture / "evidence" / "discovery.json")
             manifest["files"]["native-runtime.json"] = file_digest(
@@ -1669,7 +1696,7 @@ class StageTransferTests(unittest.TestCase):
                     seal(root, self.base / f"details-{label.replace('.', '-')}.zip")
 
     def test_discovery_binding_is_a_complete_prepared_to_archived_mapping(self) -> None:
-        relative = f"input/cad/{MAIN_ASSEMBLY}"
+        relative = f"input/{MAIN_ASSEMBLY}"
         for label in ("omitted", "foreign-path"):
             with self.subTest(case=label):
                 root = capture_root(self.base / f"binding-{label}")
@@ -1696,6 +1723,48 @@ class StageTransferTests(unittest.TestCase):
                 )
                 with self.assertRaises(PipelineError):
                     seal(root, self.base / f"binding-{label}.zip")
+
+    def test_prepared_inverse_preserves_native_and_record_relative_paths(self) -> None:
+        native = {"nested/part.SLDPRT": "a" * 64, "other/part.SLDPRT": "b" * 64}
+        archived = {"cad/nested/part.SLDPRT": "a" * 64, "cad/other/part.SLDPRT": "b" * 64,
+                    "source.json": "c" * 64, "discovery/native-discovery.json": "d" * 64,
+                    "discovery/findings.json": "e" * 64, "discovery/identity-resolution.json": "f" * 64,
+                    "records/left/calibration.json": "1" * 64, "records/right/calibration.json": "2" * 64}
+        prepared, paths = native_transfer._prepared_archive_inventory(
+            archived, native, capture_plan_sha256="3" * 64,
+        )
+        self.assertEqual(prepared, {**native, "source.json": "c" * 64,
+                         "discovery/native-discovery.json": "d" * 64, "discovery/findings.json": "e" * 64,
+                         "discovery/identity-resolution.json": "f" * 64,
+                         "records/left/calibration.json": "1" * 64, "records/right/calibration.json": "2" * 64,
+                         "capture-plan.json": "3" * 64})
+        self.assertEqual(paths["nested/part.SLDPRT"], "input/cad/nested/part.SLDPRT")
+        self.assertEqual(paths["capture-plan.json"], "evidence/capture-plan.json")
+        self.assertEqual(paths["discovery/findings.json"], "input/discovery/findings.json")
+
+    def test_prepared_inverse_rejects_missing_foreign_changed_and_ambiguous_inputs(self) -> None:
+        valid = {"cad/robot.SLDASM": "a" * 64, "source.json": "b" * 64}
+        for label, rows, plan in (
+            ("missing", {"source.json": "b" * 64}, "c" * 64),
+            ("changed", {**valid, "cad/robot.SLDASM": "d" * 64}, "c" * 64),
+            ("foreign", {**valid, "cad/foreign.SLDPRT": "d" * 64}, "c" * 64),
+            ("casefold", {**valid, "SOURCE.json": "d" * 64}, "c" * 64),
+            ("two-plans", {**valid, "capture-plan.json": "c" * 64}, "c" * 64),
+            ("no-plan", valid, None),
+        ):
+            with self.subTest(case=label), self.assertRaises(PipelineError):
+                native_transfer._prepared_archive_inventory(rows, {"robot.SLDASM": "a" * 64}, capture_plan_sha256=plan)
+
+    def test_current_capture_refuses_missing_plan_even_after_receipts_are_resealed(self) -> None:
+        (self.root / "evidence/capture-plan.json").unlink()
+        manifest = read_data(self.root / "evidence/manifest.json")
+        write_manifest(
+            self.root / "evidence", kind=manifest["kind"], identity=manifest["identity"], evidence_class="cad",
+        )
+        events = _capture_events(self.root, handoff=HANDOFF, main=MAIN_ASSEMBLY, native_files=NATIVE_FILES)
+        write_json(self.root / "reports/native-stages.json", stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events))
+        with self.assertRaisesRegex(PipelineError, "capture-plan.json"):
+            seal(self.root, self.archive)
 
     def test_unknown_discovery_input_is_not_a_derived_file(self) -> None:
         root = capture_root(self.base / "unknown-discovery-input")

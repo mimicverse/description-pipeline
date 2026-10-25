@@ -9,9 +9,70 @@ import re
 import struct
 from fractions import Fraction
 
+
+def native_binary64_sqrt(value: Fraction, *, upward: bool = False) -> float:
+    """Round an exact nonnegative square root without platform libm results.
+
+    The integer square root locates adjacent binary64 values. Their exact
+    rational midpoint selects round-to-nearest, ties-to-even; upward selects
+    the least representable upper bound. Subnormal results use the same rule.
+    """
+
+    if value < 0:
+        raise ValueError("a native squared quantity must be nonnegative")
+    if value == 0:
+        return 0.0
+    numerator, denominator = value.numerator, value.denominator
+    exponent = numerator.bit_length() - denominator.bit_length()
+    if numerator < denominator << exponent if exponent >= 0 else numerator << -exponent < denominator:
+        exponent -= 1
+    quantum = max(exponent // 2 - 52, -1074)
+    if quantum >= 0:
+        scaled_numerator = numerator
+        scaled_denominator = denominator << (2 * quantum)
+        unit = Fraction(1 << quantum)
+    else:
+        scaled_numerator = numerator << (-2 * quantum)
+        scaled_denominator = denominator
+        unit = Fraction(1, 1 << -quantum)
+    significand = math.isqrt(scaled_numerator // scaled_denominator)
+    lower_exact = significand * unit
+    lower = float(lower_exact)
+    if lower_exact**2 == value:
+        return lower
+    upper = math.nextafter(lower, math.inf)
+    if not math.isfinite(upper):
+        raise ValueError("a native square root is outside binary64")
+    if upward:
+        return upper
+    midpoint = (lower_exact + Fraction.from_float(upper)) / 2
+    if value < midpoint**2:
+        return lower
+    if value > midpoint**2:
+        return upper
+    return lower if struct.unpack("<Q", struct.pack("<d", lower))[0] % 2 == 0 else upper
+
+
+def native_binary64_unit_vector(vector) -> tuple[float, ...]:
+    """Normalize exact binary64 coordinates with deterministic nearest rounding."""
+
+    exact = tuple(Fraction.from_float(float(value)) for value in vector)
+    squared_length = sum(value**2 for value in exact)
+    if squared_length == 0:
+        raise ValueError("a native direction must be nonzero")
+    return tuple(math.copysign(native_binary64_sqrt(value**2 / squared_length), float(value)) for value in exact)
+
+
+def native_binary64_sum_upper(values) -> float:
+    """Return the least binary64 upper bound of a sum of binary64 bounds."""
+
+    exact = sum(Fraction.from_float(value) for value in values)
+    result = float(exact)
+    return math.nextafter(result, math.inf) if Fraction.from_float(result) < exact else result
+
+
 NATIVE_U_IDENTITY_RULE = "native-u-identity-128ulp-v1"
-NATIVE_U_POINT_PARAMETER_RULE = "native-u-point-parameter-authoritative-v2"
-NATIVE_U_CLOSEST_FALLBACK_RULE = "native-u-closest-point-fallback-v1"
+NATIVE_U_CLOSEST_POINT_PARAMETER_RULE = "native-u-closest-point-parameter-v1"
 NATIVE_U_IDENTITY_ULPS = 128
 NATIVE_U_COVERAGE_COVERED = "covered"
 NATIVE_U_COVERAGE_UNCOVERED = "uncovered"
@@ -20,85 +81,16 @@ NATIVE_POINT_ROUNDTRIP_RULE = "native-point-float32-pair-v3"
 NATIVE_CURVE_ENDPOINT_OPERATION_RULE = (
     "native-curve-endpoint-float32-operation-v4"
 )
-NATIVE_TOLERANT_EDGE_BOUNDARY_RULE = (
-    "native-tolerant-edge-boundary-euclidean-v5"
-)
 NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE = (
-    "native-curve-topology-endpoint-set-v2"
+    "native-curve-topology-endpoint-set-v3"
 )
-NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE = (
-    "native-open-edge-boundary-identity-v2"
-)
-NATIVE_OPEN_EDGE_SCOPE_RULE = "native-open-edge-scope-binding-v1"
+# Retained as the frozen source-scope schema value; it grants no open-edge identity.
+NATIVE_SOURCE_SCOPE_RULE = "native-open-edge-scope-binding-v1"
 NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
     "tessellation-edge-projection-v1"
 )
+NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC = "max_abs_coordinate"
 NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M = 50e-6
-NATIVE_TOLERANT_EDGE_GAP_SOURCE = (
-    "IEdge.IsTolerant(out VARIANT VT_BYREF|VT_R8)"
-)
-NATIVE_TOLERANT_EDGE_GAP_SOURCE_FIELD = (
-    "native_edges[].edge_tolerance.gap_m"
-)
-NATIVE_TOLERANT_EDGE_EVALUATE_METRIC = "max_abs_coordinate"
-NATIVE_TOLERANT_EDGE_PROJECTION_METRIC = "euclidean"
-NATIVE_TOLERANT_EDGE_WARNING_REASON = (
-    "tolerant boundary projection exceeds the binary32 v4 bound "
-    "and uses the native gap"
-)
-NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION = (
-    "native_declared_tolerant_edge;euclidean_projected_endpoint_bound"
-)
-NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS = (
-    "point_tolerance_m",
-    "point_error_m",
-    "point_roundtrip_rule",
-    "tolerant_edge_evidence.evaluate_point_error_m",
-    "projection_to_curve_l2_error_m",
-    "eligible_gap_m",
-    "composed_projection_tolerance_m",
-    "gap_used",
-)
-NATIVE_TOLERANT_EDGE_GAP_WARNING = (
-    "cad_native_tolerant_edge_boundary_projection"
-)
-NATIVE_TOLERANT_EDGE_WARNING_MESSAGE = (
-    "Native tolerant-edge boundary projection used a source-bound unordered "
-    "endpoint-set authority and, where needed, an independently replayed "
-    "open-edge identity."
-)
-NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS = frozenset(
-    {
-        "component",
-        "body_type",
-        "body_index",
-        "edge_reference_sha256",
-        "fin_id",
-        "fin_endpoint",
-        "parameter_boundary",
-        "point_roundtrip_rule",
-        "evaluate_rule_version",
-        "evaluate_metric",
-        "evaluate_point_error_m",
-        "point_tolerance_m",
-        "projection_metric",
-        "projection_to_curve_l2_error_m",
-        "eligible_gap_m",
-        "gap_used",
-        "composed_projection_tolerance_m",
-        "gap_source_api",
-        "gap_cap_m",
-        "edge_tolerance_out_variant_type",
-        "field",
-        "topology_endpoint_set",
-        "source_scope",
-        "open_edge_boundary_identity_sha256",
-    }
-)
-NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS = (
-    NATIVE_TOLERANT_EDGE_WARNING_REQUIRED_FIELDS
-    | {"affected_fields", "reason", "qualification"}
-)
 NATIVE_COLLAPSED_U_FIN_RULE = "native-fin-u-collapse-v1"
 NATIVE_PERIODIC_FIN_INTERVAL_RULE = "native-periodic-fin-interval-v1"
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
@@ -122,6 +114,15 @@ NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED = "cad_scope_local_identity_derived"
 NATIVE_COMPONENT_REFERENCE_ALIASED = "cad_component_persistent_reference_aliased"
 NATIVE_PART_WITNESS_DERIVED = "cad_part_identity_witness_derived"
 NATIVE_TOPOLOGY_IDENTITY_DERIVED = "cad_topology_identity_derived"
+NATIVE_FACE_FACET_IDS_DERIVED = (
+    "cad_face_facet_ids_derived_by_body_global_closure"
+)
+NATIVE_EDGE_FIN_IDS_DERIVED = (
+    "cad_edge_fin_ids_derived_by_empty_incident_faces"
+)
+NATIVE_PLANAR_BREP_BOUNDARY = "cad_edge_fin_ids_not_applicable_for_planar_brep"
+NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED = "cad_planar_brep_unit_normal_derived"
+NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED = "cad_planar_brep_triangulation_derived"
 NATIVE_SCOPE_IDENTITY_WARNING_CODES = frozenset(
     {
         NATIVE_COMPONENT_REFERENCE_ALIASED,
@@ -334,249 +335,6 @@ def native_scope_warning_projection(item: dict) -> dict:
         ),
         "detail": detail,
     }
-
-
-def native_tolerant_edge_warning_is_valid(item: object) -> bool:
-    """Whether one projected v5 warning retains complete field provenance."""
-
-    if not isinstance(item, dict) or set(item) != {
-        "code",
-        "blocking",
-        "severity",
-        "message",
-        "object",
-        "detail",
-    }:
-        return False
-    detail = item.get("detail")
-    if (
-        not isinstance(detail, dict)
-        or set(detail) != NATIVE_TOLERANT_EDGE_WARNING_DETAIL_FIELDS
-    ):
-        return False
-    numeric_fields = (
-        "evaluate_point_error_m",
-        "point_tolerance_m",
-        "projection_to_curve_l2_error_m",
-        "eligible_gap_m",
-        "composed_projection_tolerance_m",
-        "gap_cap_m",
-    )
-    topology = detail["topology_endpoint_set"]
-    identity_sha256 = detail["open_edge_boundary_identity_sha256"]
-    if (
-        not isinstance(topology, dict)
-        or not native_source_scope_is_valid(
-            detail["source_scope"],
-            detail["component"],
-        )
-        or (identity_sha256 is not None and not isinstance(identity_sha256, str))
-        or (
-            isinstance(identity_sha256, str)
-            and _HEX64.fullmatch(identity_sha256) is None
-        )
-    ):
-        return False
-    try:
-        recomputed_topology = native_curve_topology_endpoint_set_assignment(
-            topology["expected_start_point_m"],
-            topology["expected_end_point_m"],
-            topology["actual_start_point_m"],
-            topology["actual_end_point_m"],
-        )
-    except (KeyError, TypeError, ValueError):
-        return False
-    return (
-        item["code"] == NATIVE_TOLERANT_EDGE_GAP_WARNING
-        and item["blocking"] is False
-        and item["severity"] == "warning"
-        and isinstance(item["message"], str)
-        and item["message"] == NATIVE_TOLERANT_EDGE_WARNING_MESSAGE
-        and item["object"] == detail["component"]
-        and isinstance(detail["component"], str)
-        and bool(detail["component"])
-        and type(detail["body_type"]) is int
-        and detail["body_type"] in (0, 1)
-        and type(detail["body_index"]) is int
-        and detail["body_index"] >= 0
-        and isinstance(detail["edge_reference_sha256"], str)
-        and bool(_HEX64.fullmatch(detail["edge_reference_sha256"]))
-        and type(detail["fin_id"]) is int
-        and detail["fin_id"] >= 0
-        and detail["fin_endpoint"] in {"start", "end"}
-        and detail["parameter_boundary"] in {"u_min", "u_max"}
-        and detail["point_roundtrip_rule"]
-        == NATIVE_TOLERANT_EDGE_BOUNDARY_RULE
-        and detail["evaluate_rule_version"]
-        == NATIVE_CURVE_ENDPOINT_OPERATION_RULE
-        and detail["evaluate_metric"] == NATIVE_TOLERANT_EDGE_EVALUATE_METRIC
-        and detail["projection_metric"] == NATIVE_TOLERANT_EDGE_PROJECTION_METRIC
-        and all(
-            type(detail[field]) in (int, float)
-            and math.isfinite(float(detail[field]))
-            and detail[field] >= 0.0
-            for field in numeric_fields
-        )
-        and detail["evaluate_point_error_m"]
-        <= detail["point_tolerance_m"]
-        and detail["eligible_gap_m"]
-        <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-        and detail["projection_to_curve_l2_error_m"]
-        <= detail["composed_projection_tolerance_m"]
-        and detail["gap_used"] is True
-        and detail["gap_source_api"] == NATIVE_TOLERANT_EDGE_GAP_SOURCE
-        and detail["gap_cap_m"]
-        == NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-        and type(detail["edge_tolerance_out_variant_type"]) is int
-        and detail["edge_tolerance_out_variant_type"] == 0x4005
-        and isinstance(detail["field"], str)
-        and detail["field"]
-        == f"{detail['fin_endpoint']}_evidence.tolerant_edge_evidence"
-        and detail["affected_fields"] == list(
-            NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS
-        )
-        and isinstance(detail["reason"], str)
-        and bool(detail["reason"].strip())
-        and detail["reason"] == NATIVE_TOLERANT_EDGE_WARNING_REASON
-        and detail["qualification"]
-        == NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION
-        and topology == recomputed_topology
-        and (
-            (topology["complete_match_count"] == 1 and identity_sha256 is None)
-            or (
-                topology["complete_match_count"] == 2
-                and isinstance(identity_sha256, str)
-            )
-        )
-    )
-
-
-def native_tolerant_edge_value_warning(raw_warnings: list[dict]) -> list[dict]:
-    """Return the model-level value warning for verified tolerant-edge authority."""
-
-    objects = []
-    for item in raw_warnings:
-        if not isinstance(item, dict):
-            raise ValueError("native tessellation warning is not an object")
-        if item.get("code") != NATIVE_TOLERANT_EDGE_GAP_WARNING:
-            continue
-        projected = native_scope_warning_projection(item)
-        if not native_tolerant_edge_warning_is_valid(projected):
-            raise ValueError("native tolerant-edge warning is incomplete")
-        detail = projected["detail"]
-        objects.append(
-            {
-                "object_type": "native_tessellation_fin_endpoint",
-                "object": (
-                    f"{detail['component']}:"
-                    f"body:{detail['body_type']}/{detail['body_index']}:"
-                    f"edge:{detail['edge_reference_sha256']}:"
-                    f"fin:{detail['fin_id']}:{detail['fin_endpoint']}"
-                ),
-                **detail,
-            }
-        )
-    if not objects:
-        return []
-    objects.sort(
-        key=lambda value: json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-    )
-    return [
-        {
-            "code": NATIVE_TOLERANT_EDGE_GAP_WARNING,
-            "message": NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
-            "objects": objects,
-        }
-    ]
-
-
-def native_tolerant_edge_warning_details_match(
-    diagnostics: list[dict],
-    raw_warnings: list[dict],
-) -> bool:
-    """Require quality diagnostics to reproduce every v5 warning exactly."""
-
-    def comparable(items):
-        return sorted(
-            json.dumps(
-                item,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            for item in items
-        )
-
-    projected = [
-        native_scope_warning_projection(item)
-        for item in raw_warnings
-        if isinstance(item, dict)
-        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
-    ]
-    v5_diagnostics = [
-        item
-        for item in diagnostics
-        if isinstance(item, dict)
-        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
-    ]
-    def identities(items):
-        return [
-            (
-                item["detail"]["component"],
-                item["detail"]["body_type"],
-                item["detail"]["body_index"],
-                item["detail"]["edge_reference_sha256"],
-                item["detail"]["fin_id"],
-                item["detail"]["fin_endpoint"],
-                item["detail"]["parameter_boundary"],
-                item["detail"]["field"],
-            )
-            for item in items
-        ]
-
-    return (
-        all(native_tolerant_edge_warning_is_valid(item) for item in projected)
-        and all(
-            native_tolerant_edge_warning_is_valid(item)
-            for item in v5_diagnostics
-        )
-        and len(identities(projected)) == len(set(identities(projected)))
-        and len(identities(v5_diagnostics))
-        == len(set(identities(v5_diagnostics)))
-        and comparable(projected) == comparable(v5_diagnostics)
-    )
-
-
-def native_tolerant_edge_warning_set_matches(
-    diagnostics: list[dict],
-    raw_warnings: list[dict],
-) -> bool:
-    """Validate the paired tolerant warning sets without consumer-specific filters."""
-
-    tolerant_diagnostics = [
-        item
-        for item in diagnostics
-        if isinstance(item, dict)
-        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
-    ]
-    tolerant_raw = [
-        item
-        for item in raw_warnings
-        if isinstance(item, dict)
-        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
-    ]
-    if not tolerant_diagnostics and not tolerant_raw:
-        return True
-    return native_tolerant_edge_warning_details_match(
-        tolerant_diagnostics,
-        tolerant_raw,
-    )
 
 
 def native_scope_warning_diagnostics_are_complete(
@@ -793,33 +551,6 @@ def native_fin_interval(
     ]
 
 
-def native_boolean_success(value: object) -> bool | None:
-    """Normalize a COM boolean-like 0/1 result without accepting other values."""
-
-    if type(value) is bool:
-        return value
-    if type(value) in (int, float) and value in (0, 1):
-        return bool(value)
-    return None
-
-
-def native_get_parameter_success(value: object) -> bool | None:
-    """Parse GetParameter's flag or packed double-long status strictly."""
-
-    boolean = native_boolean_success(value)
-    if boolean is not None:
-        return boolean
-    if type(value) is not float or not math.isfinite(value):
-        return None
-    bits = struct.unpack("<Q", struct.pack("<d", value))[0]
-    low32 = bits & 0xFFFFFFFF
-    if value == 0.0:
-        return False
-    if low32 == 1:
-        return True
-    return None
-
-
 def native_evaluate2_evidence(raw: list | tuple) -> dict | None:
     """Serialize seven Evaluate2 doubles without placing packed bits in JSON."""
 
@@ -936,23 +667,6 @@ def native_point_error(
     )
 
 
-def native_point_euclidean_error(
-    left: tuple[float | int, float | int, float | int],
-    right: tuple[float | int, float | int, float | int],
-) -> float:
-    """Return the Euclidean XYZ distance between two finite native points."""
-
-    if len(left) != 3 or len(right) != 3:
-        raise ValueError("points must contain three coordinates")
-    values = [
-        _native_u(left[index]) - _native_u(right[index])
-        for index in range(3)
-    ]
-    if not all(map(math.isfinite, values)):
-        raise ValueError("points must contain finite coordinates")
-    return math.hypot(*values)
-
-
 def native_point_within_max_coordinate_bound(
     left,
     right,
@@ -978,29 +692,6 @@ def native_point_within_max_coordinate_bound(
         if difference > bound_fraction:
             return False
     return True
-
-
-def native_point_within_euclidean_bound(left, right, bound_m) -> bool:
-    """Compare one Euclidean distance to an outward binary64 bound exactly."""
-
-    if len(left) != 3 or len(right) != 3:
-        raise ValueError("points must contain three coordinates")
-    if type(bound_m) not in (int, float):
-        raise ValueError("Euclidean bound must be a JSON number")
-    bound = float(bound_m)
-    if not math.isfinite(bound) or bound < 0.0:
-        raise ValueError("Euclidean bound must be finite and non-negative")
-    squared = Fraction(0)
-    for left_value, right_value in zip(left, right, strict=True):
-        left_float = _native_u(left_value)
-        right_float = _native_u(right_value)
-        if not math.isfinite(left_float) or not math.isfinite(right_float):
-            raise ValueError("points must contain finite coordinates")
-        delta = Fraction.from_float(left_float) - Fraction.from_float(
-            right_float
-        )
-        squared += delta * delta
-    return squared <= Fraction.from_float(bound) ** 2
 
 
 def native_point_roundtrip_tolerance(*points) -> float:
@@ -1039,159 +730,6 @@ def native_curve_endpoint_operation_tolerance(*points) -> float:
         native_point_roundtrip_tolerance(endpoint, evaluated)
         + native_point_roundtrip_tolerance(endpoint, opposite)
     )
-
-
-def native_tolerant_edge_gap(gap_m: float | int) -> float:
-    """Validate the source-bound tolerant-edge gap against the global bound."""
-
-    if type(gap_m) is not float:
-        raise ValueError("tolerant edge gap must be a float")
-    gap = float(gap_m)
-    if (
-        not math.isfinite(gap)
-        or gap < 0.0
-        or gap > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-    ):
-        raise ValueError(
-            "tolerant edge gap must be finite and within the 50 micrometre bound"
-        )
-    return gap
-
-
-def native_tolerant_edge_boundary(
-    projected_point,
-    evaluated_point,
-    curve_endpoint,
-    opposite_curve_endpoint,
-    *,
-    is_tolerant,
-    gap_m,
-    topology_accepted,
-) -> dict:
-    """Evaluate one successful boundary fin with separate v4 and v5 metrics."""
-
-    if type(is_tolerant) is not bool:
-        raise ValueError("tolerant edge state must be a strict boolean")
-    if type(topology_accepted) is not bool:
-        raise ValueError("topology acceptance must be a strict boolean")
-    gap = native_tolerant_edge_gap(gap_m)
-    points = (
-        projected_point,
-        evaluated_point,
-        curve_endpoint,
-        opposite_curve_endpoint,
-    )
-    if any(len(point) != 3 for point in points):
-        raise ValueError("points must contain three coordinates")
-    curve_tolerance = native_curve_endpoint_operation_tolerance(
-        curve_endpoint,
-        evaluated_point,
-        opposite_curve_endpoint,
-    )
-    curve_error = native_point_error(curve_endpoint, evaluated_point)
-    projected_error = native_point_euclidean_error(
-        projected_point,
-        curve_endpoint,
-    )
-    projected_tolerance = math.nextafter(
-        curve_tolerance + gap,
-        math.inf,
-    )
-    ordinary_projection_closes = native_point_within_euclidean_bound(
-        projected_point,
-        curve_endpoint,
-        curve_tolerance,
-    )
-    projected_within = native_point_within_euclidean_bound(
-        projected_point,
-        curve_endpoint,
-        projected_tolerance,
-    )
-    gap_used = (
-        not ordinary_projection_closes
-        and curve_error <= curve_tolerance
-        and is_tolerant
-        and topology_accepted
-        and projected_within
-    )
-    accepted = curve_error <= curve_tolerance and (
-        ordinary_projection_closes or gap_used
-    )
-    return {
-        "point_roundtrip_rule": NATIVE_TOLERANT_EDGE_BOUNDARY_RULE,
-        "evaluate_rule_version": NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
-        "evaluate_metric": NATIVE_TOLERANT_EDGE_EVALUATE_METRIC,
-        "evaluate_point_error_m": curve_error,
-        "point_tolerance_m": curve_tolerance,
-        "projection_metric": NATIVE_TOLERANT_EDGE_PROJECTION_METRIC,
-        "ordinary_projection_closes": ordinary_projection_closes,
-        "projection_to_curve_l2_error_m": projected_error,
-        "composed_projection_tolerance_m": projected_tolerance,
-        "gap_used": gap_used,
-        "accepted": accepted,
-    }
-
-
-def native_tolerant_edge_evidence(
-    metrics: dict,
-    *,
-    edge_reference_sha256: str,
-    parameter_boundary: str,
-    eligible_gap_m: float,
-) -> dict:
-    """Format one canonical v5 evidence row from independently computed metrics."""
-
-    return {
-        "point_roundtrip_rule": metrics["point_roundtrip_rule"],
-        "evaluate_rule_version": metrics["evaluate_rule_version"],
-        "evaluate_metric": metrics["evaluate_metric"],
-        "projection_metric": metrics["projection_metric"],
-        "edge_reference_sha256": edge_reference_sha256,
-        "parameter_boundary": parameter_boundary,
-        "gap_used": metrics["gap_used"],
-        "eligible_gap_m": eligible_gap_m,
-        "gap_source_field": NATIVE_TOLERANT_EDGE_GAP_SOURCE_FIELD,
-        "evaluate_point_error_m": metrics["evaluate_point_error_m"],
-        "point_tolerance_m": metrics["point_tolerance_m"],
-        "projection_to_curve_l2_error_m": metrics[
-            "projection_to_curve_l2_error_m"
-        ],
-        "composed_projection_tolerance_m": metrics[
-            "composed_projection_tolerance_m"
-        ],
-    }
-
-
-OPEN_EDGE_SCOPE_FIELDS = frozenset(
-    {
-        "rule_version",
-        "component",
-        "source_document_path",
-        "source_copy_path",
-        "source_document_sha256",
-        "source_copy_sha256",
-        "source_document_identity_sha256",
-        "source_document_identity_kind",
-        "referenced_configuration",
-        "occurrence_scope",
-        "virtual_owner",
-        "virtual_owner_sha256",
-        "virtual_session_document_path",
-        "virtual_session_temp_root",
-        "virtual_native_api_pid",
-        "body_type",
-        "body_index",
-        "body_reference_sha256",
-        "native_body_reference_sha256",
-        "body_identity_sha256",
-        "face_index",
-        "face_reference_sha256",
-        "native_face_reference_sha256",
-        "face_identity_mode",
-        "face_identity_sha256",
-        "owner_scope_key",
-    }
-)
 
 
 SOURCE_SCOPE_FIELDS = frozenset(
@@ -1289,7 +827,7 @@ def native_source_scope_is_valid(
         and value["virtual_native_api_pid"] > 0
     )
     return (
-        value["rule_version"] == NATIVE_OPEN_EDGE_SCOPE_RULE
+        value["rule_version"] == NATIVE_SOURCE_SCOPE_RULE
         and isinstance(component_name, str)
         and bool(component_name)
         and (component is None or component_name == component)
@@ -1301,189 +839,6 @@ def native_source_scope_is_valid(
         and isinstance(value["referenced_configuration"], str)
         and bool(value["referenced_configuration"])
     )
-
-
-def _valid_open_edge_scope_binding(value: object) -> bool:
-    """Whether one scope record binds the exact component, body, and face."""
-
-    if not isinstance(value, dict) or set(value) != OPEN_EDGE_SCOPE_FIELDS:
-        return False
-    hashes = (
-        "source_document_identity_sha256",
-        "body_reference_sha256",
-        "native_body_reference_sha256",
-        "body_identity_sha256",
-        "face_reference_sha256",
-        "native_face_reference_sha256",
-        "face_identity_sha256",
-    )
-    path_is_text = (
-        isinstance(value["source_document_path"], str)
-        and bool(value["source_document_path"])
-    )
-    copy_path = value["source_copy_path"]
-    path_virtual_relative = _virtual_component_relative_path(
-        value["source_document_path"]
-    )
-    session_virtual_relative = _virtual_component_relative_path(
-        value["virtual_session_document_path"]
-    )
-    return (
-        value["rule_version"] == NATIVE_OPEN_EDGE_SCOPE_RULE
-        and isinstance(value["component"], str)
-        and bool(value["component"])
-        and path_is_text
-        and all(
-            isinstance(value[field], str)
-            and bool(_HEX64.fullmatch(value[field]))
-            for field in hashes
-        )
-        and (
-            (
-                value["source_document_identity_kind"] == "file_sha256"
-                and isinstance(value["source_document_sha256"], str)
-                and bool(
-                    _HEX64.fullmatch(value["source_document_sha256"])
-                )
-                and value["source_document_sha256"]
-                == value["source_document_identity_sha256"]
-                and isinstance(value["source_copy_sha256"], str)
-                and bool(
-                    _HEX64.fullmatch(value["source_copy_sha256"])
-                )
-                and isinstance(copy_path, str)
-                and copy_path.startswith("source/")
-                and "\\" not in copy_path
-                and all(
-                    part not in {"", ".", ".."}
-                    for part in copy_path.split("/")
-                )
-                and value["virtual_owner"] is None
-                and value["virtual_owner_sha256"] is None
-                and value["virtual_session_document_path"] is None
-                and value["virtual_session_temp_root"] is None
-                and value["virtual_native_api_pid"] is None
-            )
-            or (
-                value["source_document_identity_kind"]
-                == "virtual_path_sha256"
-                and copy_path is None
-                and value["source_document_sha256"] is None
-                and value["source_copy_sha256"] is None
-                and path_is_text
-                and value["source_document_identity_sha256"]
-                == hashlib.sha256(
-                    value["source_document_path"].encode("utf-8")
-                ).hexdigest()
-                and isinstance(value["virtual_owner"], str)
-                and bool(value["virtual_owner"])
-                and isinstance(value["virtual_owner_sha256"], str)
-                and bool(_HEX64.fullmatch(value["virtual_owner_sha256"]))
-                and path_virtual_relative is not None
-                and session_virtual_relative == path_virtual_relative
-                and isinstance(
-                    value["virtual_session_temp_root"],
-                    str,
-                )
-                and bool(value["virtual_session_temp_root"])
-                and type(value["virtual_native_api_pid"]) is int
-                and value["virtual_native_api_pid"] > 0
-            )
-        )
-        and isinstance(value["referenced_configuration"], str)
-        and bool(value["referenced_configuration"])
-        and isinstance(value["occurrence_scope"], str)
-        and value["occurrence_scope"] == value["component"]
-        and type(value["body_type"]) is int
-        and value["body_type"] in {0, 1}
-        and type(value["body_index"]) is int
-        and value["body_index"] >= 0
-        and value["body_identity_sha256"]
-        == value["body_reference_sha256"]
-        and type(value["face_index"]) is int
-        and value["face_index"] >= 0
-        and value["face_identity_sha256"]
-        == value["face_reference_sha256"]
-        and value["face_identity_mode"]
-        in {
-            NATIVE_PERSISTENT_IDENTITY_RULE,
-            NATIVE_SCOPE_IDENTITY_RULE,
-        }
-        and (
-            (
-                value["face_identity_mode"]
-                == NATIVE_PERSISTENT_IDENTITY_RULE
-                and value["owner_scope_key"] is None
-            )
-            or (
-                value["face_identity_mode"]
-                == NATIVE_SCOPE_IDENTITY_RULE
-                and isinstance(value["owner_scope_key"], str)
-                and bool(_HEX64.fullmatch(value["owner_scope_key"]))
-            )
-        )
-    )
-
-
-def native_open_edge_scope_binding(
-    *,
-    component: str,
-    source_document_path: str,
-    source_copy_path: str | None,
-    source_document_sha256: str,
-    source_copy_sha256: str,
-    source_document_identity_sha256: str,
-    source_document_identity_kind: str,
-    referenced_configuration: str,
-    occurrence_scope: str,
-    virtual_owner: str | None,
-    virtual_owner_sha256: str | None,
-    virtual_session_document_path: str | None,
-    virtual_session_temp_root: str | None,
-    virtual_native_api_pid: int | None,
-    body_type: int,
-    body_index: int,
-    body_reference_sha256: str,
-    native_body_reference_sha256: str,
-    face_index: int,
-    face_reference_sha256: str,
-    native_face_reference_sha256: str,
-    face_identity_mode: str,
-    owner_scope_key: str | None,
-) -> dict:
-    """Build one exact component/body/face binding for an open-edge identity."""
-
-    record = {
-        "rule_version": NATIVE_OPEN_EDGE_SCOPE_RULE,
-        "component": component,
-        "source_document_path": source_document_path,
-        "source_copy_path": source_copy_path,
-        "source_document_sha256": source_document_sha256,
-        "source_copy_sha256": source_copy_sha256,
-        "source_document_identity_sha256": source_document_identity_sha256,
-        "source_document_identity_kind": source_document_identity_kind,
-        "referenced_configuration": referenced_configuration,
-        "occurrence_scope": occurrence_scope,
-        "virtual_owner": virtual_owner,
-        "virtual_owner_sha256": virtual_owner_sha256,
-        "virtual_session_document_path": virtual_session_document_path,
-        "virtual_session_temp_root": virtual_session_temp_root,
-        "virtual_native_api_pid": virtual_native_api_pid,
-        "body_type": body_type,
-        "body_index": body_index,
-        "body_reference_sha256": body_reference_sha256,
-        "native_body_reference_sha256": native_body_reference_sha256,
-        "body_identity_sha256": body_reference_sha256,
-        "face_index": face_index,
-        "face_reference_sha256": face_reference_sha256,
-        "native_face_reference_sha256": native_face_reference_sha256,
-        "face_identity_mode": face_identity_mode,
-        "face_identity_sha256": face_reference_sha256,
-        "owner_scope_key": owner_scope_key,
-    }
-    if not _valid_open_edge_scope_binding(record):
-        raise ValueError("open-edge scope binding is incomplete")
-    return record
 
 
 def native_curve_topology_endpoint_set_assignment(
@@ -1570,6 +925,8 @@ def native_curve_topology_endpoint_set_assignment(
         "actual_end_point_m": list(actual_end),
         "direct_error_m": direct_error,
         "swapped_error_m": swapped_error,
+        "direct_complete": direct_complete,
+        "swapped_complete": swapped_complete,
         "complete_match_count": matching_count,
         "canonical_result": canonical_result,
         "canonical_error_m": canonical_error,
@@ -1577,461 +934,6 @@ def native_curve_topology_endpoint_set_assignment(
         "distinct_endpoint_sets": distinct_endpoints,
         "accepted": accepted,
     }
-    return record
-
-
-def _boundary_role(
-    u_value: float,
-    u_min: float,
-    u_max: float,
-) -> str | None:
-    at_min = native_u_equal(u_value, u_min)
-    at_max = native_u_equal(u_value, u_max)
-    if at_min == at_max:
-        return None
-    return "u_min" if at_min else "u_max"
-
-
-def _gap_mapping_options(
-    source_start,
-    source_end,
-    target_start,
-    target_end,
-    gap_m: float,
-) -> dict:
-    def pair_error(left, right) -> float:
-        return native_point_euclidean_error(tuple(left), tuple(right))
-
-    direct_errors = (
-        pair_error(source_start, target_start),
-        pair_error(source_end, target_end),
-    )
-    swapped_errors = (
-        pair_error(source_start, target_end),
-        pair_error(source_end, target_start),
-    )
-    direct_complete = (
-        native_point_within_euclidean_bound(
-            source_start,
-            target_start,
-            gap_m,
-        )
-        and native_point_within_euclidean_bound(
-            source_end,
-            target_end,
-            gap_m,
-        )
-    )
-    swapped_complete = (
-        native_point_within_euclidean_bound(
-            source_start,
-            target_end,
-            gap_m,
-        )
-        and native_point_within_euclidean_bound(
-            source_end,
-            target_start,
-            gap_m,
-        )
-    )
-    options = []
-    for name, errors, complete in (
-        ("direct", direct_errors, direct_complete),
-        ("swapped", swapped_errors, swapped_complete),
-    ):
-        options.append(
-            {
-                "result": name,
-                "start_error_m": errors[0],
-                "end_error_m": errors[1],
-                "maximum_error_m": max(errors),
-                "complete": complete,
-            }
-        )
-    accepted = [item for item in options if item["complete"]]
-    selected = accepted[0] if len(accepted) == 1 else None
-    rejected = [item for item in options if not item["complete"]]
-    margin = (
-        min(item["maximum_error_m"] for item in rejected) - selected["maximum_error_m"]
-        if selected is not None
-        else None
-    )
-    return {
-        "metric": "euclidean",
-        "gap_m": gap_m,
-        "options": options,
-        "complete_match_count": len(accepted),
-        "selected_result": selected["result"] if selected is not None else None,
-        "selected_maximum_error_m": (
-            selected["maximum_error_m"] if selected is not None else None
-        ),
-        "matching_margin_m": margin,
-        "unique": selected is not None,
-    }
-
-
-def native_open_edge_boundary_identity(
-    *,
-    component: str,
-    scope_binding: dict,
-    edge_reference_sha256: str,
-    edge_endpoint_refs: tuple[str, str],
-    edge_start_point: tuple,
-    edge_end_point: tuple,
-    fin_id: int,
-    fin_vertex_ids: tuple[int, int],
-    fin_start_point: tuple,
-    fin_end_point: tuple,
-    curve_start_point: tuple,
-    curve_end_point: tuple,
-    curve_u_min: float,
-    curve_u_max: float,
-    fin_endpoint_u: tuple[float, float],
-    fin_endpoint_success: tuple[bool, bool],
-    curve_sense: bool,
-    gap_m: float,
-    body_type: int,
-    face_count: int,
-    cofin_raw_id: int,
-    edge_fin_ids: tuple[int, ...],
-    topology_set_accepted: bool,
-) -> dict:
-    """Prove one open sheet boundary fin through unordered native identities."""
-
-    if not isinstance(component, str) or not component:
-        raise ValueError("component must be a non-empty string")
-    if (
-        not _valid_open_edge_scope_binding(scope_binding)
-        or scope_binding["component"] != component
-        or scope_binding["body_type"] != body_type
-    ):
-        raise ValueError("open-edge scope binding differs from the native object")
-    if (
-        not isinstance(edge_reference_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", edge_reference_sha256) is None
-    ):
-        raise ValueError("edge reference must be a SHA-256")
-    if (
-        not isinstance(edge_endpoint_refs, tuple)
-        or len(edge_endpoint_refs) != 2
-        or any(
-            not isinstance(value, str)
-            or re.fullmatch(r"[0-9a-f]{64}", value) is None
-            for value in edge_endpoint_refs
-        )
-        or edge_endpoint_refs[0] == edge_endpoint_refs[1]
-    ):
-        raise ValueError("edge endpoint refs must be two distinct SHA-256 values")
-    if (
-        not isinstance(fin_vertex_ids, tuple)
-        or len(fin_vertex_ids) != 2
-        or any(type(value) is not int or value < 0 for value in fin_vertex_ids)
-        or fin_vertex_ids[0] == fin_vertex_ids[1]
-    ):
-        raise ValueError("fin vertex IDs must be two distinct non-negative integers")
-    if type(fin_id) is not int or fin_id < 0:
-        raise ValueError("fin ID must be a non-negative integer")
-    if (
-        not isinstance(edge_fin_ids, tuple)
-        or not edge_fin_ids
-        or any(type(value) is not int or value < 0 for value in edge_fin_ids)
-        or len(edge_fin_ids) != len(set(edge_fin_ids))
-        or fin_id not in edge_fin_ids
-    ):
-        raise ValueError("fin must belong to one unique edge fin set")
-    if (
-        type(body_type) is not int
-        or type(face_count) is not int
-        or type(cofin_raw_id) is not int
-        or body_type != 1
-        or face_count != 1
-        or cofin_raw_id != -1
-    ):
-        raise ValueError("open-edge identity requires a one-face sheet boundary fin")
-    if type(curve_sense) is not bool:
-        raise ValueError("curve sense must be a strict boolean")
-    if (
-        not isinstance(fin_endpoint_success, tuple)
-        or len(fin_endpoint_success) != 2
-        or any(type(value) is not bool for value in fin_endpoint_success)
-    ):
-        raise ValueError("fin endpoint U availability must be strict booleans")
-    # ``False`` is the already validated closest-point fallback.  The caller
-    # retains that raw status and independently recomputes the fallback rule.
-    if (
-        not isinstance(fin_endpoint_u, tuple)
-        or len(fin_endpoint_u) != 2
-        or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in fin_endpoint_u)
-    ):
-        raise ValueError("fin endpoint U values must be finite numbers")
-    if type(topology_set_accepted) is not bool or topology_set_accepted is not True:
-        raise ValueError("unordered curve/edge endpoint identity must be accepted")
-    if (
-        type(curve_u_min) not in (int, float)
-        or type(curve_u_max) not in (int, float)
-        or not math.isfinite(float(curve_u_min))
-        or not math.isfinite(float(curve_u_max))
-        or float(curve_u_min) >= float(curve_u_max)
-    ):
-        raise ValueError("curve U boundaries must be finite and increasing")
-    gap = native_tolerant_edge_gap(gap_m)
-    points = (
-        edge_start_point,
-        edge_end_point,
-        fin_start_point,
-        fin_end_point,
-        curve_start_point,
-        curve_end_point,
-    )
-    if any(
-        not isinstance(point, (list, tuple))
-        or len(point) != 3
-        for point in points
-    ):
-        raise ValueError("identity points must contain three coordinates")
-    edge_start_point = tuple(_native_u(value) for value in edge_start_point)
-    edge_end_point = tuple(_native_u(value) for value in edge_end_point)
-    fin_start_point = tuple(_native_u(value) for value in fin_start_point)
-    fin_end_point = tuple(_native_u(value) for value in fin_end_point)
-    curve_start_point = tuple(_native_u(value) for value in curve_start_point)
-    curve_end_point = tuple(_native_u(value) for value in curve_end_point)
-
-    def endpoint_name(result: str, source: str) -> str:
-        if result == "direct":
-            return "start" if source == "start" else "end"
-        return "end" if source == "start" else "start"
-
-    roles = (
-        _boundary_role(float(fin_endpoint_u[0]), curve_u_min, curve_u_max),
-        _boundary_role(float(fin_endpoint_u[1]), curve_u_min, curve_u_max),
-    )
-    boundary_roles = tuple(role for role in roles if role is not None)
-    if not boundary_roles:
-        raise ValueError("fin must contain an exact edge boundary endpoint")
-    if (
-        len(boundary_roles) == 2
-        and boundary_roles[0] == boundary_roles[1]
-    ):
-        raise ValueError(
-            "fin endpoints must not collapse to one exact edge boundary"
-        )
-    full_edge = set(roles) == {"u_min", "u_max"}
-    segmented = len(boundary_roles) == 1
-    if not full_edge and not segmented:
-        raise ValueError(
-            "fin endpoints must identify a full or segmented edge interval"
-        )
-
-    curve_mapping = _gap_mapping_options(
-        curve_start_point,
-        curve_end_point,
-        edge_start_point,
-        edge_end_point,
-        gap,
-    )
-    if not curve_mapping["unique"]:
-        raise ValueError("gap-bounded endpoint mapping is not unique")
-    curve_to_edge = {
-        "start": endpoint_name(curve_mapping["selected_result"], "start"),
-        "end": endpoint_name(curve_mapping["selected_result"], "end"),
-    }
-
-    fin_to_edge = {"start": None, "end": None}
-    if full_edge:
-        fin_mapping = _gap_mapping_options(
-            fin_start_point,
-            fin_end_point,
-            edge_start_point,
-            edge_end_point,
-            gap,
-        )
-        if not fin_mapping["unique"]:
-            raise ValueError("gap-bounded fin endpoint mapping is not unique")
-        fin_to_edge = {
-            "start": endpoint_name(fin_mapping["selected_result"], "start"),
-            "end": endpoint_name(fin_mapping["selected_result"], "end"),
-        }
-        for fin_endpoint, role in zip(("start", "end"), roles, strict=True):
-            curve_endpoint = "start" if role == "u_min" else "end"
-            if fin_to_edge[fin_endpoint] != curve_to_edge[curve_endpoint]:
-                raise ValueError(
-                    "fin U boundary and gap mapping disagree on edge endpoint"
-                )
-    else:
-        boundary_index = 0 if roles[0] is not None else 1
-        interior_index = 1 - boundary_index
-        boundary_role = roles[boundary_index]
-        interior_u = float(fin_endpoint_u[interior_index])
-        if (
-            not native_u_in_closed_interval(
-                interior_u,
-                curve_u_min,
-                curve_u_max,
-            )
-            or native_u_equal(interior_u, curve_u_min)
-            or native_u_equal(interior_u, curve_u_max)
-        ):
-            raise ValueError(
-                "segmented fin interior endpoint must be strictly inside the U domain"
-            )
-        curve_endpoint = "start" if boundary_role == "u_min" else "end"
-        edge_endpoint = curve_to_edge[curve_endpoint]
-        fin_endpoint = "start" if boundary_index == 0 else "end"
-        fin_boundary_point = (
-            fin_start_point if boundary_index == 0 else fin_end_point
-        )
-        curve_boundary_point = (
-            curve_start_point if curve_endpoint == "start" else curve_end_point
-        )
-        opposite_curve_point = (
-            curve_end_point if curve_endpoint == "start" else curve_start_point
-        )
-        boundary_to_curve_tolerance = math.nextafter(
-            native_curve_endpoint_operation_tolerance(
-                fin_boundary_point,
-                fin_boundary_point,
-                opposite_curve_point,
-            )
-            + gap,
-            math.inf,
-        )
-        boundary_to_curve_error = native_point_euclidean_error(
-            fin_boundary_point,
-            curve_boundary_point,
-        )
-        if boundary_to_curve_error > boundary_to_curve_tolerance:
-            raise ValueError(
-                "segmented fin boundary endpoint does not match its curve boundary"
-            )
-        target_point = (
-            edge_start_point if edge_endpoint == "start" else edge_end_point
-        )
-        boundary_error = native_point_euclidean_error(
-            curve_boundary_point,
-            target_point,
-        )
-        candidates = []
-        for candidate_name, candidate_point in (
-            ("start", edge_start_point),
-            ("end", edge_end_point),
-        ):
-            if native_point_within_euclidean_bound(
-                curve_boundary_point,
-                candidate_point,
-                gap,
-            ):
-                candidates.append(candidate_name)
-        if candidates != [edge_endpoint]:
-            raise ValueError(
-                "segmented fin boundary endpoint does not map uniquely to its edge endpoint"
-            )
-        fin_to_edge[fin_endpoint] = edge_endpoint
-        fin_mapping = {
-            "mode": "segmented",
-            "metric": "euclidean",
-            "gap_m": gap,
-            "boundary_endpoint": fin_endpoint,
-            "boundary_role": boundary_role,
-            "edge_endpoint": edge_endpoint,
-            "boundary_error_m": boundary_error,
-            "fin_boundary_to_curve_error_m": boundary_to_curve_error,
-            "fin_boundary_to_curve_tolerance_m": (
-                boundary_to_curve_tolerance
-            ),
-            "interior_endpoint": "end" if interior_index == 1 else "start",
-            "interior_u": interior_u,
-            "complete_match_count": 1,
-            "unique": True,
-        }
-
-    two_gap = math.nextafter(2.0 * gap, math.inf)
-    separation_diagnostics = {
-        "possible_ambiguity_bound_m": two_gap,
-        "edge_separation_at_most_bound": (
-            native_point_within_euclidean_bound(
-                edge_start_point,
-                edge_end_point,
-                two_gap,
-            )
-        ),
-        "fin_separation_at_most_bound": (
-            native_point_within_euclidean_bound(
-                fin_start_point,
-                fin_end_point,
-                two_gap,
-            )
-        ),
-        "curve_separation_at_most_bound": (
-            native_point_within_euclidean_bound(
-                curve_start_point,
-                curve_end_point,
-                two_gap,
-            )
-        ),
-        "used_for_decision": False,
-    }
-
-    record = {
-        "rule_version": NATIVE_OPEN_EDGE_BOUNDARY_IDENTITY_RULE,
-        "identity_mode": "full_edge" if full_edge else "segmented",
-        "scope_binding": scope_binding,
-        "edge_reference_sha256": edge_reference_sha256,
-        "edge_endpoint_refs": {
-            "start": edge_endpoint_refs[0],
-            "end": edge_endpoint_refs[1],
-        },
-        "body_type": body_type,
-        "face_count": face_count,
-        "cofin_raw_id": cofin_raw_id,
-        "edge_fin_ids": list(edge_fin_ids),
-        "fin_id": fin_id,
-        "fin_vertex_ids": list(fin_vertex_ids),
-        "edge_endpoint_points_m": {
-            "start": list(edge_start_point),
-            "end": list(edge_end_point),
-        },
-        "fin_endpoint_points_m": {
-            "start": list(fin_start_point),
-            "end": list(fin_end_point),
-        },
-        "curve_endpoint_points_m": {
-            "start": list(curve_start_point),
-            "end": list(curve_end_point),
-        },
-        "curve_u_boundaries": {
-            "u_min": float(curve_u_min),
-            "u_max": float(curve_u_max),
-        },
-        "fin_endpoint_u": {
-            "start": float(fin_endpoint_u[0]),
-            "end": float(fin_endpoint_u[1]),
-        },
-        "fin_endpoint_boundary_roles": {
-            "start": roles[0],
-            "end": roles[1],
-        },
-        "curve_sense": curve_sense,
-        "gap": {
-            "metric": "euclidean",
-            "value_m": gap,
-            "inclusive": True,
-            "source": NATIVE_TOLERANT_EDGE_GAP_SOURCE,
-        },
-        "separation_diagnostics": separation_diagnostics,
-        "curve_to_edge_mapping": curve_mapping,
-        "fin_to_edge_mapping": fin_mapping,
-        "selected_fin_to_edge": fin_to_edge,
-        "selected_curve_to_edge": curve_to_edge,
-    }
-    record["identity_chain_sha256"] = hashlib.sha256(
-        json.dumps(
-            record,
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("ascii")
-    ).hexdigest()
     return record
 
 
@@ -2059,9 +961,10 @@ def native_curve_domain_transform(
 ) -> dict:
     """Classify an edge U domain against underlying-curve periodicity.
 
-    ``Sense`` may orient the periodic parameter lift only. It never changes the
-    raw ``UMin``/``StartPoint`` and ``UMax``/``EndPoint`` correspondence or the
-    unordered curve/edge endpoint-set identity.
+    ``Sense`` declares whether the curve and edge share direction.  It also
+    orients the periodic parameter lift.  Raw ``UMin``/``StartPoint`` and
+    ``UMax``/``EndPoint`` remain the native parameter endpoints; the unordered
+    endpoint set is an independent coverage gate, not the direction authority.
     """
 
     curve_start = _native_u(underlying_start)

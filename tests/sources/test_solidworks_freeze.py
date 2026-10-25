@@ -346,6 +346,109 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(boundary["opened"]["path"], self.backend.collected_scene_calls[0])
         self.assertEqual(self.backend.retired_session_pids, [100])
 
+    def test_freeze_replaces_the_environment_with_the_recovered_session(self) -> None:
+        collect_scene = self.backend.collect_scene
+
+        def collect_with_recovery(*args, **kwargs):
+            scene = collect_scene(*args, **kwargs)
+            self.backend.session_pid = 102
+            self.backend.capture_session_pid = 102
+            old_identity = {"pid": 101, "state": "active", "role": "copy"}
+            new_identity = {"pid": 102, "state": "active", "role": "copy"}
+            scene.notes["capture_preparation"] = {
+                "session": {
+                    "role": "copy",
+                    "identity": new_identity,
+                    "temp_root": None,
+                },
+                "session_recovery": {
+                    "trigger": {
+                        "code": "cad_rebuild_incomplete",
+                        "path": str(args[0]),
+                        "phase": "rebuild",
+                        "depth": 0,
+                        "journal_sequence": 3,
+                        "elapsed_seconds": 7.2,
+                    },
+                    "first_attempt": {
+                        "session": {
+                            "role": "copy",
+                            "identity": old_identity,
+                            "temp_root": None,
+                        }
+                    },
+                    "retirement": {
+                        "role": "copy",
+                        "retired": True,
+                        "before": old_identity,
+                        "after": {
+                            "pid": 101,
+                            "state": "closed",
+                            "role": "copy",
+                        },
+                    },
+                    "reopen": {
+                        "opened": Path(args[0]).name,
+                        "path": str(args[0]),
+                        "read_only": True,
+                        "errors": 0,
+                        "warnings": 0,
+                    },
+                    "fresh_session": {
+                        "role": "copy",
+                        "identity": new_identity,
+                        "temp_root": None,
+                    },
+                    "checks": {
+                        "old_pid": 101,
+                        "fresh_pid": 102,
+                        "different_owned_processes": True,
+                    },
+                },
+            }
+            return scene
+
+        self.backend.collect_scene = collect_with_recovery
+        with patch(
+            "description_pipeline.build.tool_identity",
+            return_value={"fixture": True},
+        ):
+            freeze(
+                self.config,
+                self.destination,
+                backend=self.backend,
+                worker_version="test-worker",
+            )
+        before = json.loads(
+            (
+                self.destination
+                / "evidence"
+                / "capture-environment-before-recovery.json"
+            ).read_text(encoding="utf-8")
+        )
+        final = json.loads(
+            (
+                self.destination / "evidence" / "environment.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(before["solidworks"]["sessions"]["copy"]["pid"], 101)
+        self.assertEqual(final["solidworks"]["sessions"]["copy"]["pid"], 102)
+        self.assertEqual(
+            final["session_boundary"]["retirement"]["before"]["pid"],
+            100,
+        )
+        scene = json.loads(
+            (
+                self.destination / "raw" / "scene_raw.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            scene["notes"]["capture_preparation"]["session_recovery"][
+                "fresh_session"
+            ]["identity"]["pid"],
+            102,
+        )
+
     def test_fresh_session_rejects_a_different_active_configuration(self) -> None:
         backend, config = self._two_component_backend()
         read = backend.document_state
@@ -807,6 +910,26 @@ class FreezeTests(unittest.TestCase):
         self.assertIn("raw/material_provenance.json", manifest["files"])
         self.assertIn("raw/scene_raw.json", manifest["files"])
         self.assertTrue(any(name.startswith("geometry/") for name in manifest["files"]))
+
+    def test_export_time_provider_selection_is_sealed_in_raw_scene(self) -> None:
+        selection = {"base-1": {"0/0": {
+            "provider": "native-planar-brep-v1",
+            "selection_result": "not_applicable",
+            "miss_reason": "native_body_is_not_a_sheet",
+        }}}
+        export = self.backend.export_component_meshes
+
+        def export_with_selection(destinations, on_activity=None):
+            result = export(destinations, on_activity=on_activity)
+            self.backend.notes = {"geometry_provider_selection": selection}
+            return result
+
+        self.backend.export_component_meshes = export_with_selection
+        manifest = freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
+        raw_path = self.destination / "raw/scene_raw.json"
+        raw = json.loads(raw_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["notes"]["geometry_provider_selection"], selection)
+        self.assertEqual(manifest["files"]["raw/scene_raw.json"], hashlib.sha256(raw_path.read_bytes()).hexdigest())
 
     def test_capture_never_builds_a_scene_and_linux_derivation_keeps_snapshot_immutable(self) -> None:
         from description_pipeline.io import inventory

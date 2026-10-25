@@ -129,6 +129,11 @@ class MetadataProvenanceTests(unittest.TestCase):
         self.assertEqual(by_rule["metadata.save_flag_inversion"]["rule_version"], "v1")
         self.assertEqual(by_rule["metadata.operation_claim"]["rule_version"], "v1")
 
+    def test_recovered_capture_keeps_the_initial_session_boundary(self) -> None:
+        runtime = runtime_environment()
+        runtime["solidworks"]["sessions"]["copy"]["pid"] = 202
+        self.objects(runtime=runtime)
+
     def test_getter_failure_placeholders_are_bound_to_their_actual_fields(self) -> None:
         runtime = runtime_environment()
         runtime["solidworks"].update(
