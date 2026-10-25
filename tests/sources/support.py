@@ -30,6 +30,7 @@ from description_pipeline.geometry.native_u import (
     native_evaluate2_evidence,
     native_point_error,
 )
+from description_pipeline.geometry.native_planar_brep import NATIVE_PLANAR_BREP_SCHEMA
 from description_pipeline.io import file_digest
 from description_pipeline.schemas import (
     NATIVE_ID_ARRAY_SOURCE_FLAT,
@@ -980,7 +981,7 @@ def native_tessellation_fixture(
         "native_edges": edge_rows,
         "no_facets_faces": normalized_no_facets,
         "planar_brep": {
-            "schema_version": "solidworks-to-urdf.native-planar-brep/v2",
+            "schema_version": NATIVE_PLANAR_BREP_SCHEMA,
             "bodies": [],
         },
         "itessellation": {

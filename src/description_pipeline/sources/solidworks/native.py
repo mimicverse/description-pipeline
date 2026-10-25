@@ -77,6 +77,8 @@ from ...geometry.native_fin_topology import (
 from ...geometry.native_planar_brep import (
     NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
     NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
+    NATIVE_PLANAR_COEDGE_INTERFACE_IID,
+    NATIVE_PLANAR_COEDGE_EVALUATE_DISPID,
     NATIVE_PLANAR_COEDGE_VERTEX_RULE,
     NATIVE_PLANAR_EDGE_VERTEX_RULE,
     NATIVE_PLANAR_BREP_PROVIDER,
@@ -137,6 +139,8 @@ IMATEENTITY2_IID = "{CE7FE69D-BCFA-441F-A37D-E740546458A4}"
 IBODY2_IID = "{3A075BFD-9962-4431-8321-7AF4903C55AD}"
 IFACE2_IID = "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}"
 IEDGE_IID = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
+ICOEDGE_IID = NATIVE_PLANAR_COEDGE_INTERFACE_IID
+ILOOP2_IID = "{9350CA6E-0ADB-485A-8941-9407DD7B3B8E}"
 IVERTEX_IID = "{83A33D63-27C5-11CE-BFD4-00400513BB57}"
 ISURFACE_IID = "{83A33D40-27C5-11CE-BFD4-00400513BB57}"
 ICURVE_IID = "{83A33D44-27C5-11CE-BFD4-00400513BB57}"
@@ -911,7 +915,7 @@ def _measured_component_state(component):
 
 
 def _hint_method(obj, name):
-    """Resolve a method name once per dispatch; never cache its return values."""
+    """Resolve a method once per dispatch and return its cached DISPID when known."""
     flag = getattr(obj, "_FlagAsMethod", None)
     if flag is not None:
         hints = vars(obj).setdefault("_description_method_hints_", set())
@@ -920,6 +924,9 @@ def _hint_method(obj, name):
             # Reuse successful metadata; initial resolution errors still block.
             flag(name)
             hints.add(name)
+    representation = getattr(obj, "_olerepr_", None)
+    descriptor = getattr(representation, "mapFuncs", {}).get(name)
+    return getattr(descriptor, "dispid", None)
 
 
 def _member(obj, name, *args):
@@ -7839,7 +7846,11 @@ class SolidWorksBackend(CadBackend):
                     {**base, "face_index": face_row["index"]},
                 )
             evidence["loops_read"] = len(loops)
-            loop = _dynamic(loops[0])
+            loop = call(
+                "ILoop2.QueryInterface",
+                lambda: _interface(_dynamic(loops[0]), ILOOP2_IID),
+                face_index=face_row["index"],
+            )
             is_outer = call(
                 "ILoop2.IsOuter",
                 lambda: _method(loop, "IsOuter"),
@@ -7942,7 +7953,7 @@ class SolidWorksBackend(CadBackend):
                 edge_by_pointer[pointer] = edge_row
             first_coedge = call(
                 "ILoop2.GetFirstCoEdge",
-                lambda: _method(loop, "GetFirstCoEdge"),
+                lambda: _interface(_method(loop, "GetFirstCoEdge"), ICOEDGE_IID),
                 face_index=face_row["index"],
             )
             if first_coedge is None:
@@ -8117,6 +8128,25 @@ class SolidWorksBackend(CadBackend):
                         "coedge and edge orientations disagree",
                         {**base, "coedge_index": coedge_index},
                     )
+                resolved_dispid = call(
+                    "ICoEdge.Evaluate2.GetIDsOfNames",
+                    lambda value=current: _hint_method(value, "Evaluate2"),
+                    coedge_index=coedge_index,
+                )
+                dispatch_binding = {
+                    "interface_iid": ICOEDGE_IID,
+                    "member": "Evaluate2",
+                    "resolved_dispid": resolved_dispid,
+                    "invoke_kind": "METHOD",
+                }
+                evidence["current_edge_fact"]["dispatch_binding"] = dispatch_binding
+                if (type(resolved_dispid) is not int
+                        or resolved_dispid != NATIVE_PLANAR_COEDGE_EVALUATE_DISPID):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "ICoEdge.Evaluate2 resolved to an unexpected dispatch member",
+                        {**base, "coedge_index": coedge_index, "dispatch_binding": dispatch_binding},
+                    )
                 evaluations = []
                 for endpoint, parameter, expected_point, opposite_point in (
                     ("start", start_parameter, start_point, end_point),
@@ -8179,6 +8209,7 @@ class SolidWorksBackend(CadBackend):
                             "endpoint": endpoint,
                             "rule_version": NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
                             "parameter": parameter,
+                            "raw_response": [float(value) for value in raw_evaluation],
                             "point_m": list(evaluated_point),
                             "tangent": list(tangent),
                             "point_error_m": error_m,
@@ -8217,17 +8248,16 @@ class SolidWorksBackend(CadBackend):
                         "start_point_m": list(start_point),
                         "end_point_m": list(end_point),
                         "curve_params_raw": [float(value) for value in curve_params],
+                        "dispatch_binding": dict(dispatch_binding),
                         "evaluations": evaluations,
                         "coedge_curve_present": coedge_curve is not None,
                     }
                 )
                 evidence["coedge_facts"].append(copy.deepcopy(coedge_rows[-1]))
-                current = _dynamic(
-                    call(
-                        "ICoEdge.GetNext",
-                        lambda value=current: _method(value, "GetNext"),
-                        coedge_index=coedge_index,
-                    )
+                current = call(
+                    "ICoEdge.GetNext",
+                    lambda value=current: _interface(_method(value, "GetNext"), ICOEDGE_IID),
+                    coedge_index=coedge_index,
                 )
                 if current is None:
                     raise CadError(

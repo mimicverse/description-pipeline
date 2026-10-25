@@ -330,6 +330,11 @@ class FakeCoEdge:
         self._next = None
         self._reverse = reverse
         self._curve_present = curve_present
+        self._olerepr_ = SimpleNamespace(mapFuncs={})
+
+    def _FlagAsMethod(self, name):  # noqa: N802 - pywin32 metadata method
+        if name == "Evaluate2":
+            self._olerepr_.mapFuncs[name] = SimpleNamespace(dispid=17)
 
     def GetEdge(self):  # noqa: N802 - SolidWorks API name
         return self._edge
@@ -1229,6 +1234,9 @@ class ComponentMeshExportTests(unittest.TestCase):
                 mutated = copy.deepcopy(entry["tessellation"])
                 evaluations = mutated["planar_brep"]["bodies"][0]["loop"]["coedges"][0]["evaluations"]
                 evaluations[endpoint]["tangent"] = [1.0, 1.0, 0.0]
+                evaluations[endpoint]["raw_response"] = (
+                    evaluations[endpoint]["point_m"] + evaluations[endpoint]["tangent"]
+                )
                 with self.assertRaisesRegex(PipelineError, "complete surface bound"):
                     parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], triangle_vertices)
 
@@ -1240,6 +1248,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         incoming["end_point_m"][0] += delta
         incoming["curve_params_raw"][3] += delta
         incoming["evaluations"][1]["point_m"][0] += delta
+        incoming["evaluations"][1]["raw_response"][0] += delta
         incoming["end_vertex_point_error_m"] = delta
         with self.assertRaisesRegex(PipelineError, "surface bound is not reproducible"):
             parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], triangles)
@@ -1461,6 +1470,7 @@ class ComponentMeshExportTests(unittest.TestCase):
                 )
             for evaluation in coedge["evaluations"]:
                 evaluation["point_m"][2] = 4.0e-5
+                evaluation["raw_response"][2] = 4.0e-5
             for endpoint, expected_point, opposite_point in (
                 (
                     "start",
@@ -1575,6 +1585,110 @@ class ComponentMeshExportTests(unittest.TestCase):
                     parse_native_tessellation(
                         "pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices,
                     )
+
+    def test_planar_walk_binds_each_loop_and_coedge_before_evaluation(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        backend = _backend(component)
+        face = edges[0]._faces[0]
+        loop = face._loops[0]
+        bindings = []
+
+        class GenericView:
+            def __init__(self, target, iid):
+                self.target = target
+                self.iid = iid
+
+            def __getattr__(self, name):
+                raise AssertionError("A generic dispatch must be bound before native member access")
+
+        face._loops = [GenericView(loop, native_module.ILOOP2_IID)]
+        loop.GetFirstCoEdge = lambda: GenericView(loop._coedges[0], native_module.ICOEDGE_IID)
+        for coedge in loop._coedges:
+            coedge.GetNext = lambda coedge=coedge: GenericView(coedge._next, native_module.ICOEDGE_IID)
+        real_bind = native_module._interface
+
+        def bind(value, iid):
+            if isinstance(value, GenericView):
+                self.assertEqual(iid, value.iid)
+                bindings.append(iid)
+                return value.target
+            return real_bind(value, iid)
+
+        before = len(body.tessellation_face_lists)
+        with patch.object(native_module, "_dynamic", side_effect=lambda value: value), patch.object(
+            native_module, "_interface", side_effect=bind
+        ):
+            entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(bindings.count(native_module.ILOOP2_IID), 1)
+        self.assertEqual(bindings.count(native_module.ICOEDGE_IID), len(edges) + 1)
+        self.assertEqual(len(body.tessellation_face_lists), before)
+        self.assertEqual(entry["tessellation_sources"], [NATIVE_PLANAR_BREP_PROVIDER])
+
+    def test_planar_coedge_query_interface_failure_is_fatal(self):
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        backend = _backend(component)
+        real_bind = native_module._interface
+
+        def bind(value, iid):
+            if iid == native_module.ICOEDGE_IID:
+                raise RuntimeError("ICoEdge QueryInterface failed")
+            return real_bind(value, iid)
+
+        before = len(body.tessellation_face_lists)
+        with patch.object(native_module, "_interface", side_effect=bind), self.assertRaises(CadError):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_coedge_evaluation_does_not_accept_an_edge_status_slot(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        backend = _backend(component)
+        coedge = edges[0]._faces[0]._loops[0]._coedges[0]
+        evaluate = coedge.Evaluate2
+        coedge.Evaluate2 = lambda u, derivatives: [*evaluate(u, derivatives), _packed_success_status()]
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "did not return six finite values"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_coedge_wrong_resolved_member_is_rejected_before_evaluation(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        backend = _backend(component)
+        coedge = edges[0]._faces[0]._loops[0]._coedges[0]
+        coedge._FlagAsMethod = lambda name: coedge._olerepr_.mapFuncs.update(
+            {name: SimpleNamespace(dispid=39)})
+        evaluations = []
+        coedge.Evaluate2 = lambda *args: evaluations.append(args)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "unexpected dispatch member"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(evaluations, [])
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_coedge_consumer_binds_dispatch_and_raw_response(self):
+        component, _body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        triangles = [tuple(tuple(float(value) for value in point) for point in triangle)
+                     for triangle in stl_vertices(self.dest).reshape(-1, 3, 3)]
+        for kind in ("iid", "member", "float-dispid", "wrong-dispid", "raw"):
+            evidence = copy.deepcopy(entry["tessellation"])
+            coedge = evidence["planar_brep"]["bodies"][0]["loop"]["coedges"][0]
+            if kind == "raw":
+                coedge["evaluations"][0]["raw_response"][0] += 1.0
+            else:
+                field, value = {
+                    "iid": ("interface_iid", native_module.IEDGE_IID),
+                    "member": ("member", "GetCurve"),
+                    "float-dispid": ("resolved_dispid", 17.0),
+                    "wrong-dispid": ("resolved_dispid", 39),
+                }[kind]
+                coedge["dispatch_binding"][field] = value
+            with self.subTest(kind=kind), self.assertRaises(PipelineError):
+                parse_native_tessellation("pcb-1", evidence, entry["bodies"], entry["triangles"], triangles)
 
     def test_curve_endpoint_sense_cannot_use_nearest_reverse_pairing(self):
         component, body, edges = _planar_sheet(

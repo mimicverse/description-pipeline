@@ -14,13 +14,15 @@ from .native_u import (
 )
 
 
-NATIVE_PLANAR_BREP_SCHEMA = "solidworks-to-urdf.native-planar-brep/v2"
+NATIVE_PLANAR_BREP_SCHEMA = "solidworks-to-urdf.native-planar-brep/v3"
 NATIVE_PLANAR_BREP_PROVIDER = "native-planar-brep-v2"
 NATIVE_PLANAR_CONVEX_FAN_RULE = "native-planar-projected-convex-fan-v2"
 NATIVE_PLANAR_COEDGE_DIRECTION_RULE = "native-coedge-directed-evaluate-tangent-v3"
 NATIVE_PLANAR_COEDGE_VERTEX_RULE = "native-coedge-adjacent-edge-vertex-incidence-v2"
 NATIVE_PLANAR_EDGE_VERTEX_RULE = "native-curve-sense-vertex-incidence-v1"
-NATIVE_PLANAR_COEDGE_EVALUATION_RULE = "native-coedge-evaluate-float32-operation-v1"
+NATIVE_PLANAR_COEDGE_EVALUATION_RULE = "native-coedge-evaluate-float32-operation-v2"
+NATIVE_PLANAR_COEDGE_INTERFACE_IID = "{83A33D57-27C5-11CE-BFD4-00400513BB57}"
+NATIVE_PLANAR_COEDGE_EVALUATE_DISPID = 17
 
 
 class PlanarBrepNotApplicable(ValueError):

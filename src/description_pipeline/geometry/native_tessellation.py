@@ -25,6 +25,8 @@ from .native_fin_topology import (
 from .native_planar_brep import (
     NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
     NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
+    NATIVE_PLANAR_COEDGE_INTERFACE_IID,
+    NATIVE_PLANAR_COEDGE_EVALUATE_DISPID,
     NATIVE_PLANAR_COEDGE_VERTEX_RULE,
     NATIVE_PLANAR_EDGE_VERTEX_RULE,
     NATIVE_PLANAR_BREP_PROVIDER,
@@ -1911,6 +1913,7 @@ def _parse_planar_brep_evidence(
         "start_vertex_point_tolerance_m",
         "end_vertex_point_tolerance_m",
         "curve_params_raw",
+        "dispatch_binding",
         "evaluations",
         "coedge_curve_present",
     }
@@ -1918,6 +1921,7 @@ def _parse_planar_brep_evidence(
         "endpoint",
         "rule_version",
         "parameter",
+        "raw_response",
         "point_m",
         "tangent",
         "point_error_m",
@@ -2081,6 +2085,17 @@ def _parse_planar_brep_evidence(
             )
             edge_reference = coedge["edge_reference_sha256"]
             edge = edge_by_reference.get(edge_reference)
+            binding = coedge["dispatch_binding"]
+            _require(
+                isinstance(binding, dict)
+                and set(binding) == {"interface_iid", "member", "resolved_dispid", "invoke_kind"}
+                and binding["interface_iid"] == NATIVE_PLANAR_COEDGE_INTERFACE_IID
+                and binding["member"] == "Evaluate2"
+                and type(binding["resolved_dispid"]) is int
+                and binding["resolved_dispid"] == NATIVE_PLANAR_COEDGE_EVALUATE_DISPID
+                and binding["invoke_kind"] == "METHOD",
+                component + f": native planar BRep coedge {coedge_index} dispatch binding is invalid",
+            )
             _require(
                 coedge["coedge_index"] == coedge_index
                 and _integer(coedge["coedge_index"])
@@ -2246,8 +2261,12 @@ def _parse_planar_brep_evidence(
                     and evaluation["endpoint"] == endpoint
                     and evaluation["rule_version"] == NATIVE_PLANAR_COEDGE_EVALUATION_RULE
                     and evaluation["parameter"] == coedge[f"{endpoint}_parameter"]
+                    and isinstance(evaluation["raw_response"], list)
+                    and len(evaluation["raw_response"]) == 6
+                    and all(_finite_number(value) for value in evaluation["raw_response"])
                     and _finite_point(evaluation["point_m"])
                     and _finite_point(evaluation["tangent"])
+                    and evaluation["raw_response"] == evaluation["point_m"] + evaluation["tangent"]
                     and math.hypot(*evaluation["tangent"]) > 0.0,
                     component + f": native planar BRep coedge {coedge_index} {endpoint} evaluation is inconsistent",
                 )
