@@ -39,6 +39,7 @@ from description_pipeline.orchestration.native_operation_client import (
     capture_handler_from_native_operation,
     discover_adapter_from_native_operation,
     native_capture_operation_id,
+    native_discover_operation_id,
     native_operation_input_was_admitted,
 )
 from description_pipeline.orchestration.discover_protocol import seal_source_archive
@@ -2139,12 +2140,19 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         *,
         expected_native_tool_sha256: str = TOOL_SHA256,
     ) -> NativeDiscoverRequest:
+        command_id = operation_id
+        run_id = "run-native-operation"
+        request_digest = digest({"operation_id": command_id})
         return NativeDiscoverRequest(
             schema_version=NATIVE_REQUEST_SCHEMA,
-            operation_id=operation_id,
-            command_id=operation_id,
-            run_id="run-native-operation",
-            request_digest=digest({"operation_id": operation_id}),
+            operation_id=native_discover_operation_id(
+                run_id=run_id,
+                command_id=command_id,
+                request_digest=request_digest,
+            ),
+            command_id=command_id,
+            run_id=run_id,
+            request_digest=request_digest,
             source_files=self.inventory,
             source_inventory_sha256=digest(self.inventory),
             main_assembly=self.MAIN,
@@ -2213,17 +2221,17 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         (outbound / "source-set.zip").write_bytes(archive.read_bytes())
         command = SimpleNamespace(
             stage="discover",
-            command_id=operation_id,
+            command_id=request.command_id,
             run_id=request.run_id,
             request_digest=request.request_digest,
             request=request.to_record(),
         )
         intent = SimpleNamespace(
             effect_kind="native_operation",
-            command_id=operation_id,
-            effect_key=f"native-discover:{operation_id}",
+            command_id=request.command_id,
+            effect_key=f"native-discover:{request.command_id}",
             target={
-                "operation_id": operation_id,
+                "operation_id": request.operation_id,
                 "main_assembly": request.main_assembly,
                 "native_target_identity": TEST_TARGET.to_record(),
                 "native_target_id": TEST_TARGET_ID,
@@ -2294,7 +2302,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         )
         self.assertNotIn(self.DECOY, observation.selection["files"])
 
-        remote = client.get_operation("discover-operation-single")
+        remote = client.get_operation(request.operation_id)
         self.assertEqual(remote.state, "satisfied")
         self.assertTrue(remote.resource_terminated)
         self.assertEqual(remote.kind, DISCOVER_KIND)
@@ -2544,7 +2552,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             workspace / "operation",
         )
         command, intent, outbound = self.observer_fixture(
-            request.operation_id,
+            request.command_id,
             workspace,
             archive=archive,
         )
@@ -2629,7 +2637,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             workspace / "operation",
         )
         command, intent, outbound = self.observer_fixture(
-            request.operation_id,
+            request.command_id,
             workspace,
             archive=archive,
         )
@@ -2682,7 +2690,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             workspace / "operation",
         )
         command, intent, outbound = self.observer_fixture(
-            request.operation_id,
+            request.command_id,
             workspace,
             archive=archive,
         )
@@ -2753,7 +2761,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.assertEqual(settled.state, "unknown")
         (workspace / "observer").mkdir()
         command, intent, outbound = self.observer_fixture(
-            request.operation_id,
+            request.command_id,
             workspace / "observer",
             archive=archive,
         )

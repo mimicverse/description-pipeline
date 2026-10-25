@@ -7,9 +7,12 @@ import hashlib
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,13 +23,32 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
+from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.interface_records import config_snapshot_digest
 from description_pipeline.io import digest, read_data, write_json
 from description_pipeline.orchestration.discover_protocol import (
     ArchiveDiscoverAdapter,
 )
+from description_pipeline.orchestration.native_operation_client import (
+    NativeOperationClient,
+    NativeOperationEndpoint,
+    NativeOperationToolProvider,
+)
+from description_pipeline.orchestration.native_operation_runtime import (
+    CAPTURE_KIND,
+    DISCOVER_KIND,
+    CaptureOperationExecutor,
+    DiscoverOperationExecutor,
+    NativeOperationRuntime,
+)
+from description_pipeline.orchestration.windows import (
+    handler as windows_handler,
+)
 from description_pipeline.pipeline.admission import AdmissionSpec
-from description_pipeline.pipeline.application import StageApplication
+from description_pipeline.pipeline.application import (
+    StageApplication,
+    application_from_environment,
+)
 from description_pipeline.pipeline.capture import CaptureHandler
 from description_pipeline.pipeline.discover import DiscoverHandler
 from description_pipeline.pipeline.effects import EffectState
@@ -58,7 +80,11 @@ from description_pipeline.schemas import (
     INSTALL_RECORD_SCHEMA,
     PLATFORM_CONFIG_SCHEMA,
 )
-from description_pipeline.pipeline.contracts import NativeTargetIdentity
+from description_pipeline.pipeline.contracts import (
+    NativeTargetIdentity,
+    StageEffectWait,
+    StagePending,
+)
 from description_pipeline.sources.solidworks.handoff import describe_handoff
 from description_pipeline.stages import CONTRACT_SHA256
 
@@ -639,6 +665,205 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("verify", "completed"),
                 ("publish", "completed"),
             ],
+        )
+
+    def test_default_environment_factory_runs_native_loopback_chain(self) -> None:
+        snapshot = self._platform_snapshot()
+        state_root = self.root / "state"
+        lock_directory = state_root / "locks"
+        lock_directory.mkdir(exist_ok=True)
+        (lock_directory / "maintenance.lock").write_bytes(b"")
+        (self.root / "endpoint-token").chmod(0o600)
+        token = (self.root / "endpoint-token").read_text(encoding="utf-8")
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "native-runtime",
+            native_tool_factory=lambda: copy.deepcopy(self.native),
+            executors={
+                DISCOVER_KIND: DiscoverOperationExecutor(
+                    selection_reader_factory=lambda: ClosureReader(
+                        transform=_capture_component_closure,
+                        reader_sha256=self.native["source_sha256"],
+                    ),
+                    backend_factory=lambda _root, _files: CountingBackend(
+                        copy.deepcopy(capture_record())
+                    ),
+                ),
+                CAPTURE_KIND: CaptureOperationExecutor(
+                    backend_factory=_qualified_backend
+                ),
+            },
+            install_id=self.native_target.install_id,
+        )
+        self.addCleanup(runtime.close)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            windows_handler(runtime, token),
+        )
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        def close_server() -> None:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+            if thread.is_alive():
+                raise AssertionError("native operation test server did not stop")
+
+        self.addCleanup(close_server)
+        host, port = server.server_address[:2]
+        client = NativeOperationClient(
+            NativeOperationEndpoint(
+                f"http://{host}:{port}",
+                token,
+                timeout=10,
+            ),
+            target_id=self.native_target.target_id,
+        )
+        tool_provider = NativeOperationToolProvider(client)
+        work_root = self.root / "default-environment-work"
+        work_root.mkdir()
+        factory_work = self.root / "default-environment-admission"
+        factory_work.mkdir()
+        self.pull_requests = _PullRequests()
+        environment = {
+            "PLATFORM_CONFIG_SNAPSHOT": str(snapshot),
+            "PLATFORM_ARTIFACT_ROOT": str(self.store.root),
+            "PLATFORM_SERVICE_DSN": "postgresql://fixture",
+            "PIPELINE_WORK_ROOT": str(work_root),
+            "PIPELINE_CLAIM_LEASE_SECONDS": "60",
+            "SOLIDWORKS_ENDPOINT_URL": f"http://{host}:{port}",
+            "ENDPOINT_TOKEN_FILE": str(self.root / "endpoint-token"),
+        }
+
+        with (
+            patch.object(
+                ArtifactStore,
+                "from_environment",
+                return_value=self.store,
+            ),
+            patch.object(
+                FactStore,
+                "from_environment",
+                return_value=self.facts,
+            ),
+            patch(
+                "description_pipeline.pipeline.application."
+                "_portable_executor_sha256",
+                return_value=self.portable["source_sha256"],
+            ),
+            patch(
+                "description_pipeline.runtime.tool_record",
+                return_value=copy.deepcopy(self.native),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.generate.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.publish.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.pipeline.verify.tool_record",
+                return_value=copy.deepcopy(self.portable),
+            ),
+            patch(
+                "description_pipeline.repository.publish."
+                "GitHubCliPullRequestClient",
+                return_value=self.pull_requests,
+            ),
+            patch(
+                "description_pipeline.pipeline.stages.publish."
+                "GitHubCliPullRequestClient",
+                return_value=self.pull_requests,
+            ),
+        ):
+            application = application_from_environment(environment)
+            self.assertEqual(
+                application.native_target_identity,
+                self.native_target,
+            )
+            admitted = load_production_admission(
+                application,
+                self._production_request(),
+                artifacts=self.store,
+                platform_snapshot=snapshot,
+                native_tool_provider=tool_provider,
+                work_root=factory_work,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+                portable_tool_provider=lambda: copy.deepcopy(self.portable),
+            )
+            self.assertIsNotNone(admitted)
+
+            deadline = time.monotonic() + 10
+            last_attempt = None
+            while True:
+                if time.monotonic() >= deadline:
+                    with runtime._connect() as connection:
+                        operation_ids = [
+                            str(row[0])
+                            for row in connection.execute(
+                                "SELECT operation_id FROM native_operation "
+                                "ORDER BY created_at, operation_id"
+                            ).fetchall()
+                        ]
+                    operations = [
+                        client.get_operation(operation_id)
+                        for operation_id in operation_ids
+                    ]
+                    self.fail(
+                        "native loopback chain did not settle: "
+                        f"{last_attempt!r}; operations={operations!r}"
+                    )
+                outcome = application.execute_run(RUN_ID)
+                last_attempt = outcome
+                if outcome.outcome == "pending":
+                    wait = StageEffectWait.from_record(
+                        outcome.payload["wait"]
+                    )
+                    while True:
+                        if time.monotonic() >= deadline:
+                            self.fail(
+                                "native loopback chain did not settle: "
+                                f"{last_attempt!r}"
+                            )
+                        attempt = application.resume_stage(wait)
+                        last_attempt = attempt
+                        if isinstance(attempt, StagePending):
+                            wait = attempt.wait
+                            time.sleep(0.05)
+                            continue
+                        break
+                    continue
+                break
+
+        self.assertEqual(outcome.outcome, "completed", repr(outcome))
+        self.assertEqual(outcome.stage, "publish")
+        self.assertEqual(len(self.pull_requests.rows), 1)
+        with runtime._connect() as connection:
+            operation_ids = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT operation_id FROM native_operation "
+                    "ORDER BY created_at, operation_id"
+                ).fetchall()
+            ]
+        operations = [client.get_operation(operation_id) for operation_id in operation_ids]
+        self.assertEqual(
+            {operation.kind for operation in operations},
+            {DISCOVER_KIND, CAPTURE_KIND},
+        )
+        self.assertEqual(
+            {operation.state for operation in operations},
+            {"satisfied"},
+        )
+        self.assertEqual(
+            {operation.target_id for operation in operations},
+            {self.native_target.target_id},
         )
 
     def test_freeze_successor_reuses_originals_and_runs_all_six_stages(self) -> None:

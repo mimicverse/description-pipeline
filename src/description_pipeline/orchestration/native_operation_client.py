@@ -1194,7 +1194,21 @@ class NativeOperationEffectObserver:
             intent.effect_kind != "native_operation"
             or intent.command_id != command.command_id
             or intent.target.get("operation_id", intent.target.get("command_id"))
-            != command.command_id
+            != (
+                native_capture_operation_id(
+                    run_id=command.run_id,
+                    command_id=command.command_id,
+                    effect_key=intent.effect_key,
+                )
+                if command.stage == "capture"
+                else native_discover_operation_id(
+                    run_id=command.run_id,
+                    command_id=command.command_id,
+                    request_digest=command.request_digest,
+                )
+                if command.stage == "discover"
+                else None
+            )
         ):
             raise NativeOperationProtocolError(
                 "native reconciliation intent belongs to another command"
