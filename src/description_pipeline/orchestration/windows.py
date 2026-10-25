@@ -140,6 +140,10 @@ def build_runtime(
         state_root=config["state_root"],
         native_tool_factory=_native_tool_record,
         executors=registry,
+        endpoint_config_digest=config.get("config_digest"),
+        endpoint_port=config.get("port"),
+        capacity_root=config.get("output_root"),
+        cad_ownership_file=ownership_file,
     )
 
 

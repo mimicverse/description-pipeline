@@ -61,7 +61,6 @@ DIAGNOSTIC_COMMAND_REQUEST_SCHEMA = "solidworks-to-urdf.diagnostic-command-reque
 EFFECT_RECONCILIATION_SCHEMA = "solidworks-to-urdf.effect-reconciliation/v1"
 EFFECT_RECONCILIATION_FAILURE_SCHEMA = "solidworks-to-urdf.effect-reconciliation-failure/v1"
 NATIVE_CAPTURE_OPERATION_SCHEMA = "solidworks-to-urdf.native-capture-operation/v1"
-NATIVE_OPERATION_HEALTH_SCHEMA = "solidworks-to-urdf.native-operation-health/v1"
 NATIVE_OPERATION_REQUEST_SCHEMA = "solidworks-to-urdf.native-operation-request/v2"
 NATIVE_OPERATION_VIEW_SCHEMA = "solidworks-to-urdf.native-operation-view/v2"
 NATIVE_OPERATION_OBSERVATION_SCHEMA = "solidworks-to-urdf.native-operation-observation/v1"

@@ -544,20 +544,16 @@ def validate_endpoint_health(health_document, release: dict) -> tuple[dict, dict
     """
 
     interface_records = _canonical_records()
-    target_contract, pipeline_id = _native_target_contract()
     try:
         health = interface_records.validate_health(health_document)
     except Exception as error:
         die(f"endpoint health invalid: {error}")
     require_matching_release(release, {"release": health["release"]})
     identity = {
-        "install_id": health["install"]["install_id"],
-        "config_digest": health["install"]["config_digest"],
+        "install_id": health["install_id"],
+        "config_digest": health["config_digest"],
         "release": {key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")},
-        "target_identity": target_contract.create(
-            install_id=health["install"]["install_id"],
-            pipeline_id=pipeline_id,
-        ).to_record(),
+        "target_identity": dict(health["target_identity"]),
     }
     return identity, health
 
@@ -650,12 +646,12 @@ def main(argv: list[str] | None = None) -> int:
                 detail = getattr(error, "detail", None)
                 die(f"endpoint does not match the active record: {error} {detail if detail else ''}")
             endpoint = {
-                "install_id": health["install"]["install_id"],
-                "config_digest": health["install"]["config_digest"],
+                "install_id": health["install_id"],
+                "config_digest": health["config_digest"],
                 "release": {
                     key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")
                 },
-                "target_identity": record["ends"]["windows"]["target_identity"],
+                "target_identity": dict(health["target_identity"]),
             }
         else:
             endpoint, health = validate_endpoint_health(health_document, release)

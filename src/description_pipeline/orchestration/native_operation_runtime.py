@@ -1078,9 +1078,32 @@ class NativeOperationRuntime:
         executors: Mapping[str, NativeOperationExecutor],
         clock: Callable[[], datetime] | None = None,
         install_id: str | None = None,
+        endpoint_config_digest: str | None = None,
+        endpoint_port: int | None = None,
+        capacity_root: Path | None = None,
+        cad_ownership_file: Path | None = None,
     ) -> None:
         self.state_root = Path(state_root).resolve()
         self.state_root.mkdir(parents=True, exist_ok=True)
+        validated_endpoint_config_digest = (
+            None
+            if endpoint_config_digest is None
+            else _sha256(endpoint_config_digest, "endpoint_config_digest")
+        )
+        if endpoint_port is not None and (
+            type(endpoint_port) is not int or not 1 <= endpoint_port <= 65535
+        ):
+            raise ValueError("endpoint_port must be a valid TCP port")
+        resolved_capacity_root = (
+            self.state_root
+            if capacity_root is None
+            else Path(capacity_root).resolve()
+        )
+        resolved_cad_ownership_file = (
+            None
+            if cad_ownership_file is None
+            else Path(cad_ownership_file).resolve()
+        )
         self._ownership = acquire_process_lock(self.state_root / ".native-operation.lock")
         self.runtime_root = self.state_root / "native-operations"
         self.db_path = self.runtime_root / "operations.sqlite3"
@@ -1096,6 +1119,10 @@ class NativeOperationRuntime:
         self.native_tool_factory = native_tool_factory
         self.executors = dict(executors)
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.endpoint_config_digest = validated_endpoint_config_digest
+        self.endpoint_port = endpoint_port
+        self.capacity_root = resolved_capacity_root
+        self.cad_ownership_file = resolved_cad_ownership_file
         self._lock = threading.RLock()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._resource_waiters: set[str] = set()

@@ -113,7 +113,9 @@ HEALTH_KEYS = (
     "release",
     "contract",
     "resource_policy",
-    "install",
+    "install_id",
+    "config_digest",
+    "target_identity",
     "endpoint",
     "cad",
     "jobs",
@@ -556,9 +558,32 @@ def validate_health(payload) -> dict:
         {"where": "resource_policy.schema_version"},
     )
     _hex64(payload["resource_policy"]["digest"], code, "resource_policy.digest")
-    _exact_keys(payload["install"], {"config_digest", "install_id"}, code, "install")
-    _hex64(payload["install"]["config_digest"], code, "install.config_digest")
-    _text(payload["install"]["install_id"], code, "install.install_id")
+    _text(payload["install_id"], code, "install_id")
+    _hex64(payload["config_digest"], code, "config_digest")
+    try:
+        from .pipeline.contracts import NativeTargetIdentity  # noqa: PLC0415
+
+        target = NativeTargetIdentity.from_record(payload["target_identity"])
+    except Exception as error:
+        raise InterfaceRecordError(
+            code,
+            {"where": "target_identity", "reason": str(error)},
+        ) from error
+    _require(
+        target.to_record() == payload["target_identity"],
+        code,
+        {"where": "target_identity"},
+    )
+    _require(
+        target.install_id == payload["install_id"],
+        code,
+        {"rule": "target_identity install_id equals health install_id"},
+    )
+    _require(
+        target.pipeline_id == payload["pipeline_id"] == PIPELINE_ID,
+        code,
+        {"where": "target_identity.pipeline_id"},
+    )
     _exact_keys(payload["endpoint"], {"port"}, code, "endpoint")
     port = payload["endpoint"]["port"]
     _require(type(port) is int and 0 < port < 65536, code, {"where": "endpoint.port"})
@@ -1079,7 +1104,7 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
     """Linux-side active install record (IF-16).
 
     ``ends.linux.config_digest`` is only ever compared with this host;
-    ``ends.windows.config_digest`` only with the endpoint ``/health.install``.
+    ``ends.windows.config_digest`` only with the endpoint ``/health``.
     The two ends are per-host generations, so this validator never requires the
     digests to be equal (or different) - cross-end equality checks are banned.
     """
@@ -1250,14 +1275,19 @@ def require_endpoint_matches_install_record(health, record) -> None:
     )
     require_same_release_identity(end["release"], health["release"])
     _require(
-        end["install_id"] == health["install"]["install_id"],
+        end["install_id"] == health["install_id"],
         "endpoint_end_mismatch",
         {"field": "install_id"},
     )
     _require(
-        end["config_digest"] == health["install"]["config_digest"],
+        end["config_digest"] == health["config_digest"],
         "endpoint_end_mismatch",
         {"field": "config_digest"},
+    )
+    _require(
+        end["target_identity"] == health["target_identity"],
+        "endpoint_end_mismatch",
+        {"field": "target_identity"},
     )
     _require(
         health["ready"] is True,

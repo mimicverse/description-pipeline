@@ -67,7 +67,12 @@ def health(ready: bool = True) -> dict:
         "release": release("native"),
         "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
         "resource_policy": {"schema_version": RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_v1_digest()},
-        "install": {"config_digest": HEX, "install_id": "gen-1"},
+        "install_id": "gen-1",
+        "config_digest": HEX,
+        "target_identity": NativeTargetIdentity.create(
+            install_id="gen-1",
+            pipeline_id=ir.PIPELINE_ID,
+        ).to_record(),
         "endpoint": {"port": 8765},
         "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
         "jobs": {"active": 0, "queued": 0, "unresolved": 0},
@@ -338,6 +343,30 @@ class B4FixSingleVariableTests(unittest.TestCase):
             (
                 "re-added auth fingerprint",
                 lambda h: h.__setitem__("auth", {"scheme": "bearer", "token_fingerprint": "3e1d"}),
+                "health_invalid",
+            ),
+            (
+                "nested install identity",
+                lambda h: h.__setitem__(
+                    "install",
+                    {"install_id": h["install_id"], "config_digest": h["config_digest"]},
+                ),
+                "health_invalid",
+            ),
+            (
+                "target install mismatch",
+                lambda h: h.__setitem__(
+                    "target_identity",
+                    NativeTargetIdentity.create(
+                        install_id="ep-other",
+                        pipeline_id=ir.PIPELINE_ID,
+                    ).to_record(),
+                ),
+                "health_invalid",
+            ),
+            (
+                "invalid endpoint config digest",
+                lambda h: h.__setitem__("config_digest", "short"),
                 "health_invalid",
             ),
         )
@@ -905,14 +934,23 @@ class InterfaceRecordTests(unittest.TestCase):
     def test_endpoint_matches_install_record_helper(self) -> None:
         record = install_record()
         payload = health(True)
-        payload["install"] = {"config_digest": OTHER_HEX, "install_id": "ep-7"}
+        payload["install_id"] = "ep-7"
+        payload["config_digest"] = OTHER_HEX
+        payload["target_identity"] = record["ends"]["windows"]["target_identity"]
         ir.require_endpoint_matches_install_record(payload, record)
         # Owned active/queued work with the same complete identity must not be refused.
         owned = copy.deepcopy(payload)
         owned["jobs"] = {"active": 2, "queued": 1, "unresolved": 0}
         ir.require_endpoint_matches_install_record(owned, record)
         bad = copy.deepcopy(payload)
-        bad["install"]["config_digest"] = HEX
+        bad["config_digest"] = HEX
+        self.reject("endpoint_end_mismatch", lambda: ir.require_endpoint_matches_install_record(bad, record))
+        bad = copy.deepcopy(payload)
+        bad["install_id"] = "ep-other"
+        bad["target_identity"] = NativeTargetIdentity.create(
+            install_id="ep-other",
+            pipeline_id=ir.PIPELINE_ID,
+        ).to_record()
         self.reject("endpoint_end_mismatch", lambda: ir.require_endpoint_matches_install_record(bad, record))
         bad = copy.deepcopy(payload)
         bad["release"]["source_commit"] = OTHER_COMMIT

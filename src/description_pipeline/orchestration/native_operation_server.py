@@ -6,17 +6,25 @@ import hmac
 import json
 import os
 import shutil
+import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 from ..delivery import PIPELINE_ID
+from ..interface_records import (
+    InterfaceRecordError,
+    resource_policy_v1_digest,
+    validate_health,
+)
 from ..io import PipelineError, canonical, digest, parse_data
 from ..schemas import (
-    NATIVE_OPERATION_HEALTH_SCHEMA as HEALTH_SCHEMA,
+    HEALTH_SCHEMA,
     NATIVE_TOOL_IDENTITY_SCHEMA,
+    RESOURCE_POLICY_SCHEMA,
 )
+from ..stages import CONTRACT, CONTRACT_SHA256
 from .native_operation_runtime import NativeOperationError, NativeOperationRuntime
 
 MAX_JSON_BYTES = 8 * 1024**2
@@ -25,32 +33,139 @@ MAX_ARCHIVE_BYTES = 16 * 1024**3
 
 def _health(runtime: NativeOperationRuntime) -> dict:
     stats = runtime.stats()
-    native_tool = None
-    native_tool_error = None
     try:
         native_tool = dict(runtime.native_tool_factory())
         canonical(native_tool)
     except Exception as error:
-        native_tool_error = f"{type(error).__name__}: {error}"
-    native_tool_sha256 = None if native_tool is None else digest(native_tool)
-    identity_matches = (
-        native_tool is not None
-        and native_tool.get("pipeline_id") == PIPELINE_ID
+        raise NativeOperationError(
+            "The native tool identity is unavailable",
+            status=503,
+            code="native_health_identity_unavailable",
+            detail={"error_type": type(error).__name__},
+        ) from error
+    embedded_release = native_tool.get("release")
+    if not isinstance(embedded_release, dict):
+        embedded_release = {}
+    release = {
+        "version": str(native_tool.get("version") or ""),
+        "source_commit": str(embedded_release.get("source_commit") or ""),
+        "source_sha256": str(native_tool.get("source_sha256") or ""),
+        "role": "native",
+    }
+    native_platform = sys.platform == "win32"
+    problems: list[str] = []
+    if not native_platform:
+        problems.append("unsupported_platform")
+    if native_tool.get("pipeline_id") != PIPELINE_ID:
+        problems.append("native_tool_pipeline_mismatch")
+    if not runtime.active:
+        problems.append("native_worker_inactive")
+    if runtime.endpoint_config_digest is None:
+        problems.append("endpoint_config_digest_unavailable")
+    if runtime.endpoint_port is None:
+        problems.append("endpoint_port_unavailable")
+    if not all(
+        (
+            release["version"],
+            release["source_commit"],
+            release["source_sha256"],
+        )
+    ):
+        problems.append("native_release_identity_unavailable")
+
+    cad = {
+        "external_session_detected": False,
+        "owned_sessions": 0,
+        "lease_held": False,
+    }
+    if native_platform:
+        try:
+            from ..sources.solidworks import isolation
+
+            cad = isolation.cad_session_facts(
+                isolation.registered_executable(),
+                ownership_file=runtime.cad_ownership_file,
+            )
+        except Exception:
+            problems.append("cad_state_unavailable")
+        else:
+            problems.extend(str(item) for item in cad.get("problems", ()))
+        try:
+            from ..runtime import native_readiness
+
+            native_readiness()
+        except Exception:
+            problems.append("native_readiness_failed")
+
+    usage = shutil.disk_usage(runtime.capacity_root)
+    native_ok = native_platform and not any(
+        item != "unsupported_platform" for item in problems
     )
-    return {
+    ready = (
+        native_ok
+        and not cad["external_session_detected"]
+        and stats["unresolved"] == 0
+    )
+    if ready:
+        reason_code = None
+    elif problems:
+        reason_code = problems[0]
+    elif cad["external_session_detected"]:
+        reason_code = "external_cad_session"
+    else:
+        reason_code = "unresolved_operations"
+    payload = {
         "schema_version": HEALTH_SCHEMA,
         "pipeline_id": PIPELINE_ID,
-        "ready": (
-            runtime.active
-            and stats["unresolved"] == 0
-            and identity_matches
-        ),
+        "native_platform": native_platform,
+        "ready": ready,
+        "release": release,
+        "contract": {
+            "schema_version": CONTRACT["schema_version"],
+            "digest": CONTRACT_SHA256,
+        },
+        "resource_policy": {
+            "schema_version": RESOURCE_POLICY_SCHEMA,
+            "digest": resource_policy_v1_digest(),
+        },
         "install_id": runtime.install_id,
-        "native_tool_sha256": native_tool_sha256,
-        "native_tool_error": native_tool_error,
-        "operations": stats,
+        "config_digest": runtime.endpoint_config_digest,
         "target_identity": runtime.target_identity.to_record(),
+        "endpoint": {"port": runtime.endpoint_port},
+        "cad": {
+            "external_session_detected": bool(
+                cad.get("external_session_detected", False)
+            ),
+            "owned_sessions": int(cad.get("owned_sessions", 0)),
+            "lease_held": bool(cad.get("lease_held", False)),
+        },
+        "jobs": {
+            "active": stats["active"],
+            "queued": stats["queued"],
+            "unresolved": stats["unresolved"],
+        },
+        "capacity": {
+            "free_bytes": int(usage.free),
+            "reserved_bytes": 0,
+        },
+        "readiness": {
+            "reason_code": reason_code,
+            "native": {
+                "ok": native_ok,
+                "problems": problems,
+            },
+        },
     }
+    try:
+        validate_health(payload)
+    except InterfaceRecordError as error:
+        raise NativeOperationError(
+            "The native endpoint cannot report its complete health identity",
+            status=503,
+            code="native_health_identity_invalid",
+            detail={"reason": str(error)},
+        ) from error
+    return payload
 
 
 def _native_tool_identity(runtime: NativeOperationRuntime) -> dict:

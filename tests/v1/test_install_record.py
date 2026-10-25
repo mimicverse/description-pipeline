@@ -231,7 +231,9 @@ class InstallRecordTests(unittest.TestCase):
         record_path.write_text(json.dumps(record), encoding="utf-8")
         health_path = self.root / "endpoint-health.json"
         matching = health()
-        matching["install"] = {"config_digest": "d" * 64, "install_id": "ep-7"}
+        matching["install_id"] = "ep-7"
+        matching["config_digest"] = "d" * 64
+        matching["target_identity"] = record["ends"]["windows"]["target_identity"]
         matching["endpoint"] = {"port": 9765}
         health_path.write_text(json.dumps(matching), encoding="utf-8")
         out = self.root / "verified-endpoint-identity.json"
@@ -254,7 +256,8 @@ class InstallRecordTests(unittest.TestCase):
             record["ends"]["windows"]["target_identity"],
         )
         forged = matching
-        forged["install"]["install_id"] = "ep-other"
+        forged["install_id"] = "ep-other"
+        forged["target_identity"] = native_target("ep-other")
         health_path.write_text(json.dumps(forged), encoding="utf-8")
         with self.assertRaisesRegex(SystemExit, "does not match the active record"):
             install_record.main(

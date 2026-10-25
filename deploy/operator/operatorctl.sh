@@ -1693,8 +1693,8 @@ function Get-Sample {{
       source_sha256 = [string]$probe.release.source_sha256
       role = 'native'
     }}
-    health_install_id = [string]$health.install.install_id
-    health_config_digest = [string]$health.install.config_digest
+    health_install_id = [string]$health.install_id
+    health_config_digest = [string]$health.config_digest
     health_release = [ordered]@{{
       version = [string]$health.release.version
       source_commit = [string]$health.release.source_commit

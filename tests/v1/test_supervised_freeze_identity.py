@@ -173,6 +173,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         )
         from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
         from description_pipeline.platform.facts import FactStore
+        from description_pipeline.schemas import TOOL_SCHEMA
         from description_pipeline.stages import CONTRACT_SHA256
         from tests.v1.config_identity_support import prepare_root, write_snapshot
         from tests.v1.test_install_record import platform_document
@@ -216,7 +217,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
 
         def tool_record(role: str, system: str) -> dict:
             return {
-                "schema_version": "solidworks-to-urdf.tool/v1",
+                "schema_version": TOOL_SCHEMA,
                 "pipeline_id": PIPELINE_ID,
                 "version": __version__,
                 "source_sha256": cls.portable_source_sha256,

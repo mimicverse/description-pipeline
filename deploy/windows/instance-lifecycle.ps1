@@ -393,7 +393,7 @@ function Health-Probe([string]$configPath, [object]$binding) {
   if ($health.release.version -ne $binding.version -or $health.release.source_commit -ne $binding.source_commit -or $health.release.source_sha256 -ne $binding.source_sha256) {
     throw 'the instance endpoint /health release identity differs from the bound release'
   }
-  if (-not $health.install.install_id -or -not $health.install.config_digest) {
+  if (-not $health.install_id -or -not $health.config_digest -or -not $health.target_identity.target_id) {
     throw 'the instance endpoint /health does not carry its install identity'
   }
   return $health
@@ -2519,8 +2519,8 @@ function Invoke-RecoveryResume($Binding) {
     Die 'windows_resume_not_disabled' ('the Windows task is neither Disabled nor Running: ' + $projection.state)
   }
   $health = $settled.health
-  if ($health.install.install_id -ne [string]$Binding.install_id -or
-      $health.install.config_digest -ne [string]$Binding.config_digest -or
+  if ($health.install_id -ne [string]$Binding.install_id -or
+      $health.config_digest -ne [string]$Binding.config_digest -or
       $health.release.version -ne [string]$Binding.version -or
       $health.release.source_commit -ne [string]$Binding.source_commit -or
       $health.release.source_sha256 -ne [string]$Binding.source_sha256) {
@@ -2817,7 +2817,7 @@ if ($Verb -eq 'promote') {
     $lockRefusal = $started.lock_refusal
     $retriedAfter = $started.retried_after_s
     $health = $settled.health
-    if ($health.install.config_digest -ne $candidate.config_digest) {
+    if ($health.config_digest -ne $candidate.config_digest) {
       throw 'the running endpoint config digest differs from the staged generation configuration'
     }
     $receipt = @{

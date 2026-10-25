@@ -85,8 +85,10 @@ TEST_TARGET = NativeTargetIdentity.create(
 TEST_TARGET_ID = TEST_TARGET.target_id
 NATIVE_TOOL = {
     "schema_version": TOOL_SCHEMA,
-    "pipeline_id": "native-operation-test",
+    "pipeline_id": PIPELINE_ID,
+    "version": "1.0.0-test",
     "source_sha256": TOOL_SHA256,
+    "release": {"source_commit": "0" * 40},
     "runtime": {"role": "native"},
 }
 OUTPUT_CONTRACT = CAPTURE_TRANSFER_SCHEMA
@@ -1022,6 +1024,9 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             state_root=self.root / "unready-health-state",
             native_tool_factory=lambda: NATIVE_TOOL,
             executors={CAPTURE_KIND: self.executor},
+            endpoint_config_digest="d" * 64,
+            endpoint_port=8765,
+            capacity_root=self.root,
         )
         server = _Server(runtime)
         self.addCleanup(server.close)
@@ -1036,6 +1041,13 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         with urlrequest.urlopen(health_request, timeout=5) as response:
             health = json.loads(response.read())
         self.assertFalse(health["ready"])
+        self.assertEqual(health["install_id"], runtime.install_id)
+        self.assertEqual(health["config_digest"], "d" * 64)
+        self.assertEqual(
+            health["target_identity"],
+            runtime.target_identity.to_record(),
+        )
+        self.assertNotIn("install", health)
         self.assertEqual(
             client.get_target_identity().target_id,
             runtime.target_identity.target_id,
