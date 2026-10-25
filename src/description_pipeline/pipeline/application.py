@@ -1462,6 +1462,11 @@ def application_from_environment(
 ) -> StageApplication:
     """Compose implemented handlers; missing runtime capabilities remain explicit."""
 
+    from .stages.publish import (
+        PublishGitReconciliationAdapter,
+        PublishPullRequestReconciliationAdapter,
+    )
+
     source = os.environ if environ is None else environ
     artifacts = ArtifactStore.from_environment(source)
     facts = FactStore.from_environment(source, result_reader=artifacts)
@@ -1558,62 +1563,41 @@ def application_from_environment(
             "native_operation",
             NativeOperationEffectObserver(client),
         )
-    from .stages import publish as publish_stage
+    adapters.setdefault("git_ref_update", PublishGitReconciliationAdapter())
+    from ..repository.publish import GitHubCliPullRequestClient
 
-    publish_observer = getattr(
-        publish_stage,
-        "PublishGitReconciliationAdapter",
-        None,
+    pull_request_root = Path(work_root) / "publish-pr-observer"
+    pull_request_root.mkdir(parents=True, exist_ok=True)
+    adapters.setdefault(
+        "pr_upsert",
+        PublishPullRequestReconciliationAdapter(
+            GitHubCliPullRequestClient(pull_request_root)
+        ),
     )
-    if publish_observer is not None:
-        adapters.setdefault("git_ref_update", publish_observer())
-    pull_request_observer = getattr(
-        publish_stage,
-        "PublishPullRequestReconciliationAdapter",
-        None,
-    )
-    if pull_request_observer is not None:
-        from ..repository.publish import GitHubCliPullRequestClient
-
-        pull_request_root = Path(work_root) / "publish-pr-observer"
-        pull_request_root.mkdir(parents=True, exist_ok=True)
-        adapters.setdefault(
-            "pr_upsert",
-            pull_request_observer(
-                GitHubCliPullRequestClient(pull_request_root)
-            ),
-        )
     controllers = dict(cancellation_controllers or {})
     if client is not None:
-        try:
-            from .cancellation import CancellationControlService
-            from ..orchestration.native_operation_cancellation import (
-                NATIVE_OPERATION_EFFECT_KIND,
-                native_operation_cancellation_adapter,
-            )
-        except ModuleNotFoundError as error:
-            if error.name not in {
-                "description_pipeline.pipeline.cancellation",
-                "description_pipeline.orchestration.native_operation_cancellation",
-            }:
-                raise
-        else:
-            cancellation_adapter = native_operation_cancellation_adapter(
-                client,
+        from .cancellation import CancellationControlService
+        from ..orchestration.native_operation_cancellation import (
+            NATIVE_OPERATION_EFFECT_KIND,
+            native_operation_cancellation_adapter,
+        )
+
+        cancellation_adapter = native_operation_cancellation_adapter(
+            client,
+            facts=facts,
+            artifacts=artifacts,
+        )
+        controllers.setdefault(
+            NATIVE_OPERATION_EFFECT_KIND,
+            CancellationControlService(
                 facts=facts,
                 artifacts=artifacts,
-            )
-            controllers.setdefault(
-                NATIVE_OPERATION_EFFECT_KIND,
-                CancellationControlService(
-                    facts=facts,
-                    artifacts=artifacts,
-                    work_root=Path(work_root) / "cancellation",
-                    claim_policy=services.claim_policy,
-                    clock=clock,
-                    adapter=cancellation_adapter,
-                ),
-            )
+                work_root=Path(work_root) / "cancellation",
+                claim_policy=services.claim_policy,
+                clock=clock,
+                adapter=cancellation_adapter,
+            ),
+        )
     reconciler = (
         EffectReconciliationService(
             facts=facts,

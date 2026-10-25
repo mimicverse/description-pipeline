@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -28,7 +29,12 @@ from description_pipeline.pipeline.application import (
     _shared_maintenance_gate,
     application_from_environment,
 )
-from description_pipeline.pipeline.stages.publish import PublishHandler
+from description_pipeline.pipeline.cancellation import CancellationControlService
+from description_pipeline.pipeline.stages.publish import (
+    PublishGitReconciliationAdapter,
+    PublishHandler,
+    PublishPullRequestReconciliationAdapter,
+)
 from description_pipeline.schemas import RUN_ADMISSION_SCHEMA
 from description_pipeline.pipeline.contracts import (
     DiagnosticReplayScope,
@@ -756,7 +762,7 @@ class StageApplicationTests(unittest.TestCase):
             payload["freeze_command"]["command_id"],
         )
 
-    def test_environment_composition_uses_the_portable_source_identity(self):
+    def _environment_composition(self):
         executor = "a" * 64
         native_target = NativeTargetIdentity.create(
             install_id="win-" + "a" * 32,
@@ -773,6 +779,10 @@ class StageApplicationTests(unittest.TestCase):
             "SOLIDWORKS_ENDPOINT_URL": "http://127.0.0.1:18765",
             "ENDPOINT_TOKEN_FILE": str(token),
         }
+        return environment, executor, native_target
+
+    def test_environment_composition_uses_the_portable_source_identity(self):
+        environment, executor, native_target = self._environment_composition()
         with patch(
             "description_pipeline.pipeline.application.tool_record",
             return_value={"source_sha256": executor},
@@ -787,6 +797,27 @@ class StageApplicationTests(unittest.TestCase):
         self.assertIn("capture", application.handlers)
         self.assertIn("discover", application.handlers)
         self.assertIsInstance(application.handlers["publish"], PublishHandler)
+        self.assertEqual(
+            application.missing_capabilities(),
+            {
+                "handlers": [],
+                "builders": [],
+                "reconciliation": [],
+                "cancellation": [],
+            },
+        )
+        self.assertIsInstance(
+            application.reconciliation_adapters["git_ref_update"],
+            PublishGitReconciliationAdapter,
+        )
+        self.assertIsInstance(
+            application.reconciliation_adapters["pr_upsert"],
+            PublishPullRequestReconciliationAdapter,
+        )
+        self.assertIsInstance(
+            application.cancellation_controllers["native_operation"],
+            CancellationControlService,
+        )
         with (
             patch(
                 "description_pipeline.pipeline.application.tool_record",
@@ -806,6 +837,49 @@ class StageApplicationTests(unittest.TestCase):
                 environment,
                 native_operation_client=Mock(target_id="0" * 64),
             )
+
+    def test_environment_composition_rejects_missing_publish_reconciliation(self):
+        environment, executor, native_target = self._environment_composition()
+        with (
+            patch.dict(
+                sys.modules,
+                {"description_pipeline.pipeline.stages.publish": None},
+            ),
+            patch(
+                "description_pipeline.pipeline.application.tool_record",
+                return_value={"source_sha256": executor},
+            ),
+            patch(
+                "description_pipeline.pipeline.application."
+                "load_registered_native_target",
+                return_value=native_target,
+            ),
+            self.assertRaises(ModuleNotFoundError),
+        ):
+            application_from_environment(environment)
+
+    def test_environment_composition_rejects_missing_native_cancellation(self):
+        environment, executor, native_target = self._environment_composition()
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "description_pipeline.orchestration."
+                    "native_operation_cancellation": None
+                },
+            ),
+            patch(
+                "description_pipeline.pipeline.application.tool_record",
+                return_value={"source_sha256": executor},
+            ),
+            patch(
+                "description_pipeline.pipeline.application."
+                "load_registered_native_target",
+                return_value=native_target,
+            ),
+            self.assertRaises(ModuleNotFoundError),
+        ):
+            application_from_environment(environment)
 
 
 if __name__ == "__main__":
