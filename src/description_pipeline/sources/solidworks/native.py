@@ -173,30 +173,34 @@ def _win32():
     return win32com.client
 
 
-def _whole_body_face_list(faces, face_reference_sha256):
-    """Build one explicit all-face dispatch array for a whole-body read."""
+def _whole_body_tessellation_argument(
+    *,
+    variant_factory=None,
+    vt_empty=None,
+):
+    """Build the official one-argument VT_EMPTY whole-body request."""
 
-    import pythoncom
+    if variant_factory is None or vt_empty is None:
+        import pythoncom
+        from win32com.client import VARIANT
 
-    typed_faces = tuple(faces)
-    references = tuple(face_reference_sha256)
-    if not typed_faces or len(typed_faces) != len(references):
-        raise RuntimeError("whole-body FaceList requires every typed native face")
-    variant_type = pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH
-    face_list = _win32().VARIANT(variant_type, typed_faces)
-    if getattr(face_list, "varianttype", None) != variant_type:
+        variant_factory = VARIANT if variant_factory is None else variant_factory
+        vt_empty = pythoncom.VT_EMPTY if vt_empty is None else vt_empty
+    argument = variant_factory(vt_empty, None)
+    if (
+        getattr(argument, "varianttype", None) != vt_empty
+        or getattr(argument, "value", object()) is not None
+    ):
         raise RuntimeError(
-            "whole-body FaceList did not marshal as VT_ARRAY|VT_DISPATCH"
+            "whole-body tessellation argument did not marshal as VT_EMPTY"
         )
-    return face_list, {
+    return argument, {
         "api": "IBody2.GetTessellation",
         "argument_count": 1,
         "face_list": {
             "scope": "whole_body",
-            "variant_type": "VT_ARRAY|VT_DISPATCH",
-            "face_count": len(typed_faces),
-            "first_face_reference_sha256": references[0],
-            "last_face_reference_sha256": references[-1],
+            "variant_type": "VT_EMPTY",
+            "value": None,
         },
     }
 
@@ -7597,17 +7601,10 @@ class SolidWorksBackend(CadBackend):
 
         def get_tessellation():
             nonlocal tessellation_request
-            typed_faces = tuple(
-                _interface(_dynamic(face), IFACE2_IID) for face in faces
+            whole_body_argument, tessellation_request = (
+                _whole_body_tessellation_argument()
             )
-            face_references = tuple(
-                row["reference"]["typed_sha256"] for row in face_rows
-            )
-            face_list, tessellation_request = _whole_body_face_list(
-                typed_faces,
-                face_references,
-            )
-            return _member(body, "GetTessellation", face_list)
+            return _member(body, "GetTessellation", whole_body_argument)
 
         raw_tessellation = call("IBody2.GetTessellation", get_tessellation)
         if raw_tessellation is None:
@@ -8049,14 +8046,6 @@ class SolidWorksBackend(CadBackend):
                 },
                 base=base,
             )
-        if tessellation_request is not None and face_rows:
-            tessellation_request["face_list"][
-                "first_face_reference_sha256"
-            ] = face_rows[0]["reference"]["typed_sha256"]
-            tessellation_request["face_list"][
-                "last_face_reference_sha256"
-            ] = face_rows[-1]["reference"]["typed_sha256"]
-
         fin_ids_by_edge_index = {}
 
         def edge_failure_context(

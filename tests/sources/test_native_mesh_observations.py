@@ -722,7 +722,23 @@ class NativeMeshObservationTests(unittest.TestCase):
             )
 
         def partial_face_list(row):
-            body(row)["request"]["face_list"]["face_count"] = 1
+            body(row)["request"]["face_list"]["value"] = 0
+
+        def legacy_face_list_request(row):
+            body(row)["request"] = {
+                "api": "IBody2.GetTessellation",
+                "argument_count": 1,
+                "face_list": {
+                    "scope": "whole_body",
+                    "variant_type": "VT_ARRAY|VT_DISPATCH",
+                    "face_count": 1,
+                    "first_face_reference_sha256": "0" * 64,
+                    "last_face_reference_sha256": "0" * 64,
+                },
+            }
+
+        def boolean_argument_count(row):
+            body(row)["request"]["argument_count"] = True
 
         def missing_match_type_evidence(row):
             body(row)["properties"].pop("match_type")
@@ -745,7 +761,21 @@ class NativeMeshObservationTests(unittest.TestCase):
             ("fin-vertices", duplicate_fin_vertex, "fin 0 is malformed"),
             ("fin-sides", fin_side_from_other_facet, "facet 1 is malformed"),
             ("reversed-fin", reversed_fin, "not a directed three-cycle"),
-            ("partial-face-list", partial_face_list, "is incomplete"),
+            (
+                "nonempty-empty-value",
+                partial_face_list,
+                "unsupported tessellation request",
+            ),
+            (
+                "legacy-face-list",
+                legacy_face_list_request,
+                "unsupported tessellation request",
+            ),
+            (
+                "boolean-argument-count",
+                boolean_argument_count,
+                "unsupported tessellation request",
+            ),
             (
                 "missing-match-type",
                 missing_match_type_evidence,

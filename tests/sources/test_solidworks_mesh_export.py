@@ -33,9 +33,10 @@ def _packed_success_status():
     return struct.unpack("<d", struct.pack("<Q", 1))[0]
 
 
-def _fake_whole_body_face_list(_faces, face_reference_sha256):
-    return "VT_ARRAY|VT_DISPATCH", support.native_tessellation_request(
-        face_reference_sha256
+def _fake_whole_body_tessellation_argument():
+    return (
+        SimpleNamespace(varianttype=0, value=None),
+        support.native_tessellation_request(),
     )
 
 
@@ -694,8 +695,8 @@ class ComponentMeshExportTests(unittest.TestCase):
             self.addCleanup(end_params_patch.stop)
         face_list_patch = patch.object(
             native_module,
-            "_whole_body_face_list",
-            _fake_whole_body_face_list,
+            "_whole_body_tessellation_argument",
+            _fake_whole_body_tessellation_argument,
         )
         face_list_patch.start()
         self.addCleanup(face_list_patch.stop)
@@ -712,19 +713,15 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(entry["bodies"], {"solid": 0, "sheet": 1})
         self.assertIn("ITessellation", entry["used_api"])
         self.assertEqual(component.body_calls, [(0,), (1,), (1,)])
-        self.assertEqual(
-            body.tessellation_face_lists[-1],
-            "VT_ARRAY|VT_DISPATCH",
-        )
+        argument = body.tessellation_face_lists[-1]
+        self.assertEqual(argument.varianttype, 0)
+        self.assertIsNone(argument.value)
         self.assertIs(body._tessellation.requested["ImprovedQuality"], True)
         self.assertEqual(body._tessellation.requested["MatchType"], 0)
         self.assertIs(body._tessellation.requested["NeedErrorList"], True)
         self.assertEqual(
             entry["tessellation"]["itessellation"]["bodies"][0]["request"],
-            support.native_tessellation_request(
-                span["face_reference_sha256"]
-                for span in entry["tessellation"]["face_spans"]
-            ),
+            support.native_tessellation_request(),
         )
         self.assertEqual(
             entry["tessellation"]["itessellation"]["bodies"][0]["properties"],

@@ -1993,29 +1993,26 @@ def _parse_itessellation_evidence(
             component
             + f": native tessellation body {index} properties differ from the request",
         )
-        previous_body = body_key
-        body_face_references = tuple(
-            span["face_reference_sha256"]
-            for span in sorted(
-                spans_by_body[body_key],
-                key=lambda item: item["face_index"],
-            )
+        request = body["request"]
+        _require(
+            isinstance(request, dict)
+            and set(request) == {"api", "argument_count", "face_list"}
+            and request["api"] == "IBody2.GetTessellation"
+            and type(request["argument_count"]) is int
+            and request["argument_count"] == 1
+            and isinstance(request["face_list"], dict)
+            and set(request["face_list"])
+            == {"scope", "variant_type", "value"}
+            and request["face_list"]["scope"] == "whole_body"
+            and request["face_list"]["variant_type"] == "VT_EMPTY"
+            and request["face_list"]["value"] is None,
+            component
+            + f": native tessellation body {index} has an unsupported tessellation request",
         )
+        previous_body = body_key
         _require(
             body["body_reference_sha256"] == body_references[body_key]
             and body["tessellate_result"] is True
-            and body["request"]
-            == {
-                "api": "IBody2.GetTessellation",
-                "argument_count": 1,
-                "face_list": {
-                    "scope": "whole_body",
-                    "variant_type": "VT_ARRAY|VT_DISPATCH",
-                    "face_count": len(body_face_references),
-                    "first_face_reference_sha256": body_face_references[0],
-                    "last_face_reference_sha256": body_face_references[-1],
-                },
-            }
             and _integer(body["facet_count"])
             and body["facet_count"] >= 0
             and _integer(body["fin_count"])
