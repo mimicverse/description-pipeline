@@ -1230,6 +1230,51 @@ class CaptureHandlerTests(unittest.TestCase):
             EffectResumePhase.INPUT_TRANSFER_PENDING,
         )
 
+    def test_transfer_resume_archive_failure_precedes_authorize_and_port(self) -> None:
+        _workspace, _effects, claim, _intent, wait = self._pending_transfer(
+            name="capture-transfer-archive-failure"
+        )
+        resume_port = Mock()
+        original_materialize = self.store.materialize
+
+        for failure in ("corrupt", "missing"):
+            with self.subTest(failure=failure):
+                workspace = self.workspace(
+                    name=f"capture-transfer-{failure}"
+                )
+                transfer_effects = _Effects(self.effect_ledger, self.command, claim)
+
+                def damaged_materialize(reference, destination, failure=failure):
+                    root = original_materialize(reference, destination)
+                    archive = root / capture_module.CAPTURE_INPUT_ARCHIVE
+                    if failure == "corrupt":
+                        archive.write_bytes(archive.read_bytes() + b"tampered")
+                    else:
+                        archive.unlink()
+                    return root
+
+                with (
+                    patch.object(
+                        self.store,
+                        "materialize",
+                        side_effect=damaged_materialize,
+                    ),
+                    self.assertRaisesRegex(
+                        capture_module.ProtocolError,
+                        "capture.effect_outbound",
+                    ),
+                ):
+                    self.handler(native_operation=resume_port).resume_transfer(
+                        self.command,
+                        claim,
+                        workspace,
+                        effects=transfer_effects,
+                        resume=wait,
+                    )
+
+                self.assertEqual(transfer_effects.authorized, [])
+                resume_port.resume_input_transfer.assert_not_called()
+
     def test_engine_routes_capture_transfer_resume_through_the_narrow_port(
         self,
     ) -> None:

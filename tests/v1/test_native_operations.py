@@ -621,6 +621,9 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         client.create_operation = mock.Mock(
             side_effect=AssertionError("Capture resume must not create")
         )
+        client.upload_input = mock.Mock(
+            side_effect=AssertionError("Capture resume drift must not upload")
+        )
         foreign = _operation(
             "operation-foreign-capture-resume",
             self.archive,
@@ -644,6 +647,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "input_archive_mismatch")
         client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
 
     def test_async_status_probe_is_one_read_and_does_not_block_the_event_loop(self) -> None:
         runtime = NativeOperationRuntime(

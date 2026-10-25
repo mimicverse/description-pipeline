@@ -15,6 +15,7 @@ import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,6 +61,7 @@ from description_pipeline.pipeline.dispatch import (
 )
 from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.engine import execute_stage
+from description_pipeline.pipeline.reconciliation import EffectReconciliationService
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.verify_contract import (
     CERTIFICATE_FILENAME,
@@ -333,6 +335,46 @@ class _UnexpectedFailureHandler:
 
     def validate_candidate(self, command, claim, candidate, *, effects):
         raise AssertionError("An unhandled failure has no candidate")
+
+
+class _AncestorConflictTransferHandler:
+    def __init__(
+        self,
+        facts: FactStore,
+        *,
+        freeze_effect_id: str,
+        freeze_command_id: str,
+        observed_at,
+    ) -> None:
+        self.facts = facts
+        self.freeze_effect_id = freeze_effect_id
+        self.freeze_command_id = freeze_command_id
+        self.observed_at = observed_at
+        self.conflict_fact_id = "ancestor-conflict-" + freeze_effect_id
+        self.external_sends = 0
+
+    def resume_transfer(self, command, claim, workspace, *, effects, resume):
+        del command, workspace
+        if claim.scope != "transfer_resume" or claim.effect_scope_id != resume.effect_id:
+            raise AssertionError("the transfer resume claim is not narrowly scoped")
+        self.facts.append_effect_fact(
+            effect_id=self.freeze_effect_id,
+            claim=None,
+            fact_type="conflict",
+            source="ancestor-conflict-probe",
+            state_class=None,
+            payload_artifact=None,
+            payload_digest=digest({"conflict": self.freeze_effect_id}),
+            observed_at=self.observed_at,
+            fact_id=self.conflict_fact_id,
+            expected_command_id=self.freeze_command_id,
+        )
+        effects.authorize_resume(
+            resume.effect_id,
+            source="ancestor-conflict-probe",
+        )
+        self.external_sends += 1
+        raise AssertionError("ancestor conflict must stop before external transfer")
 
 
 class _AirflowStub:
@@ -1107,6 +1149,108 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 "SELECT count(*) FROM effect_fact "
                 "WHERE effect_id = %s AND fact_type = 'dispatch_authorized'",
                 (discover_effect.effect_id,),
+            ),
+            [(0,)],
+        )
+
+    def test_transfer_resume_rejects_an_ancestor_conflict_before_external_send(self) -> None:
+        from tests.v1.test_platform_service_postgres import (
+            _TransferPendingReconciler,
+        )
+
+        self._execute(_EffectHandler())
+        freeze = self._predecessor_for(self.command)
+        freeze_effect_id = self.facts.effect_ids_for_command(
+            self.command.command_id
+        )[0]
+        spec = self.admission_harness.spec
+        discover_command = build_discover_command(spec, freeze)
+        self.facts.create_command(
+            discover_command,
+            admission=self.admission,
+            predecessor=freeze,
+        )
+        services = CanonicalStageServices(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "restricted-transfer-work",
+            claim_policy=ClaimPolicy(
+                owner_sha256=digest({"process": "restricted-transfer"}),
+                executor_sha256=spec.executors.discover,
+                lease=timedelta(minutes=5),
+            ),
+            clock=lambda: self.now,
+            transfer_resume_gate=lambda _command, _claim: nullcontext(),
+        )
+        claim = services.acquire_claim(discover_command)
+        workspace = services.materialize(discover_command, claim, candidate=None)
+        self.addCleanup(services.discard_workspace, workspace)
+        effects = services.effect_port(discover_command, claim, workspace)
+        outbound = workspace.root / "outbound"
+        outbound.mkdir()
+        (outbound / "request.json").write_text(
+            '{"operation":"discover"}\n',
+            encoding="utf-8",
+        )
+        native_target = spec.require_native_target_identity()
+        target_identity = {
+            "operation": discover_command.command_id,
+            "native_target_id": native_target.target_id,
+            "native_target_identity": native_target.to_record(),
+        }
+        intent = effects.prepare_effect(
+            effect_key="native",
+            effect_kind="native_operation",
+            target={
+                **target_identity,
+                "target_binding_digest": digest(target_identity),
+            },
+            expected_state={"operation": discover_command.command_id},
+            outbound_root=outbound,
+        )
+        effects.authorize_dispatch(intent.effect_id, source="restricted-transfer")
+        pending = services.yield_claim_for_effect(
+            discover_command,
+            claim,
+            intent.effect_id,
+        )
+        reconciler = EffectReconciliationService(
+            facts=self.facts,
+            artifacts=self.artifacts,
+            work_root=Path(self.directory.name) / "restricted-transfer-reconcile",
+            observer_tool_sha256=digest({"observer": "restricted-transfer"}),
+            clock=lambda: self.now + timedelta(seconds=20),
+        )
+        handler = _AncestorConflictTransferHandler(
+            self.facts,
+            freeze_effect_id=freeze_effect_id,
+            freeze_command_id=self.command.command_id,
+            observed_at=self.now + timedelta(seconds=1),
+        )
+
+        with self.assertRaisesRegex(FactConflict, "predecessor"):
+            execute_stage(
+                command_id=discover_command.command_id,
+                handler=handler,
+                services=services,
+                resume=pending.wait,
+                resume_reconciler=_TransferPendingReconciler(reconciler),
+            )
+
+        self.assertEqual(handler.external_sends, 0)
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact "
+                "WHERE effect_id = %s AND fact_id = %s AND fact_type = 'conflict'",
+                (freeze_effect_id, handler.conflict_fact_id),
+            ),
+            [(1,)],
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM effect_fact "
+                "WHERE effect_id = %s AND fact_type = 'resume_authorized'",
+                (intent.effect_id,),
             ),
             [(0,)],
         )

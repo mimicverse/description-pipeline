@@ -742,6 +742,94 @@ class DiscoverDomainTests(unittest.TestCase):
         self.assertEqual(self.harness.effects.resume_authorizations, 1)
         self.assertEqual(entry["outbound"], outbound_before)
 
+    def test_transfer_resume_archive_failure_precedes_authorize_and_native_call(
+        self,
+    ) -> None:
+        adapter = self.harness.port()
+        claim, effects = self.harness.effect_port(self.command, fence=1)
+        with patch.object(adapter, "submit", return_value=None):
+            first = DiscoverHandler(adapter).execute(
+                self.command,
+                claim,
+                self.harness.workspace(),
+                effects=effects,
+            )
+        self.assertIsInstance(first, StageDeferral)
+
+        effect_key = f"native-discover:{self.command.command_id}"
+        entry = self.harness.effects.by_key[effect_key]
+        entry["state"] = EffectState.UNKNOWN
+        entry["resume_phase"] = EffectResumePhase.INPUT_TRANSFER_PENDING
+        wait = self._resume_wait()
+        resume_claim, _resume_effects = self.harness.effect_port(
+            self.command,
+            fence=2,
+        )
+        resume_claim = replace(
+            resume_claim,
+            scope="transfer_resume",
+            effect_scope_id=entry["effect_id"],
+        )
+        resume_effects = self.harness.effects.bind(
+            self.command,
+            resume_claim,
+            self.harness.workspace(),
+        )
+        original_materialize = self.harness.store.materialize
+
+        for failure in ("corrupt", "missing"):
+            with self.subTest(failure=failure):
+                workspace_root = Path(self.temporary.name) / (
+                    f"discover-transfer-{failure}"
+                )
+                workspace_root.mkdir()
+                workspace = StageWorkspace(
+                    root=workspace_root,
+                    inputs=self.harness.workspace().inputs,
+                )
+
+                def damaged_materialize(reference, destination, failure=failure):
+                    root = original_materialize(reference, destination)
+                    archive = root / discover_module.SOURCE_ARCHIVE
+                    if failure == "corrupt":
+                        archive.write_bytes(archive.read_bytes() + b"tampered")
+                    else:
+                        archive.unlink()
+                    return root
+
+                authorizations_before = self.harness.effects.resume_authorizations
+                with (
+                    patch.object(
+                        self.harness.store,
+                        "materialize",
+                        side_effect=damaged_materialize,
+                    ),
+                    patch.object(
+                        adapter,
+                        "resume_transfer",
+                        side_effect=AssertionError(
+                            "resume port must not be called"
+                        ),
+                    ) as resume_transfer,
+                    self.assertRaisesRegex(
+                        ProtocolError,
+                        r"discover\.transfer_(identity_mismatch|outbound_invalid)",
+                    ),
+                ):
+                    DiscoverHandler(adapter).resume_transfer(
+                        self.command,
+                        resume_claim,
+                        workspace,
+                        effects=resume_effects,
+                        resume=wait,
+                    )
+
+                self.assertEqual(
+                    self.harness.effects.resume_authorizations,
+                    authorizations_before,
+                )
+                resume_transfer.assert_not_called()
+
     def test_resume_reuses_satisfied_observation_without_resend(self) -> None:
         adapter = self.harness.port()
         handler = DiscoverHandler(adapter)
