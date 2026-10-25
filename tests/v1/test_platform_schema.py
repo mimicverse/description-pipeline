@@ -19,7 +19,6 @@ ROOT = Path(__file__).resolve().parents[2]
 APPLY = ROOT / "deploy/platform/apply.sh"
 PLATFORM_DIR = ROOT / "deploy/platform"
 PYTHON_SQL_OWNERS = (
-    ROOT / "src/description_pipeline/platform/store.py",
     ROOT / "src/description_pipeline/platform/facts.py",
     ROOT / "src/description_pipeline/orchestration/lifecycle_state.py",
     ROOT / "src/description_pipeline/pipeline/cancellation.py",
