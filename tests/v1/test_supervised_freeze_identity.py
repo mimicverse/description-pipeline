@@ -40,6 +40,8 @@ from base64 import urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from description_pipeline.schemas import TOOL_SCHEMA
+
 ROOT = Path(__file__).resolve().parents[2]
 DAG_ID = "solidworks_to_urdf"
 DAG_FILE = ROOT / "deploy" / "airflow" / "dags" / "solidworks_to_urdf.py"
@@ -173,7 +175,6 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         )
         from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
         from description_pipeline.platform.facts import FactStore
-        from description_pipeline.schemas import TOOL_SCHEMA
         from description_pipeline.stages import CONTRACT_SHA256
         from tests.v1.config_identity_support import prepare_root, write_snapshot
         from tests.v1.test_install_record import platform_document

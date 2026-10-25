@@ -15,8 +15,6 @@ from description_pipeline import interface_records as ir
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.pipeline.contracts import NativeTargetIdentity
 from description_pipeline.schemas import (
-    CACHE_IMPORT_CONFIRMATION_SCHEMA,
-    CACHE_RELEASE_RECEIPT_SCHEMA,
     CHECK_POLICY_SCHEMA,
     CONFIG_SNAPSHOT_SCHEMA,
     DELIVERY_MANIFEST_SCHEMA,
@@ -82,55 +80,6 @@ def health(ready: bool = True) -> dict:
             "native": {"ok": ready, "problems": [] if ready else ["solidworks_unregistered"]},
         },
     }
-
-
-def production() -> dict:
-    return {"run_id": "native-run-7", "operation_id": "native-op-42"}
-
-
-def import_confirmation(*, production_block: dict | None = None) -> dict:
-    confirmation = {
-        "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
-        "imported": [
-            {"path": "evidence/discovery.json", "bytes": 1, "sha256": HEX},
-            {"path": "input/source.json", "bytes": 2, "sha256": OTHER_HEX},
-        ],
-        "production": production() if production_block is None else production_block,
-        "sealed": {"confirmed_at": TS, "receipt_sha256": OTHER_HEX},
-        "digest": "0" * 64,
-    }
-    confirmation["digest"] = ir.cache_import_confirmation_digest(confirmation)
-    return confirmation
-
-
-def import_block() -> dict:
-    return {"linux_run_id": "linux-run-9", "production": production(), "confirmation": import_confirmation()}
-
-
-def cache_request() -> dict:
-    return {
-        "operation_id": "release-op-1",
-        "binding": {"release": release(), "contract": {"schema_version": CONTRACT["schema_version"], "digest": HEX}},
-        "import": import_block(),
-    }
-
-
-def cache_receipt(*, status: str = "released", released_files: int = 12) -> dict:
-    block = import_block()
-    receipt = {
-        "schema_version": CACHE_RELEASE_RECEIPT_SCHEMA,
-        "status": status,
-        "operation_id": "op-0001",
-        "params_sha256": ir.cache_release_params_digest(block),
-        "import": block,
-        "released": {"files": released_files, "bytes": 4096},
-        "retained": ["jobs/1/events.json", "artifacts/run-1"],
-        "released_at": TS,
-        "identity": release("native"),
-        "receipt_sha256": "0" * 64,
-    }
-    receipt["receipt_sha256"] = ir.cache_release_receipt_digest(receipt)
-    return receipt
 
 
 def config_snapshot() -> dict:
@@ -306,8 +255,6 @@ class B4FixSingleVariableTests(unittest.TestCase):
         ir.validate_health(health(False))
         ir.validate_config_snapshot(config_snapshot())
         ir.validate_delivery_manifest(manifest())
-        ir.validate_cache_release_request(cache_request())
-        ir.validate_cache_release_receipt(cache_receipt())
         ir.validate_install_record(install_record(previous=True), previous_required=True)
         ir.validate_resource_policy(ir.RESOURCE_POLICY_V1)
         self.assertEqual(ir.RESOURCE_POLICY_V1["limits"]["max_upload_bytes"], uploads.MAX_BODY_BYTES)
@@ -456,7 +403,7 @@ class B4FixSingleVariableTests(unittest.TestCase):
             with self.subTest(label):
                 self.assert_rejected_by_one_change(ir.validate_config_snapshot, positive, mutate, code)
 
-    def test_manifest_and_cache_single_variable_negatives(self) -> None:
+    def test_manifest_single_variable_negatives(self) -> None:
         manifest_positive = manifest()
         manifest_cases = (
             ("file record without bytes", lambda m: m["subject"]["files"][0].pop("bytes"), "delivery_manifest_invalid"),
@@ -479,61 +426,6 @@ class B4FixSingleVariableTests(unittest.TestCase):
         for label, mutate, code in manifest_cases:
             with self.subTest(label):
                 self.assert_rejected_by_one_change(ir.validate_delivery_manifest, manifest_positive, mutate, code)
-        request_positive = cache_request()
-        request_cases = (
-            (
-                "confirmation reduced to counts",
-                lambda r: r.__setitem__(
-                    "import",
-                    {
-                        **r["import"],
-                        "confirmation": {
-                            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
-                            "run_id": "linux-run-9",
-                            "files": 12,
-                            "bytes": 4096,
-                            "confirmed_at": TS,
-                        },
-                    },
-                ),
-                "cache_import_confirmation_invalid",
-            ),
-            (
-                "unknown contract version",
-                lambda r: r["binding"]["contract"].__setitem__("schema_version", "unknown.contract/v99"),
-                "cache_release_invalid",
-            ),
-            (
-                "release operation equals production operation",
-                lambda r: r.__setitem__("operation_id", r["import"]["production"]["operation_id"]),
-                "cache_release_invalid",
-            ),
-            (
-                "confirmation digest not recomputed",
-                lambda r: r["import"]["confirmation"].__setitem__("digest", OTHER_HEX),
-                "cache_import_confirmation_invalid",
-            ),
-        )
-        for label, mutate, code in request_cases:
-            with self.subTest(label):
-                self.assert_rejected_by_one_change(ir.validate_cache_release_request, request_positive, mutate, code)
-        receipt_positive = cache_receipt()
-        receipt_cases = (
-            (
-                "claimed release deleted nothing",
-                lambda r: r.__setitem__("status", "released") or r["released"].__setitem__("files", 0),
-                "cache_release_receipt_invalid",
-            ),
-            (
-                "receipt tampered after signing",
-                lambda r: r["released"].__setitem__("bytes", 1),
-                "cache_release_receipt_mismatch",
-            ),
-            ("receipt without operation import binding", lambda r: r.pop("import"), "cache_release_receipt_invalid"),
-        )
-        for label, mutate, code in receipt_cases:
-            with self.subTest(label):
-                self.assert_rejected_by_one_change(ir.validate_cache_release_receipt, receipt_positive, mutate, code)
 
     def test_install_and_release_single_variable_negatives(self) -> None:
         positive = install_record(previous=True)
@@ -708,71 +600,6 @@ class InterfaceRecordTests(unittest.TestCase):
         all_empty = config_snapshot()
         all_empty["resolved"] = {key: {} for key in all_empty["resolved"]}
         self.reject("config_snapshot_invalid", lambda: ir.validate_config_snapshot(all_empty))
-        counts_only = cache_request()
-        counts_only["import"]["confirmation"] = {
-            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
-            "run_id": "linux-run-9",
-            "manifest_sha256": HEX,
-            "receipt_sha256": OTHER_HEX,
-            "files": 12,
-            "bytes": 4096,
-            "confirmed_at": TS,
-        }
-        # A counts-only import cannot stand in for the complete confirmation
-        # (imported inventory + production identity + sealed confirmation).
-        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(counts_only))
-
-    def test_cache_release_binds_full_import_confirmation(self) -> None:
-        ir.validate_cache_release_request(cache_request())
-        bad = cache_request()
-        bad["binding"]["contract"]["schema_version"] = "unknown.contract/v99"
-        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
-        bad = cache_request()
-        # A known but wrong-family schema id must be refused as well.
-        bad["binding"]["contract"]["schema_version"] = HEALTH_SCHEMA
-        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
-        bad = cache_request()
-        bad["operation_id"] = bad["import"]["production"]["operation_id"]
-        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
-        bad = cache_request()
-        bad["import"]["confirmation"] = {
-            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
-            "run_id": "linux-run-9",
-            "manifest_sha256": HEX,
-            "receipt_sha256": OTHER_HEX,
-            "files": 12,
-            "bytes": 4096,
-            "confirmed_at": TS,
-        }
-        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(bad))
-        bad = cache_request()
-        bad["import"]["confirmation"]["digest"] = OTHER_HEX
-        self.reject("cache_import_confirmation_invalid", lambda: ir.validate_cache_release_request(bad))
-        bad = cache_request()
-        mismatched = import_confirmation(production_block={"run_id": "native-run-8", "operation_id": "native-op-42"})
-        bad["import"]["confirmation"] = mismatched
-        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
-        bad = cache_request()
-        bad["import"]["linux_run_id"] = ""
-        self.reject("cache_release_invalid", lambda: ir.validate_cache_release_request(bad))
-
-    def test_cache_receipt_zero_delete_and_immutability(self) -> None:
-        ir.validate_cache_release_receipt(cache_receipt())
-        ir.validate_cache_release_receipt(cache_receipt(status="already_released", released_files=0))
-        self.reject(
-            "cache_release_receipt_invalid",
-            lambda: ir.validate_cache_release_receipt(cache_receipt(status="released", released_files=0)),
-        )
-        tampered = cache_receipt()
-        tampered["released"]["bytes"] = 1
-        self.reject("cache_release_receipt_mismatch", lambda: ir.validate_cache_release_receipt(tampered))
-        bad = cache_receipt()
-        bad["params_sha256"] = OTHER_HEX
-        self.reject("cache_release_receipt_invalid", lambda: ir.validate_cache_release_receipt(bad))
-        bad = cache_receipt()
-        bad.pop("import")
-        self.reject("cache_release_receipt_invalid", lambda: ir.validate_cache_release_receipt(bad))
-
     def test_config_identity_shape_legacy_and_file_checks(self) -> None:
         reference = {
             "schema_version": CONFIG_SNAPSHOT_SCHEMA,

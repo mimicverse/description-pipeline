@@ -26,8 +26,7 @@ from ..interface_records import (
 from ..schemas import CONFIG_SNAPSHOT_SCHEMA
 from ..stages import publication_succeeded
 
-#: One release ledger per run fixes the cache-release operation identity and
-#: its full request, so retries resend the same operation, never new parameters.
+#: Stable UUID namespace for the native observation derived from one DAG run.
 NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
