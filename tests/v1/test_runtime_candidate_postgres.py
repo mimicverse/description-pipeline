@@ -298,6 +298,15 @@ class _FailureHandler:
             "domain_input_invalid",
             "The domain input is definitely invalid",
             unavailable_reason="diagnostic sealing deliberately unavailable",
+            detail={
+                "appearance": {
+                    "issues": (
+                        {
+                            "code": "cad_appearance_effective_scope_unproven",
+                        },
+                    )
+                }
+            },
         )
 
     def validate_candidate(self, command, claim, candidate, *, effects):
@@ -2148,11 +2157,21 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
     def test_minimal_failure_envelope_does_not_require_diagnostic_seal(self) -> None:
         result = self._execute(_FailureHandler())
         self.assertNotIsInstance(result, StageResult)
+        expected_detail = {
+            "appearance": {
+                "issues": (
+                    {
+                        "code": "cad_appearance_effective_scope_unproven",
+                    },
+                )
+            }
+        }
         decision = self.facts.decision_for(self.command)
         self.assertIsNotNone(decision)
         self.assertIsNone(decision.result_record_artifact)
         self.assertIsNotNone(decision.failure_envelope)
         self.assertEqual(decision.failure_envelope.reason_code, "domain_input_invalid")
+        self.assertEqual(decision.failure_envelope.error_detail, expected_detail)
         self.assertEqual(decision.failure_envelope.unavailable_reason, "diagnostic sealing deliberately unavailable")
         rows = self._query(
             "SELECT result_record_artifact_id, failure_envelope, failure_digest "
@@ -2163,6 +2182,26 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertIsNone(rows[0][0])
         self.assertIsNotNone(rows[0][1])
         self.assertIsNotNone(rows[0][2])
+        self.assertEqual(
+            rows[0][1]["error_detail"],
+            {
+                "appearance": {
+                    "issues": [
+                        {
+                            "code": "cad_appearance_effective_scope_unproven",
+                        },
+                    ]
+                }
+            },
+        )
+        restarted = FactStore(self._connect, self.artifacts).decision_for(
+            self.command
+        )
+        self.assertEqual(restarted.failure_envelope, result)
+        self.assertEqual(
+            restarted.failure_envelope.error_detail,
+            expected_detail,
+        )
         self.assertTrue(result.retained_locations)
         self.assertTrue(Path(result.retained_locations[0]).is_dir())
 

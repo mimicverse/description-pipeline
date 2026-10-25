@@ -484,6 +484,29 @@ class FailureEnvelopeTests(unittest.TestCase):
             record,
         )
 
+    def test_non_json_failure_detail_is_rejected(self) -> None:
+        value = command()
+        with self.assertRaises(ProtocolError) as caught:
+            FailureEnvelope(
+                schema_version=FAILURE_ENVELOPE_SCHEMA,
+                command_id=value.command_id,
+                run_id=value.run_id,
+                stage=value.stage,
+                request_digest=value.request_digest,
+                outcome="failed",
+                actual_executor_sha256=value.expected_executor_sha256,
+                reason_code="domain_failed",
+                error_type="DomainFailure",
+                error_message="domain failure",
+                error_detail={"invalid": {1, 2}},
+                effect_states=(),
+                evidence_artifacts=(),
+                retained_locations=(),
+                unavailable_reason=None,
+                occurred_at=datetime(2026, 10, 26, tzinfo=UTC),
+            )
+        self.assertEqual(caught.exception.code, "failure.invalid")
+
 
 class CommandIdentityTests(unittest.TestCase):
     def test_stage_effect_wait_is_strict_non_secret_identity(self) -> None:
