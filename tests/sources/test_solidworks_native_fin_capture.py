@@ -2087,7 +2087,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         }
         with (
             patch(
-                "tests.sources.test_solidworks_native_fin_capture.fake_read_end_params",
+                f"{__name__}.fake_read_end_params",
                 return_value=malformed,
             ),
             self.assertRaises(CadError) as caught,
