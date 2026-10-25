@@ -7932,8 +7932,14 @@ class SolidWorksBackend(CadBackend):
                 return provider_miss("native_boundary_contains_non_line_edges")
 
             for edge_row in edge_rows:
-                if edge_row["endpoint_points_derived_from_curve"]:
-                    return provider_miss("native_boundary_contains_closed_edges")
+                end_params = edge_row["curve_end_params"]
+                if (end_params["success"] is not True or end_params["is_closed"] is not False
+                        or end_params["is_periodic"] is not False):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "a native line reports a closed or periodic underlying curve",
+                        {**base, "edge_index": edge_row["index"], "curve_end_params": end_params},
+                    )
                 endpoints = edge_row["endpoints"]
                 if (endpoints["start"]["reference"]["typed_sha256"]
                         == endpoints["end"]["reference"]["typed_sha256"]):

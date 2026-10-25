@@ -1586,6 +1586,41 @@ class ComponentMeshExportTests(unittest.TestCase):
             backend.export_component_meshes({"pcb-1": self.dest})
         self.assertEqual(len(body.tessellation_face_lists), before)
 
+    def test_native_line_with_closed_or_periodic_claim_is_a_fatal_conflict(self):
+        for closed, periodic in ((True, False), (False, True), (True, True)):
+            with self.subTest(closed=closed, periodic=periodic):
+                component, body, edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+                curve = edges[0]._curve
+                read = curve.GetEndParams
+                def end_params(start, end, is_closed, is_periodic, read=read, closed=closed, periodic=periodic):
+                    result = read(start, end, is_closed, is_periodic)
+                    is_closed.value, is_periodic.value = closed, periodic
+                    return result
+                curve.GetEndParams = end_params
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                with self.assertRaisesRegex(CadError, "line reports a closed or periodic underlying curve"):
+                    backend.export_component_meshes({"pcb-1": self.dest})
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_planar_consumer_rejects_closed_or_periodic_line_claim(self):
+        entry, vertices, _body, _edges, _calls = self._planar_export()
+        for field, flag in (("curve_closed", "is_closed"), ("curve_periodic", "is_periodic")):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(entry["tessellation"])
+                edge = changed["native_edges"][0]
+                edge[field] = True
+                edge["curve_end_params"][flag] = True
+                edge["curve_end_params"]["raw_outputs"][2]["value"] = edge["curve_closed"]
+                edge["curve_end_params"]["raw_outputs"][3]["value"] = edge["curve_periodic"]
+                params = edge["curve_end_params"]
+                edge["curve_domain_transform"] = native_module.native_curve_domain_transform(
+                    params["start"], params["end"], edge["u_min"], edge["u_max"],
+                    edge["curve_sense"], params["is_periodic"])
+                with self.assertRaisesRegex(PipelineError, "conflicting closed or periodic curve flags"):
+                    parse_native_tessellation("pcb-1", changed, entry["bodies"], entry["triangles"], vertices)
+
     def test_valid_shared_vertex_edge_leaves_polygon_provider_before_tangent_checks(self):
         component, body, edges = _planar_sheet(
             [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])

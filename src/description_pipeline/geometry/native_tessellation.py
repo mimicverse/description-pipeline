@@ -2073,6 +2073,13 @@ def _parse_planar_brep_evidence(
             edge_reference = coedge["edge_reference_sha256"]
             edge = edge_by_reference.get(edge_reference)
             _require(
+                isinstance(edge, dict)
+                and edge["curve_end_params"]["success"] is True
+                and edge["curve_closed"] is False
+                and edge["curve_periodic"] is False,
+                component + f": native planar line {edge_reference} has conflicting closed or periodic curve flags",
+            )
+            _require(
                 coedge["coedge_index"] == coedge_index
                 and _integer(coedge["coedge_index"])
                 and coedge["edge_is_line"] is True
