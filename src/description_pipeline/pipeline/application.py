@@ -8,6 +8,7 @@ import stat
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ from types import MappingProxyType
 from typing import Any, Protocol, get_args
 
 from ..artifacts import ArtifactStore
+from ..interface_records import validate_config_snapshot
 from ..io import PipelineError, digest, read_data
 from ..platform.facts import FactConflict, FactStore
 from ..orchestration.native_operation_client import (
@@ -50,6 +52,7 @@ from .admission import (
 )
 from .contracts import (
     ArtifactRef,
+    ExecutionClaim,
     DiagnosticReplayScope,
     DispatchCommand,
     DispatchConf,
@@ -245,6 +248,84 @@ def _native_client_from_environment(
             str(error),
         ) from error
     return NativeOperationClient(endpoint)
+
+
+@contextmanager
+def _shared_maintenance_gate(snapshot_path: Path):
+    """Reject transfer while deployment maintenance holds its exact exclusive lock."""
+
+    if (
+        not snapshot_path.is_absolute()
+        or not snapshot_path.is_file()
+        or snapshot_path.is_symlink()
+        or any(parent.is_symlink() for parent in snapshot_path.parents)
+    ):
+        raise ApplicationPortMissing(
+            "application.maintenance_gate_source_missing",
+            "PLATFORM_CONFIG_SNAPSHOT must name the active regular snapshot",
+        )
+    snapshot = validate_config_snapshot(read_data(snapshot_path))
+    state_root = Path(snapshot["resolved"]["storage"]["state_root"])
+    lock_directory = state_root / "locks"
+    lock_path = lock_directory / "maintenance.lock"
+    if (
+        not state_root.is_dir()
+        or state_root.is_symlink()
+        or any(parent.is_symlink() for parent in state_root.parents)
+        or not lock_directory.is_dir()
+        or lock_directory.is_symlink()
+        or not lock_path.is_file()
+        or lock_path.is_symlink()
+    ):
+        raise ApplicationPortMissing(
+            "application.maintenance_gate_missing",
+            "The active deployment maintenance lock is not installed",
+        )
+    try:
+        import fcntl
+    except ImportError as error:
+        raise ApplicationPortMissing(
+            "application.maintenance_gate_unsupported",
+            "Transfer continuation requires POSIX advisory locking",
+        ) from error
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_SH | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as error:
+            raise ApplicationPortMissing(
+                "application.maintenance_gate_busy",
+                "Deployment maintenance currently owns the exclusive lock",
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _transfer_resume_gate_from_environment(
+    source: Mapping[str, str],
+):
+    snapshot_value = source.get("PLATFORM_CONFIG_SNAPSHOT")
+    snapshot_path = Path(snapshot_value) if snapshot_value else None
+
+    def gate(_command: StageCommand, _claim: ExecutionClaim):
+        if snapshot_path is None:
+            raise ApplicationPortMissing(
+                "application.maintenance_gate_source_missing",
+                "PLATFORM_CONFIG_SNAPSHOT is required for transfer continuation",
+            )
+        return _shared_maintenance_gate(snapshot_path)
+
+    return gate
 
 
 class AdmissionFactPort(Protocol):
@@ -1371,6 +1452,7 @@ def application_from_environment(
             **claim_binding,
         ),
         clock=clock,
+        transfer_resume_gate=_transfer_resume_gate_from_environment(source),
     )
     client = native_operation_client
     if discover_adapter is None or capture_handler is None:

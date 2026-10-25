@@ -12,7 +12,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from description_pipeline import cli
 from description_pipeline.artifacts import ArtifactStore
@@ -24,6 +24,7 @@ from description_pipeline.pipeline.application import (
     ApplicationPortMissing,
     EffectWakeupHint,
     StageApplication,
+    _shared_maintenance_gate,
     application_from_environment,
 )
 from description_pipeline.pipeline.stages.publish import PublishHandler
@@ -543,6 +544,58 @@ class StageApplicationTests(unittest.TestCase):
 
         self.assertEqual(result, hint)
         probe.assert_awaited_once_with(wait)
+
+    def test_transfer_uses_the_existing_maintenance_lock(self):
+        state_root = self.root / "deployment-state"
+        lock_directory = state_root / "locks"
+        lock_directory.mkdir(parents=True)
+        (lock_directory / "maintenance.lock").write_bytes(b"")
+        snapshot = self.root / "platform-snapshot.json"
+        snapshot.write_text("{}", encoding="utf-8")
+
+        with patch(
+            "description_pipeline.pipeline.application."
+            "validate_config_snapshot",
+            return_value={
+                "resolved": {
+                    "storage": {"state_root": str(state_root)},
+                }
+            },
+        ), _shared_maintenance_gate(snapshot):
+            pass
+
+    def test_transfer_refuses_an_active_exclusive_maintenance_lock(self):
+        state_root = self.root / "busy-deployment-state"
+        lock_directory = state_root / "locks"
+        lock_directory.mkdir(parents=True)
+        (lock_directory / "maintenance.lock").write_bytes(b"")
+        snapshot = self.root / "busy-platform-snapshot.json"
+        snapshot.write_text("{}", encoding="utf-8")
+        fcntl = Mock(
+            LOCK_SH=1,
+            LOCK_NB=2,
+            LOCK_UN=4,
+        )
+        fcntl.flock.side_effect = BlockingIOError()
+
+        with (
+            patch(
+                "description_pipeline.pipeline.application."
+                "validate_config_snapshot",
+                return_value={
+                    "resolved": {
+                        "storage": {"state_root": str(state_root)},
+                    }
+                },
+            ),
+            patch.dict("sys.modules", {"fcntl": fcntl}),
+            self.assertRaisesRegex(
+                ApplicationPortMissing,
+                "exclusive lock",
+            ),
+            _shared_maintenance_gate(snapshot),
+        ):
+            self.fail("a busy maintenance lock must not enter the gate")
 
     def test_run_reports_exact_missing_capability_without_fallback(self):
         self.application.admit(self.harness.spec)
