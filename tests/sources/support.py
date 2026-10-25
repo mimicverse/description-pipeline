@@ -31,12 +31,17 @@ from description_pipeline.geometry.native_u import (
     native_point_error,
 )
 from description_pipeline.io import file_digest
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
+from description_pipeline.schemas import (
+    NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
 NATIVE_TESSELLATION_PROPERTIES = {
+    "improved_quality": True,
     "match_type": 0,
+    "need_error_list": True,
     "need_face_facet_map": True,
     "need_edge_fin_map": True,
     "need_vertex_params": True,
@@ -361,6 +366,11 @@ def native_tessellation_fixture(
 
     spans = copy.deepcopy(list(face_spans))
     input_edges = copy.deepcopy(list(native_edges))
+    normalized_no_facets = copy.deepcopy(list(no_facets_faces))
+    for row in normalized_no_facets:
+        row.setdefault("source_rule", NATIVE_ID_ARRAY_SOURCE_FLAT)
+        row.setdefault("warnings", [])
+        row.setdefault("derived_empty_edges", [])
     for span in spans:
         span.setdefault(
             "native_body_reference_sha256",
@@ -499,6 +509,10 @@ def native_tessellation_fixture(
                 {
                     "face_index": span["face_index"],
                     "facet_ids": facet_ids,
+                    "facet_count": len(facet_ids),
+                    "facet_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
+                    "raw_facet_ids": list(facet_ids),
+                    "warnings": [],
                     "face_identity_sha256": span[
                         "face_reference_sha256"
                     ],
@@ -803,6 +817,9 @@ def native_tessellation_fixture(
                 "end_reference_error": None,
                 "face_indices": face_indices,
                 "fin_ids": sorted(edge_fin_ids),
+                "fin_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
+                "raw_fin_ids": sorted(edge_fin_ids),
+                "warnings": [],
                 "u_min": u_min,
                 "u_max": u_max,
                 "curve_start_point_m": list(curve_start_point),
@@ -866,6 +883,9 @@ def native_tessellation_fixture(
                 "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
                 "tessellate_result": True,
                 "request": native_tessellation_request(body_face_references),
+                "property_requests": copy.deepcopy(
+                    NATIVE_TESSELLATION_PROPERTIES
+                ),
                 "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
                 "facet_count": len(body["facets"]),
                 "fin_count": len(body["fins"]),
@@ -965,7 +985,7 @@ def native_tessellation_fixture(
         "faces": len(spans),
         "face_spans": spans,
         "native_edges": edge_rows,
-        "no_facets_faces": copy.deepcopy(list(no_facets_faces)),
+        "no_facets_faces": normalized_no_facets,
         "itessellation": {
             "interface_iid": ITESSELLATION_IID,
             "u_rule_version": NATIVE_U_IDENTITY_RULE,
@@ -978,6 +998,9 @@ def native_tessellation_fixture(
                 "get_closest_point_on_calls": u_observations,
                 "evaluate2_calls": u_observations,
             },
+            "property_requests": copy.deepcopy(
+                NATIVE_TESSELLATION_PROPERTIES
+            ),
             "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
             "reference_alias_audit": {
                 "body": [],

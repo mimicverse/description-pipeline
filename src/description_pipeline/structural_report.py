@@ -11,13 +11,21 @@ import re
 from pathlib import Path
 
 from .geometry.native_u import (
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     native_scope_warning_details_match,
     native_scope_warning_diagnostic_is_valid,
 )
 from .geometry.native_tessellation import parse_native_tessellation
 from .io import PipelineError, file_digest, read_data, write_json
-from .schemas import EFFECTIVE_INSTANCES_SCHEMA
+from .schemas import (
+    EFFECTIVE_INSTANCES_SCHEMA,
+    NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+)
 
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
@@ -274,7 +282,7 @@ def _canonical_untessellated_faces(
 
     if not isinstance(value, list):
         return None
-    pinned_api = "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
+    pinned_api = NATIVE_FACETLESS_EVIDENCE_API
     out: list[dict] = []
     for entry in value:
         if not isinstance(entry, dict):
@@ -306,6 +314,23 @@ def _canonical_untessellated_faces(
         faces = tessellation.get("faces")
         if type(faces) is not int or faces < 0:
             return None
+        face_evidence = {
+            (
+                body["body_type"],
+                body["body_index"],
+                face["face_index"],
+            ): face
+            for body in tessellation["itessellation"]["bodies"]
+            for face in body["faces"]
+        }
+        edge_evidence = {
+            (
+                edge["body_type"],
+                edge["body_index"],
+                edge["edge_reference_sha256"],
+            ): edge
+            for edge in tessellation["native_edges"]
+        }
         rows = tessellation.get("no_facets_faces")
         if not isinstance(rows, list):
             return None
@@ -319,6 +344,9 @@ def _canonical_untessellated_faces(
             "triangle_count",
             "area_m2",
             "used_api",
+            "source_rule",
+            "warnings",
+            "derived_empty_edges",
         }
         for row in rows:
             if not isinstance(row, dict):
@@ -356,6 +384,66 @@ def _canonical_untessellated_faces(
             if row.get("used_api") != pinned_api:
                 return None
             key = (row["body_type"], row["body_index"], row["face_index"])
+            evidence_face = face_evidence.get(key)
+            if (
+                not isinstance(evidence_face, dict)
+                or row["source_rule"] != evidence_face["facet_ids_source"]
+                or row["warnings"] != evidence_face["warnings"]
+                or row["source_rule"]
+                not in {
+                    NATIVE_ID_ARRAY_SOURCE_FLAT,
+                    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+                }
+                or row["warnings"]
+                != (
+                    [NATIVE_FACE_FACET_IDS_DERIVED]
+                    if row["source_rule"]
+                    == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                    else []
+                )
+                or not isinstance(row["derived_empty_edges"], list)
+            ):
+                return None
+            derived_references = []
+            for derived in row["derived_empty_edges"]:
+                if not isinstance(derived, dict):
+                    return None
+                reference = derived.get("edge_reference_sha256")
+                edge = edge_evidence.get(
+                    (
+                        row["body_type"],
+                        row["body_index"],
+                        reference,
+                    )
+                )
+                if (
+                    set(derived)
+                    != {"edge_reference_sha256", "source_rule", "warnings"}
+                    or not isinstance(edge, dict)
+                    or row["face_index"] not in edge["face_indices"]
+                    or derived["source_rule"]
+                    != NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                    or derived["warnings"]
+                    != [NATIVE_EDGE_FIN_IDS_DERIVED]
+                    or edge["fin_ids_source"] != derived["source_rule"]
+                    or edge["warnings"] != derived["warnings"]
+                ):
+                    return None
+                derived_references.append(reference)
+            expected_derived_references = sorted(
+                reference
+                for (body_type, body_index, reference), edge
+                in edge_evidence.items()
+                if (
+                    body_type == row["body_type"]
+                    and body_index == row["body_index"]
+                    and row["face_index"] in edge["face_indices"]
+                    and edge["fin_ids_source"]
+                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                )
+            )
+            if derived_references != expected_derived_references:
+                return None
             if key in seen:
                 return None
             seen.add(key)
@@ -803,6 +891,21 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     )
                 else:
                     facets = "native tessellation returned zero triangles and zero facets"
+                if (
+                    row["source_rule"]
+                    == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                ):
+                    facets += (
+                        "; the successful null facet return was normalized only"
+                        " after the complete body facet inventory closed the"
+                        " native facet total"
+                    )
+                if row["derived_empty_edges"]:
+                    facets += (
+                        f"; {len(row['derived_empty_edges'])} incident sheet-edge"
+                        " fin sets were similarly derived as empty after the"
+                        " complete incident-face and global fin closure"
+                    )
                 entries.append(
                     {
                         "severity": "warning",

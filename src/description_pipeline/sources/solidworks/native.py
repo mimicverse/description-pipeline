@@ -28,6 +28,8 @@ from ...geometry.native_u import (
     NATIVE_CURVE_DOMAIN_RULE,
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_COMPONENT_REFERENCE_ALIASED,
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
     NATIVE_FACE_IDENTITY_KEY_RULE,
     NATIVE_IDENTITY_POLICY_RULE,
     NATIVE_PART_WITNESS_DERIVED,
@@ -64,7 +66,15 @@ from ...geometry.native_fin_topology import (
     NativeFinRelationError,
     validate_native_edge_fin_relations,
 )
-from ...schemas import NATIVE_DISCOVERY_SCHEMA, NATIVE_TESSELLATION_SCHEMA
+from ...schemas import (
+    NATIVE_DISCOVERY_SCHEMA,
+    NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+    NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_MESH_CAPTURE_API,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
 from .session_artifacts import (
@@ -1066,6 +1076,138 @@ def _read_curve_end_params(
             "is_periodic": values[3],
         }
     )
+    return evidence
+
+
+def _native_evidence_summary(value):
+    """Return one JSON-safe summary without treating an absent result as proof."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else {"type": "float"}
+    if isinstance(value, (list, tuple)):
+        if len(value) <= 12:
+            return [_native_evidence_summary(item) for item in value]
+        return {"type": type(value).__name__, "length": len(value)}
+    row = {"type": type(value).__name__}
+    try:
+        row["object_pointer"] = _com_iunknown_pointer(value)
+    except Exception as error:  # noqa: BLE001 - diagnostics stay explicit
+        row["pointer_error"] = f"{type(error).__name__}: {error}"[:300]
+    return row
+
+
+def _read_tessellation_error_list(
+    tessellation,
+    *,
+    face_rows=(),
+    variant_factory=None,
+    vt_byref=None,
+    vt_variant=None,
+):
+    """Read the five automation output arrays from ITessellation.GetErrorList."""
+
+    evidence = {
+        "call_form": "pywin32-byref-variant",
+        "state": "unreadable",
+        "returned": None,
+        "outputs": [],
+        "error": None,
+    }
+    try:
+        if (
+            variant_factory is None
+            or vt_byref is None
+            or vt_variant is None
+        ):
+            import pythoncom
+            from win32com.client import VARIANT
+
+            variant_factory = VARIANT if variant_factory is None else variant_factory
+            vt_byref = pythoncom.VT_BYREF if vt_byref is None else vt_byref
+            vt_variant = pythoncom.VT_VARIANT if vt_variant is None else vt_variant
+        outputs = [
+            variant_factory(vt_byref | vt_variant, None)
+            for _ in range(5)
+        ]
+        returned = _method(tessellation, "GetErrorList", *outputs)
+    except Exception as error:  # noqa: BLE001 - never fabricate an empty list
+        evidence["error"] = f"{type(error).__name__}: {error}"[:300]
+        return evidence
+
+    try:
+        face_index_by_pointer = {}
+        face_identity_errors = []
+        for row in face_rows:
+            try:
+                pointer = _com_iunknown_pointer(row["object"])
+            except Exception as error:  # noqa: BLE001 - object stays unmapped
+                face_identity_errors.append(
+                    {
+                        "face_index": row["index"],
+                        "error": f"{type(error).__name__}: {error}"[:300],
+                    }
+                )
+            else:
+                face_index_by_pointer[pointer] = row["index"]
+
+        def summarize_item(item):
+            if item is None or isinstance(item, (str, bool, int)):
+                return item
+            if isinstance(item, float):
+                return item if math.isfinite(item) else {"type": "float"}
+            row = {"type": type(item).__name__}
+            try:
+                pointer = _com_iunknown_pointer(item)
+            except Exception as error:  # noqa: BLE001 - diagnostics stay explicit
+                row["pointer_error"] = f"{type(error).__name__}: {error}"[:300]
+                row["face_index"] = None
+                row["mapping"] = "unmapped"
+            else:
+                row["object_pointer"] = pointer
+                if pointer in face_index_by_pointer:
+                    row["face_index"] = face_index_by_pointer[pointer]
+                    row["mapping"] = "face_index"
+                else:
+                    row["face_index"] = None
+                    row["mapping"] = "unmapped"
+            return row
+
+        output_rows = []
+        for index, output in enumerate(outputs):
+            raw = getattr(output, "value", None)
+            if isinstance(raw, (list, tuple)):
+                items = [summarize_item(item) for item in raw]
+                count = len(raw)
+            elif raw is None:
+                items = None
+                count = None
+            else:
+                items = [summarize_item(raw)]
+                count = 1
+            output_rows.append(
+                {
+                    "index": index,
+                    "variant_type": getattr(output, "varianttype", None),
+                    "raw_type": type(raw).__name__,
+                    "count": count,
+                    "items": items,
+                }
+            )
+        evidence.update(
+            {
+                "state": "observed",
+                "returned": _native_evidence_summary(returned),
+                "outputs": output_rows,
+                "face_identity_errors": face_identity_errors,
+            }
+        )
+    except Exception as error:  # noqa: BLE001 - failure diagnostics never mask Tessellate=False
+        evidence["error"] = (
+            "diagnostic processing failed: "
+            f"{type(error).__name__}: {error}"
+        )[:300]
     return evidence
 
 
@@ -2971,7 +3113,7 @@ CLOSE_ALL_SETTLE_DELAY_S = 0.5
 # be mistaken for degenerate; the proof stays the zero count, the empty array
 # and the measured area, never the failed probe.
 FACETLESS_DEGENERATE_AREA_M2 = 1e-12
-FACETLESS_EVIDENCE_API = "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
+FACETLESS_EVIDENCE_API = NATIVE_FACETLESS_EVIDENCE_API
 PERSISTENT_REFERENCE_DOMAIN = b"description-pipeline/native-identity/v1"
 
 
@@ -6722,6 +6864,52 @@ class SolidWorksBackend(CadBackend):
                     {**base, **where, "api": api, "error": str(error)[:300]},
                 ) from error
 
+        def native_id_array(
+            value,
+            *,
+            api,
+            label,
+            null_source=None,
+            extra_detail=None,
+            **where,
+        ):
+            detail = {
+                **base,
+                **where,
+                "api": api,
+                "raw_ids": repr(value)[:1000],
+                "raw_ids_type": type(value).__name__,
+            }
+            if extra_detail:
+                detail.update(extra_detail)
+            if isinstance(value, (tuple, list)):
+                if any(
+                    type(item) is not int or item < 0 for item in value
+                ):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        f"{api} returned an invalid {label} ID array",
+                        detail,
+                    )
+                if len(set(value)) != len(value):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        f"{api} repeats a {label} ID",
+                        detail,
+                    )
+                return (
+                    list(value),
+                    NATIVE_ID_ARRAY_SOURCE_FLAT,
+                    list(value),
+                )
+            if value is None and null_source is not None:
+                return None, null_source, None
+            raise CadError(
+                "cad_native_tessellation_unreadable",
+                f"{api} returned an invalid {label} ID array",
+                detail,
+            )
+
         registry = reference_registry or _NativeReferenceRegistry()
 
         def persistent(
@@ -7429,13 +7617,17 @@ class SolidWorksBackend(CadBackend):
                 {**base, "api": "IBody2.GetTessellation"},
             )
         tessellation = _interface(_dynamic(raw_tessellation), ITESSELLATION_IID)
+        tessellation_property_requests = {}
         tessellation_properties = {}
         for name, expected, evidence_name in (
+            ("ImprovedQuality", True, "improved_quality"),
             ("MatchType", 0, "match_type"),
+            ("NeedErrorList", True, "need_error_list"),
             ("NeedFaceFacetMap", True, "need_face_facet_map"),
             ("NeedEdgeFinMap", True, "need_edge_fin_map"),
             ("NeedVertexParams", True, "need_vertex_params"),
         ):
+            tessellation_property_requests[evidence_name] = expected
             call(
                 f"ITessellation.{name}",
                 lambda name=name, expected=expected: setattr(
@@ -7453,6 +7645,15 @@ class SolidWorksBackend(CadBackend):
                     {**base, "api": f"ITessellation.{name}", "returned": repr(observed)[:60]},
                 )
             tessellation_properties[evidence_name] = observed
+
+        def reference_evidence(reference):
+            if not isinstance(reference, dict):
+                return None
+            return {
+                "raw_sha256": reference.get("raw_sha256"),
+                "typed_sha256": reference.get("typed_sha256"),
+            }
+
         tessellate_result = call(
             "ITessellation.Tessellate",
             lambda: _method(tessellation, "Tessellate"),
@@ -7462,6 +7663,87 @@ class SolidWorksBackend(CadBackend):
                 "cad_native_tessellation_unreadable",
                 "ITessellation.Tessellate did not return a boolean",
                 {**base, "api": "ITessellation.Tessellate", "returned": repr(tessellate_result)[:60]},
+            )
+        if tessellate_result is False:
+            native_totals = {}
+            for api, name in (
+                ("GetFacetCount", "facets"),
+                ("GetFinCount", "fins"),
+                ("GetVertexCount", "vertices"),
+            ):
+                try:
+                    value = call(
+                        f"ITessellation.{api}",
+                        lambda api=api: _method(tessellation, api),
+                    )
+                except CadError as error:
+                    native_totals[name] = {
+                        "api": f"ITessellation.{api}",
+                        "value": None,
+                        "error": error.detail,
+                    }
+                else:
+                    native_totals[name] = {
+                        "api": f"ITessellation.{api}",
+                        "value": _native_evidence_summary(value),
+                        "error": None,
+                    }
+
+            face_diagnostics = []
+            for row in face_rows:
+                diagnostic = {
+                    "face_index": row["index"],
+                    "face_reference": reference_evidence(row["reference"]),
+                    "owner_body_reference": reference_evidence(
+                        row["owner_body_reference"]
+                    ),
+                    "area_m2": {"state": "unreadable", "value": None, "error": None},
+                    "triangle_count": {
+                        "state": "unreadable",
+                        "value": None,
+                        "error": None,
+                    },
+                }
+                for field, api in (
+                    ("area_m2", "GetArea"),
+                    ("triangle_count", "GetTessTriangleCount"),
+                ):
+                    try:
+                        value = _member(row["object"], api)
+                    except Exception as error:  # noqa: BLE001 - diagnostic only
+                        diagnostic[field]["error"] = (
+                            f"{type(error).__name__}: {error}"[:300]
+                        )
+                    else:
+                        diagnostic[field].update(
+                            {
+                                "state": "observed",
+                                "value": _native_evidence_summary(value),
+                            }
+                        )
+                face_diagnostics.append(diagnostic)
+            raise CadError(
+                "cad_native_tessellation_unreadable",
+                "ITessellation.Tessellate returned false",
+                {
+                    **base,
+                    "api": "ITessellation.Tessellate",
+                    "tessellate_result": False,
+                    "tessellation_request": copy.deepcopy(tessellation_request),
+                    "tessellation_properties": copy.deepcopy(
+                        tessellation_properties
+                    ),
+                    "native_totals": native_totals,
+                    "native_totals_role": (
+                        "failure_diagnostic_only; values do not prove an empty "
+                        "tessellation"
+                    ),
+                    "error_list": _read_tessellation_error_list(
+                        tessellation,
+                        face_rows=face_rows,
+                    ),
+                    "face_diagnostics": face_diagnostics,
+                },
             )
         native_totals = {}
         for api, name in (
@@ -7485,13 +7767,55 @@ class SolidWorksBackend(CadBackend):
         fins_by_id = {}
         for face_row in face_rows:
             face_index = face_row["index"]
-            facet_ids = call(
+            raw_facet_ids_value = call(
                 "ITessellation.GetFaceFacets",
-                lambda face=face_row["object"]: _as_list(
-                    _member(tessellation, "GetFaceFacets", face)
+                lambda face=face_row["object"]: _member(
+                    tessellation,
+                    "GetFaceFacets",
+                    face,
                 ),
                 face_index=face_index,
+                tessellate_result=tessellate_result,
+                tessellation_properties=copy.deepcopy(
+                    tessellation_properties
+                ),
+                native_totals=copy.deepcopy(native_totals),
             )
+            (
+                facet_ids,
+                facet_ids_source,
+                raw_facet_ids,
+            ) = native_id_array(
+                raw_facet_ids_value,
+                api="ITessellation.GetFaceFacets",
+                label="facet",
+                null_source=(
+                    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                    if body_type == 1 and tessellate_result is True
+                    else None
+                ),
+                face_index=face_index,
+                extra_detail={
+                    "face_reference": reference_evidence(
+                        face_row["reference"]
+                    ),
+                    "owner_body_reference": reference_evidence(
+                        face_row["owner_body_reference"]
+                    ),
+                    "tessellate_result": tessellate_result,
+                    "tessellation_properties": copy.deepcopy(
+                        tessellation_properties
+                    ),
+                    "native_totals": copy.deepcopy(native_totals),
+                    "face_count": len(face_rows),
+                    "edge_count": len(edge_rows),
+                },
+            )
+            face_row["facet_ids"] = facet_ids
+            face_row["facet_ids_source"] = facet_ids_source
+            face_row["raw_facet_ids"] = raw_facet_ids
+            if facet_ids is None:
+                continue
             normalized_facets = []
             for raw_facet_id in facet_ids:
                 if type(raw_facet_id) is not int or raw_facet_id < 0:
@@ -7508,15 +7832,32 @@ class SolidWorksBackend(CadBackend):
                     )
                 raw_fins = call(
                     "ITessellation.GetFacetFins",
-                    lambda facet=raw_facet_id: _as_list(
-                        _member(tessellation, "GetFacetFins", facet)
+                    lambda facet=raw_facet_id: _member(
+                        tessellation,
+                        "GetFacetFins",
+                        facet,
                     ),
                     face_index=face_index,
                     facet_id=raw_facet_id,
                 )
                 if (
-                    len(raw_fins) != 3
+                    not isinstance(raw_fins, (tuple, list))
                     or any(type(fin) is not int or fin < 0 for fin in raw_fins)
+                ):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "GetFacetFins returned an invalid fin ID array",
+                        {
+                            **base,
+                            "face_index": face_index,
+                            "facet_id": raw_facet_id,
+                            "raw_fins": repr(raw_fins)[:1000],
+                            "raw_fins_type": type(raw_fins).__name__,
+                            "native_totals": copy.deepcopy(native_totals),
+                        },
+                    )
+                if (
+                    len(raw_fins) != 3
                     or len(set(raw_fins)) != 3
                 ):
                     raise CadError(
@@ -7539,6 +7880,36 @@ class SolidWorksBackend(CadBackend):
                 }
                 normalized_facets.append(raw_facet_id)
             face_row["facet_ids"] = tuple(normalized_facets)
+
+        null_face_rows = [
+            row for row in face_rows if row["facet_ids"] is None
+        ]
+        if null_face_rows:
+            if len(facets) != native_totals["facets"]:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "a successful null face facet return did not close the native facet total",
+                    {
+                        **base,
+                        "null_face_indices": [
+                            row["index"] for row in null_face_rows
+                        ],
+                        "null_face_references": [
+                            reference_evidence(row["reference"])
+                            for row in null_face_rows
+                        ],
+                        "captured_facet_count": len(facets),
+                        "native_totals": copy.deepcopy(native_totals),
+                        "tessellate_result": tessellate_result,
+                        "tessellation_properties": copy.deepcopy(
+                            tessellation_properties
+                        ),
+                    },
+                )
+            for row in null_face_rows:
+                row["facet_ids"] = ()
+        for row in face_rows:
+            row["facet_count"] = len(row["facet_ids"])
 
         face_raw_references = {
             row["reference"]["raw_sha256"]
@@ -7687,41 +8058,57 @@ class SolidWorksBackend(CadBackend):
             ] = face_rows[-1]["reference"]["typed_sha256"]
 
         fin_ids_by_edge_index = {}
+
+        def edge_failure_context(
+            edge_row,
+            raw_edge_fins,
+            face_incidence,
+        ):
+            return {
+                "raw_edge_fins": repr(raw_edge_fins)[:1000],
+                "raw_edge_fins_type": type(raw_edge_fins).__name__,
+                "edge_reference": reference_evidence(
+                    edge_row["reference"]
+                ),
+                "owner_body_reference": reference_evidence(
+                    edge_row["owner_body_reference"]
+                ),
+                "face_incidence": copy.deepcopy(face_incidence),
+                "edge_endpoints": {
+                    name: {
+                        "state": endpoint.get("state"),
+                        "point_m": copy.deepcopy(
+                            endpoint.get("point_m")
+                        ),
+                        "reference": reference_evidence(
+                            endpoint.get("reference")
+                        ),
+                        "vertex_error": endpoint.get("vertex_error"),
+                        "point_error": endpoint.get("point_error"),
+                        "reference_error": endpoint.get(
+                            "reference_error"
+                        ),
+                        "object_pointer": endpoint.get("object_pointer"),
+                    }
+                    for name, endpoint in edge_row["endpoints"].items()
+                },
+                "curve": copy.deepcopy(edge_row["curve"]),
+                "curve_end_params": copy.deepcopy(
+                    edge_row["curve_end_params"]
+                ),
+                "tessellation_properties": copy.deepcopy(
+                    tessellation_properties
+                ),
+                "tessellate_result": tessellate_result,
+                "native_totals": copy.deepcopy(native_totals),
+                "captured_facet_count": len(facets),
+                "captured_fin_count": len(fins_by_id),
+                "face_count": len(face_rows),
+                "edge_count": len(edge_rows),
+            }
+
         for edge_row in edge_rows:
             edge_index = edge_row["index"]
-            edge_fins = call(
-                "ITessellation.GetEdgeFins",
-                lambda edge=edge_row["object"]: _as_list(
-                    _member(tessellation, "GetEdgeFins", edge)
-                ),
-                edge_index=edge_index,
-            )
-            normalized = []
-            seen = set()
-            for fin_id in edge_fins:
-                if type(fin_id) is not int or fin_id < 0:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "GetEdgeFins returned an invalid fin ID",
-                        {**base, "edge_index": edge_index, "fin_id": repr(fin_id)[:60]},
-                    )
-                if fin_id not in fins_by_id:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "an edge returned a fin outside the captured facets",
-                        {**base, "edge_index": edge_index, "fin_id": fin_id},
-                    )
-                if fin_id in seen:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "a native edge repeats a fin ID",
-                        {**base, "edge_index": edge_index, "fin_id": fin_id},
-                    )
-                seen.add(fin_id)
-                normalized.append(fin_id)
-            normalized.sort()
-            edge_row["fin_ids"] = tuple(normalized)
-            fin_ids_by_edge_index[edge_index] = tuple(normalized)
             incidence = len(edge_row["face_indices"])
             if incidence not in (1, 2):
                 raise CadError(
@@ -7742,13 +8129,104 @@ class SolidWorksBackend(CadBackend):
                         "edge_index": edge_index,
                     },
                 )
+            face_incidence = [
+                {
+                    "face_index": face_index,
+                    "facet_count": face_rows[face_index]["facet_count"],
+                    "face_reference": reference_evidence(
+                        face_rows[face_index]["reference"]
+                    ),
+                }
+                for face_index in edge_row["face_indices"]
+            ]
+            facet_fin_totals_closed = (
+                len(facets) == native_totals["facets"]
+                and len(fins_by_id) == native_totals["fins"]
+            )
+            null_source = (
+                NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                if (
+                    body_type == 1
+                    and tessellate_result is True
+                    and facet_fin_totals_closed
+                    and all(
+                        row["facet_count"] == 0
+                        for row in face_incidence
+                    )
+                )
+                else None
+            )
+            raw_edge_fins = call(
+                "ITessellation.GetEdgeFins",
+                lambda edge=edge_row["object"]: _member(
+                    tessellation,
+                    "GetEdgeFins",
+                    edge,
+                ),
+                edge_index=edge_index,
+                face_incidence=copy.deepcopy(face_incidence),
+                tessellate_result=tessellate_result,
+                tessellation_properties=copy.deepcopy(
+                    tessellation_properties
+                ),
+                native_totals=copy.deepcopy(native_totals),
+            )
+            edge_fins, fin_ids_source, raw_fin_ids = native_id_array(
+                raw_edge_fins,
+                api="ITessellation.GetEdgeFins",
+                label="fin",
+                null_source=null_source,
+                extra_detail=edge_failure_context(
+                    edge_row,
+                    raw_edge_fins,
+                    face_incidence,
+                ),
+                edge_index=edge_index,
+            )
+            normalized = []
+            seen = set()
+            for fin_id in edge_fins or ():
+                if fin_id not in fins_by_id:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "an edge returned a fin outside the captured facets",
+                        {**base, "edge_index": edge_index, "fin_id": fin_id},
+                    )
+                if fin_id in seen:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "a native edge repeats a fin ID",
+                        {**base, "edge_index": edge_index, "fin_id": fin_id},
+                    )
+                seen.add(fin_id)
+                normalized.append(fin_id)
+            normalized.sort()
+            edge_row["fin_ids"] = tuple(normalized)
+            edge_row["fin_count"] = len(normalized)
+            edge_row["fin_ids_source"] = fin_ids_source
+            edge_row["raw_fin_ids"] = raw_fin_ids
+            fin_ids_by_edge_index[edge_index] = tuple(normalized)
             if not normalized:
+                if all(
+                    row["facet_count"] == 0 for row in face_incidence
+                ) and body_type == 1 and tessellate_result is True and (
+                    facet_fin_totals_closed
+                ):
+                    # A sheet edge is allowed to have no fins only when every
+                    # incident face produced no facets in this Tessellate pass.
+                    # The edge itself remains in native topology.
+                    continue
                 raise CadError(
                     "cad_native_tessellation_unreadable",
                     "a native edge did not return any fins",
                     {
                         **base,
                         "edge_index": edge_index,
+                        **edge_failure_context(
+                            edge_row,
+                            raw_edge_fins,
+                            face_incidence,
+                        ),
                     },
                 )
         try:
@@ -8718,6 +9196,10 @@ class SolidWorksBackend(CadBackend):
                         "face_senses": edge_row["face_senses"],
                     },
                     edge_fins=edge_row["fin_ids"],
+                    incident_face_facet_counts=[
+                        len(face_rows[face_index]["facet_ids"])
+                        for face_index in edge_row["face_indices"]
+                    ],
                     fins_by_id=relation_fins,
                     vertices_by_id=vertex_points_binary64,
                 )
@@ -8828,6 +9310,15 @@ class SolidWorksBackend(CadBackend):
                     "reference": row["reference"],
                     "owner_body_reference": row["owner_body_reference"],
                     "facet_ids": row["facet_ids"],
+                    "facet_count": row["facet_count"],
+                    "facet_ids_source": row["facet_ids_source"],
+                    "raw_facet_ids": row["raw_facet_ids"],
+                    "warnings": (
+                        [NATIVE_FACE_FACET_IDS_DERIVED]
+                        if row["facet_ids_source"]
+                        == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                        else []
+                    ),
                     "identity": row.get("identity"),
                 }
                 for row in face_rows
@@ -8840,6 +9331,15 @@ class SolidWorksBackend(CadBackend):
                     "endpoints": row["endpoints"],
                     "face_indices": row["face_indices"],
                     "fin_ids": row["fin_ids"],
+                    "fin_count": row["fin_count"],
+                    "fin_ids_source": row["fin_ids_source"],
+                    "raw_fin_ids": row["raw_fin_ids"],
+                    "warnings": (
+                        [NATIVE_EDGE_FIN_IDS_DERIVED]
+                        if row["fin_ids_source"]
+                        == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                        else []
+                    ),
                     "identity": row.get("identity"),
                 }
                 for row in edge_rows
@@ -8879,6 +9379,7 @@ class SolidWorksBackend(CadBackend):
                 "scope": body_scope,
                 "tessellate_result": tessellate_result,
                 "request": tessellation_request,
+                "property_requests": dict(tessellation_property_requests),
                 "properties": tessellation_properties,
                 "facet_count": native_totals["facets"],
                 "fin_count": native_totals["fins"],
@@ -8887,6 +9388,15 @@ class SolidWorksBackend(CadBackend):
                     {
                         "face_index": row["index"],
                         "facet_ids": sorted(row["facet_ids"]),
+                        "facet_count": row["facet_count"],
+                        "facet_ids_source": row["facet_ids_source"],
+                        "raw_facet_ids": row["raw_facet_ids"],
+                        "warnings": (
+                            [NATIVE_FACE_FACET_IDS_DERIVED]
+                            if row["facet_ids_source"]
+                            == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                            else []
+                        ),
                         "face_identity_sha256": row["reference"][
                             "typed_sha256"
                         ],
@@ -8991,6 +9501,14 @@ class SolidWorksBackend(CadBackend):
                     ],
                     "face_indices": list(row["face_indices"]),
                     "fin_ids": sorted(row["fin_ids"]),
+                    "fin_ids_source": row["fin_ids_source"],
+                    "raw_fin_ids": row["raw_fin_ids"],
+                    "warnings": (
+                        [NATIVE_EDGE_FIN_IDS_DERIVED]
+                        if row["fin_ids_source"]
+                        == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                        else []
+                    ),
                     "u_min": row["curve"]["u_min"],
                     "u_max": row["curve"]["u_max"],
                     "curve_start_point_m": row["curve"]["start_point_m"],
@@ -9593,6 +10111,10 @@ class SolidWorksBackend(CadBackend):
                 row["face_index"]: row["facet_ids"]
                 for row in graph["itessellation_body"]["faces"]
             }
+            facet_sources_by_face = {
+                row["face_index"]: row["facet_ids_source"]
+                for row in graph["itessellation_body"]["faces"]
+            }
             for face_row in graph["faces"]:
                 face_index = face_row["index"]
                 records = records_by_face.get(face_index, [])
@@ -9642,6 +10164,33 @@ class SolidWorksBackend(CadBackend):
                             "area_m2": float(area),
                             "tessellate_result": graph["tessellate_result"],
                             "used_api": FACETLESS_EVIDENCE_API,
+                            "source_rule": facet_sources_by_face[face_index],
+                            "warnings": (
+                                [NATIVE_FACE_FACET_IDS_DERIVED]
+                                if facet_sources_by_face[face_index]
+                                == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                                else []
+                            ),
+                            "derived_empty_edges": sorted(
+                                (
+                                    {
+                                        "edge_reference_sha256": edge[
+                                            "edge_reference_sha256"
+                                        ],
+                                        "source_rule": edge["fin_ids_source"],
+                                        "warnings": list(edge["warnings"]),
+                                    }
+                                    for edge in graph["native_edge_rows"]
+                                    if (
+                                        face_index in edge["face_indices"]
+                                        and edge["fin_ids_source"]
+                                        == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                                    )
+                                ),
+                                key=lambda edge: edge[
+                                    "edge_reference_sha256"
+                                ],
+                            ),
                         }
                     )
                 edge_references = sorted(
@@ -9888,8 +10437,18 @@ class SolidWorksBackend(CadBackend):
                 "u_rule_version": NATIVE_U_IDENTITY_RULE,
                 "u_resolution_rule": NATIVE_U_RESOLUTION_RULE,
                 "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
-                "properties": {
+                "property_requests": {
+                    "improved_quality": True,
                     "match_type": 0,
+                    "need_error_list": True,
+                    "need_face_facet_map": True,
+                    "need_edge_fin_map": True,
+                    "need_vertex_params": True,
+                },
+                "properties": {
+                    "improved_quality": True,
+                    "match_type": 0,
+                    "need_error_list": True,
                     "need_face_facet_map": True,
                     "need_edge_fin_map": True,
                     "need_vertex_params": True,
@@ -10020,10 +10579,7 @@ class SolidWorksBackend(CadBackend):
         # tessellation count; no reader pass is needed (the Linux verifier
         # parses the delivered bytes and owns all mesh quality checks).
         triangles = len(values) // 9
-        api = (
-            "ITessellation.Tessellate/GetFaceFacets/GetFacetFins/"
-            "GetFinVertices/GetVertexPoint"
-        )
+        api = NATIVE_MESH_CAPTURE_API
         self.notes["mesh:" + component] = api
         return {
             "component": component,

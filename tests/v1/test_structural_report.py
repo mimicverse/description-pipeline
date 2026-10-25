@@ -6,8 +6,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from description_pipeline.geometry.native_u import (
+    NATIVE_FACE_FACET_IDS_DERIVED,
+)
 from description_pipeline.io import file_digest, write_json
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
+from description_pipeline.schemas import (
+    NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from description_pipeline.structural_report import write_structural_report
 from tests.sources import support
 
@@ -798,7 +804,7 @@ class StructuralReportTests(unittest.TestCase):
             "facet_count": 0,
             "area_m2": 0.0004,
             "tessellate_result": False,
-            "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+            "used_api": NATIVE_FACETLESS_EVIDENCE_API,
         }
         row.update(overrides)
         return row
@@ -937,6 +943,30 @@ class StructuralReportTests(unittest.TestCase):
             pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
             report = json.loads((root / pins["json"]["path"]).read_text())
             self.assertIn("report.geometry_metadata_missing", [item["code"] for item in report["findings"]])
+
+    def test_untessellated_warning_source_must_match_native_face_evidence(self):
+        geometry = self._geometry_list([self._untessellated_row()])
+        geometry[1]["tessellation"]["no_facets_faces"][0]["warnings"] = [
+            NATIVE_FACE_FACET_IDS_DERIVED
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "evidence/raw/geometry.json",
+                geometry,
+            )
+            pins = write_structural_report(
+                root,
+                {"run_id": "m3", "state": "failed"},
+                evidence_root=root,
+            )
+            report = json.loads(
+                (root / pins["json"]["path"]).read_text()
+            )
+            codes = [item["code"] for item in report["findings"]]
+            self.assertIn("report.geometry_metadata_invalid", codes)
+            self.assertNotIn("cad_sheet_face_untessellated", codes)
+
 
 if __name__ == "__main__":
     unittest.main()

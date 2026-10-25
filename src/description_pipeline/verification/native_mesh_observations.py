@@ -10,7 +10,17 @@ from ..geometry.native_tessellation import (
     parse_native_tessellation,
     summarize_native_topology,
 )
+from ..geometry.native_u import (
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
+)
 from ..io import PipelineError, confined
+from ..schemas import (
+    NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+)
 from ..sources.snapshot import verify_snapshot
 from . import native_discovery as evidence
 
@@ -141,7 +151,34 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         _span_digests(path, spans)
         seen = set()
         component_untessellated = []
-        base = {"body_type", "body_index", "face_index", "triangle_count", "area_m2", "used_api"}
+        face_evidence = {
+            (
+                body["body_type"],
+                body["body_index"],
+                face["face_index"],
+            ): face
+            for body in tessellation["itessellation"]["bodies"]
+            for face in body["faces"]
+        }
+        edge_evidence = {
+            (
+                edge["body_type"],
+                edge["body_index"],
+                edge["edge_reference_sha256"],
+            ): edge
+            for edge in tessellation["native_edges"]
+        }
+        base = {
+            "body_type",
+            "body_index",
+            "face_index",
+            "triangle_count",
+            "area_m2",
+            "used_api",
+            "source_rule",
+            "warnings",
+            "derived_empty_edges",
+        }
         for face in omitted:
             keys = set(face) if isinstance(face, dict) else None
             _require(
@@ -195,8 +232,81 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                     component + ": a degenerate-face probe error is only admissible at zero native area",
                 )
             _require(
-                face["used_api"] == "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                face["used_api"] == NATIVE_FACETLESS_EVIDENCE_API,
                 component + ": unsupported untessellated-face evidence API",
+            )
+            evidence_face = face_evidence.get(key)
+            _require(
+                isinstance(evidence_face, dict),
+                component + ": untessellated face has no native face evidence",
+            )
+            _require(
+                face["source_rule"] == evidence_face["facet_ids_source"]
+                and face["warnings"] == evidence_face["warnings"]
+                and face["source_rule"]
+                in {
+                    NATIVE_ID_ARRAY_SOURCE_FLAT,
+                    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+                }
+                and face["warnings"]
+                == (
+                    [NATIVE_FACE_FACET_IDS_DERIVED]
+                    if face["source_rule"]
+                    == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                    else []
+                )
+                and isinstance(face["derived_empty_edges"], list),
+                component + ": untessellated face source evidence is inconsistent",
+            )
+            derived_references = []
+            for derived in face["derived_empty_edges"]:
+                reference = (
+                    derived.get("edge_reference_sha256")
+                    if isinstance(derived, dict)
+                    else None
+                )
+                edge = edge_evidence.get(
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        reference,
+                    )
+                )
+                _require(
+                    isinstance(derived, dict)
+                    and set(derived)
+                    == {
+                        "edge_reference_sha256",
+                        "source_rule",
+                        "warnings",
+                    }
+                    and isinstance(edge, dict)
+                    and face["face_index"] in edge["face_indices"]
+                    and derived["source_rule"]
+                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                    and derived["warnings"]
+                    == [NATIVE_EDGE_FIN_IDS_DERIVED]
+                    and edge["fin_ids_source"] == derived["source_rule"]
+                    and edge["warnings"] == derived["warnings"],
+                    component + ": derived empty-edge source evidence is inconsistent",
+                )
+                derived_references.append(reference)
+            expected_derived_references = sorted(
+                reference
+                for (body_type, body_index, reference), edge
+                in edge_evidence.items()
+                if (
+                    body_type == face["body_type"]
+                    and body_index == face["body_index"]
+                    and face["face_index"] in edge["face_indices"]
+                    and edge["fin_ids_source"]
+                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                )
+            )
+            _require(
+                derived_references == expected_derived_references,
+                component
+                + ": derived empty-edge references do not exactly cover incident empty-fin edges",
             )
             component_untessellated.append(
                 {

@@ -715,6 +715,9 @@ def _mesh_body(faces, key: str):
     face_by_id = {id(face): index for index, face in enumerate(faces)}
 
     class _MeshTessellation:
+        ImprovedQuality = True
+        MatchType = 0
+        NeedErrorList = True
         NeedFaceFacetMap = True
         NeedEdgeFinMap = True
         NeedVertexParams = True
