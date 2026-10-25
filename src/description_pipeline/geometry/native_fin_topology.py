@@ -34,6 +34,86 @@ def _write_only_sense_error(value: object) -> bool:
     )
 
 
+def validate_native_edge_face_senses(
+    *, component: str, face_indices: Sequence[int], face_senses: object,
+) -> dict[int, bool]:
+    """Validate already observed face orientations before provider selection."""
+
+    face_sense_rows = face_senses
+    incidence = len(face_indices)
+    _require(
+        isinstance(face_sense_rows, list)
+        and len(face_sense_rows) == incidence
+        and [
+            row.get("face_index") if isinstance(row, Mapping) else None
+            for row in face_sense_rows
+        ]
+        == list(face_indices),
+        f"{component}: a native edge face-sense inventory is inconsistent",
+        component=component,
+        face_indices=list(face_indices),
+    )
+    face_sense = {}
+    for row in face_sense_rows:
+        _require(
+            isinstance(row, Mapping)
+            and set(row)
+            == {
+                "face_index",
+                "EdgeInFaceSense",
+                "IEdgeInFaceSense2",
+            },
+            f"{component}: a native edge face-sense row is malformed",
+            component=component,
+            face_index=row.get("face_index") if isinstance(row, Mapping) else None,
+        )
+        _require(
+            type(row["face_index"]) is int,
+            f"{component}: a native edge face-sense row is malformed",
+            component=component,
+            face_index=row["face_index"],
+        )
+        primary = row["EdgeInFaceSense"]
+        _require(
+            isinstance(primary, Mapping)
+            and set(primary) == {"value", "error"}
+            and primary["error"] is None
+            and type(primary["value"]) is bool,
+            f"{component}: a native edge primary face sense is unreadable",
+            component=component,
+            face_index=row["face_index"],
+        )
+        secondary = row["IEdgeInFaceSense2"]
+        _require(
+            isinstance(secondary, Mapping)
+            and set(secondary) == {"value", "error"}
+            and (
+                (
+                    secondary["error"] is None
+                    and type(secondary["value"]) is bool
+                    and secondary["value"] is primary["value"]
+                )
+                or (
+                    _write_only_sense_error(secondary["error"])
+                    and secondary["value"] is None
+                )
+            ),
+            f"{component}: a native edge secondary face sense is invalid",
+            component=component,
+            face_index=row["face_index"],
+        )
+        face_sense[row["face_index"]] = primary["value"]
+
+    values = list(face_sense.values())
+    _require(
+        len(values) == 1 or (len(values) == 2 and values[0] is not values[1]),
+        f"{component}: a native edge cofaces have the same orientation",
+        component=component,
+        face_indices=list(face_indices),
+    )
+    return face_sense
+
+
 def validate_native_edge_fin_relations(
     *,
     component: str,
@@ -108,69 +188,9 @@ def validate_native_edge_fin_relations(
         incident_face_facet_counts=list(facet_counts),
     )
 
-    face_sense_rows = edge["face_senses"]
-    _require(
-        isinstance(face_sense_rows, list)
-        and len(face_sense_rows) == incidence
-        and [
-            row.get("face_index") if isinstance(row, Mapping) else None
-            for row in face_sense_rows
-        ]
-        == list(face_indices),
-        f"{component}: a native edge face-sense inventory is inconsistent",
-        component=component,
-        face_indices=list(face_indices),
+    face_sense = validate_native_edge_face_senses(
+        component=component, face_indices=face_indices, face_senses=edge["face_senses"],
     )
-    face_sense = {}
-    for row in face_sense_rows:
-        _require(
-            isinstance(row, Mapping)
-            and set(row)
-            == {
-                "face_index",
-                "EdgeInFaceSense",
-                "IEdgeInFaceSense2",
-            },
-            f"{component}: a native edge face-sense row is malformed",
-            component=component,
-            face_index=row.get("face_index") if isinstance(row, Mapping) else None,
-        )
-        _require(
-            type(row["face_index"]) is int,
-            f"{component}: a native edge face-sense row is malformed",
-            component=component,
-            face_index=row["face_index"],
-        )
-        primary = row["EdgeInFaceSense"]
-        _require(
-            isinstance(primary, Mapping)
-            and set(primary) == {"value", "error"}
-            and primary["error"] is None
-            and type(primary["value"]) is bool,
-            f"{component}: a native edge primary face sense is unreadable",
-            component=component,
-            face_index=row["face_index"],
-        )
-        secondary = row["IEdgeInFaceSense2"]
-        _require(
-            isinstance(secondary, Mapping)
-            and set(secondary) == {"value", "error"}
-            and (
-                (
-                    secondary["error"] is None
-                    and type(secondary["value"]) is bool
-                    and secondary["value"] is primary["value"]
-                )
-                or (
-                    _write_only_sense_error(secondary["error"])
-                    and secondary["value"] is None
-                )
-            ),
-            f"{component}: a native edge secondary face sense is invalid",
-            component=component,
-            face_index=row["face_index"],
-        )
-        face_sense[row["face_index"]] = primary["value"]
 
     rows = {}
     for fin_id in normalized_ids:

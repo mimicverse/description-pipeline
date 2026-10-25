@@ -1741,6 +1741,30 @@ class ComponentMeshExportTests(unittest.TestCase):
             backend.export_component_meshes({"pcb-1": self.dest})
         self.assertEqual(len(body.tessellation_face_lists), before)
 
+    def test_observed_invalid_face_sense_precedes_nonexact_line_domain(self):
+        for invalid in ("invalid-face-sense", 1, None, RuntimeError("unreadable face sense")):
+            with self.subTest(invalid=repr(invalid)):
+                component, body, edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                coedge = body._faces[0]._loops[0]._coedges[0]
+                raw = coedge.GetCurveParams()
+                raw[4] = 2**-48
+                coedge.GetCurveParams = lambda values=raw: values
+
+                def read_sense(_face, value=invalid):
+                    if isinstance(value, RuntimeError):
+                        raise value
+                    return value
+
+                edges[0].EdgeInFaceSense = read_sense
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                with self.assertRaisesRegex(CadError, "primary face sense is unreadable") as caught:
+                    backend.export_component_meshes({"pcb-1": self.dest})
+                self.assertIsNotNone(caught.exception.detail["face_senses"][0]["EdgeInFaceSense"]["error"])
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
     def test_observed_d534_line_residual_is_outside_exact_provider_domain(self):
         start = (0.009999356023198996, -0.006164722832204, -0.055676906273813)
         end = (0.009968943104147997, -0.00608019051360702, -0.055676906273813)
@@ -1767,6 +1791,53 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertGreater(residual, 6.45e-18)
         self.assertLess(residual, 6.46e-18)
         self.assertEqual(len(body.tessellation_face_lists), before + 1)
+
+    def test_observed_invalid_secondary_sense_precedes_provider_selection(self):
+        for invalid in (False, 1, None, RuntimeError("unreadable secondary sense")):
+            with self.subTest(invalid=repr(invalid)):
+                component, body, edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+
+                def read_sense(_face, value=invalid):
+                    if isinstance(value, RuntimeError):
+                        raise value
+                    return value
+
+                edges[0].IEdgeInFaceSense2 = read_sense
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                with self.assertRaisesRegex(CadError, "secondary face sense is invalid"):
+                    backend.export_component_meshes({"pcb-1": self.dest})
+                self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_observed_write_only_secondary_sense_remains_allowed(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        write_only_error = type("com_error", (RuntimeError,), {})
+
+        def read_sense(_face):
+            raise write_only_error(61836, "write-only property", None, None)
+
+        edges[0].IEdgeInFaceSense2 = read_sense
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_observed_equal_coface_directions_precede_provider_selection(self):
+        shared = FakeEdge(b"same-sense-edge", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        shared.EdgeInFaceSense = lambda _face: True
+        shared.IEdgeInFaceSense2 = lambda _face: True
+        body = FakeBody([FakeFace(TRIANGLE, edges=[shared]), FakeFace(REVERSED_TRIANGLE, edges=[shared])])
+        backend = _backend(FakeComponent(FakeDocument([]), {0: [], 1: [body]}))
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "cofaces have the same orientation"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
 
     def test_planar_and_itessellation_bodies_share_one_canonical_stream(self):
         points = [

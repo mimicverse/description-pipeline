@@ -70,6 +70,7 @@ from ...geometry.native_u import (
 )
 from ...geometry.native_fin_topology import (
     NativeFinRelationError,
+    validate_native_edge_face_senses,
     validate_native_edge_fin_relations,
 )
 from ...geometry.native_planar_brep import (
@@ -7626,6 +7627,18 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
             edge_row["face_senses"] = face_senses
+            try:
+                validate_native_edge_face_senses(
+                    component=component,
+                    face_indices=edge_row["face_indices"],
+                    face_senses=face_senses,
+                )
+            except NativeFinRelationError as error:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    error.message,
+                    {**base, **error.detail, "edge_index": edge_row["index"], "face_senses": face_senses},
+                ) from error
 
         def planar_brep_candidate_impl(evidence):
             def provider_miss(reason):

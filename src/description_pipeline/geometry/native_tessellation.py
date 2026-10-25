@@ -18,6 +18,7 @@ from ..schemas import (
 )
 from .native_fin_topology import (
     NativeFinRelationError,
+    validate_native_edge_face_senses,
     validate_native_edge_fin_relations,
 )
 from .native_planar_brep import (
@@ -709,16 +710,6 @@ def _valid_curve_endpoint_evaluation(value: object, u_parameter: object) -> bool
         and math.isfinite(float(error_m))
         and tolerance >= 0.0
         and error_m <= tolerance
-    )
-
-
-def _write_only_sense_error(value: object) -> bool:
-    """Return whether a secondary sense read failed with documented COM 61836."""
-
-    return (
-        isinstance(value, str)
-        and value.startswith("com_error:")
-        and "(61836," in value
     )
 
 
@@ -1559,59 +1550,14 @@ def parse_native_tessellation(
                 component + f": native vertex {vertex_reference} binds multiple coordinates",
             )
         edge_owners[reference] = (body_key, set(edge["face_indices"]))
-        face_senses = edge["face_senses"]
-        _require(
-            len(face_senses) == len(edge["face_indices"])
-            and [
-                row.get("face_index") if isinstance(row, dict) else None
-                for row in face_senses
-            ]
-            == edge["face_indices"],
-            component + f": native edge {index} face-sense inventory is inconsistent",
-        )
-        sense_values = []
-        for row in face_senses:
-            _require(
-                isinstance(row, dict)
-                and set(row)
-                == {
-                    "face_index",
-                    "EdgeInFaceSense",
-                    "IEdgeInFaceSense2",
-                },
-                component + f": native edge {index} face-sense row is malformed",
+        try:
+            validate_native_edge_face_senses(
+                component=component,
+                face_indices=edge["face_indices"],
+                face_senses=edge["face_senses"],
             )
-            primary = row["EdgeInFaceSense"]
-            _require(
-                isinstance(primary, dict)
-                and set(primary) == {"value", "error"}
-                and primary["error"] is None
-                and type(primary["value"]) is bool,
-                component
-                + f": native edge {index} primary orientation is unreadable",
-            )
-            secondary = row["IEdgeInFaceSense2"]
-            _require(
-                isinstance(secondary, dict)
-                and set(secondary) == {"value", "error"}
-                and (
-                    (
-                        secondary["error"] is None
-                        and type(secondary["value"]) is bool
-                        and secondary["value"] is primary["value"]
-                    )
-                    or (
-                        _write_only_sense_error(secondary["error"])
-                        and secondary["value"] is None
-                    )
-                ),
-                component + f": native edge {index} secondary orientation is invalid",
-            )
-            sense_values.append(primary["value"])
-        _require(
-            len(sense_values) == 1 or sense_values[0] is not sense_values[1],
-            component + f": native edge {index} cofaces have the same orientation",
-        )
+        except NativeFinRelationError as error:
+            raise PipelineError(error.message) from error
         _require(
             all((*body_key, face_index) in face_edge_references for face_index in edge_owners[reference][1]),
             component + f": native edge {index} names an unknown face",
