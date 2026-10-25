@@ -1598,6 +1598,14 @@ def _capture_prepared_local(
 
         stage = "scene_projection"
         _capture_note(activity, "scene_projection")
+        raw_scene = raw_facts.get("scene_raw") if isinstance(raw_facts, dict) else None
+        raw_occurrences = raw_scene.get("occurrences") if isinstance(raw_scene, dict) else None
+        for occurrence in raw_occurrences if isinstance(raw_occurrences, list) else ():
+            if not isinstance(occurrence, dict):
+                continue
+            geometry_row = raw_geometry.get(occurrence.get("name"))
+            if isinstance(geometry_row, dict) and "appearance_raw" in geometry_row:
+                occurrence["appearance_raw"] = geometry_row["appearance_raw"]
         write_json(staging / "raw" / "native_capture_facts.json", raw_facts)
         from .native import project_prepared_capture, project_axis_references
 

@@ -2091,10 +2091,17 @@ def _verify_model(
     require_native_receipts=False,
 ):
     from .solidworks_physics import verify_physics
+    from ..sources.solidworks.appearance import bind_capture_appearance
 
     source = definition["source"]
     carrier = source.get("carrier")
     native_geometry_rows = evidence.geometry(root)
+    if "raw/native_capture_facts.json" in (manifest.get("files") or {}):
+        raw, native_geometry_rows = bind_capture_appearance(
+            raw,
+            native_geometry_rows,
+            evidence.native_capture_facts(root),
+        )
     metadata_warnings = _metadata_value_warnings(
         root,
         source,
@@ -2112,6 +2119,7 @@ def _verify_model(
             model,
             carrier,
             native_geometry_rows=native_geometry_rows,
+            raw_scene=raw,
             metadata_warnings=metadata_warnings,
         ),
     )
@@ -2370,10 +2378,15 @@ def _value_warning_gate(
     carrier=None,
     *,
     native_geometry_rows=None,
+    raw_scene=None,
     metadata_warnings=None,
 ):
     """Re-derive every non-native value warning from source facts and the model."""
 
+    from ..sources.solidworks.appearance import (
+        UNRECORDED_APPEARANCE,
+        require_fallback_eligible,
+    )
     from ..sources.solidworks.naming import (
         DISPLAY_MATERIAL_FALLBACK_NAME,
         DISPLAY_MATERIAL_FALLBACK_RGBA,
@@ -2418,6 +2431,11 @@ def _value_warning_gate(
     model_joints = model.get("joints") or []
     shapes = [(link, shape) for link in links for shape in link.get("visuals") or []]
     native_geometry = {}
+    raw_components = {
+        str(row.get("name") or ""): row
+        for row in (raw_scene or {}).get("components", [])
+        if isinstance(row, dict)
+    }
     for row in native_geometry_rows or []:
         _require(isinstance(row, dict), "Raw geometry rows must be objects")
         component = str(row.get("component") or "")
@@ -2876,6 +2894,34 @@ def _value_warning_gate(
             == mesh_path(current_sha256, namespace=mesh_namespace),
             "Mesh path differs from content addressing",
         )
+        if raw_scene is not None:
+            raw_component = raw_components.get(native_component)
+            _require(
+                raw_component is not None,
+                "Visual is missing from the sealed raw scene",
+            )
+            source_scope = (
+                (native_geometry.get(native_component) or {}).get(
+                    "source_scope"
+                )
+                or {}
+            )
+            require_fallback_eligible(
+                raw_component.get(
+                    "appearance_raw",
+                    UNRECORDED_APPEARANCE,
+                ),
+                component=native_component,
+                expected_document_path=source_scope.get(
+                    "source_document_path"
+                ),
+                expected_configuration=source_scope.get(
+                    "referenced_configuration"
+                ),
+                expected_bodies=(native_geometry.get(native_component) or {}).get(
+                    "body_inventory"
+                ),
+            )
         material_source = provenance.get("material_source")
         _require(
             material_source == "platform_display_fallback",

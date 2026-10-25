@@ -359,6 +359,36 @@ class FreezeTests(unittest.TestCase):
         self.assertIn("raw/scene_raw.json", manifest["files"])
         self.assertTrue(any(name.startswith("geometry/") for name in manifest["files"]))
 
+    def test_capture_retains_auxiliary_appearance_in_native_facts(self) -> None:
+        appearance = {
+            "component": "base-1",
+            "document": {
+                "material_property_values": [-1.0] * 9,
+                "has_material_property_values": False,
+                "read_errors": {},
+            },
+            "bodies": [],
+        }
+        capture_geometry = self.backend.capture_prepared_geometry
+
+        def geometry_with_appearance(source_scopes, on_activity=None):
+            rows = capture_geometry(source_scopes, on_activity=on_activity)
+            component = next(iter(rows))
+            appearance["component"] = component
+            rows[component]["appearance_raw"] = appearance
+            return rows
+
+        self.backend.capture_prepared_geometry = geometry_with_appearance
+        freeze(self.config, self.destination, backend=self.backend)
+        facts = json.loads((self.destination / "raw/native_capture_facts.json").read_text())
+        occurrence = next(
+            row for row in facts["scene_raw"]["occurrences"]
+            if row["name"] == appearance["component"]
+        )
+        self.assertEqual(occurrence["appearance_raw"], appearance)
+        geometry = json.loads((self.destination / "raw/geometry.json").read_text())
+        self.assertTrue(all("appearance_raw" not in row for row in geometry))
+
     def test_capture_never_builds_a_scene_and_linux_derivation_keeps_snapshot_immutable(self) -> None:
         from description_pipeline.io import inventory
 

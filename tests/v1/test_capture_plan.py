@@ -152,24 +152,6 @@ class CapturePlanTests(unittest.TestCase):
             (
                 "portable staged inventory",
                 {
-                "kind": "native_import_materialization",
-                "state": "cached_materialization",
-                "is_virtual": False,
-                "occurrence": "waist-1/virtual-1",
-                "owner": "waist.SLDASM",
-                "owner_sha256": "a" * 64,
-                "session_document_path": "c:/temp/VC~~/waist/virtual.sldprt",
-                "session_temp_root": "c:/temp",
-                "native_api_pid": 1,
-                "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
-                "author_imported_path": None,
-                "author_imported_error": None,
-                "document": None,
-                },
-            ),
-            (
-                "portable staged inventory",
-                {
                 "kind": "native_embedded_virtual_component",
                 "state": "embedded_virtual_component",
                 "is_virtual": False,
@@ -653,25 +635,98 @@ class CapturePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "without complete session proof"):
             steps._consume_sealed_definition(self.root)
 
-    def test_a_cached_import_materialization_is_refused_early(self) -> None:
+    def test_plan_entry_refuses_an_api_proven_cached_import(self) -> None:
+        session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7\\IC~~\\arm.step.SLDPRT"
+        session_root = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7"
+        selection_root = "C:\\selection\\m3-flat"
+        selection_path = selection_root + "\\swx8\\IC~~\\arm.step.SLDPRT"
+        source_root = "C:\\discovery\\m3-flat"
         discovery_document = json.loads(
-            (self.root / "discovery" / "native-discovery.json").read_text(
-                encoding="utf-8"
-            )
+            (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
         )
         component = next(
-            item
-            for item in discovery_document["raw"]["components"]
-            if item["instance_id"] == "arm-1"
+            item for item in discovery_document["raw"]["components"] if item["instance_id"] == "arm-1"
         )
-        component["source_provenance"] = {
-            "kind": "native_import_materialization",
+        component.update(
+            document=session_path,
+            configuration="Default",
+            suppression_state=2,
+            source_provenance={
+                "kind": "native_import_materialization",
+                "state": "cached_materialization",
+                "is_virtual": False,
+                "occurrence": "arm-1",
+                "owner": MAIN,
+                "owner_sha256": "a" * 64,
+                "materialization_path": session_path,
+                "session_document_path": session_path,
+                "native_document_path": session_path,
+                "session_temp_root": session_root,
+                "native_api_pid": 7,
+                "author_imported_in_source_root": True,
+                "author_imported_relative": "cad/arm.SLDPRT",
+                "author_imported_path": source_root + "\\cad\\arm.SLDPRT",
+                "source_root": source_root,
+                "defining_anchor": None,
+                "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                "error": None,
+                "author_imported_error": None,
+            },
+        )
+        entry = {
+            "document": selection_path,
+            "owner": MAIN,
+            "owner_sha256": "a" * 64,
+            "bound_source": "cad/arm.SLDPRT",
+            "defining_materialization": None,
+            "instance": "arm-1",
+            "name": "arm-1",
+            "author_imported_path": selection_root + "\\cad\\arm.SLDPRT",
+            "author_metadata_in_stage": True,
+            "is_virtual": False,
+            "materialization": selection_path,
+            "session_temp_root": selection_root + "\\swx8",
+            "native_api_pid": 8,
+            "configuration": "Default",
+            "suppression_state": 2,
             "state": "cached_materialization",
+            "binding": "author_metadata_only",
+            "owner_anchor": None,
         }
-        write_json(
-            self.root / "discovery" / "native-discovery.json",
-            discovery_document,
+        files = dict(discovery_document["raw"]["files"])
+        from description_pipeline.sources.solidworks.selection import seal_closure_selection
+        from tests.sources.selection_support import closure_evidence
+
+        evidence = closure_evidence(
+            files,
+            MAIN,
+            edges={
+                MAIN: ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+                "cad/base.SLDPRT": [],
+                "cad/arm.SLDPRT": [],
+            },
+            imports=[entry],
+            stage_root=selection_root,
         )
+        next(
+            edge
+            for edge in evidence["documents"][MAIN]["resolved_edges"]
+            if edge["resolved"].replace("\\", "/") == "cad/arm.SLDPRT"
+        ).update(
+            kind="native_imported_document",
+            instance="arm-1",
+            resolved="cad/arm.SLDPRT",
+            configuration="Default",
+            suppression_state=2,
+        )
+        manifest = seal_closure_selection(
+            files,
+            MAIN,
+            evidence,
+            reader_sha256=evidence["reader_sha256"],
+        )
+        discovery_document["raw"]["source_selection"] = manifest
+        write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
         discovery_sha = hashlib.sha256(
             (self.root / "discovery" / "native-discovery.json").read_bytes()
         ).hexdigest()
@@ -681,66 +736,60 @@ class CapturePlanTests(unittest.TestCase):
                 plan["objects"][1].pop("document"),
             )
         )
-        with self.assertRaisesRegex(
-            PipelineError,
-            "Cached-import materialization is not supported",
-        ):
-            steps._consume_sealed_definition(self.root)
+        from description_pipeline.sources.solidworks.discovery import _capture_plan_selector
 
-    def test_a_frozen_file_whose_name_mentions_import_remains_valid(self) -> None:
+        for boundary, action in (
+            ("producer", lambda: _capture_plan_selector(component, files)),
+            ("consumer", lambda: steps._consume_sealed_definition(self.root)),
+        ):
+            with self.subTest(boundary=boundary):
+                with self.assertRaisesRegex(PipelineError, "arm-1") as caught:
+                    action()
+                self.assertEqual(
+                    caught.exception.details,
+                    {
+                        "object": "arm-1",
+                        "reason": "cached_materialization",
+                        "state": "cached_materialization",
+                        "kind": "native_import_materialization",
+                        "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                        "is_virtual": False,
+                    },
+                )
+
+    def test_plan_entry_keeps_a_saved_resident_document_with_import_origin(self) -> None:
         discovery_document = json.loads(
-            (self.root / "discovery" / "native-discovery.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        files = dict(discovery_document["native_files"])
-        files["cad/imported-arm.SLDPRT"] = files.pop("cad/arm.SLDPRT")
-        discovery_document["native_files"] = files
-        discovery_document["raw"]["files"] = files
-        discovery_document["raw"]["source_selection"] = sealed_selection(
-            files,
-            MAIN,
+            (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
         )
         component = next(
-            item
-            for item in discovery_document["raw"]["components"]
-            if item["instance_id"] == "arm-1"
+            item for item in discovery_document["raw"]["components"] if item["instance_id"] == "arm-1"
         )
         component.update(
-            instance_id="imported-part-1",
-            name2="imported-part-1",
-            document="cad/imported-arm.SLDPRT",
+            document="cad/arm.SLDPRT",
+            configuration="Default",
+            suppression_state=2,
+            source_provenance={
+                "state": "resolved",
+                "kind": "native_imported_document",
+                "source_root": "C:\\author",
+                "native_document_path": "C:\\author\\arm.SLDPRT",
+                "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                "imported_path": "C:\\author\\arm.step",
+                "document": "cad/arm.SLDPRT",
+                "sha256": "c" * 64,
+                "is_virtual": False,
+            },
         )
-        write_json(
-            self.root / "discovery" / "native-discovery.json",
-            discovery_document,
-        )
+        write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
         discovery_sha = hashlib.sha256(
             (self.root / "discovery" / "native-discovery.json").read_bytes()
         ).hexdigest()
+        self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
 
-        def bind_imported_file(plan):
-            plan.update(
-                discovery_sha256=discovery_sha,
-                handoff_sha256=digest(files),
-            )
-            plan["selection"]["files"] = files
-            plan["objects"][1].update(
-                name="imported-part-1",
-                document="cad/imported-arm.SLDPRT",
-            )
-            plan["groups"][1]["components"] = ["imported-part-1"]
+        _source, plan = steps._consume_sealed_definition(self.root)
 
-        self._rewrite_plan(bind_imported_file)
-        _source, consumed = steps._consume_sealed_definition(self.root)
-        self.assertEqual(
-            consumed["objects"][1],
-            {
-                "name": "imported-part-1",
-                "document": "cad/imported-arm.SLDPRT",
-                "state": 2,
-            },
-        )
+        selector = next(item for item in plan["objects"] if item["name"] == "arm-1")
+        self.assertEqual(selector["document"], "cad/arm.SLDPRT")
 
     def test_a_plan_naming_another_run_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan.update(run_id="r-2"))

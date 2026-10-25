@@ -861,6 +861,148 @@ def _json_raw_value(value):
     return _raw_scalar(value)
 
 
+def _appearance_values_are_valid(value: object) -> bool:
+    """Whether one native material-property reading is the documented 9-vector."""
+
+    return (
+        isinstance(value, list)
+        and len(value) == 9
+        and all(
+            type(item) in (int, float) and math.isfinite(float(item))
+            for item in value
+        )
+    )
+
+
+def _appearance_read_error(code: str, message: str, value: object) -> dict:
+    return {
+        "code": code,
+        "message": message,
+        "detail": {"value": copy.deepcopy(value)},
+    }
+
+
+def _appearance_texture_raw(owner, configuration, read_errors):
+    """Read one documented texture pointer without making it a primary gate."""
+
+    try:
+        texture = _member(owner, "GetTexture", configuration)
+    except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
+        read_errors["texture"] = _native_error_record(error)
+        return {
+            "configuration": configuration,
+            "state": "unreadable",
+            "material_name": None,
+        }
+    if texture is None:
+        return {
+            "configuration": configuration,
+            "state": "absent",
+            "material_name": None,
+        }
+    try:
+        raw_name = _member(texture, "MaterialName")
+    except Exception as error:  # noqa: BLE001 - preserve the applied texture
+        read_errors["texture.material_name"] = _native_error_record(error)
+        return {
+            "configuration": configuration,
+            "state": "present",
+            "material_name": None,
+        }
+    if not isinstance(raw_name, str):
+        read_errors["texture.material_name"] = _appearance_read_error(
+            "cad_appearance_texture_name_invalid",
+            "ITexture.MaterialName did not return text",
+            _json_raw_value(raw_name),
+        )
+        return {
+            "configuration": configuration,
+            "state": "present",
+            "material_name": None,
+        }
+    return {
+        "configuration": configuration,
+        "state": "present",
+        "material_name": raw_name,
+    }
+
+
+def _appearance_raw(
+    owner,
+    *,
+    configuration,
+    material_member: str,
+    material_args=(),
+    material_context: dict,
+    used_api: str,
+):
+    """Record one exact appearance owner without coercing absence or failure."""
+
+    read_errors = {}
+    try:
+        material_values = _json_raw_value(
+            _member(owner, material_member, *material_args)
+        )
+    except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
+        material_values = None
+        read_errors["material_property_values"] = _native_error_record(error)
+    else:
+        if not _appearance_values_are_valid(material_values):
+            read_errors["material_property_values"] = _appearance_read_error(
+                "cad_appearance_values_invalid",
+                f"{material_member} did not return nine finite numeric values",
+                material_values,
+            )
+    try:
+        raw_has_values = _method(owner, "HasMaterialPropertyValues")
+    except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
+        has_values = None
+        read_errors["has_material_property_values"] = _native_error_record(error)
+    else:
+        has_values = raw_has_values if type(raw_has_values) is bool else None
+        if has_values is None:
+            read_errors["has_material_property_values"] = _appearance_read_error(
+                "cad_appearance_presence_invalid",
+                "HasMaterialPropertyValues did not return bool",
+                _json_raw_value(raw_has_values),
+            )
+    return {
+        "used_api": used_api,
+        "material_call": material_context,
+        "presence_call": {"arguments": [], "configuration_semantics": "native_owner_context"},
+        "material_property_values": material_values,
+        "has_material_property_values": has_values,
+        "texture": _appearance_texture_raw(
+            owner,
+            configuration,
+            read_errors,
+        ),
+        "read_errors": read_errors,
+    }
+
+
+def _unavailable_appearance_raw(
+    *,
+    configuration,
+    material_context: dict,
+    used_api: str,
+    error: object,
+) -> dict:
+    return {
+        "used_api": used_api,
+        "material_call": material_context,
+        "presence_call": {"arguments": [], "configuration_semantics": "native_owner_context"},
+        "material_property_values": None,
+        "has_material_property_values": None,
+        "texture": {
+            "configuration": configuration,
+            "state": "unreadable",
+            "material_name": None,
+        },
+        "read_errors": {"owner": copy.deepcopy(error)},
+    }
+
+
 def _optional_mass_scalar(mass_property, member, read_errors):
     key = {
         "Volume": "volume_m3",
@@ -4353,6 +4495,7 @@ class SolidWorksBackend(CadBackend):
                         "bodies": {"solid": 0, "sheet": 0},
                         "source_scope": source_scopes[component],
                         "transform_raw": _json_raw_value(self._component_transforms.get(component)),
+                        "appearance_raw": None,
                     }
                 note(
                     "geometry_facts",
@@ -4386,7 +4529,98 @@ class SolidWorksBackend(CadBackend):
             "IComponent2.GetBodies2/IBody2.GetFaces/"
             "IFace2.GetTessTriangles(True)"
         )
-
+        configuration = source_scope.get("referenced_configuration")
+        requested_context = {
+            "configuration_semantics": "requested_configuration",
+            "configuration_option": 3,
+            "configuration_names": [configuration],
+        }
+        document = None
+        document_error = None
+        try:
+            document_key = self._source_components[component][0]
+            document = self._captured_document(
+                document_key,
+                component,
+                "appearance",
+            )
+        except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
+            document_error = _native_error_record(error)
+        native_active_configuration = None
+        native_active_configuration_error = None
+        if document is not None:
+            try:
+                native_active_configuration = _active_configuration(document)
+            except Exception as error:  # noqa: BLE001 - body context stays unreadable
+                native_active_configuration_error = _native_error_record(error)
+            else:
+                if not _is_text_name(native_active_configuration):
+                    native_active_configuration_error = _appearance_read_error(
+                        "cad_appearance_active_configuration_invalid",
+                        "the native active configuration is unreadable",
+                        _json_raw_value(native_active_configuration),
+                    )
+        document_api = (
+            "IModelDocExtension.GetMaterialPropertyValues(swSpecifyConfiguration)"
+            "/IModelDocExtension.HasMaterialPropertyValues"
+            "/IModelDocExtension.GetTexture/ITexture.MaterialName"
+        )
+        if document is None:
+            document_appearance = _unavailable_appearance_raw(
+                configuration=configuration,
+                material_context=requested_context,
+                used_api=document_api,
+                error=document_error,
+            )
+        else:
+            try:
+                document_extension = _member(document, "Extension")
+                document_appearance = _appearance_raw(
+                    document_extension,
+                    configuration=configuration,
+                    material_member="GetMaterialPropertyValues",
+                    material_args=(3, (configuration,)),
+                    material_context=requested_context,
+                    used_api=document_api,
+                )
+            except Exception as error:  # noqa: BLE001 - appearance is auxiliary
+                document_appearance = _unavailable_appearance_raw(
+                    configuration=configuration,
+                    material_context=requested_context,
+                    used_api=document_api,
+                    error=_native_error_record(error),
+                )
+        occurrence_api = (
+            "IComponent2.GetMaterialPropertyValues2(swSpecifyConfiguration)"
+            "/IComponent2.HasMaterialPropertyValues"
+            "/IComponent2.GetTexture/ITexture.MaterialName"
+        )
+        try:
+            occurrence_appearance = _appearance_raw(
+                holder,
+                configuration=configuration,
+                material_member="GetMaterialPropertyValues2",
+                material_args=(3, (configuration,)),
+                material_context=requested_context,
+                used_api=occurrence_api,
+            )
+        except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
+            occurrence_appearance = _unavailable_appearance_raw(
+                configuration=configuration,
+                material_context=requested_context,
+                used_api=occurrence_api,
+                error=_native_error_record(error),
+            )
+        appearance_raw = {
+            "component": component,
+            "source_document_path": source_scope.get("source_document_path"),
+            "referenced_configuration": configuration,
+            "native_active_configuration": native_active_configuration,
+            "native_active_configuration_error": native_active_configuration_error,
+            "document": document_appearance,
+            "occurrence": occurrence_appearance,
+            "bodies": [],
+        }
         for body_type, kind in ((0, "solid"), (1, "sheet")):
             try:
                 bodies = self._body_list(holder, body_type, component)
@@ -4437,6 +4671,40 @@ class SolidWorksBackend(CadBackend):
                     self.notes[
                         f"body_name_read_error:{component}:{body_type}/{body_index}"
                     ] = copy.deepcopy(body_name_error)
+                body_context = {
+                    "configuration_semantics": "active_configuration",
+                    "active_configuration": native_active_configuration,
+                }
+                body_api = (
+                    "IBody2.MaterialPropertyValues2"
+                    "/IBody2.HasMaterialPropertyValues"
+                    "/IBody2.GetTexture/ITexture.MaterialName"
+                )
+                try:
+                    body_appearance = _appearance_raw(
+                        body,
+                        configuration=configuration,
+                        material_member="MaterialPropertyValues2",
+                        material_context=body_context,
+                        used_api=body_api,
+                    )
+                except Exception as error:  # noqa: BLE001 - appearance is auxiliary
+                    body_appearance = _unavailable_appearance_raw(
+                        configuration=configuration,
+                        material_context=body_context,
+                        used_api=body_api,
+                        error=_native_error_record(error),
+                    )
+                appearance_raw["bodies"].append(
+                    {
+                        "component": component,
+                        "enumeration_api": "IComponent2.GetBodies2",
+                        "body_type": body_type,
+                        "body_index": body_index,
+                        "body_name": body_name,
+                        "appearance": body_appearance,
+                    }
+                )
                 try:
                     faces = _as_list(_member(body, "GetFaces"))
                 except Exception as error:  # noqa: BLE001
@@ -4538,6 +4806,7 @@ class SolidWorksBackend(CadBackend):
             "source_scope": source_scope,
             "transform_raw": _json_raw_value(occurrence_transform),
             "bodies": body_counts,
+            "appearance_raw": appearance_raw,
         }
 
     def _component_source_scope(self, component):

@@ -2312,6 +2312,226 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertEqual(error.code, "cad_coordinate_system_ambiguous")
             self.assertEqual(error.detail["datum"], "CS_tip")
 
+
+class AppearanceRawTests(unittest.TestCase):
+    def test_capture_records_document_occurrence_and_body_appearance_raw(self) -> None:
+        document_calls = []
+        occurrence_calls = []
+        texture_calls = []
+        document_values = [0.1, 0.2, 0.3, 0.2, 0.4, 0.5, 0.6, 0.0, 0.0]
+        occurrence_values = [-1.0] * 9
+        body_values = [0.7, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0]
+
+        with TemporaryDirectory() as tmp, _com_stubs():
+            fixture_root = Path(tmp)
+            part = _write(fixture_root, "arm.SLDPRT")
+            part_document = _Doc(
+                part,
+                configuration="Parked",
+                configuration_children={"Painted": [], "Parked": []},
+            )
+            document_texture = types.SimpleNamespace(MaterialName="C:\\textures\\paint.jpg")
+            body_texture = types.SimpleNamespace(MaterialName="C:\\textures\\brushed.jpg")
+            part_document.Extension.GetMaterialPropertyValues = (
+                lambda option, names: document_calls.append((option, names))
+                or list(document_values)
+            )
+            part_document.Extension.HasMaterialPropertyValues = lambda: True
+            part_document.Extension.GetTexture = (
+                lambda configuration: texture_calls.append(
+                    ("document", configuration)
+                )
+                or document_texture
+            )
+
+            face = _mesh_face(
+                lambda _quality: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                "appearance",
+            )
+            body = _mesh_body([face], "appearance")
+            body.MaterialPropertyValues2 = list(body_values)
+            body.HasMaterialPropertyValues = lambda: True
+            body.GetTexture = (
+                lambda configuration: texture_calls.append(
+                    ("body", configuration)
+                )
+                or body_texture
+            )
+            component = _Component(
+                "arm-1",
+                part,
+                doc=part_document,
+                configuration="Painted",
+            )
+            component.GetBodies2 = lambda body_type: [body] if body_type == 0 else []
+            component.GetMaterialPropertyValues2 = (
+                lambda option, names: occurrence_calls.append((option, names))
+                or list(occurrence_values)
+            )
+            component.HasMaterialPropertyValues = lambda: False
+            component.GetTexture = (
+                lambda configuration: texture_calls.append(
+                    ("occurrence", configuration)
+                )
+                or None
+            )
+            assembly = _write(fixture_root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = _CaptureBackend(
+                session_factory=lambda: _Session(_App({assembly: main}))
+            )
+            backend.capture_scene_for_test(str(assembly), [])
+            geometry = backend.capture_geometry_for_test()
+            raw = geometry["arm-1"]["appearance_raw"]
+
+            self.assertEqual(geometry["arm-1"]["state"], "observed")
+            self.assertEqual(geometry["arm-1"]["triangles"], 1)
+            self.assertEqual(part_document.active_configuration, "Parked")
+            self.assertEqual(document_calls, [(3, ("Painted",))])
+            self.assertEqual(occurrence_calls, [(3, ("Painted",))])
+            self.assertEqual(
+                texture_calls,
+                [
+                    ("document", "Painted"),
+                    ("occurrence", "Painted"),
+                    ("body", "Painted"),
+                ],
+            )
+            self.assertEqual(raw["component"], "arm-1")
+            self.assertEqual(
+                raw["source_document_path"].replace("\\", "/").casefold(),
+                str(part).replace("\\", "/").casefold(),
+            )
+            self.assertEqual(raw["referenced_configuration"], "Painted")
+            self.assertEqual(raw["native_active_configuration"], "Parked")
+            self.assertIsNone(raw["native_active_configuration_error"])
+            self.assertEqual(
+                raw["document"]["material_property_values"],
+                document_values,
+            )
+            self.assertTrue(raw["document"]["has_material_property_values"])
+            self.assertEqual(
+                raw["document"]["texture"],
+                {
+                    "configuration": "Painted",
+                    "state": "present",
+                    "material_name": "C:\\textures\\paint.jpg",
+                },
+            )
+            self.assertEqual(
+                raw["occurrence"]["material_property_values"],
+                occurrence_values,
+            )
+            self.assertFalse(raw["occurrence"]["has_material_property_values"])
+            self.assertEqual(raw["occurrence"]["texture"]["state"], "absent")
+            self.assertIsNone(raw["occurrence"]["texture"]["material_name"])
+            self.assertEqual(len(raw["bodies"]), 1)
+            body_raw = raw["bodies"][0]
+            self.assertEqual(
+                {
+                    "component": body_raw["component"],
+                    "enumeration_api": body_raw["enumeration_api"],
+                    "body_type": body_raw["body_type"],
+                    "body_index": body_raw["body_index"],
+                    "body_name": body_raw["body_name"],
+                },
+                {
+                    "component": "arm-1",
+                    "enumeration_api": "IComponent2.GetBodies2",
+                    "body_type": 0,
+                    "body_index": 0,
+                    "body_name": body.Name,
+                },
+            )
+            self.assertEqual(
+                body_raw["appearance"]["material_call"],
+                {
+                    "configuration_semantics": "active_configuration",
+                    "active_configuration": "Parked",
+                },
+            )
+            self.assertEqual(
+                body_raw["appearance"]["material_property_values"],
+                body_values,
+            )
+            self.assertTrue(body_raw["appearance"]["has_material_property_values"])
+            self.assertEqual(
+                body_raw["appearance"]["texture"]["material_name"],
+                "C:\\textures\\brushed.jpg",
+            )
+            self.assertEqual(
+                body_raw["appearance"]["read_errors"],
+                {},
+            )
+
+    def test_appearance_failures_do_not_block_native_triangle_capture(self) -> None:
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "arm.SLDPRT")
+            part_document = _Doc(part)
+
+            def fail_values(*_args):
+                raise RuntimeError("material property read failed")
+
+            def fail_texture(_configuration):
+                raise RuntimeError("texture read failed")
+
+            part_document.Extension.GetMaterialPropertyValues = fail_values
+            part_document.Extension.HasMaterialPropertyValues = lambda: "true"
+            part_document.Extension.GetTexture = fail_texture
+            face = _mesh_face(
+                lambda _quality: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                "appearance-errors",
+            )
+            body = _mesh_body([face], "appearance-errors")
+            body.MaterialPropertyValues2 = [0.0] * 8
+            body.HasMaterialPropertyValues = lambda: 1
+            body.GetTexture = fail_texture
+            component = _Component("arm-1", part, doc=part_document)
+            component.GetBodies2 = lambda body_type: [body] if body_type == 0 else []
+            component.GetMaterialPropertyValues2 = fail_values
+            component.HasMaterialPropertyValues = lambda: None
+            component.GetTexture = fail_texture
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = _CaptureBackend(
+                session_factory=lambda: _Session(_App({assembly: main}))
+            )
+            scene = backend.capture_scene_for_test(str(assembly), [])
+            geometry = backend.capture_geometry_for_test()
+            raw = geometry["arm-1"]["appearance_raw"]
+
+            self.assertEqual(scene.components[0].name, "arm-1")
+            self.assertEqual(geometry["arm-1"]["state"], "observed")
+            self.assertEqual(geometry["arm-1"]["triangles"], 1)
+            for layer in (raw["document"], raw["occurrence"]):
+                self.assertIsNone(layer["material_property_values"])
+                self.assertIsNone(layer["has_material_property_values"])
+                self.assertEqual(layer["texture"]["state"], "unreadable")
+                self.assertIn(
+                    "material_property_values",
+                    layer["read_errors"],
+                )
+                self.assertIn(
+                    "has_material_property_values",
+                    layer["read_errors"],
+                )
+                self.assertIn("texture", layer["read_errors"])
+            body_appearance = raw["bodies"][0]["appearance"]
+            self.assertEqual(body_appearance["material_property_values"], [0.0] * 8)
+            self.assertIsNone(body_appearance["has_material_property_values"])
+            self.assertEqual(body_appearance["texture"]["state"], "unreadable")
+            self.assertIn(
+                "has_material_property_values",
+                body_appearance["read_errors"],
+            )
+            self.assertIn("texture", body_appearance["read_errors"])
+            self.assertEqual(
+                body_appearance["read_errors"]["material_property_values"]["code"],
+                "cad_appearance_values_invalid",
+            )
+
+
 class PropertyContractTests(unittest.TestCase):
     """Vendor six-argument Get6 by-ref contract, no deprecated Get fallback."""
 

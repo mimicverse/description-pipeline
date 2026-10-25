@@ -14,6 +14,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
+from .appearance import UNRECORDED_APPEARANCE, require_fallback_eligible
 from .errors import ConfigError
 from .naming import (
     DISPLAY_MATERIAL_FALLBACK_NAME,
@@ -490,6 +491,9 @@ def build_scene(
     placements = {component.name: list(component.transform) for component in raw_scene.components}
     masses = {name: dict(payload) for name, payload in (raw_scene.mass_properties or {}).items()}
     geometry_by_component = {entry["component"]: entry for entry in geometry_entries}
+    component_by_name = {
+        str(component.name): component for component in raw_scene.components
+    }
     bodies = list(cfg.get("bodies") or [])
     if not bodies:
         raise ConfigError("native discovery must define the rigid bodies")
@@ -601,6 +605,28 @@ def build_scene(
             entry = geometry_by_component.get(reading.name)
             if entry is None:
                 continue
+            raw_component = component_by_name.get(reading.name)
+            if raw_component is None:
+                raise ConfigError(
+                    "captured appearance has no native component binding",
+                    {"component": reading.name},
+                )
+            source_scope = entry.get("source_scope") or {}
+            require_fallback_eligible(
+                getattr(
+                    raw_component,
+                    "appearance_raw",
+                    UNRECORDED_APPEARANCE,
+                ),
+                component=reading.name,
+                expected_document_path=source_scope.get(
+                    "source_document_path"
+                ),
+                expected_configuration=source_scope.get(
+                    "referenced_configuration"
+                ),
+                expected_bodies=entry.get("body_inventory"),
+            )
             if "rgba" in entry or "material" in entry:
                 raise ConfigError(
                     "This capture schema has no independently verified CAD appearance record",

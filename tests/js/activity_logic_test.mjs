@@ -167,10 +167,26 @@ const EMITTED_ACTIONS = [
   ["discover.read_properties", "Reading properties and delivery definitions"],
   ["discover.hash_sources", "Computing file digests"],
   ["discover.build_record", "Building discovery record"],
+  ["capture.start", "Starting prepared Capture"],
+  ["capture.prepared_source", "Verifying the prepared source"],
+  ["capture.open_prepared", "Opening the prepared assembly read-only"],
+  ["capture.readings", "Reading native scene, mass, datums and configuration"],
+  ["capture.geometry_facts", "Reading native bodies, faces and triangles"],
+  ["capture.release", "Releasing the owned CAD session"],
+  ["capture.scene_projection", "Projecting sealed native facts offline"],
+  ["capture.geometry", "Writing offline STL geometry"],
+  ["capture.seal", "Sealing Capture evidence"],
+  ["capture.prepare_capture", "Preparing the current Capture occurrence"],
+  ["capture.walk", "Reading the native occurrence tree"],
+  ["capture.instance_reads", "Reading instance configuration and mass properties"],
 ];
-assert.equal(EMITTED_ACTIONS.length, 11);
+assert.equal(EMITTED_ACTIONS.length, 23);
 for (const [code, label] of EMITTED_ACTIONS) {
-  assert.equal(actionText(code, "discover"), label, code);
+  assert.equal(
+    actionText(code, code.startsWith("capture.") ? "capture" : "discover"),
+    label,
+    code,
+  );
 }
 
 // Unknown codes fall back to a neutral stage phrase, never an invented specific.

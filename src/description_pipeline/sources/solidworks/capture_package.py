@@ -62,7 +62,7 @@ def _require_selector_state(item: dict, component: object) -> None:
         )
 
 
-def _require_supported_source_kind(component: object) -> None:
+def _require_supported_source_kind(component: object, name: str) -> None:
     """Reject the source class this capture runtime does not implement."""
 
     provenance = (
@@ -75,9 +75,18 @@ def _require_supported_source_kind(component: object) -> None:
         provenance.get("kind") == "native_import_materialization"
         or provenance.get("state") == "cached_materialization"
     ):
-        raise PipelineError(
-            "Cached-import materialization is not supported by Capture"
+        error = PipelineError(
+            f"Cached 3D Interconnect import is not an accepted capture input: {name}"
         )
+        error.details = {
+            "object": name,
+            "reason": "cached_materialization",
+            "state": provenance.get("state"),
+            "kind": provenance.get("kind"),
+            "used_api": provenance.get("used_api"),
+            "is_virtual": provenance.get("is_virtual"),
+        }
+        raise error
 
 
 def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
@@ -209,7 +218,7 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 "The sealed capture plan names instances outside the sealed record"
             )
         component = raw_components.get(name)
-        _require_supported_source_kind(component)
+        _require_supported_source_kind(component, name)
         document = item.get("document")
         if document is None:
             virtual = isinstance(

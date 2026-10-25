@@ -89,4 +89,8 @@ PR 绑定同一工程内容、工具、主体、报告与 commit。工程评审�
 description stage <verify-command-id>
 ```
 
-检查只读；上述 `rebuild` 命令只从冻结原生证据离线重新生成和验证，输出到新目录，不启动 CAD，也不修改原生证据。产物用于维护复核，不进入平台发布流程。发布恢复使用操作台的发布重跑，以保持同一授权、目标和审计流程。命令与完整交付边界见[交付契约](contracts.md#delivery)。
+检查只读；上述命令只执行已登记的不可变 Verify command，由同一版
+`StageApplication` 在隔离执行环境中读取冻结输入和原始证据，独立复算并核验报告以及
+command、subject、policy、tool 与 execution 绑定。它不创建新的正式 run，不启动
+CAD，也不修改原始证据；复核结论不进入平台发布流程。发布恢复使用操作台的发布重跑，
+以保持同一授权、目标和审计流程。命令与完整交付边界见[交付契约](contracts.md#delivery)。

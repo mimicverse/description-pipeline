@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import _paths  # noqa: F401
 from . import support
+from description_pipeline.sources.solidworks.appearance import AppearanceError
 from description_pipeline.sources.solidworks.errors import ConfigError
 from description_pipeline.sources.solidworks.freeze import validate_source_config as _validate_source_config
 from description_pipeline.sources.solidworks.scene import load_scene
@@ -70,6 +71,81 @@ def _compose_scene_inputs(destination: Path, cad_root: Path) -> None:
     )
 
 
+def _appearance_owner(
+    *,
+    configuration: str,
+    member: str,
+    active: bool = False,
+    values=None,
+    has_values: bool = False,
+    read_errors=None,
+):
+    material_call = (
+        {
+            "configuration_semantics": "active_configuration",
+            "active_configuration": configuration,
+        }
+        if active
+        else {
+            "configuration_semantics": "requested_configuration",
+            "configuration_option": 3,
+            "configuration_names": [configuration],
+        }
+    )
+    return {
+        "used_api": member,
+        "material_call": material_call,
+        "presence_call": {
+            "arguments": [],
+            "configuration_semantics": "native_owner_context",
+        },
+        "material_property_values": values,
+        "has_material_property_values": has_values,
+        "texture": {
+            "configuration": configuration,
+            "state": "absent",
+            "material_name": None,
+        },
+        "read_errors": dict(read_errors or {}),
+    }
+
+
+def _appearance_raw(component: str, scope: dict, *, claimed: bool = False):
+    configuration = str(scope["referenced_configuration"])
+    values = [0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4, 0.0, 0.0]
+    return {
+        "component": component,
+        "source_document_path": scope["source_document_path"],
+        "referenced_configuration": configuration,
+        "native_active_configuration": configuration,
+        "native_active_configuration_error": None,
+        "document": _appearance_owner(
+            configuration=configuration,
+            member="IModelDocExtension.GetMaterialPropertyValues",
+            values=values if claimed else None,
+            has_values=claimed,
+        ),
+        "occurrence": _appearance_owner(
+            configuration=configuration,
+            member="IComponent2.GetMaterialPropertyValues2",
+        ),
+        "bodies": [
+            {
+                "component": component,
+                "enumeration_api": "IComponent2.GetBodies2",
+                "body_type": 0,
+                "body_index": 0,
+                "body_name": component,
+                "appearance": _appearance_owner(
+                    configuration=configuration,
+                    member="IBody2.MaterialPropertyValues2",
+                    active=True,
+                ),
+            }
+        ],
+    }
+
+
 class CadMassAuthorityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-cad-mass-"))
@@ -122,6 +198,21 @@ class CadMassAuthorityTests(unittest.TestCase):
         freeze(dict(self.config), snapshot, backend=self.backend)
         return snapshot
 
+    def _install_appearance(self, *, claimed: bool) -> None:
+        capture_geometry = self.backend.capture_prepared_geometry
+
+        def capture_with_appearance(source_scopes, on_activity=None):
+            rows = capture_geometry(source_scopes, on_activity=on_activity)
+            for component, row in rows.items():
+                row["appearance_raw"] = _appearance_raw(
+                    component,
+                    row["source_scope"],
+                    claimed=claimed and component == "arm-1",
+                )
+            return rows
+
+        self.backend.capture_prepared_geometry = capture_with_appearance
+
     def test_manual_mass_configuration_is_rejected(self) -> None:
         for key, value in (
             ("documented_masses", {"arm-1": {"mass_kg": 0.5, "reason": "manual", "evidence": "table"}}),
@@ -171,6 +262,38 @@ class CadMassAuthorityTests(unittest.TestCase):
         self.assertFalse((snapshot / "raw/declared_masses.json").exists())
         scene = load_scene(snapshot)
         self.assertNotIn("warnings", scene["provenance"])
+
+    def test_unobserved_appearance_keeps_the_warned_fallback_eligible(self) -> None:
+        self._install_appearance(claimed=False)
+        snapshot = self._freeze("appearance-unobserved")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
+        scene = load_scene(snapshot)
+        visuals = [
+            visual
+            for link in scene["links"]
+            for visual in link.get("visuals") or []
+        ]
+        self.assertTrue(visuals)
+        self.assertTrue(
+            all(
+                visual["provenance"]["material_source"]
+                == "platform_display_fallback"
+                for visual in visuals
+            )
+        )
+
+    def test_generate_rejects_claimed_appearance_without_effective_scope(self) -> None:
+        self._install_appearance(claimed=True)
+        snapshot = self._freeze("appearance-claimed")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
+        with self.assertRaises(AppearanceError) as caught:
+            load_scene(snapshot)
+        appearance = caught.exception.details["appearance"]
+        self.assertEqual(appearance["component"], "arm-1")
+        self.assertIn(
+            "cad_appearance_effective_scope_unproven",
+            {issue["code"] for issue in appearance["issues"]},
+        )
 
 
 if __name__ == "__main__":

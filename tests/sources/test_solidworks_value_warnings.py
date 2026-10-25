@@ -20,6 +20,7 @@ from description_pipeline.sources.solidworks.naming import (
     mesh_path,
     visual_name,
 )
+from description_pipeline.sources.solidworks.appearance import AppearanceError
 from description_pipeline.sources.solidworks.scene import _value_warnings
 from description_pipeline.verification.solidworks_urdf import (
     _carrier_binding,
@@ -56,6 +57,75 @@ def metadata_value_warning() -> dict:
             }
         ],
     }
+
+
+def appearance_evidence(*, claimed: bool) -> tuple[dict, dict]:
+    document = r"C:\capture\part-1.SLDPRT"
+    configuration = "Default"
+
+    def owner(member: str, *, active: bool = False, has_values: bool = False):
+        return {
+            "used_api": member,
+            "material_call": (
+                {
+                    "configuration_semantics": "active_configuration",
+                    "active_configuration": configuration,
+                }
+                if active
+                else {
+                    "configuration_semantics": "requested_configuration",
+                    "configuration_option": 3,
+                    "configuration_names": [configuration],
+                }
+            ),
+            "presence_call": {
+                "arguments": [],
+                "configuration_semantics": "native_owner_context",
+            },
+            "material_property_values": (
+                [0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4, 0.0, 0.0]
+                if has_values
+                else None
+            ),
+            "has_material_property_values": has_values,
+            "texture": {
+                "configuration": configuration,
+                "state": "absent",
+                "material_name": None,
+            },
+            "read_errors": {},
+        }
+
+    raw = {
+        "component": "part-1",
+        "source_document_path": document,
+        "referenced_configuration": configuration,
+        "native_active_configuration": configuration,
+        "native_active_configuration_error": None,
+        "document": owner(
+            "IModelDocExtension.GetMaterialPropertyValues",
+            has_values=claimed,
+        ),
+        "occurrence": owner("IComponent2.GetMaterialPropertyValues2"),
+        "bodies": [
+            {
+                "component": "part-1",
+                "enumeration_api": "IComponent2.GetBodies2",
+                "body_type": 0,
+                "body_index": 0,
+                "body_name": "part",
+                "appearance": owner(
+                    "IBody2.MaterialPropertyValues2",
+                    active=True,
+                ),
+            }
+        ],
+    }
+    scope = {
+        "source_document_path": document,
+        "referenced_configuration": configuration,
+    }
+    return raw, scope
 
 
 class ValueWarningTests(unittest.TestCase):
@@ -372,6 +442,67 @@ class ValueWarningTests(unittest.TestCase):
                     }
                 ],
             )
+
+    def test_verify_accepts_explicitly_unobserved_raw_with_the_warned_fallback(self):
+        raw, scope = appearance_evidence(claimed=False)
+        result = _value_warning_gate(
+            self.root,
+            self.source,
+            self.model,
+            native_geometry_rows=[
+                {
+                    "component": "part-1",
+                    "path": "geometry/mesh.stl",
+                    "sha": self.digest,
+                    "source_scope": scope,
+                }
+            ],
+            raw_scene={
+                "components": [
+                    {
+                        "name": "part-1",
+                        "appearance_raw": raw,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(result["objects"], 8)
+
+    def test_verify_rejects_claimed_raw_without_an_effective_appearance_proof(self):
+        raw, scope = appearance_evidence(claimed=True)
+        with self.assertRaises(AppearanceError) as caught:
+            _value_warning_gate(
+                self.root,
+                self.source,
+                self.model,
+                native_geometry_rows=[
+                    {
+                        "component": "part-1",
+                        "path": "geometry/mesh.stl",
+                        "sha": self.digest,
+                        "source_scope": scope,
+                    }
+                ],
+                raw_scene={
+                    "components": [
+                        {
+                            "name": "part-1",
+                            "appearance_raw": raw,
+                        }
+                    ]
+                },
+            )
+        self.assertEqual(
+            caught.exception.details["appearance"]["component"],
+            "part-1",
+        )
+        self.assertIn(
+            "cad_appearance_effective_scope_unproven",
+            {
+                issue["code"]
+                for issue in caught.exception.details["appearance"]["issues"]
+            },
+        )
 
     def test_functional_joint_name_is_rederived_from_raw_axis_not_source_provenance(self):
         native_bodies = [

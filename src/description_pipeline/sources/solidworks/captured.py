@@ -51,14 +51,22 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
             "this workflow requires a capture made by the direct-link-readout pipeline"
         )
     link_groups = read_data(confined(root, "raw/link_group_mass_properties.json"))
-    components = raw.get("components")
-    if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
-        raise PipelineError("Captured component readings must be objects")
     geometry = (
         read_data(confined(root, "raw/geometry.json"))
         if "raw/geometry.json" in manifest["files"]
         else []
     )
+    if "raw/native_capture_facts.json" in manifest["files"]:
+        from .appearance import bind_capture_appearance
+
+        raw, geometry = bind_capture_appearance(
+            raw,
+            geometry,
+            read_data(confined(root, "raw/native_capture_facts.json")),
+        )
+    components = raw.get("components")
+    if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
+        raise PipelineError("Captured component readings must be objects")
     readings = SimpleNamespace(
         components=[SimpleNamespace(**row) for row in components],
         coordinate_systems=datums,

@@ -648,6 +648,14 @@ def _failure(job: dict, stage: dict) -> dict:
             "The Windows native environment is not ready (service, license, or similar); "
             "the stage did not complete. Contact platform maintenance."
         )
+    elif raw_type in {"ModuleNotFoundError", "ImportError"}:
+        kind = "runtime"
+        title = "Native runtime import failed"
+        meaning = (
+            "The native stage could not import a required runtime module before completing its "
+            "task. The recorded exception is preserved; inspect the exact module and import "
+            "location in the raw failure evidence."
+        )
     elif raw_type == "TimeoutError" or "modal" in message.lower():
         kind = "runtime"
         title = "Native session blocked"
@@ -685,6 +693,18 @@ def _failure(job: dict, stage: dict) -> dict:
         failure["finding_counts"] = structured_groups
         failure["finding_samples"] = structured_samples
     failed_object = _failure_object(raw_type, message, raw_detail)
+    appearance = (
+        raw_detail.get("appearance")
+        if isinstance(raw_detail, dict)
+        else None
+    )
+    if (
+        failed_object is None
+        and isinstance(appearance, dict)
+        and isinstance(appearance.get("component"), str)
+        and appearance["component"].strip()
+    ):
+        failed_object = appearance["component"].strip()
     activity = job.get("activity_final") if isinstance(job.get("activity_final"), dict) else {}
     if (activity.get("stage") or activity.get("phase")) != stage.get("id"):
         activity = {}
@@ -755,6 +775,20 @@ def _failure(job: dict, stage: dict) -> dict:
         )
         if evidence_path:
             failure["evidence_path"] = evidence_path
+    if raw_type in {"ModuleNotFoundError", "ImportError"}:
+        phase = _first_text(
+            activity.get("action"),
+            activity.get("phase"),
+            stage.get("id"),
+        )
+        if phase:
+            failure["phase"] = phase
+        failure["cause"] = raw_error or message or "Import failure"
+        if stage.get("id") == "capture":
+            failure["actual_native_activity"] = (
+                activity if activity else "Not recorded"
+            )
+            failure["actual_native_identity"] = "Not recorded"
     return failure
 
 

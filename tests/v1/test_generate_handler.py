@@ -19,6 +19,7 @@ from description_pipeline.pipeline.contracts import (
     ProtocolError,
     StageCandidate,
     StageCommand,
+    StageFailure,
     StageResult,
 )
 from description_pipeline.pipeline.engine import StageWorkspace
@@ -32,6 +33,10 @@ from description_pipeline.pipeline.stages.generate import (
     GenerateHandler,
 )
 from description_pipeline.sources.solidworks.naming import visual_name
+from description_pipeline.sources.solidworks.appearance import (
+    AppearanceAudit,
+    AppearanceError,
+)
 from description_pipeline.sources.snapshot import write_manifest
 
 from tests.sources import test_solidworks_mass_authority as authority_fixtures
@@ -280,6 +285,44 @@ class GenerateHandlerTests(unittest.TestCase):
                 workspace,
                 effects=object(),
             )
+        self.assertFalse((workspace.root / "output").exists())
+
+    def test_appearance_rejection_preserves_structured_failure_details(self) -> None:
+        workspace, claim = self._workspace("appearance-failure", 1)
+        audit = AppearanceAudit(
+            "arm-1",
+            "unrepresentable",
+            (
+                {
+                    "code": "cad_appearance_effective_scope_unproven",
+                    "path": "appearance_raw",
+                    "message": "delivered-face coverage is not proven",
+                },
+            ),
+            (),
+        )
+        with (
+            patch.object(
+                generate_stage,
+                "_compile_capture",
+                side_effect=AppearanceError(audit),
+            ),
+            self.assertRaises(StageFailure) as caught,
+        ):
+            self.handler.execute(
+                self.command,
+                claim,
+                workspace,
+                effects=object(),
+            )
+        self.assertEqual(
+            caught.exception.reason_code,
+            "generate.appearance_unrepresentable",
+        )
+        self.assertEqual(
+            caught.exception.detail["appearance"]["component"],
+            "arm-1",
+        )
         self.assertFalse((workspace.root / "output").exists())
 
 

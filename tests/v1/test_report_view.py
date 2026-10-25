@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from description_pipeline.orchestration.report_view import build_report
-from description_pipeline.stages import CONTRACT
+from description_pipeline.stages import CONTRACT, activity_view
 from description_pipeline.verification.solidworks_urdf import evaluate_bundle
 from tests.v1.protocol_support import protocol_events
 
@@ -94,6 +94,48 @@ def passed_job() -> dict:
 
 
 class ReportViewTests(unittest.TestCase):
+    def test_activity_view_keeps_native_read_release_and_offline_phases(self) -> None:
+        view = activity_view(
+            {
+                "status": "running",
+                "events": [],
+                "activity_history": [
+                    {
+                        "at": "2026-10-25T21:20:01Z",
+                        "code": "capture.readings",
+                        "object": "robot.SLDASM",
+                    },
+                    {
+                        "at": "2026-10-25T21:20:02Z",
+                        "code": "capture.geometry_facts",
+                        "object": "arm-1",
+                    },
+                    {
+                        "at": "2026-10-25T21:20:03Z",
+                        "code": "capture.release",
+                        "object": None,
+                    },
+                ],
+                "activity": {
+                    "phase": "capture",
+                    "action": "scene_projection",
+                    "started_at": "2026-10-25T21:20:03Z",
+                    "updated_at": "2026-10-25T21:20:04Z",
+                    "current_object": "robot.SLDASM",
+                },
+            }
+        )
+        self.assertEqual(view["state"], "busy")
+        self.assertEqual(view["action"]["code"], "capture.scene_projection")
+        self.assertEqual(
+            [item["code"] for item in view["recent"]],
+            [
+                "capture.release",
+                "capture.geometry_facts",
+                "capture.readings",
+            ],
+        )
+
     def test_source_warning_objects_and_rule_fields_survive_the_report_projection(self) -> None:
         from description_pipeline.orchestration.report_view import _warning_row
 
@@ -357,6 +399,60 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(failure["error_code"], "cad_link_group_payload_invalid")
         self.assertEqual(failure["raw_detail"], {"body": "r_thigh_yaw"})
         self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
+
+    def test_generate_appearance_failure_preserves_object_phase_and_details(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="generate")
+        job["error"] = "AppearanceError: CAD appearance cannot be represented faithfully"
+        job["error_code"] = "generate.appearance_unrepresentable"
+        job["detail"] = {
+            "appearance": {
+                "component": "arm-1",
+                "state": "unrepresentable",
+                "issues": [
+                    {
+                        "code": "cad_appearance_effective_scope_unproven",
+                        "path": "appearance_raw",
+                        "message": "delivered-face coverage is not proven",
+                    }
+                ],
+                "claims": [],
+            }
+        }
+        job["activity_final"] = {
+            "stage": "generate",
+            "phase": "generate",
+            "action": "validate_appearance",
+            "current_object": "arm-1",
+        }
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["stage"], "generate")
+        self.assertEqual(failure["error_code"], "generate.appearance_unrepresentable")
+        self.assertEqual(failure["object"], "arm-1")
+        self.assertEqual(failure["phase"], "validate_appearance")
+        self.assertEqual(
+            failure["values"]["appearance"],
+            job["detail"]["appearance"],
+        )
+
+    def test_capture_import_failure_keeps_real_error_without_native_identity(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="capture")
+        job["error"] = "ModuleNotFoundError: No module named 'yaml'"
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["stage"], "capture")
+        self.assertEqual(failure["title"], "Native runtime import failed")
+        self.assertEqual(failure["kind"], "runtime")
+        self.assertEqual(failure["phase"], "capture")
+        self.assertEqual(
+            failure["cause"],
+            "ModuleNotFoundError: No module named 'yaml'",
+        )
+        self.assertEqual(failure["actual_native_activity"], "Not recorded")
+        self.assertEqual(failure["actual_native_identity"], "Not recorded")
+        self.assertNotIn("object", failure)
 
     def test_publish_failure_does_not_use_stale_capture_activity(self) -> None:
         job = passed_job()

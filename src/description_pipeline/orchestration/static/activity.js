@@ -42,6 +42,18 @@ const ACTION_TEXT = {
   "discover.read_properties": "Reading properties and delivery definitions",
   "discover.hash_sources": "Computing file digests",
   "discover.build_record": "Building discovery record",
+  "capture.start": "Starting prepared Capture",
+  "capture.prepared_source": "Verifying the prepared source",
+  "capture.open_prepared": "Opening the prepared assembly read-only",
+  "capture.readings": "Reading native scene, mass, datums and configuration",
+  "capture.geometry_facts": "Reading native bodies, faces and triangles",
+  "capture.release": "Releasing the owned CAD session",
+  "capture.scene_projection": "Projecting sealed native facts offline",
+  "capture.geometry": "Writing offline STL geometry",
+  "capture.seal": "Sealing Capture evidence",
+  "capture.prepare_capture": "Preparing the current Capture occurrence",
+  "capture.walk": "Reading the native occurrence tree",
+  "capture.instance_reads": "Reading instance configuration and mass properties",
 };
 
 const UNIT_TEXT = {
