@@ -123,10 +123,6 @@
         {
           "id": "input.valid",
           "label": "Derived definition, native provenance and archive integrity"
-        },
-        {
-          "id": "runtime.ready",
-          "label": "Native Windows, COM and SolidWorks prerequisites"
         }
       ],
       "outputs": [

@@ -241,20 +241,6 @@ def _capture_events(
             ),
         ),
         event(
-            8,
-            "capture",
-            "running",
-            check(
-                "input",
-                "runtime.ready",
-                {
-                    "role": "native",
-                    "scope": "fixture",
-                    "solidworks_executable": r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\sldworks.exe",
-                },
-            ),
-        ),
-        event(
             9,
             "capture",
             "running",
@@ -1605,12 +1591,6 @@ class StageTransferTests(unittest.TestCase):
                 "discovery.binding",
                 lambda details: details["files"].update(
                     {"input/forged.SLDPRT": "0" * 64}
-                ),
-            ),
-            (
-                "runtime.ready",
-                lambda details: details.update(
-                    solidworks_executable=r"C:\foreign\not-solidworks.exe"
                 ),
             ),
         )

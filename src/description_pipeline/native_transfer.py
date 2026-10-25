@@ -729,14 +729,13 @@ def _validate_stage_details(
         native_files=native_files,
     )
     required_identifiers = (
-        {"input.valid", "capture.integrity", "capture.input_stability", "runtime.ready"}
+        {"input.valid", "capture.integrity", "capture.input_stability"}
         if capture_only
         else set(expected)
         | {
             "handoff.admission",
             "discovery.definition",
             "discovery.binding",
-            "runtime.ready",
         }
     )
     _require(
@@ -752,16 +751,6 @@ def _validate_stage_details(
         )
 
     if capture_only:
-        runtime_ready = checks["runtime.ready"].get("details")
-        _require(
-            isinstance(runtime_ready, dict)
-            and runtime_ready.get("role") == "native"
-            and isinstance(runtime_ready.get("scope"), str)
-            and bool(runtime_ready["scope"])
-            and isinstance(runtime_ready.get("solidworks_executable"), str)
-            and _document_basename(runtime_ready["solidworks_executable"]).casefold() == "sldworks.exe",
-            "Capture runtime.ready does not bind the native SolidWorks executable",
-        )
         return
 
     admission = checks["handoff.admission"].get("details")
@@ -901,18 +890,6 @@ def _validate_stage_details(
         and (binding.get("prepared_sha256") is None or _is_sha256(binding.get("prepared_sha256"))),
         "Discover discovery.binding differs from the sealed discovery identity",
     )
-
-    runtime_ready = checks["runtime.ready"].get("details")
-    _require(
-        isinstance(runtime_ready, dict)
-        and runtime_ready.get("role") == "native"
-        and isinstance(runtime_ready.get("scope"), str)
-        and bool(runtime_ready["scope"])
-        and isinstance(runtime_ready.get("solidworks_executable"), str)
-        and _document_basename(runtime_ready["solidworks_executable"]).casefold() == "sldworks.exe",
-        "Capture runtime.ready does not bind the native SolidWorks executable",
-    )
-
 
 def _validate_source_identity(
     root: Path,

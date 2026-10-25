@@ -50,18 +50,9 @@ def fixture_mass_payload(
 
 
 class AxisFixtureBackend(support.FixtureCadBackend):
-    """Fixture backend with the native readiness metadata used by stage tests."""
+    """Fixture backend used by Capture and stage tests."""
 
     evidence_class = "cad"
-
-    def native_ready(self) -> dict:
-        return {
-            "role": "native",
-            "scope": "provided synthetic CAD backend for the capture regression suite",
-            "solidworks_executable": (
-                r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\SLDWORKS.exe"
-            ),
-        }
 
     def collect_scene(
         self,

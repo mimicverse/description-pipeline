@@ -63,11 +63,6 @@ def passed_job() -> dict:
             "files": {"handoff/a.SLDPRT": "a" * 64, "handoff/b.SLDPRT": "b" * 64, "handoff/c.SLDPRT": "c" * 64}
         },
         "discovery.definition": {"passed": True, "findings": [], "hardware_id": "nd_cfg_gap", "revision": "r1"},
-        "runtime.ready": {
-            "role": "native",
-            "scope": "Native prerequisites; the capture session checks CAD access and document readiness",
-            "solidworks_executable": "D:\\DOWNLO~1\\SOLIDWORKS\\SLDWORKS.exe",
-        },
         "publication.inputs": {
             "repository_slug": "example/repo",
             "base": "feature/nd_cfg_gap",
@@ -243,14 +238,6 @@ class ReportViewTests(unittest.TestCase):
         definition = next(row for row in discover["boundary"] if row["id"] == "discovery.definition")
         self.assertIn("Hardware nd_cfg_gap", definition["summary"]["actual"])
         self.assertIn("blocking findings 0", definition["summary"]["actual"])
-        runtime = next(row for row in stages["capture"]["boundary"] if row["id"] == "runtime.ready")
-        # Native readiness reports prerequisites; the CAD session itself is not claimed here, and
-        # the raw host executable path never reaches the operator summary.
-        self.assertEqual(runtime["summary"]["expected"], "Native platform and SolidWorks are ready")
-        self.assertIn("Windows, COM, and SolidWorks prerequisites", runtime["summary"]["actual"])
-        self.assertIn("capture session", runtime["summary"]["actual"])
-        self.assertNotIn("not recorded", runtime["summary"]["actual"])
-        self.assertNotIn("SLDWORKS.exe", runtime["summary"]["actual"])
         consumer = independent["consumer.urdf"]
         self.assertEqual(consumer["label"], "Consumer URDF loadability")
         self.assertIn("4 consumer bodies", consumer["summary"]["actual"])

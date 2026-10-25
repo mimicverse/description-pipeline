@@ -90,13 +90,6 @@ def _fixture_backend(assembly: Path, parts: list[Path], masses: tuple[dict, dict
     from tests.sources import support
 
     class PreparedBackend(support.FixtureCadBackend):
-        def native_ready(self):
-            return {
-                "role": "native",
-                "scope": "provided fixture CAD backend",
-                "solidworks_executable": (r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\SLDWORKS.exe"),
-            }
-
         def source_scopes(self, components):
             prepared_root = Path(self._prepared_capture_root)
             package_root = Path(self.document).resolve().parents[1]

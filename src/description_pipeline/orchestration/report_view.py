@@ -50,7 +50,6 @@ _BOUNDARY_LABELS = {
     "discovery.definition": "Structure definition generation",
     "discovery.binding": "Structure and identity binding",
     "input.valid": "Input validity (read-only snapshot semantics)",
-    "runtime.ready": "Native runtime readiness",
     "capture.integrity": "Capture integrity (bytes and inventory)",
     "capture.input_stability": "Input-stability recheck",
     "generation.inputs": "Generation input validity",
@@ -337,15 +336,6 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
             "scope": "CAD package input specification",
             "expected": "The CAD package passes the input specification and its archive agrees",
             "actual": f"CAD revision {revision or 'not recorded'}" + (f"; {count} files" if count is not None else ""),
-        }
-    if name == "runtime.ready":
-        return {
-            "scope": "Native runtime environment",
-            "expected": "Native platform and SolidWorks are ready",
-            "actual": (
-                "Windows, COM, and SolidWorks prerequisites were checked; "
-                "the capture session verifies actual CAD access and document readiness"
-            ),
         }
     if name == "capture.integrity":
         files = details.get("files")

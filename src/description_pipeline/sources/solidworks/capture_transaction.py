@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-import sys
 from pathlib import Path
 
 from ... import __version__
@@ -567,33 +566,6 @@ def capture_native_package(
         },
     )
 
-    def ready():
-        if backend is None and sys.platform != "win32":
-            raise PipelineError(
-                "Native SLDASM/SLDPRT capture requires Windows with licensed SolidWorks"
-            )
-        if backend is None:
-            from ...runtime import native_readiness
-
-            return native_readiness()
-        reader = getattr(backend, "native_ready", None)
-        if callable(reader):
-            return reader()
-        return {
-            "role": "native",
-            "scope": (
-                "provided CAD backend; native qualification is "
-                "recorded in the capture evidence"
-            ),
-        }
-
-    checked(
-        on_event,
-        "capture",
-        "input",
-        "runtime.ready",
-        ready,
-    )
     _require(
         package_inventory(package) == original_files,
         "Prepared inputs changed before native capture",
