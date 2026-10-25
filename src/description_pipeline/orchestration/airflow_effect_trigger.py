@@ -21,7 +21,6 @@ from ..pipeline.contracts import (
 )
 from ..pipeline.effects import EffectIntent, EffectSettlement
 from ..platform.facts import FactStore
-from ..schemas import NATIVE_DISCOVER_EFFECT_SCHEMA
 
 if TYPE_CHECKING:
     from ..pipeline.application import EffectWakeupHint

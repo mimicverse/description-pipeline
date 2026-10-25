@@ -1,10 +1,8 @@
-"""Sealed delivery storage: the one locator for registered checkpoint references.
+"""Historical native-recovery sealing support.
 
-The platform store registers ``store://sealed/<run_id>/<stage>`` locators; the
-bytes live under the configured store root.  Resolution is confined to that
-root, binds exactly one run and one stage, refuses symbolic links and never
-scans for a "newest" delivery - only a reference the store already registered
-is resolved, and the delivery manifest is still verified independently.
+Live stage outputs use immutable ArtifactRef records. This confined tree writer
+remains only for the explicit one-time native recovery migration; the portal
+and canonical run projection never resolve or accept these tree locators.
 """
 
 from __future__ import annotations

@@ -30,10 +30,7 @@ from urllib import request as urlrequest
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from description_pipeline.orchestration.airflow_client import (
-    EndpointConfig,
     PIPELINE_ID,
-    WindowsEndpoint,
-    EndpointError,
     native_run_id,
 )
 from description_pipeline.orchestration.feishu_oauth import TRIGGERING_USER_NAME_LIMIT
@@ -654,7 +651,7 @@ class PreviewStore:
 class ProjectionArtifactStore:
     """In-memory materializer for complete test-side fact projections."""
 
-    def __init__(self, platform: FakePlatformStore) -> None:
+    def __init__(self, platform: FakeRunControl) -> None:
         self.platform = platform
         self.objects: dict[str, dict[str, bytes]] = {}
         self.refs: dict[str, dict] = {}
@@ -701,7 +698,7 @@ class ProjectionArtifactStore:
         return root
 
 
-class FakePlatformStore:
+class FakeRunControl:
     """The portal-side admission surface: open by default, recording every admit."""
 
     def __init__(self) -> None:
@@ -1012,8 +1009,6 @@ class FakePlatformStore:
                     "artifacts": artifacts,
                     "failure": failure,
                 },
-                "checkpoint_uri": artifact["locator"],
-                "reused_from_run": None,
                 "updated_at": None,
             }
             by_stage[stage] = rows
@@ -1044,8 +1039,6 @@ class FakePlatformStore:
                         "state": "waiting",
                         "decision": None,
                         "receipt": {"artifacts": []},
-                        "checkpoint_uri": None,
-                        "reused_from_run": None,
                         "updated_at": None,
                     }
                     by_stage[stage] = {}
@@ -1264,8 +1257,6 @@ class FakePlatformStore:
                     "artifacts": [],
                     **({"stage_report": stage_report} if stage_report else {}),
                 },
-                "checkpoint_uri": f"store://sealed/{run_id}/{stage}",
-                "reused_from_run": None,
                 "original_executed_at": None,
                 "updated_at": None,
             }
@@ -1289,8 +1280,6 @@ class FakePlatformStore:
                         ],
                         **({"stage_report": stage_report} if stage_report else {}),
                     },
-                    "checkpoint_uri": f"store://sealed/{run_id}/freeze",
-                    "reused_from_run": None,
                     "original_executed_at": None,
                     "updated_at": None,
                 }
@@ -1306,8 +1295,6 @@ class FakePlatformStore:
                     "error": preview.get("error"),
                     **({"stage_report": stage_report} if stage_report else {}),
                 },
-                "checkpoint_uri": f"store://sealed/{run_id}/verify",
-                "reused_from_run": None,
                 "original_executed_at": None,
                 "updated_at": None,
             }
@@ -1327,8 +1314,6 @@ class FakePlatformStore:
                     "submission": result.get("submission"),
                     **({"stage_report": stage_report} if stage_report else {}),
                 },
-                "checkpoint_uri": f"store://sealed/{run_id}/publish",
-                "reused_from_run": None,
                 "original_executed_at": None,
                 "updated_at": None,
             }
@@ -1352,39 +1337,6 @@ class FakePlatformStore:
                 }
             )
         return [row for row in rows if row["seq"] > after_seq][:limit]
-
-    def sealed_path(self, checkpoint_uri: str):
-        """Materialize the registered checkpoint members and return their root."""
-
-        prefix = "store://sealed/"
-        if not isinstance(checkpoint_uri, str) or not checkpoint_uri.startswith(prefix):
-            raise FactStoreError("invalid sealed reference")
-        parts = checkpoint_uri.removeprefix(prefix).split("/")
-        if len(parts) != 2 or not all(parts) or self.fixtures is None:
-            raise FactStoreError("invalid sealed reference")
-        run_id, stage = parts
-        entry = self._entry(run_id)
-        if entry is None:
-            raise FactStoreError("the run is not registered")
-        base = self.fixtures.root / "sealed" / run_id / stage
-        preview = entry.get("preview")
-        files = {}
-        if isinstance(preview, dict):
-            files = {**(preview.get("files") or {}), **(preview.get("report_files") or {})}
-        artifacts = entry.get("artifacts") or {}
-        for path, _digest in files.items():
-            data = artifacts.get(path)
-            if not isinstance(data, (bytes, bytearray)):
-                continue
-            target = base / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(bytes(data))
-        report = self._stage_report_bytes(run_id)
-        if report is not None:
-            target = base / "reports" / "stages.json"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(report)
-        return base
 
     def admission(self):
         if self.read_error is not None:
@@ -1536,13 +1488,12 @@ class PortalTests(unittest.TestCase):
         self.airflow = MockAirflow()
         self.airflow.__enter__()
         self.addCleanup(self.airflow.__exit__, None, None, None)
-        self.platform = FakePlatformStore()
+        self.platform = FakeRunControl()
         self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))
         self.addCleanup(shutil.rmtree, self.upload_root, ignore_errors=True)
         self.endpoint_server = FakeEndpoint()
         self.endpoint_server.__enter__()
         self.addCleanup(self.endpoint_server.__exit__, None, None, None)
-        self.endpoint = WindowsEndpoint(EndpointConfig(base_url=self.endpoint_server.url, token="test-token"))
         self.store_root = Path(tempfile.mkdtemp(prefix="portal-store-"))
         self.addCleanup(shutil.rmtree, self.store_root, ignore_errors=True)
         self.store = PreviewStore(self.store_root)
@@ -1912,12 +1863,6 @@ class PortalTests(unittest.TestCase):
                     "handoff_sha256": handoff,
                     **(failure if stage_id == "capture" else {}),
                 },
-                "checkpoint_uri": (
-                    f"store://sealed/{run_id}/{stage_id}"
-                    if stage_id in {"freeze", "discover"} and state == "completed"
-                    else None
-                ),
-                "reused_from_run": None,
                 "original_executed_at": None,
             }
             for stage_id, state in states.items()
@@ -2436,18 +2381,17 @@ class PortalTests(unittest.TestCase):
             {"eligible": False, "reason": "registered_failed", "classification": "engineering_terminal_failure"},
         )
         self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
-        with patch.object(self.endpoint, "get_job", side_effect=EndpointError("offline")):
-            status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-            self.assertEqual(status, 200, body)
-            self.assertEqual(
-                json.loads(body)["retry"],
-                {
-                    "eligible": False,
-                    "reason": "registered_failed",
-                    "classification": "engineering_terminal_failure",
-                },
-            )
-            self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            json.loads(body)["retry"],
+            {
+                "eligible": False,
+                "reason": "registered_failed",
+                "classification": "engineering_terminal_failure",
+            },
+        )
+        self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
         self.assertEqual(self.airflow.clear_requests, [])
 
     def test_retry_refuses_unsafe_or_changed_dry_run_task_selection(self) -> None:
@@ -4314,15 +4258,89 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.client.request("GET", "/api/session")[0], 401)
 
     def test_entry_point_boots_from_config(self) -> None:
+        from description_pipeline.interface_records import (
+            INSTALL_RECORD_SCHEMA,
+        )
+        from description_pipeline.io import digest, write_json
+        from description_pipeline.pipeline.contracts import NativeTargetIdentity
+        from tests.v1.test_pipeline_discover import DiscoverHarness
+
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            fixture = DiscoverHarness(root / "fixture")
             token_path = Path(tmp) / "endpoint.token"
             token_path.write_text("t" * 40, encoding="utf-8")
             snapshot = root / "config-snapshot.json"
-            snapshot.write_text("{}\n", encoding="utf-8")
+            snapshot.write_bytes(
+                (fixture.configuration / "config-snapshot.json").read_bytes()
+            )
+            snapshot_sha256 = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+            target = NativeTargetIdentity.create(
+                install_id="win-" + "a" * 32,
+                pipeline_id="solidworks-to-urdf",
+            )
+            release_source_sha256 = digest({"release": "fixture"})
+            release = {
+                "version": "1.0.0",
+                "source_commit": "a" * 40,
+                "source_sha256": release_source_sha256,
+                "artifacts": [
+                    {
+                        "name": "fixture.whl",
+                        "sha256": digest({"artifact": "fixture"}),
+                    }
+                ],
+            }
+            write_json(
+                fixture.state / "install-record.json",
+                {
+                    "schema_version": INSTALL_RECORD_SCHEMA,
+                    "install_id": "install-fixture",
+                    "timestamp": "2026-10-25T00:00:00Z",
+                    "snapshot": {
+                        "path": str(snapshot),
+                        "digest": snapshot_sha256,
+                        "install_id": "install-fixture",
+                    },
+                    "release": release,
+                    "services": ["description-postgres"],
+                    "paths": {"state_root": str(fixture.state)},
+                    "dag": {
+                        "id": "solidworks_to_urdf",
+                        "path": "/srv/description/dags/solidworks_to_urdf.py",
+                        "digest": digest({"dag": "fixture"}),
+                        "tasks": 6,
+                    },
+                    "ends": {
+                        "linux": {
+                            "install_id": "install-fixture",
+                            "config_digest": snapshot_sha256,
+                            "release": {
+                                "version": release["version"],
+                                "source_commit": release["source_commit"],
+                                "source_sha256": release["source_sha256"],
+                                "role": "portable",
+                            },
+                        },
+                        "windows": {
+                            "install_id": target.install_id,
+                            "config_digest": digest({"windows": "config"}),
+                            "release": {
+                                "version": release["version"],
+                                "source_commit": release["source_commit"],
+                                "source_sha256": release["source_sha256"],
+                                "role": "native",
+                            },
+                            "target_identity": target.to_record(),
+                        },
+                    },
+                    "previous": None,
+                    "journal": [],
+                },
+            )
             artifacts = root / "artifacts"
             artifacts.mkdir()
             work = root / "work"

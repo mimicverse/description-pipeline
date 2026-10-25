@@ -76,7 +76,6 @@ from ..pipeline.dispatch import DispatchObservation
 from ..pipeline.effects import EffectState
 from ..pipeline.verify import CERTIFICATE_FILENAME, EXECUTION_RECEIPT_FILENAME
 from ..platform.facts import FactStoreError, RunNotAdmittedError
-from ..platform.storage import SEALED_URI_PREFIX, parse_sealed_uri
 from ..ports import PORTAL_HTTP_PORT
 from ..native_transfer import TEAM_REPORTS
 from .feishu_oauth import (
@@ -3091,16 +3090,15 @@ class PortalApp:
         row = stages.get(stage) if isinstance(stages, dict) else None
         if not isinstance(row, dict):
             return None
-        source_run = self._registered_checkpoint_origin(row, run_id=run_id, stage=stage)
-        if source_run is None:
-            if row.get("reused_from_run") is not None:
-                raise PortalError(
-                    HTTPStatus.BAD_GATEWAY,
-                    "Registered stage report source cannot be verified",
-                )
-            source_run = run_id
         members = projection.get("by_stage", {}).get(stage)
-        member = members.get("reports/native-stages.json") if isinstance(members, dict) else None
+        if not isinstance(members, dict) or not members:
+            return None
+        artifact = self._registered_stage_artifact(
+            members,
+            stage=stage,
+        )
+        source_run = artifact.producer_run_id
+        member = members.get("reports/native-stages.json")
         if isinstance(member, dict):
             data = self._registered_member_bytes("reports/native-stages.json", member)
         else:
@@ -3117,21 +3115,21 @@ class PortalApp:
         return report
 
     @staticmethod
-    def _registered_checkpoint_origin(row: dict, *, run_id: str, stage: str) -> str | None:
-        """The proven sealed source of a registered stage checkpoint."""
+    def _registered_stage_artifact(
+        members: dict,
+        *,
+        stage: str,
+    ) -> ArtifactRef:
+        """The immutable stage artifact that owns one registered report."""
 
-        checkpoint = row.get("checkpoint_uri")
-        if not isinstance(checkpoint, str) or not checkpoint:
-            return None
-        if not checkpoint.startswith(SEALED_URI_PREFIX):
-            return run_id if row.get("reused_from_run") is None else None
-        try:
-            checkpoint_run, checkpoint_stage = parse_sealed_uri(checkpoint)
-        except PipelineError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage checkpoint is malformed") from error
-        if checkpoint_stage != stage:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage checkpoint names another stage")
-        return checkpoint_run
+        artifact = PortalApp._stage_artifact_ref(members, stage=stage)
+        source_run = artifact.producer_run_id
+        if not isinstance(source_run, str) or not source_run:
+            raise PortalError(
+                HTTPStatus.BAD_GATEWAY,
+                "Registered stage artifact has no producer run",
+            )
+        return artifact
 
     def _registered_stage_job(self, job: dict | None, projection: dict | None) -> dict | None:
         """A display snapshot whose stage states come from registered rows.
@@ -3148,12 +3146,14 @@ class PortalApp:
         stages = projection.get("stages")
         if not isinstance(stages, dict) or not stages:
             return job
-        registered_run = projection.get("run")
-        run_id = registered_run.get("run_id") if isinstance(registered_run, dict) else None
+        run_id = projection.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             run_id = job.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             return job
+        parent_run_id = projection.get("parent_run_id")
+        by_stage = projection.get("by_stage")
+        by_stage = by_stage if isinstance(by_stage, dict) else {}
         original_events = job.get("events") if isinstance(job.get("events"), list) else []
         events: list[dict] = []
         for definition in CONTRACT["stages"]:
@@ -3169,13 +3169,27 @@ class PortalApp:
             original_stage_events = [
                 event for event in original_events if isinstance(event, dict) and event.get("stage") == stage_id
             ]
-            reused_from = row.get("reused_from_run")
+            stage_members = by_stage.get(stage_id)
             reuse = None
-            if isinstance(reused_from, str) and reused_from:
-                reuse = {"parent_run": reused_from, "reused": True}
-                source_run = self._registered_checkpoint_origin(row, run_id=run_id, stage=stage_id)
-                if source_run is not None:
-                    reuse["source_run"] = source_run
+            if isinstance(stage_members, dict) and stage_members:
+                artifact = self._registered_stage_artifact(
+                    stage_members,
+                    stage=stage_id,
+                )
+                if artifact.producer_run_id != run_id:
+                    if (
+                        not isinstance(parent_run_id, str)
+                        or artifact.producer_run_id != parent_run_id
+                    ):
+                        raise PortalError(
+                            HTTPStatus.BAD_GATEWAY,
+                            "Registered stage artifact has no proven parent run",
+                        )
+                    reuse = {
+                        "parent_run": parent_run_id,
+                        "reused": True,
+                        "source_run": artifact.producer_run_id,
+                    }
             report = (
                 self._registered_stage_report(projection, run_id=run_id, stage=stage_id)
                 if row.get("state") != "waiting"

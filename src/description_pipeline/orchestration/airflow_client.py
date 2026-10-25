@@ -1,13 +1,7 @@
-"""Shared configuration, result validation and historical native-job observation.
-
-New Freeze, Discover and Capture execution uses the native-operation client. This
-module retains only the job observation routes still read by the portal and platform,
-plus immutable platform-configuration resolution.
-"""
+"""Shared endpoint configuration, result validation and config resolution."""
 
 from __future__ import annotations
 
-import json
 import hashlib
 import math
 import os
@@ -15,13 +9,9 @@ import re
 import stat
 import unicodedata
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path, PurePosixPath
-from typing import Any
-from urllib import error as urlerror
 from urllib import parse as urlparse
-from urllib import request as urlrequest
 
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts, parse_data
@@ -34,130 +24,27 @@ from ..interface_records import (
     validate_install_record,
 )
 from ..schemas import CONFIG_SNAPSHOT_SCHEMA
-from ..stages import STAGE_IDS, publication_succeeded
+from ..stages import publication_succeeded
 
-JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 #: One release ledger per run fixes the cache-release operation identity and
 #: its full request, so retries resend the same operation, never new parameters.
 NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
-EVENT_KEYS = ("stage", "state", "at")
-#: ``native_complete`` means the Windows half finished and the sealed capture archive
-#: is ready for the Linux generate/verify/publish half; it is never final success.
-#: ``awaiting_definition`` is the nonterminal hand-off where the native raw record
-#: is available and the generated definition ZIP is still to be submitted.
-RUN_STATES = {"queued", "selecting", "running", "awaiting_definition", "native_complete", "passed", "failed"}
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
-def _validate_activity_block(activity, label: str) -> None:
-    if activity is None:
-        return
-    if not isinstance(activity, dict):
-        raise EndpointProtocolError(f"job {label} must be an object when present")
-    if activity.get("phase") not in STAGE_IDS or not isinstance(activity.get("action"), str):
-        raise EndpointProtocolError(f"job {label} must carry a stage phase and an action")
-    for field in ("at", "started_at", "updated_at"):
-        if not isinstance(activity.get(field), str):
-            raise EndpointProtocolError(f"job {label} must carry {field}")
-    completed, total = activity.get("completed"), activity.get("total")
-    if (completed is not None or total is not None) and (
-        type(completed) is not int or type(total) is not int or completed < 0 or total < completed
-    ):
-        raise EndpointProtocolError(f"job {label} counts must be a non-negative completed/total pair")
-
-
-def _validate_activity(job: dict) -> None:
-    """The optional live-activity blocks must be shape-correct when present.
-
-    Activity is observation, so the blocks are optional; when an endpoint sends
-    them, the portal must be able to trust their shape before rendering.
-    """
-
-    _validate_activity_block(job.get("activity"), "activity")
-    _validate_activity_block(job.get("activity_final"), "activity_final")
-    history = job.get("activity_history")
-    if history is not None and not isinstance(history, list):
-        raise EndpointProtocolError("job activity_history must be a list when present")
-    if isinstance(history, list):
-        for entry in history:
-            if (
-                not isinstance(entry, dict)
-                or not isinstance(entry.get("at"), str)
-                or not isinstance(entry.get("code"), str)
-            ):
-                raise EndpointProtocolError("activity history entries must carry at and code")
-
-
 class EndpointError(RuntimeError):
     """Transport or protocol failure while talking to the execution endpoint."""
-
-
-class EndpointAuthError(EndpointError):
-    """The endpoint rejected the bearer token."""
-
-
-class EndpointConflict(EndpointError):
-    """The run_id is already bound to a different request payload."""
 
 
 class EndpointProtocolError(EndpointError):
     """The endpoint returned an unexpected shape or value."""
 
 
-class EndpointNotFound(EndpointError):
-    """The endpoint has no record of the requested run, job or route."""
-
-
 class ResultNotPublishable(EndpointError):
     """A passed job whose result is missing quality or PR evidence."""
-
-
-def _error_payload(error: urlerror.HTTPError) -> dict:
-    """The server's structured refusal body, when the endpoint provides one."""
-    try:
-        raw = error.read(64 * 1024)
-    except OSError:
-        return {}
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _http_refusal(error: urlerror.HTTPError, *, context: str | None = None) -> EndpointError:
-    """One request refusal that keeps the server's structured body for callers."""
-    payload = _error_payload(error)
-    if error.code in {401, 403}:
-        failure: EndpointError = EndpointAuthError(f"endpoint rejected the bearer token ({error.code})")
-    elif error.code == 404:
-        failure = EndpointNotFound(context or "endpoint has no record of the requested resource")
-    elif error.code == 409:
-        failure = EndpointConflict(f"request conflict ({error.code})")
-    else:
-        failure = EndpointError(f"endpoint returned HTTP {error.code}")
-    message = payload.get("error")
-    if isinstance(message, str) and message:
-        failure.args = (f"{failure.args[0]}: {message}",)
-    failure.status = error.code
-    failure.payload = payload
-    failure.code = payload.get("error_code") if isinstance(payload.get("error_code"), str) else None
-    for field in ("error_code", "reason", "message", "earliest_required", "active_run_id", "detail"):
-        setattr(failure, field, payload.get(field))
-    return failure
-
-
-def validate_run_id(value: str) -> str:
-    try:
-        canonical = str(uuid.UUID(str(value)))
-    except (ValueError, AttributeError, TypeError) as error:
-        raise EndpointProtocolError(f"run_id is not a UUID: {value!r}") from error
-    if str(value) != canonical:
-        raise EndpointProtocolError(f"run_id must be the canonical lowercase UUID: {value!r}")
-    return canonical
 
 
 def native_run_id(dag_run_id: str) -> str:
@@ -549,103 +436,6 @@ def config_reference_cli(argv=None) -> int:
     return 0
 
 
-class WindowsEndpoint:
-    """Small JSON client; injectable opener keeps it testable without network."""
-
-    def __init__(
-        self,
-        config: EndpointConfig,
-        *,
-        opener: Callable[..., Any] | None = None,
-    ) -> None:
-        self.config = config
-        self._opener = opener or _opener
-
-    def _exchange(self, request: urlrequest.Request) -> dict:
-        try:
-            with self._opener(request, timeout=self.config.timeout) as response:
-                data = json.loads(response.read().decode("utf-8") or "{}")
-        except urlerror.HTTPError as error:
-            raise _http_refusal(error) from error
-        except urlerror.URLError as error:
-            raise EndpointError(f"endpoint unreachable: {error.reason}") from error
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise EndpointProtocolError("Endpoint returned invalid UTF-8 JSON") from error
-        if not isinstance(data, dict):
-            raise EndpointProtocolError("endpoint response is not a JSON object")
-        return data
-
-    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        return self._exchange(
-            urlrequest.Request(
-                self.config.base_url + path,
-                data=body,
-                method=method,
-                headers={
-                    "Authorization": f"Bearer {self.config.token}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-            )
-        )
-
-    def rerun_plan(self, run_id: str) -> dict:
-        """Authoritative per-stage restart plan of one terminal native job.
-
-        The endpoint probes its own retained checkpoints, dependency snapshot and
-        publication target; the portal must not recompute eligibility locally.
-        """
-        canonical = validate_run_id(run_id)
-        payload = self._request("GET", f"/v1/jobs/{canonical}/reruns")
-        if payload.get("run_id") != canonical:
-            raise EndpointProtocolError("rerun plan returned a different run_id")
-        if payload.get("status") not in RUN_STATES:
-            raise EndpointProtocolError(f"unexpected rerun plan status: {payload.get('status')!r}")
-        rows = payload.get("stage_reruns")
-        if not isinstance(rows, list) or [row.get("stage") for row in rows if isinstance(row, dict)] != list(STAGE_IDS):
-            raise EndpointProtocolError("rerun plan must cover every engineering stage exactly once")
-        for row in rows:
-            if not isinstance(row, dict) or any(
-                key not in row
-                for key in (
-                    "stage",
-                    "name",
-                    "eligible",
-                    "reason",
-                    "message",
-                    "recomputes",
-                    "retains",
-                    "prerequisites",
-                )
-            ):
-                raise EndpointProtocolError("rerun plan row is incomplete")
-            if not isinstance(row["eligible"], bool) or not isinstance(row["recomputes"], list):
-                raise EndpointProtocolError("rerun plan row carries invalid eligibility or recompute stages")
-        return payload
-
-    def get_job(self, run_id: str) -> dict:
-        job = self._request("GET", f"/v1/jobs/{validate_run_id(run_id)}")
-        if job.get("run_id") != run_id:
-            raise EndpointProtocolError("endpoint returned a different run_id")
-        if job.get("schema_version") != JOB_SCHEMA:
-            raise EndpointProtocolError(f"unexpected job schema: {job.get('schema_version')!r}")
-        if job.get("pipeline_id") != PIPELINE_ID:
-            raise EndpointProtocolError(f"unexpected pipeline_id: {job.get('pipeline_id')!r}")
-        for field in ("repository_slug", "repository_base"):
-            value = job.get(field)
-            if value is not None and (not isinstance(value, str) or not value.strip()):
-                raise EndpointProtocolError(f"job {field} must be non-empty text when present")
-        if job.get("status") not in RUN_STATES:
-            raise EndpointProtocolError(f"unexpected job status: {job.get('status')!r}")
-        if not isinstance(job.get("events"), list):
-            raise EndpointProtocolError("job response must include an events list")
-        for event in job["events"]:
-            if not isinstance(event, dict) or any(key not in event for key in EVENT_KEYS):
-                raise EndpointProtocolError("Events must carry stage, state and timestamp")
-        _validate_activity(job)
-        return job
-
 def verified_result(result: dict | None) -> dict:
     """Fail closed unless the run carries an independently verified model result.
 
@@ -702,29 +492,6 @@ def check_result(result: dict | None, *, expected_slug: str, expected_base: str)
             "work/description/<hardware>/<request> branch"
         )
     return result
-
-
-class _SameHostRedirect(urlrequest.HTTPRedirectHandler):
-    """Never forward the bearer token across hosts."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
-        try:
-            old = urlparse.urlsplit(req.full_url)
-            new = urlparse.urlsplit(newurl)
-            same_origin = (old.scheme, old.hostname, old.port) == (new.scheme, new.hostname, new.port)
-        except ValueError:
-            same_origin = False
-        if not same_origin:
-            raise urlerror.HTTPError(newurl, code, "cross-host redirect refused", headers, fp)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-# Internal service calls use direct connections, independent of ambient proxy settings.
-_OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}), _SameHostRedirect())
-
-
-def _opener(request: urlrequest.Request, timeout: float):
-    return _OPENER.open(request, timeout=timeout)
 
 
 if __name__ == "__main__":

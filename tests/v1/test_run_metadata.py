@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from wsgiref.simple_server import make_server
@@ -26,7 +27,6 @@ from tests.v1.test_portal import (
     _QuietHandler,
     _ThreadingWSGIServer,
 )
-from tests.v1.test_platform_store import NOW, FakeWorld
 
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.portal import AirflowApi, PortalApp, PortalConfig
@@ -35,6 +35,14 @@ from description_pipeline.platform.facts import (
     RunDisplayMetadata,
     RunNotAdmittedError,
 )
+
+NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
+
+
+class _RunWorld:
+    def __init__(self) -> None:
+        self.run_display_rows: dict[str, list] = {}
+        self.run_states: dict[str, str] = {}
 
 
 class FakeRunControlStore:
@@ -115,7 +123,7 @@ class RunMetadataTests(unittest.TestCase):
         self.airflow = MockAirflow()
         self.airflow.__enter__()
         self.addCleanup(self.airflow.__exit__, None, None, None)
-        self.world = FakeWorld()
+        self.world = _RunWorld()
         self.run_control = FakeRunControlStore(self.world.run_display_rows)
         self.projection_metadata = {}
         self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))

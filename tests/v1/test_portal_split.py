@@ -1,4 +1,4 @@
-"""Portal split wiring: registered attempts stay readable when Windows is down."""
+"""Portal reads remain independent of executable-stage transport."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from description_pipeline.orchestration import portal as portal_module
-from description_pipeline.orchestration.airflow_client import EndpointError
 
 from .portal_read_support import RegisteredPlatform
 
@@ -26,20 +25,6 @@ TASK_IDS = (
     "verify",
     "publish",
 )
-
-
-class _EndpointSlot:
-    """The portal's Windows endpoint: unreachable until a test assigns one native job."""
-
-    def __init__(self) -> None:
-        self.job: dict | None = None
-        self.calls = 0
-
-    def get_job(self, run_id):
-        self.calls += 1
-        if self.job is None:
-            raise EndpointError("windows down")
-        return self.job
 
 
 class _ExpiredAirflow:
@@ -69,7 +54,6 @@ class PortalSplitTests(unittest.TestCase):
         self.platform.admit(CHILD, from_stage="generate", parent_run_id=RUN)
         self.platform.stage(CHILD, "verify")
         self.airflow = _ExpiredAirflow()
-        self.windows = _EndpointSlot()
         self.app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=self.airflow,
@@ -86,7 +70,6 @@ class PortalSplitTests(unittest.TestCase):
     def test_canonical_state_is_the_live_boundary_for_retry_and_delete(self) -> None:
         """Deletion follows canonical run and claim state, not the retired job route."""
         job = {"status": "native_complete", "result": {"native_complete": True}}
-        self.windows.job = job
         tasks = [
             {"task_id": "freeze", "state": "success"},
             {"task_id": "discover", "state": "success"},
@@ -156,5 +139,4 @@ class PortalSplitTests(unittest.TestCase):
         self.assertEqual(json.loads(response)["error"], "Sign in with Feishu")
         # Nothing downstream was consulted and nothing was reserved on disk.
         self.assertEqual(self.airflow.calls, 0)
-        self.assertEqual(self.windows.calls, 0)
         self.assertFalse((upload_root / ".rerun-attempts").exists())

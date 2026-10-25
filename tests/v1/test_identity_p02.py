@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from description_pipeline.orchestration import portal, uploads
 from description_pipeline.orchestration.airflow_client import (
@@ -94,7 +95,12 @@ class PortalConfigTargetsTests(unittest.TestCase):
                 targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
                 repositories={"mimicverse/description": str(root / "models")},
             )
-            loaded = portal.load_portal_config(config)
+            with patch.object(
+                portal,
+                "_production_admission_runtime",
+                return_value=(None, None, None, None, None),
+            ):
+                loaded = portal.load_portal_config(config)
             self.assertEqual(loaded.pipeline_targets["m3.0"]["base"], "main")
 
     def test_loader_rejects_a_target_with_an_unconfigured_repository(self) -> None:

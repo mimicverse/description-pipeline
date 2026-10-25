@@ -224,7 +224,6 @@ def _stage_projection(
             artifacts.append({"path": path, **row})
             members[str(path)] = {
                 **row,
-                "checkpoint_uri": output_artifact.locator,
                 "stage": stage,
                 "state": decision.get("outcome") if decision else "waiting",
             }
@@ -258,9 +257,7 @@ def _stage_projection(
         "state": state,
         "command": dict(command) if isinstance(command, Mapping) else None,
         "decision": dict(decision) if isinstance(decision, Mapping) else None,
-        "checkpoint_uri": output_artifact.locator if output_artifact is not None else None,
         "receipt": receipt,
-        "reused_from_run": None,
         "original_executed_at": None,
         "updated_at": decision.get("decided_at") if isinstance(decision, Mapping) else None,
     }

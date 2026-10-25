@@ -118,7 +118,7 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
         platform = RegisteredPlatform(self.tmp / f"failure-{stage}")
         platform.admit(WSGI_RUN)
         original = f"RuntimeError: registered {stage} failure before products"
-        platform.store.confirm_stage(
+        platform.facts.confirm_stage(
             run_id=WSGI_RUN,
             stage=stage,
             state="failed",
@@ -138,7 +138,11 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
         # The convergence registers every later stage blocked after the failure: the trailing
         # events must never claim the error's stage.
         for later in STAGE_IDS[STAGE_IDS.index(stage) + 1 :]:
-            platform.store.confirm_stage(run_id=WSGI_RUN, stage=later, state="blocked")
+            platform.facts.confirm_stage(
+                run_id=WSGI_RUN,
+                stage=later,
+                state="blocked",
+            )
         return platform, original
 
     def _get(self, platform: RegisteredPlatform) -> tuple[int, bytes]:
@@ -298,7 +302,7 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
             with self.subTest(state=state):
                 platform = RegisteredPlatform(self.tmp / f"terminal-{state}")
                 platform.admit(WSGI_RUN)
-                platform.store.confirm_stage(
+                platform.facts.confirm_stage(
                     run_id=WSGI_RUN,
                     stage="capture",
                     state=state,
@@ -381,7 +385,7 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
         self.assertEqual(advice["eligible"], True, advice)
         unresolved = RegisteredPlatform(self.tmp / "advice-unresolved")
         unresolved.admit(WSGI_RUN)
-        unresolved.store.confirm_stage(
+        unresolved.facts.confirm_stage(
             run_id=WSGI_RUN,
             stage="capture",
             state="unresolved",

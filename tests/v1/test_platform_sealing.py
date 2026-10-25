@@ -11,7 +11,7 @@ from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_po
 from description_pipeline.io import PipelineError
 from description_pipeline.platform.storage import seal_delivery, sealed_resolver
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
-from tests.v1.test_platform_store import build_sealed_delivery
+from tests.v1.portal_read_support import build_sealed_delivery
 
 
 class SealDeliveryTests(unittest.TestCase):

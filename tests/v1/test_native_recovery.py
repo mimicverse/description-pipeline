@@ -13,8 +13,6 @@ from pathlib import Path
 from description_pipeline.delivery import PIPELINE_ID, read_delivery_manifest
 from description_pipeline.io import PipelineError, digest, file_digest, write_json
 from description_pipeline.platform.native_recovery import build_discovery_tree_from_prepared
-from description_pipeline.platform.native_recovery import discovery_receipt
-from description_pipeline.platform.store import PlatformStore, PlatformStoreError
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
@@ -203,40 +201,6 @@ class NativeRecoveryTests(unittest.TestCase):
                     ),
                     capture_state="completed",
                 )
-
-    def test_sealed_receipt_digests_are_recomputed_from_their_files(self) -> None:
-        built = self._build()
-        tree = self.root / "discover"
-        receipt = discovery_receipt(
-            run_id=RUN_ID,
-            tree=tree,
-            native_tool=self.native,
-            native_handoff=built["native_handoff"],
-            native_stages_sha256=built["native_stages_sha256"],
-            request_evidence_sha256=built["request_evidence_sha256"],
-            portable_tool_sha256=built["portable_tool_sha256"],
-        )
-        store = PlatformStore(lambda: None, sealed=lambda _uri: tree)
-        checkpoint = f"store://sealed/{RUN_ID}/discover"
-        row = ("discover", "completed", receipt, checkpoint, None, None)
-        self.assertEqual(
-            store._verified_direct_completed_stage(
-                None,
-                run_id=RUN_ID,
-                stage="discover",
-                row=row,
-            )["native_stages_sha256"],
-            built["native_stages_sha256"],
-        )
-        changed = dict(receipt)
-        changed["native_stages_sha256"] = "f" * 64
-        with self.assertRaisesRegex(PlatformStoreError, "digests differ"):
-            store._verified_direct_completed_stage(
-                None,
-                run_id=RUN_ID,
-                stage="discover",
-                row=("discover", "completed", changed, checkpoint, None, None),
-            )
 
     def test_every_recovered_discovery_file_is_bound_by_the_delivery_manifest(self) -> None:
         self._build()
