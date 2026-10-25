@@ -850,10 +850,15 @@ transfer manifest、run/Freeze identity、源记录、原生发现和实际 inpu
 清单路径为相对 POSIX 路径，按 UTF-8 字节排序。JSON 使用 UTF-8、键排序、无多余空白、禁止 NaN/Infinity；模型 JSON、报告与 URDF 数值使用与 locale 无关、可精确往返 binary64 的最短十进制，统一零值格式，不截断有效位；每条文件记录包含路径、字节长度和 SHA-256。摘要对规范序列化对象求 SHA-256，并以对象类型区分用途。清单及其父目录不允许符号链接、junction、路径逃逸或大小写冲突。
 
 Linux 维护人员对已登记 Verify command 使用
-`description stage <verify-command-id>`。该入口从 canonical facts 取得原
-Generate/Capture artifact closure，重算 verification certificate 与 execution
-receipt，并保留原生证据；不提供直接 check/rebuild 任意交付目录的第二入口，不注册
-正式检查点，也不能导入发布或改变原交付。新建候选从 Freeze 重新接纳并执行规定阶段；
+`description stage <verify-command-id>`，执行同一正式 StageApplication 流程。
+尚无阶段决定时，入口取得执行权，从 canonical facts 物化 Generate/Capture artifact
+closure，执行验证并提交正式决定、verification certificate 与 execution receipt；
+这些结果按既有契约参与后续发布。已有决定时，入口核验绑定并返回原封存结果，不自动
+重新执行原始验证算法。验证读取不改写输入证据，但命令执行会写入阶段业务事实。
+
+真正隔离复算须沿既有受控诊断入口绑定 `DiagnosticReplayScope`，分别记录历史生产者、
+本次工具及输入闭包，不登记正式资格，也不能由普通后继消费；不能把正式命令描述为
+只读诊断。不提供直接 check/rebuild 任意目录的第二 CLI。新建候选从 Freeze 重新接纳；
 发布和恢复始终走同一 StageApplication/effect/fact 流程。
 
 <a id="publication"></a>
