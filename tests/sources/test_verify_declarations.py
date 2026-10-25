@@ -23,6 +23,7 @@ from description_pipeline.verification import v14_declarations as v14
 from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.verification import solidworks_urdf
+from description_pipeline.verification import native_declarations as native_declarations_module
 from description_pipeline.verification.native_declarations import verify_declarations
 from description_pipeline.verification.native_discovery import _Failure, rebuild_interface_frames, verify_discovery
 
@@ -1721,6 +1722,33 @@ class NativeDeclarationsTests(unittest.TestCase):
         claims = source_claims()
         claims["bodies"][1]["components"].pop()
         self.assertIn("v14.claims", self.errors(fixture(), claims))
+
+    def test_aligned_status_does_not_suppress_unresolved_axis_diagnostic(self):
+        original = native_declarations_module.canonicalize_axis
+
+        def aligned_status(*args, **kwargs):
+            decision = original(*args, **kwargs)
+            decision["status"] = "local_class_aligned"
+            return decision
+
+        with mock.patch.object(
+            native_declarations_module,
+            "canonicalize_axis",
+            side_effect=aligned_status,
+        ):
+            report = verify_declarations(fixture(), source_claims())
+
+        self.assertTrue(report["passed"], report["errors"])
+        diagnostic = next(
+            item
+            for item in report["diagnostics"]
+            if item["code"] == "direction.semantics_unresolved"
+        )
+        self.assertEqual(diagnostic["detail"]["status"], "local_class_aligned")
+        self.assertEqual(
+            diagnostic["detail"]["delivered_local_axis"],
+            [0.0, 1.0, 0.0],
+        )
 
     def test_optional_saved_semantics_block_silent_discard(self):
         raw = fixture()

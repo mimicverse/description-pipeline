@@ -672,15 +672,15 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         decision["assembly_direction"] = (assembly / norm).tolist()
         state["directions"][name] = decision
         state["carried_axes"][name] = decision["delivered_local_axis"]
-        if decision["status"] != "local_class_aligned":
-            diagnostics.append(
-                {
-                    "code": "direction.semantics_unresolved",
-                    "blocking": False,
-                    "message": "the authored CAD axis is preserved; its motion class is not proven",
-                    "detail": {"joint": name, **decision},
-                }
-            )
+        # The v3 audit never establishes author-positive semantics.
+        diagnostics.append(
+            {
+                "code": "direction.semantics_unresolved",
+                "blocking": False,
+                "message": "the authored CAD axis is preserved; its motion class is not proven",
+                "detail": {"joint": name, **decision},
+            }
+        )
         return decision
 
     def joint_limits(name, joint):

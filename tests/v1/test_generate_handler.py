@@ -504,6 +504,111 @@ class GenerateVerifyClosureTests(unittest.TestCase):
                     self.assertNotIn("WARNING display.material_fallback:", urdf)
                 self.assertEqual(digest(inventory(self.fixture.capture_root)), capture_before)
 
+    def test_shared_aligned_status_cannot_suppress_unresolved_warning(self) -> None:
+        from description_pipeline.sources.solidworks import (
+            discovery as discovery_module,
+        )
+        from description_pipeline.verification import (
+            native_declarations,
+            native_discovery,
+        )
+
+        baseline_model = read_data(
+            self.fixture.generate_root / "model/robot.json"
+        )
+        baseline_joint = baseline_model["joints"][0]
+        original_status = baseline_joint["provenance"]["axis.direction_relation"]
+        self.assertEqual(original_status, "unverified")
+        baseline = self._evaluate()
+        self.assertTrue(baseline["passed"])
+        capture_before = digest(inventory(self.fixture.capture_root))
+
+        original = discovery_module.canonicalize_axis
+
+        def aligned_status(*args, **kwargs):
+            decision = original(*args, **kwargs)
+            decision["status"] = "local_class_aligned"
+            return decision
+
+        workspace = StageWorkspace(
+            root=self.fixture.root / "aligned-status-generate",
+            inputs={self.fixture.capture_ref.artifact_id: self.fixture.capture_root},
+        )
+        claim = self.fixture._claim(
+            self.fixture.generator_command,
+            owner=digest({"process": "aligned-status-mutation"}),
+            executor=self.fixture.generate_executor,
+        )
+        with (
+            patch.object(
+                discovery_module,
+                "canonicalize_axis",
+                side_effect=aligned_status,
+            ),
+            patch.object(
+                native_discovery,
+                "canonicalize_axis",
+                side_effect=aligned_status,
+            ),
+            patch.object(
+                native_declarations,
+                "canonicalize_axis",
+                side_effect=aligned_status,
+            ),
+        ):
+            generated = GenerateHandler(self.fixture.store).execute(
+                self.fixture.generator_command,
+                claim,
+                workspace,
+                effects=object(),
+            )
+            source = Path(generated.candidate_root)
+            reference = self.fixture.store.seal_tree(
+                source,
+                kind="stage_output:generate",
+                producer_run_id=self.fixture.generator_command.run_id,
+                producer_stage="generate",
+                producer_tool_sha256=self.fixture.generate_executor,
+            )
+            report, _generate = self._evaluate_details(reference)
+
+        poisoned_model = read_data(source / "model/robot.json")
+        joint = poisoned_model["joints"][0]
+        self.assertEqual(
+            joint["provenance"]["axis.direction_relation"],
+            "local_class_aligned",
+        )
+        for field in ("axis", "xyz", "rpy", "limits"):
+            self.assertEqual(joint[field], baseline_joint[field])
+        self.assertEqual(
+            digest(inventory(self.fixture.capture_root)),
+            capture_before,
+        )
+        direction_warnings = [
+            item
+            for item in poisoned_model["provenance"]["value_warnings"]
+            if item["code"] == "direction.semantics_unresolved"
+        ]
+        self.assertEqual(len(direction_warnings), 1)
+        direction_warning = direction_warnings[0]
+        self.assertEqual(direction_warning["objects"][0]["object"], joint["name"])
+        self.assertTrue(report["passed"], [item for item in report["checks"] if not item["passed"]])
+        qualification = next(
+            item
+            for item in report["qualifications"]
+            if item["fact_id"] == "machine_qualification"
+        )
+        self.assertEqual(qualification["status"], "unqualified")
+        baseline_qualification = next(
+            item
+            for item in baseline["qualifications"]
+            if item["fact_id"] == "machine_qualification"
+        )
+        self.assertEqual(
+            qualification["status"],
+            baseline_qualification["status"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

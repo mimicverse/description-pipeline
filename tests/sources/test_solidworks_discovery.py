@@ -20,6 +20,7 @@ from unittest import mock
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
+from description_pipeline.sources.solidworks import discovery as discovery_module  # noqa: E402
 from description_pipeline.io import PipelineError, digest, file_digest, inventory, parse_data  # noqa: E402
 from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     CONTRACT,
@@ -511,6 +512,30 @@ class DiscoveryTests(unittest.TestCase):
         report = self._verify(output)
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["joints"], 1)
+
+    def test_aligned_status_does_not_suppress_mate_unresolved_warning(self):
+        original = discovery_module.canonicalize_axis
+
+        def aligned_status(*args, **kwargs):
+            decision = original(*args, **kwargs)
+            decision["status"] = "local_class_aligned"
+            return decision
+
+        with mock.patch.object(
+            discovery_module,
+            "canonicalize_axis",
+            side_effect=aligned_status,
+        ):
+            result, _source, _output = self._prepare()
+
+        self.assertTrue(result.passed, result.findings)
+        finding = next(
+            item
+            for item in result.findings
+            if item["code"] == "direction.semantics_unresolved"
+        )
+        self.assertEqual(finding["detail"]["status"], "local_class_aligned")
+        self.assertEqual(finding["detail"]["delivered_local_axis"], [0.0, 0.0, 1.0])
 
     def test_duplicate_controlled_records_block_regardless_of_content_or_root_order(self):
         _source, records = self._native()

@@ -981,8 +981,8 @@ def _value_warnings(
                 ),
                 "motion": provenance.get("motion"),
             }
-            if provenance.get("status", provenance.get("direction_relation")) != "local_class_aligned":
-                direction_unresolved.append(direction)
+            # The v3 audit never establishes author-positive semantics.
+            direction_unresolved.append(direction)
         if source_joint.get("type") != "fixed" and not any(
             word in {"roll", "pitch", "yaw"} for word in joint["name"].split("_")
         ):

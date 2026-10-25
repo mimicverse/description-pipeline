@@ -5073,8 +5073,8 @@ def _value_warning_gate(
                 ),
                 "motion": provenance.get("motion"),
             }
-            if provenance.get("status", provenance.get("direction_relation")) != "local_class_aligned":
-                add("direction.semantics_unresolved", row)
+            # The v3 audit never establishes author-positive semantics.
+            add("direction.semantics_unresolved", row)
         if joint.get("limit_source") == "preview_policy":
             policy = joint.get("preview_policy") or {}
             add(

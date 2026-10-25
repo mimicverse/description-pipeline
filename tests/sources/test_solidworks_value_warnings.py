@@ -871,7 +871,7 @@ class ValueWarningTests(unittest.TestCase):
         )
         self.assertFalse(any(item["object_type"] == "frame" for item in formatted["objects"]))
 
-    def test_direction_rule_warning_preserves_an_unverified_authored_axis(self):
+    def test_direction_rule_warning_ignores_shared_aligned_status(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)
         source["joints"] = [
@@ -880,7 +880,7 @@ class ValueWarningTests(unittest.TestCase):
                 "source_name": "left_shoulder_pitch_joint",
                 "type": "revolute",
                 "axis_provenance": {
-                    "status": "unverified",
+                    "status": "local_class_aligned",
                     "motion": "pitch",
                     "parent_axis": [0.0, -0.9396926208, -0.3420201433],
                     "rule_id": "direction.positive_semantics",

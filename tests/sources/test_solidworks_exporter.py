@@ -14,6 +14,7 @@ from . import _paths  # noqa: F401
 from . import support  # noqa: E402
 from .selection_support import sealed_selection  # noqa: E402
 from .test_solidworks_discovery import IDENTITY, FakeBackend
+from description_pipeline.sources.solidworks import discovery as discovery_module
 from description_pipeline.sources.solidworks.discovery import (
     DISCOVERY_SCHEMA,
     _exporter_constraint_checks,
@@ -314,6 +315,28 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
         self.assertEqual([item["code"] for item in findings], ["direction.semantics_unresolved"])
         self.assertFalse(findings[0]["blocking"])
+
+    def test_aligned_status_does_not_suppress_exporter_unresolved_warning(self):
+        original = discovery_module.canonicalize_axis
+
+        def aligned_status(*args, **kwargs):
+            decision = original(*args, **kwargs)
+            decision["status"] = "local_class_aligned"
+            return decision
+
+        with mock.patch.object(
+            discovery_module,
+            "canonicalize_axis",
+            side_effect=aligned_status,
+        ):
+            _bodies, joints, findings = self.derive(raw_record())
+
+        self.assertEqual(joints[0]["axis"]["direction_relation"], "local_class_aligned")
+        self.assertEqual(joints[0]["delivered_axis"], [0.0, 0.0, 1.0])
+        self.assertEqual(
+            [item["code"] for item in findings],
+            ["direction.semantics_unresolved"],
+        )
 
     def test_rotation_window_policy_uses_purpose_specific_rules(self):
         record = raw_record()
