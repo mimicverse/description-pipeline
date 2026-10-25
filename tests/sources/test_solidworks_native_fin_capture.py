@@ -1001,6 +1001,35 @@ class NativeFinCaptureTests(unittest.TestCase):
         }[vertex_id]
         return body, face_10, edge, tessellation, extension
 
+    def test_u_coverage_failure_preserves_complete_read_graph_without_more_native_calls(self):
+        body, _face, edge, tessellation, extension = self.open_boundary_fixture()
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: (0.25, 0.0, 0.0), 2: (0.75, 0.0, 0.0), 3: (0.0, 1.0, 0.0),
+        }[vertex_id]
+        with self.assertRaisesRegex(CadError, "do not cover its U domain") as caught:
+            self.capture(body, extension, body_type=1)
+        detail = json.loads(json.dumps(caught.exception.detail, allow_nan=False))
+        snapshot = detail["edge_u_coverage"]
+        self.assertEqual(snapshot["curve"]["u_min"], 0.0)
+        self.assertEqual(snapshot["curve"]["u_max"], 1.0)
+        self.assertEqual(snapshot["raw_fin_ids"], [100])
+        self.assertEqual(snapshot["fin_ids_source"], NATIVE_ID_ARRAY_SOURCE_FLAT)
+        self.assertEqual(snapshot["fin_ids"], [100])
+        self.assertEqual(snapshot["intervals_by_face"], {"0": [[0.25, 0.75]]})
+        self.assertEqual(len(snapshot["fin_inventory"]), 3)
+        self.assertEqual(len(snapshot["vertex_points_binary64"]), 3)
+        self.assertEqual(snapshot["fin_inventory"]["100"]["vertex_ids"], [1, 2])
+        for endpoint, u in (("start", 0.25), ("end", 0.75)):
+            evidence = snapshot["fin_inventory"]["100"][f"{endpoint}_evidence"]
+            self.assertEqual(evidence["u"], u)
+            self.assertEqual(evidence["closest_point_on_raw"][3], u)
+            self.assertEqual(evidence["evaluate_payload"][:3], [u, 0.0, 0.0])
+            self.assertTrue(evidence["evaluate_packed_status"]["parsed_success"])
+        self.assertFalse(native_u_intervals_cover(snapshot["intervals_by_face"]["0"],
+                                                 snapshot["curve"]["u_min"], snapshot["curve"]["u_max"]))
+        self.assertEqual(edge.closest_calls, 2)
+        self.assertEqual(edge.evaluate_calls, 4)
+
     @staticmethod
     def short_open_parameter_tessellation():
         def binary32(point):

@@ -10282,6 +10282,58 @@ class SolidWorksBackend(CadBackend):
                 row["end_u"] = end_evidence["u"]
                 row["start_evidence"] = start_evidence
                 row["end_evidence"] = end_evidence
+        def edge_u_failure_context(edge_row, intervals_by_face):
+            # Preserve the already-read body graph; diagnostics must not make
+            # additional CAD calls or replace the original coverage rejection.
+            face_incidence = [
+                {
+                    "face_index": index,
+                    "facet_count": face_rows[index]["facet_count"],
+                    "face_reference": reference_evidence(face_rows[index]["reference"]),
+                }
+                for index in edge_row["face_indices"]
+            ]
+            return {
+                "edge_u_coverage": {
+                    "schema_version": "solidworks-to-urdf.native-edge-u-failure/v1",
+                    **edge_failure_context(edge_row, edge_row["raw_fin_ids"], face_incidence),
+                    "source_scope": copy.deepcopy(body_scope),
+                    "curve_domain_transform": copy.deepcopy(edge_row["curve_domain_transform"]),
+                    "curve_endpoint_evaluations": copy.deepcopy(edge_row["curve_endpoint_evaluations"]),
+                    "topology_endpoint_assignment": copy.deepcopy(edge_row["topology_endpoint_assignment"]),
+                    "face_senses": copy.deepcopy(edge_row["face_senses"]),
+                    "closed_fin_cycles": copy.deepcopy(edge_row["closed_fin_cycles"]),
+                    "endpoint_points_derived_from_curve": edge_row["endpoint_points_derived_from_curve"],
+                    "raw_fin_ids": copy.deepcopy(edge_row["raw_fin_ids"]),
+                    "fin_ids_source": edge_row["fin_ids_source"],
+                    "fin_ids": list(edge_row["fin_ids"]),
+                    "intervals_by_face": copy.deepcopy(intervals_by_face),
+                    "edge_inventory": [
+                        {
+                            "edge_index": item["index"],
+                            "edge_reference": reference_evidence(item["reference"]),
+                            "face_indices": list(item["face_indices"]),
+                            "raw_fin_ids": copy.deepcopy(item["raw_fin_ids"]),
+                            "fin_ids_source": item["fin_ids_source"],
+                            "fin_ids": list(item["fin_ids"]),
+                        }
+                        for item in edge_rows
+                    ],
+                    "face_inventory": [
+                        {
+                            "face_index": item["index"],
+                            "face_reference": reference_evidence(item["reference"]),
+                            "raw_facet_ids": copy.deepcopy(item["raw_facet_ids"]),
+                            "facet_ids": list(item["facet_ids"]),
+                        }
+                        for item in face_rows
+                    ],
+                    "facet_inventory": copy.deepcopy(facets),
+                    "fin_inventory": copy.deepcopy(fins_by_id),
+                    "vertex_points_binary64": copy.deepcopy(vertex_points_binary64),
+                }
+            }
+
         for edge_row in edge_rows:
             incidence = len(edge_row["face_indices"])
             relation_fins = {
@@ -10379,6 +10431,7 @@ class SolidWorksBackend(CadBackend):
                                 "edge_index": edge_row["index"],
                                 "face_index": face_index,
                                 "intervals": intervals,
+                                **edge_u_failure_context(edge_row, intervals_by_face),
                             },
                         )
                 for face_index in edge_row["face_indices"]:
@@ -10393,6 +10446,7 @@ class SolidWorksBackend(CadBackend):
                                 **base,
                                 "edge_index": edge_row["index"],
                                 "face_index": face_index,
+                                **edge_u_failure_context(edge_row, intervals_by_face),
                             },
                         )
         triangle_records = []
