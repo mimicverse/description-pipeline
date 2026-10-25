@@ -844,6 +844,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         *,
         normal=(0.0, 0.0, 1.0),
         face_in_surface_sense=False,
+        area_observation=None,
     ):
         points = points or [
             (0.0, 0.0, 0.0),
@@ -856,6 +857,8 @@ class ComponentMeshExportTests(unittest.TestCase):
             normal=normal,
             face_in_surface_sense=face_in_surface_sense,
         )
+        if area_observation is not None:
+            body._faces[0]._area = area_observation
         backend = _backend(component)
         tessellation_calls = len(body.tessellation_face_lists)
         entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
@@ -959,7 +962,7 @@ class ComponentMeshExportTests(unittest.TestCase):
             )
 
     def test_planar_bundle_projects_field_warnings_from_verified_bytes(self):
-        entry, _triangles, _body, _edges, _calls = self._planar_export()
+        entry, _triangles, _body, _edges, _calls = self._planar_export(area_observation=1.00000000001)
         bundle = self.dest.parent / "planar-bundle"
         row = {**entry, "component": "pcb-1", "path": "geometry/planar.stl"}
         row.pop("written")
@@ -984,6 +987,59 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(len(warnings), 2)
         self.assertTrue(all(row["object"] == "pcb-1:body:1/0" for row in warnings))
         self.assertEqual({row["detail"]["field"] for row in warnings}, {"face_normal_unit", "triangles"})
+        area = next(row["detail"] for row in warnings if row["detail"]["field"] == "triangles")
+        self.assertEqual(area["native_face_area_api"], "IFace2.GetArea")
+        self.assertEqual(area["native_face_area_approx_m2"], 1.00000000001)
+        self.assertEqual(area["derived_boundary_area_m2"], 1.0)
+        self.assertAlmostEqual(area["native_minus_derived_area_m2"], 1e-11, places=15)
+
+    def test_mixed_native_providers_seal_admit_and_verify_actual_bytes(self):
+        from tests.v1 import test_stage_transfer as transfer_fixture  # noqa: PLC0415
+        from description_pipeline import native_transfer  # noqa: PLC0415
+        from description_pipeline.io import read_data, write_json  # noqa: PLC0415
+
+        component, _body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        shared = FakeEdge(b"mixed-shared-edge", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        component._bodies[1].append(FakeBody(
+            [FakeFace(TRIANGLE, edges=[shared]), FakeFace(REVERSED_TRIANGLE, edges=[shared])],
+            name="tessellated-sheet",
+        ))
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(set(entry["tessellation_sources"]), {NATIVE_PLANAR_BREP_PROVIDER, "sheet_itessellation"})
+        root = transfer_fixture.capture_root(self.tmp / "mixed-transfer")
+        row = {key: value for key, value in entry.items() if key != "written"}
+        row.update(path="geometry/base.stl", sha256=hashlib.sha256(self.dest.read_bytes()).hexdigest())
+        (root / "evidence/geometry/base.stl").write_bytes(self.dest.read_bytes())
+        capture = read_data(root / "evidence/capture.json")
+        capture["geometry"] = [row]
+        write_json(root / "evidence/capture.json", capture)
+        manifest = read_data(root / "evidence/manifest.json")
+        write_manifest(root / "evidence", kind=manifest["kind"], identity=manifest["identity"],
+                       evidence_class=manifest["evidence_class"])
+        events = transfer_fixture._capture_events(
+            root, handoff=transfer_fixture.HANDOFF, upload=transfer_fixture.HANDOFF,
+            upload_files=transfer_fixture.NATIVE_FILES, main=transfer_fixture.MAIN_ASSEMBLY,
+            native_files=transfer_fixture.NATIVE_FILES,
+        )
+        write_json(root / "reports/native-stages.json", transfer_fixture.stage_view(
+            run_id=transfer_fixture.RUN_ID, handoff=transfer_fixture.HANDOFF, events=events,
+        ))
+        archive = self.tmp / "mixed-transfer.zip"
+        transfer_fixture.seal(root, archive)
+        destination = self.tmp / "mixed-admitted"
+        transfer_fixture.admit(archive, destination)
+        self.assertEqual(native_transfer.verify_transfer(destination)["main_assembly"], transfer_fixture.MAIN_ASSEMBLY)
+        result = verify_native_mesh_observations(destination)
+        self.assertEqual(result["components"], 1)
+        self.assertEqual(len(result["topologies"][0]["bodies"]), 2)
+        damaged = self.tmp / "mixed-damaged.zip"
+        transfer_fixture.repack(archive, damaged, {"evidence/geometry/base.stl": b"invalid mesh bytes"})
+        refused = self.tmp / "mixed-refused"
+        with self.assertRaises(PipelineError):
+            transfer_fixture.admit(damaged, refused)
+        self.assertFalse(refused.exists())
 
     def test_planar_consumer_rejects_noncollinear_endpoint_tangents(self):
         entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
@@ -994,6 +1050,69 @@ class ComponentMeshExportTests(unittest.TestCase):
                 evaluations[endpoint]["tangent"] = [1.0, 1.0, 0.0]
                 with self.assertRaisesRegex(PipelineError, "boundary line"):
                     parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], triangle_vertices)
+
+    def test_planar_consumer_rejects_nonexact_closure_inside_endpoint_bound(self):
+        entry, triangles, _body, _edges, _calls = self._planar_export()
+        mutated = copy.deepcopy(entry["tessellation"])
+        incoming = mutated["planar_brep"]["bodies"][0]["loop"]["coedges"][0]
+        delta = 2**-24
+        incoming["end_point_m"][0] += delta
+        incoming["curve_params_raw"][3] += delta
+        incoming["evaluations"][1]["point_m"][0] += delta
+        incoming["end_vertex_point_error_m"] = delta
+        with self.assertRaisesRegex(PipelineError, "loop is open"):
+            parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], triangles)
+
+    def test_planar_producer_excludes_nonexact_loop_closure(self):
+        points = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
+        component, body, edges = _planar_sheet(points)
+        delta = 2**-24
+        trims = [(points[0], (1.0 + delta, 0.0, 0.0)),
+                 ((1.0 - delta, 0.0, 0.0), points[2]), (points[2], points[0])]
+
+        class TrimLine(FakeCurve):
+            @property
+            def LineParams(self):  # noqa: N802 - SolidWorks API name
+                start, end = self.trim
+                return [*start, *(end[axis] - start[axis] for axis in range(3))]
+
+        for coedge, edge, (start, end) in zip(body._faces[0]._loops[0]._coedges, edges, trims, strict=True):
+            edge._curve = TrimLine(edge)
+            edge._curve.trim = start, end
+            coedge.GetCurveParams = lambda a=start, b=end: [*a, *b, 0.0, 1.0, False, False]
+            coedge.Evaluate2 = lambda parameter, derivatives, a=start, b=end: [
+                *(a[axis] + parameter * (b[axis] - a[axis]) for axis in range(3)),
+                *(b[axis] - a[axis] for axis in range(3)),
+            ]
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before + 1)
+        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
+
+    def test_tangent_rounding_cells_handle_signed_zero_and_subnormal_ties(self):
+        for perpendicular, domain_miss in ((-0.0, False), (math.ulp(0.0), True), (2 * math.ulp(0.0), False)):
+            with self.subTest(perpendicular=perpendicular):
+                component, body, _edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+                )
+                coedge = body._faces[0]._loops[0]._coedges[0]
+                evaluate = coedge.Evaluate2
+                coedge.Evaluate2 = lambda parameter, derivatives, read=evaluate, y=perpendicular: [
+                    *read(parameter, derivatives)[:3], 1.0, y, 0.0
+                ]
+                backend = _backend(component)
+                before = len(body.tessellation_face_lists)
+                target = self.tmp / f"subnormal-{perpendicular.hex()}.stl"
+                if perpendicular == 0.0:
+                    backend.export_component_meshes({"pcb-1": target})
+                    self.assertEqual(len(body.tessellation_face_lists), before)
+                else:
+                    with self.assertRaises(CadError) as caught:
+                        backend.export_component_meshes({"pcb-1": target})
+                    self.assertEqual(len(body.tessellation_face_lists), before + int(domain_miss))
+                    self.assertEqual("planar_brep_evidence" in caught.exception.detail, not domain_miss)
 
     def test_planar_consumer_recomputes_evaluate_tolerance(self):
         entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
@@ -1046,6 +1165,29 @@ class ComponentMeshExportTests(unittest.TestCase):
                 entry["triangles"],
                 triangle_vertices,
             )
+
+    def test_native_approximate_area_does_not_replace_boundary_proof(self):
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        )
+        body._faces[0]._area = 1.00000000001
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        planar = entry["tessellation"]["planar_brep"]["bodies"][0]
+        self.assertEqual(planar["face_area_m2"], 1.00000000001)
+        self.assertEqual(planar["triangulation"]["boundary_area_m2"], 1.0)
+        vertices = [tuple(tuple(float(value) for value in point) for point in triangle)
+                    for triangle in stl_vertices(self.dest).reshape(-1, 3, 3)]
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+        for invalid in (None, True, -1.0, 0.0, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid):
+                mutated = copy.deepcopy(entry["tessellation"])
+                mutated["planar_brep"]["bodies"][0]["face_area_m2"] = invalid
+                with self.assertRaisesRegex(PipelineError, "body.*malformed"):
+                    parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], vertices)
+        forged = copy.deepcopy(entry["tessellation"])
+        forged["planar_brep"]["bodies"][0]["native_face_reference_sha256"] = "0" * 64
+        with self.assertRaisesRegex(PipelineError, "does not bind one face"):
+            parse_native_tessellation("pcb-1", forged, entry["bodies"], entry["triangles"], vertices)
 
     def test_planar_consumer_rejects_forged_loop_identity(self):
         entry, triangle_vertices, _body, _edges, _calls = self._planar_export()

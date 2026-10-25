@@ -3,6 +3,7 @@
 import hashlib
 import math
 import struct
+from fractions import Fraction
 from pathlib import Path
 
 from ..geometry.native_tessellation import (
@@ -232,6 +233,13 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                     "Planar BRep mesh triangles are derived from the native plane, ordered boundary, and trim facts.",
                     {
                         "rule_version": planar_body["triangulation"]["rule_version"],
+                        "native_face_area_api": "IFace2.GetArea",
+                        "native_face_area_approx_m2": planar_body["face_area_m2"],
+                        "derived_boundary_area_m2": planar_body["triangulation"]["boundary_area_m2"],
+                        "native_minus_derived_area_m2": float(
+                            Fraction(planar_body["face_area_m2"])
+                            - Fraction(planar_body["triangulation"]["boundary_area_m2"])
+                        ),
                         "triangle_count": len(planar_body["triangulation"]["triangles"]),
                         "error_components_m": planar_body["triangulation"]["error_components_m"],
                         "surface_error_upper_bound_m": planar_body["triangulation"]["surface_error_upper_bound_m"],

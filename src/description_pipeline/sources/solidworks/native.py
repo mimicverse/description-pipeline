@@ -3132,7 +3132,6 @@ CLOSE_ALL_SETTLE_DELAY_S = 0.5
 # orders of magnitude below 1 mm2, so no displayable face of this assembly can
 # be mistaken for degenerate; the proof stays the zero count, the empty array
 # and the measured area, never the failed probe.
-FACETLESS_DEGENERATE_AREA_M2 = 1e-12
 FACETLESS_EVIDENCE_API = NATIVE_FACETLESS_EVIDENCE_API
 PERSISTENT_REFERENCE_DOMAIN = b"description-pipeline/native-identity/v1"
 
@@ -8347,6 +8346,12 @@ class SolidWorksBackend(CadBackend):
                 )
             for index, row in enumerate(coedge_rows):
                 next_row = coedge_rows[(index + 1) % len(coedge_rows)]
+                if row["end_vertex_reference_sha256"] != next_row["start_vertex_reference_sha256"]:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "successive coedges do not share one native vertex identity",
+                        {**base, "coedge_index": index},
+                    )
                 tolerance = native_point_roundtrip_tolerance(
                     row["end_point_m"],
                     next_row["start_point_m"],
@@ -8366,6 +8371,10 @@ class SolidWorksBackend(CadBackend):
                             "point_tolerance_m": tolerance,
                         },
                     )
+                if row["end_point_m"] != next_row["start_point_m"]:
+                    # Selecting either rounded endpoint would add a closure
+                    # displacement excluded by this exact polygon provider.
+                    return None
             boundary_points = [tuple(row["start_point_m"]) for row in coedge_rows]
             boundary_references = [row["start_vertex_reference_sha256"] for row in coedge_rows]
             if len(set(boundary_references)) != len(boundary_references):

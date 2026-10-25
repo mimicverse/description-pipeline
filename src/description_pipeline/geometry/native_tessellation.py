@@ -2278,14 +2278,7 @@ def _parse_planar_brep_evidence(
             next_coedge = coedges[(coedge_index + 1) % len(coedges)]
             _require(
                 coedge["end_vertex_reference_sha256"] == next_coedge["start_vertex_reference_sha256"]
-                and native_point_error(
-                    coedge["end_point_m"],
-                    next_coedge["start_point_m"],
-                )
-                <= native_point_roundtrip_tolerance(
-                    coedge["end_point_m"],
-                    next_coedge["start_point_m"],
-                ),
+                and coedge["end_point_m"] == next_coedge["start_point_m"],
                 component + f": native planar BRep loop is open at coedge {coedge_index}",
             )
         _require(
@@ -2419,10 +2412,6 @@ def _parse_planar_brep_evidence(
         _require(
             triangulation["boundary_area_m2"] == boundary_area,
             component + f": native planar BRep boundary area is not reproducible for {body_key}",
-        )
-        _require(
-            body["face_area_m2"] == boundary_area,
-            component + f": native planar BRep face and boundary areas conflict for {body_key}",
         )
         triangle_polygons = []
         triangle_area2 = Fraction(0, 1)
