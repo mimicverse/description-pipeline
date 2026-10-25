@@ -14,6 +14,7 @@ from description_pipeline.geometry.native_planar_brep import (
     PlanarBrepNotApplicable,
     _orientation3,
     build_planar_convex_triangulation,
+    project_native_plane,
 )
 from description_pipeline.geometry.native_u import (
     native_binary64_sqrt,
@@ -62,14 +63,18 @@ class NativePlanarBrepTests(unittest.TestCase):
                 source_displacements=[([0.0, 0.0, 0.0], [3e-5, 0.0, 0.0])],
             )
 
-    def test_rounded_sloped_boundary_is_a_provider_miss(self):
-        # Independent binary64 API results need not be rationally incident.
+    def test_rounded_sloped_boundary_has_a_rational_projection_and_complete_bound(self):
         normal = [0.6, 0.8, 0.0]
         point = [-0.8 * 0.3, 0.6 * 0.3, 0.0]
-        with self.assertRaisesRegex(PlanarBrepNotApplicable, "exact-plane"):
-            build_planar_convex_triangulation(
-                normal, [0.0, 0.0, 0.0], [[0.0, 0.0, 0.0], point, [*point[:2], 1.0], [0.0, 0.0, 1.0]]
-            )
+        points = [[0.0, 0.0, 0.0], point, [*point[:2], 1.0], [0.0, 0.0, 1.0]]
+        result = build_planar_convex_triangulation(normal, [0.0, 0.0, 0.0], points)
+        exact = project_native_plane(point, [0.0, 0.0, 0.0], normal)
+        self.assertEqual(sum(Fraction(n) * coordinate for n, coordinate in zip(normal, exact, strict=True)), 0)
+        self.assertNotEqual(exact, tuple(Fraction(float(value)) for value in exact))
+        self.assertGreater(result["error_components_m"]["constructive_vertex_displacement"], 0)
+        self.assertGreater(result["error_components_m"]["binary64_projection_displacement"], 0)
+        self.assertLess(result["surface_error_upper_bound_m"], 5e-5)
+        self.assertEqual(result["triangles"][0]["native_points"][1], point)
 
     def test_all_axis_directions_preserve_face_orientation(self):
         for axis in range(3):
@@ -161,10 +166,10 @@ class NativePlanarBrepTests(unittest.TestCase):
                 ],
             )
 
-    def test_nonplanar_native_vertex_is_outside_exact_provider_domain(self):
+    def test_nonplanar_native_vertex_exceeding_complete_budget_is_rejected(self):
         with self.assertRaisesRegex(
-            PlanarBrepNotApplicable,
-            "exact-plane provider domain",
+            PlanarBrepEvidenceError,
+            "complete surface bound",
         ):
             build_planar_convex_triangulation(
                 [0.0, 0.0, 1.0],
@@ -285,10 +290,10 @@ class NativePlanarBrepTests(unittest.TestCase):
             result["error_components_m"]["binary32_vertex_displacement"],
         )
 
-    def test_surface_budget_cannot_expand_exact_plane_domain(self):
+    def test_plane_distance_and_construction_are_both_explicitly_charged(self):
         with self.assertRaisesRegex(
-            PlanarBrepNotApplicable,
-            "exact-plane provider domain",
+            PlanarBrepEvidenceError,
+            "complete surface bound",
         ):
             build_planar_convex_triangulation(
                 [0.0, 0.0, 1.0],
@@ -300,6 +305,22 @@ class NativePlanarBrepTests(unittest.TestCase):
                     [0.0, 1.0, 4.0e-5],
                 ],
             )
+
+    def test_binary32_collinear_boundary_is_rejected_even_with_positive_fan_triangles(self):
+        # All fan triangles remain positive, but the middle boundary turn collapses.
+        with self.assertRaisesRegex(PlanarBrepEvidenceError, "binary32 planar boundary"):
+            build_planar_convex_triangulation([0.0, 0.0, 1.0], [0.0, 0.0, 0.0],
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0 + 2**-25, 0.5, 0.0],
+                 [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+
+    def test_tangent_displacement_cannot_be_hidden_by_small_vertex_errors(self):
+        with self.assertRaisesRegex(PlanarBrepEvidenceError, "complete surface bound"):
+            build_planar_convex_triangulation([0.0, 0.0, 1.0], [0.0, 0.0, 0.0], _square(2, 1),
+                tangent_displacements=[([0.0, 0.0, 0.0], [0.0, 0.000051, 0.0])])
+
+    def test_raw_fact_types_do_not_accept_internal_rational_values(self):
+        with self.assertRaisesRegex(PlanarBrepEvidenceError, "normal is malformed"):
+            build_planar_convex_triangulation([Fraction(0), 0.0, 1.0], [0.0, 0.0, 0.0], _square(2, 1))
 
 
 if __name__ == "__main__":

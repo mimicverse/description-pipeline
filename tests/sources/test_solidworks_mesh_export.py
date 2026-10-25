@@ -11,6 +11,7 @@ import struct
 import tempfile
 import threading
 import unittest
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -868,6 +869,108 @@ class ComponentMeshExportTests(unittest.TestCase):
         ]
         return entry, triangle_vertices, body, edges, tessellation_calls
 
+    def test_observed_body31_vertices_plane_and_line_have_a_complete_bound(self):
+        # Preserved 98bc native facts, raw failure SHA-256:
+        # 70dff2acbf603e6bc5fdced53da153547bf54ea4b0e12b7f00e45b52cadd48a1.
+        # Unobserved coedge evaluations use the generic fixture; this is not
+        # a claim of a complete native run or hidden-kernel certification.
+        points = [
+            (0.060781277853051, 0.004712752888887, -0.044569082296165),
+            (0.06078171447497903, 0.004712752888887, -0.044569082296165),
+            (0.06078171455672958, 0.00471275285563233, -0.044568082296165),
+            (0.060781277929139566, 0.004712752888887, -0.044568082296165),
+        ]
+        normal = (0.0, -1.0, 1.7347234759759997e-16)
+        line = [0.060486118872238, 0.004712752888887, -0.044568082296165, 1.0, 0.0, 0.0]
+
+        class ObservedLine(FakeCurve):
+            @property
+            def LineParams(self):  # noqa: N802 - SolidWorks API name
+                return list(line)
+
+        component, body, edges = _planar_sheet(points, normal=normal)
+        body._faces[0]._area = 4.366247590222231e-13
+        edges[2]._curve = ObservedLine(edges[2])
+        backend = _backend(component, name="renamed-native-sheet")
+        before = len(body.tessellation_face_lists)
+        body._tessellation.tessellate_result = False
+        entry = backend.export_component_meshes({"renamed-native-sheet": self.dest})["renamed-native-sheet"]
+        self.assertEqual(len(body.tessellation_face_lists), before)
+        planar = entry["tessellation"]["planar_brep"]["bodies"][0]
+        self.assertEqual([row["point_m"] for row in planar["boundary_vertices"]], [list(point) for point in points])
+        errors = planar["triangulation"]["error_components_m"]
+        self.assertGreater(errors["constructive_vertex_displacement"], 3.3e-11)
+        self.assertGreater(errors["cross_api_vertex_displacement"], 3.3e-11)
+        self.assertGreater(errors["binary64_projection_displacement"], 0)
+        self.assertLess(planar["triangulation"]["surface_error_upper_bound_m"], 3e-9)
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation(
+            "renamed-native-sheet", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+
+    def test_topology_identity_cannot_be_chosen_by_identical_coordinates(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        edges[0]._end = FakeVertex(edges[1]._start._point, b"different-native-vertex")
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "adjacent native edges"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_raw_trim_and_topology_must_agree_even_when_both_follow_tangent(self):
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1e-6, 0.0, 0.0), (1e-6, 1e-6, 0.0), (0.0, 1e-6, 0.0)])
+        coedge = body._faces[0]._loops[0]._coedges[0]
+        coedge.GetCurveParams = lambda: [0.0, 0.0, 0.0, -1e-6, 1e-5, 0.0, 0.0, 1.0, 0.0, 0.0]
+        coedge.Evaluate2 = lambda u, derivatives: [-u * 1e-6, u * 1e-5, 0.0, 1.0, 1.0, 0.0]
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "trim reverses its native topological direction"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
+    def test_small_nonparallel_tangent_is_bounded_for_the_entire_segment(self):
+        component, body, _edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        coedge = body._faces[0]._loops[0]._coedges[0]
+        read = coedge.Evaluate2
+        coedge.Evaluate2 = lambda u, derivatives: [*read(u, derivatives)[:3], 1.0, 3e-5, 0.0]
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+        errors = entry["tessellation"]["planar_brep"]["bodies"][0]["triangulation"]["error_components_m"]
+        bound = errors["tangent_segment_displacement"]
+        self.assertGreaterEqual(Fraction(bound)**2, Fraction(3e-5)**2 / (1 + Fraction(3e-5)**2))
+        self.assertLess(bound, 5e-5)
+
+    def test_consumer_recomputes_every_bound_component_and_both_vertex_representations(self):
+        points = [(0.0, 0.0, 0.0), (-0.24, 0.18, 0.0), (-0.24, 0.18, 1.0), (0.0, 0.0, 1.0)]
+        entry, vertices, _body, _edges, _calls = self._planar_export(points, normal=(0.6, 0.8, 0.0))
+        original = entry["tessellation"]["planar_brep"]["bodies"][0]["triangulation"]
+        for key in original["error_components_m"]:
+            with self.subTest(component=key):
+                changed = copy.deepcopy(entry["tessellation"])
+                ledger = changed["planar_brep"]["bodies"][0]["triangulation"]["error_components_m"]
+                ledger[key] = math.nextafter(ledger[key], math.inf)
+                with self.assertRaisesRegex(PipelineError, "surface bound is not reproducible"):
+                    parse_native_tessellation("pcb-1", changed, entry["bodies"], entry["triangles"], vertices)
+        for field in ("native_points", "constructed_points", "stl_points"):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(entry["tessellation"])
+                point = changed["planar_brep"]["bodies"][0]["triangulation"]["triangles"][0][field][0]
+                point[0] = math.nextafter(point[0], math.inf)
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation("pcb-1", changed, entry["bodies"], entry["triangles"], vertices)
+
+    def test_consumer_rejects_coordinate_nearest_vertex_rebinding(self):
+        entry, vertices, _body, _edges, _calls = self._planar_export()
+        changed = copy.deepcopy(entry["tessellation"])
+        row = changed["planar_brep"]["bodies"][0]["loop"]["coedges"][0]
+        row["start_vertex_reference_sha256"], row["end_vertex_reference_sha256"] = (
+            row["end_vertex_reference_sha256"], row["start_vertex_reference_sha256"])
+        with self.assertRaisesRegex(PipelineError, "adjacent vertex incidence"):
+            parse_native_tessellation("pcb-1", changed, entry["bodies"], entry["triangles"], vertices)
+
     def test_sheet_only_part_exports_its_faces(self):
         body = FakeBody([FakeFace(TRIANGLE)])
         component = FakeComponent(
@@ -1061,13 +1164,12 @@ class ComponentMeshExportTests(unittest.TestCase):
                          json.loads(json.dumps(backend.notes["geometry_provider_selection"])))
         self.assertEqual(admitted_notes["geometry_provider_selection"]["pcb-1"]["1/1"]["selection_result"],
                          "not_applicable")
-        plane_selection = admitted_notes["geometry_provider_selection"]["pcb-1"]["1/2"]
-        self.assertIn("exact-line", plane_selection["miss_reason"])
-        self.assertEqual(plane_selection["surface"]["plane_params"], [0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-        self.assertEqual(plane_selection["current_edge_fact"]["edge_line_params"],
-                         [0.0, 2**-48, 0.0, 1.0, 0.0, 0.0])
-        self.assertEqual(plane_selection["line_domain_predicate"]["trim_line_residual_upper_bound_m"],
-                         [2**-48, 2**-48])
+        self.assertNotIn("1/2", admitted_notes["geometry_provider_selection"]["pcb-1"])
+        admitted_capture = read_data(destination / "evidence/capture.json")
+        derived_body = admitted_capture["geometry"][0]["tessellation"]["planar_brep"]["bodies"][1]
+        self.assertEqual(derived_body["body_index"], 2)
+        self.assertGreaterEqual(
+            derived_body["triangulation"]["error_components_m"]["cross_api_vertex_displacement"], 2**-48)
         self.assertEqual(native_transfer.verify_transfer(destination)["main_assembly"], transfer_fixture.MAIN_ASSEMBLY)
         result = verify_native_mesh_observations(destination)
         self.assertEqual(result["components"], 1)
@@ -1086,10 +1188,10 @@ class ComponentMeshExportTests(unittest.TestCase):
                 mutated = copy.deepcopy(entry["tessellation"])
                 evaluations = mutated["planar_brep"]["bodies"][0]["loop"]["coedges"][0]["evaluations"]
                 evaluations[endpoint]["tangent"] = [1.0, 1.0, 0.0]
-                with self.assertRaisesRegex(PipelineError, "boundary line"):
+                with self.assertRaisesRegex(PipelineError, "complete surface bound"):
                     parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], triangle_vertices)
 
-    def test_planar_consumer_rejects_nonexact_closure_inside_endpoint_bound(self):
+    def test_planar_consumer_rejects_unaccounted_nonexact_closure(self):
         entry, triangles, _body, _edges, _calls = self._planar_export()
         mutated = copy.deepcopy(entry["tessellation"])
         incoming = mutated["planar_brep"]["bodies"][0]["loop"]["coedges"][0]
@@ -1098,10 +1200,10 @@ class ComponentMeshExportTests(unittest.TestCase):
         incoming["curve_params_raw"][3] += delta
         incoming["evaluations"][1]["point_m"][0] += delta
         incoming["end_vertex_point_error_m"] = delta
-        with self.assertRaisesRegex(PipelineError, "loop is open|contradicts edge direction"):
+        with self.assertRaisesRegex(PipelineError, "surface bound is not reproducible"):
             parse_native_tessellation("pcb-1", mutated, entry["bodies"], entry["triangles"], triangles)
 
-    def test_planar_producer_excludes_nonexact_loop_closure(self):
+    def test_planar_producer_bounds_nonclosed_observations_without_changing_native_vertices(self):
         points = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
         component, body, edges = _planar_sheet(points)
         delta = 2**-24
@@ -1124,33 +1226,34 @@ class ComponentMeshExportTests(unittest.TestCase):
             ]
         backend = _backend(component)
         before = len(body.tessellation_face_lists)
-        with self.assertRaises(CadError) as caught:
-            backend.export_component_meshes({"pcb-1": self.dest})
-        self.assertEqual(len(body.tessellation_face_lists), before + 1)
-        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(len(body.tessellation_face_lists), before)
+        planar = entry["tessellation"]["planar_brep"]["bodies"][0]
+        self.assertEqual([row["point_m"] for row in planar["boundary_vertices"]], [list(point) for point in points])
+        self.assertGreaterEqual(planar["triangulation"]["error_components_m"]["cross_api_vertex_displacement"], delta)
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
 
-    def test_exact_tangent_domain_excludes_nonzero_subnormal_offsets(self):
-        for perpendicular, domain_miss in ((-0.0, False), (math.ulp(0.0), True), (2 * math.ulp(0.0), True)):
+    def test_subnormal_tangent_offsets_are_outward_bounded(self):
+        for perpendicular in (-0.0, math.ulp(0.0), 2 * math.ulp(0.0)):
             with self.subTest(perpendicular=perpendicular):
                 component, body, _edges = _planar_sheet(
-                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
-                )
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
                 coedge = body._faces[0]._loops[0]._coedges[0]
                 evaluate = coedge.Evaluate2
                 coedge.Evaluate2 = lambda parameter, derivatives, read=evaluate, y=perpendicular: [
-                    *read(parameter, derivatives)[:3], 1.0, y, 0.0
-                ]
+                    *read(parameter, derivatives)[:3], 1.0, y, 0.0]
                 backend = _backend(component)
                 before = len(body.tessellation_face_lists)
                 target = self.tmp / f"subnormal-{perpendicular.hex()}.stl"
-                if perpendicular == 0.0:
-                    backend.export_component_meshes({"pcb-1": target})
-                    self.assertEqual(len(body.tessellation_face_lists), before)
-                else:
-                    with self.assertRaises(CadError) as caught:
-                        backend.export_component_meshes({"pcb-1": target})
-                    self.assertEqual(len(body.tessellation_face_lists), before + int(domain_miss))
-                    self.assertEqual("planar_brep_evidence" in caught.exception.detail, not domain_miss)
+                entry = backend.export_component_meshes({"pcb-1": target})["pcb-1"]
+                self.assertEqual(len(body.tessellation_face_lists), before)
+                errors = entry["tessellation"]["planar_brep"]["bodies"][0]["triangulation"]["error_components_m"]
+                bound = errors["tangent_segment_displacement"]
+                exact_squared = Fraction(perpendicular)**2 / (1 + Fraction(perpendicular)**2)
+                self.assertGreaterEqual(Fraction(bound)**2, exact_squared)
+                vertices = stl_vertices(target).reshape(-1, 3, 3).tolist()
+                parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
 
     def test_planar_consumer_recomputes_evaluate_tolerance(self):
         entry, triangle_vertices, _body, _edges, _calls = self._planar_export()
@@ -1177,7 +1280,7 @@ class ComponentMeshExportTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             PipelineError,
-            "edge, coedge, and trim lines differ",
+            "native planar line relation differs",
         ):
             parse_native_tessellation(
                 "pcb-1",
@@ -1254,7 +1357,7 @@ class ComponentMeshExportTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             PipelineError,
-            "boundary edge|preserve boundary area",
+            "triangle 1 is malformed",
         ):
             parse_native_tessellation(
                 "pcb-1",
@@ -1375,7 +1478,7 @@ class ComponentMeshExportTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             PipelineError,
-            "conflicts with its plane",
+            "triangle 0 is malformed",
         ):
             parse_native_tessellation(
                 "pcb-1",
@@ -1427,7 +1530,7 @@ class ComponentMeshExportTests(unittest.TestCase):
                     self.assertTrue(coedge["same_direction_as_edge"])
                     self.assertEqual(coedge["start_point_m"], edge._start._point)
                 coedges[0]["start_vertex_reference_sha256"] = "0" * 64
-                with self.assertRaisesRegex(PipelineError, "unordered native vertex set"):
+                with self.assertRaisesRegex(PipelineError, "adjacent vertex incidence"):
                     parse_native_tessellation(
                         "pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices,
                     )
@@ -1616,7 +1719,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertIn("trim", str(caught.exception))
         self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
 
-    def test_rounded_plane_domain_miss_uses_itessellation_once(self):
+    def test_rounded_plane_is_constructed_without_itessellation(self):
         point = (-0.8 * 0.3, 0.6 * 0.3, 0.0)
         component, body, _edges = _planar_sheet(
             [(0.0, 0.0, 0.0), point, (*point[:2], 1.0), (0.0, 0.0, 1.0)],
@@ -1624,12 +1727,14 @@ class ComponentMeshExportTests(unittest.TestCase):
         )
         backend = _backend(component)
         tessellation_calls = len(body.tessellation_face_lists)
-        with self.assertRaises(CadError) as caught:
-            backend.export_component_meshes({"pcb-1": self.dest})
-        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls + 1)
-        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+        errors = entry["tessellation"]["planar_brep"]["bodies"][0]["triangulation"]["error_components_m"]
+        self.assertGreater(errors["constructive_vertex_displacement"], 0)
 
-    def test_rounded_tangent_domain_miss_precedes_plane_domain(self):
+    def test_rounded_tangent_and_plane_have_separate_bounds(self):
         point = (-0.8 * 0.3, 0.6 * 0.3, 0.0)
         component, body, _edges = _planar_sheet(
             [(0.0, 0.0, 0.0), point, (*point[:2], 1.0), (0.0, 0.0, 1.0)],
@@ -1640,29 +1745,26 @@ class ComponentMeshExportTests(unittest.TestCase):
         coedge.Evaluate2 = lambda parameter, derivatives: [*evaluate(parameter, derivatives)[:3], -0.8, 0.6, 0.0]
         backend = _backend(component)
         tessellation_calls = len(body.tessellation_face_lists)
-        with self.assertRaises(CadError) as caught:
-            backend.export_component_meshes({"pcb-1": self.dest})
-        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls + 1)
-        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+        errors = entry["tessellation"]["planar_brep"]["bodies"][0]["triangulation"]["error_components_m"]
+        self.assertGreater(errors["constructive_vertex_displacement"], 0)
 
     def test_planar_miss_facts_survive_the_primary_tessellate_failure(self):
-        point = (-0.8 * 0.3, 0.6 * 0.3, 0.0)
         component, body, _edges = _planar_sheet(
-            [(0.0, 0.0, 0.0), point, (*point[:2], 1.0), (0.0, 0.0, 1.0)],
-            normal=(0.6, 0.8, 0.0),
-        )
+            [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.0, 2.0, 0.0), (1.0, 0.5, 0.0), (0.0, 2.0, 0.0)])
         backend = _backend(component)
         body._tessellation.tessellate_result = False
         before = len(body.tessellation_face_lists)
         with self.assertRaises(CadError) as caught:
             backend.export_component_meshes({"pcb-1": self.dest})
         self.assertEqual(caught.exception.message, "ITessellation.Tessellate returned false")
-        self.assertIs(caught.exception.detail["tessellate_result"], False)
         selection = caught.exception.detail["planar_provider_selection"]
         self.assertEqual(selection["selection_result"], "not_applicable")
-        self.assertIn("exact-plane", selection["miss_reason"])
-        self.assertEqual(selection["surface"]["plane_params"][:3], [0.6, 0.8, 0.0])
-        self.assertEqual(len(selection["coedge_facts"]), 4)
+        self.assertIn("not strictly convex", selection["miss_reason"])
+        self.assertEqual(len(selection["coedge_facts"]), 5)
         self.assertEqual(len(body.tessellation_face_lists), before + 1)
         json.dumps(caught.exception.detail, allow_nan=False)
 
@@ -1677,7 +1779,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(selection["surface"], {"is_plane": False})
         self.assertEqual(caught.exception.detail["api"], "ITessellation.Tessellate")
 
-    def test_planar_producer_excludes_unproved_noncollinear_end_tangent(self):
+    def test_planar_producer_rejects_tangent_whose_full_segment_exceeds_budget(self):
         component, body, _edges = _planar_sheet([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
         coedge = body._faces[0]._loops[0]._coedges[0]
         evaluate = coedge.Evaluate2
@@ -1691,10 +1793,9 @@ class ComponentMeshExportTests(unittest.TestCase):
         tessellation_calls = len(body.tessellation_face_lists)
         with self.assertRaises(CadError) as caught:
             backend.export_component_meshes({"pcb-1": self.dest})
-        self.assertNotIn("planar_brep_evidence", caught.exception.detail)
-        self.assertEqual(caught.exception.detail["planar_provider_selection"]["miss_reason"],
-                         "tangent_is_outside_exact_line_provider_domain")
-        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls + 1)
+        self.assertIn("complete surface bound", caught.exception.message)
+        self.assertIn("planar_brep_evidence", caught.exception.detail)
+        self.assertEqual(len(body.tessellation_face_lists), tessellation_calls)
 
     def test_observed_reverse_tangent_precedes_noncollinear_domain_in_both_orders(self):
         for reverse_endpoint in (0.0, 1.0):
@@ -1791,7 +1892,7 @@ class ComponentMeshExportTests(unittest.TestCase):
                                     for row in rows))
                 self.assertEqual(len(body.tessellation_face_lists), before)
 
-    def test_observed_a42_parameters_reach_exact_line_domain_selection(self):
+    def test_observed_a42_local_u_and_line_rounding_are_bounded(self):
         start = (0.031987069790850996, -0.000599999998052, -0.053373733962836)
         end = (0.031987069790850996, -0.000599999998052, -0.052817323706427)
         line = [0.031987069790851, -0.000599999998052, -0.055476906273812, -0.0, -0.0, -1.0]
@@ -1811,16 +1912,19 @@ class ComponentMeshExportTests(unittest.TestCase):
         coedge = body._faces[0]._loops[0]._coedges[0]
         coedge.GetCurveParams = lambda: list(raw)
         coedge._curve_present = False
+        coedge.Evaluate2 = lambda u, derivatives: [
+            *(start[axis] + (u - raw[6]) / (raw[7] - raw[6]) * (end[axis] - start[axis]) for axis in range(3)),
+            *(end[axis] - start[axis] for axis in range(3))]
         backend = _backend(component)
         body._tessellation.tessellate_result = False
         before = len(body.tessellation_face_lists)
-        with self.assertRaisesRegex(CadError, "Tessellate returned false") as caught:
-            backend.export_component_meshes({"pcb-1": self.dest})
-        selection = caught.exception.detail["planar_provider_selection"]
-        self.assertIn("exact-line", selection["miss_reason"])
-        self.assertEqual(selection["current_edge_fact"]["curve_params_raw"], raw)
-        self.assertEqual(selection["current_edge_fact"]["edge_line_params"], line)
-        self.assertEqual(len(body.tessellation_face_lists), before + 1)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(len(body.tessellation_face_lists), before)
+        row = entry["tessellation"]["planar_brep"]["bodies"][0]["loop"]["coedges"][0]
+        self.assertEqual(row["curve_params_raw"], raw)
+        self.assertEqual(row["edge_line_params"], line)
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
 
     def test_coedge_curve_can_have_an_independent_line_origin_and_direction(self):
         class LocalLine(FakeCurve):
@@ -1899,7 +2003,7 @@ class ComponentMeshExportTests(unittest.TestCase):
                 self.assertIsNotNone(caught.exception.detail["face_senses"][0]["EdgeInFaceSense"]["error"])
                 self.assertEqual(len(body.tessellation_face_lists), before)
 
-    def test_observed_d534_line_residual_is_outside_exact_provider_domain(self):
+    def test_observed_d534_line_residual_is_explicitly_bounded(self):
         start = (0.009999356023198996, -0.006164722832204, -0.055676906273813)
         end = (0.009968943104147997, -0.00608019051360702, -0.055676906273813)
         line = [*start, -0.33853503429773646, 0.9409537876819618, -0.0]
@@ -1916,15 +2020,14 @@ class ComponentMeshExportTests(unittest.TestCase):
         backend = _backend(component)
         body._tessellation.tessellate_result = False
         before = len(body.tessellation_face_lists)
-        with self.assertRaisesRegex(CadError, "Tessellate returned false") as caught:
-            backend.export_component_meshes({"pcb-1": self.dest})
-        selection = caught.exception.detail["planar_provider_selection"]
-        self.assertIn("exact-line", selection["miss_reason"])
-        self.assertEqual(selection["current_edge_fact"]["edge_line_params"], line)
-        residual = selection["line_domain_predicate"]["trim_line_residual_upper_bound_m"][1]
-        self.assertGreater(residual, 6.45e-18)
-        self.assertLess(residual, 6.46e-18)
-        self.assertEqual(len(body.tessellation_face_lists), before + 1)
+        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(len(body.tessellation_face_lists), before)
+        triangulation = entry["tessellation"]["planar_brep"]["bodies"][0]["triangulation"]
+        bound = triangulation["error_components_m"]["cross_api_vertex_displacement"]
+        self.assertGreater(bound, 6.45e-18)
+        self.assertLess(bound, 6.46e-18)
+        vertices = stl_vertices(self.dest).reshape(-1, 3, 3).tolist()
+        parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
 
     def test_observed_invalid_secondary_sense_precedes_provider_selection(self):
         for invalid in (False, 1, None, RuntimeError("unreadable secondary sense")):

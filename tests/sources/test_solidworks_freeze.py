@@ -913,7 +913,7 @@ class FreezeTests(unittest.TestCase):
 
     def test_export_time_provider_selection_is_sealed_in_raw_scene(self) -> None:
         selection = {"base-1": {"0/0": {
-            "provider": "native-planar-brep-v1",
+            "provider": "native-planar-brep-v2",
             "selection_result": "not_applicable",
             "miss_reason": "native_body_is_not_a_sheet",
         }}}

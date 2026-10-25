@@ -1735,6 +1735,8 @@ def _polygon_area2(points) -> Fraction:
 
 
 def _triangles_overlap(first, second) -> bool:
+    first = first if _polygon_area2(first) > 0 else tuple(reversed(first))
+    second = second if _polygon_area2(second) > 0 else tuple(reversed(second))
     intersection = _clip_convex_polygon(first, second)
     return len(intersection) >= 3 and _polygon_area2(intersection) > 0
 
@@ -1762,8 +1764,8 @@ def _projected_boundary(points, face_normal):
         face_normal[axis],
         tuple(
             (
-                Fraction.from_float(point[first]),
-                Fraction.from_float(point[second]),
+                Fraction(point[first]),
+                Fraction(point[second]),
             )
             for point in points
         ),
@@ -1777,6 +1779,63 @@ def _plane_residual_squared(point, plane_point, plane_normal):
         for index in range(3)
     )
     return numerator * numerator / sum(value * value for value in normal)
+
+
+def _planar_distance_squared(first, second):
+    return sum((Fraction(first[axis]) - Fraction(second[axis])) ** 2 for axis in range(3))
+
+
+def _planar_line_projection(point, line):
+    origin = tuple(Fraction(value) for value in line[:3])
+    direction = tuple(Fraction(value) for value in line[3:])
+    scalar = sum((Fraction(point[axis]) - origin[axis]) * direction[axis] for axis in range(3))
+    scalar /= sum(value**2 for value in direction)
+    return tuple(origin[axis] + scalar * direction[axis] for axis in range(3))
+
+
+def _planar_unordered_segment_bound(points, targets):
+    # An unordered geometric segment has no endpoint identity. Either affine
+    # correspondence bounds its entire image; take the tighter complete bound.
+    return min(
+        max(_planar_distance_squared(point, target) for point, target in zip(order, targets, strict=True))
+        for order in (points, tuple(reversed(points)))
+    )
+
+
+def _planar_project_to_plane(point, plane_point, normal):
+    axis = max(range(3), key=lambda index: abs(normal[index]))
+    exact = [Fraction(value) for value in point]
+    # Solve the raw native plane equation without a binary64 intermediate.
+    residual = sum(Fraction(normal[index]) * (exact[index] - Fraction(plane_point[index])) for index in range(3))
+    exact[axis] -= residual / Fraction(normal[axis])
+    return tuple(exact)
+
+
+def _validate_planar_boundary(component, points, normal, label):
+    normal_axis, projected = _projected_boundary(points, normal)
+    sign = 1 if normal_axis > 0 else -1
+    area = _polygon_area2(projected)
+    _require(len(set(projected)) == len(projected), component + f": {label} repeats a boundary vertex")
+    _require(area * sign > 0, component + f": {label} boundary does not follow face orientation")
+    _require(
+        all(
+            _cross2(projected[i], projected[(i + 1) % len(projected)], projected[(i + 2) % len(projected)]) * sign > 0
+            for i in range(len(projected))
+        ),
+        component + f": {label} boundary is not strictly convex",
+    )
+    for first in range(len(projected)):
+        for second in range(first + 1, len(projected)):
+            if second == (first + 1) % len(projected) or first == (second + 1) % len(projected):
+                continue
+            _require(
+                not _segments_intersect(
+                    (projected[first], projected[(first + 1) % len(projected)]),
+                    (projected[second], projected[(second + 1) % len(projected)]),
+                ),
+                component + f": {label} boundary self-intersects",
+            )
+    return sign, projected, area
 
 
 def _parse_planar_brep_evidence(
@@ -1863,6 +1922,7 @@ def _parse_planar_brep_evidence(
         "triangle_index",
         "vertex_indices",
         "native_points",
+        "constructed_points",
         "stl_points",
     }
     covered_bodies = set()
@@ -1977,6 +2037,32 @@ def _parse_planar_brep_evidence(
         boundary_points = []
         boundary_references = []
         source_error_squared = Fraction(0, 1)
+        tangent_error_squared = Fraction(0, 1)
+        endpoint_sets = []
+        vertex_points = {}
+        for coedge in coedges:
+            _require(
+                isinstance(coedge, dict) and isinstance(coedge.get("edge_reference_sha256"), str),
+                component + ": native planar coedge reference is malformed",
+            )
+            edge = edge_by_reference.get(coedge["edge_reference_sha256"])
+            _require(isinstance(edge, dict), component + ": native planar coedge names an unknown edge")
+            refs = set()
+            for endpoint in ("start", "end"):
+                ref = edge[f"{endpoint}_vertex_reference_sha256"]
+                point = edge[f"{endpoint}_point_m"]
+                _require(
+                    isinstance(ref, str) and bool(HEX64.fullmatch(ref)) and _finite_point(point),
+                    component + ": native planar edge lacks a complete vertex identity",
+                )
+                _require(
+                    ref not in vertex_points or vertex_points[ref] == point,
+                    component + ": one native planar vertex has conflicting coordinates",
+                )
+                vertex_points[ref] = point
+                refs.add(ref)
+            _require(len(refs) == 2, component + ": native planar edge must have two distinct vertices")
+            endpoint_sets.append(refs)
         seen_edges = set()
         for coedge_index, coedge in enumerate(coedges):
             _require(
@@ -1987,12 +2073,13 @@ def _parse_planar_brep_evidence(
             edge = edge_by_reference.get(edge_reference)
             _require(
                 coedge["coedge_index"] == coedge_index
+                and _integer(coedge["coedge_index"])
                 and coedge["edge_is_line"] is True
                 and type(coedge["same_direction_as_edge"]) is bool
                 and coedge["tangent_direction_rule"] == NATIVE_PLANAR_COEDGE_DIRECTION_RULE
                 and type(coedge["coedge_curve_present"]) is bool
                 and _integer(coedge["edge_index"])
-                and coedge["edge_index"] >= 0
+                and 0 <= coedge["edge_index"] < len(native_edges_for_body)
                 and isinstance(coedge["native_edge_reference_sha256"], str)
                 and bool(HEX64.fullmatch(coedge["native_edge_reference_sha256"]))
                 and edge_reference not in seen_edges
@@ -2009,6 +2096,13 @@ def _parse_planar_brep_evidence(
                 and _finite_point(coedge["start_point_m"])
                 and _finite_point(coedge["end_point_m"]),
                 component + f": native planar BRep coedge {coedge_index} is malformed for body {body_key}",
+            )
+            _require(
+                coedge["same_direction_as_edge"] is next(
+                    row["EdgeInFaceSense"]["value"] for row in edge["face_senses"]
+                    if row["face_index"] == body["face_index"]
+                ),
+                component + f": native planar coedge {coedge_index} disagrees with its native face sense",
             )
             edge_line_raw = coedge["edge_line_params"]
             coedge_line_raw = coedge["coedge_line_params"]
@@ -2044,38 +2138,18 @@ def _parse_planar_brep_evidence(
                 if coedge_direction is not None
                 else 0
             )
+            expected_orientation = "not_observed"
+            if coedge_direction is not None:
+                expected_orientation = (
+                    "non_collinear"
+                    if _vector_cross(edge_direction, coedge_direction) != (0, 0, 0)
+                    else ("same" if line_dot > 0 else "opposite")
+                )
             _require(
                 any(edge_direction)
-                and (
-                    coedge_direction is None
-                    or (
-                        any(coedge_direction)
-                        and _vector_cross(
-                            edge_direction,
-                            coedge_direction,
-                        )
-                        == (0, 0, 0)
-                        and _vector_cross(
-                            edge_direction,
-                            _vector_difference(
-                                edge_line[:3],
-                                coedge_line[:3],
-                            ),
-                        )
-                        == (0, 0, 0)
-                    )
-                )
-                and all(
-                    _vector_cross(
-                        edge_direction,
-                        _vector_difference(edge_line[:3], point),
-                    )
-                    == (0, 0, 0)
-                    for point in trim_points
-                )
-                and coedge["line_orientation"]
-                == ("not_observed" if coedge_direction is None else ("same" if line_dot > 0 else "opposite")),
-                component + f": native planar edge, coedge, and trim lines differ for coedge {coedge_index}",
+                and (coedge_direction is None or any(coedge_direction))
+                and coedge["line_orientation"] == expected_orientation,
+                component + f": native planar line relation differs for coedge {coedge_index}",
             )
             seen_edges.add(edge_reference)
             raw_curve_params = coedge["curve_params_raw"]
@@ -2089,35 +2163,22 @@ def _parse_planar_brep_evidence(
                 and raw_curve_params[3:6] == coedge["end_point_m"],
                 component + f": native planar BRep curve parameters differ for coedge {coedge_index}",
             )
-            endpoint_by_reference = {
-                edge["start_vertex_reference_sha256"]: edge["start_point_m"],
-                edge["end_vertex_reference_sha256"]: edge["end_point_m"],
-            }
+            start_set = endpoint_sets[coedge_index - 1] & endpoint_sets[coedge_index]
+            end_set = endpoint_sets[coedge_index] & endpoint_sets[(coedge_index + 1) % len(coedges)]
             _require(
-                len(endpoint_by_reference) == 2
-                and {coedge["start_vertex_reference_sha256"], coedge["end_vertex_reference_sha256"]}
-                == set(endpoint_by_reference),
-                component + f": native planar BRep coedge {coedge_index} does not bind its unordered native vertex set",
+                len(start_set) == 1 and len(end_set) == 1 and start_set != end_set,
+                component + f": native planar coedge {coedge_index} has ambiguous adjacent vertex incidence",
             )
+            start_ref, end_ref = next(iter(start_set)), next(iter(end_set))
             _require(
-                coedge["vertex_identity_rule"] == NATIVE_PLANAR_COEDGE_VERTEX_RULE,
-                component + f": native planar BRep coedge {coedge_index} vertex identity rule is unsupported",
+                coedge["vertex_identity_rule"] == NATIVE_PLANAR_COEDGE_VERTEX_RULE
+                and coedge["start_vertex_reference_sha256"] == start_ref
+                and coedge["end_vertex_reference_sha256"] == end_ref,
+                component + f": native planar coedge {coedge_index} violates adjacent vertex incidence",
             )
-            expected_edge_point = endpoint_by_reference[coedge["start_vertex_reference_sha256"]]
-            expected_edge_end = endpoint_by_reference[coedge["end_vertex_reference_sha256"]]
-            start_tolerance = native_point_roundtrip_tolerance(
-                coedge["start_point_m"],
-                expected_edge_point,
-            )
-            end_tolerance = native_point_roundtrip_tolerance(
-                coedge["end_point_m"],
-                expected_edge_end,
-            )
-            _require(
-                coedge["start_point_m"] == expected_edge_point
-                and coedge["end_point_m"] == expected_edge_end,
-                component + f": native planar BRep coedge {coedge_index} contradicts edge direction",
-            )
+            expected_edge_point, expected_edge_end = vertex_points[start_ref], vertex_points[end_ref]
+            start_tolerance = native_point_roundtrip_tolerance(coedge["start_point_m"], expected_edge_point)
+            end_tolerance = native_point_roundtrip_tolerance(coedge["end_point_m"], expected_edge_end)
             for endpoint, trim_point, vertex_point, vertex_tolerance in (
                 (
                     "start",
@@ -2145,8 +2206,7 @@ def _parse_planar_brep_evidence(
                     and vertex_point == (expected_edge_point if endpoint == "start" else expected_edge_end)
                     and coedge[f"{endpoint}_vertex_point_error_m"] == computed_error
                     and coedge[f"{endpoint}_vertex_point_tolerance_m"] == computed_tolerance
-                    and computed_tolerance == vertex_tolerance
-                    and computed_error <= computed_tolerance,
+                    and computed_tolerance == vertex_tolerance,
                     component
                     + f": native planar BRep coedge {coedge_index} {endpoint} vertex displacement is not reproducible",
                 )
@@ -2199,18 +2259,44 @@ def _parse_planar_brep_evidence(
                     component
                     + f": native planar BRep coedge {coedge_index} {endpoint} evaluation bound is not reproducible",
                 )
-            segment = _vector_difference(
-                _fraction_point(coedge["start_point_m"]),
-                _fraction_point(coedge["end_point_m"]),
-            )
+            segment = _vector_difference(_fraction_point(expected_edge_point), _fraction_point(expected_edge_end))
+            raw_segment = _vector_difference(*trim_points)
             _require(
-                all(
-                    _vector_cross(segment, _fraction_point(row["tangent"])) == (0, 0, 0)
-                    and sum(segment[axis] * Fraction.from_float(row["tangent"][axis]) for axis in range(3)) > 0
-                    for row in evaluations
-                ),
-                component + f": native planar BRep coedge {coedge_index} tangent contradicts its boundary line",
+                sum(segment[axis] * raw_segment[axis] for axis in range(3)) > 0,
+                component + f": native planar coedge {coedge_index} trim reverses its topological direction",
             )
+            targets = (expected_edge_point, expected_edge_end)
+            for endpoint_index, evaluation in enumerate(evaluations):
+                tangent = _fraction_point(evaluation["tangent"])
+                tangent_dot = sum(segment[axis] * tangent[axis] for axis in range(3))
+                _require(
+                    tangent_dot > 0 and sum(raw_segment[axis] * tangent[axis] for axis in range(3)) > 0,
+                    component + f": native planar coedge {coedge_index} tangent contradicts its boundary line",
+                )
+                scale = tangent_dot / sum(value**2 for value in tangent)
+                difference = tuple(segment[axis] - scale * tangent[axis] for axis in range(3))
+                tangent_error_squared = max(tangent_error_squared, sum(value**2 for value in difference))
+                source_error_squared = max(
+                    source_error_squared, _planar_distance_squared(evaluation["point_m"], targets[endpoint_index])
+                )
+            curve_points = (edge["curve_start_point_m"], edge["curve_end_point_m"])
+            evaluated_points = tuple(edge["curve_endpoint_evaluations"][key]["payload"][:3] for key in ("start", "end"))
+            source_error_squared = max(
+                source_error_squared,
+                _planar_unordered_segment_bound(curve_points, targets),
+                _planar_unordered_segment_bound(evaluated_points, targets),
+                _planar_unordered_segment_bound(
+                    tuple(_planar_line_projection(point, edge_line) for point in curve_points), targets
+                ),
+            )
+            if coedge_line is not None:
+                source_error_squared = max(
+                    source_error_squared,
+                    *(
+                        _planar_distance_squared(_planar_line_projection(point, coedge_line), target)
+                        for point, target in zip(trim_points, targets, strict=True)
+                    ),
+                )
             start_reference = coedge["start_vertex_reference_sha256"]
             end_reference = coedge["end_vertex_reference_sha256"]
             _require(
@@ -2222,7 +2308,7 @@ def _parse_planar_brep_evidence(
                 component + f": native planar BRep coedge {coedge_index} has invalid vertex identities",
             )
             boundary_references.append(start_reference)
-            boundary_points.append(tuple(coedge["start_point_m"]))
+            boundary_points.append(tuple(expected_edge_point))
         _require(
             seen_edges == set(edge_by_reference),
             component + f": native planar BRep loop does not cover every body edge for {body_key}",
@@ -2231,7 +2317,7 @@ def _parse_planar_brep_evidence(
             next_coedge = coedges[(coedge_index + 1) % len(coedges)]
             _require(
                 coedge["end_vertex_reference_sha256"] == next_coedge["start_vertex_reference_sha256"]
-                and coedge["end_point_m"] == next_coedge["start_point_m"],
+                and coedge["end_vertex_point_m"] == next_coedge["start_vertex_point_m"],
                 component + f": native planar BRep loop is open at coedge {coedge_index}",
             )
         _require(
@@ -2260,6 +2346,7 @@ def _parse_planar_brep_evidence(
                 isinstance(row, dict)
                 and set(row) == boundary_required
                 and row["vertex_index"] == vertex_index
+                and _integer(row["vertex_index"])
                 and row["vertex_reference_sha256"] == boundary_references[vertex_index]
                 and row["point_m"] == list(boundary_points[vertex_index]),
                 component + f": native planar BRep boundary vertex {vertex_index} is inconsistent",
@@ -2278,78 +2365,47 @@ def _parse_planar_brep_evidence(
                 "boundary_area_m2",
                 "triangles",
             }
+            and _finite_number(triangulation["boundary_area_m2"])
+            and triangulation["boundary_area_m2"] > 0
+            and isinstance(triangulation["error_components_m"], dict)
+            and all(_finite_number(value) and value >= 0 for value in triangulation["error_components_m"].values())
+            and _finite_number(triangulation["surface_error_upper_bound_m"])
+            and _finite_number(triangulation["surface_error_limit_m"])
             and isinstance(triangulation["triangles"], list),
             component + f": native planar BRep triangulation is malformed for {body_key}",
         )
         computed_face_normal = tuple(surface["face_normal_unit"])
-        projected_normal, projected_boundary = _projected_boundary(
-            boundary_points,
-            computed_face_normal,
+        raw_face_normal = surface["face_normal_raw"]
+        plane_point = surface["plane_params"][3:6]
+        exact_projected = tuple(
+            _planar_project_to_plane(point, plane_point, raw_face_normal) for point in boundary_points
         )
+        constructed_points = tuple(tuple(float(value) for value in point) for point in exact_projected)
         _require(
-            projected_normal != 0.0,
-            component + ": planar normal has no projection",
+            all(all(math.isfinite(value) for value in point) for point in constructed_points),
+            component + ": native planar projection is outside binary64",
         )
-        orientation_sign = 1 if projected_normal > 0 else -1
-        boundary_area2_signed = _polygon_area2(projected_boundary)
-        _require(
-            boundary_area2_signed != 0 and orientation_sign * boundary_area2_signed > 0,
-            component + f": native planar BRep boundary does not follow face orientation for {body_key}",
+        orientation_sign, _projected_boundary_points, boundary_area2_signed = _validate_planar_boundary(
+            component, exact_projected, raw_face_normal, "native planar BRep"
         )
-        turns = [
-            _cross2(
-                projected_boundary[index],
-                projected_boundary[(index + 1) % len(projected_boundary)],
-                projected_boundary[(index + 2) % len(projected_boundary)],
-            )
-            for index in range(len(projected_boundary))
-        ]
-        _require(
-            all(turn * orientation_sign > 0 for turn in turns),
-            component + f": native planar BRep boundary is not strictly convex for {body_key}",
+        stl_boundary = tuple(_binary32_point(point) for point in constructed_points)
+        _, _projected_stl_boundary, stl_boundary_area2 = _validate_planar_boundary(
+            component, stl_boundary, raw_face_normal, "binary32 planar BRep"
         )
-        for first_index in range(len(projected_boundary)):
-            first = (
-                projected_boundary[first_index],
-                projected_boundary[(first_index + 1) % len(projected_boundary)],
-            )
-            for second_index in range(
-                first_index + 1,
-                len(projected_boundary),
-            ):
-                if second_index in {
-                    first_index,
-                    (first_index + 1) % len(projected_boundary),
-                } or first_index in {
-                    second_index,
-                    (second_index + 1) % len(projected_boundary),
-                }:
-                    continue
-                second = (
-                    projected_boundary[second_index],
-                    projected_boundary[(second_index + 1) % len(projected_boundary)],
-                )
-                _require(
-                    not _segments_intersect(first, second),
-                    component + f": native planar BRep boundary self-intersects for {body_key}",
-                )
-
-        plane_point = tuple(float(value) for value in surface["plane_params"][3:6])
         plane_residual_squared = max(
-            _plane_residual_squared(
-                point,
-                plane_point,
-                surface["plane_params"][:3],
-            )
-            for point in boundary_points
+            _plane_residual_squared(point, plane_point, raw_face_normal) for point in boundary_points
         )
-        _require(
-            plane_residual_squared == 0,
-            component + f": native planar BRep boundary conflicts with its plane for {body_key}",
+        construction_squared = max(
+            _planar_distance_squared(native, exact)
+            for native, exact in zip(boundary_points, exact_projected, strict=True)
+        )
+        projection_rounding_squared = max(
+            _planar_distance_squared(exact, rounded)
+            for exact, rounded in zip(exact_projected, constructed_points, strict=True)
         )
         triangles = triangulation["triangles"]
         _require(
-            len(triangles) == span["triangle_count"],
+            len(triangles) == span["triangle_count"] == len(boundary_points) - 2,
             component + f": native planar BRep triangle count differs from its face span for {body_key}",
         )
         _require(
@@ -2358,7 +2414,7 @@ def _parse_planar_brep_evidence(
             component + f": native planar BRep triangulation rule or normal differs for {body_key}",
         )
         normal_exact = _fraction_point(surface["face_normal_raw"])
-        dominant_axis = max(range(3), key=lambda axis: abs(computed_face_normal[axis]))
+        dominant_axis = max(range(3), key=lambda axis: abs(raw_face_normal[axis]))
         boundary_area = native_binary64_sqrt(
             boundary_area2_signed**2 * sum(value**2 for value in normal_exact) / (4 * normal_exact[dominant_axis] ** 2)
         )
@@ -2368,6 +2424,8 @@ def _parse_planar_brep_evidence(
         )
         triangle_polygons = []
         triangle_area2 = Fraction(0, 1)
+        stl_triangle_area2 = Fraction(0, 1)
+        stl_triangle_polygons = []
         binary32_error_squared = Fraction(0, 1)
         directed_edges = defaultdict(int)
         boundary_directed_edges = {(index, (index + 1) % len(boundary_points)) for index in range(len(boundary_points))}
@@ -2376,6 +2434,7 @@ def _parse_planar_brep_evidence(
                 isinstance(triangle, dict)
                 and set(triangle) == triangle_required
                 and triangle["triangle_index"] == expected_index
+                and _integer(triangle["triangle_index"])
                 and isinstance(triangle["vertex_indices"], list)
                 and len(triangle["vertex_indices"]) == 3
                 and all(
@@ -2383,9 +2442,17 @@ def _parse_planar_brep_evidence(
                     for vertex_index in triangle["vertex_indices"]
                 )
                 and len(set(triangle["vertex_indices"])) == 3
+                and triangle["vertex_indices"] == [0, expected_index + 1, expected_index + 2]
                 and isinstance(triangle["native_points"], list)
                 and len(triangle["native_points"]) == 3
                 and all(_finite_point(point) for point in triangle["native_points"])
+                and isinstance(triangle["constructed_points"], list)
+                and len(triangle["constructed_points"]) == 3
+                and all(_finite_point(point) for point in triangle["constructed_points"])
+                and all(
+                    tuple(triangle["constructed_points"][position]) == constructed_points[vertex_index]
+                    for position, vertex_index in enumerate(triangle["vertex_indices"])
+                )
                 and isinstance(triangle["stl_points"], list)
                 and len(triangle["stl_points"]) == 3
                 and all(_finite_point(point) for point in triangle["stl_points"])
@@ -2396,8 +2463,8 @@ def _parse_planar_brep_evidence(
                 component + f": native planar BRep triangle {expected_index} is malformed",
             )
             _, projected_triangle = _projected_boundary(
-                triangle["native_points"],
-                computed_face_normal,
+                [exact_projected[index] for index in triangle["vertex_indices"]],
+                raw_face_normal,
             )
             triangle_orientation = _cross2(
                 projected_triangle[0],
@@ -2408,9 +2475,9 @@ def _parse_planar_brep_evidence(
                 triangle_orientation * orientation_sign > 0,
                 component + f": native planar BRep triangle {expected_index} reverses orientation",
             )
-            native_triangle = tuple(_fraction_point(point) for point in triangle["native_points"])
+            constructed_triangle = tuple(_fraction_point(point) for point in triangle["constructed_points"])
             for position in range(3):
-                expected_stl_point = _binary32_point(triangle["native_points"][position])
+                expected_stl_point = _binary32_point(triangle["constructed_points"][position])
                 _require(
                     expected_stl_point == tuple(triangle["stl_points"][position]),
                     component
@@ -2420,11 +2487,27 @@ def _parse_planar_brep_evidence(
                 binary32_error_squared = max(
                     binary32_error_squared,
                     sum(
-                        (Fraction.from_float(triangle["stl_points"][position][axis]) - native_triangle[position][axis])
+                        (
+                            Fraction.from_float(triangle["stl_points"][position][axis])
+                            - constructed_triangle[position][axis]
+                        )
                         ** 2
                         for axis in range(3)
                     ),
                 )
+            _, stl_polygon = _projected_boundary(triangle["stl_points"], raw_face_normal)
+            stl_orientation = _cross2(*stl_polygon)
+            stl_exact = tuple(_fraction_point(point) for point in triangle["stl_points"])
+            stl_cross = _vector_cross(
+                _vector_difference(stl_exact[0], stl_exact[1]), _vector_difference(stl_exact[0], stl_exact[2])
+            )
+            _require(
+                stl_orientation * orientation_sign > 0
+                and sum(stl_cross[axis] * Fraction(raw_face_normal[axis]) for axis in range(3)) > 0,
+                component + f": native planar BRep binary32 triangle {expected_index} reverses orientation",
+            )
+            stl_triangle_polygons.append(stl_polygon)
+            stl_triangle_area2 += stl_orientation * orientation_sign
             triangle_area2 += triangle_orientation * orientation_sign
             triangle_polygons.append(projected_triangle)
             first, second, third = triangle["vertex_indices"]
@@ -2457,23 +2540,28 @@ def _parse_planar_brep_evidence(
                 component + f": native planar BRep internal edges are not reciprocal for {body_key}",
             )
         _require(
-            triangle_area2 == abs(boundary_area2_signed),
+            triangle_area2 == abs(boundary_area2_signed) and stl_triangle_area2 == abs(stl_boundary_area2),
             component + f": native planar BRep triangles do not preserve boundary area for {body_key}",
         )
         for first_index, first_triangle in enumerate(triangle_polygons):
             for second_triangle in triangle_polygons[first_index + 1 :]:
                 _require(
-                    not _triangles_overlap(
-                        first_triangle,
-                        second_triangle,
-                    ),
+                    not _triangles_overlap(first_triangle, second_triangle),
                     component + f": native planar BRep triangles overlap for {body_key}",
+                )
+        for first_index, first_triangle in enumerate(stl_triangle_polygons):
+            for second_triangle in stl_triangle_polygons[first_index + 1 :]:
+                _require(
+                    not _triangles_overlap(first_triangle, second_triangle),
+                    component + f": native planar BRep binary32 triangles overlap for {body_key}",
                 )
         surface_error_limit = Fraction.from_float(NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M)
         error_components = {
             "native_plane_residual": _outward_sqrt(plane_residual_squared),
-            "constructive_vertex_displacement": 0.0,
+            "constructive_vertex_displacement": _outward_sqrt(construction_squared),
+            "binary64_projection_displacement": _outward_sqrt(projection_rounding_squared),
             "cross_api_vertex_displacement": _outward_sqrt(source_error_squared),
+            "tangent_segment_displacement": _outward_sqrt(tangent_error_squared),
             "binary32_vertex_displacement": _outward_sqrt(binary32_error_squared),
         }
         surface_error_bound = native_binary64_sum_upper(error_components.values())

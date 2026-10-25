@@ -977,7 +977,7 @@ def native_tessellation_fixture(
         "native_edges": edge_rows,
         "no_facets_faces": normalized_no_facets,
         "planar_brep": {
-            "schema_version": "solidworks-to-urdf.native-planar-brep/v1",
+            "schema_version": "solidworks-to-urdf.native-planar-brep/v2",
             "bodies": [],
         },
         "itessellation": {

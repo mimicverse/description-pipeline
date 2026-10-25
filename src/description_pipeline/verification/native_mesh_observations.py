@@ -231,9 +231,17 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                 (
                     NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
                     "triangles",
-                    "Planar BRep mesh triangles are derived from the native plane, ordered boundary, and trim facts.",
+                    "Planar BRep mesh triangles are derived from native vertices, "
+                    "rational plane projection, and binary32 encoding.",
                     {
                         "rule_version": planar_body["triangulation"]["rule_version"],
+                        "qualification_target": "observed_native_nominal_model",
+                        "derived_fields": [
+                            "constructed_points", "stl_points", "boundary_area_m2", "error_components_m",
+                        ],
+                        "construction_stages": [
+                            "native_vertex", "rational_plane_point", "binary64_point", "binary32_point",
+                        ],
                         "native_face_area_api": "IFace2.GetArea",
                         "vertex_identity_rule": NATIVE_PLANAR_COEDGE_VERTEX_RULE,
                         "native_face_area_approx_m2": planar_body["face_area_m2"],
