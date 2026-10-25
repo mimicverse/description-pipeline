@@ -669,6 +669,41 @@ class NativeMeshObservationTests(unittest.TestCase):
                 with self.assertRaisesRegex(PipelineError, message):
                     self.verify()
 
+    def test_match_type_is_strict_for_requests_and_observations_at_both_scopes(self):
+        original = copy.deepcopy(self.row)
+        self.assertEqual(
+            original["tessellation"]["schema_version"],
+            "solidworks-to-urdf.native-tessellation/v18",
+        )
+        for scope in ("component", "body"):
+            for field in ("property_requests", "properties"):
+                for value in (0, 1, -1, False, True, 2.0, "2", None):
+                    with self.subTest(scope=scope, field=field, value=repr(value)):
+                        self.row = copy.deepcopy(original)
+                        evidence = self.row["tessellation"]["itessellation"]
+                        if scope == "body":
+                            evidence = evidence["bodies"][0]
+                        evidence[field]["match_type"] = value
+                        with self.assertRaises(PipelineError):
+                            self.verify()
+
+        for value in (0, 1):
+            with self.subTest(synchronized_legacy_mode=value):
+                self.row = copy.deepcopy(original)
+                evidence = self.row["tessellation"]["itessellation"]
+                for item in (evidence, *evidence["bodies"]):
+                    for field in ("property_requests", "properties"):
+                        item[field]["match_type"] = value
+                with self.assertRaisesRegex(PipelineError, "requests are incomplete"):
+                    self.verify()
+
+    def test_legacy_tessellation_schema_is_rejected_with_edge_curve_properties(self):
+        self.row["tessellation"]["schema_version"] = (
+            "solidworks-to-urdf.native-tessellation/v17"
+        )
+        with self.assertRaisesRegex(PipelineError, "unsupported native tessellation schema"):
+            self.verify()
+
     def test_body_local_face_facet_fin_and_vertex_ids_fail_closed(self):
         original = copy.deepcopy(self.row)
 

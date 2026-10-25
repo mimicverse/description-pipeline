@@ -716,7 +716,7 @@ def _mesh_body(faces, key: str):
 
     class _MeshTessellation:
         ImprovedQuality = True
-        MatchType = 0
+        MatchType = 2
         NeedErrorList = True
         NeedFaceFacetMap = True
         NeedEdgeFinMap = True

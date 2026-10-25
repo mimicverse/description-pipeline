@@ -1029,6 +1029,9 @@ class NativeFinCaptureTests(unittest.TestCase):
                                                  snapshot["curve"]["u_min"], snapshot["curve"]["u_max"]))
         self.assertEqual(edge.closest_calls, 2)
         self.assertEqual(edge.evaluate_calls, 4)
+        self.assertEqual(tessellation.requested["MatchType"], 2)
+        self.assertEqual(tessellation.property_writes.count("MatchType"), 1)
+        self.assertEqual(tessellation.tessellate_calls, 1)
 
     @staticmethod
     def short_open_parameter_tessellation():
@@ -2710,7 +2713,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     detail["tessellation_properties"],
                     {
                         "improved_quality": True,
-                        "match_type": 0,
+                        "match_type": 2,
                         "need_error_list": True,
                         "need_face_facet_map": True,
                         "need_edge_fin_map": True,
@@ -2762,6 +2765,20 @@ class NativeFinCaptureTests(unittest.TestCase):
 
     def test_one_tessellate_partitions_edge_and_internal_fins(self):
         body, face_10, face_20, edge, tessellation, extension = self.fixture()
+        original_tessellate = tessellation.Tessellate
+
+        def tessellate_after_property_readbacks():
+            expected = [
+                "ImprovedQuality", "MatchType", "NeedErrorList",
+                "NeedFaceFacetMap", "NeedEdgeFinMap", "NeedVertexParams",
+            ]
+            self.assertEqual(tessellation.property_writes, expected)
+            self.assertEqual(tessellation.property_reads, expected)
+            self.assertIs(type(tessellation.requested["MatchType"]), int)
+            self.assertEqual(tessellation.requested["MatchType"], 2)
+            return original_tessellate()
+
+        tessellation.Tessellate = tessellate_after_property_readbacks
 
         captured = self.capture(body, extension)
 
@@ -2776,7 +2793,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             tessellation.requested,
             {
                 "ImprovedQuality": True,
-                "MatchType": 0,
+                "MatchType": 2,
                 "NeedErrorList": True,
                 "NeedFaceFacetMap": True,
                 "NeedEdgeFinMap": True,
@@ -2813,7 +2830,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             captured["itessellation_body"]["properties"],
             {
                 "improved_quality": True,
-                "match_type": 0,
+                "match_type": 2,
                 "need_error_list": True,
                 "need_face_facet_map": True,
                 "need_edge_fin_map": True,
@@ -6144,14 +6161,46 @@ class NativeFinCaptureTests(unittest.TestCase):
                 )
 
     def test_match_type_readback_mismatch_is_rejected(self):
+        for readback in (0, 1, -1, False, True, 2.0, "2", None):
+            with self.subTest(readback=repr(readback)):
+                body, _face_10, _face_20, _edge, tessellation, extension = (
+                    self.fixture()
+                )
+                tessellation.property_readbacks["MatchType"] = readback
+
+                with self.assertRaises(CadError) as caught:
+                    self.capture(body, extension)
+
+                self.assertEqual(
+                    caught.exception.code, "cad_native_tessellation_unreadable"
+                )
+                self.assertEqual(
+                    caught.exception.detail["api"], "ITessellation.MatchType"
+                )
+                self.assertEqual(tessellation.requested["MatchType"], 2)
+                self.assertEqual(tessellation.property_writes.count("MatchType"), 1)
+                self.assertEqual(tessellation.tessellate_calls, 0)
+
+    def test_match_type_set_failure_does_not_tessellate_or_fallback(self):
         body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
-        tessellation.property_readbacks["MatchType"] = 1
+        original_setattr = FakeTessellation.__setattr__
+        attempted_values = []
 
-        with self.assertRaises(CadError) as caught:
+        def fail_match_type(instance, name, value):
+            if name == "MatchType":
+                attempted_values.append(value)
+                raise RuntimeError("native MatchType setter failed")
+            return original_setattr(instance, name, value)
+
+        with (
+            patch.object(FakeTessellation, "__setattr__", fail_match_type),
+            self.assertRaises(CadError) as caught,
+        ):
             self.capture(body, extension)
-
         self.assertEqual(caught.exception.code, "cad_native_tessellation_unreadable")
         self.assertEqual(caught.exception.detail["api"], "ITessellation.MatchType")
+        self.assertEqual(attempted_values, [2])
+        self.assertEqual(tessellation.tessellate_calls, 0)
 
     def test_analysis_property_readback_mismatch_is_rejected(self):
         for name in ("ImprovedQuality", "NeedErrorList"):
@@ -6189,7 +6238,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             error.detail["tessellation_properties"],
             {
                 "improved_quality": True,
-                "match_type": 0,
+                "match_type": 2,
                 "need_error_list": True,
                 "need_face_facet_map": True,
                 "need_edge_fin_map": True,

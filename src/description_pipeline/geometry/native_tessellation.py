@@ -14,6 +14,7 @@ from ..schemas import (
     NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
     NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
     NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
+    NATIVE_TESSELLATION_MATCH_TYPE,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from .native_fin_topology import (
@@ -2778,7 +2779,7 @@ def _parse_itessellation_evidence(
             isinstance(candidate, dict)
             and set(candidate) == {"match_type", *expected_boolean_properties}
             and type(candidate["match_type"]) is int
-            and candidate["match_type"] == 0
+            and candidate["match_type"] == NATIVE_TESSELLATION_MATCH_TYPE
             and all(
                 type(candidate[key]) is bool and candidate[key] is True
                 for key in expected_boolean_properties

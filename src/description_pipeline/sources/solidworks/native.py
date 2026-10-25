@@ -93,6 +93,7 @@ from ...schemas import (
     NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
     NATIVE_FACETLESS_EVIDENCE_API,
     NATIVE_MESH_CAPTURE_API,
+    NATIVE_TESSELLATION_MATCH_TYPE,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from .errors import CadError, EnvironmentError_
@@ -8731,7 +8732,7 @@ class SolidWorksBackend(CadBackend):
         tessellation_properties = {}
         for name, expected, evidence_name in (
             ("ImprovedQuality", True, "improved_quality"),
-            ("MatchType", 0, "match_type"),
+            ("MatchType", NATIVE_TESSELLATION_MATCH_TYPE, "match_type"),
             ("NeedErrorList", True, "need_error_list"),
             ("NeedFaceFacetMap", True, "need_face_facet_map"),
             ("NeedEdgeFinMap", True, "need_edge_fin_map"),
@@ -11629,7 +11630,7 @@ class SolidWorksBackend(CadBackend):
                 "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
                 "property_requests": {
                     "improved_quality": True,
-                    "match_type": 0,
+                    "match_type": NATIVE_TESSELLATION_MATCH_TYPE,
                     "need_error_list": True,
                     "need_face_facet_map": True,
                     "need_edge_fin_map": True,
@@ -11637,7 +11638,7 @@ class SolidWorksBackend(CadBackend):
                 },
                 "properties": {
                     "improved_quality": True,
-                    "match_type": 0,
+                    "match_type": NATIVE_TESSELLATION_MATCH_TYPE,
                     "need_error_list": True,
                     "need_face_facet_map": True,
                     "need_edge_fin_map": True,

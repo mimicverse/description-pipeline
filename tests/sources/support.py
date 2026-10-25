@@ -41,7 +41,7 @@ from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix,
 
 NATIVE_TESSELLATION_PROPERTIES = {
     "improved_quality": True,
-    "match_type": 0,
+    "match_type": 2,
     "need_error_list": True,
     "need_face_facet_map": True,
     "need_edge_fin_map": True,

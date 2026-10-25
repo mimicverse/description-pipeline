@@ -972,7 +972,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(argument.varianttype, 0)
         self.assertIsNone(argument.value)
         self.assertIs(body._tessellation.requested["ImprovedQuality"], True)
-        self.assertEqual(body._tessellation.requested["MatchType"], 0)
+        self.assertEqual(body._tessellation.requested["MatchType"], 2)
         self.assertIs(body._tessellation.requested["NeedErrorList"], True)
         self.assertEqual(
             entry["tessellation"]["itessellation"]["bodies"][0]["request"],
