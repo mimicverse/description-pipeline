@@ -22,6 +22,9 @@ from description_pipeline.orchestration.discover_protocol import (
     admit_observation_bundle,
     seal_observation_bundle,
 )
+from description_pipeline.orchestration.native_operation_client import (
+    native_discover_operation_id,
+)
 import description_pipeline.pipeline.discover as discover_module
 from description_pipeline.pipeline.contracts import (
     ArtifactRef,
@@ -549,7 +552,11 @@ class DiscoverHarness:
         value = self.request() if request is None else request
         return NativeDiscoverRequest(
             schema_version=NATIVE_DISCOVER_REQUEST_SCHEMA,
-            operation_id=command.command_id,
+            operation_id=native_discover_operation_id(
+                run_id=command.run_id,
+                command_id=command.command_id,
+                request_digest=command.request_digest,
+            ),
             command_id=command.command_id,
             run_id=command.run_id,
             request_digest=command.request_digest,
@@ -905,13 +912,13 @@ class DiscoverDomainTests(unittest.TestCase):
             effect_key=f"native-discover:{self.command.command_id}",
             effect_kind="native_operation",
             target={
-                "operation_id": self.command.command_id,
+                "operation_id": request.operation_id,
                 "main_assembly": MAIN,
                 "native_tool_sha256": TOOL_SHA256,
             },
             expected_state={
                 "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
-                "operation_id": self.command.command_id,
+                "operation_id": request.operation_id,
                 "request_digest": self.command.request_digest,
                 "source_inventory_sha256": digest(self.harness.source_files),
                 "source_archive_sha256": archive_sha256,

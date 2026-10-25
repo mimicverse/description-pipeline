@@ -381,6 +381,18 @@ def _write_canonical(path: Path, value: Any) -> None:
     path.write_bytes(canonical(value) + b"\n")
 
 
+def _native_operation_id(command: StageCommand) -> str:
+    from ..orchestration.native_operation_client import (
+        native_discover_operation_id,
+    )
+
+    return native_discover_operation_id(
+        run_id=command.run_id,
+        command_id=command.command_id,
+        request_digest=command.request_digest,
+    )
+
+
 class DiscoverHandler:
     """Run one Discover command through the command-bound runtime effect port."""
 
@@ -394,7 +406,7 @@ class DiscoverHandler:
         target: NativeTargetIdentity,
     ) -> dict[str, Any]:
         identity = {
-            "operation_id": command.command_id,
+            "operation_id": _native_operation_id(command),
             "main_assembly": request["main_assembly"],
             "native_tool_sha256": request["expected_native_tool_sha256"],
             "native_target_identity": target.to_record(),
@@ -414,7 +426,7 @@ class DiscoverHandler:
     ) -> dict[str, Any]:
         return {
             "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
-            "operation_id": command.command_id,
+            "operation_id": _native_operation_id(command),
             "request_digest": command.request_digest,
             "source_inventory_sha256": request["source_inventory_sha256"],
             "source_archive_sha256": source_archive_sha256,
@@ -582,7 +594,7 @@ class DiscoverHandler:
             _artifact_files(roots["freeze"], bound["freeze"], role="freeze")
             native_request = NativeDiscoverRequest(
                 schema_version=NATIVE_DISCOVER_REQUEST_SCHEMA,
-                operation_id=command.command_id,
+                operation_id=_native_operation_id(command),
                 command_id=command.command_id,
                 run_id=command.run_id,
                 request_digest=command.request_digest,

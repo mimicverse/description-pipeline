@@ -879,6 +879,30 @@ def native_capture_operation_id(
     )
 
 
+def native_discover_operation_id(
+    *,
+    run_id: str,
+    command_id: str,
+    request_digest: str,
+) -> str:
+    """The exact path-safe identity for one Discover native command."""
+
+    for field, value in (
+        ("run_id", run_id),
+        ("command_id", command_id),
+        ("request_digest", request_digest),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{field} is required")
+    return "discover-" + digest(
+        {
+            "run_id": run_id,
+            "command_id": command_id,
+            "request_digest": request_digest,
+        }
+    )
+
+
 def observe_native_operation(
     client: NativeOperationClient,
     operation_id: str,
@@ -2351,6 +2375,7 @@ __all__ = [
     "capture_handler_from_native_operation",
     "discover_adapter_from_native_operation",
     "native_capture_operation_id",
+    "native_discover_operation_id",
     "native_operation_input_was_admitted",
     "observe_native_operation",
     "read_sealed_native_operation_request",
