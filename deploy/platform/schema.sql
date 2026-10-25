@@ -479,27 +479,96 @@ BEGIN
     END IF;
 END $$;
 
--- One-way legacy cutover. The maintenance operator must archive and verify the old
--- relations, views and ACLs, then provide the receipt digest through apply.sh. A
+-- One-way legacy cutover. apply.sh must create and independently restore-verify the
+-- complete platform plus Airflow schema archive, bind this database/schema/role, and
+-- hold relation/catalog locks while this SQL executes in the same transaction. A
 -- target that still carries any legacy relation is refused without that receipt.
 -- DROP intentionally omits CASCADE: any remaining dependency aborts the migration
 -- instead of being silently removed.
-DO $$
+CREATE OR REPLACE FUNCTION pg_temp.guard_legacy_cutover(target_schema text)
+RETURNS void
+LANGUAGE plpgsql
+AS $guard$
+DECLARE
+    archive_receipt text := COALESCE(
+        current_setting('description.legacy_receipt_sha256', true), ''
+    );
+    archive_sha256 text := COALESCE(
+        current_setting('description.legacy_archive_sha256', true), ''
+    );
+    archive_evidence text := COALESCE(
+        current_setting('description.legacy_evidence_sha256', true), ''
+    );
+    archive_cluster_system_identifier text := COALESCE(
+        current_setting(
+            'description.legacy_archive_cluster_system_identifier',
+            true
+        ), ''
+    );
+    archive_database text := COALESCE(
+        current_setting('description.legacy_archive_database', true), ''
+    );
+    archive_database_oid text := COALESCE(
+        current_setting('description.legacy_archive_database_oid', true), ''
+    );
+    archive_schema text := COALESCE(
+        current_setting('description.legacy_archive_platform_schema', true), ''
+    );
+    archive_schema_oid text := COALESCE(
+        current_setting('description.legacy_archive_platform_schema_oid', true), ''
+    );
+    archive_role text := COALESCE(
+        current_setting('description.legacy_archive_migration_role', true), ''
+    );
+    legacy_present boolean;
 BEGIN
-    IF to_regclass('request') IS NOT NULL
-       OR to_regclass('run') IS NOT NULL
-       OR to_regclass('stage') IS NOT NULL
-       OR to_regclass('operation') IS NOT NULL
-       OR to_regclass('run_event') IS NOT NULL THEN
-        IF COALESCE(
-            current_setting('description.legacy_archive_sha256', true),
-            ''
-        ) !~ '^[0-9a-f]{64}$' THEN
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS class
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = class.relnamespace
+        WHERE namespace.nspname = target_schema
+          AND class.relname IN (
+              'request', 'run', 'stage', 'operation', 'run_event'
+          )
+          AND class.relkind IN ('r', 'p', 'v', 'm', 'f')
+    ) INTO legacy_present;
+
+    IF legacy_present THEN
+        IF archive_receipt !~ '^[0-9a-f]{64}$'
+           OR archive_sha256 !~ '^[0-9a-f]{64}$'
+           OR archive_evidence !~ '^[0-9a-f]{64}$'
+           OR archive_cluster_system_identifier !~ '^[0-9]+$'
+           OR archive_database_oid !~ '^[0-9]+$'
+           OR archive_schema_oid !~ '^[0-9]+$'
+           OR archive_schema IS DISTINCT FROM target_schema
+           OR archive_database IS DISTINCT FROM current_database()
+           OR archive_database_oid IS DISTINCT FROM (
+               SELECT oid::text FROM pg_database WHERE datname = current_database()
+           )
+           OR archive_cluster_system_identifier IS DISTINCT FROM (
+               SELECT system_identifier::text FROM pg_control_system()
+           )
+           OR archive_schema_oid IS DISTINCT FROM (
+               SELECT oid::text
+               FROM pg_catalog.pg_namespace
+               WHERE nspname = target_schema
+           )
+           OR archive_role IS DISTINCT FROM session_user THEN
             RAISE EXCEPTION
-                'legacy_lifecycle_archive_receipt_required';
+                'legacy_lifecycle_archive_receipt_invalid';
         END IF;
     END IF;
-END $$;
+END
+$guard$;
+
+SET search_path TO :"platform_schema";
+
+SELECT pg_temp.guard_legacy_cutover(current_schema());
+
+SET search_path TO :"platform_schema", pg_catalog;
+
+DROP FUNCTION pg_temp.guard_legacy_cutover(text);
 
 DROP VIEW IF EXISTS :"platform_schema".lifecycle_projection;
 DROP TABLE IF EXISTS :"platform_schema".run_event;

@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import fcntl
+import importlib.util
+import multiprocessing
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
 import uuid
+import urllib.parse
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -15,11 +22,9 @@ from unittest import mock
 try:
     import pgserver
     import psycopg2
-    from pgserver._commands import POSTGRES_BIN_PATH
 except ImportError:
     pgserver = None
     psycopg2 = None
-    POSTGRES_BIN_PATH = None
 
 from description_pipeline.io import digest
 from description_pipeline.orchestration.lifecycle_state import collect_projection
@@ -40,6 +45,41 @@ from description_pipeline.schemas import (
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_DIR = Path(__file__).resolve().parents[2] / "deploy" / "platform"
+APPLY = PLATFORM_DIR / "apply.sh"
+PG_BIN = Path(pgserver.__file__).resolve().parent / "pginstall" / "bin" if pgserver else None
+
+
+def _legacy_cutover_module():
+    spec = importlib.util.spec_from_file_location(
+        "legacy_cutover_test_module",
+        PLATFORM_DIR / "legacy_cutover.py",
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("legacy cutover module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _attempt_legacy_ddl(
+    uri: str,
+    statement: str,
+    start,
+    result,
+) -> None:
+    import psycopg2
+
+    start.wait(10)
+    try:
+        with psycopg2.connect(uri) as connection, connection.cursor() as cursor:
+            cursor.execute("SET LOCAL lock_timeout = '500ms'")
+            cursor.execute(statement)
+    except psycopg2.errors.LockNotAvailable:
+        result.put(("locked", statement))
+    except Exception as error:
+        result.put(("error", statement, type(error).__name__, str(error)))
+    else:
+        result.put(("changed", statement))
 
 
 def _sql(
@@ -92,13 +132,63 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
             options=f"-c search_path={self.schema},public",
         )
 
-    def _apply(self, *names: str, legacy_archive_sha256: str = "e" * 64) -> None:
-        with self._connect() as connection, connection.cursor() as cursor:
+    def _role_connect(self, role: str):
+        return psycopg2.connect(
+            self.server.get_uri(),
+            user=role,
+            options=f"-c search_path={self.schema},public",
+        )
+
+    def _apply(
+        self,
+        *names: str,
+        legacy_archive_sha256: str = "e" * 64,
+        cluster_system_identifier: str | None = None,
+        archive_platform_schema: str | None = None,
+    ) -> None:
+        receipt_schema = archive_platform_schema or self.schema
+        with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
             for name in names:
                 if name == "schema.sql":
                     cursor.execute(
-                        "SELECT set_config('description.legacy_archive_sha256', %s, false)",
-                        (legacy_archive_sha256,),
+                        """
+                        SELECT
+                            set_config('description.legacy_receipt_sha256', %s, false),
+                            set_config('description.legacy_archive_sha256', %s, false),
+                            set_config('description.legacy_evidence_sha256', %s, false),
+                            set_config(
+                                'description.legacy_archive_cluster_system_identifier',
+                                COALESCE(
+                                    %s,
+                                    (
+                                        SELECT system_identifier::text
+                                        FROM pg_control_system()
+                                    )
+                                ),
+                                false
+                            ),
+                            set_config('description.legacy_archive_database', current_database(), false),
+                            set_config(
+                                'description.legacy_archive_database_oid',
+                                (SELECT oid::text FROM pg_database WHERE datname = current_database()),
+                                false
+                            ),
+                            set_config('description.legacy_archive_platform_schema', %s, false),
+                            set_config(
+                                'description.legacy_archive_platform_schema_oid',
+                                (SELECT oid::text FROM pg_namespace WHERE nspname = %s),
+                                false
+                            ),
+                            set_config('description.legacy_archive_migration_role', current_user, false)
+                        """,
+                        (
+                            legacy_archive_sha256,
+                            legacy_archive_sha256,
+                            legacy_archive_sha256,
+                            cluster_system_identifier,
+                            receipt_schema,
+                            receipt_schema,
+                        ),
                     )
                 cursor.execute(
                     _sql(
@@ -115,8 +205,191 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
             cursor.execute(statement, parameters)
             return cursor.fetchall()
 
+    def _apply_without_receipt(self) -> subprocess.CompletedProcess[str]:
+        parsed = urllib.parse.urlsplit(self.server.get_uri())
+        host = (
+            urllib.parse.parse_qs(parsed.query).get("host", [""])[0]
+            or parsed.hostname
+            or "localhost"
+        )
+        return subprocess.run(
+            [
+                "bash",
+                str(APPLY),
+                "--psql",
+                str(PG_BIN / "psql"),
+                "--database",
+                self.database,
+                "--host",
+                host,
+                "--user",
+                "platform_migrate",
+                "--platform-schema",
+                self.schema,
+                "--airflow-schema",
+                self.airflow_schema,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PLATFORM_ARCHIVE_PYTHON": sys.executable,
+            },
+        )
+
+    def _apply_script(
+        self,
+        receipt: Path,
+        *,
+        user: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        parsed = urllib.parse.urlsplit(self.server.get_uri())
+        host = (
+            urllib.parse.parse_qs(parsed.query).get("host", [""])[0]
+            or parsed.hostname
+            or "localhost"
+        )
+        directory = receipt.parent / f"maintenance-{uuid.uuid4().hex}"
+        directory.mkdir()
+        lock_path = directory / "maintenance.lock"
+        owner = digest({"lock": str(lock_path)})
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.maintenance-lock/v1",
+                    "owner_id": owner,
+                    "acquired_at": "2026-10-25T00:00:00Z",
+                    "pid": os.getpid(),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            environment = {
+                **os.environ,
+                "OPERATORCTL_MAINTENANCE_LOCK_OWNER": owner,
+                "OPERATORCTL_MAINTENANCE_LOCK_FD": str(descriptor),
+                "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(lock_path),
+                "PLATFORM_ARCHIVE_PYTHON": sys.executable,
+            }
+            return subprocess.run(
+                [
+                    "bash",
+                    str(APPLY),
+                    "--psql",
+                    str(PG_BIN / "psql"),
+                    "--database",
+                    self.database,
+                    "--host",
+                    host,
+                    "--user",
+                    user or parsed.username or "postgres",
+                    "--platform-schema",
+                    self.schema,
+                    "--airflow-schema",
+                    self.airflow_schema,
+                    "--legacy-archive-receipt",
+                    str(receipt),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                pass_fds=(descriptor,),
+            )
+        finally:
+            os.close(descriptor)
+
+    def _prepare_archive(
+        self,
+        receipt: Path,
+        *,
+        user: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        parsed = urllib.parse.urlsplit(self.server.get_uri())
+        host = (
+            urllib.parse.parse_qs(parsed.query).get("host", [""])[0]
+            or parsed.hostname
+            or "localhost"
+        )
+        directory = receipt.parent / f"maintenance-{uuid.uuid4().hex}"
+        directory.mkdir()
+        lock_path = directory / "maintenance.lock"
+        owner = digest({"lock": str(lock_path)})
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.maintenance-lock/v1",
+                    "owner_id": owner,
+                    "acquired_at": "2026-10-25T00:00:00Z",
+                    "pid": os.getpid(),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            environment = {
+                **os.environ,
+                "OPERATORCTL_MAINTENANCE_LOCK_OWNER": owner,
+                "OPERATORCTL_MAINTENANCE_LOCK_FD": str(descriptor),
+                "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(lock_path),
+            }
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(PLATFORM_DIR / "legacy_cutover.py"),
+                    "prepare",
+                    "--receipt",
+                    str(receipt),
+                    "--psql",
+                    str(PG_BIN / "psql"),
+                    "--pg-dump",
+                    str(PG_BIN / "pg_dump"),
+                    "--pg-restore",
+                    str(PG_BIN / "pg_restore"),
+                    "--initdb",
+                    str(PG_BIN / "initdb"),
+                    "--pg-ctl",
+                    str(PG_BIN / "pg_ctl"),
+                    "--createdb",
+                    str(PG_BIN / "createdb"),
+                    "--database",
+                    self.database,
+                    "--platform-schema",
+                    self.schema,
+                    "--airflow-schema",
+                    self.airflow_schema,
+                    "--schema-file",
+                    str(PLATFORM_DIR / "schema.sql"),
+                    "--views-file",
+                    str(PLATFORM_DIR / "views.sql"),
+                    "--roles-file",
+                    str(PLATFORM_DIR / "roles.sql"),
+                    "--libpq",
+                    f"h={host}",
+                    "--libpq",
+                    f"U={user or parsed.username or 'postgres'}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                pass_fds=(descriptor,),
+            )
+        finally:
+            os.close(descriptor)
+
     def _create_airflow_tables(self) -> None:
-        with self._connect() as connection, connection.cursor() as cursor:
+        with self._role_connect("airflow_migrate") as connection, connection.cursor() as cursor:
             cursor.execute(
                 f"""
                 CREATE TABLE "{self.airflow_schema}".task_instance (
@@ -132,6 +405,7 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                 )
                 """
             )
+        with self._role_connect("airflow_migrate") as connection, connection.cursor() as cursor:
             cursor.execute(
                 f"""
                 CREATE TABLE "{self.airflow_schema}".dag_run (
@@ -144,6 +418,15 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                 )
                 """
             )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                _sql(
+                    "grants-airflow.sql",
+                    platform_schema=self.schema,
+                    airflow_schema=self.airflow_schema,
+                    database=self.database,
+                )
+            )
 
     def _install_canonical_schema(self) -> None:
         self._apply("schema.sql")
@@ -151,7 +434,7 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
         self._apply("views.sql", "roles.sql")
 
     def _create_legacy_run_table(self) -> None:
-        with self._connect() as connection, connection.cursor() as cursor:
+        with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 CREATE TABLE run (
@@ -162,6 +445,142 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                     updated_at timestamptz NOT NULL
                 )
                 """
+            )
+
+    def _create_legacy_lifecycle_schema(self, *, include_view: bool = True) -> None:
+        with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE request (
+                    request_id text PRIMARY KEY,
+                    principal text NOT NULL,
+                    target_hardware text NOT NULL,
+                    main_assembly text,
+                    configuration jsonb,
+                    baseline jsonb,
+                    sealed_at timestamptz NOT NULL DEFAULT now()
+                );
+                CREATE TABLE run (
+                    run_id text PRIMARY KEY,
+                    request_id text NOT NULL REFERENCES request (request_id),
+                    parent_run_id text REFERENCES run (run_id),
+                    from_stage text,
+                    state text NOT NULL,
+                    tool_identity jsonb,
+                    display_name text,
+                    hidden_at timestamptz,
+                    hidden_reason text,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                );
+                CREATE TABLE stage (
+                    run_id text NOT NULL REFERENCES run (run_id),
+                    stage text NOT NULL,
+                    state text NOT NULL,
+                    receipt jsonb,
+                    checkpoint_uri text,
+                    reused_from_run text,
+                    original_executed_at timestamptz,
+                    updated_at timestamptz NOT NULL DEFAULT now(),
+                    PRIMARY KEY (run_id, stage)
+                );
+                CREATE TABLE operation (
+                    operation_id text PRIMARY KEY,
+                    run_id text NOT NULL REFERENCES run (run_id),
+                    stage text,
+                    kind text NOT NULL,
+                    state text NOT NULL,
+                    operation_key text NOT NULL UNIQUE,
+                    params_digest text NOT NULL,
+                    dag_id text,
+                    dag_run_id text,
+                    task_id text,
+                    map_index integer,
+                    try_number integer,
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                );
+                CREATE TABLE run_event (
+                    run_id text NOT NULL REFERENCES run (run_id),
+                    seq bigint NOT NULL CHECK (seq > 0),
+                    at timestamptz NOT NULL DEFAULT now(),
+                    kind text NOT NULL,
+                    stage text,
+                    operation_id text,
+                    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+                    PRIMARY KEY (run_id, seq)
+                );
+                """
+                + (
+                    """
+                    CREATE VIEW lifecycle_projection AS
+                        SELECT run_id, state FROM run;
+                    """
+                    if include_view
+                    else ""
+                )
+            )
+
+    def _insert_legacy_unresolved(
+        self,
+        *,
+        request_id: str,
+        run_id: str,
+        operation_id: str,
+        display_name: str | None = None,
+        configuration: str | None = None,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        recorded_at = recorded_at or datetime(2026, 10, 25, tzinfo=UTC)
+        with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO request (
+                    request_id, principal, target_hardware, configuration, sealed_at
+                ) VALUES (%s, 'fixture', 'm3.0', %s::jsonb, %s)
+                """,
+                (request_id, configuration, recorded_at),
+            )
+            cursor.execute(
+                """
+                INSERT INTO run (
+                    run_id, request_id, state, display_name,
+                    created_at, updated_at
+                ) VALUES (%s, %s, 'unresolved', %s, %s, %s)
+                """,
+                (run_id, request_id, display_name, recorded_at, recorded_at),
+            )
+            cursor.execute(
+                """
+                INSERT INTO stage (run_id, stage, state, updated_at)
+                VALUES (%s, 'capture', 'unresolved', %s)
+                """,
+                (run_id, recorded_at),
+            )
+            cursor.execute(
+                """
+                INSERT INTO operation (
+                    operation_id, run_id, stage, kind, state,
+                    operation_key, params_digest, task_id, updated_at
+                ) VALUES (
+                    %s, %s, 'capture', 'native', 'unresolved',
+                    %s, %s, 'capture', %s
+                )
+                """,
+                (
+                    operation_id,
+                    run_id,
+                    f"{run_id}/native",
+                    digest({"params": run_id}),
+                    recorded_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO run_event (
+                    run_id, seq, at, kind, stage, operation_id
+                ) VALUES (%s, 1, %s, 'native-unknown', 'capture', %s)
+                """,
+                (run_id, recorded_at, operation_id),
             )
 
     def _insert_run(
@@ -452,71 +871,138 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
     def test_cutover_archives_display_drops_legacy_tables_and_builds_canonical_view(self) -> None:
         run_id = "run-cutover"
         request_id = "request-cutover"
-        with self._connect() as connection, connection.cursor() as cursor:
+        self._install_canonical_schema()
+        self._create_legacy_lifecycle_schema(include_view=False)
+        with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                CREATE TABLE run_admission (
-                    run_id text PRIMARY KEY,
-                    request_id text NOT NULL UNIQUE,
-                    parent_run_id text REFERENCES run_admission (run_id),
-                    from_stage text,
-                    request jsonb NOT NULL,
-                    request_digest char(64) NOT NULL,
-                    created_at timestamptz NOT NULL DEFAULT now()
+                INSERT INTO request (
+                    request_id, principal, target_hardware
+                ) VALUES (%s, 'fixture', 'm3.0')
+                """,
+                (request_id,),
+            )
+            cursor.execute(
+                """
+                INSERT INTO run (
+                    run_id, request_id, state, display_name, updated_at
+                ) VALUES (%s, %s, 'unresolved', %s, now())
+                """,
+                (run_id, request_id, "Archived display"),
+            )
+            cursor.execute(
+                """
+                INSERT INTO stage (run_id, stage, state)
+                VALUES (%s, 'capture', 'unresolved')
+                """,
+                (run_id,),
+            )
+            cursor.execute(
+                """
+                INSERT INTO operation (
+                    operation_id, run_id, stage, kind, state,
+                    operation_key, params_digest, task_id
+                ) VALUES (
+                    %s, %s, 'capture', 'native', 'unresolved',
+                    %s, %s, 'capture'
                 )
-                """
+                """,
+                (
+                    "operation-cutover",
+                    run_id,
+                    f"{run_id}/native",
+                    digest({"params": run_id}),
+                ),
             )
             cursor.execute(
-                "INSERT INTO run_admission "
-                "(run_id, request_id, request, request_digest) VALUES (%s, %s, %s::jsonb, %s)",
-                (run_id, request_id, '{"request":"cutover"}', "a" * 64),
-            )
-            cursor.execute(
                 """
-                CREATE TABLE run (
-                    run_id text PRIMARY KEY,
-                    display_name text,
-                    hidden_at timestamptz,
-                    hidden_reason text,
-                    updated_at timestamptz NOT NULL
-                )
-                """
-            )
-            cursor.execute(
-                "INSERT INTO run (run_id, display_name, updated_at) VALUES (%s, %s, now())",
-                (run_id, "Archived display"),
+                INSERT INTO run_event (
+                    run_id, seq, kind, stage, operation_id
+                ) VALUES (%s, 1, 'native-unknown', 'capture', %s)
+                """,
+                (run_id, "operation-cutover"),
             )
 
-        self._apply("schema.sql")
-        with self._connect() as connection, connection.cursor() as cursor:
+        self._insert_run(run_id, request={"purpose": "cutover archive"})
+        unresolved_command = self._insert_stage_command(run_id, "capture")
+        unresolved_claim = self._insert_open_claim(
+            unresolved_command,
+            stage="capture",
+        )
+        self._insert_effect(
+            run_id,
+            "capture",
+            unresolved_command,
+            fact_type="dispatch_authorized",
+            claim_id=unresolved_claim,
+        )
+        archived_airflow_time = datetime(2026, 10, 25, tzinfo=UTC)
+        with self._role_connect("airflow_migrate") as connection, connection.cursor() as cursor:
             cursor.execute(
                 f"""
-                CREATE TABLE "{self.airflow_schema}".task_instance (
-                    dag_id text NOT NULL,
-                    task_id text NOT NULL,
-                    run_id text NOT NULL,
-                    map_index integer NOT NULL,
-                    state text,
-                    try_number integer,
-                    start_date timestamptz,
-                    end_date timestamptz,
-                    PRIMARY KEY (dag_id, task_id, run_id, map_index)
+                INSERT INTO "{self.airflow_schema}".task_instance (
+                    dag_id, task_id, run_id, map_index, state,
+                    try_number, start_date
+                ) VALUES (
+                    'solidworks_to_urdf', 'capture', 'archived-airflow',
+                    0, 'running', 1, %s
                 )
-                """
+                """,
+                (archived_airflow_time,),
             )
             cursor.execute(
                 f"""
-                CREATE TABLE "{self.airflow_schema}".dag_run (
-                    dag_id text NOT NULL,
-                    run_id text NOT NULL,
-                    state text,
-                    start_date timestamptz,
-                    end_date timestamptz,
-                    PRIMARY KEY (dag_id, run_id)
+                INSERT INTO "{self.airflow_schema}".dag_run (
+                    dag_id, run_id, state, start_date
+                ) VALUES (
+                    'solidworks_to_urdf', 'archived-airflow', 'running', %s
                 )
-                """
+                """,
+                (archived_airflow_time,),
             )
-        self._apply("views.sql", "roles.sql")
+        directory = Path(tempfile.mkdtemp(prefix="legacy-archive-", dir=self.server_root.name))
+        receipt = directory / "legacy-cutover.json"
+        completed = self._apply_script(receipt)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        archive = Path(str(receipt) + ".archive.tar.gz")
+        self.assertTrue(receipt.is_file())
+        self.assertTrue(archive.is_file())
+        with tarfile.open(archive, "r:gz") as bundle:
+            names = set(bundle.getnames())
+            self.assertEqual(
+                names,
+                {
+                    "manifest.json",
+                    "evidence.json",
+                    "platform.dump",
+                    "schema.sql",
+                    "toc.txt",
+                },
+            )
+            evidence = json.loads(bundle.extractfile("evidence.json").read())
+        self.assertEqual(
+            evidence["unresolved"],
+            {
+                "legacy_operation": {"active": 0, "unresolved": 1},
+                "legacy_run": {"active": 0, "unresolved": 1},
+            },
+        )
+        self.assertIn("effect_fact", evidence["relations"])
+        self.assertTrue(evidence["relations"]["effect_fact"]["rows"])
+        self.assertIn("execution_claim", evidence["relations"])
+        self.assertTrue(evidence["relations"]["execution_claim"]["rows"])
+        self.assertEqual(
+            len(evidence["airflow_relations"]["task_instance"]["rows"]),
+            1,
+        )
+        self.assertIn(
+            '"state": "running"',
+            evidence["airflow_relations"]["task_instance"]["rows"][0],
+        )
+        self.assertEqual(
+            len(evidence["airflow_relations"]["dag_run"]["rows"]),
+            1,
+        )
 
         self.assertEqual(
             self._query(
@@ -625,13 +1111,13 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
         self.assertIn(("dag_run", "running", "in_flight"), rows)
         self.assertEqual(
             RunControlStore(self._connect).get_admitted_run(run_id).state,
-            "incomplete",
+            "unresolved",
         )
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute("SET ROLE operator_ro")
             self.assertEqual(
                 read_admitted_runs(connection, run_id=run_id)[0].state,
-                "incomplete",
+                "unresolved",
             )
         self._query(
             "UPDATE execution_claim SET task_id = NULL "
@@ -662,7 +1148,7 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
         self._create_legacy_run_table()
         with self.assertRaises(psycopg2.errors.RaiseException) as raised:
             self._apply("schema.sql", legacy_archive_sha256="")
-        self.assertIn("legacy_lifecycle_archive_receipt_required", str(raised.exception))
+        self.assertIn("legacy_lifecycle_archive_receipt_invalid", str(raised.exception))
         self.assertEqual(
             self._query(
                 "SELECT to_regclass(%s)::text",
@@ -671,59 +1157,706 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
             [("run",)],
         )
 
+    def test_fresh_apply_without_receipt_uses_actual_platform_schema(self) -> None:
+        self._create_airflow_tables()
+
+        first = self._apply_without_receipt()
+        second = self._apply_without_receipt()
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(
+            self._query(
+                "SELECT to_regclass(%s)::text",
+                (f"{self.schema}.run_admission",),
+            ),
+            [("run_admission",)],
+        )
+
+    def test_guard_inventory_is_bound_to_deployed_platform_schema(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-decoy-schema",
+            run_id="run-decoy-schema",
+            operation_id="operation-decoy-schema",
+        )
+        decoy_schema = "decoy_" + uuid.uuid4().hex
+        with psycopg2.connect(self.server.get_uri()) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f'CREATE SCHEMA "{decoy_schema}" AUTHORIZATION platform_migrate'
+            )
+
+        with self.assertRaises(psycopg2.errors.RaiseException) as raised:
+            self._apply(
+                "schema.sql",
+                archive_platform_schema=decoy_schema,
+            )
+
+        self.assertIn(
+            "legacy_lifecycle_archive_receipt_invalid",
+            str(raised.exception),
+        )
+        self.assertEqual(
+            self._query(
+                """
+                SELECT c.relname
+                FROM pg_class AS c
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s
+                  AND c.relname IN (
+                      'request', 'run', 'stage', 'operation', 'run_event'
+                  )
+                ORDER BY c.relname
+                """,
+                (self.schema,),
+            ),
+            [
+                ("operation",),
+                ("request",),
+                ("run",),
+                ("run_event",),
+                ("stage",),
+            ],
+        )
+
+    def test_arbitrary_receipt_does_not_authorize_legacy_drop(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-arbitrary",
+            run_id="run-arbitrary",
+            operation_id="operation-arbitrary",
+        )
+        directory = Path(tempfile.mkdtemp(prefix="arbitrary-receipt-", dir=self.server_root.name))
+        receipt = directory / "receipt.json"
+        receipt.write_text('{"archive":"verified"}\n', encoding="utf-8")
+        Path(str(receipt) + ".archive.tar.gz").write_bytes(b"unrelated archive\n")
+
+        completed = self._apply_script(receipt)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("archive receipt", completed.stderr)
+        self.assertEqual(
+            self._query(
+                """
+                SELECT r.run_id, o.operation_id
+                FROM run AS r
+                JOIN operation AS o ON o.run_id = r.run_id
+                WHERE r.run_id = %s
+                """,
+                ("run-arbitrary",),
+            ),
+            [("run-arbitrary", "operation-arbitrary")],
+        )
+
+    def test_archive_dump_must_pass_independent_restore(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-restore",
+            run_id="run-restore",
+            operation_id="operation-restore",
+        )
+        directory = Path(tempfile.mkdtemp(prefix="restore-receipt-", dir=self.server_root.name))
+        receipt = directory / "receipt.json"
+        prepared = self._prepare_archive(receipt)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        archive = Path(str(receipt) + ".archive.tar.gz")
+        module = _legacy_cutover_module()
+        with tarfile.open(archive, "r:gz") as bundle:
+            manifest = json.loads(bundle.extractfile("manifest.json").read())
+            evidence = json.loads(bundle.extractfile("evidence.json").read())
+            members = {
+                name: (metadata["kind"], bundle.extractfile(name).read())
+                for name, metadata in manifest["members"].items()
+            }
+        members["platform.dump"] = ("postgres-custom-dump", b"not-a-postgres-dump\n")
+        tampered_manifest = module._manifest(members, evidence)
+        tampered_archive = directory / "tampered.tar.gz"
+        module._write_archive(tampered_archive, members, tampered_manifest)
+        os.replace(tampered_archive, archive)
+        receipt_record = json.loads(receipt.read_text(encoding="utf-8"))
+        receipt_record["archive_sha256"] = module.sha256_file(archive)
+        receipt_record["manifest_sha256"] = module.sha256_bytes(
+            module.canonical(tampered_manifest)
+        )
+        receipt.write_text(
+            module.canonical(receipt_record).decode("utf-8"),
+            encoding="utf-8",
+        )
+
+        verified = self._prepare_archive(receipt)
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertIn("pg_restore", verified.stderr)
+        self.assertEqual(
+            self._query(
+                "SELECT to_regclass(%s)::text",
+                (f"{self.schema}.run",),
+            ),
+            [("run",)],
+        )
+
+    def test_archive_receipt_cannot_authorize_another_database_schema(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-source",
+            run_id="run-source",
+            operation_id="operation-source",
+        )
+        directory = Path(tempfile.mkdtemp(prefix="source-receipt-", dir=self.server_root.name))
+        receipt = directory / "receipt.json"
+        prepared = self._prepare_archive(receipt)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+
+        original_schema = self.schema
+        other_schema = "cutover_other_" + uuid.uuid4().hex
+        with psycopg2.connect(self.server.get_uri()) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                _sql(
+                    "bootstrap.sql",
+                    platform_schema=other_schema,
+                    airflow_schema=self.airflow_schema,
+                    database=self.database,
+                )
+            )
+        self.schema = other_schema
+        try:
+            self._create_legacy_lifecycle_schema()
+            self._insert_legacy_unresolved(
+                request_id="request-other",
+                run_id="run-other",
+                operation_id="operation-other",
+            )
+            rejected = self._prepare_archive(receipt)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("another cluster, database, or schema", rejected.stderr)
+            self.assertEqual(
+                self._query(
+                    "SELECT to_regclass(%s)::text",
+                    (f"{other_schema}.run",),
+                ),
+                [("run",)],
+            )
+        finally:
+            with psycopg2.connect(self.server.get_uri()) as connection, connection.cursor() as cursor:
+                cursor.execute(f'DROP SCHEMA "{other_schema}" CASCADE')
+            self.schema = original_schema
+
+    def test_archive_receipt_binds_cluster_identity_not_locator(self) -> None:
+        original_server = self.server
+        server_roots = tempfile.TemporaryDirectory(
+            prefix="cutover-clusters-",
+            dir=self.server_root.name,
+        )
+        servers = {}
+        receipt = Path(server_roots.name) / "cluster-receipt.json"
+        try:
+            for label in ("source", "foreign"):
+                root = Path(server_roots.name) / label
+                root.mkdir()
+                server = pgserver.get_server(root / "pgdata", cleanup_mode="delete")
+                servers[label] = server
+                with psycopg2.connect(server.get_uri()) as connection, connection.cursor() as cursor:
+                    cursor.execute("SELECT current_database()")
+                    database = cursor.fetchone()[0]
+                    self.assertEqual(database, "postgres")
+                    cursor.execute(
+                        _sql(
+                            "bootstrap.sql",
+                            platform_schema=self.schema,
+                            airflow_schema=self.airflow_schema,
+                            database=database,
+                        )
+                    )
+                self.server = server
+                self.database = database
+                self._create_legacy_lifecycle_schema()
+                self._insert_legacy_unresolved(
+                    request_id="request-cluster",
+                    run_id="run-cluster",
+                    operation_id="operation-cluster",
+                )
+                if label == "foreign":
+                    prepared = self._prepare_archive(receipt)
+                    self.assertEqual(prepared.returncode, 0, prepared.stderr)
+
+            def identity(server):
+                with psycopg2.connect(server.get_uri()) as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            (SELECT system_identifier::text FROM pg_control_system()),
+                            current_database(),
+                            (
+                                SELECT oid::text
+                                FROM pg_database
+                                WHERE datname = current_database()
+                            ),
+                            (
+                                SELECT oid::text
+                                FROM pg_namespace
+                                WHERE nspname = %s
+                            )
+                        """,
+                        (self.schema,),
+                    )
+                    return cursor.fetchone()
+
+            source_identity = identity(servers["source"])
+            foreign_identity = identity(servers["foreign"])
+            self.assertEqual(source_identity[1:], foreign_identity[1:])
+            self.assertNotEqual(source_identity[0], foreign_identity[0])
+            receipt_record = json.loads(receipt.read_text(encoding="utf-8"))
+            with tarfile.open(
+                str(receipt) + ".archive.tar.gz",
+                "r:gz",
+            ) as bundle:
+                manifest = json.loads(bundle.extractfile("manifest.json").read())
+            self.assertEqual(
+                receipt_record["cluster_system_identifier"],
+                foreign_identity[0],
+            )
+            self.assertEqual(
+                manifest["cluster_system_identifier"],
+                foreign_identity[0],
+            )
+
+            self.server = servers["source"]
+            self.database = "postgres"
+            rejected = self._apply_script(receipt)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("another cluster, database, or schema", rejected.stderr)
+            with self.assertRaises(psycopg2.errors.RaiseException) as raised:
+                self._apply(
+                    "schema.sql",
+                    cluster_system_identifier=foreign_identity[0],
+                )
+            self.assertIn(
+                "legacy_lifecycle_archive_receipt_invalid",
+                str(raised.exception),
+            )
+            self.assertEqual(
+                self._query(
+                    "SELECT to_regclass(%s)::text",
+                    (f"{self.schema}.run",),
+                ),
+                [("run",)],
+            )
+        finally:
+            self.server = original_server
+            for temp_server in servers.values():
+                temp_server.cleanup()
+            server_roots.cleanup()
+
+    def test_jsonb_numeric_precision_is_lossless_in_row_evidence(self) -> None:
+        first = "0.123456789012345678901"
+        second = "0.123456789012345678902"
+        self.assertEqual(
+            json.loads('{"value":' + first + "}"),
+            json.loads('{"value":' + second + "}"),
+        )
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-precision",
+            run_id="run-precision",
+            operation_id="operation-precision",
+            configuration='{"value":' + first + "}",
+        )
+        directory = Path(tempfile.mkdtemp(prefix="precision-receipt-", dir=self.server_root.name))
+        receipt = directory / "receipt.json"
+        prepared = self._prepare_archive(receipt)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        archive = Path(str(receipt) + ".archive.tar.gz")
+        with tarfile.open(archive, "r:gz") as bundle:
+            evidence = json.loads(bundle.extractfile("evidence.json").read())
+            dump = bundle.extractfile("platform.dump").read()
+            schema_sql = bundle.extractfile("schema.sql").read()
+        request_rows = evidence["relations"]["request"]["rows"]
+        self.assertTrue(any(first in row for row in request_rows), request_rows)
+
+        parsed = urllib.parse.urlsplit(self.server.get_uri())
+        host = (
+            urllib.parse.parse_qs(parsed.query).get("host", [""])[0]
+            or parsed.hostname
+            or "localhost"
+        )
+        module = _legacy_cutover_module()
+        restore_args = argparse.Namespace(
+            psql=str(PG_BIN / "psql"),
+            pg_dump=str(PG_BIN / "pg_dump"),
+            pg_restore=str(PG_BIN / "pg_restore"),
+            initdb=str(PG_BIN / "initdb"),
+            pg_ctl=str(PG_BIN / "pg_ctl"),
+            createdb=str(PG_BIN / "createdb"),
+            database=self.database,
+            platform_schema=self.schema,
+            airflow_schema=self.airflow_schema,
+            libpq=[
+                f"h={host}",
+                f"U={parsed.username or 'postgres'}",
+            ],
+        )
+        tampered_evidence = json.loads(json.dumps(evidence))
+        tampered_evidence["relations"]["request"]["rows"] = [
+            row.replace(first, second)
+            for row in tampered_evidence["relations"]["request"]["rows"]
+        ]
+        with tempfile.TemporaryDirectory(prefix="precision-dump-") as restore_directory:
+            dump_path = Path(restore_directory) / "platform.dump"
+            dump_path.write_bytes(dump)
+            with self.assertRaises(module.ArchiveError) as raised:
+                module._restore_full(
+                    restore_args,
+                    dump_path,
+                    schema_sql,
+                    tampered_evidence,
+                )
+        self.assertIn("restored archive differs in relations", str(raised.exception))
+
+        self._query(
+            "UPDATE request SET configuration = %s::jsonb "
+            "WHERE request_id = %s RETURNING request_id",
+            ('{"value":' + second + "}", "request-precision"),
+        )
+        rejected = self._apply_script(receipt)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("live legacy facts differ", rejected.stderr)
+        self.assertEqual(
+            self._query(
+                "SELECT to_regclass(%s)::text",
+                (f"{self.schema}.run",),
+            ),
+            [("run",)],
+        )
+
+    def test_archived_airflow_rows_change_blocks_cutover(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._create_airflow_tables()
+        self._insert_legacy_unresolved(
+            request_id="request-airflow-drift",
+            run_id="run-airflow-drift",
+            operation_id="operation-airflow-drift",
+        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO "{self.airflow_schema}".task_instance (
+                    dag_id, task_id, run_id, map_index, state, try_number
+                ) VALUES ('solidworks_to_urdf', 'capture', 'airflow-drift', 0, 'running', 1)
+                """
+            )
+        directory = Path(
+            tempfile.mkdtemp(
+                prefix="airflow-drift-receipt-",
+                dir=self.server_root.name,
+            )
+        )
+        receipt = directory / "receipt.json"
+        prepared = self._prepare_archive(receipt)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self._query(
+            f"""
+            UPDATE "{self.airflow_schema}".task_instance
+            SET state = 'success'
+            WHERE dag_id = 'solidworks_to_urdf'
+              AND task_id = 'capture'
+              AND run_id = 'airflow-drift'
+              AND map_index = 0
+            RETURNING task_id
+            """
+        )
+
+        rejected = self._apply_script(receipt)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("live legacy facts differ", rejected.stderr)
+        self.assertEqual(
+            self._query(
+                f'''
+                SELECT state
+                FROM "{self.airflow_schema}".task_instance
+                WHERE dag_id = 'solidworks_to_urdf'
+                  AND task_id = 'capture'
+                  AND run_id = 'airflow-drift'
+                  AND map_index = 0
+                '''
+            ),
+            [("success",)],
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT to_regclass(%s)::text",
+                (f"{self.schema}.run",),
+            ),
+            [("run",)],
+        )
+
+    def test_archived_rows_change_blocks_cutover(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-drift",
+            run_id="run-drift",
+            operation_id="operation-drift",
+            display_name="Before archive",
+        )
+        directory = Path(tempfile.mkdtemp(prefix="drift-receipt-", dir=self.server_root.name))
+        receipt = directory / "receipt.json"
+        prepared = self._prepare_archive(receipt)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self._query(
+            "UPDATE run SET display_name = %s WHERE run_id = %s RETURNING run_id",
+            ("Changed after archive", "run-drift"),
+        )
+
+        rejected = self._apply_script(receipt)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("live legacy facts differ", rejected.stderr)
+        self.assertEqual(
+            self._query(
+                "SELECT display_name FROM run WHERE run_id = %s",
+                ("run-drift",),
+            ),
+            [("Changed after archive",)],
+        )
+
+    def _assert_catalog_ddl_drift_blocks_cutover(
+        self,
+        before_archive: str,
+        after_archive: str,
+    ) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._create_airflow_tables()
+        self._insert_legacy_unresolved(
+            request_id="request-catalog-drift",
+            run_id="run-catalog-drift",
+            operation_id="operation-catalog-drift",
+        )
+        with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
+            cursor.execute(before_archive)
+        directory = Path(
+            tempfile.mkdtemp(
+                prefix="catalog-drift-receipt-",
+                dir=self.server_root.name,
+            )
+        )
+        receipt = directory / "receipt.json"
+        prepared = self._prepare_archive(receipt)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        with tarfile.open(str(receipt) + ".archive.tar.gz", "r:gz") as bundle:
+            evidence_text = bundle.extractfile("evidence.json").read().decode("utf-8")
+        self.assertIn(
+            f"{self.schema}.catalog-sentinel",
+            evidence_text,
+        )
+        with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
+            cursor.execute(after_archive)
+
+        rejected = self._apply_script(receipt)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "live legacy schema or ACL SQL differs",
+            rejected.stderr,
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT to_regclass(%s)::text",
+                (f"{self.schema}.run",),
+            ),
+            [("run",)],
+        )
+
+    def test_archived_default_literal_change_blocks_cutover(self) -> None:
+        self._assert_catalog_ddl_drift_blocks_cutover(
+            f"""
+            ALTER TABLE request
+            ALTER COLUMN target_hardware
+            SET DEFAULT '{self.schema}.catalog-sentinel'
+            """,
+            """
+            ALTER TABLE request
+            ALTER COLUMN target_hardware
+            SET DEFAULT 'catalog-sentinel'
+            """,
+        )
+
+    def test_archived_comment_literal_change_blocks_cutover(self) -> None:
+        self._assert_catalog_ddl_drift_blocks_cutover(
+            f"COMMENT ON TABLE request IS '{self.schema}.catalog-sentinel'",
+            "COMMENT ON TABLE request IS 'catalog-sentinel'",
+        )
+
+    def test_cutover_requires_one_time_database_administrator(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-privilege",
+            run_id="run-privilege",
+            operation_id="operation-privilege",
+        )
+        directory = Path(tempfile.mkdtemp(prefix="privilege-receipt-", dir=self.server_root.name))
+        receipt = directory / "receipt.json"
+        prepared = self._prepare_archive(receipt, user="platform_migrate")
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        rejected = self._apply_script(receipt, user="platform_migrate")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("one-time database administrator", rejected.stderr)
+        self.assertEqual(
+            self._query(
+                "SELECT to_regclass(%s)::text",
+                (f"{self.schema}.run",),
+            ),
+            [("run",)],
+        )
+
+    def test_cutover_lock_blocks_concurrent_index_acl_owner_and_view_ddl(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._create_airflow_tables()
+        self._insert_legacy_unresolved(
+            request_id="request-lock",
+            run_id="run-lock",
+            operation_id="operation-lock",
+        )
+        before = self._query(
+            """
+            SELECT pg_get_userbyid(c.relowner),
+                   has_table_privilege('operator_ro', c.oid, 'SELECT')
+            FROM pg_class AS c
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = 'run'
+            """,
+            (self.schema,),
+        )
+        module = _legacy_cutover_module()
+        statements = (
+            f'UPDATE "{self.schema}".run SET state = \'running\' WHERE run_id = \'run-lock\'',
+            f'CREATE TABLE "{self.schema}".concurrent_table (id integer)',
+            f'CREATE INDEX run_concurrent_idx ON "{self.schema}".run (state)',
+            f'GRANT SELECT ON "{self.schema}".run TO operator_ro',
+            f'ALTER TABLE "{self.schema}".run OWNER TO platform_migrate',
+            f'ALTER VIEW "{self.schema}".lifecycle_projection SET (security_barrier=true)',
+            f"""
+            INSERT INTO "{self.airflow_schema}".dag_run (
+                dag_id, run_id, state
+            ) VALUES ('concurrent', 'run-concurrent', 'running')
+            """,
+        )
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        result = context.Queue()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SET LOCAL lock_timeout = '30s'")
+            module.lock_cutover_relations(
+                cursor,
+                self.schema,
+                self.airflow_schema,
+            )
+            workers = [
+                context.Process(
+                    target=_attempt_legacy_ddl,
+                    args=(self.server.get_uri(), statement, start, result),
+                )
+                for statement in statements
+            ]
+            for process in workers:
+                self.addCleanup(
+                    lambda item=process: item.terminate() if item.is_alive() else None
+                )
+                process.start()
+            start.set()
+            for process in workers:
+                process.join(20)
+                self.assertEqual(process.exitcode, 0)
+            outcomes = [result.get(timeout=5) for _ in workers]
+            self.assertEqual(
+                sorted(row[0] for row in outcomes),
+                [
+                    "locked",
+                    "locked",
+                    "locked",
+                    "locked",
+                    "locked",
+                    "locked",
+                    "locked",
+                ],
+                outcomes,
+            )
+            connection.rollback()
+        self.assertEqual(
+            self._query(
+                "SELECT to_regclass(%s)::text, to_regclass(%s)::text",
+                (
+                    f"{self.schema}.run_concurrent_idx",
+                    f"{self.schema}.lifecycle_projection",
+                ),
+            ),
+            [(None, "lifecycle_projection")],
+        )
+        self.assertEqual(
+            self._query(
+                """
+                SELECT pg_get_userbyid(c.relowner),
+                       has_table_privilege('operator_ro', c.oid, 'SELECT')
+                FROM pg_class AS c
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = 'run'
+                """,
+                (self.schema,),
+            ),
+            before,
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT state, display_name FROM run WHERE run_id = 'run-lock'"
+            ),
+            [("unresolved", None)],
+        )
+        definition = self._query(
+            """
+            SELECT pg_get_viewdef(%s::regclass, true)
+            """,
+            (f"{self.schema}.lifecycle_projection",),
+        )[0][0]
+        self.assertIn("state", definition)
+        self.assertEqual(
+            self._query(
+                """
+                SELECT c.reloptions
+                FROM pg_class AS c
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = 'lifecycle_projection'
+                """,
+                (self.schema,),
+            ),
+            [(None,)],
+        )
+
+    def test_cutover_postcondition_rejects_unexpected_relation(self) -> None:
+        self._install_canonical_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(f'CREATE TABLE "{self.schema}".unexpected_table (id integer)')
+        module = _legacy_cutover_module()
+        with (
+            self._connect() as connection,
+            connection.cursor() as cursor,
+            self.assertRaises(module.ArchiveError),
+        ):
+            module.verify_canonical_cutover_state(cursor, self.schema)
+
     def test_legacy_cutover_does_not_cascade_through_an_unarchived_dependency(self) -> None:
-        self._create_legacy_run_table()
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-dependency",
+            run_id="run-dependency",
+            operation_id="operation-dependency",
+        )
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute("CREATE VIEW legacy_run_dependency AS SELECT run_id FROM run")
-        with self.assertRaises(psycopg2.errors.DependentObjectsStillExist):
-            self._apply("schema.sql")
+        self._create_airflow_tables()
+        directory = Path(tempfile.mkdtemp(prefix="dependency-receipt-", dir=self.server_root.name))
+        completed = self._apply_script(directory / "receipt.json")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("DependentObjectsStillExist", completed.stderr)
         self.assertEqual(
             self._query(
                 "SELECT to_regclass(%s)::text, to_regclass(%s)::text",
                 (f"{self.schema}.run", f"{self.schema}.legacy_run_dependency"),
             ),
             [("run", "legacy_run_dependency")],
-        )
-
-    def test_apply_script_binds_the_archive_receipt_to_the_schema_guard(self) -> None:
-        self._create_legacy_run_table()
-        self._create_airflow_tables()
-        with tempfile.TemporaryDirectory(prefix="schema-receipt-") as directory:
-            receipt = Path(directory) / "legacy-archive.json"
-            receipt.write_text('{"archive":"verified"}\n', encoding="utf-8")
-            postmaster = self.server.get_postmaster_info()
-            completed = subprocess.run(
-                [
-                    "bash",
-                    str(PLATFORM_DIR / "apply.sh"),
-                    "--psql",
-                    str(Path(POSTGRES_BIN_PATH) / "psql"),
-                    "--database",
-                    self.database,
-                    "--platform-schema",
-                    self.schema,
-                    "--airflow-schema",
-                    self.airflow_schema,
-                    "--socket",
-                    str(postmaster.socket_dir),
-                    "--port",
-                    str(postmaster.port),
-                    "--user",
-                    "postgres",
-                    "--legacy-archive-receipt",
-                    str(receipt),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(
-            self._query(
-                "SELECT to_regclass(%s)::text",
-                (f"{self.schema}.run",),
-            ),
-            [(None,)],
         )
 
     def test_lifecycle_matrix_distinguishes_not_run_blocked_running_and_unresolved(self) -> None:
