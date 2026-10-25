@@ -34,6 +34,9 @@ from description_pipeline.pipeline.diagnostic import (  # noqa: E402
     DiagnosticAdmissionSpec,
     build_diagnostic_command,
 )
+from description_pipeline.pipeline.contracts import (  # noqa: E402
+    NativeTargetIdentity,
+)
 from description_pipeline.pipeline.discover import (  # noqa: E402
     CONFIGURATION_KIND,
     DISCOVER_CHECKS_SCHEMA,
@@ -429,6 +432,7 @@ def _seal_current_diagnostic(
     validated: Mapping[str, Any],
     migration_tool: Mapping[str, Any],
     native_tool: Mapping[str, Any],
+    native_target_identity: NativeTargetIdentity,
     created_at: datetime,
 ) -> tuple[DiagnosticAdmissionSpec, dict[str, Any]]:
     """Build the current Capture contract around the immutable legacy bytes."""
@@ -681,6 +685,7 @@ def _seal_current_diagnostic(
         "effect_key": "capture-native",
         "handoff_sha256": plan["handoff_sha256"],
         "main_assembly": plan["main_assembly"],
+        "native_target_identity": native_target_identity.to_record(),
         "native_tool_source_sha256": current_tool_source,
         "native_tool_record_sha256": current_tool_record,
         "native_tool_requirement_artifact_id": requirement.artifact_id,
@@ -716,6 +721,7 @@ def _seal_current_diagnostic(
 
 def migrate_historical_capture_input(
     inputs: MigrationInputs,
+    native_target_identity: NativeTargetIdentity,
     *,
     artifact_store: Path,
     work_root: Path,
@@ -725,6 +731,11 @@ def migrate_historical_capture_input(
     expected_prepared_sha256: str | None = None,
     diagnostic_created_at: datetime | None = None,
 ) -> dict[str, Any]:
+    if not isinstance(native_target_identity, NativeTargetIdentity):
+        raise HistoricalMigrationError(
+            "historical_capture.native_target_identity",
+            {"where": "native_target_identity"},
+        )
     validated = validate_legacy_inputs(inputs)
     plan = validated["plan"]
     run_id = plan["run_id"]
@@ -825,6 +836,9 @@ def migrate_historical_capture_input(
                 "runtime": dict(tool.get("runtime") or {}),
                 "release": tool.get("release"),
             },
+            "current_native_target": (
+                native_target_identity.to_record()
+            ),
         }
         write_json(staging / "migration.json", migration)
         admission, current_inputs = _seal_current_diagnostic(
@@ -833,6 +847,7 @@ def migrate_historical_capture_input(
             validated=validated,
             migration_tool=tool,
             native_tool=current_native_tool,
+            native_target_identity=native_target_identity,
             created_at=created_at,
         )
         write_json(
@@ -867,6 +882,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--tool-record", type=Path)
     parser.add_argument("--current-native-tool", type=Path, required=True)
+    parser.add_argument(
+        "--native-target-identity",
+        type=Path,
+        required=True,
+    )
     parser.add_argument("--expected-run-id")
     parser.add_argument("--expected-prepared-sha256")
     parser.add_argument("--diagnostic-created-at", required=True)
@@ -879,6 +899,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         tool = read_data(args.tool_record) if args.tool_record is not None else None
         current_native_tool = read_data(args.current_native_tool)
+        native_target_identity = NativeTargetIdentity.from_record(
+            read_data(args.native_target_identity)
+        )
         receipt = migrate_historical_capture_input(
             MigrationInputs(
                 prepared=args.prepared,
@@ -886,6 +909,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_request=args.source_request,
                 capture_request=args.capture_request,
             ),
+            native_target_identity,
             artifact_store=args.artifact_store,
             work_root=args.work_root,
             migration_tool=tool,

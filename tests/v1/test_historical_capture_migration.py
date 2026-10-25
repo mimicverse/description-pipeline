@@ -12,6 +12,7 @@ import uuid
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 try:
     import pgserver
@@ -21,6 +22,7 @@ except ImportError:
     psycopg2 = None
 
 from description_pipeline.artifacts import ArtifactStore
+from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import digest, file_digest, read_data, write_json
 from description_pipeline.orchestration.native_operation_client import (
     capture_handler_from_native_operation,
@@ -37,7 +39,10 @@ from description_pipeline.pipeline.capture import (
     CaptureInputs,
     CaptureRequest,
 )
-from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.pipeline.contracts import (
+    ArtifactRef,
+    NativeTargetIdentity,
+)
 from description_pipeline.pipeline.diagnostic import (
     DiagnosticAdmissionSpec,
     build_diagnostic_command,
@@ -59,6 +64,7 @@ PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 RUN_ID = "preflight-fixture-0123456789abcdef"
 MAIN = "robot.SLDASM"
 SOURCE_SHA256 = digest({"migration-source": 1})
+TEST_INSTALL_ID = "win-" + "7" * 32
 
 
 def _load_tool():
@@ -84,6 +90,17 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
         )
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        install_id = mock.patch.object(
+            NativeOperationRuntime,
+            "_install_id",
+            return_value=TEST_INSTALL_ID,
+        )
+        install_id.start()
+        self.addCleanup(install_id.stop)
+        self.native_target_identity = NativeTargetIdentity.create(
+            install_id=TEST_INSTALL_ID,
+            pipeline_id=PIPELINE_ID,
+        )
         self.prepared = self.root / "prepared"
         self.prepared.mkdir()
         (self.prepared / "discovery").mkdir()
@@ -271,6 +288,7 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
         arguments.update(overrides)
         return HISTORICAL.migrate_historical_capture_input(
             HISTORICAL.MigrationInputs(**arguments),
+            self.native_target_identity,
             artifact_store=self.artifact_store,
             work_root=self.work_root,
             migration_tool=self.tool_record,
@@ -320,6 +338,10 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
             migration["migration_tool"]["source_sha256"],
             SOURCE_SHA256,
         )
+        self.assertEqual(
+            migration["current_native_target"],
+            self.native_target_identity.to_record(),
+        )
         for name in (MAIN, "part.SLDPRT", "source.json", "capture-plan.json"):
             self.assertEqual(
                 (root / "legacy/prepared" / name).read_bytes(),
@@ -332,6 +354,10 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
         self.assertEqual(
             command.to_record(),
             receipt["diagnostic_command"],
+        )
+        self.assertEqual(
+            command.request["native_target_identity"],
+            self.native_target_identity.to_record(),
         )
         workspace = StageWorkspace(
             root=self.root / "diagnostic-workspace",
@@ -418,6 +444,7 @@ class HistoricalCaptureMigrationTests(unittest.TestCase):
                     source_request=self.source_request,
                     capture_request=self.capture_request,
                 ),
+                self.native_target_identity,
                 artifact_store=self.artifact_store,
                 work_root=self.work_root,
                 migration_tool=self.tool_record,
