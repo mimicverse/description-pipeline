@@ -1079,6 +1079,138 @@ def _read_curve_end_params(
     return evidence
 
 
+def _native_evidence_summary(value):
+    """Return one JSON-safe summary without treating an absent result as proof."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else {"type": "float"}
+    if isinstance(value, (list, tuple)):
+        if len(value) <= 12:
+            return [_native_evidence_summary(item) for item in value]
+        return {"type": type(value).__name__, "length": len(value)}
+    row = {"type": type(value).__name__}
+    try:
+        row["object_pointer"] = _com_iunknown_pointer(value)
+    except Exception as error:  # noqa: BLE001 - diagnostics stay explicit
+        row["pointer_error"] = f"{type(error).__name__}: {error}"[:300]
+    return row
+
+
+def _read_tessellation_error_list(
+    tessellation,
+    *,
+    face_rows=(),
+    variant_factory=None,
+    vt_byref=None,
+    vt_variant=None,
+):
+    """Read the five automation output arrays from ITessellation.GetErrorList."""
+
+    evidence = {
+        "call_form": "pywin32-byref-variant",
+        "state": "unreadable",
+        "returned": None,
+        "outputs": [],
+        "error": None,
+    }
+    try:
+        if (
+            variant_factory is None
+            or vt_byref is None
+            or vt_variant is None
+        ):
+            import pythoncom
+            from win32com.client import VARIANT
+
+            variant_factory = VARIANT if variant_factory is None else variant_factory
+            vt_byref = pythoncom.VT_BYREF if vt_byref is None else vt_byref
+            vt_variant = pythoncom.VT_VARIANT if vt_variant is None else vt_variant
+        outputs = [
+            variant_factory(vt_byref | vt_variant, None)
+            for _ in range(5)
+        ]
+        returned = _method(tessellation, "GetErrorList", *outputs)
+    except Exception as error:  # noqa: BLE001 - never fabricate an empty list
+        evidence["error"] = f"{type(error).__name__}: {error}"[:300]
+        return evidence
+
+    try:
+        face_index_by_pointer = {}
+        face_identity_errors = []
+        for row in face_rows:
+            try:
+                pointer = _com_iunknown_pointer(row["object"])
+            except Exception as error:  # noqa: BLE001 - object stays unmapped
+                face_identity_errors.append(
+                    {
+                        "face_index": row["index"],
+                        "error": f"{type(error).__name__}: {error}"[:300],
+                    }
+                )
+            else:
+                face_index_by_pointer[pointer] = row["index"]
+
+        def summarize_item(item):
+            if item is None or isinstance(item, (str, bool, int)):
+                return item
+            if isinstance(item, float):
+                return item if math.isfinite(item) else {"type": "float"}
+            row = {"type": type(item).__name__}
+            try:
+                pointer = _com_iunknown_pointer(item)
+            except Exception as error:  # noqa: BLE001 - diagnostics stay explicit
+                row["pointer_error"] = f"{type(error).__name__}: {error}"[:300]
+                row["face_index"] = None
+                row["mapping"] = "unmapped"
+            else:
+                row["object_pointer"] = pointer
+                if pointer in face_index_by_pointer:
+                    row["face_index"] = face_index_by_pointer[pointer]
+                    row["mapping"] = "face_index"
+                else:
+                    row["face_index"] = None
+                    row["mapping"] = "unmapped"
+            return row
+
+        output_rows = []
+        for index, output in enumerate(outputs):
+            raw = getattr(output, "value", None)
+            if isinstance(raw, (list, tuple)):
+                items = [summarize_item(item) for item in raw]
+                count = len(raw)
+            elif raw is None:
+                items = None
+                count = None
+            else:
+                items = [summarize_item(raw)]
+                count = 1
+            output_rows.append(
+                {
+                    "index": index,
+                    "variant_type": getattr(output, "varianttype", None),
+                    "raw_type": type(raw).__name__,
+                    "count": count,
+                    "items": items,
+                }
+            )
+        evidence.update(
+            {
+                "state": "observed",
+                "returned": _native_evidence_summary(returned),
+                "outputs": output_rows,
+                "face_identity_errors": face_identity_errors,
+            }
+        )
+    except Exception as error:  # noqa: BLE001 - failure diagnostics never mask Tessellate=False
+        evidence["error"] = (
+            "diagnostic processing failed: "
+            f"{type(error).__name__}: {error}"
+        )[:300]
+    return evidence
+
+
 def _active_configuration(doc):
     """Name of the configuration a document currently has active."""
 
@@ -7485,13 +7617,17 @@ class SolidWorksBackend(CadBackend):
                 {**base, "api": "IBody2.GetTessellation"},
             )
         tessellation = _interface(_dynamic(raw_tessellation), ITESSELLATION_IID)
+        tessellation_property_requests = {}
         tessellation_properties = {}
         for name, expected, evidence_name in (
+            ("ImprovedQuality", True, "improved_quality"),
             ("MatchType", 0, "match_type"),
+            ("NeedErrorList", True, "need_error_list"),
             ("NeedFaceFacetMap", True, "need_face_facet_map"),
             ("NeedEdgeFinMap", True, "need_edge_fin_map"),
             ("NeedVertexParams", True, "need_vertex_params"),
         ):
+            tessellation_property_requests[evidence_name] = expected
             call(
                 f"ITessellation.{name}",
                 lambda name=name, expected=expected: setattr(
@@ -7509,6 +7645,15 @@ class SolidWorksBackend(CadBackend):
                     {**base, "api": f"ITessellation.{name}", "returned": repr(observed)[:60]},
                 )
             tessellation_properties[evidence_name] = observed
+
+        def reference_evidence(reference):
+            if not isinstance(reference, dict):
+                return None
+            return {
+                "raw_sha256": reference.get("raw_sha256"),
+                "typed_sha256": reference.get("typed_sha256"),
+            }
+
         tessellate_result = call(
             "ITessellation.Tessellate",
             lambda: _method(tessellation, "Tessellate"),
@@ -7518,6 +7663,87 @@ class SolidWorksBackend(CadBackend):
                 "cad_native_tessellation_unreadable",
                 "ITessellation.Tessellate did not return a boolean",
                 {**base, "api": "ITessellation.Tessellate", "returned": repr(tessellate_result)[:60]},
+            )
+        if tessellate_result is False:
+            native_totals = {}
+            for api, name in (
+                ("GetFacetCount", "facets"),
+                ("GetFinCount", "fins"),
+                ("GetVertexCount", "vertices"),
+            ):
+                try:
+                    value = call(
+                        f"ITessellation.{api}",
+                        lambda api=api: _method(tessellation, api),
+                    )
+                except CadError as error:
+                    native_totals[name] = {
+                        "api": f"ITessellation.{api}",
+                        "value": None,
+                        "error": error.detail,
+                    }
+                else:
+                    native_totals[name] = {
+                        "api": f"ITessellation.{api}",
+                        "value": _native_evidence_summary(value),
+                        "error": None,
+                    }
+
+            face_diagnostics = []
+            for row in face_rows:
+                diagnostic = {
+                    "face_index": row["index"],
+                    "face_reference": reference_evidence(row["reference"]),
+                    "owner_body_reference": reference_evidence(
+                        row["owner_body_reference"]
+                    ),
+                    "area_m2": {"state": "unreadable", "value": None, "error": None},
+                    "triangle_count": {
+                        "state": "unreadable",
+                        "value": None,
+                        "error": None,
+                    },
+                }
+                for field, api in (
+                    ("area_m2", "GetArea"),
+                    ("triangle_count", "GetTessTriangleCount"),
+                ):
+                    try:
+                        value = _member(row["object"], api)
+                    except Exception as error:  # noqa: BLE001 - diagnostic only
+                        diagnostic[field]["error"] = (
+                            f"{type(error).__name__}: {error}"[:300]
+                        )
+                    else:
+                        diagnostic[field].update(
+                            {
+                                "state": "observed",
+                                "value": _native_evidence_summary(value),
+                            }
+                        )
+                face_diagnostics.append(diagnostic)
+            raise CadError(
+                "cad_native_tessellation_unreadable",
+                "ITessellation.Tessellate returned false",
+                {
+                    **base,
+                    "api": "ITessellation.Tessellate",
+                    "tessellate_result": False,
+                    "tessellation_request": copy.deepcopy(tessellation_request),
+                    "tessellation_properties": copy.deepcopy(
+                        tessellation_properties
+                    ),
+                    "native_totals": native_totals,
+                    "native_totals_role": (
+                        "failure_diagnostic_only; values do not prove an empty "
+                        "tessellation"
+                    ),
+                    "error_list": _read_tessellation_error_list(
+                        tessellation,
+                        face_rows=face_rows,
+                    ),
+                    "face_diagnostics": face_diagnostics,
+                },
             )
         native_totals = {}
         for api, name in (
@@ -7536,14 +7762,6 @@ class SolidWorksBackend(CadBackend):
                     {**base, "api": f"ITessellation.{api}", "returned": repr(value)[:60]},
                 )
             native_totals[name] = value
-
-        def reference_evidence(reference):
-            if not isinstance(reference, dict):
-                return None
-            return {
-                "raw_sha256": reference.get("raw_sha256"),
-                "typed_sha256": reference.get("typed_sha256"),
-            }
 
         facets = {}
         fins_by_id = {}
@@ -9161,6 +9379,7 @@ class SolidWorksBackend(CadBackend):
                 "scope": body_scope,
                 "tessellate_result": tessellate_result,
                 "request": tessellation_request,
+                "property_requests": dict(tessellation_property_requests),
                 "properties": tessellation_properties,
                 "facet_count": native_totals["facets"],
                 "fin_count": native_totals["fins"],
@@ -10218,8 +10437,18 @@ class SolidWorksBackend(CadBackend):
                 "u_rule_version": NATIVE_U_IDENTITY_RULE,
                 "u_resolution_rule": NATIVE_U_RESOLUTION_RULE,
                 "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
-                "properties": {
+                "property_requests": {
+                    "improved_quality": True,
                     "match_type": 0,
+                    "need_error_list": True,
+                    "need_face_facet_map": True,
+                    "need_edge_fin_map": True,
+                    "need_vertex_params": True,
+                },
+                "properties": {
+                    "improved_quality": True,
+                    "match_type": 0,
+                    "need_error_list": True,
                     "need_face_facet_map": True,
                     "need_edge_fin_map": True,
                     "need_vertex_params": True,

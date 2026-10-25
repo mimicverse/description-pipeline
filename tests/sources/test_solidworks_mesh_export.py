@@ -315,7 +315,9 @@ class FakeTessellation:
 
     def __setattr__(self, name, value):
         if name in {
+            "ImprovedQuality",
             "MatchType",
+            "NeedErrorList",
             "NeedFaceFacetMap",
             "NeedEdgeFinMap",
             "NeedVertexParams",
@@ -714,7 +716,9 @@ class ComponentMeshExportTests(unittest.TestCase):
             body.tessellation_face_lists[-1],
             "VT_ARRAY|VT_DISPATCH",
         )
+        self.assertIs(body._tessellation.requested["ImprovedQuality"], True)
         self.assertEqual(body._tessellation.requested["MatchType"], 0)
+        self.assertIs(body._tessellation.requested["NeedErrorList"], True)
         self.assertEqual(
             entry["tessellation"]["itessellation"]["bodies"][0]["request"],
             support.native_tessellation_request(
@@ -926,15 +930,25 @@ class ComponentMeshExportTests(unittest.TestCase):
         )
         self.assertIn("mesh_tessellation:pcb-1", backend.notes)
 
-    def test_sheet_empty_face_with_tessellate_refusal_is_recorded_not_failed(self):
+    def test_sheet_empty_face_with_tessellate_refusal_is_a_primary_failure(self):
         tessellation = FakeTessellation(facets=0, tessellate_result=False)
         backend = self._sheet_facetless_backend(
             FakeFace([], triangle_count=0, area=7.486257000421631e-13), tessellation
         )
-        entry = backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
-        row = entry["tessellation"]["no_facets_faces"][0]
-        self.assertIs(row["tessellate_result"], False)
-        self.assertEqual(row["area_m2"], 7.486257000421631e-13)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        self.assertEqual(
+            caught.exception.detail["api"],
+            "ITessellation.Tessellate",
+        )
+        self.assertIs(caught.exception.detail["tessellate_result"], False)
+        self.assertEqual(
+            caught.exception.detail["face_diagnostics"][0]["area_m2"][
+                "value"
+            ],
+            7.486257000421631e-13,
+        )
+        self.assertFalse(self.dest.exists())
 
     def test_sheet_empty_face_with_positive_facets_fails_until_reconstruction_is_validated(self):
         tessellation = FakeTessellation(facets=1, tessellate_result=True)

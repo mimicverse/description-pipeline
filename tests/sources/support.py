@@ -39,7 +39,9 @@ from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
 NATIVE_TESSELLATION_PROPERTIES = {
+    "improved_quality": True,
     "match_type": 0,
+    "need_error_list": True,
     "need_face_facet_map": True,
     "need_edge_fin_map": True,
     "need_vertex_params": True,
@@ -881,6 +883,9 @@ def native_tessellation_fixture(
                 "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
                 "tessellate_result": True,
                 "request": native_tessellation_request(body_face_references),
+                "property_requests": copy.deepcopy(
+                    NATIVE_TESSELLATION_PROPERTIES
+                ),
                 "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
                 "facet_count": len(body["facets"]),
                 "fin_count": len(body["fins"]),
@@ -993,6 +998,9 @@ def native_tessellation_fixture(
                 "get_closest_point_on_calls": u_observations,
                 "evaluate2_calls": u_observations,
             },
+            "property_requests": copy.deepcopy(
+                NATIVE_TESSELLATION_PROPERTIES
+            ),
             "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
             "reference_alias_audit": {
                 "body": [],

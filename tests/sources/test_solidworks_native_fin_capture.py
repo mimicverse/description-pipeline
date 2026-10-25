@@ -200,6 +200,9 @@ class FakeFace:
             ) / 2.0
         return abs(area)
 
+    def GetTessTriangleCount(self):  # noqa: N802 - SolidWorks API name
+        return len(self.display_triangles) // 9
+
     def GetBody(self):  # noqa: N802 - SolidWorks API name
         self.body_calls += 1
         return self.owner
@@ -365,7 +368,9 @@ class FakeCurve:
 class FakeTessellation:
     _option_names = frozenset(
         {
+            "ImprovedQuality",
             "MatchType",
+            "NeedErrorList",
             "NeedFaceFacetMap",
             "NeedEdgeFinMap",
             "NeedVertexParams",
@@ -377,6 +382,10 @@ class FakeTessellation:
         self.transient_remaining = dict(transient_failures or {})
         self.call_counts = {}
         self.tessellate_calls = 0
+        self.tessellate_result = True
+        self.error_list_calls = 0
+        self.error_list_outputs = [[] for _ in range(5)]
+        self.error_list_error = None
         self.edge_fin_calls = []
         self.face_facet_calls = []
         self.facet_fin_calls = []
@@ -421,7 +430,17 @@ class FakeTessellation:
     def Tessellate(self):  # noqa: N802 - SolidWorks API name
         self._observe("Tessellate")
         self.tessellate_calls += 1
-        return True
+        return self.tessellate_result
+
+    def GetErrorList(self, *outputs):  # noqa: N802 - SolidWorks API name
+        self._observe("GetErrorList")
+        self.error_list_calls += 1
+        if self.error_list_error is not None:
+            raise RuntimeError(self.error_list_error)
+        if len(outputs) != 5:
+            raise AssertionError("GetErrorList requires five output variants")
+        for output, value in zip(outputs, self.error_list_outputs, strict=True):
+            output.value = value
 
     def GetFaceFacets(self, face):  # noqa: N802 - SolidWorks API name
         self._observe("GetFaceFacets")
@@ -2561,14 +2580,19 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             CadError,
-            "invalid facet ID array",
+            "Tessellate returned false",
         ) as caught:
             self.capture(body, extension, body_type=1)
 
+        self.assertEqual(
+            caught.exception.detail["api"],
+            "ITessellation.Tessellate",
+        )
         self.assertIs(
             caught.exception.detail["tessellate_result"],
             False,
         )
+        self.assertEqual(tessellation.face_facet_calls, [])
 
     def test_parser_accepts_sheet_null_face_and_edge_by_complete_closure(self):
         edge_reference = hashlib.sha256(b"edge").hexdigest()
@@ -2734,7 +2758,9 @@ class NativeFinCaptureTests(unittest.TestCase):
                 self.assertEqual(
                     detail["tessellation_properties"],
                     {
+                        "improved_quality": True,
                         "match_type": 0,
+                        "need_error_list": True,
                         "need_face_facet_map": True,
                         "need_edge_fin_map": True,
                         "need_vertex_params": True,
@@ -2796,7 +2822,9 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(
             tessellation.requested,
             {
+                "ImprovedQuality": True,
                 "MatchType": 0,
+                "NeedErrorList": True,
                 "NeedFaceFacetMap": True,
                 "NeedEdgeFinMap": True,
                 "NeedVertexParams": True,
@@ -2805,7 +2833,9 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(
             tessellation.property_writes,
             [
+                "ImprovedQuality",
                 "MatchType",
+                "NeedErrorList",
                 "NeedFaceFacetMap",
                 "NeedEdgeFinMap",
                 "NeedVertexParams",
@@ -2814,7 +2844,9 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(
             tessellation.property_reads,
             [
+                "ImprovedQuality",
                 "MatchType",
+                "NeedErrorList",
                 "NeedFaceFacetMap",
                 "NeedEdgeFinMap",
                 "NeedVertexParams",
@@ -2830,11 +2862,17 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(
             captured["itessellation_body"]["properties"],
             {
+                "improved_quality": True,
                 "match_type": 0,
+                "need_error_list": True,
                 "need_face_facet_map": True,
                 "need_edge_fin_map": True,
                 "need_vertex_params": True,
             },
+        )
+        self.assertEqual(
+            captured["itessellation_body"]["property_requests"],
+            captured["itessellation_body"]["properties"],
         )
         self.assertEqual(len(tessellation.face_facet_calls), 2)
         self.assertCountEqual(tessellation.facet_fin_calls, [10, 20])
@@ -6056,6 +6094,160 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "cad_native_tessellation_unreadable")
         self.assertEqual(caught.exception.detail["api"], "ITessellation.MatchType")
+
+    def test_analysis_property_readback_mismatch_is_rejected(self):
+        for name in ("ImprovedQuality", "NeedErrorList"):
+            with self.subTest(name=name):
+                body, _face_10, _face_20, _edge, tessellation, extension = (
+                    self.fixture()
+                )
+                tessellation.property_readbacks[name] = 1
+
+                with self.assertRaises(CadError) as caught:
+                    self.capture(body, extension)
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_native_tessellation_unreadable",
+                )
+                self.assertEqual(
+                    caught.exception.detail["api"],
+                    f"ITessellation.{name}",
+                )
+
+    def test_tessellate_false_is_the_primary_error(self):
+        body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
+        tessellation.tessellate_result = False
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension)
+
+        error = caught.exception
+        self.assertEqual(error.code, "cad_native_tessellation_unreadable")
+        self.assertEqual(error.message, "ITessellation.Tessellate returned false")
+        self.assertEqual(error.detail["api"], "ITessellation.Tessellate")
+        self.assertIs(error.detail["tessellate_result"], False)
+        self.assertEqual(
+            error.detail["tessellation_properties"],
+            {
+                "improved_quality": True,
+                "match_type": 0,
+                "need_error_list": True,
+                "need_face_facet_map": True,
+                "need_edge_fin_map": True,
+                "need_vertex_params": True,
+            },
+        )
+        self.assertEqual(tessellation.tessellate_calls, 1)
+        self.assertEqual(tessellation.face_facet_calls, [])
+        self.assertIn(
+            "failure_diagnostic_only",
+            error.detail["native_totals_role"],
+        )
+        self.assertEqual(
+            set(error.detail["native_totals"]),
+            {"facets", "fins", "vertices"},
+        )
+        self.assertEqual(
+            [row["face_index"] for row in error.detail["face_diagnostics"]],
+            [0, 1],
+        )
+        self.assertEqual(
+            error.detail["face_diagnostics"][0]["triangle_count"],
+            {"state": "observed", "value": 1, "error": None},
+        )
+        self.assertEqual(error.detail["error_list"]["state"], "unreadable")
+
+    def test_error_list_output_arrays_are_preserved_without_empty_inference(self):
+        _body, _face_10, _face_20, _edge, tessellation, _extension = self.fixture()
+        tessellation.error_list_outputs = [[], [11, 12], [], [], []]
+
+        evidence = native_module._read_tessellation_error_list(
+            tessellation,
+            face_rows=[],
+            variant_factory=FakeVariant,
+            vt_byref=0x4000,
+            vt_variant=0x000C,
+        )
+
+        self.assertEqual(evidence["state"], "observed")
+        self.assertIsNone(evidence["error"])
+        self.assertEqual(
+            [row["count"] for row in evidence["outputs"]],
+            [0, 2, 0, 0, 0],
+        )
+        self.assertEqual(evidence["outputs"][0]["items"], [])
+        self.assertEqual(evidence["outputs"][1]["items"], [11, 12])
+
+        tessellation.error_list_error = "unsupported automation call"
+        unreadable = native_module._read_tessellation_error_list(
+            tessellation,
+            face_rows=[],
+            variant_factory=FakeVariant,
+            vt_byref=0x4000,
+            vt_variant=0x000C,
+        )
+        self.assertEqual(unreadable["state"], "unreadable")
+        self.assertEqual(unreadable["outputs"], [])
+        self.assertIn("unsupported automation call", unreadable["error"])
+
+    def test_error_list_face_mapping_uses_canonical_iunknown_identity(self):
+        _body, face_10, face_20, _edge, tessellation, _extension = self.fixture()
+        tessellation.error_list_outputs = [[face_20], [], [], [], []]
+        face_rows = [
+            {
+                "index": 0,
+                "object": face_10,
+                "object_pointer": 0x1000,
+            },
+            {
+                "index": 1,
+                "object": face_20,
+                "object_pointer": 0x2000,
+            },
+        ]
+
+        def canonical(value):
+            return 0xA000 if value is face_10 else 0xB000
+
+        with patch.object(
+            native_module,
+            "_com_iunknown_pointer",
+            side_effect=canonical,
+        ):
+            evidence = native_module._read_tessellation_error_list(
+                tessellation,
+                face_rows=face_rows,
+                variant_factory=FakeVariant,
+                vt_byref=0x4000,
+                vt_variant=0x000C,
+            )
+
+        item = evidence["outputs"][0]["items"][0]
+        self.assertEqual(item["object_pointer"], 0xB000)
+        self.assertEqual(item["face_index"], 1)
+        self.assertEqual(item["mapping"], "face_index")
+        self.assertNotIn(item["object_pointer"], (0x1000, 0x2000))
+
+    def test_error_list_formatting_failure_remains_diagnostic_unreadable(self):
+        _body, _face_10, _face_20, _edge, tessellation, _extension = self.fixture()
+        with patch.object(
+            native_module,
+            "_native_evidence_summary",
+            side_effect=RuntimeError("diagnostic formatting failed"),
+        ):
+            evidence = native_module._read_tessellation_error_list(
+                tessellation,
+                face_rows=[],
+                variant_factory=FakeVariant,
+                vt_byref=0x4000,
+                vt_variant=0x000C,
+            )
+
+        self.assertEqual(evidence["state"], "unreadable")
+        self.assertEqual(evidence["outputs"], [])
+        self.assertIn("diagnostic processing failed", evidence["error"])
+        self.assertIn("diagnostic formatting failed", evidence["error"])
 
     def test_native_total_mismatch_is_rejected(self):
         body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()

@@ -1693,6 +1693,7 @@ def _parse_itessellation_evidence(
         "u_rule_version",
         "u_resolution_rule",
         "point_roundtrip_rule",
+        "property_requests",
         "properties",
         "identity_rule",
         "bodies",
@@ -1868,21 +1869,39 @@ def _parse_itessellation_evidence(
         component + ": native U observation statistics are inconsistent",
     )
     properties = value["properties"]
+    property_requests = value["property_requests"]
     expected_boolean_properties = (
+        "improved_quality",
+        "need_error_list",
         "need_face_facet_map",
         "need_edge_fin_map",
         "need_vertex_params",
     )
+
+    def properties_are_strict(candidate):
+        return (
+            isinstance(candidate, dict)
+            and set(candidate) == {"match_type", *expected_boolean_properties}
+            and type(candidate["match_type"]) is int
+            and candidate["match_type"] == 0
+            and all(
+                type(candidate[key]) is bool and candidate[key] is True
+                for key in expected_boolean_properties
+            )
+        )
+
     _require(
-        isinstance(properties, dict)
-        and set(properties) == {"match_type", *expected_boolean_properties}
-        and type(properties["match_type"]) is int
-        and properties["match_type"] == 0
-        and all(
-            type(properties[key]) is bool and properties[key] is True
-            for key in expected_boolean_properties
-        ),
+        properties_are_strict(property_requests),
+        component + ": native ITessellation property requests are incomplete",
+    )
+    _require(
+        properties_are_strict(properties),
         component + ": native ITessellation properties are incomplete",
+    )
+    _require(
+        properties == property_requests,
+        component
+        + ": native ITessellation requested and observed properties differ",
     )
     if triangle_vertices is not None:
         _require(
@@ -1925,6 +1944,7 @@ def _parse_itessellation_evidence(
                 "body_reference_sha256",
                 "tessellate_result",
                 "request",
+                "property_requests",
                 "properties",
                 "facet_count",
                 "fin_count",
@@ -1940,6 +1960,7 @@ def _parse_itessellation_evidence(
                     "scope",
                     "tessellate_result",
                     "request",
+                    "property_requests",
                     "properties",
                     "facet_count",
                     "fin_count",
@@ -1964,6 +1985,14 @@ def _parse_itessellation_evidence(
             previous_body is None or body_key > previous_body,
             component + f": native tessellation body {index} is duplicated or unordered",
         )
+        _require(
+            properties_are_strict(body["property_requests"])
+            and properties_are_strict(body["properties"])
+            and body["property_requests"] == property_requests
+            and body["properties"] == properties,
+            component
+            + f": native tessellation body {index} properties differ from the request",
+        )
         previous_body = body_key
         body_face_references = tuple(
             span["face_reference_sha256"]
@@ -1987,7 +2016,6 @@ def _parse_itessellation_evidence(
                     "last_face_reference_sha256": body_face_references[-1],
                 },
             }
-            and body["properties"] == properties
             and _integer(body["facet_count"])
             and body["facet_count"] >= 0
             and _integer(body["fin_count"])

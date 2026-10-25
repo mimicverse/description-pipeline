@@ -591,6 +591,59 @@ class NativeMeshObservationTests(unittest.TestCase):
                 "properties are incomplete",
             ),
             (
+                "property-request",
+                lambda row: row["tessellation"]["itessellation"][
+                    "property_requests"
+                ].__setitem__("need_edge_fin_map", False),
+                "property requests are incomplete",
+            ),
+            (
+                "property-request-false",
+                lambda row: row["tessellation"]["itessellation"].__setitem__(
+                    "property_requests",
+                    {
+                        **support.NATIVE_TESSELLATION_PROPERTIES,
+                        "need_error_list": False,
+                    },
+                ),
+                "property requests are incomplete",
+            ),
+            (
+                "missing-property-requests",
+                lambda row: row["tessellation"]["itessellation"].pop(
+                    "property_requests"
+                ),
+                "ITessellation evidence is missing",
+            ),
+            (
+                "improved-quality",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "improved_quality", False
+                ),
+                "properties are incomplete",
+            ),
+            (
+                "improved-quality-int",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "improved_quality", 1
+                ),
+                "properties are incomplete",
+            ),
+            (
+                "need-error-list",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "need_error_list", False
+                ),
+                "properties are incomplete",
+            ),
+            (
+                "need-error-list-int",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "need_error_list", 1
+                ),
+                "properties are incomplete",
+            ),
+            (
                 "property-int",
                 lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
                     "need_edge_fin_map", 1
@@ -674,6 +727,18 @@ class NativeMeshObservationTests(unittest.TestCase):
         def missing_match_type_evidence(row):
             body(row)["properties"].pop("match_type")
 
+        def body_improved_quality_int(row):
+            body(row)["properties"]["improved_quality"] = 1
+
+        def body_need_error_list_int(row):
+            body(row)["properties"]["need_error_list"] = 1
+
+        def body_match_type_bool(row):
+            body(row)["properties"]["match_type"] = False
+
+        def body_conflicting_need_error_list(row):
+            body(row)["properties"]["need_error_list"] = False
+
         cases = (
             ("misowned", misowned_facet, "face arrays do not close"),
             ("three-fins", missing_fin, "facet 0 is malformed"),
@@ -681,7 +746,31 @@ class NativeMeshObservationTests(unittest.TestCase):
             ("fin-sides", fin_side_from_other_facet, "facet 1 is malformed"),
             ("reversed-fin", reversed_fin, "not a directed three-cycle"),
             ("partial-face-list", partial_face_list, "is incomplete"),
-            ("missing-match-type", missing_match_type_evidence, "is incomplete"),
+            (
+                "missing-match-type",
+                missing_match_type_evidence,
+                "properties differ from the request",
+            ),
+            (
+                "body-improved-quality-int",
+                body_improved_quality_int,
+                "properties differ from the request",
+            ),
+            (
+                "body-need-error-list-int",
+                body_need_error_list_int,
+                "properties differ from the request",
+            ),
+            (
+                "body-match-type-bool",
+                body_match_type_bool,
+                "properties differ from the request",
+            ),
+            (
+                "body-conflicting-need-error-list",
+                body_conflicting_need_error_list,
+                "properties differ from the request",
+            ),
         )
         for label, mutate, message in cases:
             with self.subTest(label=label):
