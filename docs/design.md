@@ -30,7 +30,7 @@ flowchart LR
 | `StageApplication` | 接纳、构造命令、组合六个 handler、路由对账和取消 | CAD 原生事实、网页授权 |
 | 共同 stage engine | claim、执行、候选校验、唯一 decision 及失败保全 | 各阶段领域算法 |
 | Linux handlers | 冻结、原生协调、模型生成、独立验证与发布 | Windows 会话所有权 |
-| Windows native runtime | 原生读取、重建、几何观察与本 operation 的会话管理 | 完整模型、URDF、独立质量结论、Git 和 PR |
+| Windows native runtime | 已保存 CAD 原生事实读取、几何观察与本 operation 的会话管理 | 完整模型、URDF、独立质量结论、Git 和 PR |
 | PostgreSQL `FactStore` | 接纳、命令、执行权、effect 与阶段决定 | artifact 文件内容和 Airflow 调度状态 |
 | `ArtifactStore` | 不可变文件集合、manifest、摘要及物化 | 运行成功、阶段决定和业务显示状态 |
 
