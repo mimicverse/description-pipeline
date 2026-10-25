@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import shutil
@@ -665,18 +666,20 @@ class PublishHandlerTests(unittest.TestCase):
         resume=None,
     ):
         selected = handler or self.fixture.handler
-        if resume is None:
-            return selected.execute(
-                command or self.fixture.command,
-                claim or self.fixture.claim,
-                workspace or self.fixture.workspace,
-                effects=effects or self.fixture.effects,
-            )
-        return selected.resume_stage(
+        arguments = (
             command or self.fixture.command,
             claim or self.fixture.claim,
             workspace or self.fixture.workspace,
-            effects=effects or self.fixture.effects,
+        )
+        selected_effects = effects or self.fixture.effects
+        if resume is None:
+            return selected.execute(
+                *arguments,
+                effects=selected_effects,
+            )
+        return selected.resume_stage(
+            *arguments,
+            effects=selected_effects,
             resume=resume,
         )
 
@@ -1804,6 +1807,22 @@ else:
                 ),
                 before,
             )
+
+    def test_publish_handler_separates_normal_and_resume_protocols(self) -> None:
+        execute_parameters = inspect.signature(
+            PublishHandler.execute,
+            eval_str=True,
+        ).parameters
+        resume_parameters = inspect.signature(
+            PublishHandler.resume_stage,
+            eval_str=True,
+        ).parameters
+        self.assertNotIn("resume", execute_parameters)
+        self.assertIn("resume", resume_parameters)
+        self.assertIs(
+            resume_parameters["resume"].annotation,
+            StageEffectWait,
+        )
 
     def test_git_status_probe_is_read_only_and_hints_exact_refs_only(self) -> None:
         first = self._run()
