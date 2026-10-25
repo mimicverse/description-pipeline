@@ -1586,6 +1586,40 @@ class ComponentMeshExportTests(unittest.TestCase):
             backend.export_component_meshes({"pcb-1": self.dest})
         self.assertEqual(len(body.tessellation_face_lists), before)
 
+    def test_valid_shared_vertex_edge_leaves_polygon_provider_before_tangent_checks(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        edge = edges[0]
+        edge._end = edge._start
+        edge.Evaluate2 = lambda u, n: [*edge._start._point, 0.0, 0.0, 0.0, _packed_success_status()]
+        backend = _backend(component)
+        body._tessellation.tessellate_result = False
+        before = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError) as caught:
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(caught.exception.message, "ITessellation.Tessellate returned false")
+        self.assertEqual(caught.exception.detail["planar_provider_selection"]["miss_reason"],
+                         "native_boundary_contains_closed_edges")
+        self.assertEqual(len(body.tessellation_face_lists), before + 1)
+
+    def test_invalid_shared_vertex_edge_cannot_escape_as_a_provider_miss(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        edge = edges[0]
+        edge._end = edge._start
+        read = edge.GetCurveParams3
+        def params():
+            result = read()
+            result.UMinValue, result.UMaxValue = 0.0, 0.0
+            return result
+        edge.GetCurveParams3 = params
+        edge.Evaluate2 = lambda u, n: [*edge._start._point, 0.0, 0.0, 0.0, _packed_success_status()]
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaises(CadError):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
+
     def test_edge_derivative_mapping_covers_all_native_sense_combinations(self):
         for curve_sense in (True, False):
             for coedge_sense in (True, False):

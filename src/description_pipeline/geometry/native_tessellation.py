@@ -2222,11 +2222,16 @@ def _parse_planar_brep_evidence(
             # UMin/UMax payloads. Coedge-local parameters never enter this API.
             edge_evaluations = edge["curve_endpoint_evaluations"]
             parameter_points = tuple(edge_evaluations[key]["payload"][:3] for key in ("start", "end"))
-            parameter_segment = _vector_difference(*map(_fraction_point, parameter_points))
+            parameter_segments = (
+                _vector_difference(_fraction_point(edge["curve_start_point_m"]),
+                                   _fraction_point(edge["curve_end_point_m"])),
+                _vector_difference(*map(_fraction_point, parameter_points)),
+            )
             for key in ("start", "end"):
                 derivative = _fraction_point(edge_evaluations[key]["payload"][3:6])
                 _require(
-                    sum(parameter_segment[axis] * derivative[axis] for axis in range(3)) > 0,
+                    all(sum(segment[axis] * derivative[axis] for axis in range(3)) > 0
+                        for segment in parameter_segments),
                     component + f": native planar coedge {coedge_index} edge derivative "
                     "contradicts its parameter direction",
                 )

@@ -7931,6 +7931,17 @@ class SolidWorksBackend(CadBackend):
             if not all(edge_line_types.values()):
                 return provider_miss("native_boundary_contains_non_line_edges")
 
+            for edge_row in edge_rows:
+                if edge_row["endpoint_points_derived_from_curve"]:
+                    return provider_miss("native_boundary_contains_closed_edges")
+                endpoints = edge_row["endpoints"]
+                if (endpoints["start"]["reference"]["typed_sha256"]
+                        == endpoints["end"]["reference"]["typed_sha256"]):
+                    # Prove the shared vertex has a closed, nonzero native
+                    # domain before classifying it outside the polygon provider.
+                    finalize_topology_assignment(edge_row)
+                    return provider_miss("native_boundary_contains_closed_edges")
+
             edge_by_pointer = {}
             for edge_row in edge_rows:
                 try:
@@ -8128,10 +8139,14 @@ class SolidWorksBackend(CadBackend):
                 # the curve/coedge sense correspondence exactly once below.
                 edge_evaluations = edge_row["curve_endpoint_evaluations"]
                 parameter_points = tuple(edge_evaluations[key]["payload"][:3] for key in ("start", "end"))
-                parameter_segment = point_offset(*parameter_points)
+                parameter_segments = (
+                    point_offset(edge_row["curve"]["start_point_m"], edge_row["curve"]["end_point_m"]),
+                    point_offset(*parameter_points),
+                )
                 for key in ("start", "end"):
                     derivative = edge_evaluations[key]["payload"][3:6]
-                    if sum(parameter_segment[axis] * Fraction(derivative[axis]) for axis in range(3)) <= 0:
+                    if any(sum(segment[axis] * Fraction(derivative[axis]) for axis in range(3)) <= 0
+                           for segment in parameter_segments):
                         raise CadError(
                             "cad_native_tessellation_unreadable",
                             "the edge derivative does not follow its native parameter direction",
