@@ -12,7 +12,7 @@ from . import __version__
 from .io import PipelineError, pin_utf8_streams, read_data
 from .pipeline.admission import AdmissionSpec
 from .pipeline.application import AdmissionOutcome, ApplicationOutcome, STAGES, StageApplication
-from .pipeline.contracts import FailureEnvelope, StageResult
+from .pipeline.contracts import FailureEnvelope, StagePending, StageResult
 from .runtime import tool_record
 
 ApplicationFactory = Callable[[], StageApplication]
@@ -46,6 +46,12 @@ def parser() -> argparse.ArgumentParser:
 def _record(value) -> dict:
     if isinstance(value, (StageResult, FailureEnvelope, ApplicationOutcome)):
         return value.to_record()
+    if isinstance(value, StagePending):
+        return {
+            "passed": False,
+            "outcome": "pending",
+            "wait": value.wait.to_record(),
+        }
     raise PipelineError(f"Unsupported CLI result type: {type(value).__name__}")
 
 
