@@ -9,10 +9,9 @@ from pathlib import Path
 
 from description_pipeline.geometry.native_transform import transform_from_solidworks
 from description_pipeline.io import PipelineError, write_json
-from description_pipeline.verification.solidworks_physics import (
-    verify_urdf_mass_equality,
-    verify_native_capture_facts,
-)
+from description_pipeline.schemas import EFFECTIVE_INSTANCES_SCHEMA
+from description_pipeline.verification.native_capture_facts import verify_native_capture_facts
+from description_pipeline.verification.solidworks_physics import verify_urdf_mass_equality
 
 
 class NativeCaptureFactsTests(unittest.TestCase):
@@ -224,7 +223,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
                 "component_context": projected_context,
             },
             "effective_instances": {
-                "schema_version": "solidworks-to-urdf.effective-instances/v1",
+                "schema_version": EFFECTIVE_INSTANCES_SCHEMA,
                 "assembly": "/source/root.SLDASM",
                 "configuration": "Default",
                 "readings": {},

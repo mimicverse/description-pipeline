@@ -10,7 +10,7 @@ from description_pipeline.sources.solidworks.appearance import (
     AppearanceError,
     audit_appearance,
     bind_capture_appearance,
-    require_fallback_eligible,
+    require_deliverable_appearance,
 )
 
 COMPONENT = "arm-1"
@@ -114,7 +114,7 @@ class AppearanceAuditTests(unittest.TestCase):
             expected_configuration=CONFIGURATION,
         )
 
-    def test_explicitly_unobserved_owners_leave_the_warned_fallback_eligible(self):
+    def test_unrecorded_or_explicitly_unobserved_owners_are_not_deliverable(self):
         raw = _raw(
             occurrence=_layer(
                 owner_configuration=CONFIGURATION,
@@ -126,15 +126,22 @@ class AppearanceAuditTests(unittest.TestCase):
         self.assertEqual(audit.state, "unobserved")
         self.assertEqual(audit.issues, ())
         self.assertEqual(audit.claims, ())
-        self.assertEqual(
-            require_fallback_eligible(
-                _raw(),
-                component=COMPONENT,
-                expected_document_path=DOCUMENT,
-                expected_configuration=CONFIGURATION,
-            ).state,
-            "unobserved",
-        )
+        for candidate in (UNRECORDED_APPEARANCE, raw):
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(AppearanceError) as caught:
+                    require_deliverable_appearance(
+                        candidate,
+                        component=COMPONENT,
+                        expected_document_path=DOCUMENT,
+                        expected_configuration=CONFIGURATION,
+                    )
+                self.assertIn(
+                    "cad_appearance_effective_scope_unproven",
+                    {
+                        issue["code"]
+                        for issue in caught.exception.details["appearance"]["issues"]
+                    },
+                )
 
     def test_read_failure_is_not_treated_as_absence(self):
         raw = _raw(
@@ -145,7 +152,7 @@ class AppearanceAuditTests(unittest.TestCase):
             )
         )
         with self.assertRaises(AppearanceError) as caught:
-            require_fallback_eligible(
+            require_deliverable_appearance(
                 raw,
                 component=COMPONENT,
                 expected_document_path=DOCUMENT,

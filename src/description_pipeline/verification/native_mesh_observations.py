@@ -21,7 +21,7 @@ from ..geometry.native_scope import native_binary64_unit_vector
 from ..geometry.native_transform import transform_from_solidworks
 from ..io import PipelineError, confined
 from ..sources.snapshot import verify_snapshot
-from . import native_discovery as evidence
+from . import capture_evidence as evidence
 
 _GEOMETRY_KEYS = {
     "component",

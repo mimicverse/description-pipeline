@@ -14,9 +14,6 @@ import numpy as np
 
 from description_pipeline.io import PipelineError
 from description_pipeline.sources.solidworks.naming import (
-    DISPLAY_MATERIAL_FALLBACK_NAME,
-    DISPLAY_MATERIAL_FALLBACK_RGBA,
-    DISPLAY_MATERIAL_FALLBACK_RULE,
     mesh_path,
     visual_name,
 )
@@ -138,7 +135,6 @@ class ValueWarningTests(unittest.TestCase):
         self.digest = hashlib.sha256(b"mesh").hexdigest()
         self.visual = visual_name("part-1", link="base_link")
         self.mesh_name = mesh_path(self.digest, namespace="M3.0.3_20261016.SLDASM")
-        self.material = DISPLAY_MATERIAL_FALLBACK_NAME
         self.source = {
             "robot_name": "robot",
             "robot_name_source": "cad",
@@ -158,14 +154,8 @@ class ValueWarningTests(unittest.TestCase):
                             "filename": "geometry/mesh.stl",
                             "sha256": self.digest,
                             "mesh_name": self.mesh_name,
-                            "material": self.material,
-                            "rgba": list(DISPLAY_MATERIAL_FALLBACK_RGBA),
                             "scale": [1.0, 1.0, 1.0],
-                            "provenance": {
-                                "native_component": "part-1",
-                                "material_source": "platform_display_fallback",
-                                **DISPLAY_MATERIAL_FALLBACK_RULE,
-                            },
+                            "provenance": {"native_component": "part-1"},
                         }
                     ],
                 }
@@ -228,26 +218,6 @@ class ValueWarningTests(unittest.TestCase):
                         ],
                     },
                     {
-                        "code": "display.material_fallback",
-                        "message": (
-                            "CAD appearance is unavailable; a platform display fallback is used "
-                            "without material semantics."
-                        ),
-                        "objects": [
-                            {
-                                "object_type": "visual",
-                                "object": self.visual,
-                                "field": "material",
-                                "actual": {"name": self.material, "rgba": list(DISPLAY_MATERIAL_FALLBACK_RGBA)},
-                                "source": "platform display fallback; CAD appearance unobserved",
-                                "original": None,
-                                "rule_id": DISPLAY_MATERIAL_FALLBACK_RULE["rule_id"],
-                                "rule_version": DISPLAY_MATERIAL_FALLBACK_RULE["rule_version"],
-                                "reason": DISPLAY_MATERIAL_FALLBACK_RULE["reason"],
-                            }
-                        ],
-                    },
-                    {
                         "code": "geometry.derived_from_native",
                         "message": "Geometry, frame transforms and signed joint axes are derived from native evidence.",
                         "objects": [
@@ -290,16 +260,13 @@ class ValueWarningTests(unittest.TestCase):
                     },
                     {
                         "code": "display.constant",
-                        "message": "Display scale and material color are platform constants, not CAD readings.",
+                        "message": "Mesh display scale is a platform constant, not a CAD reading.",
                         "objects": [
                             {
                                 "object_type": "visual",
                                 "object": self.visual,
-                                "fields": ["scale", "material.rgba"],
-                                "actual": {
-                                    "scale": [1.0, 1.0, 1.0],
-                                    "rgba": list(DISPLAY_MATERIAL_FALLBACK_RGBA),
-                                },
+                                "fields": ["scale"],
+                                "actual": {"scale": [1.0, 1.0, 1.0]},
                                 "source": "display constant",
                             }
                         ],
@@ -310,7 +277,7 @@ class ValueWarningTests(unittest.TestCase):
 
     def test_valid_cad_derived_warning_inventory_passes(self):
         result = _value_warning_gate(self.root, self.source, self.model)
-        self.assertEqual(result["objects"], 8)
+        self.assertEqual(result["objects"], 7)
 
     def test_metadata_warning_is_compared_as_an_exact_existing_value_warning(self):
         metadata_group = metadata_value_warning()
@@ -323,7 +290,7 @@ class ValueWarningTests(unittest.TestCase):
             model,
             metadata_warnings=[metadata_group],
         )
-        self.assertEqual(result["objects"], 9)
+        self.assertEqual(result["objects"], 8)
 
         forged = copy.deepcopy(metadata_group)
         forged["objects"][0]["fields"] = ["/captured_at"]
@@ -347,7 +314,7 @@ class ValueWarningTests(unittest.TestCase):
             ),
             lambda warnings: warnings[1]["objects"][0].update(source="manual export"),
             lambda warnings: warnings[0]["objects"][0].update(object="wrong"),
-            lambda warnings: warnings[3]["objects"][0].update(actual="meshes/visual/manual.stl"),
+            lambda warnings: warnings[2]["objects"][0].update(actual="meshes/visual/manual.stl"),
         )
         for mutate in mutations:
             with self.subTest(mutate=mutate):
@@ -395,17 +362,6 @@ class ValueWarningTests(unittest.TestCase):
             rule_version="naming-v1",
             reason="CAD appearance material formatting",
         )
-        warning = next(
-            item
-            for item in model["provenance"]["value_warnings"]
-            if item["code"] == "display.material_fallback"
-        )
-        warning["objects"][0].update(
-            actual={"name": "fabricated_blue", "rgba": [0.0, 0.0, 1.0, 1.0]},
-            source="CAD appearance",
-            original="fabricated_blue",
-            rule_id="naming.cad_appearance",
-        )
         with self.assertRaisesRegex(
             PipelineError,
             "capture schema carries no independently verified CAD appearance",
@@ -443,30 +399,38 @@ class ValueWarningTests(unittest.TestCase):
                 ],
             )
 
-    def test_verify_accepts_explicitly_unobserved_raw_with_the_warned_fallback(self):
+    def test_verify_rejects_explicitly_unobserved_native_appearance(self):
         raw, scope = appearance_evidence(claimed=False)
-        result = _value_warning_gate(
-            self.root,
-            self.source,
-            self.model,
-            native_geometry_rows=[
-                {
-                    "component": "part-1",
-                    "path": "geometry/mesh.stl",
-                    "sha": self.digest,
-                    "source_scope": scope,
-                }
-            ],
-            raw_scene={
-                "components": [
+        with self.assertRaises(AppearanceError) as caught:
+            _value_warning_gate(
+                self.root,
+                self.source,
+                self.model,
+                native_geometry_rows=[
                     {
-                        "name": "part-1",
-                        "appearance_raw": raw,
+                        "component": "part-1",
+                        "path": "geometry/mesh.stl",
+                        "sha": self.digest,
+                        "source_scope": scope,
                     }
-                ]
+                ],
+                raw_scene={
+                    "components": [
+                        {
+                            "name": "part-1",
+                            "appearance_raw": raw,
+                        }
+                    ]
+                },
+                native_appearance=True,
+            )
+        self.assertIn(
+            "cad_appearance_effective_scope_unproven",
+            {
+                issue["code"]
+                for issue in caught.exception.details["appearance"]["issues"]
             },
         )
-        self.assertEqual(result["objects"], 8)
 
     def test_verify_rejects_claimed_raw_without_an_effective_appearance_proof(self):
         raw, scope = appearance_evidence(claimed=True)
@@ -491,6 +455,7 @@ class ValueWarningTests(unittest.TestCase):
                         }
                     ]
                 },
+                native_appearance=True,
             )
         self.assertEqual(
             caught.exception.details["appearance"]["component"],
@@ -912,7 +877,7 @@ class ValueWarningTests(unittest.TestCase):
             }
         )
         result = _value_warning_gate(self.root, source, model)
-        self.assertEqual(result["objects"], 12)
+        self.assertEqual(result["objects"], 11)
 
     def test_unclassified_joint_has_a_direct_warning_fixture(self):
         source = copy.deepcopy(self.source)
@@ -949,7 +914,7 @@ class ValueWarningTests(unittest.TestCase):
             }
         )
         result = _value_warning_gate(self.root, source, model)
-        self.assertEqual(result["objects"], 10)
+        self.assertEqual(result["objects"], 9)
 
     def test_conforming_frame_keeps_source_name_without_a_formatting_warning(self):
         source = copy.deepcopy(self.source)
@@ -997,7 +962,7 @@ class ValueWarningTests(unittest.TestCase):
             }
         )
         result = _value_warning_gate(self.root, source, model)
-        self.assertEqual(result["objects"], 10)
+        self.assertEqual(result["objects"], 9)
         formatted = next(
             item
             for item in model["provenance"]["value_warnings"]
@@ -1057,7 +1022,7 @@ class ValueWarningTests(unittest.TestCase):
             }
         )
         result = _value_warning_gate(self.root, source, model)
-        self.assertEqual(result["objects"], 10)
+        self.assertEqual(result["objects"], 9)
 
     def test_preview_policy_limit_warning_is_field_level(self):
         policy = {

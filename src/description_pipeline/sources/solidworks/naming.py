@@ -94,14 +94,6 @@ _FUNCTIONAL_JOINT_BY_ROLE = {
     "waist": "waist_pitch",
 }
 
-DISPLAY_MATERIAL_FALLBACK_NAME = "display_fallback_gray"
-DISPLAY_MATERIAL_FALLBACK_RGBA = (0.7, 0.7, 0.7, 1.0)
-DISPLAY_MATERIAL_FALLBACK_RULE = {
-    "rule_id": "display.material_fallback",
-    "rule_version": "display-material-v1",
-    "reason": "platform readability fallback when CAD appearance is unavailable",
-}
-
 _ROLE_VOCABULARY = frozenset(_SEGMENT_BY_ROLE) | frozenset(
     role for _segment, outgoing in _SEGMENT_BY_ROLE.values() for role in outgoing
 )

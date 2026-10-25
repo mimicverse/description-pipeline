@@ -54,6 +54,7 @@ from description_pipeline.pipeline.verify import (
 )
 from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA, STAGE_RESULT_SCHEMA
+from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.stages import CONTRACT_SHA256
 from description_pipeline.platform.facts import FactStore
 from tests.v1 import verification_fixture as hermetic
@@ -101,19 +102,26 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             expected_executor_sha256=self.generate_executor,
             predecessor_decision_id="capture-decision",
         )
-        generated = GenerateHandler(self.store).execute(
-            self.generator_command,
-            self._claim(
+        # These tests exercise the downstream verifier, not appearance
+        # qualification. Dedicated native-appearance tests exercise the
+        # unpatched production gate through GenerateHandler and VerifyHandler.
+        with patch(
+            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
+            return_value=None,
+        ):
+            generated = GenerateHandler(self.store).execute(
                 self.generator_command,
-                owner=digest({"process": "generate"}),
-                executor=self.generate_executor,
-            ),
-            StageWorkspace(
-                root=self.root / "generate-attempt",
-                inputs={self.capture_ref.artifact_id: self.capture_root},
-            ),
-            effects=NoExternalEffects(),
-        )
+                self._claim(
+                    self.generator_command,
+                    owner=digest({"process": "generate"}),
+                    executor=self.generate_executor,
+                ),
+                StageWorkspace(
+                    root=self.root / "generate-attempt",
+                    inputs={self.capture_ref.artifact_id: self.capture_root},
+                ),
+                effects=NoExternalEffects(),
+            )
         self.generate_source = Path(generated.candidate_root)
         self.generate_ref = self.store.seal_tree(
             self.generate_source,
@@ -145,8 +153,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
     def _verify_request(
         self,
         generate_ref=None,
+        capture_ref=None,
+        capture_root=None,
     ) -> tuple[StageCommand, ExecutionClaim, StageWorkspace]:
         generate_ref = generate_ref or self.generate_ref
+        capture_ref = capture_ref or self.capture_ref
+        capture_root = capture_root or self.capture_root
         verifier = hermetic._portable_tool()
         verifier_sha256 = verifier["source_sha256"]
         command = StageCommand.create(
@@ -155,13 +167,13 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             stage="verify",
             idempotency_key="verify-command",
             request={
-                "capture_artifact_id": self.capture_ref.artifact_id,
+                "capture_artifact_id": capture_ref.artifact_id,
                 "generate_artifact_id": generate_ref.artifact_id,
                 "output_contract": OUTPUT_CONTRACT,
                 "purpose": self.frozen_request["purpose"],
                 "schema_version": REQUEST_SCHEMA,
             },
-            input_artifacts=(generate_ref, self.capture_ref),
+            input_artifacts=(generate_ref, capture_ref),
             config_snapshot_sha256=str(self.frozen_request["platform_config_digest"]),
             contract_sha256=CONTRACT_SHA256,
             policy_sha256=check_policy_digest(),
@@ -183,17 +195,21 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             root=self.root / f"verify-{generate_ref.artifact_id[:8]}-{self.verify_attempt}",
             inputs={
                 generate_ref.artifact_id: generate_root,
-                self.capture_ref.artifact_id: self.capture_root,
+                capture_ref.artifact_id: capture_root,
             },
         )
         return command, claim, workspace
 
     def _run_verify(self, generate_ref=None):
         command, claim, workspace = self._verify_request(generate_ref)
-        execution = VerifyHandler(
-            identity_provider=hermetic._portable_tool,
-            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
-        ).execute(command, claim, workspace, effects=NoExternalEffects())
+        with patch(
+            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
+            return_value=None,
+        ):
+            execution = VerifyHandler(
+                identity_provider=hermetic._portable_tool,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+            ).execute(command, claim, workspace, effects=NoExternalEffects())
         output = Path(execution.candidate_root)
         return (
             command,
@@ -203,6 +219,207 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             (output / CERTIFICATE_FILENAME).read_bytes(),
             command.input_artifacts[0],
             claim,
+        )
+
+    def test_native_unrecorded_appearance_fails_verify_handler(self):
+        command, claim, workspace = self._verify_request()
+        execution = VerifyHandler(
+            identity_provider=hermetic._portable_tool,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        ).execute(
+            command,
+            claim,
+            workspace,
+            effects=NoExternalEffects(),
+        )
+        self.assertEqual(execution.outcome, "failed")
+        certificate = read_data(
+            Path(execution.candidate_root) / CERTIFICATE_FILENAME
+        )
+        check = next(
+            row
+            for row in certificate["checks"]
+            if row["id"] == "provenance.value_warnings"
+        )
+        self.assertIs(check["passed"], False)
+        self.assertIn(
+            "cad_appearance_effective_scope_unproven",
+            {
+                issue["code"]
+                for issue in check["details"]["appearance"]["issues"]
+            },
+        )
+
+    def test_native_all_false_appearance_fails_verify_handler(self):
+        source = self.root / "native-all-false-capture"
+        shutil.copytree(self.capture_root, source)
+        evidence = source / "evidence"
+        facts_path = evidence / "raw/native_capture_facts.json"
+        facts = read_data(facts_path)
+        geometry = {
+            row["component"]: row
+            for row in read_data(evidence / "raw/geometry.json")
+        }
+        for occurrence in facts["scene_raw"]["occurrences"]:
+            component = str(occurrence["name"])
+            scope = facts["source_scopes"][component]
+            configuration = str(scope["referenced_configuration"])
+
+            def owner(
+                member,
+                *,
+                active=False,
+                configuration=configuration,
+            ):
+                return {
+                    "used_api": member,
+                    "material_call": (
+                        {
+                            "configuration_semantics": "active_configuration",
+                            "active_configuration": configuration,
+                        }
+                        if active
+                        else {
+                            "configuration_semantics": "requested_configuration",
+                            "configuration_option": 3,
+                            "configuration_names": [configuration],
+                        }
+                    ),
+                    "presence_call": {
+                        "arguments": [],
+                        "configuration_semantics": "native_owner_context",
+                    },
+                    "material_property_values": [-1.0] * 9,
+                    "has_material_property_values": False,
+                    "texture": {
+                        "configuration": configuration,
+                        "state": "absent",
+                        "material_name": None,
+                    },
+                    "read_errors": {},
+                }
+
+            occurrence["appearance_raw"] = {
+                "component": component,
+                "source_document_path": scope["source_document_path"],
+                "referenced_configuration": configuration,
+                "native_active_configuration": configuration,
+                "native_active_configuration_error": None,
+                "document": owner(
+                    "IModelDocExtension.GetMaterialPropertyValues"
+                ),
+                "occurrence": owner(
+                    "IComponent2.GetMaterialPropertyValues2"
+                ),
+                "bodies": [
+                    {
+                        "component": component,
+                        "enumeration_api": "IComponent2.GetBodies2",
+                        "body_type": body["body_type"],
+                        "body_index": body["body_index"],
+                        "body_name": body.get("body_name"),
+                        "appearance": owner(
+                            "IBody2.MaterialPropertyValues2",
+                            active=True,
+                        ),
+                    }
+                    for body in geometry[component]["tessellation"]["bodies"]
+                ],
+            }
+        write_json(facts_path, facts)
+        manifest = read_data(evidence / "manifest.json")
+        write_manifest(
+            evidence,
+            kind=manifest["kind"],
+            identity=manifest["identity"],
+            evidence_class="cad",
+        )
+        (source / "manifest.json").unlink()
+        capture_ref = self.store.seal_tree(
+            source,
+            kind="stage_output:capture",
+            producer_run_id="capture-run",
+            producer_stage="capture",
+            producer_tool_sha256=digest({"executor": "capture-tool"}),
+        )
+        capture_root = self.store.materialize(
+            capture_ref,
+            self.root / "native-all-false-materialized",
+        )
+        generate_command = StageCommand.create(
+            command_id="generate-all-false",
+            run_id="generate-all-false-run",
+            stage="generate",
+            idempotency_key="generate-all-false/run",
+            request={
+                "schema_version": GENERATE_REQUEST_SCHEMA,
+                "capture_artifact_id": capture_ref.artifact_id,
+                "output_contract": GENERATE_OUTPUT_CONTRACT,
+            },
+            input_artifacts=(capture_ref,),
+            config_snapshot_sha256=self.generator_command.config_snapshot_sha256,
+            contract_sha256=self.generator_command.contract_sha256,
+            policy_sha256=self.generator_command.policy_sha256,
+            expected_executor_sha256=self.generate_executor,
+            predecessor_decision_id="capture-decision",
+        )
+        generate_claim = replace(
+            self._claim(
+                generate_command,
+                owner=digest({"process": "all-false-generate"}),
+                executor=self.generate_executor,
+            ),
+            command_id=generate_command.command_id,
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
+            return_value=None,
+        ):
+            generated = GenerateHandler(self.store).execute(
+                generate_command,
+                generate_claim,
+                StageWorkspace(
+                    root=self.root / "all-false-generate-attempt",
+                    inputs={capture_ref.artifact_id: capture_root},
+                ),
+                effects=NoExternalEffects(),
+            )
+        generate_ref = self.store.seal_tree(
+            generated.candidate_root,
+            kind="stage_output:generate",
+            producer_run_id=generate_command.run_id,
+            producer_stage="generate",
+            producer_tool_sha256=self.generate_executor,
+        )
+        command, claim, workspace = self._verify_request(
+            generate_ref,
+            capture_ref=capture_ref,
+            capture_root=capture_root,
+        )
+        execution = VerifyHandler(
+            identity_provider=hermetic._portable_tool,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        ).execute(
+            command,
+            claim,
+            workspace,
+            effects=NoExternalEffects(),
+        )
+        self.assertEqual(execution.outcome, "failed")
+        certificate = read_data(
+            Path(execution.candidate_root) / CERTIFICATE_FILENAME
+        )
+        check = next(
+            row
+            for row in certificate["checks"]
+            if row["id"] == "provenance.value_warnings"
+        )
+        self.assertIn(
+            "cad_appearance_effective_scope_unproven",
+            {
+                issue["code"]
+                for issue in check["details"]["appearance"]["issues"]
+            },
         )
 
     def _seal_mutated_generate(self, name: str, mutate) -> object:
@@ -270,15 +487,19 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             claim_id="diagnostic-verify-claim",
             command_id=diagnostic.command_id,
         )
-        execution = VerifyHandler(
-            identity_provider=hermetic._portable_tool,
-            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
-        ).execute(
-            diagnostic,
-            diagnostic_claim,
-            workspace,
-            effects=NoExternalEffects(),
-        )
+        with patch(
+            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
+            return_value=None,
+        ):
+            execution = VerifyHandler(
+                identity_provider=hermetic._portable_tool,
+                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+            ).execute(
+                diagnostic,
+                diagnostic_claim,
+                workspace,
+                effects=NoExternalEffects(),
+            )
         self.assertEqual(execution.outcome, "completed")
         self.assertEqual(diagnostic.diagnostic_scope, scope)
 
@@ -422,21 +643,27 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             )
 
     def test_original_xml_mutations_fail_and_certificate_is_deterministic(self) -> None:
-        def material_missing(payload: str) -> str:
-            start = payload.index("<material")
-            end = payload.index("</material>") + len("</material>")
-            return payload[:start] + payload[end:]
+        def mesh_path_invalid(payload: str) -> str:
+            return payload.replace(
+                'filename="../meshes/',
+                'filename="../invalid/',
+                1,
+            )
 
         def visual_invalid_name(payload: str) -> str:
             return payload.replace('visual name="', 'visual name="BAD-', 1)
 
-        def material_wrong_color(payload: str) -> str:
-            return payload.replace('rgba="0.7 0.7 0.7 1.0"', 'rgba="1 0 0 1"', 1)
+        def scale_invalid(payload: str) -> str:
+            return payload.replace(
+                'scale="1.0 1.0 1.0"',
+                'scale="2.0 1.0 1.0"',
+                1,
+            )
 
         for name, mutate in (
-            ("material-missing", material_missing),
+            ("mesh-path-invalid", mesh_path_invalid),
             ("visual-invalid-name", visual_invalid_name),
-            ("material-wrong-color", material_wrong_color),
+            ("scale-invalid", scale_invalid),
         ):
             generate_ref = self._seal_mutated_generate(name, mutate)
             _command, execution, certificate, _receipt, _bytes, _ref, _claim = self._run_verify(generate_ref)
@@ -445,9 +672,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             failed = {row["id"] for row in certificate["checks"] if row["passed"] is not True}
             self.assertIn("urdf.syntax_names", failed)
 
-        first_ref = self._seal_mutated_generate("deterministic-a", material_missing)
+        first_ref = self._seal_mutated_generate("deterministic-a", mesh_path_invalid)
         first = self._run_verify(first_ref)
-        second_ref = self._seal_mutated_generate("deterministic-b", material_missing)
+        second_ref = self._seal_mutated_generate("deterministic-b", mesh_path_invalid)
         second = self._run_verify(second_ref)
         self.assertEqual(first_ref.artifact_id, second_ref.artifact_id)
         self.assertEqual(first[2], second[2])
@@ -486,11 +713,17 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
 
     def test_explicit_replay_executes_handler_and_matches_saved_certificate(self) -> None:
         command, _execution, certificate, _receipt, _bytes, generate_ref, _claim = self._run_verify()
-        with patch.object(
-            pipeline_verify,
-            "evaluate_bundle",
-            wraps=pipeline_verify.evaluate_bundle,
-        ) as evaluator:
+        with (
+            patch.object(
+                pipeline_verify,
+                "evaluate_bundle",
+                wraps=pipeline_verify.evaluate_bundle,
+            ) as evaluator,
+            patch(
+                "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
+                return_value=None,
+            ),
+        ):
             replayed = replay_verification(
                 generate_root=self.generate_root,
                 capture_root=self.capture_root,

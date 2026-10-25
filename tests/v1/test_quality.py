@@ -18,7 +18,7 @@ from description_pipeline.interface_records import CHECK_POLICY_V1, validate_qua
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks import verify as oracle
 from description_pipeline.sources.snapshot import write_manifest
-from description_pipeline.verification import solidworks_urdf as quality
+from description_pipeline.verification import native_discovery, solidworks_urdf as quality
 from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
 from tests.sources import support
 
@@ -512,12 +512,12 @@ class PhysicsTests(unittest.TestCase):
                 },
             ),
             mock.patch.object(
-                quality.evidence,
+                native_discovery,
                 "rebuild_rigid_bodies",
                 return_value=copy.deepcopy(self.source["bodies"]),
             ),
-            mock.patch.object(quality.evidence, "rebuild_joint_facts", return_value=[]),
-            mock.patch.object(quality.evidence, "rebuild_interface_frames", return_value=[]),
+            mock.patch.object(native_discovery, "rebuild_joint_facts", return_value=[]),
+            mock.patch.object(native_discovery, "rebuild_interface_frames", return_value=[]),
         ):
             return quality.rebuilt_definition(self.bundle)["source"]
 
@@ -1632,7 +1632,7 @@ class UrdfMassEqualityTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         raw_fact_gate = mock.patch(
-            "description_pipeline.verification.solidworks_physics."
+            "description_pipeline.verification.native_capture_facts."
             "verify_native_capture_facts",
             return_value={"native_capture_facts": True},
         )

@@ -13,6 +13,7 @@ from description_pipeline.sources.solidworks.appearance import AppearanceError
 from description_pipeline.sources.solidworks.errors import ConfigError
 from description_pipeline.sources.solidworks.freeze import validate_source_config as _validate_source_config
 from description_pipeline.sources.solidworks.scene import load_scene
+from description_pipeline.sources.snapshot import write_manifest
 
 
 def freeze(config, *args, **kwargs):
@@ -213,6 +214,16 @@ class CadMassAuthorityTests(unittest.TestCase):
 
         self.backend.capture_prepared_geometry = capture_with_appearance
 
+    @staticmethod
+    def _mark_as_native(snapshot: Path) -> None:
+        manifest = json.loads((snapshot / "manifest.json").read_text())
+        write_manifest(
+            snapshot,
+            kind=manifest["kind"],
+            identity=manifest["identity"],
+            evidence_class="cad",
+        )
+
     def test_manual_mass_configuration_is_rejected(self) -> None:
         for key, value in (
             ("documented_masses", {"arm-1": {"mass_kg": 0.5, "reason": "manual", "evidence": "table"}}),
@@ -263,29 +274,29 @@ class CadMassAuthorityTests(unittest.TestCase):
         scene = load_scene(snapshot)
         self.assertNotIn("warnings", scene["provenance"])
 
-    def test_unobserved_appearance_keeps_the_warned_fallback_eligible(self) -> None:
-        self._install_appearance(claimed=False)
-        snapshot = self._freeze("appearance-unobserved")
-        _compose_scene_inputs(snapshot, self.tmp / "cad")
-        scene = load_scene(snapshot)
-        visuals = [
-            visual
-            for link in scene["links"]
-            for visual in link.get("visuals") or []
-        ]
-        self.assertTrue(visuals)
-        self.assertTrue(
-            all(
-                visual["provenance"]["material_source"]
-                == "platform_display_fallback"
-                for visual in visuals
-            )
-        )
+    def test_native_unrecorded_or_default_appearance_fails_generation(self) -> None:
+        for label, explicit in (("unrecorded", False), ("all_false_all_minus_one", True)):
+            with self.subTest(case=label):
+                if explicit:
+                    self._install_appearance(claimed=False)
+                snapshot = self._freeze("appearance-" + label)
+                _compose_scene_inputs(snapshot, self.tmp / "cad")
+                self._mark_as_native(snapshot)
+                with self.assertRaises(AppearanceError) as caught:
+                    load_scene(snapshot)
+                self.assertIn(
+                    "cad_appearance_effective_scope_unproven",
+                    {
+                        issue["code"]
+                        for issue in caught.exception.details["appearance"]["issues"]
+                    },
+                )
 
     def test_generate_rejects_claimed_appearance_without_effective_scope(self) -> None:
         self._install_appearance(claimed=True)
         snapshot = self._freeze("appearance-claimed")
         _compose_scene_inputs(snapshot, self.tmp / "cad")
+        self._mark_as_native(snapshot)
         with self.assertRaises(AppearanceError) as caught:
             load_scene(snapshot)
         appearance = caught.exception.details["appearance"]

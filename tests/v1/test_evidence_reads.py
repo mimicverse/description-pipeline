@@ -12,7 +12,7 @@ from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
-from description_pipeline.verification import native_discovery as ev
+from description_pipeline.verification import capture_evidence as ev
 
 HEX = "a" * 64
 

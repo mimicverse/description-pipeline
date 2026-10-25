@@ -726,7 +726,7 @@ def bind_capture_appearance(
     return raw, geometry
 
 
-def require_fallback_eligible(
+def require_deliverable_appearance(
     raw: object,
     *,
     component: str,
@@ -734,7 +734,7 @@ def require_fallback_eligible(
     expected_configuration: object,
     expected_bodies: Sequence[Mapping[str, Any]] | None = None,
 ) -> AppearanceAudit:
-    """Return an unobserved audit or reject unrepresentable appearance facts."""
+    """Reject unless the raw facts prove a faithfully renderable appearance."""
 
     audit = audit_appearance(
         raw,
@@ -743,6 +743,16 @@ def require_fallback_eligible(
         expected_configuration=expected_configuration,
         expected_bodies=expected_bodies,
     )
-    if audit.issues:
-        raise AppearanceError(audit)
-    return audit
+    if not audit.issues:
+        unproven = _issue(
+            "cad_appearance_effective_scope_unproven",
+            "appearance_raw",
+            "the current facts do not prove the effective appearance of every delivered face",
+        )
+        audit = AppearanceAudit(
+            audit.component,
+            "unrepresentable",
+            (*audit.issues, unproven),
+            audit.claims,
+        )
+    raise AppearanceError(audit)

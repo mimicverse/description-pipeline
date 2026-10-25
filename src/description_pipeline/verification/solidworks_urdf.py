@@ -50,7 +50,7 @@ from ..interface_records import (
     validate_qualification,
 )
 from ..stages import required_rows_complete
-from . import native_discovery as evidence
+from . import capture_evidence as evidence
 from .consumer import load as load_consumer
 
 QUALITY_SCHEMA = "solidworks-to-urdf.quality/v1"
@@ -2120,6 +2120,7 @@ def _verify_model(
             carrier,
             native_geometry_rows=native_geometry_rows,
             raw_scene=raw,
+            native_appearance=manifest.get("evidence_class") != "fixture",
             metadata_warnings=metadata_warnings,
         ),
     )
@@ -2379,23 +2380,16 @@ def _value_warning_gate(
     *,
     native_geometry_rows=None,
     raw_scene=None,
+    native_appearance=False,
     metadata_warnings=None,
 ):
     """Re-derive every non-native value warning from source facts and the model."""
 
     from ..sources.solidworks.appearance import (
         UNRECORDED_APPEARANCE,
-        require_fallback_eligible,
+        require_deliverable_appearance,
     )
-    from ..sources.solidworks.naming import (
-        DISPLAY_MATERIAL_FALLBACK_NAME,
-        DISPLAY_MATERIAL_FALLBACK_RGBA,
-        DISPLAY_MATERIAL_FALLBACK_RULE,
-        asset_namespace,
-        carrier_names_and_rules,
-        mesh_path,
-        visual_name,
-    )
+    from ..sources.solidworks.naming import asset_namespace, carrier_names_and_rules, mesh_path, visual_name
 
     mesh_namespace = asset_namespace(Path(str(source.get("assembly") or "robot")).name)
     warnings = (model.get("provenance") or {}).get("value_warnings")
@@ -2894,7 +2888,7 @@ def _value_warning_gate(
             == mesh_path(current_sha256, namespace=mesh_namespace),
             "Mesh path differs from content addressing",
         )
-        if raw_scene is not None:
+        if native_appearance:
             raw_component = raw_components.get(native_component)
             _require(
                 raw_component is not None,
@@ -2906,7 +2900,7 @@ def _value_warning_gate(
                 )
                 or {}
             )
-            require_fallback_eligible(
+            require_deliverable_appearance(
                 raw_component.get(
                     "appearance_raw",
                     UNRECORDED_APPEARANCE,
@@ -2922,17 +2916,11 @@ def _value_warning_gate(
                     "body_inventory"
                 ),
             )
-        material_source = provenance.get("material_source")
-        _require(
-            material_source == "platform_display_fallback",
-            "The capture schema carries no independently verified CAD appearance",
-        )
-        _require(
-            shape.get("material") == DISPLAY_MATERIAL_FALLBACK_NAME
-            and shape.get("rgba") == list(DISPLAY_MATERIAL_FALLBACK_RGBA)
-            and all(provenance.get(key) == value for key, value in DISPLAY_MATERIAL_FALLBACK_RULE.items()),
-            "Display material fallback differs from its versioned platform rule",
-        )
+        if shape.get("rgba") is not None:
+            _require(
+                provenance.get("material_source") == "native_appearance",
+                "The capture schema carries no independently verified CAD appearance",
+            )
         add(
             "naming.derived_visual",
             {
@@ -2959,20 +2947,6 @@ def _value_warning_gate(
                 "rule_id": "naming.mesh",
                 "rule_version": "naming-v1",
                 "reason": "current capture content addressing",
-            },
-        )
-        add(
-            "display.material_fallback",
-            {
-                "object_type": "visual",
-                "object": shape["name"],
-                "field": "material",
-                "actual": {"name": shape["material"], "rgba": shape["rgba"]},
-                "source": "platform display fallback; CAD appearance unobserved",
-                "original": None,
-                "rule_id": provenance.get("rule_id"),
-                "rule_version": provenance.get("rule_version"),
-                "reason": provenance.get("reason"),
             },
         )
     if native_geometry_rows is not None:
@@ -3058,9 +3032,6 @@ def _value_warning_gate(
     for _link, shape in shapes:
         fields = ["scale"]
         actual_value = {"scale": shape.get("scale")}
-        if shape.get("rgba"):
-            fields.append("material.rgba")
-            actual_value["rgba"] = shape["rgba"]
         add(
             "display.constant",
             {
@@ -3079,10 +3050,7 @@ def _value_warning_gate(
         "geometry.derived_from_native": (
             "Geometry, frame transforms and signed joint axes are derived from native evidence."
         ),
-        "display.constant": "Display scale and material color are platform constants, not CAD readings.",
-        "display.material_fallback": (
-            "CAD appearance is unavailable; a platform display fallback is used without material semantics."
-        ),
+        "display.constant": "Mesh display scale is a platform constant, not a CAD reading.",
         "naming.formatted_interface": (
             "Link, joint, and frame names are deterministic formatting of native CAD identities."
         ),

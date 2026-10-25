@@ -67,6 +67,30 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
     components = raw.get("components")
     if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
         raise PipelineError("Captured component readings must be objects")
+    if manifest.get("evidence_class") != "fixture":
+        from .appearance import (
+            UNRECORDED_APPEARANCE,
+            require_deliverable_appearance,
+        )
+
+        components_by_name = {str(row.get("name") or ""): row for row in components}
+        for entry in geometry:
+            component = str(entry.get("component") or "")
+            source_scope = entry.get("source_scope") or {}
+            raw_component = components_by_name.get(component)
+            require_deliverable_appearance(
+                (
+                    raw_component.get("appearance_raw", UNRECORDED_APPEARANCE)
+                    if raw_component is not None
+                    else UNRECORDED_APPEARANCE
+                ),
+                component=component,
+                expected_document_path=source_scope.get("source_document_path"),
+                expected_configuration=source_scope.get(
+                    "referenced_configuration"
+                ),
+                expected_bodies=entry.get("body_inventory"),
+            )
     readings = SimpleNamespace(
         components=[SimpleNamespace(**row) for row in components],
         coordinate_systems=datums,

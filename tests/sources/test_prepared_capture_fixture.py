@@ -14,6 +14,7 @@ from description_pipeline.geometry.native_tessellation import (
 )
 from description_pipeline.geometry.native_transform import transform_from_solidworks
 from description_pipeline.io import PipelineError
+from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.native import (
     materialize_native_triangles,
@@ -119,7 +120,7 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
                 },
             )
             self.assertEqual(entry["component"], component)
-            self.assertEqual(entry["tessellation"]["schema_version"], "native-triangles/v1")
+            self.assertEqual(entry["tessellation"]["schema_version"], NATIVE_TESSELLATION_SCHEMA)
             self.assertGreater(entry["triangles"], 0)
         order = self.backend.order
         self.assertLess(order.index("collect_prepared_scene"), order.index("capture_prepared_geometry"))

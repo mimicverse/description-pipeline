@@ -14,12 +14,8 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
-from .appearance import UNRECORDED_APPEARANCE, require_fallback_eligible
 from .errors import ConfigError
 from .naming import (
-    DISPLAY_MATERIAL_FALLBACK_NAME,
-    DISPLAY_MATERIAL_FALLBACK_RGBA,
-    DISPLAY_MATERIAL_FALLBACK_RULE,
     asset_namespace,
     fixed_joint_name,
     mesh_path,
@@ -491,9 +487,6 @@ def build_scene(
     placements = {component.name: list(component.transform) for component in raw_scene.components}
     masses = {name: dict(payload) for name, payload in (raw_scene.mass_properties or {}).items()}
     geometry_by_component = {entry["component"]: entry for entry in geometry_entries}
-    component_by_name = {
-        str(component.name): component for component in raw_scene.components
-    }
     bodies = list(cfg.get("bodies") or [])
     if not bodies:
         raise ConfigError("native discovery must define the rigid bodies")
@@ -605,28 +598,6 @@ def build_scene(
             entry = geometry_by_component.get(reading.name)
             if entry is None:
                 continue
-            raw_component = component_by_name.get(reading.name)
-            if raw_component is None:
-                raise ConfigError(
-                    "captured appearance has no native component binding",
-                    {"component": reading.name},
-                )
-            source_scope = entry.get("source_scope") or {}
-            require_fallback_eligible(
-                getattr(
-                    raw_component,
-                    "appearance_raw",
-                    UNRECORDED_APPEARANCE,
-                ),
-                component=reading.name,
-                expected_document_path=source_scope.get(
-                    "source_document_path"
-                ),
-                expected_configuration=source_scope.get(
-                    "referenced_configuration"
-                ),
-                expected_bodies=entry.get("body_inventory"),
-            )
             if "rgba" in entry or "material" in entry:
                 raise ConfigError(
                     "This capture schema has no independently verified CAD appearance record",
@@ -645,17 +616,11 @@ def build_scene(
                     entry["sha"],
                     namespace=mesh_namespace,
                 ),
-                "material": DISPLAY_MATERIAL_FALLBACK_NAME,
                 "scale": [1.0, 1.0, 1.0],
                 "xyz": list(reading.relative_translation),
                 "rpy": list(rpy_from_matrix(reading.relative_rotation)),
-                "provenance": {
-                    "native_component": reading.name,
-                    "material_source": "platform_display_fallback",
-                    **DISPLAY_MATERIAL_FALLBACK_RULE,
-                },
+                "provenance": {"native_component": reading.name},
             }
-            visual["rgba"] = list(DISPLAY_MATERIAL_FALLBACK_RGBA)
             visuals.append(visual)
         links.append(
             {
@@ -1311,39 +1276,6 @@ def _value_warnings(
                 "objects": mesh_paths,
             }
         )
-    material_fallbacks = []
-    for link in links:
-        for visual in link.get("visuals") or []:
-            provenance = visual.get("provenance") or {}
-            if provenance.get("material_source") != "platform_display_fallback":
-                continue
-            material_fallbacks.append(
-                {
-                    "object_type": "visual",
-                    "object": visual["name"],
-                    "field": "material",
-                    "actual": {
-                        "name": visual.get("material"),
-                        "rgba": visual.get("rgba"),
-                    },
-                    "source": "platform display fallback; CAD appearance unobserved",
-                    "original": None,
-                    "rule_id": provenance.get("rule_id"),
-                    "rule_version": provenance.get("rule_version"),
-                    "reason": provenance.get("reason"),
-                }
-            )
-    if material_fallbacks:
-        warnings.append(
-            {
-                "code": "display.material_fallback",
-                "message": (
-                    "CAD appearance is unavailable; a platform display fallback is used "
-                    "without material semantics."
-                ),
-                "objects": material_fallbacks,
-            }
-        )
     if cfg.get("robot_name_source") == "cad_filename_derived":
         source_name = str(cfg.get("assembly") or "").replace("\\", "/").rsplit("/", 1)[-1]
         warnings.append(
@@ -1440,17 +1372,12 @@ def _value_warnings(
     constants = []
     for link in links:
         for visual in link.get("visuals") or []:
-            fields = ["scale"]
-            actual = {"scale": visual.get("scale")}
-            if visual.get("rgba"):
-                fields.append("material.rgba")
-                actual["rgba"] = visual["rgba"]
             constants.append(
                 {
                     "object_type": "visual",
                     "object": visual["name"],
-                    "fields": fields,
-                    "actual": actual,
+                    "fields": ["scale"],
+                    "actual": {"scale": visual.get("scale")},
                     "source": "display constant",
                 }
             )
@@ -1458,7 +1385,7 @@ def _value_warnings(
         warnings.append(
             {
                 "code": "display.constant",
-                "message": "Display scale and material color are platform constants, not CAD readings.",
+                "message": "Mesh display scale is a platform constant, not a CAD reading.",
                 "objects": constants,
             }
         )
