@@ -96,6 +96,7 @@ def _expectation_from_operation(
     return NativeOperationStatusExpectation(
         operation_id=operation["operation_id"],
         kind=operation["kind"],
+        target_id=operation["target_id"],
         request_sha256=operation["request_sha256"],
         native_tool_requirement_sha256=operation["native_tool"][
             "requirement_sha256"
@@ -159,6 +160,7 @@ def _native_expectation(
             "input_archive_bytes": archive_member["bytes"],
             "input_archive_sha256": archive_member["sha256"],
             "main_assembly": request.main_assembly,
+            "native_target_id": request.native_target_identity["target_id"],
             "native_tool_record_sha256": request.native_tool_record_sha256,
             "native_tool_source_sha256": request.native_tool_source_sha256,
             "object_set_sha256": record.get("object_set_sha256"),
@@ -231,6 +233,7 @@ def _native_expectation(
             "request_digest": command.request_digest,
             "source_inventory_sha256": request.source_inventory_sha256,
             "source_archive_sha256": archive_member["sha256"],
+            "native_target_id": request.native_target_identity["target_id"],
             "native_tool_sha256": request.expected_native_tool_sha256,
             "native_tool_record_sha256": request.expected_native_tool_record_sha256,
             "native_tool_requirement_artifact_id": (
@@ -250,6 +253,7 @@ def _native_expectation(
                     request.expected_native_tool_record_sha256
                 ),
                 output_contract=NATIVE_OBSERVATION_SCHEMA,
+                target_id=request.native_target_identity["target_id"],
             )
         except NativeOperationError as error:
             raise ValueError("The Discover pending operation is invalid") from error

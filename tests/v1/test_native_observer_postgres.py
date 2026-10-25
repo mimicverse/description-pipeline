@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -57,6 +58,14 @@ PLATFORM_SCHEMA = (
     / "platform"
     / "schema.sql"
 )
+
+
+def _plain(value):
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
 
 
 @unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
@@ -112,7 +121,7 @@ class NativeObserverPostgresTests(unittest.TestCase):
             run_id=test_capture_handler.CHILD,
             request_id="native-observer-recovery",
             target_stage="capture",
-            request=dict(self.fixture.command.request),
+            request=_plain(self.fixture.command.request),
             input_artifacts=self.fixture.command.input_artifacts,
             expected_executor_sha256=self.fixture.stage_executor,
             config_snapshot_sha256=self.fixture.command.config_snapshot_sha256,
@@ -177,6 +186,7 @@ class NativeObserverPostgresTests(unittest.TestCase):
                 self.fixture.current_native_tool
             ),
             executors={CAPTURE_KIND: self._return_recovered_archive},
+            install_id=test_capture_handler.CAPTURE_TARGET.install_id,
         )
         self._recovered_archive = recovered_archive
         self._executor_calls = 0
@@ -270,6 +280,7 @@ class NativeObserverPostgresTests(unittest.TestCase):
             output_contract=(
                 "solidworks-to-urdf.capture-transfer/v3"
             ),
+            target_id=runtime.target_identity.target_id,
         )
         client.create_operation(envelope)
         client.upload_input(operation_id, source_archive)

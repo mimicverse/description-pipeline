@@ -19,6 +19,7 @@ from unittest.mock import Mock, patch
 from urllib import error as urlerror
 
 from description_pipeline.artifacts import ArtifactStore
+from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import canonical, digest, file_digest, read_data
 import description_pipeline.pipeline.capture as capture_module
 from description_pipeline.pipeline.capture import (
@@ -30,6 +31,7 @@ from description_pipeline.pipeline.contracts import (
     ArtifactRef,
     DiagnosticReplayScope,
     ExecutionClaim,
+    NativeTargetIdentity,
     StageCommand,
 )
 from description_pipeline.pipeline.discover import (
@@ -90,6 +92,10 @@ from .test_stage_transfer import native_tool as build_capture_tool
 PARENT = "a0000000-0000-4000-8000-000000000001"
 CHILD = "a0000000-0000-4000-8000-000000000002"
 MAIN = "cad/robot.SLDASM"
+CAPTURE_TARGET = NativeTargetIdentity.create(
+    install_id="win-" + "2" * 32,
+    pipeline_id=PIPELINE_ID,
+)
 
 
 def _capture_component_closure(evidence: dict) -> dict:
@@ -522,6 +528,7 @@ class CaptureHandlerTests(unittest.TestCase):
                 "effect_key": "capture-native",
                 "handoff_sha256": self.handoff_sha256,
                 "main_assembly": MAIN,
+                "native_target_identity": CAPTURE_TARGET.to_record(),
                 "native_tool_source_sha256": self.expected_native_tool_sha256,
                 "native_tool_record_sha256": self.native_tool_sha256,
                 "native_tool_requirement_artifact_id": (
@@ -582,6 +589,7 @@ class CaptureHandlerTests(unittest.TestCase):
                 "effect_key": "capture-native-diagnostic",
                 "handoff_sha256": self.handoff_sha256,
                 "main_assembly": MAIN,
+                "native_target_identity": CAPTURE_TARGET.to_record(),
                 "native_tool_source_sha256": current_tool["source_sha256"],
                 "native_tool_record_sha256": digest(current_tool),
                 "native_tool_requirement_artifact_id": requirement.artifact_id,
@@ -693,6 +701,7 @@ class CaptureHandlerTests(unittest.TestCase):
             schema_version=OPERATION_VIEW_SCHEMA,
             operation_id=operation_id,
             kind=CAPTURE_KIND,
+            target_id=CAPTURE_TARGET.target_id,
             payload_sha256=outbound["payload_sha256"],
             state="satisfied",
             request_sha256=digest(request.to_record()),
@@ -713,7 +722,8 @@ class CaptureHandlerTests(unittest.TestCase):
             finished_at=now,
         )
         client = NativeOperationClient(
-            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32)
+            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32),
+            target_id=CAPTURE_TARGET.target_id,
         )
         client.get_operation = Mock(return_value=view)
 
@@ -1310,7 +1320,8 @@ class CaptureHandlerTests(unittest.TestCase):
         observer_root = self.root / "capture-observer-missing-evidence"
         observer_root.mkdir()
         client = NativeOperationClient(
-            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32)
+            NativeOperationEndpoint("http://127.0.0.1:1", "t" * 32),
+            target_id=CAPTURE_TARGET.target_id,
         )
         with self.assertRaisesRegex(Exception, "effect_outbound"):
             NativeOperationEffectObserver(client).observe(
@@ -1373,6 +1384,9 @@ class CaptureHandlerTests(unittest.TestCase):
                 self.headers["Content-Type"] = (
                     "application/json; charset=utf-8"
                 )
+                self.headers["X-Native-Target-ID"] = (
+                    CAPTURE_TARGET.target_id
+                )
                 self._body = io.BytesIO(
                     (json.dumps(body, sort_keys=True) + "\n").encode()
                 )
@@ -1391,6 +1405,8 @@ class CaptureHandlerTests(unittest.TestCase):
             del timeout
             method = request.get_method()
             path = request.full_url
+            if method == "GET" and path.endswith("/target"):
+                return Response(CAPTURE_TARGET.to_record())
             if method == "GET" and path.endswith(
                 f"/operations/{operation_id}"
             ):
@@ -1409,6 +1425,7 @@ class CaptureHandlerTests(unittest.TestCase):
                         "schema_version": OPERATION_VIEW_SCHEMA,
                         "operation_id": envelope["operation_id"],
                         "kind": envelope["kind"],
+                        "target_id": CAPTURE_TARGET.target_id,
                         "payload_sha256": envelope["payload_sha256"],
                         "state": "accepted",
                         "request_sha256": envelope["request_sha256"],
@@ -1439,6 +1456,7 @@ class CaptureHandlerTests(unittest.TestCase):
                         "schema_version": OPERATION_VIEW_SCHEMA,
                         "operation_id": operation_id,
                         "kind": CAPTURE_KIND,
+                        "target_id": CAPTURE_TARGET.target_id,
                         "payload_sha256": envelope["payload_sha256"],
                         "state": "unknown",
                         "request_sha256": envelope["request_sha256"],
@@ -1476,6 +1494,7 @@ class CaptureHandlerTests(unittest.TestCase):
                 "http://127.0.0.1:1",
                 "t" * 32,
             ),
+            target_id=CAPTURE_TARGET.target_id,
             opener=opener,
         )
         replay_claim = self._claim(

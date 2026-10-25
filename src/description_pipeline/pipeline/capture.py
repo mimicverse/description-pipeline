@@ -53,13 +53,19 @@ from ..stages import stage_view
 from .contracts import (
     ArtifactRef,
     ExecutionClaim,
+    NativeTargetIdentity,
     ProtocolError,
     StageCandidate,
     StageCommand,
     StageExecution,
     StageFailure,
 )
-from .effects import EffectSettlement, EffectState, StageEffectPort
+from .effects import (
+    EffectSettlement,
+    EffectState,
+    StageEffectPort,
+    require_native_transfer_target,
+)
 from .engine import StageWorkspace
 
 if TYPE_CHECKING:
@@ -88,6 +94,27 @@ class CaptureUnresolved(PipelineError):
     """The native operation has a possible external effect with no safe terminal fact."""
 
 
+def _capture_target(
+    command: StageCommand,
+    request: CaptureRequest,
+) -> dict[str, Any]:
+    identity = NativeTargetIdentity.from_record(
+        request.native_target_identity
+    )
+    target = {
+        "command_id": command.command_id,
+        "main_assembly": request.main_assembly,
+        "native_target_identity": identity.to_record(),
+        "native_target_id": identity.target_id,
+        "native_tool_sha256": request.native_tool_record_sha256,
+        "run_id": command.run_id,
+        "stage": "capture",
+    }
+    target["target_binding_digest"] = digest(target)
+    require_native_transfer_target(target)
+    return target
+
+
 _CAPTURE_OUTBOUND_FIELDS = frozenset(
     {
         "command_id",
@@ -97,6 +124,8 @@ _CAPTURE_OUTBOUND_FIELDS = frozenset(
         "input_archive_bytes",
         "input_archive_sha256",
         "main_assembly",
+        "native_target_identity",
+        "native_target_id",
         "native_tool_record_sha256",
         "native_tool_source_sha256",
         "object_set_sha256",
@@ -108,6 +137,7 @@ _CAPTURE_OUTBOUND_FIELDS = frozenset(
         "request_digest",
         "request_evidence",
         "run_id",
+        "target_binding_digest",
         "schema_version",
         "upstream_artifacts",
         "upload_sha256",
@@ -197,6 +227,7 @@ def _capture_operation_envelope(
         input_archive_bytes=record["input_archive_bytes"],
         native_tool_requirement_sha256=record["native_tool_record_sha256"],
         output_contract=CAPTURE_TRANSFER_SCHEMA,
+        target_id=record["native_target_id"],
     )
 
 
@@ -401,6 +432,7 @@ class CaptureRequest:
     native_tool_source_sha256: str
     native_tool_record_sha256: str
     native_tool_requirement_artifact_id: str
+    native_target_identity: Mapping[str, Any]
     handoff_sha256: str
     upload_sha256: str
     prepared_sha256: str
@@ -416,6 +448,7 @@ class CaptureRequest:
             "effect_key",
             "handoff_sha256",
             "main_assembly",
+            "native_target_identity",
             "native_tool_source_sha256",
             "native_tool_record_sha256",
             "native_tool_requirement_artifact_id",
@@ -427,7 +460,20 @@ class CaptureRequest:
                 "capture.request_fields",
                 {"missing": sorted(required - set(request)), "unknown": sorted(set(request) - required)},
             )
-        values = {key: request[key] for key in required}
+        try:
+            target = NativeTargetIdentity.from_record(
+                request["native_target_identity"]
+            )
+        except ProtocolError as error:
+            raise ProtocolError(
+                "capture.native_target_invalid",
+                {"where": "native_target_identity"},
+            ) from error
+        values = {
+            key: request[key]
+            for key in required
+            if key != "native_target_identity"
+        }
         if not all(isinstance(value, str) and value and "\x00" not in value for value in values.values()):
             raise ProtocolError("capture.request_invalid", {"where": "text-fields"})
         for key in (
@@ -440,7 +486,7 @@ class CaptureRequest:
             value = values[key]
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ProtocolError("capture.request_invalid", {"where": key})
-        return cls(**values)
+        return cls(native_target_identity=target.to_record(), **values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1254,6 +1300,10 @@ class CaptureHandler:
     ) -> dict[str, Any]:
         objects = list(inputs.object_names)
         prepared_files = dict(sorted(inputs.prepared_files.items()))
+        target = _capture_target(command, request)
+        identity = NativeTargetIdentity.from_record(
+            request.native_target_identity
+        )
         return {
             "schema_version": NATIVE_CAPTURE_EFFECT_SCHEMA,
             "command_id": command.command_id,
@@ -1263,6 +1313,8 @@ class CaptureHandler:
             "input_archive_bytes": operation["input"]["archive_bytes"],
             "input_archive_sha256": operation["input"]["archive_sha256"],
             "main_assembly": request.main_assembly,
+            "native_target_identity": identity.to_record(),
+            "native_target_id": identity.target_id,
             "native_tool_record_sha256": (
                 request.native_tool_record_sha256
             ),
@@ -1278,6 +1330,7 @@ class CaptureHandler:
             "request_digest": command.request_digest,
             "request_evidence": dict(inputs.request_evidence),
             "run_id": command.run_id,
+            "target_binding_digest": target["target_binding_digest"],
             "upstream_artifacts": list(_upstream_records(inputs)),
             "upload_sha256": request.upload_sha256,
         }
@@ -1346,6 +1399,7 @@ class CaptureHandler:
                     request.native_tool_record_sha256
                 ),
                 output_contract=CAPTURE_TRANSFER_SCHEMA,
+                target_id=request.native_target_identity["target_id"],
             )
             outbound = self._outbound_record(
                 command,
@@ -1369,6 +1423,9 @@ class CaptureHandler:
                     "input_archive_sha256"
                 ],
                 "main_assembly": request.main_assembly,
+                "native_target_id": request.native_target_identity[
+                    "target_id"
+                ],
                 "native_tool_record_sha256": (
                     request.native_tool_record_sha256
                 ),
@@ -1456,12 +1513,7 @@ class CaptureHandler:
             intent = effects.prepare_effect(
                 effect_key=request.effect_key,
                 effect_kind="native_operation",
-                target={
-                    "command_id": command.command_id,
-                    "host": "windows",
-                    "run_id": command.run_id,
-                    "stage": "capture",
-                },
+                target=_capture_target(command, request),
                 expected_state=expected_state,
                 outbound_root=outbound_root,
             )
