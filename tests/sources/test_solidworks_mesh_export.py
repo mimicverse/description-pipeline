@@ -980,7 +980,7 @@ class ComponentMeshExportTests(unittest.TestCase):
         )
         self.assertEqual(
             entry["tessellation"]["itessellation"]["bodies"][0]["properties"],
-            support.NATIVE_TESSELLATION_PROPERTIES,
+            support.native_tessellation_body_properties(2),
         )
         self.assertEqual(read_stl(self.dest).triangles, 1)
 

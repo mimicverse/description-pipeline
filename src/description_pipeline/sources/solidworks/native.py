@@ -93,7 +93,7 @@ from ...schemas import (
     NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
     NATIVE_FACETLESS_EVIDENCE_API,
     NATIVE_MESH_CAPTURE_API,
-    NATIVE_TESSELLATION_MATCH_TYPE,
+    NATIVE_TESSELLATION_MATCH_POLICY,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from .errors import CadError, EnvironmentError_
@@ -6855,6 +6855,12 @@ class SolidWorksBackend(CadBackend):
             "body_type": body_type,
             "body_index": body_index,
         }
+        if type(body_type) is not int or body_type not in (0, 1):
+            raise CadError(
+                "cad_native_tessellation_unreadable",
+                "the captured body has an invalid SolidWorks body type",
+                {**base, "returned": repr(body_type)[:60]},
+            )
         owner_scope = dict(scope_context or {})
         body_scope = dict(source_scope or {})
         witness_cache = None
@@ -8728,11 +8734,16 @@ class SolidWorksBackend(CadBackend):
                 {**base, "api": "IBody2.GetTessellation"},
             )
         tessellation = _interface(_dynamic(raw_tessellation), ITESSELLATION_IID)
+        selected_match_type = (
+            2
+            if body_type == 1 and len(face_rows) == 1
+            else 0
+        )
         tessellation_property_requests = {}
         tessellation_properties = {}
         for name, expected, evidence_name in (
             ("ImprovedQuality", True, "improved_quality"),
-            ("MatchType", NATIVE_TESSELLATION_MATCH_TYPE, "match_type"),
+            ("MatchType", selected_match_type, "match_type"),
             ("NeedErrorList", True, "need_error_list"),
             ("NeedFaceFacetMap", True, "need_face_facet_map"),
             ("NeedEdgeFinMap", True, "need_edge_fin_map"),
@@ -9201,6 +9212,12 @@ class SolidWorksBackend(CadBackend):
                 "curve_end_params": copy.deepcopy(
                     edge_row["curve_end_params"]
                 ),
+                "tessellation_request": copy.deepcopy(
+                    tessellation_request
+                ),
+                "tessellation_property_requests": copy.deepcopy(
+                    tessellation_property_requests
+                ),
                 "tessellation_properties": copy.deepcopy(
                     tessellation_properties
                 ),
@@ -9210,6 +9227,135 @@ class SolidWorksBackend(CadBackend):
                 "captured_fin_count": len(fins_by_id),
                 "face_count": len(face_rows),
                 "edge_count": len(edge_rows),
+            }
+
+        def fin_failure_context(
+            edge_row,
+            fin_id,
+            row,
+            cofin_value,
+        ):
+            face_index = facets[row["facet_id"]]["face_index"]
+            face_incidence = [
+                {
+                    "face_index": index,
+                    "facet_count": face_rows[index]["facet_count"],
+                    "face_reference": reference_evidence(
+                        face_rows[index]["reference"]
+                    ),
+                }
+                for index in edge_row["face_indices"]
+            ]
+            cofin_observed_fin_ids = sorted(
+                {fin_id}
+                | {
+                    candidate_fin_id
+                    for candidate_fin_id, candidate in fins_by_id.items()
+                    if type(candidate.get("cofin_raw_id")) is int
+                }
+            )
+            u_observed_fin_ids = sorted(
+                candidate_fin_id
+                for candidate_fin_id, candidate in fins_by_id.items()
+                if candidate.get("start_u") is not None
+                and candidate.get("end_u") is not None
+            )
+            applicable_fin_ids = set(fin_to_edge_row)
+            internal_fin_ids = sorted(set(fins_by_id) - applicable_fin_ids)
+            return {
+                "fin_failure": {
+                    "schema_version": (
+                        "solidworks-to-urdf.native-fin-failure/v1"
+                    ),
+                    "read_state": {
+                        "rule": "first-failure-partial-no-unread-promotion",
+                        "cofin": {
+                            "state": "first_failure_partial",
+                            "observed_fin_ids": cofin_observed_fin_ids,
+                            "unobserved_fin_ids": sorted(
+                                applicable_fin_ids
+                                - set(cofin_observed_fin_ids)
+                            ),
+                            "not_applicable_fin_ids": internal_fin_ids,
+                        },
+                        "u": {
+                            "state": "first_failure_partial",
+                            "observed_fin_ids": u_observed_fin_ids,
+                            "unobserved_fin_ids": sorted(
+                                applicable_fin_ids - set(u_observed_fin_ids)
+                            ),
+                            "not_applicable_fin_ids": internal_fin_ids,
+                        },
+                    },
+                    "current_fin": {
+                        "fin_id": fin_id,
+                        "facet_id": row["facet_id"],
+                        "face_index": face_index,
+                        "vertex_ids": list(row.get("vertex_ids") or ()),
+                        "vertex_points_binary64": {
+                            str(vertex_id): copy.deepcopy(
+                                vertex_points_binary64.get(vertex_id)
+                            )
+                            for vertex_id in (row.get("vertex_ids") or ())
+                        },
+                        "cofin_read": {
+                            "state": "observed",
+                            "raw": _native_evidence_summary(cofin_value),
+                            "raw_type": type(cofin_value).__name__,
+                        },
+                        "u_read": {
+                            "state": "not_read_before_first_failure",
+                            "start_u": None,
+                            "end_u": None,
+                        },
+                    },
+                    **edge_failure_context(
+                        edge_row,
+                        edge_row["raw_fin_ids"],
+                        face_incidence,
+                    ),
+                    "face_inventory": [
+                        {
+                            "face_index": item["index"],
+                            "face_reference": reference_evidence(
+                                item["reference"]
+                            ),
+                            "owner_body_reference": reference_evidence(
+                                item["owner_body_reference"]
+                            ),
+                            "raw_facet_ids": copy.deepcopy(
+                                item["raw_facet_ids"]
+                            ),
+                            "facet_ids": list(item["facet_ids"]),
+                            "facet_ids_source": item["facet_ids_source"],
+                        }
+                        for item in face_rows
+                    ],
+                    "edge_inventory": [
+                        {
+                            "edge_index": item["index"],
+                            "edge_reference": reference_evidence(
+                                item["reference"]
+                            ),
+                            "owner_body_reference": reference_evidence(
+                                item["owner_body_reference"]
+                            ),
+                            "face_indices": list(item["face_indices"]),
+                            "raw_fin_ids": copy.deepcopy(
+                                item["raw_fin_ids"]
+                            ),
+                            "fin_ids_source": item["fin_ids_source"],
+                            "fin_ids": list(item["fin_ids"]),
+                        }
+                        for item in edge_rows
+                    ],
+                    "facet_inventory": copy.deepcopy(facets),
+                    "fin_inventory": copy.deepcopy(fins_by_id),
+                    "fin_vertices": copy.deepcopy(fin_vertices),
+                    "vertex_points_binary64": copy.deepcopy(
+                        vertex_points_binary64
+                    ),
+                }
             }
 
         for edge_row in edge_rows:
@@ -10099,6 +10245,12 @@ class SolidWorksBackend(CadBackend):
                             "fin_id": fin_id,
                             "raw_value": repr(cofin_id)[:60],
                             "raw_type": type(cofin_id).__name__,
+                            **fin_failure_context(
+                                edge_row,
+                                fin_id,
+                                row,
+                                cofin_id,
+                            ),
                         },
                     )
                 incidence = len(edge_row["face_indices"])
@@ -10112,6 +10264,12 @@ class SolidWorksBackend(CadBackend):
                                 "edge_index": edge_row["index"],
                                 "fin_id": fin_id,
                                 "cofin_raw_id": cofin_id,
+                                **fin_failure_context(
+                                    edge_row,
+                                    fin_id,
+                                    row,
+                                    cofin_id,
+                                ),
                             },
                         )
                     row["cofin_raw_id"] = -1
@@ -10126,6 +10284,12 @@ class SolidWorksBackend(CadBackend):
                                 "edge_index": edge_row["index"],
                                 "fin_id": fin_id,
                                 "cofin_raw_id": cofin_id,
+                                **fin_failure_context(
+                                    edge_row,
+                                    fin_id,
+                                    row,
+                                    cofin_id,
+                                ),
                             },
                         )
                     if cofin_id not in edge_row["fin_ids"]:
@@ -10138,6 +10302,12 @@ class SolidWorksBackend(CadBackend):
                                 "fin_id": fin_id,
                                 "cofin_id": cofin_id,
                                 "fin_ids": tuple(edge_row["fin_ids"]),
+                                **fin_failure_context(
+                                    edge_row,
+                                    fin_id,
+                                    row,
+                                    cofin_id,
+                                ),
                             },
                         )
                     row["cofin_raw_id"] = cofin_id
@@ -10299,6 +10469,26 @@ class SolidWorksBackend(CadBackend):
                     "schema_version": "solidworks-to-urdf.native-edge-u-failure/v1",
                     **edge_failure_context(edge_row, edge_row["raw_fin_ids"], face_incidence),
                     "source_scope": copy.deepcopy(body_scope),
+                    "read_state": {
+                        "rule": "first-failure-partial-no-unread-promotion",
+                        "cofin": {
+                            "state": "first_failure_partial",
+                            "observed_fin_ids": sorted(
+                                fin_id
+                                for fin_id, fin in fins_by_id.items()
+                                if type(fin.get("cofin_raw_id")) is int
+                            ),
+                        },
+                        "u": {
+                            "state": "first_failure_partial",
+                            "observed_fin_ids": sorted(
+                                fin_id
+                                for fin_id, fin in fins_by_id.items()
+                                if fin.get("start_u") is not None
+                                and fin.get("end_u") is not None
+                            ),
+                        },
+                    },
                     "curve_domain_transform": copy.deepcopy(edge_row["curve_domain_transform"]),
                     "curve_endpoint_evaluations": copy.deepcopy(edge_row["curve_endpoint_evaluations"]),
                     "topology_endpoint_assignment": copy.deepcopy(edge_row["topology_endpoint_assignment"]),
@@ -11628,9 +11818,9 @@ class SolidWorksBackend(CadBackend):
                 "u_rule_version": NATIVE_U_IDENTITY_RULE,
                 "u_resolution_rule": NATIVE_U_RESOLUTION_RULE,
                 "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
+                "match_type_policy": NATIVE_TESSELLATION_MATCH_POLICY,
                 "property_requests": {
                     "improved_quality": True,
-                    "match_type": NATIVE_TESSELLATION_MATCH_TYPE,
                     "need_error_list": True,
                     "need_face_facet_map": True,
                     "need_edge_fin_map": True,
@@ -11638,7 +11828,6 @@ class SolidWorksBackend(CadBackend):
                 },
                 "properties": {
                     "improved_quality": True,
-                    "match_type": NATIVE_TESSELLATION_MATCH_TYPE,
                     "need_error_list": True,
                     "need_face_facet_map": True,
                     "need_edge_fin_map": True,

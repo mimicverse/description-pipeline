@@ -34,19 +34,26 @@ from description_pipeline.geometry.native_planar_brep import NATIVE_PLANAR_BREP_
 from description_pipeline.io import file_digest
 from description_pipeline.schemas import (
     NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_TESSELLATION_MATCH_POLICY,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
-NATIVE_TESSELLATION_PROPERTIES = {
+NATIVE_TESSELLATION_COMMON_PROPERTIES = {
     "improved_quality": True,
-    "match_type": 2,
     "need_error_list": True,
     "need_face_facet_map": True,
     "need_edge_fin_map": True,
     "need_vertex_params": True,
 }
+
+
+def native_tessellation_body_properties(match_type: int) -> dict[str, Any]:
+    return {
+        **NATIVE_TESSELLATION_COMMON_PROPERTIES,
+        "match_type": match_type,
+    }
 
 
 def native_tessellation_request() -> dict[str, Any]:
@@ -870,6 +877,12 @@ def native_tessellation_fixture(
     for body_type, body_index in body_keys:
         body_key = (body_type, body_index)
         body = evidence_by_body[body_key]
+        match_type = (
+            2
+            if body_type == 1 and len(body["spans"]) == 1
+            else 0
+        )
+        body_properties = native_tessellation_body_properties(match_type)
         body_rows.append(
             {
                 "body_type": body_type,
@@ -877,10 +890,8 @@ def native_tessellation_fixture(
                 "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
                 "tessellate_result": True,
                 "request": native_tessellation_request(),
-                "property_requests": copy.deepcopy(
-                    NATIVE_TESSELLATION_PROPERTIES
-                ),
-                "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
+                "property_requests": copy.deepcopy(body_properties),
+                "properties": copy.deepcopy(body_properties),
                 "facet_count": len(body["facets"]),
                 "fin_count": len(body["fins"]),
                 "vertex_count": len(body["vertex_ids_by_point"]),
@@ -990,6 +1001,7 @@ def native_tessellation_fixture(
             "u_resolution_rule": NATIVE_U_RESOLUTION_RULE,
             "identity_rule": NATIVE_IDENTITY_POLICY_RULE,
             "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
+            "match_type_policy": NATIVE_TESSELLATION_MATCH_POLICY,
             "u_observation_stats": {
                 "unique_observations": u_observations,
                 "cache_hits": 0,
@@ -997,9 +1009,11 @@ def native_tessellation_fixture(
                 "evaluate2_calls": u_observations,
             },
             "property_requests": copy.deepcopy(
-                NATIVE_TESSELLATION_PROPERTIES
+                NATIVE_TESSELLATION_COMMON_PROPERTIES
             ),
-            "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
+            "properties": copy.deepcopy(
+                NATIVE_TESSELLATION_COMMON_PROPERTIES
+            ),
             "reference_alias_audit": {
                 "body": [],
                 "face": [],

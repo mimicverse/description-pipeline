@@ -28,7 +28,9 @@ from description_pipeline.geometry.native_u import (
 from description_pipeline.io import PipelineError
 from description_pipeline.schemas import (
     NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
     NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+    NATIVE_TESSELLATION_MATCH_POLICY,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from description_pipeline.sources.snapshot import write_manifest
@@ -592,7 +594,7 @@ class NativeMeshObservationTests(unittest.TestCase):
                 lambda row: row["tessellation"]["itessellation"].__setitem__(
                     "property_requests",
                     {
-                        **support.NATIVE_TESSELLATION_PROPERTIES,
+                        **support.NATIVE_TESSELLATION_COMMON_PROPERTIES,
                         "need_error_list": False,
                     },
                 ),
@@ -641,14 +643,14 @@ class NativeMeshObservationTests(unittest.TestCase):
                 "properties are incomplete",
             ),
             (
-                "match-type",
+                "top-level-match-type",
                 lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
                     "match_type", 1
                 ),
                 "properties are incomplete",
             ),
             (
-                "match-type-bool",
+                "top-level-match-type-bool",
                 lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
                     "match_type", False
                 ),
@@ -669,40 +671,192 @@ class NativeMeshObservationTests(unittest.TestCase):
                 with self.assertRaisesRegex(PipelineError, message):
                     self.verify()
 
-    def test_match_type_is_strict_for_requests_and_observations_at_both_scopes(self):
+    def test_match_type_policy_and_body_modes_are_strict_and_topology_bound(self):
         original = copy.deepcopy(self.row)
         self.assertEqual(
             original["tessellation"]["schema_version"],
-            "solidworks-to-urdf.native-tessellation/v18",
+            "solidworks-to-urdf.native-tessellation/v19",
         )
-        for scope in ("component", "body"):
-            for field in ("property_requests", "properties"):
-                for value in (0, 1, -1, False, True, 2.0, "2", None):
-                    with self.subTest(scope=scope, field=field, value=repr(value)):
-                        self.row = copy.deepcopy(original)
-                        evidence = self.row["tessellation"]["itessellation"]
-                        if scope == "body":
-                            evidence = evidence["bodies"][0]
-                        evidence[field]["match_type"] = value
-                        with self.assertRaises(PipelineError):
-                            self.verify()
+        evidence = original["tessellation"]["itessellation"]
+        self.assertEqual(
+            evidence["match_type_policy"],
+            NATIVE_TESSELLATION_MATCH_POLICY,
+        )
+        self.assertNotIn("match_type", evidence["properties"])
+        self.assertNotIn("match_type", evidence["property_requests"])
+        self.assertEqual(
+            evidence["properties"],
+            evidence["property_requests"],
+        )
+        self.assertEqual(
+            evidence["properties"],
+            support.NATIVE_TESSELLATION_COMMON_PROPERTIES,
+        )
 
-        for value in (0, 1):
-            with self.subTest(synchronized_legacy_mode=value):
+        for policy in (None, "", "native-tessellation/v18", True):
+            with self.subTest(policy=repr(policy)):
                 self.row = copy.deepcopy(original)
-                evidence = self.row["tessellation"]["itessellation"]
-                for item in (evidence, *evidence["bodies"]):
-                    for field in ("property_requests", "properties"):
-                        item[field]["match_type"] = value
-                with self.assertRaisesRegex(PipelineError, "requests are incomplete"):
+                self.row["tessellation"]["itessellation"][
+                    "match_type_policy"
+                ] = policy
+                with self.assertRaisesRegex(PipelineError, "policy is unsupported"):
                     self.verify()
 
-    def test_legacy_tessellation_schema_is_rejected_with_edge_curve_properties(self):
-        self.row["tessellation"]["schema_version"] = (
-            "solidworks-to-urdf.native-tessellation/v17"
+        for field in ("property_requests", "properties"):
+            with self.subTest(scope="top", field=field, value=2):
+                self.row = copy.deepcopy(original)
+                top = self.row["tessellation"]["itessellation"]
+                top[field]["match_type"] = 2
+                expected = (
+                    "property requests are incomplete"
+                    if field == "property_requests"
+                    else "properties are incomplete"
+                )
+                with self.assertRaisesRegex(PipelineError, expected):
+                    self.verify()
+
+        body = evidence["bodies"][0]
+        self.assertEqual(body["body_type"], 1)
+        self.assertEqual(len(body["faces"]), 3)
+        self.assertEqual(body["properties"]["match_type"], 0)
+        for field in ("property_requests", "properties"):
+            for value in (1, -1, False, True, 2.0, "2", None):
+                with self.subTest(scope="body", field=field, value=repr(value)):
+                    self.row = copy.deepcopy(original)
+                    self.row["tessellation"]["itessellation"]["bodies"][0][
+                        field
+                    ]["match_type"] = value
+                    with self.assertRaisesRegex(
+                        PipelineError,
+                        "properties differ",
+                    ):
+                        self.verify()
+            with self.subTest(scope="body", field=field, forged_mode=2):
+                self.row = copy.deepcopy(original)
+                self.row["tessellation"]["itessellation"]["bodies"][0][
+                    field
+                ]["match_type"] = 2
+                with self.assertRaisesRegex(PipelineError, "properties differ"):
+                    self.verify()
+
+    def test_two_face_sheet_mode_uses_validated_span_inventory_not_body_metadata(self):
+        body_reference = hashlib.sha256(b"two-face-sheet-body").hexdigest()
+        spans = [
+            {
+                "body_type": 1,
+                "body_index": 0,
+                "body_name": "sheet",
+                "body_reference_sha256": body_reference,
+                "face_index": face_index,
+                "face_reference_sha256": hashlib.sha256(
+                    f"two-face-sheet-{face_index}".encode()
+                ).hexdigest(),
+                "face_owner_id": face_index + 1,
+                "edge_references": [],
+                "triangle_start": 0,
+                "triangle_count": 0,
+                "triangle_records_sha256": hashlib.sha256(b"").hexdigest(),
+            }
+            for face_index in range(2)
+        ]
+        no_facets = [
+            {
+                "body_type": 1,
+                "body_index": 0,
+                "face_index": face_index,
+                "triangle_count": 0,
+                "facet_count": 0,
+                "area_m2": 1.0,
+                "tessellate_result": True,
+                "used_api": NATIVE_FACETLESS_EVIDENCE_API,
+            }
+            for face_index in range(2)
+        ]
+        evidence = support.native_tessellation_fixture(
+            spans,
+            [],
+            no_facets,
         )
-        with self.assertRaisesRegex(PipelineError, "unsupported native tessellation schema"):
-            self.verify()
+        body = evidence["itessellation"]["bodies"][0]
+        for face in body["faces"]:
+            face.update(
+                {
+                    "facet_ids_source": (
+                        NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                    ),
+                    "raw_facet_ids": None,
+                    "warnings": [NATIVE_FACE_FACET_IDS_DERIVED],
+                }
+            )
+        self.assertEqual(body["properties"]["match_type"], 0)
+        self.assertEqual(
+            len(parse_native_tessellation(
+                "sheet",
+                evidence,
+                {"solid": 0, "sheet": 1},
+                0,
+                [],
+            )),
+            2,
+        )
+
+        def assert_rejected(mutate):
+            broken = copy.deepcopy(evidence)
+            mutate(broken["itessellation"]["bodies"][0])
+            with self.assertRaises(PipelineError):
+                parse_native_tessellation(
+                    "sheet",
+                    broken,
+                    {"solid": 0, "sheet": 1},
+                    0,
+                    [],
+                )
+
+        def forged_mode(item):
+            for field in ("property_requests", "properties"):
+                item[field]["match_type"] = 2
+
+        def truncated_inventory_forged_as_single_face(item):
+            item["faces"] = item["faces"][:1]
+            forged_mode(item)
+
+        def extra_orphan_face(item):
+            orphan = copy.deepcopy(item["faces"][0])
+            orphan["face_index"] = 2
+            item["faces"].append(orphan)
+
+        def cross_face_reference(item):
+            item["faces"][0]["face_identity_sha256"] = item["faces"][1][
+                "face_identity_sha256"
+            ]
+
+        def boolean_body_type(item):
+            item["body_type"] = True
+
+        for label, mutate in (
+            ("forged-mode", forged_mode),
+            ("truncated", truncated_inventory_forged_as_single_face),
+            ("orphan", extra_orphan_face),
+            ("cross-face-ref", cross_face_reference),
+            ("boolean-body-type", boolean_body_type),
+        ):
+            with self.subTest(label=label):
+                assert_rejected(mutate)
+
+    def test_legacy_tessellation_schema_is_rejected_with_edge_curve_properties(self):
+        for schema in (
+            "solidworks-to-urdf.native-tessellation/v18",
+            "solidworks-to-urdf.native-tessellation/v17",
+        ):
+            with self.subTest(schema=schema):
+                original = copy.deepcopy(self.row)
+                self.row["tessellation"]["schema_version"] = schema
+                with self.assertRaisesRegex(
+                    PipelineError,
+                    "unsupported native tessellation schema",
+                ):
+                    self.verify()
+                self.row = original
 
     def test_body_local_face_facet_fin_and_vertex_ids_fail_closed(self):
         original = copy.deepcopy(self.row)

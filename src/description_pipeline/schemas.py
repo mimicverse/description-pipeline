@@ -12,9 +12,8 @@ INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 TOOL_SCHEMA = "solidworks-to-urdf.tool/v1"
 EFFECTIVE_INSTANCES_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
-NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v18"
-# swTesselationMatchEdgeCurve trims facet boundaries to model edge curves.
-NATIVE_TESSELLATION_MATCH_TYPE = 2
+NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v19"
+NATIVE_TESSELLATION_MATCH_POLICY = "native-topology-match-selection-v1"
 NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP = "native-planar-brep-boundary"
 NATIVE_ID_ARRAY_SOURCE_FLAT = "native-flat-array"
 NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO = (

@@ -14,7 +14,7 @@ from ..schemas import (
     NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
     NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
     NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
-    NATIVE_TESSELLATION_MATCH_TYPE,
+    NATIVE_TESSELLATION_MATCH_POLICY,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from .native_fin_topology import (
@@ -2593,6 +2593,7 @@ def _parse_itessellation_evidence(
         "u_rule_version",
         "u_resolution_rule",
         "point_roundtrip_rule",
+        "match_type_policy",
         "property_requests",
         "properties",
         "identity_rule",
@@ -2777,15 +2778,17 @@ def _parse_itessellation_evidence(
     def properties_are_strict(candidate):
         return (
             isinstance(candidate, dict)
-            and set(candidate) == {"match_type", *expected_boolean_properties}
-            and type(candidate["match_type"]) is int
-            and candidate["match_type"] == NATIVE_TESSELLATION_MATCH_TYPE
+            and set(candidate) == set(expected_boolean_properties)
             and all(
                 type(candidate[key]) is bool and candidate[key] is True
                 for key in expected_boolean_properties
             )
         )
 
+    _require(
+        value["match_type_policy"] == NATIVE_TESSELLATION_MATCH_POLICY,
+        component + ": native match-type policy is unsupported",
+    )
     _require(
         properties_are_strict(property_requests),
         component + ": native ITessellation property requests are incomplete",
@@ -2882,10 +2885,48 @@ def _parse_itessellation_evidence(
             component + f": native tessellation body {index} is duplicated or unordered",
         )
         _require(
-            properties_are_strict(body["property_requests"])
-            and properties_are_strict(body["properties"])
-            and body["property_requests"] == property_requests
-            and body["properties"] == properties,
+            isinstance(spans_by_body.get(body_key), list)
+            and bool(spans_by_body[body_key]),
+            component + f": native tessellation body {index} has no face inventory",
+        )
+        expected_match_type = (
+            2
+            if body_key[0] == 1 and len(spans_by_body[body_key]) == 1
+            else 0
+        )
+        _require(
+            isinstance(body["property_requests"], dict)
+            and set(body["property_requests"])
+            == {"match_type", *expected_boolean_properties}
+            and type(body["property_requests"]["match_type"]) is int
+            and body["property_requests"]["match_type"]
+            == expected_match_type
+            and all(
+                type(body["property_requests"][key]) is bool
+                and body["property_requests"][key] is True
+                for key in expected_boolean_properties
+            )
+            and isinstance(body["properties"], dict)
+            and set(body["properties"])
+            == {"match_type", *expected_boolean_properties}
+            and type(body["properties"]["match_type"]) is int
+            and body["properties"]["match_type"] == expected_match_type
+            and all(
+                type(body["properties"][key]) is bool
+                and body["properties"][key] is True
+                for key in expected_boolean_properties
+            )
+            and body["property_requests"] == body["properties"]
+            and {
+                key: body["property_requests"][key]
+                for key in expected_boolean_properties
+            }
+            == property_requests
+            and {
+                key: body["properties"][key]
+                for key in expected_boolean_properties
+            }
+            == properties,
             component
             + f": native tessellation body {index} properties differ from the request",
         )

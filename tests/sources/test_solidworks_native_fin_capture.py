@@ -1019,6 +1019,18 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(len(snapshot["fin_inventory"]), 3)
         self.assertEqual(len(snapshot["vertex_points_binary64"]), 3)
         self.assertEqual(snapshot["fin_inventory"]["100"]["vertex_ids"], [1, 2])
+        self.assertEqual(
+            snapshot["read_state"]["cofin"]["state"],
+            "first_failure_partial",
+        )
+        self.assertEqual(
+            snapshot["read_state"]["u"]["state"],
+            "first_failure_partial",
+        )
+        self.assertEqual(
+            snapshot["tessellation_property_requests"]["match_type"],
+            2,
+        )
         for endpoint, u in (("start", 0.25), ("end", 0.75)):
             evidence = snapshot["fin_inventory"]["100"][f"{endpoint}_evidence"]
             self.assertEqual(evidence["u"], u)
@@ -2027,6 +2039,72 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         self.assertEqual(len(spans), 1)
 
+    def test_match_type_is_selected_from_body_type_and_complete_face_inventory(self):
+        solid_body, _face_10, _face_20, _edge, solid_tessellation, extension = (
+            self.fixture()
+        )
+        solid = self.capture(solid_body, extension, body_type=0)
+
+        sheet_body, _face_10, _face_20, _edge, sheet_tessellation, extension = (
+            self.fixture()
+        )
+        two_face_sheet = self.capture(sheet_body, extension, body_type=1)
+
+        one_face_body, _face_10, _edge, one_face_tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        one_face_sheet = self.capture(one_face_body, extension, body_type=1)
+
+        self.assertEqual(
+            solid["itessellation_body"]["property_requests"]["match_type"],
+            0,
+        )
+        self.assertEqual(
+            two_face_sheet["itessellation_body"]["property_requests"][
+                "match_type"
+            ],
+            0,
+        )
+        self.assertEqual(
+            one_face_sheet["itessellation_body"]["property_requests"][
+                "match_type"
+            ],
+            2,
+        )
+        for body, tessellation, expected in (
+            (solid_body, solid_tessellation, 0),
+            (sheet_body, sheet_tessellation, 0),
+            (one_face_body, one_face_tessellation, 2),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(tessellation.requested["MatchType"], expected)
+                self.assertIs(type(tessellation.requested["MatchType"]), int)
+                self.assertEqual(
+                    tessellation.property_writes.count("MatchType"),
+                    1,
+                )
+                self.assertEqual(
+                    tessellation.property_reads.count("MatchType"),
+                    1,
+                )
+                self.assertEqual(tessellation.tessellate_calls, 1)
+                self.assertEqual(body.tessellation_calls, 1)
+
+    def test_invalid_body_type_is_rejected_before_tessellation(self):
+        for body_type in (True, 2, -1, 1.0, "1", None):
+            with self.subTest(body_type=repr(body_type)):
+                body, _face_10, _face_20, _edge, tessellation, extension = (
+                    self.fixture()
+                )
+                with self.assertRaisesRegex(
+                    CadError,
+                    "invalid SolidWorks body type",
+                ):
+                    self.capture(body, extension, body_type=body_type)
+                self.assertEqual(body.tessellation_calls, 0)
+                self.assertEqual(tessellation.tessellate_calls, 0)
+                self.assertEqual(tessellation.requested, {})
+
 
 
     def test_malformed_curve_end_params_raise_a_stable_cad_error(self):
@@ -2245,8 +2323,90 @@ class NativeFinCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(
             CadError,
             "shared-edge fin did not report a cofin ID",
-        ):
+        ) as caught:
             self.capture(body, extension)
+        calls_before = copy.deepcopy(tessellation.call_counts)
+        detail = json.loads(
+            json.dumps(caught.exception.detail, allow_nan=False)
+        )
+        self.assertEqual(tessellation.call_counts, calls_before)
+        snapshot = detail["fin_failure"]
+        self.assertEqual(detail["edge_index"], 0)
+        self.assertEqual(detail["fin_id"], 100)
+        self.assertEqual(detail["cofin_raw_id"], -1)
+        self.assertEqual(snapshot["current_fin"]["fin_id"], 100)
+        self.assertEqual(snapshot["current_fin"]["facet_id"], 10)
+        self.assertEqual(snapshot["current_fin"]["face_index"], 0)
+        self.assertEqual(snapshot["current_fin"]["vertex_ids"], [1, 2])
+        self.assertEqual(
+            snapshot["current_fin"]["vertex_points_binary64"],
+            {"1": [0.0, 0.0, 0.0], "2": [1.0, 0.0, 0.0]},
+        )
+        self.assertEqual(
+            snapshot["current_fin"]["cofin_read"],
+            {"state": "observed", "raw": -1, "raw_type": "int"},
+        )
+        self.assertEqual(
+            snapshot["current_fin"]["u_read"]["state"],
+            "not_read_before_first_failure",
+        )
+        self.assertEqual(snapshot["edge_inventory"][0]["face_indices"], [0, 1])
+        self.assertEqual(
+            snapshot["edge_inventory"][0]["raw_fin_ids"],
+            [100, 200],
+        )
+        self.assertEqual(
+            snapshot["edge_inventory"][0]["fin_ids"],
+            [100, 200],
+        )
+        self.assertEqual(len(snapshot["face_inventory"]), 2)
+        self.assertEqual(len(snapshot["facet_inventory"]), 2)
+        self.assertEqual(len(snapshot["fin_inventory"]), 6)
+        self.assertEqual(len(snapshot["vertex_points_binary64"]), 4)
+        self.assertEqual(
+            snapshot["read_state"]["cofin"]["state"],
+            "first_failure_partial",
+        )
+        self.assertEqual(
+            snapshot["read_state"]["u"]["state"],
+            "first_failure_partial",
+        )
+        self.assertEqual(
+            snapshot["tessellation_property_requests"]["match_type"],
+            0,
+        )
+        self.assertEqual(
+            snapshot["tessellation_properties"]["match_type"],
+            0,
+        )
+        self.assertEqual(
+            snapshot["tessellation_request"]["api"],
+            "IBody2.GetTessellation",
+        )
+        self.assertEqual(tessellation.error_list_calls, 0)
+
+    def test_fin_failure_read_state_tracks_actual_calls_and_excludes_internal_fins(self):
+        body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
+        tessellation.cofin_values[200] = -1
+
+        with self.assertRaisesRegex(CadError, "shared-edge fin") as caught:
+            self.capture(body, extension)
+
+        snapshot = json.loads(
+            json.dumps(caught.exception.detail["fin_failure"], allow_nan=False)
+        )
+        cofin = snapshot["read_state"]["cofin"]
+        u = snapshot["read_state"]["u"]
+        self.assertEqual(cofin["observed_fin_ids"], [100, 200])
+        self.assertEqual(cofin["unobserved_fin_ids"], [])
+        self.assertEqual(cofin["not_applicable_fin_ids"], [101, 102, 201, 202])
+        self.assertEqual(u["observed_fin_ids"], [100])
+        self.assertEqual(u["unobserved_fin_ids"], [200])
+        self.assertEqual(u["not_applicable_fin_ids"], [101, 102, 201, 202])
+        self.assertEqual(snapshot["current_fin"]["fin_id"], 200)
+        self.assertEqual(snapshot["current_fin"]["cofin_read"]["raw"], -1)
+        self.assertEqual(tessellation.cofin_calls, [100, 200])
+        self.assertEqual(tessellation.error_list_calls, 0)
 
     def test_shared_edge_rejects_cofin_outside_its_fin_set(self):
         body, _face_10, _face_20, _edge, tessellation, extension = (
@@ -2265,8 +2425,35 @@ class NativeFinCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(
             CadError,
             "shared-edge cofin is outside the same edge",
-        ):
+        ) as caught:
             self.capture(body, extension)
+        calls_before = copy.deepcopy(tessellation.call_counts)
+        detail = json.loads(
+            json.dumps(caught.exception.detail, allow_nan=False)
+        )
+        self.assertEqual(tessellation.call_counts, calls_before)
+        snapshot = detail["fin_failure"]
+        self.assertEqual(detail["edge_index"], 0)
+        self.assertEqual(detail["fin_id"], 100)
+        self.assertEqual(detail["cofin_id"], 102)
+        self.assertEqual(snapshot["current_fin"]["cofin_read"]["raw"], 102)
+        self.assertEqual(
+            snapshot["current_fin"]["u_read"]["state"],
+            "not_read_before_first_failure",
+        )
+        self.assertEqual(
+            snapshot["read_state"]["cofin"]["state"],
+            "first_failure_partial",
+        )
+        self.assertEqual(
+            snapshot["read_state"]["u"]["state"],
+            "first_failure_partial",
+        )
+        self.assertEqual(
+            snapshot["tessellation_property_requests"]["match_type"],
+            0,
+        )
+        self.assertEqual(tessellation.error_list_calls, 0)
 
     def test_solid_body_cannot_use_open_boundary_semantics(self):
         body, _face_10, _edge, _tessellation, extension = (
@@ -2292,7 +2479,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             self.capture(body, extension, body_type=1)
 
     def test_open_edge_rejects_invalid_boundary_reads(self):
-        for value in (-2, None, True, 1.0):
+        for value in (-2, None, True, 1.0, object()):
             with self.subTest(value=value):
                 body, _face_10, _edge, tessellation, extension = (
                     self.open_boundary_fixture()
@@ -2308,6 +2495,39 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "did not return an integer boundary or cofin ID",
                     caught.exception.message,
                 )
+                calls_before = copy.deepcopy(tessellation.call_counts)
+                detail = json.loads(
+                    json.dumps(caught.exception.detail, allow_nan=False)
+                )
+                self.assertEqual(tessellation.call_counts, calls_before)
+                snapshot = detail["fin_failure"]
+                self.assertEqual(snapshot["current_fin"]["fin_id"], 100)
+                self.assertEqual(
+                    snapshot["current_fin"]["cofin_read"]["raw_type"],
+                    type(value).__name__,
+                )
+                if type(value) is object:
+                    self.assertIs(
+                        type(
+                            snapshot["current_fin"]["cofin_read"]["raw"][
+                                "object_pointer"
+                            ]
+                        ),
+                        int,
+                    )
+                self.assertEqual(
+                    snapshot["current_fin"]["u_read"]["state"],
+                    "not_read_before_first_failure",
+                )
+                self.assertEqual(len(snapshot["face_inventory"]), 1)
+                self.assertEqual(len(snapshot["edge_inventory"]), 1)
+                self.assertEqual(len(snapshot["facet_inventory"]), 1)
+                self.assertEqual(len(snapshot["fin_inventory"]), 3)
+                self.assertEqual(
+                    snapshot["tessellation_property_requests"]["match_type"],
+                    2,
+                )
+                self.assertEqual(tessellation.error_list_calls, 0)
 
     def test_native_edge_rejects_an_empty_fin_set(self):
         body, _face_10, _edge, tessellation, extension = (
@@ -2578,7 +2798,9 @@ class NativeFinCaptureTests(unittest.TestCase):
             "curve_type": 0,
         }
         evidence = support.native_tessellation_fixture([span], [edge])
-        face = evidence["itessellation"]["bodies"][0]["faces"][0]
+        body_evidence = evidence["itessellation"]["bodies"][0]
+        self.assertEqual(body_evidence["properties"]["match_type"], 2)
+        face = body_evidence["faces"][0]
         face.update(
             {
                 "facet_ids_source": (
@@ -2609,6 +2831,19 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertEqual(len(spans), 1)
         self.assertEqual(spans[0]["triangle_count"], 0)
+
+        wrong_mode = copy.deepcopy(evidence)
+        wrong_body = wrong_mode["itessellation"]["bodies"][0]
+        for field in ("property_requests", "properties"):
+            wrong_body[field]["match_type"] = 0
+        with self.assertRaisesRegex(PipelineError, "properties differ"):
+            parse_native_tessellation(
+                "sheet",
+                wrong_mode,
+                {"solid": 0, "sheet": 1},
+                0,
+                [],
+            )
 
         for target, warnings in (
             ("face", []),
@@ -2775,7 +3010,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             self.assertEqual(tessellation.property_writes, expected)
             self.assertEqual(tessellation.property_reads, expected)
             self.assertIs(type(tessellation.requested["MatchType"]), int)
-            self.assertEqual(tessellation.requested["MatchType"], 2)
+            self.assertEqual(tessellation.requested["MatchType"], 0)
             return original_tessellate()
 
         tessellation.Tessellate = tessellate_after_property_readbacks
@@ -2793,7 +3028,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             tessellation.requested,
             {
                 "ImprovedQuality": True,
-                "MatchType": 2,
+                "MatchType": 0,
                 "NeedErrorList": True,
                 "NeedFaceFacetMap": True,
                 "NeedEdgeFinMap": True,
@@ -2830,7 +3065,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             captured["itessellation_body"]["properties"],
             {
                 "improved_quality": True,
-                "match_type": 2,
+                "match_type": 0,
                 "need_error_list": True,
                 "need_face_facet_map": True,
                 "need_edge_fin_map": True,
@@ -6161,46 +6396,100 @@ class NativeFinCaptureTests(unittest.TestCase):
                 )
 
     def test_match_type_readback_mismatch_is_rejected(self):
-        for readback in (0, 1, -1, False, True, 2.0, "2", None):
-            with self.subTest(readback=repr(readback)):
-                body, _face_10, _face_20, _edge, tessellation, extension = (
-                    self.fixture()
-                )
-                tessellation.property_readbacks["MatchType"] = readback
+        for fixture_name, expected, body_type, values in (
+            ("solid", 0, 0, (1, -1, False, True, 2, 2.0, "2", None)),
+            ("single-face-sheet", 2, 1, (0, 1, -1, False, True, 2.0, "2", None)),
+        ):
+            for readback in values:
+                with self.subTest(fixture=fixture_name, readback=repr(readback)):
+                    if fixture_name == "solid":
+                        (
+                            body,
+                            _face_10,
+                            _face_20,
+                            _edge,
+                            tessellation,
+                            extension,
+                        ) = self.fixture()
+                    else:
+                        body, _face_10, _edge, tessellation, extension = (
+                            self.open_boundary_fixture()
+                        )
+                    tessellation.property_readbacks["MatchType"] = readback
 
-                with self.assertRaises(CadError) as caught:
-                    self.capture(body, extension)
+                    with self.assertRaises(CadError) as caught:
+                        self.capture(body, extension, body_type=body_type)
 
-                self.assertEqual(
-                    caught.exception.code, "cad_native_tessellation_unreadable"
-                )
-                self.assertEqual(
-                    caught.exception.detail["api"], "ITessellation.MatchType"
-                )
-                self.assertEqual(tessellation.requested["MatchType"], 2)
-                self.assertEqual(tessellation.property_writes.count("MatchType"), 1)
-                self.assertEqual(tessellation.tessellate_calls, 0)
+                    self.assertEqual(
+                        caught.exception.code,
+                        "cad_native_tessellation_unreadable",
+                    )
+                    self.assertEqual(
+                        caught.exception.detail["api"],
+                        "ITessellation.MatchType",
+                    )
+                    self.assertEqual(
+                        tessellation.requested["MatchType"],
+                        expected,
+                    )
+                    self.assertEqual(
+                        tessellation.property_writes.count("MatchType"),
+                        1,
+                    )
+                    self.assertEqual(tessellation.tessellate_calls, 0)
 
     def test_match_type_set_failure_does_not_tessellate_or_fallback(self):
-        body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
         original_setattr = FakeTessellation.__setattr__
-        attempted_values = []
-
-        def fail_match_type(instance, name, value):
-            if name == "MatchType":
-                attempted_values.append(value)
-                raise RuntimeError("native MatchType setter failed")
-            return original_setattr(instance, name, value)
-
-        with (
-            patch.object(FakeTessellation, "__setattr__", fail_match_type),
-            self.assertRaises(CadError) as caught,
+        for fixture_name, expected, body_type in (
+            ("solid", 0, 0),
+            ("single-face-sheet", 2, 1),
         ):
-            self.capture(body, extension)
-        self.assertEqual(caught.exception.code, "cad_native_tessellation_unreadable")
-        self.assertEqual(caught.exception.detail["api"], "ITessellation.MatchType")
-        self.assertEqual(attempted_values, [2])
-        self.assertEqual(tessellation.tessellate_calls, 0)
+            with self.subTest(fixture=fixture_name):
+                if fixture_name == "solid":
+                    (
+                        body,
+                        _face_10,
+                        _face_20,
+                        _edge,
+                        tessellation,
+                        extension,
+                    ) = self.fixture()
+                else:
+                    body, _face_10, _edge, tessellation, extension = (
+                        self.open_boundary_fixture()
+                    )
+                attempted_values = []
+
+                def fail_match_type(
+                    instance,
+                    name,
+                    value,
+                    attempted=attempted_values,
+                ):
+                    if name == "MatchType":
+                        attempted.append(value)
+                        raise RuntimeError("native MatchType setter failed")
+                    return original_setattr(instance, name, value)
+
+                with (
+                    patch.object(
+                        FakeTessellation,
+                        "__setattr__",
+                        fail_match_type,
+                    ),
+                    self.assertRaises(CadError) as caught,
+                ):
+                    self.capture(body, extension, body_type=body_type)
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_native_tessellation_unreadable",
+                )
+                self.assertEqual(
+                    caught.exception.detail["api"],
+                    "ITessellation.MatchType",
+                )
+                self.assertEqual(attempted_values, [expected])
+                self.assertEqual(tessellation.tessellate_calls, 0)
 
     def test_analysis_property_readback_mismatch_is_rejected(self):
         for name in ("ImprovedQuality", "NeedErrorList"):
@@ -6238,7 +6527,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             error.detail["tessellation_properties"],
             {
                 "improved_quality": True,
-                "match_type": 2,
+                "match_type": 0,
                 "need_error_list": True,
                 "need_face_facet_map": True,
                 "need_edge_fin_map": True,
