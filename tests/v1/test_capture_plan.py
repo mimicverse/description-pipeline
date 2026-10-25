@@ -688,21 +688,56 @@ class CapturePlanTests(unittest.TestCase):
             steps._consume_sealed_definition(self.root)
 
     def test_a_frozen_file_whose_name_mentions_import_remains_valid(self) -> None:
-        selector = discovery._capture_plan_selector(
-            {
-                "instance_id": "imported-part-1",
-                "name2": "imported-part-1",
-                "document": "cad/imported-part.SLDPRT",
-                "suppression_state": 2,
-                "state": 2,
-            },
-            {},
+        discovery_document = json.loads(
+            (self.root / "discovery" / "native-discovery.json").read_text(
+                encoding="utf-8"
+            )
         )
+        files = dict(discovery_document["native_files"])
+        files["cad/imported-arm.SLDPRT"] = files.pop("cad/arm.SLDPRT")
+        discovery_document["native_files"] = files
+        discovery_document["raw"]["files"] = files
+        discovery_document["raw"]["source_selection"] = sealed_selection(
+            files,
+            MAIN,
+        )
+        component = next(
+            item
+            for item in discovery_document["raw"]["components"]
+            if item["instance_id"] == "arm-1"
+        )
+        component.update(
+            instance_id="imported-part-1",
+            name2="imported-part-1",
+            document="cad/imported-arm.SLDPRT",
+        )
+        write_json(
+            self.root / "discovery" / "native-discovery.json",
+            discovery_document,
+        )
+        discovery_sha = hashlib.sha256(
+            (self.root / "discovery" / "native-discovery.json").read_bytes()
+        ).hexdigest()
+
+        def bind_imported_file(plan):
+            plan.update(
+                discovery_sha256=discovery_sha,
+                handoff_sha256=digest(files),
+            )
+            plan["selection"]["files"] = files
+            plan["objects"][1].update(
+                name="imported-part-1",
+                document="cad/imported-arm.SLDPRT",
+            )
+            plan["groups"][1]["components"] = ["imported-part-1"]
+
+        self._rewrite_plan(bind_imported_file)
+        _source, consumed = steps._consume_sealed_definition(self.root)
         self.assertEqual(
-            selector,
+            consumed["objects"][1],
             {
                 "name": "imported-part-1",
-                "document": "cad/imported-part.SLDPRT",
+                "document": "cad/imported-arm.SLDPRT",
                 "state": 2,
             },
         )
