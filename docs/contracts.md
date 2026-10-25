@@ -675,6 +675,28 @@ COM；Freeze 保留初次准备职责。Capture 读取 scene 与内存几何事�
 最终 50 µm 双向曲面上界、覆盖、朝向及其他质量要求仍按 `docs/quality.md` 验收，
 未建立项如实保持未通过，不借用历史几何证明或未验证预览豁免。
 
+### 原生外观读数与交付
+
+`appearance_raw` 分别保留 document、occurrence、body 的实际 API、明确参数、原始数组、
+`HasMaterialPropertyValues`、texture pointer、`MaterialName`、读取错误以及实际与请求
+配置的绑定。这些事实不表示已经取得最终有效外观，也不证明不存在 face、feature 或
+display-state 覆盖；三个观测层颜色相同不能补齐未读取的覆盖层。
+
+不能自行规定 body、occurrence、document 的优先级或继承。`-1` 与 Has 标志只按
+对应 API、owner 和真实配置的语义解释，不能跨层推断全局缺失，读取错误不能当作
+absent。纹理名称只是名称观察，不是资产字节、UV 或纹理消费证明。
+
+Generate 必须能够证明实际交付 visual 的颜色及纹理可以忠实表示。必需外观读数失败、
+对象或配置错绑、无法唯一证明交付 RGBA 的冲突，以及存在纹理但缺少资产、UV 或绑定
+消费能力时，阶段明确失败并保留原始事实和错误定位，不能任挑颜色、回退默认色或仅
+附 warning 后登记成功。与已证明的交付外观无关的辅助诊断按原事实保留，不另设所有
+辅助 API 零错误的资格。当前单色输出不能把多层 raw 的一致性冒称每个交付面的有效
+外观证明；缺证范围须如实记录。
+
+Verify 从原始读数和实际输出独立复核外观来源、绑定及表示一致性，不能只比较生成
+声明。未经证明的覆盖层、纹理资产或转换仍保持未闭合；名称差异的非阻塞许可不扩大
+到颜色、纹理或实际对象归属。
+
 ### Native target identity
 
 端点 `/health` 的顶层 `install_id` 是 Windows 安装目标身份的一部分；`ready` 只描述
