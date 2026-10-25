@@ -689,6 +689,93 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         )
 
     @classmethod
+    def _runtime_scope(cls) -> dict:
+        from airflow.models.dagrun import DagRun
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+
+        with Session() as session:
+            dag_runs = (
+                session.query(DagRun)
+                .filter(DagRun.dag_id == DAG_ID)
+                .order_by(DagRun.run_id)
+                .all()
+            )
+            task_instances = (
+                session.query(TaskInstance)
+                .filter(TaskInstance.dag_id == DAG_ID)
+                .order_by(
+                    TaskInstance.run_id,
+                    TaskInstance.task_id,
+                    TaskInstance.map_index,
+                )
+                .all()
+            )
+        platform_rows = {}
+        queries = {
+            "commands": (
+                "SELECT command_id, run_id, kind, stage FROM command "
+                "ORDER BY run_id, stage NULLS LAST, kind"
+            ),
+            "stage_decisions": (
+                "SELECT run_id, stage, command_id, outcome, reason_code "
+                "FROM stage_decision ORDER BY run_id, stage"
+            ),
+            "execution_claims": (
+                "SELECT command_id, dag_id, dag_run_id, task_id, map_index, "
+                "fence, closure_code FROM execution_claim "
+                "ORDER BY dag_run_id, task_id, fence"
+            ),
+            "effect_intents": (
+                "SELECT effect_id, command_id, effect_kind, effect_key "
+                "FROM effect_intent ORDER BY command_id, effect_key"
+            ),
+            "effect_facts": (
+                "SELECT effect_id, seq, fact_type, source, state_class "
+                "FROM effect_fact ORDER BY effect_id, seq"
+            ),
+        }
+        with cls.connect() as connection, connection.cursor() as cursor:
+            for name, query in queries.items():
+                cursor.execute(query)
+                columns = [item.name for item in cursor.description]
+                platform_rows[name] = [
+                    {
+                        column: str(value) if value is not None else None
+                        for column, value in zip(columns, row, strict=True)
+                    }
+                    for row in cursor.fetchall()
+                ]
+        return {
+            "dag_runs": [
+                {
+                    "run_id": run.run_id,
+                    "state": (
+                        run.state.value
+                        if hasattr(run.state, "value")
+                        else str(run.state or "")
+                    ),
+                }
+                for run in dag_runs
+            ],
+            "task_instances": [
+                {
+                    "run_id": task.run_id,
+                    "task_id": task.task_id,
+                    "map_index": task.map_index,
+                    "state": (
+                        task.state.value
+                        if hasattr(task.state, "value")
+                        else str(task.state or "")
+                    ),
+                    "try_number": task.try_number,
+                }
+                for task in task_instances
+            ],
+            "platform": platform_rows,
+        }
+
+    @classmethod
     def _cleanup(cls) -> None:
         if cls._cleaned:
             return
@@ -701,6 +788,18 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             "temp_removed": False,
         }
         evidence_dir = getattr(cls, "evidence_dir", None)
+        if evidence_dir is not None and hasattr(cls, "connect"):
+            try:
+                runtime_scope = cls._runtime_scope()
+                (evidence_dir / "runtime-scope.json").write_text(
+                    json.dumps(runtime_scope, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                cleanup["runtime_scope"] = "runtime-scope.json"
+            except Exception as error:  # noqa: BLE001 - evidence capture must survive
+                cleanup["runtime_scope_error"] = (
+                    f"{type(error).__name__}: {error}"
+                )
         original = getattr(cls, "original_environ", None)
         if original is not None:
             os.environ.clear()
