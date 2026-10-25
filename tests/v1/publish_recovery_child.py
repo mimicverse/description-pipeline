@@ -12,6 +12,7 @@ from unittest.mock import patch
 import psycopg2
 
 from description_pipeline.artifacts import ArtifactStore
+from description_pipeline.pipeline.contracts import StagePending
 from description_pipeline.pipeline.engine import execute_stage
 from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.reconciliation import EffectReconciliationService
@@ -145,10 +146,22 @@ def _send(args) -> int:
         )
         expected = publish_stage.PublishIncomplete
     elif args.mode == "send-pr":
+        original_observe = pull_requests.observe
+        observe_calls = 0
+
+        def observe_then_crash(*call_args, **call_kwargs):
+            nonlocal observe_calls
+            observe_calls += 1
+            if observe_calls == 2:
+                raise _ProcessCrash(
+                    "process stopped after pull-request write"
+                )
+            return original_observe(*call_args, **call_kwargs)
+
         failure = patch.object(
-            publish_stage,
-            "_require_pr_match",
-            side_effect=_ProcessCrash("process stopped after pull-request write"),
+            pull_requests,
+            "observe",
+            side_effect=observe_then_crash,
         )
         expected = _ProcessCrash
     else:
@@ -160,8 +173,14 @@ def _send(args) -> int:
         expected = publish_stage.PublishIncomplete
     try:
         with failure:
-            execute_stage(command_id=command.command_id, handler=handler, services=services)
+            result = execute_stage(
+                command_id=command.command_id,
+                handler=handler,
+                services=services,
+            )
     except expected:
+        return 23
+    if isinstance(result, StagePending):
         return 23
     raise AssertionError("The send process was expected to stop with an unresolved effect")
 
