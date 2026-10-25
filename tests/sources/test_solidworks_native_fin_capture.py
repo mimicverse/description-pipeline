@@ -3730,7 +3730,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     expected = "cofaces have the same orientation"
                 else:
                     senses[0]["EdgeInFaceSense"]["value"] = None
-                    expected = "primary orientation is unreadable"
+                    expected = "primary face sense is unreadable"
                 with self.assertRaisesRegex(PipelineError, expected):
                     parse_native_tessellation(
                         "part-1",
