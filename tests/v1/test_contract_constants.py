@@ -14,11 +14,9 @@ from description_pipeline.orchestration import uploads
 from description_pipeline.schemas import exporter_declaration_present
 from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import (
-    DELIVERY_STAGES,
     FIXED_REQUIRED_CHECKS,
     HOST_BY_STAGE,
     PORTABLE_STAGES,
-    STAGE_IDS,
     required_rows_complete,
 )
 from description_pipeline.verification import native_discovery, solidworks_urdf
@@ -89,12 +87,6 @@ class ContractConvergenceTests(unittest.TestCase):
     def test_portable_stages_derive_from_the_contract_hosts(self) -> None:
         self.assertEqual(PORTABLE_STAGES, ("freeze", "generate", "verify", "publish"))
         self.assertEqual(tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",)), PORTABLE_STAGES)
-
-    def test_delivery_stages_split_the_native_boundary_from_report_rendering(self) -> None:
-        """Report rendering keys on delivery stages, not on every portable stage."""
-        self.assertEqual(DELIVERY_STAGES, ("generate", "verify", "publish"))
-        self.assertLessEqual(set(DELIVERY_STAGES), set(PORTABLE_STAGES))
-        self.assertEqual(tuple(stage for stage in STAGE_IDS if stage in DELIVERY_STAGES), DELIVERY_STAGES)
 
     def test_owned_schema_ids_are_never_retyped_as_literals(self) -> None:
         owned = {

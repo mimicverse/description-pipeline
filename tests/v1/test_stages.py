@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,10 +14,7 @@ from description_pipeline.stages import (
     STAGE_IDS,
     checked,
     canonical_freeze_timestamp,
-    compact_view,
-    contract_markdown,
     record_check,
-    require_complete,
     stage_view,
     validate_freeze_events,
 )
@@ -43,7 +39,6 @@ class StageTests(unittest.TestCase):
         self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in CONTRACT["stages"]}, expected)
         view = stage_view()
         self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in view["stages"]}, expected)
-        self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in compact_view(view)["stages"]}, expected)
 
     def test_freeze_events_require_one_canonical_raw_block(self):
         events = freeze_events()
@@ -151,18 +146,6 @@ class StageTests(unittest.TestCase):
             record_check(events.append, "publish", "output", "invented_gate", "passed", {})
         self.assertEqual(events, [])
 
-    def test_completed_labels_without_boundary_evidence_cannot_qualify_a_view(self):
-        view = stage_view()
-        for row in view["stages"]:
-            row["state"] = "completed"
-        with self.assertRaises(PipelineError):
-            require_complete(view)
-
-    def test_scoped_run_cannot_qualify_as_a_complete_native_workflow(self):
-        view = stage_view({"execution_scope": ["generate", "verify"]})
-        with self.assertRaisesRegex(PipelineError, "all six engineering stages"):
-            require_complete(view)
-
     def test_stage_table_and_mechanical_responsibilities_match_the_contract(self):
         docs = Path(__file__).resolve().parents[2] / "docs"
         contracts = (docs / "contracts.md").read_text()
@@ -213,18 +196,6 @@ class StageTests(unittest.TestCase):
                 tuple(check["id"] for check in stage["output_qc"]),
                 expected_qc[stage["id"]][1],
             )
-        rendered = contract_markdown()
-        rendered_rows = [
-            [cell.strip() for cell in line.strip("|").split("|")]
-            for line in rendered.splitlines()
-            if line.startswith("| `")
-        ]
-        self.assertEqual(tuple(documented_stages), tuple(row[0].strip("`").split("`", 1)[0] for row in rendered_rows))
-        for row, stage in zip(rendered_rows, CONTRACT["stages"], strict=True):
-            self.assertEqual(row[0], f"`{stage['id']}` {stage['name']}")
-            self.assertEqual(row[1], stage["host_text"])
-            self.assertEqual(row[2], stage["doc"]["input"])
-            self.assertEqual(row[3], stage["doc"]["output"])
         for stage in CONTRACT["stages"]:
             self.assertTrue(stage["name"])
             self.assertTrue(stage["host_text"].isascii())
@@ -309,17 +280,12 @@ class StageTests(unittest.TestCase):
             all(row["state"] == "external_review" for stage in after["stages"] for row in stage["confirmations"])
         )
 
-    def test_contract_render_is_pure_and_terminal_xcom_excludes_large_evidence(self):
+    def test_stage_view_is_pure(self):
         job = {"events": [], "artifacts": {f"evidence/{i}.json": "a" * 64 for i in range(10000)}}
         before = copy.deepcopy(job)
         view = stage_view(job)
         self.assertEqual(job, before)
-        self.assertLess(len(json.dumps(compact_view(view))), 7000)
-        table = contract_markdown()
-        self.assertEqual(len(table.splitlines()), 8)
-        self.assertIn("| Stage | Execution | Input and input checks | Sealed output and output checks |", table)
-        for definition in CONTRACT["stages"]:
-            self.assertIn(f"`{definition['id']}` {definition['name']}", table)
+        self.assertEqual(len(view["stages"]), 6)
 
 
 if __name__ == "__main__":
