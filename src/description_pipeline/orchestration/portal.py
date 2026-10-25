@@ -847,9 +847,14 @@ def _production_admission_runtime(
         )
         from ..pipeline.ingestion import load_production_admission
         from ..pipeline.ingestion import load_production_freeze_successor
+        from ..pipeline.native_target import (
+            load_registered_native_target,
+        )
 
+        native_target = load_registered_native_target(snapshot)
         client = NativeOperationClient(
-            NativeOperationEndpoint(base_url=url, token=token)
+            NativeOperationEndpoint(base_url=url, token=token),
+            target_id=native_target.target_id,
         )
         runtime_environment = {
             **dict(environ),
@@ -859,6 +864,7 @@ def _production_admission_runtime(
         application = application_from_environment(
             runtime_environment,
             native_operation_client=client,
+            native_target_identity=native_target,
         )
         artifacts = application.artifacts
         tool_provider = NativeOperationToolProvider(client)

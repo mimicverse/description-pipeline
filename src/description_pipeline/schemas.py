@@ -20,7 +20,7 @@ NATIVE_IDENTITY_RESOLUTION_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"
 
 #: Canonical six-stage records and external-effect envelopes.  These ids cross
 #: process and persistence boundaries and therefore have one owner here.
-ADMISSION_SPEC_SCHEMA = "solidworks-to-urdf.admission-spec/v2"
+ADMISSION_SPEC_SCHEMA = "solidworks-to-urdf.admission-spec/v3"
 AIRFLOW_DISPATCH_CONF_SCHEMA = "solidworks-to-urdf.airflow-dispatch-conf/v1"
 AIRFLOW_DISPATCH_EFFECT_SCHEMA = "solidworks-to-urdf.airflow-dispatch-effect/v1"
 ARTIFACT_MANIFEST_SCHEMA = "solidworks-to-urdf.artifact-manifest/v1"

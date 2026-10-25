@@ -493,6 +493,7 @@ class CaptureHandlerTests(unittest.TestCase):
             "upload_inventory_sha256": digest(self.stage_fixture.source_files),
             "ruleset_catalog_sha256": self.ruleset_ref.set_sha256,
             "platform_config_sha256": self.stage_fixture.platform_config_sha256,
+            "native_target_identity": CAPTURE_TARGET.to_record(),
         }
         freeze_command = StageCommand.create(
             command_id="freeze-command",

@@ -14,6 +14,7 @@ from description_pipeline.pipeline.contracts import (
     ArtifactRef,
     DiagnosticReplayScope,
     ExecutionClaim,
+    NativeTargetIdentity,
     StageCandidate,
     StageCommand,
     StageDecision,
@@ -201,6 +202,10 @@ class FreezeHarness:
             for path in sorted(self.originals.rglob("*"))
             if path.is_file()
         }
+        self.native_target = NativeTargetIdentity.create(
+            install_id="win-" + "a" * 32,
+            pipeline_id="solidworks-to-urdf",
+        )
 
     def request(self, **overrides):
         record = {
@@ -218,6 +223,7 @@ class FreezeHarness:
             "upload_inventory_sha256": digest(self.upload_files),
             "ruleset_catalog_sha256": self.ruleset_ref.set_sha256,
             "platform_config_sha256": self.platform_config_sha256,
+            "native_target_identity": self.native_target.to_record(),
         }
         record.update(overrides)
         return record

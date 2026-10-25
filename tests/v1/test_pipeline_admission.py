@@ -44,6 +44,7 @@ from description_pipeline.pipeline.admission import (
 from description_pipeline.pipeline.admission import ADMISSION_SPEC_SCHEMA
 from description_pipeline.pipeline.contracts import (
     ArtifactRef,
+    NativeTargetIdentity,
     ProtocolError,
     StageCommand,
     StageDecision,
@@ -158,6 +159,10 @@ class AdmissionHarness:
             ruleset_files["catalog.json"],
         )
         self.publish_intent = self._publish_intent()
+        self.native_target_identity = NativeTargetIdentity.create(
+            install_id="win-" + "a" * 32,
+            pipeline_id="solidworks-to-urdf",
+        )
         self.spec = AdmissionSpec(
             schema_version=ADMISSION_SPEC_SCHEMA,
             run_id="run-1",
@@ -191,6 +196,7 @@ class AdmissionHarness:
             platform_config_sha256=digest({"platform-config": 1}),
             publish_intent=self.publish_intent,
             created_at=datetime(2026, 10, 25, 9, 30, tzinfo=UTC),
+            native_target_identity=self.native_target_identity,
         )
 
     def _publish_intent(self) -> VerifiedPublishIntent:
@@ -382,6 +388,10 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(first.request["request_id"], self.harness.spec.request_id)
         self.assertEqual(first.request["originals_artifact_id"], self.harness.originals_ref.artifact_id)
         self.assertEqual(
+            first.request["native_target_identity"],
+            self.harness.native_target_identity.to_record(),
+        )
+        self.assertEqual(
             first.input_artifacts,
             (
                 self.harness.originals_ref,
@@ -396,6 +406,18 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(restored, self.harness.spec)
         self.assertEqual(restored.admission_sha256, self.harness.spec.admission_sha256)
         self.assertEqual(build_freeze_command(restored), self.command)
+
+    def test_native_commands_refuse_a_spec_without_a_registered_target(self) -> None:
+        untargeted = replace(
+            self.harness.spec,
+            native_target_identity=None,
+        )
+        with self.assertRaises(ProtocolError) as raised:
+            build_freeze_command(untargeted)
+        self.assertEqual(
+            raised.exception.code,
+            "admission.native_target_identity_missing",
+        )
 
     def test_run_admission_frozen_request_rebuilds_the_same_spec(self) -> None:
         restored = AdmissionSpec.from_record(build_run_admission(self.harness.spec).request)
@@ -506,6 +528,10 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(
             discover.request["native_tool_requirement_artifact_id"],
             self.harness.spec.native_tool_requirement.ref.artifact_id,
+        )
+        self.assertEqual(
+            discover.request["native_target_identity"],
+            self.harness.native_target_identity.to_record(),
         )
         self.assertEqual(discover.request["submission_identity"]["owner"], self.harness.spec.principal)
         self.assertEqual(discover.request["submission_identity"]["hardware_id"], self.harness.spec.target_hardware)
@@ -623,6 +649,7 @@ class AdmissionProjectionTests(unittest.TestCase):
                 "native_tool_source_sha256",
                 "native_tool_record_sha256",
                 "native_tool_requirement_artifact_id",
+                "native_target_identity",
                 "prepared_sha256",
                 "upload_sha256",
             },
@@ -648,6 +675,10 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(
             capture_command.request["native_tool_requirement_artifact_id"],
             self.harness.spec.native_tool_requirement.ref.artifact_id,
+        )
+        self.assertEqual(
+            capture_command.request["native_target_identity"],
+            self.harness.native_target_identity.to_record(),
         )
         self.assertNotEqual(
             capture_command.expected_executor_sha256,

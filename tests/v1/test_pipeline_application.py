@@ -24,6 +24,7 @@ from description_pipeline.pipeline.application import (
     ApplicationPortMissing,
     EffectWakeupHint,
     StageApplication,
+    _plain,
     _shared_maintenance_gate,
     application_from_environment,
 )
@@ -37,6 +38,7 @@ from description_pipeline.pipeline.contracts import (
     StageDecision,
     StageEffectWait,
     StageExecution,
+    NativeTargetIdentity,
     StagePending,
     StageResult,
 )
@@ -658,7 +660,7 @@ class StageApplicationTests(unittest.TestCase):
             run_id="diagnostic-run",
             stage="freeze",
             idempotency_key="diagnostic-run/freeze",
-            request=formal.request,
+            request=_plain(formal.request),
             input_artifacts=formal.input_artifacts,
             config_snapshot_sha256=formal.config_snapshot_sha256,
             contract_sha256=formal.contract_sha256,
@@ -719,11 +721,16 @@ class StageApplicationTests(unittest.TestCase):
 
     def test_environment_composition_uses_the_portable_source_identity(self):
         executor = "a" * 64
+        native_target = NativeTargetIdentity.create(
+            install_id="win-" + "a" * 32,
+            pipeline_id="solidworks-to-urdf",
+        )
         token = self.root / "endpoint.token"
         token.write_text("t" * 40, encoding="utf-8")
         token.chmod(0o600)
         environment = {
             "PLATFORM_ARTIFACT_ROOT": str(self.root / "factory-cas"),
+            "PLATFORM_CONFIG_SNAPSHOT": str(self.root / "platform-snapshot.json"),
             "PLATFORM_SERVICE_DSN": "postgresql://unused/unused",
             "PIPELINE_WORK_ROOT": str(self.root / "factory-work"),
             "SOLIDWORKS_ENDPOINT_URL": "http://127.0.0.1:18765",
@@ -732,12 +739,36 @@ class StageApplicationTests(unittest.TestCase):
         with patch(
             "description_pipeline.pipeline.application.tool_record",
             return_value={"source_sha256": executor},
+        ), patch(
+            "description_pipeline.pipeline.application."
+            "load_registered_native_target",
+            return_value=native_target,
         ):
             application = application_from_environment(environment)
         self.assertEqual(application.services.claim_policy.executor_sha256, executor)
+        self.assertEqual(application.native_target_identity, native_target)
         self.assertIn("capture", application.handlers)
         self.assertIn("discover", application.handlers)
         self.assertIsInstance(application.handlers["publish"], PublishHandler)
+        with (
+            patch(
+                "description_pipeline.pipeline.application.tool_record",
+                return_value={"source_sha256": executor},
+            ),
+            patch(
+                "description_pipeline.pipeline.application."
+                "load_registered_native_target",
+                return_value=native_target,
+            ),
+            self.assertRaisesRegex(
+                ApplicationError,
+                "differs from the registered target",
+            ),
+        ):
+            application_from_environment(
+                environment,
+                native_operation_client=Mock(target_id="0" * 64),
+            )
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ from .admission import (
 from .contracts import DispatchCommand, ProtocolError, RunAdmission, StageCommand
 from .discover import CONFIGURATION_KIND, RULESET_KIND, SOURCE_SET_KIND
 from .freeze import RulesetCatalog, RulesetRoot
+from .native_target import load_registered_native_target
 from .publish_contract import REPOSITORY_SNAPSHOT_KIND, REPOSITORY_SNAPSHOT_METADATA
 from ..orchestration.feishu_oauth import valid_actor_principal
 
@@ -746,6 +747,23 @@ class PreparedAdmission:
     def register(self, application: AdmissionApplication) -> AdmissionOutcomePort:
         if not callable(getattr(application, "admit", None)):
             raise TypeError("application must provide admit(spec)")
+        application_target = getattr(
+            application,
+            "native_target_identity",
+            None,
+        )
+        expected_target = self.spec.require_native_target_identity()
+        if (
+            application_target is not None
+            and application_target != expected_target
+        ):
+            raise ProtocolError(
+                "admission_ingestion.native_target_mismatch",
+                {
+                    "application": application_target.to_record(),
+                    "admission": expected_target.to_record(),
+                },
+            )
         outcome = application.admit(self.spec)
         self.validate_outcome(outcome)
         return outcome
@@ -1251,6 +1269,10 @@ class ProductionAdmissionFactory:
                 portable_tool,
             )
         )
+        native_target_identity = load_registered_native_target(
+            self.platform_snapshot,
+            snapshot_bytes=snapshot_bytes,
+        )
         created_at = self._now()
         if originals is None:
             if not isinstance(request, ProductionAdmissionRequest):
@@ -1298,6 +1320,7 @@ class ProductionAdmissionFactory:
             platform_config_sha256=platform_config_sha256,
             publish_intent=publish_intent,
             created_at=created_at,
+            native_target_identity=native_target_identity,
         )
         return PreparedAdmission(
             spec=spec,

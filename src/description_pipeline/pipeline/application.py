@@ -58,6 +58,7 @@ from .contracts import (
     DispatchConf,
     EffectKind,
     FailureEnvelope,
+    NativeTargetIdentity,
     RunAdmission,
     StageCommand,
     StageDecision,
@@ -71,6 +72,7 @@ from .dispatch import DispatchAdapter, DispatchResult, TechnicalDispatchService
 from .effects import EffectIntent
 from .engine import StageAttemptResult, StageHandler, StageServices, execute_stage
 from .freeze import FreezeHandler
+from .native_target import load_registered_native_target
 from .services import CanonicalStageServices, ClaimPolicy
 from .reconciliation import (
     EffectReconciliationAdapter,
@@ -192,6 +194,8 @@ def _portable_executor_sha256() -> str:
 
 def _native_client_from_environment(
     source: Mapping[str, str],
+    *,
+    target_id: str,
 ) -> NativeOperationClient:
     """Build the loopback client without contacting the Windows endpoint."""
 
@@ -247,7 +251,10 @@ def _native_client_from_environment(
             "application.native_endpoint_invalid",
             str(error),
         ) from error
-    return NativeOperationClient(endpoint)
+    return NativeOperationClient(
+        endpoint,
+        target_id=target_id,
+    )
 
 
 @contextmanager
@@ -326,6 +333,24 @@ def _transfer_resume_gate_from_environment(
         return _shared_maintenance_gate(snapshot_path)
 
     return gate
+
+
+def _registered_native_target_from_environment(
+    source: Mapping[str, str],
+) -> NativeTargetIdentity:
+    snapshot_value = source.get("PLATFORM_CONFIG_SNAPSHOT")
+    if not snapshot_value:
+        raise ApplicationPortMissing(
+            "application.native_target_missing",
+            "PLATFORM_CONFIG_SNAPSHOT is required to load the registered native target",
+        )
+    try:
+        return load_registered_native_target(snapshot_value)
+    except PipelineError as error:
+        raise ApplicationError(
+            "application.native_target_invalid",
+            str(error),
+        ) from error
 
 
 class AdmissionFactPort(Protocol):
@@ -519,6 +544,7 @@ class StageApplication:
         reconciler: EffectReconciliationService | None = None,
         reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
         cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
+        native_target_identity: NativeTargetIdentity | None = None,
     ) -> None:
         if getattr(services, "facts", facts) is not facts:
             raise ApplicationError("application.store_identity_mismatch", "Stage services use another fact store")
@@ -528,6 +554,15 @@ class StageApplication:
         self.facts = facts
         self.artifacts = artifacts
         self.clock = clock
+        if native_target_identity is not None and not isinstance(
+            native_target_identity,
+            NativeTargetIdentity,
+        ):
+            raise ApplicationError(
+                "application.native_target_invalid",
+                "native_target_identity must be a NativeTargetIdentity",
+            )
+        self.native_target_identity = native_target_identity
         adapters = dict(reconciliation_adapters or {})
         unknown_kinds = set(adapters) - _EFFECT_KINDS
         if unknown_kinds:
@@ -1381,6 +1416,7 @@ def build_stage_application(
     reconciler: EffectReconciliationService | None = None,
     reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
     cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
+    native_target_identity: NativeTargetIdentity | None = None,
 ) -> StageApplication:
     """Construct one immutable application from explicit ports; no hidden fallback exists."""
 
@@ -1394,6 +1430,7 @@ def build_stage_application(
         reconciler=reconciler,
         reconciliation_adapters=reconciliation_adapters,
         cancellation_controllers=cancellation_controllers,
+        native_target_identity=native_target_identity,
     )
 
 
@@ -1406,6 +1443,7 @@ def application_from_environment(
     handlers: Mapping[StageId, StageHandler] | None = None,
     builders: Mapping[StageId, CommandBuilder] | None = None,
     native_operation_client: NativeOperationClient | None = None,
+    native_target_identity: NativeTargetIdentity | None = None,
     reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
     cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
     airflow_task_binding: AirflowTaskBinding | None = None,
@@ -1420,6 +1458,29 @@ def application_from_environment(
     if not work_root:
         raise ApplicationError("application.work_root_missing", "PIPELINE_WORK_ROOT is not configured")
     executor_sha256 = _portable_executor_sha256()
+    registered_target = (
+        native_target_identity
+        if native_target_identity is not None
+        else _registered_native_target_from_environment(source)
+    )
+    if not isinstance(registered_target, NativeTargetIdentity):
+        raise ApplicationError(
+            "application.native_target_invalid",
+            "native_target_identity must be a NativeTargetIdentity",
+        )
+    if (
+        native_operation_client is not None
+        and getattr(native_operation_client, "target_id", None)
+        != registered_target.target_id
+    ):
+        raise ApplicationError(
+            "application.native_client_target_mismatch",
+            "The injected native client differs from the registered target",
+            detail={
+                "registered": registered_target.target_id,
+                "client": getattr(native_operation_client, "target_id", None),
+            },
+        )
     owner_sha256 = digest({"process": str(uuid.uuid4()), "pid": os.getpid()})
     lease_seconds = float(source.get("PIPELINE_CLAIM_LEASE_SECONDS", "3600"))
     if airflow_task_binding is None:
@@ -1459,7 +1520,10 @@ def application_from_environment(
         client = (
             native_operation_client
             if native_operation_client is not None
-            else _native_client_from_environment(source)
+            else _native_client_from_environment(
+                source,
+                target_id=registered_target.target_id,
+            )
         )
         tool_provider = NativeOperationToolProvider(client)
         if discover_adapter is None:
@@ -1580,6 +1644,7 @@ def application_from_environment(
         reconciler=reconciler,
         reconciliation_adapters=adapters,
         cancellation_controllers=controllers,
+        native_target_identity=registered_target,
     )
 __all__ = [
     "STAGES",

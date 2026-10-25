@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -28,7 +29,7 @@ from description_pipeline.artifacts import ArtifactStore, ArtifactStoreError
 from description_pipeline import __version__
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.interface_records import config_snapshot_digest
-from description_pipeline.io import PipelineError, canonical, digest
+from description_pipeline.io import PipelineError, canonical, digest, write_json
 from description_pipeline.pipeline.admission import (
     ADMISSION_SPEC_SCHEMA,
     AdmissionSpec,
@@ -39,10 +40,12 @@ from description_pipeline.pipeline.application import (
     AdmissionOutcome,
     ApplicationError,
     StageApplication,
+    _plain as _application_plain,
 )
 from description_pipeline.pipeline.contracts import (
     DispatchCommand,
     DispatchConf,
+    NativeTargetIdentity,
     ProtocolError,
     StageCommand,
 )
@@ -62,6 +65,9 @@ from description_pipeline.pipeline.ingestion import (
     load_production_admission,
     load_production_freeze_successor,
 )
+from description_pipeline.pipeline.native_target import (
+    load_registered_native_target,
+)
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.publish_contract import REPOSITORY_SNAPSHOT_FILE
 from description_pipeline.pipeline.stages.generate import GenerateHandler
@@ -70,6 +76,7 @@ from description_pipeline.repository.publish import materialize_repository_snaps
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     CONFIG_SNAPSHOT_SCHEMA,
+    INSTALL_RECORD_SCHEMA,
     PLATFORM_CONFIG_SCHEMA,
     TOOL_SCHEMA,
 )
@@ -266,6 +273,94 @@ class ProductionAdmissionTests(unittest.TestCase):
         }
         self.native_reads = 0
         self.artifacts = ArtifactStore(self.artifacts_root)
+        self.native_target = NativeTargetIdentity.create(
+            install_id="win-" + "1" * 32,
+            pipeline_id=PIPELINE_ID,
+        )
+        self._write_install_record()
+
+    def _write_install_record(
+        self,
+        *,
+        target: NativeTargetIdentity | None = None,
+        snapshot_path: Path | None = None,
+    ) -> None:
+        target = self.native_target if target is None else target
+        snapshot_path = (
+            self.snapshot_path
+            if snapshot_path is None
+            else Path(snapshot_path)
+        )
+        snapshot_sha256 = hashlib.sha256(
+            snapshot_path.read_bytes()
+        ).hexdigest()
+        release_source_sha256 = digest(
+            {
+                "source_commit": self.release_common["source_commit"],
+                "source_tree": self.release_common["source_tree"],
+            }
+        )
+        release = {
+            "version": self.release_common["version"],
+            "source_commit": self.release_common["source_commit"],
+            "source_sha256": release_source_sha256,
+            "artifacts": [
+                {
+                    "name": "fixture.whl",
+                    "sha256": digest({"fixture": "artifact"}),
+                }
+            ],
+        }
+        record = {
+            "schema_version": INSTALL_RECORD_SCHEMA,
+            "install_id": "install-fixture",
+            "timestamp": "2026-10-25T00:00:00Z",
+            "snapshot": {
+                "path": str(snapshot_path),
+                "digest": snapshot_sha256,
+                "install_id": "install-fixture",
+            },
+            "release": release,
+            "services": ["description-postgres"],
+            "paths": {"state_root": str(self.state)},
+            "dag": {
+                "id": "solidworks_to_urdf",
+                "path": "/srv/description/dags/solidworks_to_urdf.py",
+                "digest": digest({"dag": "fixture"}),
+                "tasks": 6,
+            },
+            "ends": {
+                "linux": {
+                    "install_id": "install-fixture",
+                    "config_digest": snapshot_sha256,
+                    "release": {
+                        "version": self.portable_release["version"],
+                        "source_commit": self.portable_release["source_commit"],
+                        "source_sha256": release_source_sha256,
+                        "role": "portable",
+                    },
+                },
+                "windows": {
+                    "install_id": target.install_id,
+                    "config_digest": digest({"windows": "config"}),
+                    "release": {
+                        "version": self.native_release["version"],
+                        "source_commit": self.native_release["source_commit"],
+                        "source_sha256": release_source_sha256,
+                        "role": "native",
+                    },
+                    "target_identity": target.to_record(),
+                },
+            },
+            "previous": None,
+            "journal": [],
+        }
+        write_json(self.state / "install-record.json", record)
+
+    def _write_snapshot(self, snapshot: dict) -> None:
+        self.snapshot_path.write_bytes(canonical(snapshot))
+        self.snapshot_bytes = self.snapshot_path.read_bytes()
+        self._write_install_record()
 
     def _repository(self) -> Path:
         source = self.root / "repository-source"
@@ -782,7 +877,7 @@ class ProductionAdmissionTests(unittest.TestCase):
             "repository_slug": "mimicverse/robot",
             "base": "main",
         }
-        self.snapshot_path.write_bytes(canonical(current_snapshot))
+        self._write_snapshot(current_snapshot)
         (self.checkout / "README.md").write_text(
             "fixture\nsuccessor-current-generation\n",
             encoding="utf-8",
@@ -996,6 +1091,20 @@ class ProductionAdmissionTests(unittest.TestCase):
         prepared = self._factory(work_root=work).prepare(self.request)
         spec = prepared.spec
         self.assertEqual(spec.schema_version, ADMISSION_SPEC_SCHEMA)
+        self.assertEqual(spec.native_target_identity, self.native_target)
+        self.assertEqual(
+            AdmissionSpec.from_record(spec.to_record()),
+            spec,
+        )
+        self.assertEqual(
+            prepared.run_admission.request["native_target_identity"],
+            self.native_target.to_record(),
+        )
+        freeze_command = build_freeze_command(spec)
+        self.assertEqual(
+            freeze_command.request["native_target_identity"],
+            self.native_target.to_record(),
+        )
         self.assertEqual(spec.originals.inventory, describe_handoff(self.upload / "CAD")["files"])
         ruleset_root = self.artifacts.materialize(
             spec.ruleset.artifact.ref,
@@ -1051,6 +1160,164 @@ class ProductionAdmissionTests(unittest.TestCase):
         self.assertNotIn(str(self.checkout), json.dumps(serialized))
         restored = AdmissionSpec.from_record(serialized)
         self.assertEqual(restored, spec)
+
+    def test_same_request_retry_reuses_the_sealed_native_target(self) -> None:
+        class Application:
+            outcome = None
+
+            @classmethod
+            def load_admission_outcome(cls, run_id):
+                del run_id
+                return cls.outcome
+
+            @classmethod
+            def admit(cls, spec):
+                cls.outcome = _admission_outcome(self.artifacts, spec)
+                return cls.outcome
+
+        first_work = self.root / "retry-first"
+        first_work.mkdir()
+        first = self._factory(work_root=first_work).admit(
+            Application,
+            self.request,
+        )
+        original_spec = AdmissionSpec.from_record(first.admission.request)
+        self.assertEqual(
+            original_spec.native_target_identity,
+            self.native_target,
+        )
+        replacement = NativeTargetIdentity.create(
+            install_id="win-" + "2" * 32,
+            pipeline_id=PIPELINE_ID,
+        )
+        self._write_install_record(target=replacement)
+
+        def unavailable_provider():
+            raise AssertionError("existing admission must not reread current tools")
+
+        second_work = self.root / "retry-second"
+        second_work.mkdir()
+        retried = ProductionAdmissionFactory(
+            artifacts=self.artifacts,
+            platform_snapshot=self.snapshot_path,
+            native_tool_provider=unavailable_provider,
+            work_root=second_work,
+            clock=lambda: datetime(
+                2026,
+                10,
+                25,
+                11,
+                tzinfo=UTC,
+            ),
+            portable_tool_provider=unavailable_provider,
+        ).admit(Application, self.request)
+        self.assertEqual(retried, first)
+        self.assertEqual(
+            AdmissionSpec.from_record(
+                retried.admission.request
+            ).native_target_identity,
+            self.native_target,
+        )
+
+    def test_registered_target_loader_rejects_alias_and_snapshot_drift(self) -> None:
+        from description_pipeline.io import read_data
+
+        record_path = self.state / "install-record.json"
+        exact = read_data(record_path)
+        variants = []
+        alias = copy.deepcopy(exact)
+        alias["snapshot"]["path"] = str(
+            self.state / ".." / self.snapshot_path.name
+        )
+        variants.append(alias)
+        wrong_root = copy.deepcopy(exact)
+        wrong_root["paths"]["state_root"] = str(self.root / "other-state")
+        variants.append(wrong_root)
+        wrong_pipeline = copy.deepcopy(exact)
+        wrong_pipeline["ends"]["windows"]["target_identity"][
+            "pipeline_id"
+        ] = "another-pipeline"
+        variants.append(wrong_pipeline)
+        for mutation in variants:
+            with self.subTest(mutation=mutation):
+                write_json(record_path, mutation)
+                with self.assertRaises(ProtocolError):
+                    load_registered_native_target(self.snapshot_path)
+
+        write_json(record_path, exact)
+        self.assertEqual(
+            load_registered_native_target(self.snapshot_path),
+            self.native_target,
+        )
+        record_path.unlink()
+        with self.assertRaises(ProtocolError):
+            load_registered_native_target(self.snapshot_path)
+
+    def test_admission_cannot_splice_snapshot_a_with_target_b(self) -> None:
+        replacement = NativeTargetIdentity.create(
+            install_id="win-" + "3" * 32,
+            pipeline_id=PIPELINE_ID,
+        )
+        provider_called = False
+
+        def switch_snapshot_and_target():
+            nonlocal provider_called
+            if provider_called:
+                return self.native_tool
+            provider_called = True
+            replacement_snapshot = self._config_snapshot()
+            replacement_snapshot["generated_at"] = "2026-10-25T01:00:00Z"
+            self.snapshot_path.write_bytes(canonical(replacement_snapshot))
+            self._write_install_record(target=replacement)
+            return self.native_tool
+
+        work = self.root / "race-work"
+        work.mkdir()
+        factory = ProductionAdmissionFactory(
+            artifacts=self.artifacts,
+            platform_snapshot=self.snapshot_path,
+            native_tool_provider=switch_snapshot_and_target,
+            work_root=work,
+            clock=lambda: datetime(
+                2026,
+                10,
+                25,
+                10,
+                tzinfo=UTC,
+            ),
+            portable_tool_provider=lambda: self.portable_tool,
+        )
+        with self.assertRaises(ProtocolError) as raised:
+            factory.prepare(self.request)
+        self.assertEqual(
+            raised.exception.code,
+            "native_target.install_record_snapshot_mismatch",
+        )
+
+    def test_application_client_target_must_match_admitted_target(self) -> None:
+        work = self.root / "application-target-mismatch"
+        work.mkdir()
+        prepared = self._factory(work_root=work).prepare(self.request)
+        foreign = NativeTargetIdentity.create(
+            install_id="win-" + "5" * 32,
+            pipeline_id=PIPELINE_ID,
+        )
+
+        class Application:
+            native_target_identity = foreign
+
+            @staticmethod
+            def admit(_spec):
+                raise AssertionError(
+                    "target mismatch must fail before application admission"
+                )
+
+        with self.assertRaises(ProtocolError) as raised:
+            prepared.register(Application())
+        self.assertEqual(
+            raised.exception.code,
+            "admission_ingestion.native_target_mismatch",
+        )
 
     def test_artifact_closure_survives_origin_deletion_and_new_work_root(self) -> None:
         work = self.root / "work"
@@ -1114,7 +1381,7 @@ class ProductionAdmissionTests(unittest.TestCase):
             "repository_slug": "mimicverse/robot",
             "base": "main",
         }
-        self.snapshot_path.write_bytes(canonical(current_snapshot))
+        self._write_snapshot(current_snapshot)
         (self.checkout / "README.md").write_text(
             "fixture\nsuccessor\n",
             encoding="utf-8",
@@ -1346,6 +1613,7 @@ class ProductionAdmissionTests(unittest.TestCase):
         )
         ambiguous_snapshot = self.root / "ambiguous-config.json"
         ambiguous_snapshot.write_bytes(canonical(ambiguous_config))
+        self._write_install_record(snapshot_path=ambiguous_snapshot)
         ambiguous_request = replace(
             self.request,
             run_id="run-ambiguous",
@@ -1553,7 +1821,10 @@ class ProductionAdmissionTests(unittest.TestCase):
                         run_id=original.run_id,
                         stage="freeze",
                         idempotency_key=original.idempotency_key,
-                        request={**dict(original.request), "principal": "other"},
+                        request={
+                            **_application_plain(original.request),
+                            "principal": "other",
+                        },
                         input_artifacts=original.input_artifacts,
                         config_snapshot_sha256=original.config_snapshot_sha256,
                         contract_sha256=original.contract_sha256,
@@ -1584,7 +1855,7 @@ class ProductionAdmissionTests(unittest.TestCase):
         snapshot = self._config_snapshot()
         snapshot["resolved"]["specifications"]["record_roots"] = [str(empty)]
         snapshot["resolved"]["derived"]["discovery"]["record_roots"] = [str(empty)]
-        self.snapshot_path.write_bytes(canonical(snapshot))
+        self._write_snapshot(snapshot)
         with self.assertRaisesRegex(ProtocolError, "ruleset_empty"):
             self._factory(work_root=work).prepare(self.request)
 
@@ -1592,11 +1863,11 @@ class ProductionAdmissionTests(unittest.TestCase):
         other_artifacts.mkdir()
         bad_config = self._config_snapshot()
         bad_config["resolved"]["storage"]["artifact_root"] = str(other_artifacts)
-        self.snapshot_path.write_bytes(canonical(bad_config))
+        self._write_snapshot(bad_config)
         with self.assertRaisesRegex(ProtocolError, "config_mismatch"):
             self._factory(work_root=work).prepare(self.request)
 
-        self.snapshot_path.write_bytes(canonical(self._config_snapshot()))
+        self._write_snapshot(self._config_snapshot())
         bad_target = replace(
             self.request,
             target_hardware="unknown",

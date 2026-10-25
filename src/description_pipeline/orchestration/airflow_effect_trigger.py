@@ -110,7 +110,10 @@ def _expectation_from_operation(
 def _native_expectation(
     evidence: _EffectEvidence,
 ) -> tuple[str, NativeOperationStatusExpectation]:
-    from ..schemas import NATIVE_CAPTURE_EFFECT_SCHEMA
+    from ..schemas import (
+        NATIVE_CAPTURE_EFFECT_SCHEMA,
+        NATIVE_DISCOVER_EFFECT_SCHEMA,
+    )
     from .native_operation_client import MAX_OPERATION_JSON_BYTES
     from .native_operation_runtime import (
         CAPTURE_KIND,
@@ -274,7 +277,10 @@ def _native_probe_from_environment(
     if evidence.intent.effect_kind != "native_operation":
         raise ValueError("The pending effect is not a native operation")
     _kind, expected = _native_expectation(evidence)
-    return _native_client_from_environment(os.environ), expected
+    return _native_client_from_environment(
+        os.environ,
+        target_id=expected.target_id,
+    ), expected
 
 
 def _native_wakeable(view: object | None) -> bool:

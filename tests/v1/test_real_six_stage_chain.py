@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -54,8 +55,10 @@ from description_pipeline.pipeline.verify import VerifyHandler
 from description_pipeline.platform.facts import FactStore
 from description_pipeline.schemas import (
     CONFIG_SNAPSHOT_SCHEMA,
+    INSTALL_RECORD_SCHEMA,
     PLATFORM_CONFIG_SCHEMA,
 )
+from description_pipeline.pipeline.contracts import NativeTargetIdentity
 from description_pipeline.sources.solidworks.handoff import describe_handoff
 from description_pipeline.stages import CONTRACT_SHA256
 
@@ -197,6 +200,10 @@ class RealSixStageChainTests(unittest.TestCase):
         self.store = self.publish.store
         self.portable = _portable_tool()
         self.native = _native_tool()
+        self.native_target = NativeTargetIdentity.create(
+            install_id="win-" + "4" * 32,
+            pipeline_id="solidworks-to-urdf",
+        )
         release = {
             "schema_version": "solidworks-to-urdf.release/v1",
             "pipeline_id": "solidworks-to-urdf",
@@ -394,8 +401,68 @@ class RealSixStageChainTests(unittest.TestCase):
         }
         path = self.root / "config-snapshot.json"
         write_json(path, snapshot)
+        self._write_install_record(path, snapshot)
         self.platform_snapshot_path = path
         return path
+
+    def _write_install_record(self, path: Path, snapshot: dict) -> None:
+        state_root = Path(snapshot["resolved"]["storage"]["state_root"])
+        snapshot_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        release_common = self.portable["release"]
+        release_triple = {
+            "version": release_common["version"],
+            "source_commit": release_common["source_commit"],
+            "source_sha256": release_common["source_sha256"],
+        }
+        record = {
+            "schema_version": INSTALL_RECORD_SCHEMA,
+            "install_id": snapshot["install_id"],
+            "timestamp": "2026-10-25T00:00:00Z",
+            "snapshot": {
+                "path": str(path),
+                "digest": snapshot_sha256,
+                "install_id": snapshot["install_id"],
+            },
+            "release": {
+                **release_triple,
+                "artifacts": [
+                    {
+                        "name": "fixture.whl",
+                        "sha256": digest({"fixture": "artifact"}),
+                    }
+                ],
+            },
+            "services": ["description-postgres"],
+            "paths": {"state_root": str(state_root)},
+            "dag": {
+                "id": "solidworks_to_urdf",
+                "path": "/srv/description/dags/solidworks_to_urdf.py",
+                "digest": digest({"dag": "fixture"}),
+                "tasks": 6,
+            },
+            "ends": {
+                "linux": {
+                    "install_id": snapshot["install_id"],
+                    "config_digest": snapshot_sha256,
+                    "release": {
+                        **release_triple,
+                        "role": "portable",
+                    },
+                },
+                "windows": {
+                    "install_id": self.native_target.install_id,
+                    "config_digest": digest({"windows": snapshot_sha256}),
+                    "release": {
+                        **release_triple,
+                        "role": "native",
+                    },
+                    "target_identity": self.native_target.to_record(),
+                },
+            },
+            "previous": None,
+            "journal": [],
+        }
+        write_json(state_root / "install-record.json", record)
 
     def _install_current_tools(
         self,

@@ -40,6 +40,7 @@ from ..sources.solidworks.revision import package_inventory
 from .contracts import (
     ArtifactRef,
     ExecutionClaim,
+    NativeTargetIdentity,
     ProtocolError,
     StageCandidate,
     StageCommand,
@@ -60,6 +61,7 @@ _REQUEST_FIELDS = {
     "change_summary",
     "configuration_artifact_id",
     "main_assembly",
+    "native_target_identity",
     "originals_artifact_id",
     "platform_config_sha256",
     "principal",
@@ -277,6 +279,16 @@ def _validate_request(command: StageCommand) -> dict[str, Any]:
         )
     if request["schema_version"] != FREEZE_REQUEST_SCHEMA:
         raise FreezeRefusal("freeze.request_invalid", "Freeze request schema is unsupported")
+    try:
+        NativeTargetIdentity.from_record(
+            request["native_target_identity"]
+        )
+    except PipelineError as error:
+        raise FreezeRefusal(
+            "freeze.request_invalid",
+            "Freeze native target identity is invalid",
+            {"field": "native_target_identity"},
+        ) from error
     for field in ("request_id", "principal", "target_hardware", "ruleset_version"):
         _text(request[field], "freeze.request_invalid", field)
     if request["purpose"] not in REQUEST_PURPOSES:

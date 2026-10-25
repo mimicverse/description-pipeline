@@ -4206,6 +4206,7 @@ class PortalTests(unittest.TestCase):
 
     def test_config_loader_installs_the_production_admission_runtime(self) -> None:
         from types import SimpleNamespace
+        from description_pipeline.pipeline.contracts import NativeTargetIdentity
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4232,6 +4233,10 @@ class PortalTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_application = SimpleNamespace(artifacts=object())
+            native_target = NativeTargetIdentity.create(
+                install_id="win-" + "a" * 32,
+                pipeline_id="solidworks-to-urdf",
+            )
             environment = {
                 "PLATFORM_CONFIG_SNAPSHOT": str(snapshot),
                 "PLATFORM_ARTIFACT_ROOT": str(artifacts),
@@ -4244,10 +4249,21 @@ class PortalTests(unittest.TestCase):
                     "description_pipeline.pipeline.application.application_from_environment",
                     return_value=fake_application,
                 ) as application_factory,
+                patch(
+                    "description_pipeline.pipeline.native_target."
+                    "load_registered_native_target",
+                    return_value=native_target,
+                ),
             ):
                 config = load_portal_config(config_path)
 
             application_factory.assert_called_once()
+            self.assertEqual(
+                application_factory.call_args.kwargs[
+                    "native_target_identity"
+                ],
+                native_target,
+            )
             self.assertIs(config.production_application, fake_application)
             self.assertIsNotNone(config.production_native_client)
             self.assertEqual(config.production_config_snapshot, snapshot.resolve())

@@ -22,6 +22,7 @@ from ..schemas import (
 )
 from .contracts import (
     ArtifactRef,
+    NativeTargetIdentity,
     ProtocolError,
     RunAdmission,
     StageCommand,
@@ -73,6 +74,7 @@ _ADMISSION_FIELDS = frozenset(
         "native_tool_source_sha256",
         "native_tool_record_sha256",
         "native_tool_requirement",
+        "native_target_identity",
         "originals",
         "parent_run_id",
         "policy_sha256",
@@ -385,6 +387,7 @@ class AdmissionSpec:
     platform_config_sha256: str
     publish_intent: VerifiedPublishIntent
     created_at: datetime
+    native_target_identity: NativeTargetIdentity | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != ADMISSION_SPEC_SCHEMA:
@@ -423,6 +426,14 @@ class AdmissionSpec:
             "platform_config_sha256",
         ):
             _require_digest(getattr(self, field), "admission.invalid", field)
+        if self.native_target_identity is not None and not isinstance(
+            self.native_target_identity,
+            NativeTargetIdentity,
+        ):
+            raise ProtocolError(
+                "admission.invalid",
+                {"where": "native_target_identity"},
+            )
         if (
             not isinstance(self.native_tool_requirement, VerifiedArtifact)
             or self.native_tool_requirement.ref.kind
@@ -444,6 +455,22 @@ class AdmissionSpec:
     def admission_sha256(self) -> str:
         return digest(self.identity_record())
 
+    @property
+    def native_target_id(self) -> str | None:
+        return (
+            None
+            if self.native_target_identity is None
+            else self.native_target_identity.target_id
+        )
+
+    def require_native_target_identity(self) -> NativeTargetIdentity:
+        if self.native_target_identity is None:
+            raise ProtocolError(
+                "admission.native_target_identity_missing",
+                {"target_hardware": self.target_hardware},
+            )
+        return self.native_target_identity
+
     def identity_record(self) -> dict[str, Any]:
         return {
             "change_summary": self.change_summary,
@@ -457,6 +484,11 @@ class AdmissionSpec:
             "native_tool_source_sha256": self.native_tool_source_sha256,
             "native_tool_record_sha256": self.native_tool_record_sha256,
             "native_tool_requirement": self.native_tool_requirement.to_record(),
+            "native_target_identity": (
+                None
+                if self.native_target_identity is None
+                else self.native_target_identity.to_record()
+            ),
             "originals": self.originals.to_record(),
             "parent_run_id": self.parent_run_id,
             "policy_sha256": self.policy_sha256,
@@ -512,6 +544,11 @@ class AdmissionSpec:
             native_tool_record_sha256=record["native_tool_record_sha256"],
             native_tool_requirement=_verified_from_record(
                 record["native_tool_requirement"]
+            ),
+            native_target_identity=(
+                NativeTargetIdentity.from_record(record["native_target_identity"])
+                if record["native_target_identity"] is not None
+                else None
             ),
             contract_sha256=record["contract_sha256"],
             policy_sha256=record["policy_sha256"],
@@ -1084,6 +1121,7 @@ def build_freeze_command(spec: AdmissionSpec) -> StageCommand:
 
     if not isinstance(spec, AdmissionSpec):
         raise ProtocolError("admission.spec_required", {"stage": "freeze"})
+    native_target = spec.require_native_target_identity()
     if spec.from_stage not in {None, "freeze"}:
         raise ProtocolError("admission.stage_mismatch", {"stage": "freeze", "from_stage": spec.from_stage})
     request = {
@@ -1101,6 +1139,7 @@ def build_freeze_command(spec: AdmissionSpec) -> StageCommand:
         "upload_inventory_sha256": spec.originals.inventory_sha256,
         "ruleset_catalog_sha256": spec.ruleset.artifact.ref.set_sha256,
         "platform_config_sha256": spec.platform_config_sha256,
+        "native_target_identity": native_target.to_record(),
     }
     return _base_command(
         spec,
@@ -1134,6 +1173,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         raise ProtocolError("admission.predecessor_invalid", {"stage": "discover"})
     if predecessor.command.run_id != spec.run_id or predecessor.decision.run_id != spec.run_id:
         raise ProtocolError("admission.predecessor_invalid", {"reason": "run-mismatch"})
+    native_target = spec.require_native_target_identity()
     request = {
         "schema_version": DISCOVER_REQUEST_SCHEMA,
         "freeze_artifact_id": predecessor.result.output_artifact.artifact_id,
@@ -1155,6 +1195,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         "native_tool_requirement_artifact_id": (
             spec.native_tool_requirement.ref.artifact_id
         ),
+        "native_target_identity": native_target.to_record(),
     }
     return _base_command(
         spec,
@@ -1193,6 +1234,7 @@ def build_capture_command(
 
     freeze = _require_predecessor(freeze, stage="freeze", run_id=spec.run_id)
     discover = _require_predecessor(discover, stage="discover", run_id=spec.run_id)
+    native_target = spec.require_native_target_identity()
     if (
         discover_result.predecessor != discover
         or discover.command.request.get("freeze_artifact_id") != freeze.result.output_artifact.artifact_id
@@ -1222,6 +1264,7 @@ def build_capture_command(
         "native_tool_source_sha256": discover_result.native_tool_source_sha256,
         "native_tool_record_sha256": discover_result.native_tool_record_sha256,
         "native_tool_requirement_artifact_id": spec.native_tool_requirement.ref.artifact_id,
+        "native_target_identity": native_target.to_record(),
     }
     return _base_command(
         spec,
