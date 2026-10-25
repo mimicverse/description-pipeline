@@ -680,9 +680,19 @@ class DiscoverDomainTests(unittest.TestCase):
         entry["resume_phase"] = EffectResumePhase.INPUT_TRANSFER_PENDING
         outbound_before = entry["outbound"]
         wait = self._resume_wait()
-        resume_claim, resume_effects = self.harness.effect_port(
+        resume_claim, _resume_effects = self.harness.effect_port(
             self.command,
             fence=2,
+        )
+        resume_claim = replace(
+            resume_claim,
+            scope="transfer_resume",
+            effect_scope_id=entry["effect_id"],
+        )
+        resume_effects = self.harness.effects.bind(
+            self.command,
+            resume_claim,
+            self.harness.workspace(),
         )
 
         with (
@@ -699,7 +709,7 @@ class DiscoverDomainTests(unittest.TestCase):
                 ),
             ),
         ):
-            resumed = DiscoverHandler(adapter).execute(
+            resumed = DiscoverHandler(adapter).resume_transfer(
                 self.command,
                 resume_claim,
                 self.harness.workspace(),
@@ -733,7 +743,7 @@ class DiscoverDomainTests(unittest.TestCase):
             fence=2,
         )
 
-        resumed = handler.execute(
+        resumed = handler.resume_stage(
             self.command,
             second_claim,
             self.harness.workspace(),
@@ -768,7 +778,7 @@ class DiscoverDomainTests(unittest.TestCase):
         )
 
         with self.assertRaises(ProtocolError) as raised:
-            handler.execute(
+            handler.resume_stage(
                 self.command,
                 second_claim,
                 self.harness.workspace(),

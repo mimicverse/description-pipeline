@@ -46,7 +46,13 @@ from .contracts import (
     StageExecution,
     StageFailure,
 )
-from .effects import EffectResumePhase, EffectState, StageEffectPort
+from .effects import (
+    EffectIntent,
+    EffectResumePhase,
+    EffectState,
+    StageEffectPort,
+    TransferResumeEffectPort,
+)
 from .engine import StageWorkspace
 from .freeze import (
     RulesetCatalog,
@@ -477,7 +483,40 @@ class DiscoverHandler:
         workspace: StageWorkspace,
         *,
         effects: StageEffectPort,
-        resume: StageEffectWait | None = None,
+    ) -> StageExecution | StageDeferral:
+        return self._execute(
+            command,
+            claim,
+            workspace,
+            effects=effects,
+            resume=None,
+        )
+
+    def resume_stage(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
+        resume: StageEffectWait,
+    ) -> StageExecution | StageDeferral:
+        return self._execute(
+            command,
+            claim,
+            workspace,
+            effects=effects,
+            resume=resume,
+        )
+
+    def _execute(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
+        resume: StageEffectWait | None,
     ) -> StageExecution | StageDeferral:
         try:
             if command.stage != "discover" or command.kind != "stage":
@@ -716,6 +755,229 @@ class DiscoverHandler:
         except NativeDiscoverRefusal as refusal:
             raise StageFailure(refusal.code, refusal.message) from refusal
 
+    def resume_transfer(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: TransferResumeEffectPort,
+        resume: StageEffectWait,
+    ) -> StageDeferral:
+        """Continue only the exact sealed Discover input transfer."""
+
+        from ..orchestration.native_operation_client import (
+            read_sealed_native_operation_request,
+        )
+
+        if (
+            claim.scope != "transfer_resume"
+            or claim.effect_scope_id != resume.effect_id
+        ):
+            raise ProtocolError(
+                "discover.transfer_claim_mismatch",
+                {"effect_id": resume.effect_id},
+            )
+        try:
+            request_data = _validate_request(command)
+            target = NativeTargetIdentity.from_record(
+                request_data["native_target_identity"]
+            )
+        except (NativeDiscoverRefusal, ProtocolError) as error:
+            raise StageFailure(
+                "discover.transfer_request_invalid",
+                str(error),
+            ) from error
+        if (
+            resume.run_id != command.run_id
+            or resume.stage != command.stage
+            or resume.command_id != command.command_id
+            or resume.request_digest != command.request_digest
+            or resume.effect_kind != "native_operation"
+        ):
+            raise ProtocolError(
+                "discover.transfer_wait_mismatch",
+                {"effect_id": resume.effect_id},
+            )
+        settlement = effects.effect_settlement(resume.effect_id)
+        if (
+            settlement.state is not EffectState.UNKNOWN
+            or settlement.resume_phase
+            is not EffectResumePhase.INPUT_TRANSFER_PENDING
+            or settlement.outbound_artifact is None
+        ):
+            raise ProtocolError(
+                "discover.transfer_not_pending",
+                {"effect_id": resume.effect_id},
+            )
+        artifacts = getattr(self.native, "artifacts", None)
+        if (
+            artifacts is None
+            or not callable(getattr(artifacts, "materialize", None))
+        ):
+            raise ProtocolError(
+                "discover.transfer_artifact_store_missing",
+                {"command_id": command.command_id},
+            )
+        outbound_root = artifacts.materialize(
+            settlement.outbound_artifact,
+            workspace.root / f"discover-transfer-outbound-{claim.fence}",
+        )
+        request_path = outbound_root / "request.json"
+        source_path = outbound_root / "source.json"
+        archive = outbound_root / SOURCE_ARCHIVE
+        request_record = read_data(request_path)
+        source_record = read_data(source_path)
+        native_request = NativeDiscoverRequest.from_record(request_record)
+        if (
+            request_path.read_bytes()
+            != canonical(native_request.to_record()) + b"\n"
+            or source_path.read_bytes() != canonical(source_record) + b"\n"
+            or not isinstance(source_record, dict)
+            or source_record
+            != {
+                "source_files": dict(native_request.source_files),
+                "source_inventory_sha256": (
+                    native_request.source_inventory_sha256
+                ),
+            }
+            or not archive.is_file()
+            or archive.is_symlink()
+        ):
+            raise ProtocolError(
+                "discover.transfer_outbound_invalid",
+                {"effect_id": resume.effect_id},
+            )
+        source_archive_sha256 = file_digest(archive)
+        expected_state = self._effect_expected_state(
+            command,
+            native_request.to_record(),
+            source_archive_sha256,
+            target,
+        )
+        expected_state_digest = digest(expected_state)
+        effect_target = self._effect_target(
+            command,
+            native_request.to_record(),
+            target,
+        )
+        expected_identity_digest = digest(
+            {
+                "command_id": command.command_id,
+                "effect_id": settlement.effect_id,
+                "effect_key": resume.effect_key,
+                "effect_kind": "native_operation",
+                "expected_state": expected_state,
+                "expected_state_digest": expected_state_digest,
+                "outbound_artifact_id": (
+                    settlement.outbound_artifact.artifact_id
+                ),
+                "outbound_digest": (
+                    settlement.outbound_artifact.set_sha256
+                ),
+                "target": effect_target,
+            }
+        )
+        if (
+            resume.effect_key
+            != f"native-discover:{command.command_id}"
+            or resume.intent_identity_digest != expected_identity_digest
+            or resume.outbound_artifact_id
+            != settlement.outbound_artifact.artifact_id
+            or resume.outbound_digest
+            != settlement.outbound_artifact.set_sha256
+            or resume.expected_state_digest != expected_state_digest
+        ):
+            raise ProtocolError(
+                "discover.transfer_identity_mismatch",
+                {"effect_id": resume.effect_id},
+            )
+        intent = EffectIntent(
+            effect_id=settlement.effect_id,
+            command_id=command.command_id,
+            effect_key=resume.effect_key,
+            effect_kind="native_operation",
+            target=effect_target,
+            expected_state=expected_state,
+            expected_state_digest=expected_state_digest,
+            outbound_artifact_id=(
+                settlement.outbound_artifact.artifact_id
+            ),
+            outbound_digest=settlement.outbound_artifact.set_sha256,
+            created_at=datetime.now(UTC),
+        )
+        sealed = read_sealed_native_operation_request(
+            command,
+            intent,
+            outbound_root,
+        )
+        if (
+            sealed.target_id != target.target_id
+            or sealed.request != native_request
+            or sealed.input_archive != archive
+            or sealed.input_archive_sha256 != source_archive_sha256
+        ):
+            raise ProtocolError(
+                "discover.transfer_sealed_request_mismatch",
+                {"effect_id": resume.effect_id},
+            )
+
+        effects.authorize_resume(
+            resume.effect_id,
+            source="linux_discover_handler",
+        )
+        try:
+            observation = self.native.resume_transfer(
+                archive,
+                native_request,
+                target,
+                workspace.root / f"native-discover-{claim.fence}",
+            )
+        except NativeDiscoverRefusal as refusal:
+            failure_root = (
+                workspace.root
+                / f"discover-transfer-unobservable-{claim.fence}"
+            )
+            failure_root.mkdir(parents=True, exist_ok=False)
+            _write_canonical(
+                failure_root / "native-failure-evidence.json",
+                {
+                    "detail": refusal.detail,
+                    "message": refusal.message,
+                    "reason_code": refusal.code,
+                },
+            )
+            effects.record_timeout(
+                resume.effect_id,
+                source="windows_discover",
+                detail_root=failure_root,
+            )
+            return StageDeferral(resume.effect_id)
+        if observation is None:
+            evidence_root = (
+                workspace.root
+                / f"discover-transfer-unobservable-{claim.fence}"
+            )
+            evidence_root.mkdir(parents=True, exist_ok=False)
+            _write_canonical(
+                evidence_root / "native-failure-evidence.json",
+                {
+                    "reason_code": "discover.transfer_unobservable",
+                },
+            )
+            effects.record_timeout(
+                resume.effect_id,
+                source="windows_discover",
+                detail_root=evidence_root,
+            )
+            return StageDeferral(resume.effect_id)
+        effects.record_response(
+            resume.effect_id,
+            source="windows_discover",
+            response_root=observation.root,
+        )
+        return StageDeferral(resume.effect_id)
+
     def _obtain_observation(
         self,
         command: StageCommand,
@@ -759,61 +1021,6 @@ class DiscoverHandler:
                     target,
                 ),
             )
-        if (
-            state is EffectState.UNKNOWN
-            and settlement is not None
-            and resume is not None
-            and settlement.resume_phase
-            is EffectResumePhase.INPUT_TRANSFER_PENDING
-        ):
-            effects.authorize_resume(
-                settlement.effect_id,
-                source="linux_discover_handler",
-            )
-            outbound_root = workspace.root / f"discover-outbound-{claim.fence}"
-            try:
-                observation = self.native.resume_transfer(
-                    outbound_root / SOURCE_ARCHIVE,
-                    native_request,
-                    target,
-                    workspace.root / f"native-discover-{claim.fence}",
-                )
-            except NativeDiscoverRefusal as refusal:
-                raise StageFailure(
-                    refusal.code,
-                    refusal.message,
-                ) from refusal
-            if observation is None:
-                return StageDeferral(settlement.effect_id)
-            effects.record_response(
-                settlement.effect_id,
-                source="windows_discover",
-                response_root=observation.root,
-            )
-            effects.record_observation(
-                settlement.effect_id,
-                source="windows_discover",
-                state_class="known",
-                observation_root=observation.root,
-            )
-            settled = effects.effect_settlement(settlement.effect_id)
-            if (
-                settled.state is not EffectState.SATISFIED
-                or settled.payload_artifact is None
-            ):
-                raise ProtocolError(
-                    "effect.not_satisfied",
-                    {
-                        "effect_id": settlement.effect_id,
-                        "state": settled.state.value,
-                    },
-                )
-            observation = self.native.materialize(
-                settled.payload_artifact,
-                native_request,
-                workspace.root / f"discover-observation-{claim.fence}",
-            )
-            return settled.payload_artifact, observation
         if state in {EffectState.UNKNOWN, EffectState.CONFLICT}:
             raise ProtocolError(
                 "effect.unresolved",

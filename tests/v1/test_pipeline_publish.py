@@ -664,7 +664,15 @@ class PublishHandlerTests(unittest.TestCase):
         handler=None,
         resume=None,
     ):
-        return (handler or self.fixture.handler).execute(
+        selected = handler or self.fixture.handler
+        if resume is None:
+            return selected.execute(
+                command or self.fixture.command,
+                claim or self.fixture.claim,
+                workspace or self.fixture.workspace,
+                effects=effects or self.fixture.effects,
+            )
+        return selected.resume_stage(
             command or self.fixture.command,
             claim or self.fixture.claim,
             workspace or self.fixture.workspace,

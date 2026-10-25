@@ -2105,7 +2105,40 @@ class PublishHandler:
         workspace: StageWorkspace,
         *,
         effects: StageEffectPort,
-        resume: StageEffectWait | None = None,
+    ) -> StageExecution | StageDeferral:
+        return self._execute(
+            command,
+            claim,
+            workspace,
+            effects=effects,
+            resume=None,
+        )
+
+    def resume_stage(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
+        resume: StageEffectWait,
+    ) -> StageExecution | StageDeferral:
+        return self._execute(
+            command,
+            claim,
+            workspace,
+            effects=effects,
+            resume=resume,
+        )
+
+    def _execute(
+        self,
+        command: StageCommand,
+        claim: ExecutionClaim,
+        workspace: StageWorkspace,
+        *,
+        effects: StageEffectPort,
+        resume: StageEffectWait | None,
     ) -> StageExecution | StageDeferral:
         if command.stage != "publish" or (
             command.predecessor_decision_id is None and command.diagnostic_scope is None
