@@ -2174,13 +2174,10 @@ class NativeOperationDiscoverPort:
         target: NativeTargetIdentity,
         workspace: Path,
     ) -> NativeObservation | None:
-        if target.target_id != self.client.target_id:
-            raise NativeOperationClientConflict(
-                "Discover adapter target differs from its client",
-                status=409,
-                code="native_target_mismatch",
-            )
         """Continue only the original operation's unadmitted input transfer."""
+
+        if target.target_id != self.client.target_id:
+            return None
 
         archive = Path(source_archive)
         workspace = Path(workspace)
@@ -2199,7 +2196,18 @@ class NativeOperationDiscoverPort:
             output_contract=NATIVE_OBSERVATION_SCHEMA,
             target_id=target.target_id,
         )
-        view = self.client.resume_input_transfer(envelope, archive)
+        try:
+            view = self.client.resume_input_transfer(envelope, archive)
+        except NativeOperationNotFound:
+            return None
+        except NativeOperationClientError as error:
+            if (
+                error.status is None
+                or error.status >= 500
+                or error.code == "native_target_mismatch"
+            ):
+                return None
+            raise
         if view is None:
             return None
         return self._observation_from_view(

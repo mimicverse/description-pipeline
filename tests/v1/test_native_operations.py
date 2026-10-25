@@ -2405,6 +2405,52 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.assertEqual(client.create_operation.call_count, 0)
         self.assertEqual(client.upload_input.call_count, 1)
 
+    def test_discover_transfer_unobservable_conditions_remain_pending(self) -> None:
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = _CountingBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        port = NativeOperationDiscoverPort(client, NATIVE_TOOL)
+        workspace = self.root / "workspace-transfer-unobservable"
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        request = self.request("discover-operation-transfer-unobservable")
+        other_target = NativeTargetIdentity.create(
+            install_id="win-" + "5" * 32,
+            pipeline_id=PIPELINE_ID,
+        )
+        client.resume_input_transfer = mock.Mock(
+            wraps=client.resume_input_transfer
+        )
+
+        self.assertIsNone(
+            port.resume_transfer(
+                archive,
+                request,
+                other_target,
+                workspace / "wrong-target",
+            )
+        )
+        client.resume_input_transfer.assert_not_called()
+
+        for error in (
+            NativeOperationNotFound("missing", status=404),
+            NativeOperationClientError("unreachable"),
+            NativeOperationClientError("service unavailable", status=503),
+        ):
+            with self.subTest(error=type(error).__name__):
+                client.resume_input_transfer.side_effect = error
+                self.assertIsNone(
+                    port.resume_transfer(
+                        archive,
+                        request,
+                        TEST_TARGET,
+                        workspace / "unobservable",
+                    )
+                )
+
     def test_effect_observer_downloads_satisfied_discover_without_posting(self) -> None:
         reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
