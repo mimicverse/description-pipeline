@@ -782,6 +782,8 @@ def native_tessellation_fixture(
             topology_endpoints[1],
             edge["start_point_m"],
             edge["end_point_m"],
+            shared_vertex=(edge.get("start_vertex_reference_sha256") is not None
+                           and edge.get("start_vertex_reference_sha256") == edge.get("end_vertex_reference_sha256")),
         )
         edge_rows.append(
             {
@@ -845,6 +847,7 @@ def native_tessellation_fixture(
                     ),
                 },
                 "topology_endpoint_assignment": topology_assignment,
+                "closed_fin_cycles": [],
                 "endpoint_points_derived_from_curve": False,
                 "face_senses": [
                     {
@@ -1032,6 +1035,8 @@ def refresh_topology_endpoint_assignment(tessellation: dict[str, Any]) -> None:
                 topology_endpoints[1],
                 edge["start_point_m"],
                 edge["end_point_m"],
+                shared_vertex=(edge["start_vertex_reference_sha256"] is not None
+                               and edge["start_vertex_reference_sha256"] == edge["end_vertex_reference_sha256"]),
             )
         )
 

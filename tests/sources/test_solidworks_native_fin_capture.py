@@ -55,7 +55,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     native_evaluate2_evidence,
     native_evaluate2_success,
     native_float32_adjacency_bound,
-    native_fin_interval,
+    native_open_fin_interval,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_scope_identity_sha256,
@@ -1616,65 +1616,12 @@ class NativeFinCaptureTests(unittest.TestCase):
             native_point_error(end, evaluated_end),
         )
 
-    def test_periodic_fin_interval_normalizes_seam_and_rejects_ambiguity(self):
-        upper = 2.0 * math.pi
-        seam = upper - 0.120830486676529
-
-        self.assertEqual(
-            native_fin_interval(
-                0.0,
-                seam,
-                0.0,
-                upper,
-                is_periodic=True,
-                is_closed=True,
-            ),
-            [(seam, upper), (0.0, 0.0)],
-        )
-        self.assertEqual(
-            native_fin_interval(
-                seam,
-                0.0,
-                0.0,
-                upper,
-                is_periodic=True,
-                is_closed=True,
-            ),
-            [(seam, upper), (0.0, 0.0)],
-        )
-        self.assertEqual(
-            native_fin_interval(
-                0.0,
-                0.120830486676529,
-                0.0,
-                upper,
-                is_periodic=True,
-                is_closed=True,
-            ),
-            [(0.0, 0.120830486676529)],
-        )
+    def test_open_fin_interval_does_not_guess_a_shorter_periodic_complement(self):
+        self.assertEqual(native_open_fin_interval(0.0, 3.0, 0.0, 4.0), [(0.0, 3.0)])
+        self.assertEqual(native_open_fin_interval(3.0, 0.0, 0.0, 4.0), [(0.0, 3.0)])
+        self.assertEqual(native_open_fin_interval(0.0, 2.0, 0.0, 4.0), [(0.0, 2.0)])
         with self.assertRaises(ValueError):
-            native_fin_interval(
-                0.0,
-                math.pi,
-                0.0,
-                upper,
-                is_periodic=True,
-                is_closed=True,
-            )
-        for near_half in (
-            math.nextafter(math.pi, 0.0),
-            math.nextafter(math.pi, upper),
-        ):
-            with self.subTest(near_half=near_half), self.assertRaises(ValueError):
-                native_fin_interval(
-                    0.0,
-                    near_half,
-                    0.0,
-                    upper,
-                    is_periodic=True,
-                    is_closed=True,
-                )
+            native_open_fin_interval(-1.0, 2.0, 0.0, 4.0)
 
     def test_collapsed_u_fin_requires_positive_bounded_geometric_span(self):
         point = (0.0, 0.0, 0.0)
@@ -1687,8 +1634,6 @@ class NativeFinCaptureTests(unittest.TestCase):
             end_point=moved,
             u_min=2.667937521368035e-7,
             u_max=1.0,
-            is_periodic=False,
-            is_closed=False,
             component="fixture",
             reference="edge",
         )
@@ -1710,8 +1655,6 @@ class NativeFinCaptureTests(unittest.TestCase):
                     end_point=moved_point,
                     u_min=2.667937521368035e-7,
                     u_max=1.0,
-                    is_periodic=False,
-                    is_closed=False,
                     component="fixture",
                     reference="edge",
                 )
@@ -1974,38 +1917,15 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertIn("both absent endpoints", caught.exception.message)
 
     def test_closed_absent_endpoints_serialize_null_reference_errors(self):
-        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
-        closed_point = (0.0, 0.0, 0.0)
-        projected_point = (1e-7, 0.0, 0.0)
-        edge.vertices = [None, None]
-        edge.curve = FakeCurve(-10.0, 10.0, is_closed=True)
-        edge.u_min = 0.0
-        edge.u_max = 1.0
-        edge.curve_start_point = list(closed_point)
-        edge.curve_end_point = list(closed_point)
-        edge.evaluate_u_points = {
-            0.0: closed_point,
-            1.0: closed_point,
-        }
-        edge.GetClosestPointOn = lambda x, _y, _z: [
-            *closed_point,
-            1.0 if x > 0.0 else 0.0,
-            0.0,
-        ]
-        tessellation.GetVertexPoint = lambda vertex_id: {
-            1: closed_point,
-            2: projected_point,
-            3: (0.0, 1.0, 0.0),
-            4: (1.0, 1.0, 0.0),
-        }[vertex_id]
-
-        captured = self.capture(body, extension)
-
-        edge_row = captured["native_edge_rows"][0]
-        self.assertEqual(edge_row["start_vertex_state"], "absent")
-        self.assertEqual(edge_row["end_vertex_state"], "absent")
-        self.assertIsNone(edge_row["start_reference_error"])
-        self.assertIsNone(edge_row["end_reference_error"])
+        with tempfile.TemporaryDirectory() as directory:
+            entry, triangles = self.closed_vertex_export(directory, absent=True)
+            edge = entry["tessellation"]["native_edges"][0]
+            self.assertEqual(edge["start_vertex_state"], "absent")
+            self.assertEqual(edge["end_vertex_state"], "absent")
+            self.assertIsNone(edge["start_reference_error"])
+            self.assertIsNone(edge["end_reference_error"])
+            self.assertTrue(edge["endpoint_points_derived_from_curve"])
+            parse_native_tessellation("part-1", entry["tessellation"], entry["bodies"], entry["triangles"], triangles)
 
     def test_present_vertex_get_point_failure_is_not_reclassified_as_absent(self):
         body, _face_10, _face_20, edge, _tessellation, extension = self.fixture()
@@ -4471,6 +4391,100 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertEqual(native_curve_parameter_endpoints(start, end), (start, end))
 
+    def closed_vertex_export(self, directory, *, periodic=True, absent=False, parameter_nodes=(0.0, 1.0, 2.0, 3.0)):
+        body, face, _unused, edge, tessellation, extension = self.fixture()
+        body.faces = [face]
+        edge.faces = [face]
+        edge.vertices = [None, None] if absent else [edge.vertices[0], edge.vertices[0]]
+        edge.u_min, edge.u_max = 0.0, 4.0
+        edge.curve = FakeCurve(0.0, 4.0, is_closed=True, is_periodic=periodic)
+        point_cycle = (POINTS[1], POINTS[2], POINTS[4], POINTS[3])
+        points = dict(zip(parameter_nodes, point_cycle, strict=True))
+        points[4.0] = POINTS[1]
+        parameters = dict(zip(point_cycle, parameter_nodes, strict=True))
+        edge.GetClosestPointOn = lambda x, y, z: [x, y, z, parameters[(x, y, z)], 0.0]
+        edge.evaluate_u_points = points
+        tessellation.GetFaceFacets = lambda _face: [10, 11]
+        tessellation.GetEdgeFins = lambda _edge: [100, 102, 103, 104]
+        tessellation.GetFinVertices = lambda fin: {
+            100: [1, 2], 101: [2, 3], 102: [3, 1],
+            103: [2, 4], 104: [4, 3], 105: [3, 2],
+        }[fin]
+        tessellation.cofin_values = dict.fromkeys((100, 102, 103, 104), -1)
+        backend = SolidWorksBackend()
+        backend._source_components = {"part-1": (object(), "Default")}
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(Extension=extension)
+        destination = Path(directory) / "closed-edge.stl"
+        with patch.object(native_module, "_read_curve_end_params", fake_read_end_params):
+            entry = backend._write_component_mesh("part-1", destination, FakeHolder(body, body_type=1))
+        entry["tessellation"] = json.loads(json.dumps(entry["tessellation"]))
+        return entry, self.stl_triangles(destination)
+
+    def test_nonuniform_closed_edge_accepts_long_parameter_segments(self):
+        for periodic in (True, False):
+            with self.subTest(periodic=periodic), tempfile.TemporaryDirectory() as directory:
+                entry, triangles = self.closed_vertex_export(
+                    directory, periodic=periodic, parameter_nodes=(0.0, 0.1, 0.2, 0.3))
+                proof = entry["tessellation"]["native_edges"][0]["closed_fin_cycles"][0]
+                self.assertIn([[0.3, 4.0]], [segment["intervals"] for segment in proof["segments"]])
+                parse_native_tessellation(
+                    "part-1", entry["tessellation"], entry["bodies"], entry["triangles"], triangles)
+
+    def test_open_trim_of_closed_underlying_curve_uses_its_own_domain(self):
+        body, _face, edge, _tessellation, extension = self.open_boundary_fixture()
+        edge.u_min, edge.u_max = 1.0, 9.0
+        edge.curve = FakeCurve(0.0, 10.0, is_closed=True, is_periodic=True)
+        edge.GetCurveParams3 = lambda: SimpleNamespace(
+            UMinValue=1.0, UMaxValue=9.0, StartPoint=[0.0, 0.0, 0.0],
+            EndPoint=[1.0, 0.0, 0.0], Sense=True, CurveType=0)
+        edge.GetClosestPointOn = lambda x, y, z: [x, y, z, 1.0 + 8.0 * x, 0.0]
+        edge.Evaluate2 = lambda u, derivatives: [(u - 1.0) / 8.0, 0.0, 0.0,
+                                                0.0, 0.0, 0.0, packed_evaluate_status(1)]
+        backend = SolidWorksBackend()
+        backend._source_components = {"part-1": (object(), "Default")}
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(Extension=extension)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                native_module, "_read_curve_end_params", fake_read_end_params):
+            destination = Path(directory) / "open-trim.stl"
+            entry = backend._write_component_mesh("part-1", destination, FakeHolder(body, body_type=1))
+            triangles = self.stl_triangles(destination)
+        edge_row = entry["tessellation"]["native_edges"][0]
+        self.assertTrue(edge_row["curve_closed"])
+        self.assertFalse(edge_row["topology_endpoint_assignment"]["shared_vertex"])
+        self.assertEqual(edge_row["closed_fin_cycles"], [])
+        parse_native_tessellation("part-1", entry["tessellation"], entry["bodies"], entry["triangles"], triangles)
+
+    def test_nonperiodic_closed_edge_uses_topological_parameter_partition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry, triangles = self.closed_vertex_export(directory, periodic=False)
+            evidence = entry["tessellation"]
+            self.assertFalse(evidence["native_edges"][0]["curve_periodic"])
+            parse_native_tessellation("part-1", evidence, entry["bodies"], entry["triangles"], triangles)
+            evidence["native_edges"][0]["closed_fin_cycles"][0]["segments"][0]["intervals"][0][1] += 0.5
+            with self.assertRaisesRegex(PipelineError, "partition is not independently reproducible"):
+                parse_native_tessellation("part-1", evidence, entry["bodies"], entry["triangles"], triangles)
+
+    def test_shared_native_vertex_preserves_a_nonzero_closed_edge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry, triangles = self.closed_vertex_export(directory)
+            evidence = entry["tessellation"]
+            edge = evidence["native_edges"][0]
+            self.assertEqual(edge["start_vertex_reference_sha256"], edge["end_vertex_reference_sha256"])
+            self.assertTrue(edge["topology_endpoint_assignment"]["shared_vertex"])
+            parse_native_tessellation("part-1", evidence, entry["bodies"], entry["triangles"], triangles)
+            for mutation in ("wrong_vertex", "wrong_closure", "zero_domain"):
+                with self.subTest(mutation=mutation):
+                    changed = copy.deepcopy(evidence)
+                    row = changed["native_edges"][0]
+                    if mutation == "wrong_vertex":
+                        row["end_vertex_reference_sha256"] = "0" * 64
+                    elif mutation == "wrong_closure":
+                        row["topology_endpoint_assignment"]["shared_vertex"] = False
+                    else:
+                        row["u_max"] = row["u_min"]
+                    with self.assertRaises(PipelineError):
+                        parse_native_tessellation("part-1", changed, entry["bodies"], entry["triangles"], triangles)
+
     def test_closed_absent_endpoints_parser_derives_curve_closure(self):
         body, face_10, face_20, _edge, _tessellation, extension = self.fixture()
         _edge.curve = FakeCurve(-10.0, 10.0, is_closed=False)
@@ -4633,14 +4647,10 @@ class NativeFinCaptureTests(unittest.TestCase):
                     for point in triangle
                 )
             support.refresh_topology_endpoint_assignment(derived)
-            derived_spans = parse_native_tessellation(
-                "part-1",
-                derived,
-                entry["bodies"],
-                entry["triangles"],
-                triangle_vertices,
-            )
-            self.assertEqual(len(derived_spans), 2)
+            with self.assertRaisesRegex(PipelineError, "closed edge fins"):
+                parse_native_tessellation(
+                    "part-1", derived, entry["bodies"], entry["triangles"], triangle_vertices,
+                )
             fins = {
                 row["fin_id"]: row
                 for row in tessellation["itessellation"]["bodies"][0]["fins"]
@@ -5816,6 +5826,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             "edge": [shared_edge_reference],
             "vertex": [shared_vertex_reference],
         }
+        support.refresh_topology_endpoint_assignment(evidence)
         identity_warnings = []
         parse_native_tessellation(
             "edge-alias",

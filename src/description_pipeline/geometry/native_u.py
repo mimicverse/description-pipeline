@@ -82,7 +82,7 @@ NATIVE_CURVE_ENDPOINT_OPERATION_RULE = (
     "native-curve-endpoint-float32-operation-v4"
 )
 NATIVE_CURVE_TOPOLOGY_ENDPOINT_SET_RULE = (
-    "native-curve-topology-endpoint-set-v3"
+    "native-curve-topology-endpoint-set-v4"
 )
 # Retained as the frozen source-scope schema value; it grants no open-edge identity.
 NATIVE_SOURCE_SCOPE_RULE = "native-open-edge-scope-binding-v1"
@@ -92,7 +92,6 @@ NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
 NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC = "max_abs_coordinate"
 NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M = 50e-6
 NATIVE_COLLAPSED_U_FIN_RULE = "native-fin-u-collapse-v1"
-NATIVE_PERIODIC_FIN_INTERVAL_RULE = "native-periodic-fin-interval-v1"
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
 NATIVE_U_RESOLUTION_RULE = "native-u-binary32-resolution-gate-v1"
 NATIVE_SCOPE_IDENTITY_RULE = "native-scope-entity-id-v1"
@@ -512,43 +511,22 @@ def native_u_intervals_cover(
     )
 
 
-def native_fin_interval(
+def native_open_fin_interval(
     start: float | int,
     end: float | int,
     lower: float | int,
     upper: float | int,
-    *,
-    is_periodic: bool,
-    is_closed: bool,
 ) -> list[tuple[float, float]]:
-    """Return the native fin interval without confusing a seam segment for its complement."""
-
+    """Return one open-edge interval in its validated edge-local domain."""
     start_value = _native_u(start)
     end_value = _native_u(end)
     lower_value = _native_u(lower)
     upper_value = _native_u(upper)
-    if (
-        lower_value >= upper_value
-        or not native_u_in_closed_interval(start_value, lower_value, upper_value)
-        or not native_u_in_closed_interval(end_value, lower_value, upper_value)
-    ):
+    if (lower_value >= upper_value
+            or not native_u_in_closed_interval(start_value, lower_value, upper_value)
+            or not native_u_in_closed_interval(end_value, lower_value, upper_value)):
         raise ValueError("fin endpoints must lie inside a non-empty edge domain")
-    direct = (min(start_value, end_value), max(start_value, end_value))
-    if not (is_periodic and is_closed):
-        return [direct]
-    period = upper_value - lower_value
-    direct_width = direct[1] - direct[0]
-    complement_width = period - direct_width
-    if native_u_equal(direct_width, complement_width):
-        raise ValueError(
-            "periodic fin interval is ambiguous at half the edge domain"
-        )
-    if direct_width < complement_width:
-        return [direct]
-    return [
-        (direct[1], upper_value),
-        (lower_value, direct[0]),
-    ]
+    return [(min(start_value, end_value), max(start_value, end_value))]
 
 
 def native_evaluate2_evidence(raw: list | tuple) -> dict | None:
@@ -846,9 +824,13 @@ def native_curve_topology_endpoint_set_assignment(
     expected_end,
     actual_start,
     actual_end,
+    *,
+    shared_vertex: bool = False,
 ) -> dict:
     """Match unordered native endpoint sets without assigning edge direction."""
 
+    if type(shared_vertex) is not bool:
+        raise ValueError("shared vertex identity must be a boolean")
     points = (expected_start, expected_end, actual_start, actual_end)
     if any(
         not isinstance(point, (list, tuple))
@@ -898,7 +880,14 @@ def native_curve_topology_endpoint_set_assignment(
         expected_start != expected_end
         and actual_start != actual_end
     )
-    accepted = distinct_endpoints and matching_count >= 1
+    closed_endpoint_set = (
+        shared_vertex
+        and actual_start == actual_end
+        and native_point_within_max_coordinate_bound(
+            expected_start, expected_end, native_point_roundtrip_tolerance(expected_start, expected_end)
+        )
+    )
+    accepted = (closed_endpoint_set if shared_vertex else distinct_endpoints) and matching_count >= 1
     if direct_complete and not swapped_complete:
         canonical_result = "direct"
         canonical_error = direct_error
@@ -932,6 +921,7 @@ def native_curve_topology_endpoint_set_assignment(
         "canonical_error_m": canonical_error,
         "alternative_margin_m": alternative_error,
         "distinct_endpoint_sets": distinct_endpoints,
+        "shared_vertex": shared_vertex,
         "accepted": accepted,
     }
     return record

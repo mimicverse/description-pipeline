@@ -1096,6 +1096,47 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(area["derived_boundary_area_m2"], 1.0)
         self.assertAlmostEqual(area["native_minus_derived_area_m2"], 1e-11, places=15)
 
+    def test_cross_kind_edge_alias_uses_identity_across_bodies_and_edge_orders(self):
+        for reverse_inventory in (False, True):
+            with self.subTest(reverse_inventory=reverse_inventory):
+                component, _first, _edges = _planar_sheet(
+                    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+                _other, second, second_edges = _planar_sheet(
+                    [(2.0, 0.0, 0.0), (3.0, 0.0, 0.0), (3.0, 1.0, 0.0), (2.0, 1.0, 0.0)])
+                if reverse_inventory:
+                    second._faces[0]._edges.reverse()
+                component._bodies[1].append(second)
+                backend = _backend(component)
+                extension = component._document.Extension
+                extension.references[id(second)] = b"cross-kind-second-body"
+                extension.references[id(second_edges[0])] = b"cross-kind-second-body"
+                target = self.tmp / f"cross-kind-{reverse_inventory}.stl"
+                entry = backend.export_component_meshes({"pcb-1": target})["pcb-1"]
+                entry["tessellation"] = json.loads(json.dumps(entry["tessellation"]))
+                vertices = stl_vertices(target).reshape(-1, 3, 3).tolist()
+                parse_native_tessellation("pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices)
+                aliases = entry["tessellation"]["itessellation"]["cross_kind_raw_aliases"]
+                self.assertEqual(len(aliases), 1)
+                edge_owner = next(owner for owner in aliases[0]["owners"] if owner["kind"] == "edge")
+                self.assertEqual(edge_owner["body_index"], 1)
+                self.assertNotIn("edge_index", edge_owner)
+                for mutation in ("wrong_identity", "wrong_body", "missing_owner", "duplicate_owner"):
+                    with self.subTest(mutation=mutation):
+                        changed = copy.deepcopy(entry["tessellation"])
+                        owners = changed["itessellation"]["cross_kind_raw_aliases"][0]["owners"]
+                        changed_edge = next(owner for owner in owners if owner["kind"] == "edge")
+                        if mutation == "wrong_identity":
+                            changed_edge["typed_sha256"] = "0" * 64
+                        elif mutation == "wrong_body":
+                            changed_edge["body_index"] = 0
+                        elif mutation == "missing_owner":
+                            owners.remove(changed_edge)
+                        else:
+                            owners.append(copy.deepcopy(changed_edge))
+                        with self.assertRaises(PipelineError):
+                            parse_native_tessellation(
+                                "pcb-1", changed, entry["bodies"], entry["triangles"], vertices)
+
     def test_mixed_native_providers_seal_admit_and_verify_actual_bytes(self):
         from tests.v1 import test_stage_transfer as transfer_fixture  # noqa: PLC0415
         from description_pipeline import native_transfer  # noqa: PLC0415
@@ -1534,6 +1575,26 @@ class ComponentMeshExportTests(unittest.TestCase):
                     parse_native_tessellation(
                         "pcb-1", entry["tessellation"], entry["bodies"], entry["triangles"], vertices,
                     )
+
+    def test_curve_endpoint_sense_cannot_use_nearest_reverse_pairing(self):
+        component, body, edges = _planar_sheet(
+            [(0.0, 0.0, 0.0), (80e-6, 0.0, 0.0), (80e-6, 1e-4, 0.0), (0.0, 1e-4, 0.0)])
+        edge = edges[0]
+        read = edge.GetCurveParams3
+        def reversed_params():
+            params = read()
+            params.Sense = False
+            params.StartPoint = [10e-6, 0.0, 0.0]
+            params.EndPoint = [70e-6, 0.0, 0.0]
+            return params
+        edge.GetCurveParams3 = reversed_params
+        edge.Evaluate2 = lambda u, derivatives: [10e-6 + u * 60e-6, 0.0, 0.0,
+                                                0.0, 0.0, 0.0, _packed_success_status()]
+        backend = _backend(component)
+        before = len(body.tessellation_face_lists)
+        with self.assertRaisesRegex(CadError, "native endpoint correspondence"):
+            backend.export_component_meshes({"pcb-1": self.dest})
+        self.assertEqual(len(body.tessellation_face_lists), before)
 
     def test_planar_wrong_coedge_sense_is_not_hidden_by_unordered_vertices(self):
         component, _body, edges = _planar_sheet(

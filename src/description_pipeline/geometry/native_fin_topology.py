@@ -9,6 +9,8 @@ from .native_u import (
     native_point_error,
     native_point_roundtrip_tolerance,
     native_u_equal,
+    native_u_domain_is_resolvable,
+    native_u_in_closed_interval,
 )
 
 
@@ -391,4 +393,102 @@ def validate_native_edge_fin_relations(
     return {
         "fin_ids": normalized_ids,
         "collapsed_pairs": sorted(set(collapsed_pairs)),
+    }
+
+
+def closed_edge_fin_partition(*, component: str, fins: Mapping[int, Mapping], lower: float, upper: float) -> dict:
+    """Derive a closed edge partition from its complete undirected fin cycle.
+
+    Parameter adjacency, not U length or an assumed raw fin orientation,
+    identifies each segment. The two domain endpoints represent one seam node.
+    Topological vertices remain distinct even when their parameters collapse.
+    """
+    _require(native_u_domain_is_resolvable(lower, upper),
+             f"{component}: closed edge parameter domain is unresolved")
+    adjacency = {}
+    parameters = {}
+    for fin_id, row in sorted(fins.items()):
+        pair = row["vertex_ids"]
+        _require(len(pair) == 2 and pair[0] != pair[1],
+                 f"{component}: closed edge fin has invalid vertices", fin_id=fin_id)
+        for vertex, raw_u in zip(pair, (row["start_u"], row["end_u"]), strict=True):
+            _require(native_u_in_closed_interval(raw_u, lower, upper) and lower <= raw_u <= upper,
+                     f"{component}: closed edge fin parameter is outside its domain", fin_id=fin_id)
+            value = lower if native_u_equal(raw_u, upper) or native_u_equal(raw_u, lower) else raw_u
+            observations = parameters.setdefault(vertex, [])
+            _require(all(native_u_equal(value, previous) for previous in observations),
+                     f"{component}: one closed edge vertex has conflicting parameters", vertex_id=vertex)
+            observations.append(value)
+            adjacency.setdefault(vertex, []).append(fin_id)
+    _require(len(adjacency) >= 3 and all(len(rows) == 2 for rows in adjacency.values()),
+             f"{component}: closed edge fins do not form an unambiguous cycle")
+    first = min(adjacency)
+    vertex_cycle = [first]
+    fin_cycle = []
+    vertex = first
+    while len(fin_cycle) < len(fins):
+        choices = sorted(fin for fin in adjacency[vertex] if fin not in fin_cycle)
+        _require(bool(choices), f"{component}: closed edge fin cycle is disconnected")
+        fin_id = choices[0]
+        fin_cycle.append(fin_id)
+        pair = fins[fin_id]["vertex_ids"]
+        vertex = pair[1] if pair[0] == vertex else pair[0]
+        vertex_cycle.append(vertex)
+        _require(vertex == first or vertex not in vertex_cycle[:-1],
+                 f"{component}: closed edge fin cycle repeats a vertex")
+        if vertex == first:
+            break
+    _require(vertex == first and len(fin_cycle) == len(fins),
+             f"{component}: closed edge fins contain disconnected cycles")
+
+    values = sorted({value for rows in parameters.values() for value in rows})
+    groups = []
+    for value in values:
+        if not groups or not native_u_equal(value, groups[-1][-1]):
+            groups.append([value])
+        else:
+            _require(all(native_u_equal(value, previous) for previous in groups[-1]),
+                     f"{component}: closed edge parameter identity is non-transitive")
+            groups[-1].append(value)
+    nodes = [group[0] for group in groups]
+    _require(len(nodes) >= 3, f"{component}: closed edge has insufficient unique parameter nodes")
+    node_by_value = {value: index for index, group in enumerate(groups) for value in group}
+    node_by_vertex = {}
+    for vertex, observations in parameters.items():
+        matches = {node_by_value[value] for value in observations}
+        _require(len(matches) == 1, f"{component}: closed edge parameter identity is ambiguous", vertex_id=vertex)
+        node_by_vertex[vertex] = matches.pop()
+    owners = {}
+    segments = []
+    for fin_id, row in sorted(fins.items()):
+        start, end = (node_by_vertex[vertex] for vertex in row["vertex_ids"])
+        _require((start == end) == native_u_equal(row["start_u"], row["end_u"]),
+                 f"{component}: closed edge parameter identity changes a fin's nonzero span", fin_id=fin_id)
+        if start == end:
+            segments.append({"fin_id": fin_id, "intervals": []})
+            continue
+        if (start + 1) % len(nodes) == end:
+            segment = start
+        elif (end + 1) % len(nodes) == start:
+            segment = end
+        else:
+            raise NativeFinRelationError(f"{component}: closed edge fin skips a parameter node", {"fin_id": fin_id})
+        _require(segment not in owners, f"{component}: closed edge parameter segment is covered more than once",
+                 fin_id=fin_id)
+        owners[segment] = fin_id
+        if segment + 1 < len(nodes):
+            intervals = [[nodes[segment], nodes[segment + 1]]]
+        else:
+            intervals = [[nodes[-1], upper]]
+            if nodes[0] > lower:
+                intervals.append([lower, nodes[0]])
+        segments.append({"fin_id": fin_id, "intervals": intervals})
+    _require(len(owners) == len(nodes), f"{component}: closed edge parameter partition is incomplete")
+    return {
+        "rule_version": "native-closed-edge-fin-partition-v1",
+        "domain": [lower, upper],
+        "vertex_cycle": vertex_cycle,
+        "fin_cycle": fin_cycle,
+        "parameter_node_count": len(nodes),
+        "segments": segments,
     }

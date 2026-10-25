@@ -28,6 +28,18 @@ from description_pipeline.io import PipelineError  # noqa: E402
 
 
 class NativeCurveDomainTests(unittest.TestCase):
+    def test_closed_endpoint_set_requires_shared_native_vertex_and_consistent_points(self):
+        point = (1.0, 2.0, 3.0)
+        self.assertFalse(native_curve_topology_endpoint_set_assignment(point, point, point, point)["accepted"])
+        self.assertTrue(native_curve_topology_endpoint_set_assignment(
+            point, point, point, point, shared_vertex=True)["accepted"])
+        self.assertFalse(native_curve_topology_endpoint_set_assignment(
+            point, (1.1, 2.0, 3.0), point, point, shared_vertex=True)["accepted"])
+        self.assertFalse(native_curve_topology_endpoint_set_assignment(
+            point, (1.1, 2.0, 3.0), point, (1.1, 2.0, 3.0), shared_vertex=True)["accepted"])
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            native_curve_topology_endpoint_set_assignment(point, point, point, point, shared_vertex=1)
+
     def test_topology_pairing_accepts_observed_39nm_curve_wobble(self):
         expected_start = (
             0.01000643903049045,
@@ -439,18 +451,13 @@ class NativeCurveDomainTests(unittest.TestCase):
 
         self.assertIn("curve-domain proof", str(caught.exception))
 
-    def test_closed_absent_edge_requires_equal_evaluate2_endpoints(self):
+    def test_endpoint_closure_alone_does_not_prove_a_closed_fin_cycle(self):
         tessellation, triangles, _former_end = self.closed_absent_case()
-
-        spans = self.parse(tessellation, triangles)
-
-        self.assertEqual(len(spans), 2)
         row = tessellation["native_edges"][0]
-        self.assertEqual(row["curve_domain_transform"]["status"], "edge_local_nonperiodic")
-        self.assertEqual(
-            row["curve_endpoint_evaluations"]["start"]["payload"][:3],
-            row["curve_endpoint_evaluations"]["end"]["payload"][:3],
-        )
+        self.assertEqual(row["curve_endpoint_evaluations"]["start"]["payload"][:3],
+                         row["curve_endpoint_evaluations"]["end"]["payload"][:3])
+        with self.assertRaisesRegex(PipelineError, "closed edge fins"):
+            self.parse(tessellation, triangles)
 
     def test_closed_absent_edge_with_distinct_evaluate2_points_is_rejected(self):
         tessellation, triangles, former_end = self.closed_absent_case()

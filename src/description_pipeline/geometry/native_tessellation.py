@@ -18,6 +18,7 @@ from ..schemas import (
 )
 from .native_fin_topology import (
     NativeFinRelationError,
+    closed_edge_fin_partition,
     validate_native_edge_face_senses,
     validate_native_edge_fin_relations,
 )
@@ -25,6 +26,7 @@ from .native_planar_brep import (
     NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
     NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
     NATIVE_PLANAR_COEDGE_VERTEX_RULE,
+    NATIVE_PLANAR_EDGE_VERTEX_RULE,
     NATIVE_PLANAR_BREP_PROVIDER,
     NATIVE_PLANAR_CONVEX_FAN_RULE,
     NATIVE_PLANAR_BREP_SCHEMA,
@@ -61,11 +63,12 @@ from .native_u import (
     native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
-    native_fin_interval,
+    native_open_fin_interval,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_point_within_max_coordinate_bound,
     native_u_equal,
+    native_u_domain_is_resolvable,
     native_u_in_closed_interval,
     native_u_intervals_cover,
     native_curve_domain_transform,
@@ -722,8 +725,6 @@ def _finite_fin_intervals(
     end_point: object,
     u_min: float,
     u_max: float,
-    is_periodic: bool,
-    is_closed: bool,
     component: str,
     reference: str,
 ) -> tuple[list[tuple[float, float]], float | None]:
@@ -731,13 +732,11 @@ def _finite_fin_intervals(
 
     if not native_u_equal(start_u, end_u):
         return (
-            native_fin_interval(
+            native_open_fin_interval(
                 start_u,
                 end_u,
                 u_min,
                 u_max,
-                is_periodic=is_periodic,
-                is_closed=is_closed,
             ),
             None,
         )
@@ -1035,6 +1034,7 @@ def parse_native_tessellation(
         "curve_domain_transform",
         "curve_endpoint_evaluations",
         "topology_endpoint_assignment",
+        "closed_fin_cycles",
         "endpoint_points_derived_from_curve",
         "face_senses",
     }
@@ -1055,6 +1055,8 @@ def parse_native_tessellation(
             len(edge["face_indices"]) <= 2,
             component + f": native edge {index} is non-manifold",
         )
+        _require(isinstance(edge["closed_fin_cycles"], list),
+                 component + f": native edge {index} closed partition evidence is malformed")
         reference = edge["edge_reference_sha256"]
         native_reference = edge["native_edge_reference_sha256"]
         identity_mode = edge["edge_identity_mode"]
@@ -1549,6 +1551,13 @@ def parse_native_tessellation(
                 observed == tuple(point),
                 component + f": native vertex {vertex_reference} binds multiple coordinates",
             )
+        if start_reference is not None and start_reference == end_reference:
+            evaluated_start = evaluations["start"]["payload"][:3]
+            evaluated_end = evaluations["end"]["payload"][:3]
+            _require(native_u_domain_is_resolvable(edge["u_min"], edge["u_max"])
+                     and native_point_within_max_coordinate_bound(evaluated_start, evaluated_end,
+                         native_point_roundtrip_tolerance(evaluated_start, evaluated_end)),
+                     component + ": shared native vertex lacks a closed nonzero edge domain")
         edge_owners[reference] = (body_key, set(edge["face_indices"]))
         try:
             validate_native_edge_face_senses(
@@ -1793,13 +1802,12 @@ def _planar_line_projection(point, line):
     return tuple(origin[axis] + scalar * direction[axis] for axis in range(3))
 
 
-def _planar_unordered_segment_bound(points, targets):
-    # An unordered geometric segment has no endpoint identity. Either affine
-    # correspondence bounds its entire image; take the tighter complete bound.
-    return min(
-        max(_planar_distance_squared(point, target) for point, target in zip(order, targets, strict=True))
-        for order in (points, tuple(reversed(points)))
-    )
+def _planar_directed_segment_bound(component, points, targets):
+    observed = _vector_difference(*(tuple(Fraction(value) for value in point) for point in points))
+    expected = _vector_difference(*(tuple(Fraction(value) for value in point) for point in targets))
+    _require(sum(observed[axis] * expected[axis] for axis in range(3)) > 0,
+             component + ": curve observation reverses its native endpoint correspondence")
+    return max(_planar_distance_squared(point, target) for point, target in zip(points, targets, strict=True))
 
 
 def _planar_project_to_plane(point, plane_point, normal):
@@ -1886,6 +1894,8 @@ def _parse_planar_brep_evidence(
         "line_orientation",
         "same_direction_as_edge",
         "vertex_identity_rule",
+        "curve_vertex_identity_rule",
+        "curve_vertex_references_sha256",
         "tangent_direction_rule",
         "start_parameter",
         "end_parameter",
@@ -2279,24 +2289,25 @@ def _parse_planar_brep_evidence(
                 source_error_squared = max(
                     source_error_squared, _planar_distance_squared(evaluation["point_m"], targets[endpoint_index])
                 )
+            curve_refs = [start_ref, end_ref]
+            if edge["curve_sense"] is not coedge["same_direction_as_edge"]:
+                curve_refs.reverse()
+            _require(coedge["curve_vertex_identity_rule"] == NATIVE_PLANAR_EDGE_VERTEX_RULE
+                     and coedge["curve_vertex_references_sha256"] == curve_refs,
+                     component + f": native planar coedge {coedge_index} curve endpoint references differ")
+            curve_targets = tuple(vertex_points[ref] for ref in curve_refs)
             curve_points = (edge["curve_start_point_m"], edge["curve_end_point_m"])
             evaluated_points = tuple(edge["curve_endpoint_evaluations"][key]["payload"][:3] for key in ("start", "end"))
             source_error_squared = max(
                 source_error_squared,
-                _planar_unordered_segment_bound(curve_points, targets),
-                _planar_unordered_segment_bound(evaluated_points, targets),
-                _planar_unordered_segment_bound(
-                    tuple(_planar_line_projection(point, edge_line) for point in curve_points), targets
-                ),
+                _planar_directed_segment_bound(component, curve_points, curve_targets),
+                _planar_directed_segment_bound(component, evaluated_points, curve_targets),
+                _planar_directed_segment_bound(component,
+                    tuple(_planar_line_projection(point, edge_line) for point in curve_points), curve_targets),
             )
             if coedge_line is not None:
-                source_error_squared = max(
-                    source_error_squared,
-                    *(
-                        _planar_distance_squared(_planar_line_projection(point, coedge_line), target)
-                        for point, target in zip(trim_points, targets, strict=True)
-                    ),
-                )
+                source_error_squared = max(source_error_squared, _planar_directed_segment_bound(component,
+                    tuple(_planar_line_projection(point, coedge_line) for point in trim_points), targets))
             start_reference = coedge["start_vertex_reference_sha256"]
             end_reference = coedge["end_vertex_reference_sha256"]
             _require(
@@ -2645,7 +2656,7 @@ def _parse_itessellation_evidence(
         kind_owner_keys = {
             "body": base_owner_keys,
             "face": base_owner_keys | {"face_index"},
-            "edge": base_owner_keys | {"edge_index"},
+            "edge": base_owner_keys,
             "vertex": base_owner_keys | {"vertex_index"},
         }
         _require(
@@ -2672,10 +2683,6 @@ def _parse_itessellation_evidence(
                     and (
                         owner["kind"] != "face"
                         or (_integer(owner["face_index"]) and owner["face_index"] >= 0)
-                    )
-                    and (
-                        owner["kind"] != "edge"
-                        or (_integer(owner["edge_index"]) and owner["edge_index"] >= 0)
                     )
                     and (
                         owner["kind"] != "vertex"
@@ -3362,7 +3369,7 @@ def _parse_itessellation_evidence(
                     "typed_sha256": span["face_reference_sha256"],
                 }
             )
-    for edge_index, edge in enumerate(native_edges):
+    for edge in native_edges:
         expected_cross_kind_owners[
             edge["native_edge_reference_sha256"]
         ].append(
@@ -3371,7 +3378,6 @@ def _parse_itessellation_evidence(
                 "component": component,
                 "body_type": edge["body_type"],
                 "body_index": edge["body_index"],
-                "edge_index": edge_index,
                 "typed_sha256": edge["edge_reference_sha256"],
             }
         )
@@ -3394,7 +3400,7 @@ def _parse_itessellation_evidence(
             int(owner.get("body_index", -1)),
             str(owner["kind"]),
             int(owner.get("face_index", -1)),
-            int(owner.get("edge_index", -1)),
+            str(owner.get("typed_sha256", "")),
             str(owner.get("endpoint", "")),
         )
 
@@ -3729,6 +3735,7 @@ def _parse_itessellation_evidence(
                 topology_endpoints[1],
                 edge["start_point_m"],
                 edge["end_point_m"],
+                shared_vertex=(edge["start_vertex_reference_sha256"] == edge["end_vertex_reference_sha256"]),
             )
             _require(
                 edge["topology_endpoint_assignment"] == assignment,
@@ -3834,6 +3841,28 @@ def _parse_itessellation_evidence(
                 raise PipelineError(error.message) from error
             u_min = float(edge["u_min"])
             u_max = float(edge["u_max"])
+            is_closed_edge = bool(
+                (edge["topology_endpoint_assignment"] is not None
+                 and edge["topology_endpoint_assignment"]["shared_vertex"])
+                or edge["endpoint_points_derived_from_curve"]
+            )
+            partitions = []
+            partition_by_fin = {}
+            if is_closed_edge:
+                for face_index in edge["face_indices"]:
+                    face_fins = {fin_id: evidence["fins"][fin_id] for fin_id in actual
+                                 if evidence["fins"][fin_id]["face_index"] == face_index}
+                    if not face_fins:
+                        continue
+                    try:
+                        partition = closed_edge_fin_partition(
+                            component=component, fins=face_fins, lower=u_min, upper=u_max)
+                    except NativeFinRelationError as error:
+                        raise PipelineError(error.message) from error
+                    partitions.append({"face_index": face_index, **partition})
+                    partition_by_fin.update({row["fin_id"]: row["intervals"] for row in partition["segments"]})
+            _require(edge["closed_fin_cycles"] == partitions,
+                     component + ": closed edge partition is not independently reproducible")
             intervals_by_face = {}
             collapsed_fin_span = {}
             for fin_id in actual:
@@ -3856,8 +3885,6 @@ def _parse_itessellation_evidence(
                     end_point=fin_end,
                     u_min=u_min,
                     u_max=u_max,
-                    is_periodic=edge["curve_periodic"],
-                    is_closed=edge["curve_closed"],
                     component=component,
                     reference=reference,
                 )
@@ -3865,7 +3892,7 @@ def _parse_itessellation_evidence(
                     collapsed_fin_span[fin_id] = span
                     continue
                 intervals_by_face.setdefault(fin["face_index"], []).extend(
-                    intervals
+                    partition_by_fin[fin_id] if is_closed_edge else intervals
                 )
             for face_index, intervals in intervals_by_face.items():
                 _require(
@@ -3873,6 +3900,16 @@ def _parse_itessellation_evidence(
                     component
                     + f": native tessellation edge {reference} face {face_index} does not cover its U domain",
                 )
+            if (edge["start_vertex_reference_sha256"] is not None
+                    and edge["start_vertex_reference_sha256"] == edge["end_vertex_reference_sha256"]):
+                evaluated_edge_points = {
+                    tuple(evidence["fins"][fin_id][f"{endpoint}_evidence"]["evaluate_payload"][:3])
+                    for fin_id in actual for endpoint in ("start", "end")
+                }
+                _require(len(evaluated_edge_points) >= 2 and any(
+                    not native_u_equal(evidence["fins"][fin_id]["start_u"], evidence["fins"][fin_id]["end_u"])
+                    for fin_id in actual),
+                    component + ": closed native edge lacks nonzero evaluated fin geometry")
             curve_points = {
                 tuple(_float32(value) for value in edge["curve_start_point_m"]),
                 tuple(_float32(value) for value in edge["curve_end_point_m"]),
@@ -3891,6 +3928,7 @@ def _parse_itessellation_evidence(
                     topology_endpoints[1],
                     endpoint_points[0],
                     endpoint_points[1],
+                    shared_vertex=(edge["start_vertex_reference_sha256"] == edge["end_vertex_reference_sha256"]),
                 )
                 _require(
                     edge["topology_endpoint_assignment"] == assignment,

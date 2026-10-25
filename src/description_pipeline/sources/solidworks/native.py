@@ -57,18 +57,20 @@ from ...geometry.native_u import (
     native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
-    native_fin_interval,
+    native_open_fin_interval,
     native_point_error,
     native_point_roundtrip_tolerance,
     native_point_within_max_coordinate_bound,
     native_scope_identity_sha256,
     native_u_equal,
+    native_u_domain_is_resolvable,
     native_u_in_closed_interval,
     native_u_intervals_cover,
     native_curve_domain_transform,
 )
 from ...geometry.native_fin_topology import (
     NativeFinRelationError,
+    closed_edge_fin_partition,
     validate_native_edge_face_senses,
     validate_native_edge_fin_relations,
 )
@@ -76,6 +78,7 @@ from ...geometry.native_planar_brep import (
     NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
     NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
     NATIVE_PLANAR_COEDGE_VERTEX_RULE,
+    NATIVE_PLANAR_EDGE_VERTEX_RULE,
     NATIVE_PLANAR_BREP_PROVIDER,
     NATIVE_PLANAR_BREP_SCHEMA,
     PlanarBrepEvidenceError,
@@ -3266,7 +3269,7 @@ class _NativeReferenceRegistry:
                 int(owner.get("body_index", -1)),
                 str(owner["kind"]),
                 int(owner.get("face_index", -1)),
-                int(owner.get("edge_index", -1)),
+                str(owner.get("typed_sha256", "")),
                 str(owner.get("endpoint", "")),
             )
 
@@ -3279,7 +3282,7 @@ class _NativeReferenceRegistry:
             }
         ):
             owners = [
-                owner
+                {key: value for key, value in owner.items() if key != "edge_index"}
                 for references in self.raw_owners.values()
                 for owner in references.get(raw_sha256, [])
             ]
@@ -7120,6 +7123,34 @@ class SolidWorksBackend(CadBackend):
                     )
                 row["owner_body_reference"] = owner_reference
 
+        def finalize_topology_assignment(edge_row):
+            endpoints = edge_row["endpoints"]
+            if {endpoints[name]["state"] for name in ("start", "end")} != {"present"}:
+                return
+            curve = edge_row["curve"]
+            evaluations = edge_row["curve_endpoint_evaluations"]
+            shared_vertex = (endpoints["start"]["reference"]["typed_sha256"]
+                             == endpoints["end"]["reference"]["typed_sha256"])
+            if shared_vertex:
+                evaluated = [evaluations[name]["payload"] for name in ("start", "end")]
+                if (any(evaluations[name]["error"] is not None for name in ("start", "end"))
+                        or not native_u_domain_is_resolvable(curve["u_min"], curve["u_max"])
+                        or any(value is None for value in evaluated)
+                        or not native_point_within_max_coordinate_bound(evaluated[0][:3], evaluated[1][:3],
+                            native_point_roundtrip_tolerance(evaluated[0][:3], evaluated[1][:3]))):
+                    raise CadError("cad_native_tessellation_unreadable",
+                                   "shared native vertex lacks a closed nonzero edge domain", base)
+            assignment = native_curve_topology_endpoint_set_assignment(
+                curve["start_point_m"], curve["end_point_m"],
+                endpoints["start"]["point_m"], endpoints["end"]["point_m"], shared_vertex=shared_vertex,
+            )
+            edge_row["topology_endpoint_assignment"] = assignment
+            if assignment["accepted"] is not True:
+                raise CadError("cad_native_tessellation_unreadable",
+                               "edge topology endpoints do not form a complete curve endpoint set",
+                               {**base, "edge_index": edge_row["index"], "curve_sense": curve["sense"],
+                                "topology_endpoint_assignment": assignment})
+
         for edge_row in edge_rows:
             endpoints = {}
             for name, point_api in (
@@ -7546,25 +7577,10 @@ class SolidWorksBackend(CadBackend):
                         },
                     },
                 )
-            if set(endpoint_states.values()) == {"present"}:
-                topology_assignment = native_curve_topology_endpoint_set_assignment(
-                    parameter_endpoints[0],
-                    parameter_endpoints[1],
-                    endpoints["start"]["point_m"],
-                    endpoints["end"]["point_m"],
-                )
-                edge_row["topology_endpoint_assignment"] = topology_assignment
-                if topology_assignment["accepted"] is not True:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "edge topology endpoints do not form a complete curve endpoint set",
-                        {
-                            **base,
-                            "edge_index": edge_row["index"],
-                            "curve_sense": curve_sense,
-                            "topology_endpoint_assignment": topology_assignment,
-                        },
-                    )
+            if (set(endpoint_states.values()) == {"present"}
+                    and endpoints["start"]["reference"]["typed_sha256"]
+                    != endpoints["end"]["reference"]["typed_sha256"]):
+                finalize_topology_assignment(edge_row)
             if not both_absent and (
                 not endpoint_evaluations_valid
                 or curve_domain_transform["status"]
@@ -8259,16 +8275,16 @@ class SolidWorksBackend(CadBackend):
                     )
                 endpoint_sets.append(references)
 
-            def add_unoriented_segment_observations(points, targets):
-                orders = (points, tuple(reversed(points)))
-                chosen = min(
-                    orders,
-                    key=lambda order: max(
-                        sum((Fraction(point[axis]) - Fraction(target[axis])) ** 2 for axis in range(3))
-                        for point, target in zip(order, targets, strict=True)
-                    ),
-                )
-                source_displacements.extend(zip(chosen, targets, strict=True))
+            def add_directed_segment_observations(points, targets, *, coedge_index):
+                observed = point_offset(*points)
+                expected = point_offset(*targets)
+                if sum(observed[axis] * expected[axis] for axis in range(3)) <= 0:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "curve observation reverses its native endpoint correspondence",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                source_displacements.extend(zip(points, targets, strict=True))
 
             def line_projection(point, line):
                 origin = tuple(Fraction(value) for value in line[:3])
@@ -8317,22 +8333,28 @@ class SolidWorksBackend(CadBackend):
                     tangent_displacements.append((projected_end, targets[1]))
                     source_displacements.append((evaluation["point_m"], target))
                 native_edge = edge_rows[row["edge_index"]]
+                finalize_topology_assignment(native_edge)
+                curve_refs = [start_reference, end_reference]
+                if native_edge["curve"]["sense"] is not row["same_direction_as_edge"]:
+                    curve_refs.reverse()
+                curve_targets = tuple(native_vertices[ref]["point_m"] for ref in curve_refs)
+                row["curve_vertex_identity_rule"] = NATIVE_PLANAR_EDGE_VERTEX_RULE
+                row["curve_vertex_references_sha256"] = curve_refs
                 curve_points = (native_edge["curve"]["start_point_m"], native_edge["curve"]["end_point_m"])
-                add_unoriented_segment_observations(curve_points, targets)
+                add_directed_segment_observations(curve_points, curve_targets, coedge_index=index)
                 evaluated_points = tuple(
                     native_edge["curve_endpoint_evaluations"][key]["payload"][:3] for key in ("start", "end")
                 )
-                add_unoriented_segment_observations(evaluated_points, targets)
-                add_unoriented_segment_observations(
-                    tuple(line_projection(point, row["edge_line_params"]) for point in curve_points), targets
+                add_directed_segment_observations(evaluated_points, curve_targets, coedge_index=index)
+                add_directed_segment_observations(
+                    tuple(line_projection(point, row["edge_line_params"]) for point in curve_points),
+                    curve_targets, coedge_index=index,
                 )
                 if row["coedge_line_params"] is not None:
-                    source_displacements.extend(
-                        (
-                            line_projection(row[f"{endpoint}_point_m"], row["coedge_line_params"]),
-                            targets[endpoint_index],
-                        )
-                        for endpoint_index, endpoint in enumerate(("start", "end"))
+                    add_directed_segment_observations(
+                        tuple(line_projection(row[f"{endpoint}_point_m"], row["coedge_line_params"])
+                              for endpoint in ("start", "end")),
+                        targets, coedge_index=index,
                     )
             evidence["coedge_facts"] = copy.deepcopy(coedge_rows)
             boundary_points = [tuple(row["start_vertex_point_m"]) for row in coedge_rows]
@@ -8652,6 +8674,7 @@ class SolidWorksBackend(CadBackend):
                         "curve_domain_transform": row["curve_domain_transform"],
                         "curve_endpoint_evaluations": row["curve_endpoint_evaluations"],
                         "topology_endpoint_assignment": row["topology_endpoint_assignment"],
+                        "closed_fin_cycles": [],
                         "endpoint_points_derived_from_curve": row["endpoint_points_derived_from_curve"],
                         "face_senses": row["face_senses"],
                     }
@@ -9825,6 +9848,9 @@ class SolidWorksBackend(CadBackend):
                     base=base,
                 )
 
+        for edge_row in edge_rows:
+            finalize_topology_assignment(edge_row)
+
         def fin_endpoint_u(
             edge,
             point,
@@ -10304,23 +10330,49 @@ class SolidWorksBackend(CadBackend):
                         **error.detail,
                     },
                 ) from error
+            assignment = edge_row["topology_endpoint_assignment"]
+            if assignment is not None and assignment["shared_vertex"]:
+                evaluated_edge_points = {
+                    tuple(fins_by_id[fin_id][f"{endpoint}_evidence"]["evaluate_payload"][:3])
+                    for fin_id in edge_row["fin_ids"] for endpoint in ("start", "end")
+                }
+                if len(evaluated_edge_points) < 2 or not any(
+                    not native_u_equal(fins_by_id[fin_id]["start_u"], fins_by_id[fin_id]["end_u"])
+                    for fin_id in edge_row["fin_ids"]
+                ):
+                    raise CadError("cad_native_tessellation_unreadable",
+                                   "closed native edge lacks nonzero evaluated fin geometry", base)
+            is_closed_edge = bool(
+                (assignment is not None and assignment["shared_vertex"])
+                or edge_row["endpoint_points_derived_from_curve"]
+            )
+            edge_row["closed_fin_cycles"] = []
+            partition_by_fin = {}
+            if is_closed_edge:
+                for face_index in edge_row["face_indices"]:
+                    face_fins = {fin_id: fins_by_id[fin_id] for fin_id in edge_row["fin_ids"]
+                                 if fins_by_id[fin_id]["face_index"] == face_index}
+                    if not face_fins:
+                        continue
+                    try:
+                        partition = closed_edge_fin_partition(
+                            component=component, fins=face_fins,
+                            lower=edge_row["curve"]["u_min"], upper=edge_row["curve"]["u_max"],
+                        )
+                    except NativeFinRelationError as error:
+                        raise CadError("cad_native_tessellation_unreadable", error.message,
+                                       {**base, "edge_index": edge_row["index"], **error.detail}) from error
+                    edge_row["closed_fin_cycles"].append({"face_index": face_index, **partition})
+                    partition_by_fin.update({row["fin_id"]: row["intervals"] for row in partition["segments"]})
             if edge_row["fin_ids"]:
                 intervals_by_face = {}
                 for fin_id in edge_row["fin_ids"]:
                     fin = fins_by_id[fin_id]
                     face_index = facets[fin["facet_id"]]["face_index"]
                     intervals_by_face.setdefault(face_index, []).extend(
-                        native_fin_interval(
-                            fin["start_u"],
-                            fin["end_u"],
-                            edge_row["curve"]["u_min"],
-                            edge_row["curve"]["u_max"],
-                            is_periodic=edge_row["curve_end_params"][
-                                "is_periodic"
-                            ],
-                            is_closed=edge_row["curve_end_params"][
-                                "is_closed"
-                            ],
+                        partition_by_fin[fin_id] if is_closed_edge else native_open_fin_interval(
+                            fin["start_u"], fin["end_u"],
+                            edge_row["curve"]["u_min"], edge_row["curve"]["u_max"],
                         )
                     )
                 for face_index, intervals in intervals_by_face.items():
@@ -10618,6 +10670,7 @@ class SolidWorksBackend(CadBackend):
                     "topology_endpoint_assignment": row[
                         "topology_endpoint_assignment"
                     ],
+                    "closed_fin_cycles": row["closed_fin_cycles"],
                     "endpoint_points_derived_from_curve": row[
                         "endpoint_points_derived_from_curve"
                     ],
