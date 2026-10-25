@@ -23,6 +23,9 @@ from urllib import request as urlrequest
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import canonical, digest, file_digest, write_json
 from description_pipeline.native_transfer import CAPTURE_TRANSFER_SCHEMA
+from description_pipeline.orchestration.airflow_effect_trigger import (
+    _native_wakeable,
+)
 from description_pipeline.orchestration.native_operation_client import (
     NativeOperationCapturePort,
     NativeOperationClient,
@@ -1791,11 +1794,149 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.addCleanup(server.close)
         self.addCleanup(runtime.close)
         client = server.client()
-        client.create_operation(_operation("operation-pre-cancel", self.archive))
+        envelope = _operation("operation-pre-cancel", self.archive)
+        client.create_operation(envelope)
         cancelled = client.cancel_operation("operation-pre-cancel")
         self.assertEqual(cancelled.state, "cancelled")
+        self.assertTrue(cancelled.resource_terminated)
+        self.assertTrue(_native_wakeable(cancelled))
+        self.assertEqual(
+            [event["type"] for event in runtime._events("operation-pre-cancel")],
+            ["accepted", "cancel_requested", "cancelled"],
+        )
+        expected = NativeOperationStatusExpectation.from_create(
+            NativeOperationCreate.from_record(envelope)
+        )
+        self.assertEqual(expected.require(cancelled), cancelled)
         with self.assertRaises(NativeOperationClientConflict):
             client.upload_input("operation-pre-cancel", self.archive)
+        self.assertNotIn(
+            "input_admitted",
+            {event["type"] for event in runtime._events("operation-pre-cancel")},
+        )
+        self.assertNotIn(
+            "execution_started",
+            {event["type"] for event in runtime._events("operation-pre-cancel")},
+        )
+        self.assertEqual(self.calls, 0)
+
+    def test_repeated_pre_start_cancel_is_idempotent(self) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "repeated-pre-start-cancel-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        self.addCleanup(runtime.close)
+        runtime.create(_operation("operation-repeat-cancel", self.archive))
+        first = runtime.cancel("operation-repeat-cancel")
+        second = runtime.cancel("operation-repeat-cancel")
+        self.assertEqual(second, first)
+        self.assertTrue(second["resource_terminated"])
+        self.assertEqual(
+            [
+                event["type"]
+                for event in runtime._events("operation-repeat-cancel")
+            ],
+            ["accepted", "cancel_requested", "cancelled"],
+        )
+        self.assertEqual(self.calls, 0)
+
+    def test_input_admitted_cancel_before_claim_has_no_native_lease(
+        self,
+    ) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls: list[str] = []
+
+        def executor(request, source_archive, workspace, native_tool):
+            del source_archive, native_tool
+            calls.append(str(request["command_id"]))
+            if request["command_id"] == "operation-lease-holder":
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("lease holder was not released")
+            artifact = Path(workspace) / "result.zip"
+            artifact.write_bytes(b"completed")
+            return NativeOperationResult(
+                artifact_path=artifact,
+                artifact_name="result.zip",
+                output_contract=OUTPUT_CONTRACT,
+                resource_terminated=True,
+            )
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "input-admitted-cancel-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: executor},
+        )
+        self.addCleanup(runtime.close)
+        runtime.create(_operation("operation-lease-holder", self.archive))
+        runtime.admit_input("operation-lease-holder", self.archive)
+        self.assertTrue(entered.wait(5))
+
+        runtime.create(_operation("operation-input-admitted", self.archive))
+        runtime.admit_input("operation-input-admitted", self.archive)
+        self.assertEqual(
+            runtime.view("operation-input-admitted")["state"],
+            "awaiting_input",
+        )
+        cancelled = runtime.cancel("operation-input-admitted")
+
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertTrue(cancelled["resource_terminated"])
+        self.assertEqual(
+            [
+                event["type"]
+                for event in runtime._events("operation-input-admitted")
+            ],
+            ["accepted", "input_admitted", "cancel_requested", "cancelled"],
+        )
+        with runtime._connect() as connection:
+            lease = connection.execute(
+                "SELECT operation_id FROM native_resource_lease WHERE singleton=1"
+            ).fetchone()
+        self.assertEqual(lease[0], "operation-lease-holder")
+        self.assertEqual(calls, ["operation-lease-holder"])
+
+        release.set()
+        finished = _wait_for(
+            lambda: (
+                row
+                if (row := runtime.view("operation-lease-holder"))["state"]
+                == "satisfied"
+                else None
+            )
+        )
+        self.assertTrue(finished["resource_terminated"])
+        self.assertEqual(calls, ["operation-lease-holder"])
+
+    def test_pre_start_cancel_terminal_projection_survives_restart(self) -> None:
+        state = self.root / "pre-start-cancel-restart-state"
+        first = NativeOperationRuntime(
+            state_root=state,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        first.create(_operation("operation-cancel-restart", self.archive))
+        cancelled = first.cancel("operation-cancel-restart")
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertTrue(cancelled["resource_terminated"])
+        first.close()
+
+        second = NativeOperationRuntime(
+            state_root=state,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        self.addCleanup(second.close)
+        recovered = second.view("operation-cancel-restart")
+        self.assertEqual(recovered, cancelled)
+        self.assertTrue(recovered["resource_terminated"])
+        with second._connect() as connection:
+            lease = connection.execute(
+                "SELECT operation_id FROM native_resource_lease WHERE singleton=1"
+            ).fetchone()
+        self.assertIsNone(lease)
         self.assertEqual(self.calls, 0)
 
     def test_post_start_cancel_is_unknown_and_never_restarts(self) -> None:
@@ -1833,6 +1974,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertTrue(entered.wait(5))
         cancelled = client.cancel_operation("operation-post-cancel")
         self.assertEqual(cancelled.state, "unknown")
+        self.assertFalse(cancelled.resource_terminated)
         release.set()
         released = _wait_for(
             lambda: (

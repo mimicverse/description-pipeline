@@ -1818,6 +1818,7 @@ class NativeOperationRuntime:
                 {
                     "code": "native_operation_cancelled",
                     "message": "Cancellation completed before native execution",
+                    "resource_terminated": True,
                 },
             )
             return
@@ -2070,6 +2071,7 @@ class NativeOperationRuntime:
                         {
                             "code": "native_operation_cancelled",
                             "message": "Cancellation completed before native execution",
+                            "resource_terminated": True,
                         },
                     )
         return self.view(
