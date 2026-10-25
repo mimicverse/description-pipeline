@@ -21,7 +21,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import digest, file_digest, write_json
+from description_pipeline.io import canonical, digest, file_digest, write_json
 from description_pipeline.native_transfer import CAPTURE_TRANSFER_SCHEMA
 from description_pipeline.orchestration.native_operation_client import (
     NativeOperationCapturePort,
@@ -2213,13 +2213,19 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         request = self.request(operation_id)
         outbound = workspace / "outbound"
         outbound.mkdir()
-        write_json(outbound / "request.json", request.to_record())
-        write_json(
-            outbound / "source.json",
-            {
-                "source_files": dict(request.source_files),
-                "source_inventory_sha256": request.source_inventory_sha256,
-            },
+        (outbound / "request.json").write_bytes(
+            canonical(request.to_record()) + b"\n"
+        )
+        (outbound / "source.json").write_bytes(
+            canonical(
+                {
+                    "source_files": dict(request.source_files),
+                    "source_inventory_sha256": (
+                        request.source_inventory_sha256
+                    ),
+                }
+            )
+            + b"\n"
         )
         (outbound / "source-set.zip").write_bytes(archive.read_bytes())
         command_request = request.to_record()
@@ -2702,6 +2708,97 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                 client.get_operation = mock.Mock(
                     side_effect=AssertionError(
                         "foreign Discover target must be rejected before observation"
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    NativeOperationProtocolError,
+                    "Discover reconciliation",
+                ):
+                    NativeOperationEffectObserver(client).observe(
+                        command=command,
+                        intent=altered,
+                        outbound_root=outbound,
+                        workspace_root=workspace,
+                    )
+
+                client.get_operation.assert_not_called()
+
+    def test_effect_observer_rejects_self_consistent_discover_outbound_drift(
+        self,
+    ) -> None:
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = _CountingBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+
+        for label in (
+            "main-assembly",
+            "source-inventory",
+            "source-archive",
+        ):
+            with self.subTest(case=label):
+                workspace = self.root / f"observer-outbound-{label}"
+                archive = seal_source_archive(
+                    self.source,
+                    self.inventory,
+                    workspace / "input-source-set.zip",
+                )
+                command, intent, outbound = self.observer_fixture(
+                    f"discover-operation-outbound-{label}",
+                    workspace,
+                    archive=archive,
+                )
+                request_record = json.loads(
+                    (outbound / "request.json").read_text()
+                )
+                target = dict(intent.target)
+                expected_state = dict(intent.expected_state)
+                if label == "main-assembly":
+                    request_record["main_assembly"] = self.SELECTED
+                    target["main_assembly"] = self.SELECTED
+                elif label == "source-inventory":
+                    source_files = dict(request_record["source_files"])
+                    source_files[self.SELECTED] = "f" * 64
+                    source_inventory_sha256 = digest(source_files)
+                    request_record["source_files"] = source_files
+                    request_record[
+                        "source_inventory_sha256"
+                    ] = source_inventory_sha256
+                    expected_state[
+                        "source_inventory_sha256"
+                    ] = source_inventory_sha256
+                    (outbound / "source.json").write_bytes(
+                        canonical(
+                            {
+                                "source_files": source_files,
+                                "source_inventory_sha256": (
+                                    source_inventory_sha256
+                                ),
+                            }
+                        )
+                        + b"\n"
+                    )
+                else:
+                    archive.write_bytes(archive.read_bytes() + b"trailing")
+                    expected_state[
+                        "source_archive_sha256"
+                    ] = file_digest(archive)
+                (outbound / "request.json").write_bytes(
+                    canonical(request_record) + b"\n"
+                )
+                target["target_binding_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in target.items()
+                        if key != "target_binding_digest"
+                    }
+                )
+                altered = SimpleNamespace(**vars(intent))
+                altered.target = target
+                altered.expected_state = expected_state
+                client.get_operation = mock.Mock(
+                    side_effect=AssertionError(
+                        "outbound drift must be rejected before observation"
                     )
                 )
 

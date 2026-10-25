@@ -23,7 +23,15 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-from ..io import PipelineError, digest, file_digest, parse_data, read_data, write_json
+from ..io import (
+    PipelineError,
+    canonical,
+    confined,
+    digest,
+    file_digest,
+    parse_data,
+    write_json,
+)
 from ..native_transfer import (
     CAPTURE_MANIFEST,
     CAPTURE_TRANSFER_SCHEMA,
@@ -42,6 +50,7 @@ from .discover_protocol import (
     OBSERVATION_ARCHIVE,
     SOURCE_ARCHIVE,
     admit_observation_bundle,
+    seal_source_archive,
 )
 from .native_operation_runtime import (
     CAPTURE_KIND,
@@ -973,6 +982,68 @@ def _effect_target_identity(intent: EffectIntent) -> NativeTargetIdentity:
     )
 
 
+def _validate_discover_source_archive(
+    archive: Path,
+    source_files: Mapping[str, str],
+) -> None:
+    """Require one canonical SourceSet archive with exactly its registered bytes."""
+
+    from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="description-discover-source-"
+        ) as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            with zipfile.ZipFile(archive) as source:
+                members = source.infolist()
+                names = [item.filename for item in members]
+                if (
+                    len(names) != len(set(names))
+                    or set(names) != set(source_files)
+                    or any(
+                        item.is_dir() or item.flag_bits & 0x1
+                        for item in members
+                    )
+                    or sum(item.file_size for item in members)
+                    > MAX_HANDOFF_BYTES
+                ):
+                    raise NativeOperationProtocolError(
+                        "Discover source archive has invalid members"
+                    )
+                for item in members:
+                    target = confined(
+                        root,
+                        item.filename,
+                        exists=False,
+                    )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    hasher = hashlib.sha256()
+                    with source.open(item) as input_stream, target.open(
+                        "xb"
+                    ) as output_stream:
+                        while block := input_stream.read(1024 * 1024):
+                            hasher.update(block)
+                            output_stream.write(block)
+                    if hasher.hexdigest() != source_files[item.filename]:
+                        raise NativeOperationProtocolError(
+                            "Discover source archive member differs from its inventory"
+                        )
+            rebuilt = Path(directory) / "rebuilt.zip"
+            seal_source_archive(root, source_files, rebuilt)
+            if file_digest(rebuilt) != file_digest(archive):
+                raise NativeOperationProtocolError(
+                    "Discover source archive is not canonical"
+                )
+    except NativeOperationProtocolError:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        raise NativeOperationProtocolError(
+            "Discover source archive is invalid"
+        ) from error
+
+
 def read_sealed_native_operation_request(
     command: StageCommand,
     intent: EffectIntent,
@@ -1106,22 +1177,31 @@ def read_sealed_native_operation_request(
             raise NativeOperationProtocolError(
                 "Discover reconciliation intent differs from the registered target"
             )
+        request_path = outbound_root / "request.json"
+        request_raw = request_path.read_bytes()
         request = NativeDiscoverRequest.from_record(
-            read_data(outbound_root / "request.json")
+            parse_data(request_raw, request_path)
         )
+        if request_raw != canonical(request.to_record()) + b"\n":
+            raise NativeOperationProtocolError(
+                "Discover reconciliation request is not canonical"
+            )
         expected_target = discover_effect_target(
             command,
-            request.to_record(),
+            command.request,
             command_target,
         )
         if dict(intent.target) != expected_target:
             raise NativeOperationProtocolError(
                 "Discover reconciliation effect intent differs from the frozen command"
             )
-        source = read_data(outbound_root / "source.json")
+        source_path = outbound_root / "source.json"
+        source_raw = source_path.read_bytes()
+        source = parse_data(source_raw, source_path)
         archive = outbound_root / SOURCE_ARCHIVE
         if (
-            source
+            source_raw != canonical(source) + b"\n"
+            or source
             != {
                 "source_files": dict(request.source_files),
                 "source_inventory_sha256": request.source_inventory_sha256,
@@ -1130,6 +1210,11 @@ def read_sealed_native_operation_request(
             or request.run_id != command.run_id
             or request.request_digest != command.request_digest
             or request.operation_id != expected_target["operation_id"]
+            or request.source_files != command.request.get("source_files")
+            or request.source_inventory_sha256
+            != command.request.get("source_inventory_sha256")
+            or request.main_assembly != command.request.get("main_assembly")
+            or request.purpose != command.request.get("purpose")
             or request.expected_native_tool_sha256
             != command.request.get("expected_native_tool_sha256")
             or request.expected_native_tool_record_sha256
@@ -1142,10 +1227,14 @@ def read_sealed_native_operation_request(
             raise NativeOperationProtocolError(
                 "Discover reconciliation outbound differs from the frozen command"
             )
+        _validate_discover_source_archive(
+            archive,
+            request.source_files,
+        )
         source_archive_sha256 = file_digest(archive)
         if dict(intent.expected_state) != discover_effect_expected_state(
             command,
-            request.to_record(),
+            command.request,
             source_archive_sha256,
             command_target,
         ):
