@@ -10,7 +10,8 @@ from collections import defaultdict
 from ..io import PipelineError
 from ..schemas import (
     NATIVE_ID_ARRAY_SOURCE_FLAT,
-    NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from .native_fin_topology import (
@@ -1009,7 +1010,6 @@ def parse_native_tessellation(
         "end_reference_error",
         "face_indices",
         "fin_ids",
-        "native_fin_count",
         "fin_ids_source",
         "raw_fin_ids",
         "u_min",
@@ -1144,13 +1144,10 @@ def parse_native_tessellation(
             and isinstance(edge["fin_ids"], list)
             and edge["fin_ids"] == sorted(set(edge["fin_ids"]))
             and all(_integer(value) and value >= 0 for value in edge["fin_ids"])
-            and _integer(edge["native_fin_count"])
-            and edge["native_fin_count"] >= 0
-            and edge["native_fin_count"] == len(edge["fin_ids"])
             and edge["fin_ids_source"]
             in {
                 NATIVE_ID_ARRAY_SOURCE_FLAT,
-                NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+                NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
             }
             and (
                 (
@@ -1161,14 +1158,24 @@ def parse_native_tessellation(
                         for value in edge["raw_fin_ids"]
                     )
                     and sorted(edge["raw_fin_ids"]) == edge["fin_ids"]
-                    and len(edge["raw_fin_ids"]) == edge["native_fin_count"]
                 )
                 or (
                     edge["fin_ids_source"]
-                    == NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT
-                    and edge["native_fin_count"] == 0
-                    and edge["fin_ids"] == []
+                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                    and edge["body_type"] == 1
                     and edge["raw_fin_ids"] is None
+                    and edge["fin_ids"] == []
+                    and all(
+                        face_spans_by_key[
+                            (
+                                edge["body_type"],
+                                edge["body_index"],
+                                face_index,
+                            )
+                        ]["triangle_count"]
+                        == 0
+                        for face_index in edge["face_indices"]
+                    )
                 )
             )
             and type(edge["u_min"]) in (int, float)
@@ -3109,7 +3116,7 @@ def _parse_itessellation_body(
             and face["facet_ids_source"]
             in {
                 NATIVE_ID_ARRAY_SOURCE_FLAT,
-                NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+                NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
             }
             and (
                 (
@@ -3124,7 +3131,8 @@ def _parse_itessellation_body(
                 )
                 or (
                     face["facet_ids_source"]
-                    == NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT
+                    == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                    and body_key[0] == 1
                     and facet_count == 0
                     and facet_ids == []
                     and face["raw_facet_ids"] is None
@@ -3165,6 +3173,20 @@ def _parse_itessellation_body(
     _require(
         set(faces) == set(face_spans),
         component + f": native tessellation body {body_key} does not cover every face",
+    )
+    _require(
+        sum(len(facet_ids) for facet_ids in faces.values())
+        == body["facet_count"]
+        and len(
+            {
+                facet_id
+                for facet_ids in faces.values()
+                for facet_id in facet_ids
+            }
+        )
+        == body["facet_count"],
+        component
+        + f": native tessellation body {body_key} face arrays do not close the native facet total",
     )
 
     facets = {}

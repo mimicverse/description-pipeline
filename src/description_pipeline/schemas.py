@@ -12,16 +12,19 @@ INPUT_SCHEMA = "solidworks-to-urdf.input/v1"
 TOOL_SCHEMA = "solidworks-to-urdf.tool/v1"
 EFFECTIVE_INSTANCES_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
-NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v10"
+NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v11"
 NATIVE_ID_ARRAY_SOURCE_FLAT = "native-flat-array"
-NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT = "native-null-zero-count"
+NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO = (
+    "native-body-global-null-zero"
+)
+NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO = (
+    "native-incident-faces-null-zero"
+)
 NATIVE_FACETLESS_EVIDENCE_API = (
-    "IBody2.GetTessellation/ITessellation.Tessellate/"
-    "IGetFaceFacetsCount2/GetFaceFacets"
+    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
 )
 NATIVE_MESH_CAPTURE_API = (
-    "ITessellation.Tessellate/IGetFaceFacetsCount2/GetFaceFacets/"
-    "GetFacetFins/IGetEdgeFinsCount/GetEdgeFins/"
+    "ITessellation.Tessellate/GetFaceFacets/GetFacetFins/"
     "GetFinVertices/GetVertexPoint"
 )
 NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"

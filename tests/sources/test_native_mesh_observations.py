@@ -636,7 +636,7 @@ class NativeMeshObservationTests(unittest.TestCase):
             body(row)["properties"].pop("match_type")
 
         cases = (
-            ("misowned", misowned_facet, "has misowned facets"),
+            ("misowned", misowned_facet, "face arrays do not close"),
             ("three-fins", missing_fin, "facet 0 is malformed"),
             ("fin-vertices", duplicate_fin_vertex, "fin 0 is malformed"),
             ("fin-sides", fin_side_from_other_facet, "facet 1 is malformed"),
@@ -675,11 +675,6 @@ class NativeMeshObservationTests(unittest.TestCase):
         missing_edge_fin = copy.deepcopy(original)
         missing_edge_fin["tessellation"]["native_edges"][0]["fin_ids"].pop()
         missing_edge_fin["tessellation"]["native_edges"][0][
-            "native_fin_count"
-        ] = len(
-            missing_edge_fin["tessellation"]["native_edges"][0]["fin_ids"]
-        )
-        missing_edge_fin["tessellation"]["native_edges"][0][
             "raw_fin_ids"
         ] = list(
             missing_edge_fin["tessellation"]["native_edges"][0]["fin_ids"]
@@ -690,11 +685,6 @@ class NativeMeshObservationTests(unittest.TestCase):
             internal_fin["fin_id"]
         )
         extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"].sort()
-        extra_internal_fin["tessellation"]["native_edges"][0][
-            "native_fin_count"
-        ] = len(
-            extra_internal_fin["tessellation"]["native_edges"][0]["fin_ids"]
-        )
         extra_internal_fin["tessellation"]["native_edges"][0][
             "raw_fin_ids"
         ] = list(
@@ -1071,7 +1061,6 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         edge = tessellation["native_edges"][0]
         fin_ids = set(edge["fin_ids"])
         edge["fin_ids"] = []
-        edge["native_fin_count"] = 0
         edge["raw_fin_ids"] = []
         for fin in tessellation["itessellation"]["bodies"][0]["fins"]:
             if fin["fin_id"] not in fin_ids:

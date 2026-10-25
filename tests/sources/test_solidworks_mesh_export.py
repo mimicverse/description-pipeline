@@ -396,17 +396,6 @@ class FakeTessellation:
             return list(values)
         return list(range(1, int(self._facets or 0) + 1))
 
-    def IGetFaceFacetsCount2(self, face):  # noqa: N802 - SolidWorks API name
-        if self._graph is not None:
-            values = self._facets_by_face.get(id(face))
-            if values is None:
-                reference = getattr(face, "_persist_reference", b"")
-                values = self._facets_by_reference[
-                    hashlib.sha256(reference).hexdigest()
-                ]
-            return len(values)
-        return int(self._facets or 0)
-
     def GetFacetFins(self, facet_id):  # noqa: N802 - SolidWorks API name
         if self._graph is not None:
             return list(self._fins_by_facet[facet_id])
@@ -422,16 +411,6 @@ class FakeTessellation:
                 (),
             )
         return list(values)
-
-    def IGetEdgeFinsCount(self, edge):  # noqa: N802 - SolidWorks API name
-        values = self._fins_by_edge.get(id(edge))
-        if values is None:
-            reference = getattr(edge, "_persist_reference", b"")
-            values = self._fins_by_edge_reference.get(
-                hashlib.sha256(reference).hexdigest(),
-                (),
-            )
-        return len(values)
 
     def GetFinVertices(self, fin_id):  # noqa: N802 - SolidWorks API name
         if self._graph is not None:

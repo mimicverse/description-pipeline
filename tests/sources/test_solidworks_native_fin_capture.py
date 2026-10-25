@@ -65,7 +65,8 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
 from description_pipeline.io import PipelineError  # noqa: E402
 from description_pipeline.schemas import (  # noqa: E402
     NATIVE_ID_ARRAY_SOURCE_FLAT,
-    NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
     NATIVE_TESSELLATION_SCHEMA,
 )
 import description_pipeline.sources.solidworks.native as native_module  # noqa: E402
@@ -374,10 +375,6 @@ class FakeTessellation:
         self.tessellate_calls = 0
         self.edge_fin_calls = []
         self.face_facet_calls = []
-        self.face_facet_count_calls = []
-        self.edge_fin_count_calls = []
-        self.face_facet_counts = {}
-        self.edge_fin_counts = {}
         self.facet_fin_calls = []
         self.fin_vertex_calls = []
         self.vertex_point_calls = []
@@ -428,18 +425,6 @@ class FakeTessellation:
         value = self.face_facets[id(face)]
         return list(value) if isinstance(value, (list, tuple)) else [value]
 
-    def IGetFaceFacetsCount2(self, face):  # noqa: N802 - SolidWorks API name
-        self._observe("IGetFaceFacetsCount2")
-        self.face_facet_count_calls.append(face)
-        if id(face) in self.face_facet_counts:
-            return self.face_facet_counts[id(face)]
-        value = self.face_facets[id(face)]
-        if value is None:
-            return 0
-        if isinstance(value, (list, tuple)):
-            return len(value)
-        return 1
-
     def GetFacetFins(self, facet_id):  # noqa: N802 - SolidWorks API name
         self._observe("GetFacetFins")
         self.facet_fin_calls.append(facet_id)
@@ -453,11 +438,6 @@ class FakeTessellation:
         self._observe("GetEdgeFins")
         self.edge_fin_calls.append(edge)
         return [100, 200]
-
-    def IGetEdgeFinsCount(self, edge):  # noqa: N802 - SolidWorks API name
-        self._observe("IGetEdgeFinsCount")
-        self.edge_fin_count_calls.append(edge)
-        return self.edge_fin_counts.get(id(edge), 2)
 
     def GetFinVertices(self, fin_id):  # noqa: N802 - SolidWorks API name
         self._observe("GetFinVertices")
@@ -990,7 +970,6 @@ class NativeFinCaptureTests(unittest.TestCase):
         }
         tessellation.cofin_values = {100: -1}
         tessellation.GetEdgeFins = lambda _edge: [100]
-        tessellation.edge_fin_counts[id(edge)] = 1
         tessellation.GetVertexPoint = lambda vertex_id: {
             1: (0.0, 0.0, 0.0),
             2: (1.0, 0.0, 0.0),
@@ -2358,7 +2337,6 @@ class NativeFinCaptureTests(unittest.TestCase):
             self.open_boundary_fixture()
         )
         tessellation.GetEdgeFins = lambda _edge: []
-        tessellation.edge_fin_counts[id(_edge)] = 0
 
         with self.assertRaises(CadError) as caught:
             self.capture(body, extension, body_type=1)
@@ -2378,8 +2356,8 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertIs(detail["tessellate_result"], True)
         self.assertEqual(tessellation.tessellate_calls, 1)
 
-    def test_native_edge_null_requires_a_zero_native_count(self):
-        body, face_10, edge, tessellation, extension = (
+    def test_native_edge_null_is_completed_by_empty_incident_faces(self):
+        body, face_10, _edge, tessellation, extension = (
             self.open_boundary_fixture()
         )
         tessellation.face_facets = {id(face_10): []}
@@ -2389,48 +2367,113 @@ class NativeFinCaptureTests(unittest.TestCase):
             "GetVertexCount": 0,
         }
         tessellation.GetEdgeFins = lambda _edge: None
-        tessellation.edge_fin_counts[id(edge)] = 1
 
-        with self.assertRaises(CadError) as caught:
-            self.capture(body, extension, body_type=1)
-        self.assertIn(
-            "invalid fin ID array",
-            str(caught.exception),
-        )
+        captured = self.capture(body, extension, body_type=1)
+
+        self.assertEqual(captured["edges"][0]["fin_ids"], ())
         self.assertEqual(
-            caught.exception.detail["raw_edge_fins"],
-            "None",
+            captured["edges"][0]["fin_ids_source"],
+            NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
         )
-        self.assertEqual(
-            caught.exception.detail["raw_edge_fins_type"],
-            "NoneType",
-        )
-        self.assertEqual(
-            caught.exception.detail["native_fin_count"],
-            "1",
-        )
+        self.assertIsNone(captured["edges"][0]["raw_fin_ids"])
         self.assertEqual(tessellation.tessellate_calls, 1)
 
-    def test_native_face_null_requires_a_zero_native_count(self):
+    def test_native_edge_null_is_rejected_with_an_active_incident_face(self):
+        body, _face, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.GetEdgeFins = lambda _edge: None
+
+        with self.assertRaisesRegex(CadError, "invalid fin ID array"):
+            self.capture(body, extension, body_type=1)
+
+    def test_native_edge_null_requires_global_fin_closure(self):
         body, face, _edge, tessellation, extension = (
             self.open_boundary_fixture()
         )
+        tessellation.face_facets = {id(face): []}
+        tessellation.native_totals = {
+            "GetFacetCount": 0,
+            "GetFinCount": 1,
+            "GetVertexCount": 0,
+        }
+        tessellation.GetEdgeFins = lambda _edge: None
+
+        with self.assertRaisesRegex(CadError, "invalid fin ID array"):
+            self.capture(body, extension, body_type=1)
+
+    def test_sheet_face_null_is_completed_by_body_global_facet_closure(self):
+        body, _face, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.native_totals = {
+            "GetFacetCount": 0,
+            "GetFinCount": 0,
+            "GetVertexCount": 0,
+        }
         tessellation.GetFaceFacets = lambda _face: None
-        tessellation.face_facet_counts[id(face)] = 1
+        tessellation.GetEdgeFins = lambda _edge: []
+
+        captured = self.capture(body, extension, body_type=1)
+
+        self.assertEqual(captured["faces"][0]["facet_ids"], ())
+        self.assertEqual(
+            captured["faces"][0]["facet_ids_source"],
+            NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+        )
+        self.assertIsNone(captured["faces"][0]["raw_facet_ids"])
+        self.assertEqual(tessellation.tessellate_calls, 1)
+
+    def test_face_null_requires_complete_body_facet_closure(self):
+        body, _face, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.GetFaceFacets = lambda _face: None
+        tessellation.native_totals["GetFacetCount"] = 1
+
+        with self.assertRaisesRegex(
+            CadError,
+            "did not close the native facet total",
+        ):
+            self.capture(body, extension, body_type=1)
+
+    def test_solid_face_null_cannot_use_sheet_closure(self):
+        body, _face, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.native_totals = {
+            "GetFacetCount": 0,
+            "GetFinCount": 0,
+            "GetVertexCount": 0,
+        }
+        tessellation.GetFaceFacets = lambda _face: None
 
         with self.assertRaisesRegex(
             CadError,
             "invalid facet ID array",
-        ) as caught:
-            self.capture(body, extension, body_type=1)
+        ):
+            self.capture(body, extension, body_type=0)
 
-        self.assertEqual(caught.exception.detail["native_count"], "1")
-        self.assertEqual(caught.exception.detail["raw_ids"], "None")
-        self.assertEqual(caught.exception.detail["raw_ids_type"], "NoneType")
-        self.assertEqual(tessellation.tessellate_calls, 1)
+    def test_solid_edge_null_cannot_use_incident_face_closure(self):
+        body, face, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.face_facets = {id(face): []}
+        tessellation.native_totals = {
+            "GetFacetCount": 0,
+            "GetFinCount": 0,
+            "GetVertexCount": 0,
+        }
+        tessellation.GetEdgeFins = lambda _edge: None
+
+        with self.assertRaisesRegex(
+            CadError,
+            "only on a sheet body",
+        ):
+            self.capture(body, extension, body_type=0)
 
     def test_untessellated_sheet_edge_may_have_no_fins(self):
-        body, face, edge, tessellation, extension = (
+        body, face, _edge, tessellation, extension = (
             self.open_boundary_fixture()
         )
         tessellation.face_facets = {id(face): []}
@@ -2440,7 +2483,6 @@ class NativeFinCaptureTests(unittest.TestCase):
             "GetVertexCount": 0,
         }
         tessellation.GetEdgeFins = lambda _edge: []
-        tessellation.edge_fin_counts[id(edge)] = 0
 
         captured = self.capture(body, extension, body_type=1)
 
@@ -2460,7 +2502,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(tessellation.tessellate_calls, 1)
 
     def test_untessellated_solid_edge_cannot_have_no_fins(self):
-        body, face_10, face_20, edge, tessellation, extension = self.fixture()
+        body, face_10, face_20, _edge, tessellation, extension = self.fixture()
         tessellation.face_facets = {
             id(face_10): [],
             id(face_20): [],
@@ -2471,7 +2513,6 @@ class NativeFinCaptureTests(unittest.TestCase):
             "GetVertexCount": 0,
         }
         tessellation.GetEdgeFins = lambda _edge: []
-        tessellation.edge_fin_counts[id(edge)] = 0
 
         with self.assertRaisesRegex(
             CadError,
@@ -2480,8 +2521,8 @@ class NativeFinCaptureTests(unittest.TestCase):
             self.capture(body, extension, body_type=0)
         self.assertEqual(tessellation.tessellate_calls, 1)
 
-    def test_null_zero_count_arrays_are_recorded_as_explicit_native_evidence(self):
-        body, face, edge, tessellation, extension = (
+    def test_null_face_records_raw_none_and_derived_zero_source(self):
+        body, _face, _edge, tessellation, extension = (
             self.open_boundary_fixture()
         )
         tessellation.native_totals = {
@@ -2490,30 +2531,20 @@ class NativeFinCaptureTests(unittest.TestCase):
             "GetVertexCount": 0,
         }
         tessellation.GetFaceFacets = lambda _face: None
-        tessellation.face_facet_counts[id(face)] = 0
-        tessellation.GetEdgeFins = lambda _edge: None
-        tessellation.edge_fin_counts[id(edge)] = 0
+        tessellation.GetEdgeFins = lambda _edge: []
 
         captured = self.capture(body, extension, body_type=1)
 
         self.assertEqual(captured["faces"][0]["facet_ids"], ())
         self.assertEqual(
             captured["faces"][0]["facet_ids_source"],
-            NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+            NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
         )
         self.assertIsNone(captured["faces"][0]["raw_facet_ids"])
-        self.assertEqual(captured["edges"][0]["fin_ids"], ())
-        self.assertEqual(
-            captured["edges"][0]["fin_ids_source"],
-            NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
-        )
-        self.assertIsNone(captured["edges"][0]["raw_fin_ids"])
-        self.assertEqual(len(tessellation.face_facet_count_calls), 1)
-        self.assertEqual(len(tessellation.edge_fin_count_calls), 1)
         self.assertEqual(tessellation.tessellate_calls, 1)
 
-    def test_null_zero_count_requires_a_successful_tessellate_call(self):
-        body, face, _edge, tessellation, extension = (
+    def test_null_face_requires_a_successful_tessellate_call(self):
+        body, _face, _edge, tessellation, extension = (
             self.open_boundary_fixture()
         )
         tessellation.native_totals = {
@@ -2523,7 +2554,6 @@ class NativeFinCaptureTests(unittest.TestCase):
         }
         tessellation.Tessellate = lambda: False
         tessellation.GetFaceFacets = lambda _face: None
-        tessellation.face_facet_counts[id(face)] = 0
 
         with self.assertRaisesRegex(
             CadError,
@@ -2535,6 +2565,66 @@ class NativeFinCaptureTests(unittest.TestCase):
             caught.exception.detail["tessellate_result"],
             False,
         )
+
+    def test_parser_accepts_sheet_null_face_and_edge_by_complete_closure(self):
+        edge_reference = hashlib.sha256(b"edge").hexdigest()
+        span = {
+            "body_type": 1,
+            "body_index": 0,
+            "body_name": "sheet",
+            "body_reference_sha256": hashlib.sha256(b"body").hexdigest(),
+            "face_index": 0,
+            "face_reference_sha256": hashlib.sha256(b"face").hexdigest(),
+            "face_owner_id": 1,
+            "edge_references": [edge_reference],
+            "triangle_start": 0,
+            "triangle_count": 0,
+            "triangle_records_sha256": hashlib.sha256(b"").hexdigest(),
+        }
+        edge = {
+            "body_type": 1,
+            "body_index": 0,
+            "edge_reference_sha256": edge_reference,
+            "start_vertex_reference_sha256": hashlib.sha256(b"v1").hexdigest(),
+            "end_vertex_reference_sha256": hashlib.sha256(b"v2").hexdigest(),
+            "start_point_m": [0.0, 0.0, 0.0],
+            "end_point_m": [1e-5, 0.0, 0.0],
+            "face_indices": [0],
+            "u_min": 0.0,
+            "u_max": 1.0,
+            "curve_sense": True,
+            "curve_type": 0,
+        }
+        evidence = support.native_tessellation_fixture([span], [edge])
+        face = evidence["itessellation"]["bodies"][0]["faces"][0]
+        face.update(
+            {
+                "facet_ids_source": (
+                    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                ),
+                "raw_facet_ids": None,
+            }
+        )
+        native_edge = evidence["native_edges"][0]
+        native_edge.update(
+            {
+                "fin_ids_source": (
+                    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                ),
+                "raw_fin_ids": None,
+            }
+        )
+
+        spans = parse_native_tessellation(
+            "sheet",
+            evidence,
+            {"solid": 0, "sheet": 1},
+            0,
+            [],
+        )
+
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["triangle_count"], 0)
 
     def test_face_facet_read_requires_a_flat_native_integer_array(self):
         for value in ([[]], [()], [None]):
@@ -2556,47 +2646,16 @@ class NativeFinCaptureTests(unittest.TestCase):
                 self.assertEqual(tessellation.tessellate_calls, 1)
 
     def test_face_facet_ids_must_be_unique(self):
-        body, face, _edge, tessellation, extension = (
+        body, _face, _edge, tessellation, extension = (
             self.open_boundary_fixture()
         )
         tessellation.GetFaceFacets = lambda _face: [10, 10]
-        tessellation.face_facet_counts[id(face)] = 2
 
         with self.assertRaisesRegex(CadError, "repeats a facet ID"):
             self.capture(body, extension, body_type=1)
 
-    def test_native_id_counts_must_be_unique_nonnegative_integers(self):
-        for api, invalid in (
-            ("IGetFaceFacetsCount2", None),
-            ("IGetFaceFacetsCount2", True),
-            ("IGetFaceFacetsCount2", -1),
-            ("IGetFaceFacetsCount2", 1.0),
-            ("IGetEdgeFinsCount", None),
-            ("IGetEdgeFinsCount", True),
-            ("IGetEdgeFinsCount", -1),
-            ("IGetEdgeFinsCount", 1.0),
-        ):
-            with self.subTest(api=api, invalid=invalid):
-                body, face, edge, tessellation, extension = (
-                    self.open_boundary_fixture()
-                )
-                if api == "IGetFaceFacetsCount2":
-                    tessellation.face_facet_counts[id(face)] = invalid
-                else:
-                    tessellation.edge_fin_counts[id(edge)] = invalid
-                with self.assertRaisesRegex(
-                    CadError,
-                    "invalid (facet|fin) count",
-                ):
-                    self.capture(body, extension, body_type=1)
-
-    def test_native_count_and_array_failures_preserve_same_pass_context(self):
-        for api in (
-            "IGetFaceFacetsCount2",
-            "GetFaceFacets",
-            "IGetEdgeFinsCount",
-            "GetEdgeFins",
-        ):
+    def test_native_array_failures_preserve_same_pass_context(self):
+        for api in ("GetFaceFacets", "GetEdgeFins"):
             with self.subTest(api=api):
                 body, _face, _edge, tessellation, extension = (
                     self.open_boundary_fixture()
@@ -2626,26 +2685,9 @@ class NativeFinCaptureTests(unittest.TestCase):
                 )
                 self.assertIs(detail["tessellate_result"], True)
 
-    def test_native_id_array_length_must_match_the_native_count(self):
-        for api in ("face", "edge"):
-            with self.subTest(api=api):
-                body, face, edge, tessellation, extension = (
-                    self.open_boundary_fixture()
-                )
-                if api == "face":
-                    tessellation.face_facet_counts[id(face)] = 0
-                else:
-                    tessellation.edge_fin_counts[id(edge)] = 0
-                with self.assertRaisesRegex(
-                    CadError,
-                    "count differs from its native count",
-                ):
-                    self.capture(body, extension, body_type=1)
-
     def test_edge_fin_ids_are_canonicalized_after_native_read(self):
-        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
         tessellation.GetEdgeFins = lambda _edge: [200, 100]
-        tessellation.edge_fin_counts[id(edge)] = 2
 
         captured = self.capture(body, extension)
 
@@ -2663,11 +2705,10 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         for label, fin_ids, message in cases:
             with self.subTest(label=label):
-                body, _face_10, _face_20, edge, tessellation, extension = (
+                body, _face_10, _face_20, _edge, tessellation, extension = (
                     self.fixture()
                 )
                 tessellation.GetEdgeFins = lambda _edge, value=fin_ids: value
-                tessellation.edge_fin_counts[id(edge)] = len(fin_ids)
                 with self.assertRaisesRegex(CadError, message):
                     self.capture(body, extension)
 
@@ -4605,10 +4646,8 @@ class NativeFinCaptureTests(unittest.TestCase):
 
     def test_production_capture_retries_critical_itessellation_reads(self):
         for api in (
-            "IGetFaceFacetsCount2",
             "GetFaceFacets",
             "GetFacetFins",
-            "IGetEdgeFinsCount",
             "GetFinVertices",
             "GetVertexPoint",
         ):
@@ -5903,7 +5942,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 0
             ].__setitem__(
                 "facet_ids_source",
-                NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+                NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
             ),
             lambda value: value["itessellation"]["bodies"][0]["faces"][
                 0
@@ -5912,14 +5951,11 @@ class NativeFinCaptureTests(unittest.TestCase):
                 0
             ].__setitem__("raw_facet_ids", [999]),
             lambda value: value["native_edges"][0].__setitem__(
-                "native_fin_count", 99
-            ),
-            lambda value: value["native_edges"][0].__setitem__(
                 "fin_ids_source", "unknown"
             ),
             lambda value: value["native_edges"][0].__setitem__(
                 "fin_ids_source",
-                NATIVE_ID_ARRAY_SOURCE_NULL_ZERO_COUNT,
+                NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
             ),
             lambda value: value["native_edges"][0].__setitem__(
                 "raw_fin_ids", None

@@ -809,7 +809,6 @@ def native_tessellation_fixture(
                 "end_reference_error": None,
                 "face_indices": face_indices,
                 "fin_ids": sorted(edge_fin_ids),
-                "native_fin_count": len(edge_fin_ids),
                 "fin_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
                 "raw_fin_ids": sorted(edge_fin_ids),
                 "u_min": u_min,
