@@ -1394,6 +1394,8 @@ class NativeOperationEffectObserver:
     def _terminal_absence(
         workspace_root: Path,
         view: NativeOperationView,
+        *,
+        terminal_basis: str,
     ) -> EffectReconciliationEvidence:
         from ..pipeline.reconciliation import EffectReconciliationEvidence
 
@@ -1407,7 +1409,7 @@ class NativeOperationEffectObserver:
                 ),
                 "operation_id": view.operation_id,
                 "state_class": "absent",
-                "reason": "terminated_without_artifact",
+                "reason": terminal_basis,
                 "operation": view.to_record(),
             },
         )
@@ -1420,6 +1422,13 @@ class NativeOperationEffectObserver:
                 "state": view.state,
                 "resource_terminated": True,
                 "artifact": None,
+                "terminal_basis": terminal_basis,
+                "started_at": view.started_at,
+                "actual_native_tool_sha256": (
+                    view.actual_native_tool_sha256
+                ),
+                "owner_sha256": view.owner_sha256,
+                "executor_sha256": view.executor_sha256,
             },
         )
 
@@ -1543,14 +1552,38 @@ class NativeOperationEffectObserver:
         *,
         workspace_root: Path,
     ) -> EffectReconciliationEvidence:
-        if (
+        tool_bound_terminal_absence = (
             view.state in {"failed", "cancelled", "unknown"}
             and view.resource_terminated
             and view.artifact is None
             and view.actual_native_tool_sha256
             == view.native_tool_requirement_sha256
-        ):
-            return self._terminal_absence(workspace_root, view)
+        )
+        pre_execution_cancel = (
+            view.state == "cancelled"
+            and view.resource_terminated
+            and view.artifact is None
+            and view.started_at is None
+            and view.actual_native_tool_sha256 is None
+            and view.owner_sha256 is None
+            and view.executor_sha256 is None
+            and view.failure is not None
+            and view.failure.code == "native_operation_cancelled"
+        )
+        if pre_execution_cancel:
+            return self._terminal_absence(
+                workspace_root,
+                view,
+                terminal_basis=(
+                    "pre_execution_cancel_without_native_claim"
+                ),
+            )
+        if tool_bound_terminal_absence:
+            return self._terminal_absence(
+                workspace_root,
+                view,
+                terminal_basis="native_tool_bound_terminal_absence",
+            )
         return self._unknown_evidence(
             workspace_root,
             operation_id=view.operation_id,

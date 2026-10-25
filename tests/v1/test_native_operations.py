@@ -2769,6 +2769,86 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         client.upload_input.assert_not_called()
         client.cancel_operation.assert_not_called()
 
+    def test_effect_observer_accepts_pre_execution_cancel_as_known_absence(
+        self,
+    ) -> None:
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = _CountingBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        workspace = self.root / "workspace-pre-execution-cancel"
+        workspace.mkdir()
+        archive = seal_source_archive(
+            self.source,
+            self.inventory,
+            workspace / "input-source-set.zip",
+        )
+        request = self.request("discover-operation-pre-execution-cancel")
+        envelope = build_operation_record(
+            operation_id=request.operation_id,
+            kind=DISCOVER_KIND,
+            request=request.to_record(),
+            input_archive_sha256=file_digest(archive),
+            input_archive_bytes=archive.stat().st_size,
+            native_tool_requirement_sha256=digest(NATIVE_TOOL),
+            output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=TEST_TARGET_ID,
+        )
+        command, intent, outbound = self.observer_fixture(
+            request.command_id,
+            workspace,
+            archive=archive,
+        )
+        client.create_operation = mock.Mock(wraps=client.create_operation)
+        client.upload_input = mock.Mock(wraps=client.upload_input)
+        client.cancel_operation = mock.Mock(wraps=client.cancel_operation)
+
+        self.assertEqual(
+            client.create_operation(envelope).state,
+            "accepted",
+        )
+        cancelled = client.cancel_operation(request.operation_id)
+        self.assertEqual(cancelled.state, "cancelled")
+        self.assertTrue(cancelled.resource_terminated)
+
+        evidence = NativeOperationEffectObserver(client).observe(
+            command=command,
+            intent=intent,
+            outbound_root=outbound,
+            workspace_root=workspace,
+        )
+
+        self.assertEqual(evidence.fact_type, "reconciled")
+        self.assertEqual(evidence.state_class, "absent")
+        self.assertEqual(evidence.metadata["state"], "cancelled")
+        self.assertIs(evidence.metadata["resource_terminated"], True)
+        self.assertIsNone(evidence.metadata["artifact"])
+        self.assertEqual(
+            evidence.metadata["terminal_basis"],
+            "pre_execution_cancel_without_native_claim",
+        )
+        self.assertIsNone(evidence.metadata["started_at"])
+        self.assertIsNone(evidence.metadata["actual_native_tool_sha256"])
+        self.assertIsNone(evidence.metadata["owner_sha256"])
+        self.assertIsNone(evidence.metadata["executor_sha256"])
+        observation = json.loads(
+            (Path(evidence.payload_root) / "operation.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            observation["reason"],
+            "pre_execution_cancel_without_native_claim",
+        )
+        self.assertIsNone(observation["operation"]["started_at"])
+        self.assertIsNone(
+            observation["operation"]["actual_native_tool_sha256"]
+        )
+        self.assertIsNone(observation["operation"]["owner_sha256"])
+        self.assertEqual(client.create_operation.call_count, 1)
+        self.assertEqual(client.upload_input.call_count, 0)
+        self.assertEqual(client.cancel_operation.call_count, 1)
+        self.assertEqual(backend.calls, 0)
+
     def test_effect_observer_rejects_self_bound_foreign_discover_target(
         self,
     ) -> None:
