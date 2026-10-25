@@ -4054,6 +4054,25 @@ def _parse_itessellation_evidence(
                 component
                 + f": native tessellation edge {reference} has no fin without an untessellated face",
             )
+            if native_fin_resolutions is not None:
+                for partition in partitions:
+                    native_fin_resolutions.append({
+                        "code": "native_closed_fin_partition_derived",
+                        "blocking": False,
+                        "severity": "warning",
+                        "message": "Closed edge parameter coverage is derived from the complete native fin cycle.",
+                        "object": f"{component}:edge:{reference}",
+                        "detail": {
+                            "component": component,
+                            "body_type": body_key[0],
+                            "body_index": body_key[1],
+                            "edge_reference_sha256": reference,
+                            "face_index": partition["face_index"],
+                            "field": "native_edges.closed_fin_cycles",
+                            "rule_version": partition["rule_version"],
+                            "derived_fields": ["vertex_cycle", "fin_cycle", "parameter_node_count", "segments"],
+                        },
+                    })
 
 
 def _parse_itessellation_body(

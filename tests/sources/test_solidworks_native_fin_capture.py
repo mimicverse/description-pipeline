@@ -4464,6 +4464,22 @@ class NativeFinCaptureTests(unittest.TestCase):
             with self.assertRaisesRegex(PipelineError, "partition is not independently reproducible"):
                 parse_native_tessellation("part-1", evidence, entry["bodies"], entry["triangles"], triangles)
 
+    def test_closed_fin_partition_warning_locates_derived_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry, triangles = self.closed_vertex_export(directory)
+            warnings = []
+            parse_native_tessellation(
+                "part-1", entry["tessellation"], entry["bodies"], entry["triangles"], triangles,
+                native_fin_resolutions=warnings,
+            )
+        warning = next(row for row in warnings if row["code"] == "native_closed_fin_partition_derived")
+        edge = entry["tessellation"]["native_edges"][0]
+        self.assertFalse(warning["blocking"])
+        self.assertEqual(warning["detail"]["edge_reference_sha256"], edge["edge_reference_sha256"])
+        self.assertEqual(warning["detail"]["field"], "native_edges.closed_fin_cycles")
+        self.assertIn("segments", warning["detail"]["derived_fields"])
+        self.assertEqual(warning["detail"]["rule_version"], edge["closed_fin_cycles"][0]["rule_version"])
+
     def test_shared_native_vertex_preserves_a_nonzero_closed_edge(self):
         with tempfile.TemporaryDirectory() as directory:
             entry, triangles = self.closed_vertex_export(directory)

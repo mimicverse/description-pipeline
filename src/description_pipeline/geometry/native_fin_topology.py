@@ -9,6 +9,7 @@ from .native_u import (
     native_point_error,
     native_point_roundtrip_tolerance,
     native_u_equal,
+    native_u_tolerance,
     native_u_domain_is_resolvable,
     native_u_in_closed_interval,
 )
@@ -442,14 +443,30 @@ def closed_edge_fin_partition(*, component: str, fins: Mapping[int, Mapping], lo
              f"{component}: closed edge fins contain disconnected cycles")
 
     values = sorted({value for rows in parameters.values() for value in rows})
-    groups = []
-    for value in values:
-        if not groups or not native_u_equal(value, groups[-1][-1]):
-            groups.append([value])
-        else:
-            _require(all(native_u_equal(value, previous) for previous in groups[-1]),
-                     f"{component}: closed edge parameter identity is non-transitive")
-            groups[-1].append(value)
+    parents = list(range(len(values)))
+
+    def root(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    maximum_tolerance = native_u_tolerance(values[0], values[-1])
+    for first, value in enumerate(values):
+        for second in range(first + 1, len(values)):
+            other = values[second]
+            if other - value > maximum_tolerance:
+                break
+            if native_u_equal(value, other):
+                parents[root(second)] = root(first)
+    groups_by_root = {}
+    for index, value in enumerate(values):
+        groups_by_root.setdefault(root(index), []).append(value)
+    groups = sorted(groups_by_root.values(), key=lambda group: group[0])
+    for group in groups:
+        _require(all(native_u_equal(first, second) for index, first in enumerate(group)
+                     for second in group[index + 1:]),
+                 f"{component}: closed edge parameter identity is non-transitive")
     nodes = [group[0] for group in groups]
     _require(len(nodes) >= 3, f"{component}: closed edge has insufficient unique parameter nodes")
     node_by_value = {value: index for index, group in enumerate(groups) for value in group}

@@ -66,6 +66,13 @@ class ClosedPartitionTests(unittest.TestCase):
         with self.assertRaisesRegex(NativeFinRelationError, "non-transitive"):
             self.partition(fins)
 
+    def test_ulp_exponent_boundary_cannot_hide_cross_cluster_identity(self):
+        before_one = math.nextafter(1.0, 0.0)
+        first = 1.0 - 200 * math.ulp(before_one)
+        fins = cycle([0.0, first, before_one, 1.0, 3.0])
+        with self.assertRaisesRegex(NativeFinRelationError, "non-transitive"):
+            self.partition(fins)
+
     def test_seam_identity_cannot_erase_a_noncollapsed_fin(self):
         for endpoint in (4.0, math.nextafter(4.0, 0.0)):
             fins = cycle([0.0, endpoint, 1.0, 3.0])
