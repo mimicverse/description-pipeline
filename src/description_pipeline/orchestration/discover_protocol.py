@@ -316,8 +316,10 @@ class ArchiveDiscoverAdapter:
         self,
         source_archive: Path,
         request: NativeDiscoverRequest,
+        target,
         workspace: Path,
     ) -> NativeObservation:
+        del target
         self.invocations.append(
             {
                 "operation_id": request.operation_id,
@@ -340,9 +342,10 @@ class ArchiveDiscoverAdapter:
         self,
         source_archive: Path,
         request: NativeDiscoverRequest,
+        target,
         workspace: Path,
     ) -> NativeObservation | None:
-        return self.submit(source_archive, request, workspace)
+        return self.submit(source_archive, request, target, workspace)
 
     def materialize(
         self,

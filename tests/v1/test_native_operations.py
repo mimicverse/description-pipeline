@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Mapping
 from dataclasses import replace
+from email.message import Message
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +20,7 @@ from unittest import mock
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import digest, file_digest, write_json
 from description_pipeline.native_transfer import CAPTURE_TRANSFER_SCHEMA
 from description_pipeline.orchestration.native_operation_client import (
@@ -43,6 +48,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     CaptureOperationExecutor,
     DISCOVER_KIND,
     DiscoverOperationExecutor,
+    NativeOperationError,
     NativeOperationFailure,
     NativeOperationCreate,
     NativeOperationResult,
@@ -51,7 +57,10 @@ from description_pipeline.orchestration.native_operation_runtime import (
     build_operation_record,
 )
 from description_pipeline.pipeline.capture import CaptureEffectDispatch
-from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.pipeline.contracts import (
+    ArtifactRef,
+    NativeTargetIdentity,
+)
 from description_pipeline.pipeline.reconciliation import EffectReconciliationEvidence
 from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.sources.solidworks.revision import package_inventory
@@ -68,6 +77,12 @@ from tests.sources.test_solidworks_discovery import FakeBackend, record
 
 TOKEN = "t" * 32
 TOOL_SHA256 = "ab" * 32
+TEST_INSTALL_ID = "win-" + "0" * 32
+TEST_TARGET = NativeTargetIdentity.create(
+    install_id=TEST_INSTALL_ID,
+    pipeline_id=PIPELINE_ID,
+)
+TEST_TARGET_ID = TEST_TARGET.target_id
 NATIVE_TOOL = {
     "schema_version": TOOL_SCHEMA,
     "pipeline_id": "native-operation-test",
@@ -100,6 +115,7 @@ def _operation(
     operation_id: str,
     archive: Path,
     *,
+    target_id: str = TEST_TARGET_ID,
     kind: str = CAPTURE_KIND,
     request: dict | None = None,
     output_contract: str = OUTPUT_CONTRACT,
@@ -148,6 +164,7 @@ def _operation(
         input_archive_bytes=archive.stat().st_size,
         native_tool_requirement_sha256=digest(tool),
         output_contract=output_contract,
+        target_id=target_id,
     )
 
 
@@ -169,6 +186,23 @@ def _artifact_ref(stage: str, operation_id: str) -> ArtifactRef:
     )
 
 
+def _sealed_capture_dispatch(
+    envelope: Mapping[str, object],
+    archive: Path,
+) -> CaptureEffectDispatch:
+    request = envelope["request"]
+    execution = request["execution"]
+    return CaptureEffectDispatch(
+        effect_id="effect-capture-transfer-resume",
+        settlement=None,
+        outbound_root=archive.parent,
+        outbound={},
+        operation=envelope,
+        input_archive=archive,
+        execution=execution,
+    )
+
+
 class _Server:
     def __init__(self, runtime: NativeOperationRuntime) -> None:
         self.runtime = runtime
@@ -183,7 +217,8 @@ class _Server:
 
     def client(self) -> NativeOperationClient:
         return NativeOperationClient(
-            NativeOperationEndpoint(self.base_url, TOKEN, timeout=5.0)
+            NativeOperationEndpoint(self.base_url, TOKEN, timeout=5.0),
+            target_id=self.runtime.target_identity.target_id,
         )
 
     def close(self) -> None:
@@ -200,6 +235,13 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.archive = self.root / "input.zip"
         self.archive.write_bytes(b"complete input archive")
         self.calls = 0
+        self.install_id_patch = mock.patch.object(
+            NativeOperationRuntime,
+            "_install_id",
+            return_value=TEST_INSTALL_ID,
+        )
+        self.install_id_patch.start()
+        self.addCleanup(self.install_id_patch.stop)
 
     def executor(self, request, source_archive, workspace, native_tool):
         del request, source_archive, native_tool
@@ -288,6 +330,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         sleeper = mock.Mock()
         client = NativeOperationClient(
             NativeOperationEndpoint(server.base_url, TOKEN, timeout=5.0),
+            target_id=TEST_TARGET_ID,
             sleeper=sleeper,
         )
         envelope = _operation("operation-submit-once", self.archive)
@@ -370,7 +413,8 @@ class NativeOperationRuntimeTests(unittest.TestCase):
 
     def test_input_transfer_resume_never_creates_a_missing_operation(self) -> None:
         client = NativeOperationClient(
-            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN)
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN),
+            target_id=TEST_TARGET_ID,
         )
         envelope = _operation("operation-missing-transfer", self.archive)
         client.get_operation = mock.Mock(
@@ -459,6 +503,138 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             "satisfied",
         )
 
+    def test_capture_port_resume_uses_only_the_sealed_operation_and_archive(
+        self,
+    ) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "capture-resume-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        envelope = _operation("operation-capture-resume", self.archive)
+        client.create_operation(envelope)
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError("Capture resume must not create")
+        )
+        client.upload_input = mock.Mock(wraps=client.upload_input)
+        dispatch = _sealed_capture_dispatch(envelope, self.archive)
+
+        resumed = NativeOperationCapturePort(client).resume_input_transfer(
+            dispatch,
+            native_tool=NATIVE_TOOL,
+        )
+
+        self.assertIsNotNone(resumed)
+        self.assertEqual(
+            client.wait_for_terminal(
+                envelope["operation_id"],
+                timeout=5,
+            ).state,
+            "satisfied",
+        )
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_called_once_with(
+            envelope["operation_id"],
+            self.archive,
+        )
+
+    def test_capture_port_resume_keeps_missing_operation_unresolved(self) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "missing-capture-resume-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        envelope = _operation("operation-missing-capture-resume", self.archive)
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError("Capture resume must not create")
+        )
+        client.upload_input = mock.Mock(
+            side_effect=AssertionError("missing operation cannot accept input")
+        )
+
+        resumed = NativeOperationCapturePort(client).resume_input_transfer(
+            _sealed_capture_dispatch(envelope, self.archive),
+            native_tool=NATIVE_TOOL,
+        )
+
+        self.assertIsNone(resumed)
+        client.create_operation.assert_not_called()
+
+        client.get_operation = mock.Mock(
+            side_effect=NativeOperationClientError(
+                "native endpoint unavailable",
+                status=503,
+            )
+        )
+        self.assertIsNone(
+            NativeOperationCapturePort(client).resume_input_transfer(
+                _sealed_capture_dispatch(envelope, self.archive),
+                native_tool=NATIVE_TOOL,
+            )
+        )
+        client.create_operation.assert_not_called()
+        client.upload_input.assert_not_called()
+
+    def test_capture_port_resume_keeps_unreachable_target_unresolved(self) -> None:
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN),
+            target_id=TEST_TARGET_ID,
+        )
+        client._target_verified = True
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError("Capture resume must not create")
+        )
+        envelope = _operation("operation-unreachable-capture-resume", self.archive)
+
+        resumed = NativeOperationCapturePort(client).resume_input_transfer(
+            _sealed_capture_dispatch(envelope, self.archive),
+            native_tool=NATIVE_TOOL,
+        )
+
+        self.assertIsNone(resumed)
+        client.create_operation.assert_not_called()
+
+    def test_capture_port_resume_rejects_target_and_archive_drift(self) -> None:
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN),
+            target_id=TEST_TARGET_ID,
+        )
+        client._target_verified = True
+        client.create_operation = mock.Mock(
+            side_effect=AssertionError("Capture resume must not create")
+        )
+        foreign = _operation(
+            "operation-foreign-capture-resume",
+            self.archive,
+            target_id=digest({"target": "foreign"}),
+        )
+
+        self.assertIsNone(
+            NativeOperationCapturePort(client).resume_input_transfer(
+                _sealed_capture_dispatch(foreign, self.archive),
+                native_tool=NATIVE_TOOL,
+            )
+        )
+
+        envelope = _operation("operation-archive-capture-resume", self.archive)
+        dispatch = _sealed_capture_dispatch(envelope, self.archive)
+        self.archive.write_bytes(b"changed sealed archive")
+        with self.assertRaises(NativeOperationClientConflict) as raised:
+            NativeOperationCapturePort(client).resume_input_transfer(
+                dispatch,
+                native_tool=NATIVE_TOOL,
+            )
+        self.assertEqual(raised.exception.code, "input_archive_mismatch")
+        client.create_operation.assert_not_called()
+
     def test_async_status_probe_is_one_read_and_does_not_block_the_event_loop(self) -> None:
         runtime = NativeOperationRuntime(
             state_root=self.root / "state",
@@ -534,11 +710,13 @@ class NativeOperationRuntimeTests(unittest.TestCase):
 
     def test_async_status_probe_reports_missing_without_other_calls(self) -> None:
         client = NativeOperationClient(
-            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN)
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN),
+            target_id=TEST_TARGET_ID,
         )
         expected = NativeOperationStatusExpectation(
             operation_id="operation-missing",
             kind=CAPTURE_KIND,
+            target_id=TEST_TARGET_ID,
             request_sha256=digest({"request": "missing"}),
             native_tool_requirement_sha256=digest(NATIVE_TOOL),
             input_archive_sha256=file_digest(self.archive),
@@ -600,6 +778,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             headers={
                 "Authorization": f"Bearer {TOKEN}",
                 "Content-Type": "application/json",
+                "X-Native-Target-ID": TEST_TARGET_ID,
             },
         )
         with self.assertRaises(urlerror.HTTPError) as raised:
@@ -653,6 +832,252 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             client.upload_input("operation-input-mismatch", other)
         self.assertEqual(raised.exception.code, "input_archive_mismatch")
         self.assertEqual(self.calls, 0)
+
+    def test_target_identity_survives_restart_for_an_unadmitted_operation(self) -> None:
+        state = self.root / "restart-target-state"
+        self.install_id_patch.stop()
+        first_runtime = NativeOperationRuntime(
+            state_root=state,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+            install_id=TEST_INSTALL_ID,
+        )
+        envelope = _operation("operation-restart-target", self.archive)
+        first_runtime.create(envelope)
+        target = first_runtime.target_identity
+        first_runtime.close()
+
+        second_runtime = NativeOperationRuntime(
+            state_root=state,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        self.addCleanup(second_runtime.close)
+
+        self.assertEqual(second_runtime.target_identity, target)
+        self.assertEqual(
+            second_runtime.view("operation-restart-target")["state"],
+            "accepted",
+        )
+        second_runtime.admit_input("operation-restart-target", self.archive)
+        completed = _wait_for(
+            lambda: (
+                current
+                if (current := second_runtime.view("operation-restart-target"))[
+                    "state"
+                ]
+                == "satisfied"
+                else None
+            )
+        )
+        self.assertEqual(
+            completed["target_id"],
+            target.target_id,
+        )
+        self.assertEqual(self.calls, 1)
+
+    def test_same_tool_on_another_install_rejects_every_operation_boundary(self) -> None:
+        other_install_id = "win-" + "4" * 32
+        with mock.patch.object(
+            NativeOperationRuntime,
+            "_install_id",
+            side_effect=[TEST_INSTALL_ID, other_install_id],
+        ):
+            first_runtime = NativeOperationRuntime(
+                state_root=self.root / "first-target-state",
+                native_tool_factory=lambda: NATIVE_TOOL,
+                executors={CAPTURE_KIND: self.executor},
+            )
+            second_runtime = NativeOperationRuntime(
+                state_root=self.root / "second-target-state",
+                native_tool_factory=lambda: NATIVE_TOOL,
+                executors={CAPTURE_KIND: self.executor},
+            )
+        first_server = _Server(first_runtime)
+        second_server = _Server(second_runtime)
+        self.addCleanup(first_server.close)
+        self.addCleanup(second_server.close)
+        self.addCleanup(first_runtime.close)
+        self.addCleanup(second_runtime.close)
+
+        first_client = first_server.client()
+        second_client = second_server.client()
+        first_target = first_runtime.target_identity
+        second_target = second_runtime.target_identity
+        foreign_client = NativeOperationClient(
+            NativeOperationEndpoint(second_server.base_url, TOKEN, timeout=5.0),
+            target_id=first_target.target_id,
+        )
+        self.assertEqual(
+            first_runtime.native_tool_factory(),
+            second_runtime.native_tool_factory(),
+        )
+        self.assertNotEqual(first_target, second_target)
+
+        envelope = _operation(
+            "operation-foreign-target",
+            self.archive,
+            target_id=first_target.target_id,
+        )
+        first_client.create_operation(envelope)
+
+        with self.assertRaises(NativeOperationClientConflict) as routed_error:
+            foreign_client.get_target_identity()
+        self.assertEqual(routed_error.exception.code, "native_target_mismatch")
+        foreign_client._target_verified = True
+        with self.assertRaises(NativeOperationClientConflict) as create_error:
+            second_client.create_operation(envelope)
+        self.assertEqual(create_error.exception.code, "native_target_mismatch")
+        with self.assertRaises(NativeOperationClientConflict) as view_error:
+            foreign_client.get_operation("operation-foreign-target")
+        self.assertEqual(view_error.exception.code, "native_target_mismatch")
+        with self.assertRaises(NativeOperationClientConflict) as upload_error:
+            foreign_client.upload_input("operation-foreign-target", self.archive)
+        self.assertEqual(upload_error.exception.code, "native_target_mismatch")
+        with self.assertRaises(NativeOperationClientConflict) as cancel_error:
+            foreign_client.cancel_operation("operation-foreign-target")
+        self.assertEqual(cancel_error.exception.code, "native_target_mismatch")
+
+        self.assertEqual(
+            first_runtime.view("operation-foreign-target")["state"],
+            "accepted",
+        )
+        self.assertEqual(
+            list(second_runtime.runtime_root.glob(".operation-input-*")),
+            [],
+        )
+        self.assertEqual(self.calls, 0)
+
+    def test_recovered_operation_cannot_survive_a_changed_state_target(self) -> None:
+        state = self.root / "drifted-state"
+        self.install_id_patch.stop()
+        first_runtime = NativeOperationRuntime(
+            state_root=state,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+            install_id=TEST_INSTALL_ID,
+        )
+        first_runtime.create(_operation("operation-target-drift", self.archive))
+        first_runtime.close()
+
+        with sqlite3.connect(state / "native-operations" / "operations.sqlite3") as connection:
+            connection.execute(
+                "UPDATE native_install SET install_id=? WHERE singleton=1",
+                ("win-" + "5" * 32,),
+            )
+
+        with self.assertRaises(NativeOperationError) as raised:
+            NativeOperationRuntime(
+                state_root=state,
+                native_tool_factory=lambda: NATIVE_TOOL,
+                executors={CAPTURE_KIND: self.executor},
+            )
+        self.assertEqual(raised.exception.code, "native_target_mismatch")
+        self.assertEqual(self.calls, 0)
+
+    def test_v1_native_state_schema_is_refused_without_creating_side_tables(self) -> None:
+        state = self.root / "legacy-state"
+        runtime_root = state / "native-operations"
+        runtime_root.mkdir(parents=True)
+        database = runtime_root / "operations.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                """
+                CREATE TABLE native_operation (
+                    operation_id TEXT PRIMARY KEY,
+                    payload_sha256 TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    input_archive_sha256 TEXT NOT NULL,
+                    input_archive_bytes INTEGER NOT NULL,
+                    native_tool_requirement_sha256 TEXT NOT NULL,
+                    output_contract TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+        with self.assertRaises(NativeOperationError) as raised:
+            NativeOperationRuntime(
+                state_root=state,
+                native_tool_factory=lambda: NATIVE_TOOL,
+                executors={CAPTURE_KIND: self.executor},
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "native_state_schema_unsupported",
+        )
+        with sqlite3.connect(database) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        self.assertEqual(tables, {"native_operation"})
+
+    def test_unready_health_does_not_block_target_or_read_only_observation(self) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "unready-health-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        runtime.create(_operation("operation-unready-health", self.archive))
+
+        health_request = urlrequest.Request(
+            server.base_url + "/health",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        with urlrequest.urlopen(health_request, timeout=5) as response:
+            health = json.loads(response.read())
+        self.assertFalse(health["ready"])
+        self.assertEqual(
+            client.get_target_identity().target_id,
+            runtime.target_identity.target_id,
+        )
+        self.assertEqual(
+            client.get_operation("operation-unready-health").state,
+            "accepted",
+        )
+
+    def test_client_rejects_response_view_and_status_target_drift(self) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "drift-client-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        envelope = _operation("operation-view-target", self.archive)
+        view = client.create_operation(envelope)
+        foreign_target = digest({"native_target": "foreign"})
+        altered = replace(view, target_id=foreign_target).to_record()
+        with self.assertRaises(NativeOperationClientConflict):
+            client._view(altered)
+
+        headers = Message()
+        headers["Content-Type"] = "application/json"
+        headers["X-Native-Target-ID"] = foreign_target
+        response = SimpleNamespace(
+            headers=headers,
+            read=lambda limit: b"{}",
+        )
+        with self.assertRaises(NativeOperationClientConflict) as raised:
+            client._response_json(response)
+        self.assertEqual(raised.exception.code, "native_target_mismatch")
+
+        expected = NativeOperationStatusExpectation.from_create(
+            NativeOperationCreate.from_record(envelope)
+        )
+        with self.assertRaises(NativeOperationClientConflict):
+            expected.require(replace(view, target_id=foreign_target))
 
     def test_capture_executor_calls_the_shared_native_transaction(self) -> None:
         package = self.root / "prepared"
@@ -835,6 +1260,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             input_archive_bytes=input_archive.stat().st_size,
             native_tool_requirement_sha256=digest(NATIVE_TOOL),
             output_contract=CAPTURE_TRANSFER_SCHEMA,
+            target_id=TEST_TARGET_ID,
         )
         dispatch = CaptureEffectDispatch(
             effect_id="effect-capture-adapter",
@@ -1607,6 +2033,13 @@ class NativeDiscoverOperationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="native-discover-operation-")
         self.addCleanup(self.temporary.cleanup)
+        install_id = mock.patch.object(
+            NativeOperationRuntime,
+            "_install_id",
+            return_value=TEST_INSTALL_ID,
+        )
+        install_id.start()
+        self.addCleanup(install_id.stop)
         self.root = Path(self.temporary.name)
         self.source = self.root / "source"
         self.files = {
@@ -1678,10 +2111,10 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         request: NativeDiscoverRequest,
         workspace: Path,
     ):
-        observation = port.submit(archive, request, workspace)
+        observation = port.submit(archive, request, TEST_TARGET, workspace)
         if observation is None:
             client.wait_for_terminal(request.operation_id, timeout=5)
-            observation = port.submit(archive, request, workspace)
+            observation = port.submit(archive, request, TEST_TARGET, workspace)
         self.assertIsNotNone(observation)
         return observation
 
@@ -1721,10 +2154,20 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             effect_kind="native_operation",
             command_id=operation_id,
             effect_key=f"native-discover:{operation_id}",
-            target={"operation_id": operation_id},
+            target={
+                "operation_id": operation_id,
+                "main_assembly": request.main_assembly,
+                "native_target_identity": TEST_TARGET.to_record(),
+                "native_target_id": TEST_TARGET_ID,
+                "native_tool_sha256": (
+                    request.expected_native_tool_record_sha256
+                ),
+                "target_binding_digest": "f" * 64,
+            },
             expected_state={
                 "request_digest": request.request_digest,
                 "source_archive_sha256": file_digest(archive),
+                "native_target_id": TEST_TARGET_ID,
                 "native_tool_record_sha256": (
                     request.expected_native_tool_record_sha256
                 ),
@@ -1732,6 +2175,13 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                     request.native_tool_requirement_artifact_id
                 ),
             },
+        )
+        intent.target["target_binding_digest"] = digest(
+            {
+                key: value
+                for key, value in intent.target.items()
+                if key != "target_binding_digest"
+            }
         )
         return command, intent, outbound
 
@@ -1784,6 +2234,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         repeated = port.submit(
             archive,
             request,
+            TEST_TARGET,
             workspace,
         )
         self.assertIsNotNone(repeated)
@@ -1837,7 +2288,12 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         request = self.request("discover-operation-nonblocking")
 
         self.assertIsNone(
-            port.submit(archive, request, workspace / "operation")
+            port.submit(
+                archive,
+                request,
+                TEST_TARGET,
+                workspace / "operation",
+            )
         )
         self.assertTrue(entered.wait(5))
         self.assertEqual(backend.calls, 1)
@@ -1849,6 +2305,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         observation = port.submit(
             archive,
             request,
+            TEST_TARGET,
             workspace / "operation",
         )
 
@@ -1900,6 +2357,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             input_archive_bytes=archive.stat().st_size,
             native_tool_requirement_sha256=digest(NATIVE_TOOL),
             output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=TEST_TARGET_ID,
         )
         self.assertEqual(
             client.create_operation(envelope).state,
@@ -1916,6 +2374,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             port.resume_transfer(
                 archive,
                 request,
+                TEST_TARGET,
                 workspace / "operation",
             )
         )
@@ -1925,6 +2384,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             port.resume_transfer(
                 archive,
                 request,
+                TEST_TARGET,
                 workspace / "operation",
             )
         )
@@ -1936,6 +2396,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         observation = port.resume_transfer(
             archive,
             request,
+            TEST_TARGET,
             workspace / "operation",
         )
 
@@ -2249,6 +2710,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
 
         timeout_client = NativeOperationClient(
             NativeOperationEndpoint("http://127.0.0.1:1", TOKEN),
+            target_id=TEST_TARGET_ID,
             opener=timeout_opener,
         )
         unobservable = NativeOperationEffectObserver(timeout_client).observe(
@@ -2292,6 +2754,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                 request.expected_native_tool_record_sha256
             ),
             output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=TEST_TARGET_ID,
         )
         client.create_operation(envelope)
         client.upload_input(request.operation_id, archive)
@@ -2354,8 +2817,12 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.assertEqual(backend.calls, 0)
 
     def test_client_rejects_malformed_operation_view(self) -> None:
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN),
+            target_id=TEST_TARGET_ID,
+        )
         with self.assertRaises(NativeOperationProtocolError):
-            NativeOperationClient._view({"schema_version": "wrong"})
+            client._view({"schema_version": "wrong"})
 
 
 if __name__ == "__main__":

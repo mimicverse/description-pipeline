@@ -49,6 +49,7 @@ def _health(runtime: NativeOperationRuntime) -> dict:
         "native_tool_sha256": native_tool_sha256,
         "native_tool_error": native_tool_error,
         "operations": stats,
+        "target_identity": runtime.target_identity.to_record(),
     }
 
 
@@ -80,16 +81,34 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "X-Native-Target-ID",
+                runtime.target_identity.target_id,
+            )
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
             self.close_connection = True
 
-        def _authorized(self) -> bool:
+        def _authorized(self, *, require_target: bool = True) -> bool:
             received = self.headers.get("Authorization", "")
             if not hmac.compare_digest(received.encode("utf-8"), ("Bearer " + token).encode("ascii")):
                 self._reply(401, {"error": "Unauthorized"})
                 return False
+            if require_target:
+                target_id = self.headers.get("X-Native-Target-ID", "")
+                if not hmac.compare_digest(
+                    target_id.encode("utf-8"),
+                    runtime.target_identity.target_id.encode("ascii"),
+                ):
+                    self._reply(
+                        409,
+                        {
+                            "error": "Native target mismatch",
+                            "error_code": "native_target_mismatch",
+                        },
+                    )
+                    return False
             return True
 
         def _failure(self, error: Exception) -> None:
@@ -166,21 +185,38 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
             return parsed.path
 
         def do_GET(self) -> None:
-            if not self._authorized():
-                return
             try:
                 path = self._route_path()
                 if path == "/health":
+                    if not self._authorized(require_target=False):
+                        return
                     self._reply(200, _health(runtime))
+                    return
+                if not self._authorized():
                     return
                 if path == "/native-tool":
                     self._reply(200, _native_tool_identity(runtime))
+                    return
+                if path == "/target":
+                    self._reply(
+                        200,
+                        {
+                            **runtime.target_identity.to_record(),
+                            "install_id": runtime.install_id,
+                            "pipeline_id": runtime.target_identity.pipeline_id,
+                        },
+                    )
                     return
                 if path.startswith("/operations/"):
                     suffix = path[len("/operations/") :]
                     if suffix.endswith("/artifact"):
                         operation_id = unquote(suffix[: -len("/artifact")])
-                        path, metadata = runtime.artifact_path(operation_id)
+                        path, metadata = runtime.artifact_path(
+                            operation_id,
+                            expected_target_id=self.headers.get(
+                                "X-Native-Target-ID"
+                            ),
+                        )
                         with path.open("rb") as stream:
                             self.send_response(200)
                             self.send_header("Content-Type", "application/zip")
@@ -190,13 +226,25 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
                                 "attachment; filename*=UTF-8''" + quote(metadata["name"], safe=""),
                             )
                             self.send_header("X-Artifact-SHA256", metadata["sha256"])
+                            self.send_header(
+                                "X-Native-Target-ID",
+                                runtime.target_identity.target_id,
+                            )
                             self.send_header("Cache-Control", "private, no-store")
                             self.send_header("Connection", "close")
                             self.end_headers()
                             shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
                         self.close_connection = True
                         return
-                    self._reply(200, runtime.view(unquote(suffix)))
+                    self._reply(
+                        200,
+                        runtime.view(
+                            unquote(suffix),
+                            expected_target_id=self.headers.get(
+                                "X-Native-Target-ID"
+                            ),
+                        ),
+                    )
                     return
                 self._reply(404, {"error": "Unknown API route"})
             except (NativeOperationError, OSError, ValueError, TypeError) as error:
@@ -217,7 +265,13 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
                         operation_id = unquote(suffix[: -len("/input")])
                         archive = self._archive_body()
                         try:
-                            result = runtime.admit_input(operation_id, archive)
+                            result = runtime.admit_input(
+                                operation_id,
+                                archive,
+                                expected_target_id=self.headers.get(
+                                    "X-Native-Target-ID"
+                                ),
+                            )
                         finally:
                             archive.unlink(missing_ok=True)
                         self._reply(202, result)
@@ -226,7 +280,15 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
                         if self.headers.get("Content-Length", "0") != "0":
                             raise NativeOperationError("Cancellation requests do not carry a body")
                         operation_id = unquote(suffix[: -len("/cancel")])
-                        self._reply(202, runtime.cancel(operation_id))
+                        self._reply(
+                            202,
+                            runtime.cancel(
+                                operation_id,
+                                expected_target_id=self.headers.get(
+                                    "X-Native-Target-ID"
+                                ),
+                            ),
+                        )
                         return
                 self._reply(404, {"error": "Unknown API route"})
             except (NativeOperationError, OSError, ValueError, TypeError) as error:

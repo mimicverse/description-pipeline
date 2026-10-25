@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from description_pipeline.artifacts import ArtifactStore
+from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.interface_records import config_snapshot_digest
 from description_pipeline.io import digest, file_digest, read_data, write_json
 from description_pipeline.orchestration.discover_protocol import (
@@ -26,6 +27,7 @@ from description_pipeline.pipeline.contracts import (
     ArtifactRef,
     DiagnosticReplayScope,
     ExecutionClaim,
+    NativeTargetIdentity,
     StageCandidate,
     StageCommand,
     StageDeferral,
@@ -47,6 +49,7 @@ from description_pipeline.pipeline.discover import (
 from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
 from description_pipeline.pipeline.freeze import RulesetCatalog, RulesetRoot
 from description_pipeline.pipeline.effects import EffectSettlement, EffectState
+from description_pipeline.pipeline.effects import EffectResumePhase
 from description_pipeline.schemas import (
     CONFIG_SNAPSHOT_SCHEMA,
     NATIVE_DISCOVER_EFFECT_SCHEMA,
@@ -80,6 +83,10 @@ NATIVE_TOOL = {
 }
 NATIVE_TOOL_RECORD_SHA256 = digest(NATIVE_TOOL)
 NATIVE_TOOL_REQUIREMENT_ARTIFACT_ID = "native-tool-requirement-fixture"
+NATIVE_TARGET = NativeTargetIdentity.create(
+    install_id="win-" + "1" * 32,
+    pipeline_id=PIPELINE_ID,
+)
 
 
 def _members(root: Path) -> list[dict]:
@@ -150,6 +157,7 @@ class EffectLedger:
         self.artifacts = artifacts
         self.by_key: dict[str, dict] = {}
         self.authorizations = 0
+        self.resume_authorizations = 0
         self.timeouts = 0
 
     def bind(self, command, claim, workspace) -> _MemoryEffectPort:
@@ -225,6 +233,7 @@ class _MemoryEffectPort:
             "state": EffectState.PREPARED,
             "outbound_sha256": outbound.set_sha256,
             "payload": None,
+            "resume_phase": None,
             "target": target_value,
         }
         return SimpleNamespace(effect_id=effect_id)
@@ -236,6 +245,16 @@ class _MemoryEffectPort:
         entry["state"] = EffectState.UNKNOWN
         self.ledger.authorizations += 1
         return SimpleNamespace(effect_id=effect_id, fact_type="dispatch_authorized")
+
+    def authorize_resume(self, effect_id, *, source):
+        entry = self._entry(effect_id)
+        if entry["state"] is not EffectState.UNKNOWN:
+            raise ProtocolError(
+                "effect.dispatch_refused",
+                {"state": entry["state"].value},
+            )
+        self.ledger.resume_authorizations += 1
+        return SimpleNamespace(effect_id=effect_id, fact_type="resume_authorized")
 
     def record_response(self, effect_id, *, source, response_root):
         entry = self._entry(effect_id)
@@ -292,6 +311,7 @@ class _MemoryEffectPort:
             decisive_fact=None,
             payload_artifact=entry["payload"],
             outbound_artifact=entry.get("outbound"),
+            resume_phase=entry.get("resume_phase"),
         )
 
     def effect_settlement_for_key(self, effect_key):
@@ -489,6 +509,7 @@ class DiscoverHarness:
             "native_tool_requirement_artifact_id": (
                 NATIVE_TOOL_REQUIREMENT_ARTIFACT_ID
             ),
+            "native_target_identity": NATIVE_TARGET.to_record(),
         }
         record.update(overrides)
         return record
@@ -641,6 +662,56 @@ class DiscoverDomainTests(unittest.TestCase):
         submit.assert_called_once()
         self.assertEqual(backend.calls, 0)
         self.assertEqual(self.harness.effects.authorizations, 1)
+
+    def test_transfer_phase_uses_only_the_narrow_resume_transfer_path(self) -> None:
+        adapter = self.harness.port()
+        claim, effects = self.harness.effect_port(self.command, fence=1)
+        with patch.object(adapter, "submit", return_value=None):
+            first = DiscoverHandler(adapter).execute(
+                self.command,
+                claim,
+                self.harness.workspace(),
+                effects=effects,
+            )
+        self.assertIsInstance(first, StageDeferral)
+        effect_key = f"native-discover:{self.command.command_id}"
+        entry = self.harness.effects.by_key[effect_key]
+        entry["state"] = EffectState.UNKNOWN
+        entry["resume_phase"] = EffectResumePhase.INPUT_TRANSFER_PENDING
+        outbound_before = entry["outbound"]
+        wait = self._resume_wait()
+        resume_claim, resume_effects = self.harness.effect_port(
+            self.command,
+            fence=2,
+        )
+
+        with (
+            patch.object(
+                adapter,
+                "resume_transfer",
+                return_value=None,
+            ) as resume_transfer,
+            patch.object(
+                adapter,
+                "submit",
+                side_effect=AssertionError(
+                    "transfer resume must not use initial submission"
+                ),
+            ),
+        ):
+            resumed = DiscoverHandler(adapter).execute(
+                self.command,
+                resume_claim,
+                self.harness.workspace(),
+                effects=resume_effects,
+                resume=wait,
+            )
+
+        self.assertIsInstance(resumed, StageDeferral)
+        self.assertEqual(resumed.effect_id, entry["effect_id"])
+        resume_transfer.assert_called_once()
+        self.assertEqual(self.harness.effects.resume_authorizations, 1)
+        self.assertEqual(entry["outbound"], outbound_before)
 
     def test_resume_reuses_satisfied_observation_without_resend(self) -> None:
         adapter = self.harness.port()
@@ -1226,6 +1297,7 @@ class DiscoverEngineTests(unittest.TestCase):
         observation = original_submit(
             archive,
             self.harness.native_request(self.command),
+            NATIVE_TARGET,
             self.root / "canonical-observation",
         )
         self.assertIsNotNone(observation)

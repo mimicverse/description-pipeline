@@ -37,6 +37,7 @@ from ..sources.solidworks.revision import package_inventory
 from .contracts import (
     ArtifactRef,
     ExecutionClaim,
+    NativeTargetIdentity,
     ProtocolError,
     StageCandidate,
     StageCommand,
@@ -45,7 +46,7 @@ from .contracts import (
     StageExecution,
     StageFailure,
 )
-from .effects import EffectState, StageEffectPort
+from .effects import EffectResumePhase, EffectState, StageEffectPort
 from .engine import StageWorkspace
 from .freeze import (
     RulesetCatalog,
@@ -77,6 +78,7 @@ _REQUEST_FIELDS = frozenset(
         "expected_native_tool_sha256",
         "expected_native_tool_record_sha256",
         "native_tool_requirement_artifact_id",
+        "native_target_identity",
     }
 )
 _SUBMISSION_FIELDS = frozenset(
@@ -105,6 +107,7 @@ class DiscoverDomainAdapter(Protocol):
         self,
         source_archive: Path,
         request: NativeDiscoverRequest,
+        target: NativeTargetIdentity,
         workspace: Path,
     ) -> NativeObservation | None: ...
 
@@ -112,6 +115,7 @@ class DiscoverDomainAdapter(Protocol):
         self,
         source_archive: Path,
         request: NativeDiscoverRequest,
+        target: NativeTargetIdentity,
         workspace: Path,
     ) -> NativeObservation | None: ...
 
@@ -200,6 +204,15 @@ def _validate_request(command: StageCommand) -> dict[str, Any]:
         request["native_tool_requirement_artifact_id"],
         "native_tool_requirement_artifact_id",
     )
+    try:
+        NativeTargetIdentity.from_record(
+            request["native_target_identity"]
+        )
+    except ProtocolError as error:
+        raise NativeDiscoverRefusal(
+            "discover.native_target_invalid",
+            str(error),
+        ) from error
     submission = request["submission_identity"]
     if not isinstance(submission, dict) or set(submission) != _SUBMISSION_FIELDS:
         raise NativeDiscoverRefusal("discover.request_invalid", "Submission identity fields are invalid")
@@ -372,11 +385,18 @@ class DiscoverHandler:
     def _effect_target(
         command: StageCommand,
         request: Mapping[str, Any],
+        target: NativeTargetIdentity,
     ) -> dict[str, Any]:
-        return {
+        identity = {
             "operation_id": command.command_id,
             "main_assembly": request["main_assembly"],
             "native_tool_sha256": request["expected_native_tool_sha256"],
+            "native_target_identity": target.to_record(),
+            "native_target_id": target.target_id,
+        }
+        return {
+            **identity,
+            "target_binding_digest": digest(identity),
         }
 
     @staticmethod
@@ -384,6 +404,7 @@ class DiscoverHandler:
         command: StageCommand,
         request: Mapping[str, Any],
         source_archive_sha256: str,
+        target: NativeTargetIdentity,
     ) -> dict[str, Any]:
         return {
             "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
@@ -398,6 +419,7 @@ class DiscoverHandler:
             "native_tool_requirement_artifact_id": request[
                 "native_tool_requirement_artifact_id"
             ],
+            "native_target_id": target.target_id,
         }
 
     @staticmethod
@@ -478,6 +500,9 @@ class DiscoverHandler:
                     {"command_id": command.command_id},
                 )
             request = _validate_request(command)
+            target = NativeTargetIdentity.from_record(
+                request["native_target_identity"]
+            )
             bound = _bound_artifacts(command, request)
             roots = _input_roots(command, workspace, bound)
             source_files = _artifact_files(roots["source_set"], bound["source_set"], role="source_set")
@@ -542,6 +567,7 @@ class DiscoverHandler:
                 roots["source_set"],
                 effects,
                 resume,
+                target,
             )
             if isinstance(obtained, StageDeferral):
                 return obtained
@@ -699,6 +725,7 @@ class DiscoverHandler:
         source_root: Path,
         effects: StageEffectPort,
         resume: StageEffectWait | None,
+        target: NativeTargetIdentity,
     ) -> tuple[ArtifactRef, NativeObservation] | StageDeferral:
         effect_key = f"native-discover:{command.command_id}"
         settlement = effects.effect_settlement_for_key(effect_key)
@@ -724,12 +751,69 @@ class DiscoverHandler:
                     command,
                     native_request.to_record(),
                     source_archive_sha256,
+                    target,
                 ),
                 target=self._effect_target(
                     command,
                     native_request.to_record(),
+                    target,
                 ),
             )
+        if (
+            state is EffectState.UNKNOWN
+            and settlement is not None
+            and resume is not None
+            and settlement.resume_phase
+            is EffectResumePhase.INPUT_TRANSFER_PENDING
+        ):
+            effects.authorize_resume(
+                settlement.effect_id,
+                source="linux_discover_handler",
+            )
+            outbound_root = workspace.root / f"discover-outbound-{claim.fence}"
+            try:
+                observation = self.native.resume_transfer(
+                    outbound_root / SOURCE_ARCHIVE,
+                    native_request,
+                    target,
+                    workspace.root / f"native-discover-{claim.fence}",
+                )
+            except NativeDiscoverRefusal as refusal:
+                raise StageFailure(
+                    refusal.code,
+                    refusal.message,
+                ) from refusal
+            if observation is None:
+                return StageDeferral(settlement.effect_id)
+            effects.record_response(
+                settlement.effect_id,
+                source="windows_discover",
+                response_root=observation.root,
+            )
+            effects.record_observation(
+                settlement.effect_id,
+                source="windows_discover",
+                state_class="known",
+                observation_root=observation.root,
+            )
+            settled = effects.effect_settlement(settlement.effect_id)
+            if (
+                settled.state is not EffectState.SATISFIED
+                or settled.payload_artifact is None
+            ):
+                raise ProtocolError(
+                    "effect.not_satisfied",
+                    {
+                        "effect_id": settlement.effect_id,
+                        "state": settled.state.value,
+                    },
+                )
+            observation = self.native.materialize(
+                settled.payload_artifact,
+                native_request,
+                workspace.root / f"discover-observation-{claim.fence}",
+            )
+            return settled.payload_artifact, observation
         if state in {EffectState.UNKNOWN, EffectState.CONFLICT}:
             raise ProtocolError(
                 "effect.unresolved",
@@ -760,6 +844,7 @@ class DiscoverHandler:
             command,
             native_request.to_record(),
             source_archive_sha256,
+            target,
         )
         intent = effects.prepare_effect(
             effect_key=effect_key,
@@ -767,6 +852,7 @@ class DiscoverHandler:
             target=self._effect_target(
                 command,
                 native_request.to_record(),
+                target,
             ),
             expected_state=expected_state,
             outbound_root=outbound_root,
@@ -778,6 +864,7 @@ class DiscoverHandler:
             observation = self.native.submit(
                 outbound_root / SOURCE_ARCHIVE,
                 native_request,
+                target,
                 workspace.root / f"native-discover-{claim.fence}",
             )
         except NativeDiscoverRefusal as refusal:

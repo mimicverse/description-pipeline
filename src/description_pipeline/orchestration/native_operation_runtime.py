@@ -17,10 +17,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from ..delivery import PIPELINE_ID
 from ..io import acquire_process_lock, canonical, digest, file_digest
 from ..interface_records import validate_request_record
 from ..native_transfer import CAPTURE_TRANSFER_SCHEMA, MAX_TRANSFER_BYTES
-from ..pipeline.contracts import ArtifactRef, ProtocolError
+from ..pipeline.contracts import ArtifactRef, NativeTargetIdentity, ProtocolError
 from ..schemas import (
     NATIVE_CAPTURE_OPERATION_SCHEMA as CAPTURE_OPERATION_SCHEMA,
     NATIVE_OPERATION_REQUEST_SCHEMA as OPERATION_SCHEMA,
@@ -241,6 +242,7 @@ def build_operation_record(
     input_archive_bytes: int,
     native_tool_requirement_sha256: str,
     output_contract: str,
+    target_id: str,
 ) -> dict[str, object]:
     """Build the canonical wire record, including its derived payload digest."""
 
@@ -258,6 +260,7 @@ def build_operation_record(
         native_tool_requirement_sha256,
         "native_tool.requirement_sha256",
     )
+    target = _sha256(target_id, "target_id")
     output = _text(output_contract, "output_contract")
     payload_record = {
         "input_archive_bytes": input_archive_bytes,
@@ -269,6 +272,7 @@ def build_operation_record(
         "request": request_record,
         "request_sha256": request_sha256,
         "schema_version": OPERATION_SCHEMA,
+        "target_id": target,
     }
     return {
         "schema_version": OPERATION_SCHEMA,
@@ -283,6 +287,7 @@ def build_operation_record(
         "native_tool": {"requirement_sha256": tool_sha256},
         "output_contract": output,
         "payload_sha256": digest(payload_record),
+        "target_id": target,
     }
 
 
@@ -352,6 +357,7 @@ class NativeOperationView:
     schema_version: str
     operation_id: str
     kind: str
+    target_id: str
     payload_sha256: str
     state: str
     request_sha256: str
@@ -373,6 +379,7 @@ class NativeOperationView:
         _operation_id(self.operation_id)
         if self.kind not in _KINDS:
             raise NativeOperationError("Native operation view kind is invalid")
+        _sha256(self.target_id, "target_id")
         _sha256(self.payload_sha256, "payload_sha256")
         if self.state not in _STATES:
             raise NativeOperationError("Native operation view state is invalid")
@@ -411,6 +418,7 @@ class NativeOperationView:
             "schema_version": self.schema_version,
             "operation_id": self.operation_id,
             "kind": self.kind,
+            "target_id": self.target_id,
             "payload_sha256": self.payload_sha256,
             "state": self.state,
             "request_sha256": self.request_sha256,
@@ -435,6 +443,7 @@ class NativeOperationView:
             "schema_version",
             "operation_id",
             "kind",
+            "target_id",
             "payload_sha256",
             "state",
             "request_sha256",
@@ -464,6 +473,7 @@ class NativeOperationView:
             schema_version=record["schema_version"],
             operation_id=record["operation_id"],
             kind=record["kind"],
+            target_id=record["target_id"],
             payload_sha256=record["payload_sha256"],
             state=record["state"],
             request_sha256=record["request_sha256"],
@@ -654,6 +664,7 @@ class NativeOperationCreate:
     schema_version: str
     operation_id: str
     kind: str
+    target_id: str
     request: Mapping[str, object]
     request_sha256: str
     input_archive_sha256: str
@@ -668,6 +679,7 @@ class NativeOperationCreate:
         _operation_id(self.operation_id)
         if self.kind not in _KINDS:
             raise NativeOperationError("Native operation kind must be discover or capture")
+        _sha256(self.target_id, "target_id")
         if not isinstance(self.request, Mapping):
             raise NativeOperationError("Native operation request must be an object")
         request = copy.deepcopy(dict(self.request))
@@ -741,6 +753,7 @@ class NativeOperationCreate:
             "request": dict(self.request),
             "request_sha256": self.request_sha256,
             "schema_version": self.schema_version,
+            "target_id": self.target_id,
         }
 
     def to_record(self) -> dict[str, object]:
@@ -748,6 +761,7 @@ class NativeOperationCreate:
             "schema_version": self.schema_version,
             "operation_id": self.operation_id,
             "kind": self.kind,
+            "target_id": self.target_id,
             "request": dict(self.request),
             "request_sha256": self.request_sha256,
             "input": {
@@ -767,6 +781,7 @@ class NativeOperationCreate:
             "schema_version",
             "operation_id",
             "kind",
+            "target_id",
             "request",
             "request_sha256",
             "input",
@@ -795,6 +810,7 @@ class NativeOperationCreate:
             schema_version=record["schema_version"],
             operation_id=record["operation_id"],
             kind=record["kind"],
+            target_id=record["target_id"],
             request=record["request"],
             request_sha256=record["request_sha256"],
             input_archive_sha256=input_value["archive_sha256"],
@@ -1061,6 +1077,7 @@ class NativeOperationRuntime:
         native_tool_factory: Callable[[], Mapping[str, object]],
         executors: Mapping[str, NativeOperationExecutor],
         clock: Callable[[], datetime] | None = None,
+        install_id: str | None = None,
     ) -> None:
         self.state_root = Path(state_root).resolve()
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -1086,7 +1103,11 @@ class NativeOperationRuntime:
         self._closed = False
         try:
             self._init_db()
-            self.install_id = self._install_id()
+            self.install_id = self._install_id(install_id)
+            self.target_identity = NativeTargetIdentity.create(
+                install_id=self.install_id,
+                pipeline_id=PIPELINE_ID,
+            )
             self._recover()
             self._thread = threading.Thread(
                 target=self._work,
@@ -1112,6 +1133,43 @@ class NativeOperationRuntime:
 
     def _init_db(self) -> None:
         with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'native_operation'
+                """
+            ).fetchone()
+            if existing is not None:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(native_operation)"
+                    )
+                }
+                required = {
+                    "operation_id",
+                    "payload_sha256",
+                    "kind",
+                    "target_id",
+                    "request_json",
+                    "request_sha256",
+                    "input_archive_sha256",
+                    "input_archive_bytes",
+                    "native_tool_requirement_sha256",
+                    "output_contract",
+                    "created_at",
+                }
+                if columns != required:
+                    raise NativeOperationError(
+                        "The native operation state schema is unsupported; "
+                        "use a fresh state root",
+                        code="native_state_schema_unsupported",
+                        detail={
+                            "missing": sorted(required - columns),
+                            "unknown": sorted(columns - required),
+                        },
+                    )
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(
                 """
@@ -1119,6 +1177,7 @@ class NativeOperationRuntime:
                     operation_id TEXT PRIMARY KEY,
                     payload_sha256 TEXT NOT NULL UNIQUE,
                     kind TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
                     request_json TEXT NOT NULL,
                     request_sha256 TEXT NOT NULL,
                     input_archive_sha256 TEXT NOT NULL,
@@ -1149,14 +1208,24 @@ class NativeOperationRuntime:
                 """
             )
 
-    def _install_id(self) -> str:
+    def _install_id(self, configured: str | None) -> str:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT install_id FROM native_install WHERE singleton=1"
             ).fetchone()
             if row is not None:
-                return str(row[0])
-            value = "win-" + uuid.uuid4().hex
+                stored = str(row[0])
+                if configured is not None and stored != configured:
+                    raise NativeOperationError(
+                        "The configured native install identity differs from state",
+                        code="native_target_identity_conflict",
+                    )
+                return stored
+            value = configured or ("win-" + uuid.uuid4().hex)
+            NativeTargetIdentity.create(
+                install_id=value,
+                pipeline_id=PIPELINE_ID,
+            )
             connection.execute(
                 "INSERT INTO native_install(singleton, install_id) VALUES(1, ?)",
                 (value,),
@@ -1252,6 +1321,12 @@ class NativeOperationRuntime:
 
     def create(self, record: Mapping[str, object]) -> dict:
         intent = NativeOperationCreate.from_record(record)
+        if intent.target_id != self.target_identity.target_id:
+            raise NativeOperationError(
+                "The operation names another native target",
+                status=409,
+                code="native_target_mismatch",
+            )
         with self._lock, self._connect() as connection:
             if self._stopping:
                 raise NativeOperationError(
@@ -1260,27 +1335,32 @@ class NativeOperationRuntime:
                     code="native_operation_closing",
                 )
             row = connection.execute(
-                "SELECT payload_sha256 FROM native_operation WHERE operation_id=?",
+                "SELECT payload_sha256, target_id "
+                "FROM native_operation WHERE operation_id=?",
                 (intent.operation_id,),
             ).fetchone()
             if row is not None:
-                if str(row[0]) != intent.payload_sha256:
+                if (
+                    str(row[0]) != intent.payload_sha256
+                    or str(row[1]) != intent.target_id
+                ):
                     raise NativeOperationConflict(intent.operation_id)
             else:
                 created_at = self._now()
                 connection.execute(
                     """
                     INSERT INTO native_operation(
-                        operation_id, payload_sha256, kind, request_json,
+                        operation_id, payload_sha256, kind, target_id, request_json,
                         request_sha256, input_archive_sha256,
                         input_archive_bytes, native_tool_requirement_sha256,
                         output_contract, created_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         intent.operation_id,
                         intent.payload_sha256,
                         intent.kind,
+                        intent.target_id,
                         canonical(dict(intent.request)).decode("utf-8"),
                         intent.request_sha256,
                         intent.input_archive_sha256,
@@ -1294,7 +1374,10 @@ class NativeOperationRuntime:
                     connection,
                     intent.operation_id,
                     "accepted",
-                    {"payload_sha256": intent.payload_sha256},
+                    {
+                        "payload_sha256": intent.payload_sha256,
+                        "target_id": intent.target_id,
+                    },
                     observed_at=created_at,
                 )
         return self.view(intent.operation_id)
@@ -1316,6 +1399,7 @@ class NativeOperationRuntime:
             "schema_version": OPERATION_SCHEMA,
             "operation_id": row["operation_id"],
             "kind": row["kind"],
+            "target_id": row["target_id"],
             "request": json.loads(row["request_json"]),
             "request_sha256": row["request_sha256"],
             "input": {
@@ -1333,6 +1417,25 @@ class NativeOperationRuntime:
     def _input_path(self, operation_id: str, archive_sha256: str) -> Path:
         return self.input_root / operation_id / f"{archive_sha256}.zip"
 
+    def _require_operation_target(
+        self,
+        intent: NativeOperationCreate,
+        *,
+        expected_target_id: str | None,
+    ) -> None:
+        if expected_target_id is not None:
+            _sha256(expected_target_id, "expected_target_id")
+        current = self.target_identity.target_id
+        if intent.target_id != current or (
+            expected_target_id is not None
+            and expected_target_id != current
+        ):
+            raise NativeOperationError(
+                "The operation target differs from the current native target",
+                status=409,
+                code="native_target_mismatch",
+            )
+
     def _admitted_input_matches(
         self,
         operation_id: str,
@@ -1346,11 +1449,21 @@ class NativeOperationRuntime:
             and file_digest(path) == intent.input_archive_sha256
         )
 
-    def admit_input(self, operation_id: str, archive_path: str | Path) -> dict:
+    def admit_input(
+        self,
+        operation_id: str,
+        archive_path: str | Path,
+        *,
+        expected_target_id: str | None = None,
+    ) -> dict:
         canonical_id = _operation_id(operation_id)
         source = Path(archive_path)
         with self._lock:
             _row, intent = self._intent(canonical_id)
+            self._require_operation_target(
+                intent,
+                expected_target_id=expected_target_id,
+            )
             if not source.is_file() or source.is_symlink():
                 raise NativeOperationError(
                     "Input archive is missing",
@@ -1375,7 +1488,10 @@ class NativeOperationRuntime:
                         status=409,
                         code="input_archive_storage_changed",
                     )
-                return self.view(canonical_id)
+                return self.view(
+                    canonical_id,
+                    expected_target_id=expected_target_id,
+                )
             if types & _TERMINAL_STATES:
                 raise NativeOperationError(
                     "Native operation is already terminal",
@@ -1452,6 +1568,11 @@ class NativeOperationRuntime:
         lease_owner = None if lease is None else str(lease[0])
         for (operation_id,) in operations:
             operation_id = str(operation_id)
+            _row, intent = self._intent(operation_id)
+            self._require_operation_target(
+                intent,
+                expected_target_id=None,
+            )
             events = self._events(operation_id)
             types = {event["type"] for event in events}
             if types & _TERMINAL_STATES:
@@ -1875,10 +1996,18 @@ class NativeOperationRuntime:
             finally:
                 self._queue.task_done()
 
-    def cancel(self, operation_id: str) -> dict:
+    def cancel(
+        self,
+        operation_id: str,
+        *,
+        expected_target_id: str | None = None,
+    ) -> dict:
         canonical_id = _operation_id(operation_id)
-        _self_intent = self._intent(canonical_id)
-        del _self_intent
+        _row, intent = self._intent(canonical_id)
+        self._require_operation_target(
+            intent,
+            expected_target_id=expected_target_id,
+        )
         with self._lock, self._connect() as connection:
             events = self._events_in_connection(connection, canonical_id)
             types = {event["type"] for event in events}
@@ -1916,7 +2045,10 @@ class NativeOperationRuntime:
                             "message": "Cancellation completed before native execution",
                         },
                     )
-        return self.view(canonical_id)
+        return self.view(
+            canonical_id,
+            expected_target_id=expected_target_id,
+        )
 
     def reconcile_resource_termination(
         self,
@@ -2032,6 +2164,7 @@ class NativeOperationRuntime:
             schema_version=OPERATION_VIEW_SCHEMA,
             operation_id=operation_id,
             kind=intent.kind,
+            target_id=intent.target_id,
             payload_sha256=intent.payload_sha256,
             state=state,
             request_sha256=intent.request_sha256,
@@ -2048,11 +2181,32 @@ class NativeOperationRuntime:
             finished_at=finished_at,
         )
 
-    def view(self, operation_id: str) -> dict:
-        return self._project(_operation_id(operation_id)).to_record()
-
-    def artifact_path(self, operation_id: str) -> tuple[Path, dict]:
+    def view(
+        self,
+        operation_id: str,
+        *,
+        expected_target_id: str | None = None,
+    ) -> dict:
         canonical_id = _operation_id(operation_id)
+        _row, intent = self._intent(canonical_id)
+        self._require_operation_target(
+            intent,
+            expected_target_id=expected_target_id,
+        )
+        return self._project(canonical_id).to_record()
+
+    def artifact_path(
+        self,
+        operation_id: str,
+        *,
+        expected_target_id: str | None = None,
+    ) -> tuple[Path, dict]:
+        canonical_id = _operation_id(operation_id)
+        _row, intent = self._intent(canonical_id)
+        self._require_operation_target(
+            intent,
+            expected_target_id=expected_target_id,
+        )
         view = self._project(canonical_id)
         if view.artifact is None or not view.resource_terminated:
             raise NativeOperationError(

@@ -29,6 +29,7 @@ from ..native_transfer import (
     CAPTURE_TRANSFER_SCHEMA,
     MAX_MANIFEST_BYTES,
 )
+from ..pipeline.contracts import NativeTargetIdentity
 from ..schemas import NATIVE_CAPTURE_EFFECT_SCHEMA
 from ..sources.solidworks.discover_stage import (
     NATIVE_OBSERVATION_SCHEMA,
@@ -205,6 +206,7 @@ class NativeOperationStatusExpectation:
 
     operation_id: str
     kind: str
+    target_id: str
     request_sha256: str
     native_tool_requirement_sha256: str
     input_archive_sha256: str
@@ -215,6 +217,7 @@ class NativeOperationStatusExpectation:
         if self.kind not in _KINDS:
             raise ValueError("kind is not a native operation kind")
         for name in (
+            "target_id",
             "request_sha256",
             "native_tool_requirement_sha256",
             "input_archive_sha256",
@@ -235,6 +238,7 @@ class NativeOperationStatusExpectation:
         return cls(
             operation_id=intent.operation_id,
             kind=intent.kind,
+            target_id=intent.target_id,
             request_sha256=intent.request_sha256,
             native_tool_requirement_sha256=intent.native_tool_requirement_sha256,
             input_archive_sha256=intent.input_archive_sha256,
@@ -251,6 +255,7 @@ class NativeOperationStatusExpectation:
         if (
             view.operation_id != self.operation_id
             or view.kind != self.kind
+            or view.target_id != self.target_id
             or view.request_sha256 != self.request_sha256
             or view.native_tool_requirement_sha256
             != self.native_tool_requirement_sha256
@@ -349,22 +354,33 @@ class NativeOperationClient:
         self,
         endpoint: NativeOperationEndpoint,
         *,
+        target_id: str,
         opener: Callable[..., Any] | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(endpoint, NativeOperationEndpoint):
             raise TypeError("endpoint must be a NativeOperationEndpoint")
+        if (
+            not isinstance(target_id, str)
+            or len(target_id) != 64
+            or any(character not in "0123456789abcdef" for character in target_id)
+        ):
+            raise ValueError("target_id must be a lowercase SHA-256 digest")
         self.endpoint = endpoint
+        self.target_id = target_id
         self._opener = opener or _internal_opener
         self._sleep = sleeper
         self._clock = clock
+        self._target_lock = threading.Lock()
+        self._target_verified = False
 
     @property
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.endpoint.token}",
             "Cache-Control": "no-store",
+            "X-Native-Target-ID": self.target_id,
         }
 
     def _open(self, request: urlrequest.Request):
@@ -409,6 +425,7 @@ class NativeOperationClient:
         )
 
     def _response_json(self, response) -> dict:
+        self._require_response_target(response)
         content_type = response.headers.get_content_type()
         if content_type != "application/json":
             raise NativeOperationProtocolError(
@@ -433,6 +450,15 @@ class NativeOperationClient:
                 "native operation endpoint response is not a JSON object"
             )
         return value
+
+    def _require_response_target(self, response) -> None:
+        received = response.headers.get("X-Native-Target-ID")
+        if received != self.target_id:
+            raise NativeOperationClientConflict(
+                "native operation response carries another target",
+                status=409,
+                code="native_target_mismatch",
+            )
 
     def _request_json(
         self,
@@ -494,20 +520,55 @@ class NativeOperationClient:
             raise ValueError("operation_id is not path-safe")
         return operation_id
 
-    @staticmethod
-    def _view(value: Mapping[str, object]) -> NativeOperationView:
+    def _view(self, value: Mapping[str, object]) -> NativeOperationView:
         try:
-            return NativeOperationView.from_record(value)
+            view = NativeOperationView.from_record(value)
         except NativeOperationError as error:
             raise NativeOperationProtocolError(
                 f"native operation endpoint returned an invalid view: {error}"
             ) from error
+        if view.target_id != self.target_id:
+            raise NativeOperationClientConflict(
+                "native operation view belongs to another target",
+                status=409,
+                code="native_target_mismatch",
+            )
+        return view
 
     def get_native_tool(self) -> NativeToolIdentity:
+        self._ensure_target()
         response = self._request_json("GET", "/native-tool")
         return NativeToolIdentity.from_record(response)
 
+    def get_target_identity(self) -> NativeTargetIdentity:
+        response = self._request_json("GET", "/target")
+        try:
+            identity = NativeTargetIdentity.from_record(response)
+        except Exception as error:
+            raise NativeOperationProtocolError(
+                "native endpoint health has no canonical target identity"
+            ) from error
+        if (
+            identity.target_id != self.target_id
+            or response.get("install_id") != identity.install_id
+            or response.get("pipeline_id") != identity.pipeline_id
+        ):
+            raise NativeOperationClientConflict(
+                "native endpoint health names another target",
+                status=409,
+                code="native_target_mismatch",
+            )
+        return identity
+
+    def _ensure_target(self) -> None:
+        with self._target_lock:
+            if self._target_verified:
+                return
+            self.get_target_identity()
+            self._target_verified = True
+
     def create_operation(self, envelope: Mapping[str, object]) -> NativeOperationView:
+        self._ensure_target()
         try:
             intent = NativeOperationCreate.from_record(envelope)
         except NativeOperationError as error:
@@ -521,6 +582,7 @@ class NativeOperationClient:
         if (
             view.operation_id != intent.operation_id
             or view.kind != intent.kind
+            or view.target_id != intent.target_id
             or view.payload_sha256 != intent.payload_sha256
             or view.request_sha256 != intent.request_sha256
             or view.input_archive_sha256 != intent.input_archive_sha256
@@ -533,6 +595,7 @@ class NativeOperationClient:
         return view
 
     def upload_input(self, operation_id: str, archive: str | Path) -> NativeOperationView:
+        self._ensure_target()
         canonical_id = self._operation_id(operation_id)
         source = Path(archive)
         if not source.is_file() or source.is_symlink():
@@ -567,6 +630,7 @@ class NativeOperationClient:
         return view
 
     def get_operation(self, operation_id: str) -> NativeOperationView:
+        self._ensure_target()
         operation_id = self._operation_id(operation_id)
         response = self._request_json(
             "GET",
@@ -670,6 +734,7 @@ class NativeOperationClient:
         return expected.require(view)
 
     def cancel_operation(self, operation_id: str) -> NativeOperationView:
+        self._ensure_target()
         operation_id = self._operation_id(operation_id)
         response = self._request_json(
             "POST",
@@ -740,6 +805,7 @@ class NativeOperationClient:
         size = 0
         try:
             with os.fdopen(descriptor, "wb") as stream, self._open(request) as response:
+                self._require_response_target(response)
                 if response.headers.get_content_type() != "application/zip":
                     raise NativeOperationProtocolError(
                         "native artifact response has a different media type"
@@ -859,12 +925,22 @@ class SealedNativeOperationRequest:
 
     operation_id: str
     kind: str
+    target_id: str
     request: CaptureOperationRequest | NativeDiscoverRequest
     request_sha256: str
     payload_sha256: str | None
     native_tool_requirement_sha256: str
     input_archive: Path | None = None
     input_archive_sha256: str | None = None
+
+
+def _effect_target_identity(intent: EffectIntent) -> NativeTargetIdentity:
+    from ..pipeline.effects import require_native_transfer_target
+
+    require_native_transfer_target(intent.target)
+    return NativeTargetIdentity.from_record(
+        intent.target["native_target_identity"]
+    )
 
 
 def read_sealed_native_operation_request(
@@ -884,6 +960,7 @@ def read_sealed_native_operation_request(
 
         outbound = validate_capture_effect_outbound(outbound_root, command)
         request = CaptureRequest.from_command(command)
+        target = _effect_target_identity(intent)
         objects = outbound["objects"]
         expected_upstream = [
             artifact.to_record()
@@ -903,6 +980,7 @@ def read_sealed_native_operation_request(
             "input_archive_bytes": outbound["input_archive_bytes"],
             "input_archive_sha256": outbound["input_archive_sha256"],
             "main_assembly": request.main_assembly,
+            "native_target_id": target.target_id,
             "native_tool_record_sha256": request.native_tool_record_sha256,
             "native_tool_source_sha256": request.native_tool_source_sha256,
             "object_set_sha256": digest(objects),
@@ -919,6 +997,7 @@ def read_sealed_native_operation_request(
         }
         if (
             outbound["upstream_artifacts"] != expected_upstream
+            or outbound["native_target_id"] != target.target_id
             or dict(intent.expected_state) != expected_state
         ):
             raise NativeOperationProtocolError(
@@ -952,6 +1031,7 @@ def read_sealed_native_operation_request(
                     request.native_tool_record_sha256
                 ),
                 output_contract=CAPTURE_TRANSFER_SCHEMA,
+                target_id=target.target_id,
             )
         except Exception as error:
             raise NativeOperationProtocolError(
@@ -960,6 +1040,7 @@ def read_sealed_native_operation_request(
         if (
             outbound["operation_id"] != operation["operation_id"]
             or outbound["payload_sha256"] != operation["payload_sha256"]
+            or outbound["native_target_id"] != operation["target_id"]
         ):
             raise NativeOperationProtocolError(
                 "Capture reconciliation outbound operation identity is inconsistent"
@@ -967,6 +1048,7 @@ def read_sealed_native_operation_request(
         return SealedNativeOperationRequest(
             operation_id=outbound["operation_id"],
             kind=CAPTURE_KIND,
+            target_id=target.target_id,
             request=native_request,
             request_sha256=digest(native_request.to_record()),
             payload_sha256=outbound["payload_sha256"],
@@ -976,6 +1058,7 @@ def read_sealed_native_operation_request(
         )
 
     if command.stage == "discover":
+        target = _effect_target_identity(intent)
         request = NativeDiscoverRequest.from_record(
             read_data(outbound_root / "request.json")
         )
@@ -1010,6 +1093,8 @@ def read_sealed_native_operation_request(
             != command.request_digest
             or intent.expected_state.get("native_tool_record_sha256")
             != request.expected_native_tool_record_sha256
+            or intent.expected_state.get("native_target_id")
+            != target.target_id
             or intent.expected_state.get(
                 "native_tool_requirement_artifact_id"
             )
@@ -1028,10 +1113,12 @@ def read_sealed_native_operation_request(
                 request.expected_native_tool_record_sha256
             ),
             output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=target.target_id,
         )
         return SealedNativeOperationRequest(
             operation_id=request.operation_id,
             kind=DISCOVER_KIND,
+            target_id=target.target_id,
             request=request,
             request_sha256=digest(request.to_record()),
             payload_sha256=operation["payload_sha256"],
@@ -1201,11 +1288,48 @@ class NativeOperationEffectObserver:
         )
 
     @staticmethod
+    def _transfer_pending(
+        workspace_root: Path,
+        view: NativeOperationView,
+        *,
+        resume_target_digest: str,
+    ) -> EffectReconciliationEvidence:
+        from ..pipeline.effects import EffectResumePhase
+        from ..pipeline.reconciliation import EffectReconciliationEvidence
+
+        root = workspace_root / f"native-transfer-pending-{view.operation_id}"
+        root.mkdir(parents=True, exist_ok=False)
+        write_json(
+            root / "operation.json",
+            {
+                "schema_version": (
+                    "description-pipeline.native-operation-observation/v1"
+                ),
+                "operation_id": view.operation_id,
+                "state": view.state,
+                "operation": view.to_record(),
+            },
+        )
+        return EffectReconciliationEvidence(
+            fact_type="observation",
+            state_class="unobservable",
+            payload_root=root,
+            resume_phase=EffectResumePhase.INPUT_TRANSFER_PENDING,
+            resume_target_digest=resume_target_digest,
+            metadata={
+                "operation_id": view.operation_id,
+                "state": view.state,
+                "target_id": view.target_id,
+            },
+        )
+
+    @staticmethod
     def _view_identity(
         view: NativeOperationView,
         *,
         operation_id: str,
         kind: str,
+        target_id: str,
         request_sha256: str,
         native_tool_requirement_sha256: str,
         payload_sha256: str | None = None,
@@ -1214,6 +1338,7 @@ class NativeOperationEffectObserver:
         if (
             view.operation_id != operation_id
             or view.kind != kind
+            or view.target_id != target_id
             or view.request_sha256 != request_sha256
             or view.native_tool_requirement_sha256
             != native_tool_requirement_sha256
@@ -1257,6 +1382,7 @@ class NativeOperationEffectObserver:
             "schema_version": (
                 "description-pipeline.native-operation-identity/v1"
             ),
+            "target_id": view.target_id,
             "platform_origin": platform_origin,
             "native_runtime": {
                 "owner_sha256": native_owner,
@@ -1348,11 +1474,24 @@ class NativeOperationEffectObserver:
             observed,
             operation_id=operation_id,
             kind=CAPTURE_KIND,
+            target_id=identity.target_id,
             request_sha256=identity.request_sha256,
             native_tool_requirement_sha256=request.native_tool_record_sha256,
             payload_sha256=identity.payload_sha256,
             input_archive_sha256=identity.input_archive_sha256,
         )
+        if observed.state == "accepted":
+            from ..pipeline.effects import (
+                native_transfer_target_digest,
+            )
+
+            return self._transfer_pending(
+                workspace_root,
+                observed,
+                resume_target_digest=(
+                    native_transfer_target_digest(intent.target)
+                ),
+            )
         if observed.state != "satisfied" and not (
             observed.state == "unknown"
             and observed.artifact is not None
@@ -1486,6 +1625,7 @@ class NativeOperationEffectObserver:
             observed,
             operation_id=operation_id,
             kind=DISCOVER_KIND,
+            target_id=identity.target_id,
             request_sha256=identity.request_sha256,
             native_tool_requirement_sha256=(
                 identity.native_tool_requirement_sha256
@@ -1493,6 +1633,18 @@ class NativeOperationEffectObserver:
             payload_sha256=identity.payload_sha256,
             input_archive_sha256=source_archive_sha256,
         )
+        if observed.state == "accepted":
+            from ..pipeline.effects import (
+                native_transfer_target_digest,
+            )
+
+            return self._transfer_pending(
+                workspace_root,
+                observed,
+                resume_target_digest=(
+                    native_transfer_target_digest(intent.target)
+                ),
+            )
         if observed.state != "satisfied" and not (
             observed.state == "unknown"
             and observed.artifact is not None
@@ -1618,6 +1770,39 @@ class NativeOperationCapturePort:
             ),
         )
 
+    def resume_input_transfer(
+        self,
+        sealed_dispatch,
+        *,
+        native_tool: Mapping[str, object],
+    ) -> NativeOperationView | None:
+        """Continue only the sealed operation's unadmitted input transfer.
+
+        A missing operation, an unavailable endpoint, or a different native
+        target remains unresolved. Local operation, archive, tool, or
+        protocol conflicts are not converted to a resend.
+        """
+
+        try:
+            intent, _request, archive, _tool = self._sealed_request(
+                sealed_dispatch,
+                native_tool,
+            )
+            return self.client.resume_input_transfer(
+                intent.to_record(),
+                archive,
+            )
+        except NativeOperationNotFound:
+            return None
+        except NativeOperationClientError as error:
+            if (
+                error.status is None
+                or error.status >= 500
+                or error.code == "native_target_mismatch"
+            ):
+                return None
+            raise
+
     @staticmethod
     def _request_record(
         inputs,
@@ -1665,8 +1850,8 @@ class NativeOperationCapturePort:
         request = CaptureOperationRequest.from_record(record)
         return request, current_tool
 
-    @staticmethod
     def _sealed_request(
+        self,
         sealed_dispatch,
         current_native_tool: Mapping[str, object],
     ) -> tuple[
@@ -1696,6 +1881,12 @@ class NativeOperationCapturePort:
         if intent.kind != CAPTURE_KIND:
             raise NativeOperationProtocolError(
                 "sealed dispatch names another native operation kind"
+            )
+        if intent.target_id != self.client.target_id:
+            raise NativeOperationClientConflict(
+                "sealed operation names another native target",
+                status=409,
+                code="native_target_mismatch",
             )
         execution = copy.deepcopy(dict(execution_value))
         if execution != dict(request.execution):
@@ -1938,8 +2129,15 @@ class NativeOperationDiscoverPort:
         self,
         source_archive: Path,
         request,
+        target: NativeTargetIdentity,
         workspace: Path,
     ) -> NativeObservation | None:
+        if target.target_id != self.client.target_id:
+            raise NativeOperationClientConflict(
+                "Discover adapter target differs from its client",
+                status=409,
+                code="native_target_mismatch",
+            )
         archive = Path(source_archive)
         workspace = Path(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
@@ -1955,6 +2153,7 @@ class NativeOperationDiscoverPort:
             input_archive_bytes=archive.stat().st_size,
             native_tool_requirement_sha256=digest(self._tool()),
             output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=target.target_id,
         )
         try:
             view = self.client.submit_operation(envelope, archive)
@@ -1972,8 +2171,15 @@ class NativeOperationDiscoverPort:
         self,
         source_archive: Path,
         request,
+        target: NativeTargetIdentity,
         workspace: Path,
     ) -> NativeObservation | None:
+        if target.target_id != self.client.target_id:
+            raise NativeOperationClientConflict(
+                "Discover adapter target differs from its client",
+                status=409,
+                code="native_target_mismatch",
+            )
         """Continue only the original operation's unadmitted input transfer."""
 
         archive = Path(source_archive)
@@ -1991,6 +2197,7 @@ class NativeOperationDiscoverPort:
             input_archive_bytes=archive.stat().st_size,
             native_tool_requirement_sha256=digest(self._tool()),
             output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=target.target_id,
         )
         view = self.client.resume_input_transfer(envelope, archive)
         if view is None:
@@ -2053,17 +2260,24 @@ class NativeRemoteDiscoverAdapter:
         self,
         source_archive: Path,
         request,
+        target: NativeTargetIdentity,
         workspace: Path,
     ) -> NativeObservation | None:
-        return self.port.submit(source_archive, request, workspace)
+        return self.port.submit(source_archive, request, target, workspace)
 
     def resume_transfer(
         self,
         source_archive: Path,
         request,
+        target: NativeTargetIdentity,
         workspace: Path,
     ) -> NativeObservation | None:
-        return self.port.resume_transfer(source_archive, request, workspace)
+        return self.port.resume_transfer(
+            source_archive,
+            request,
+            target,
+            workspace,
+        )
 
     def materialize(
         self,

@@ -19,6 +19,7 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
+from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import digest, file_digest, write_json
 from description_pipeline.orchestration.discover_protocol import (
     SOURCE_ARCHIVE,
@@ -43,6 +44,7 @@ from description_pipeline.pipeline.cancellation import (
 )
 from description_pipeline.pipeline.contracts import (
     FailureEnvelope,
+    NativeTargetIdentity,
     ProtocolError,
     StageCommand,
 )
@@ -68,6 +70,10 @@ from tests.v1.test_pipeline_admission import AdmissionHarness
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / "schema.sql"
 TOKEN = "n" * 32
+CANCEL_TARGET = NativeTargetIdentity.create(
+    install_id="win-" + "3" * 32,
+    pipeline_id=PIPELINE_ID,
+)
 
 
 class _CancelServer:
@@ -107,6 +113,10 @@ class _CancelServer:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
+                self.send_header(
+                    "X-Native-Target-ID",
+                    CANCEL_TARGET.target_id,
+                )
                 self.end_headers()
                 self.wfile.write(payload)
 
@@ -132,6 +142,15 @@ class _CancelServer:
         self.thread.join(timeout=5)
         if self.thread.is_alive():
             raise AssertionError("cancel loopback server did not stop")
+
+
+def _client(loopback: _CancelServer) -> NativeOperationClient:
+    client = NativeOperationClient(
+        loopback.endpoint,
+        target_id=CANCEL_TARGET.target_id,
+    )
+    client._target_verified = True
+    return client
 
 
 @unittest.skipUnless(PG_AVAILABLE, "pgserver/psycopg2 are not installed")
@@ -318,19 +337,25 @@ class NativeCancellationAdapterTests(unittest.TestCase):
             outbound / SOURCE_ARCHIVE,
         )
         effects = services.effect_port(target_command, claim, workspace)
+        transfer_target = {
+            "operation_id": request.operation_id,
+            "main_assembly": request.main_assembly,
+            "native_target_identity": CANCEL_TARGET.to_record(),
+            "native_target_id": CANCEL_TARGET.target_id,
+            "native_tool_sha256": request.expected_native_tool_record_sha256,
+        }
+        transfer_target["target_binding_digest"] = digest(transfer_target)
         effect = effects.prepare_effect(
             effect_key=f"native-discover:{target_command.command_id}",
             effect_kind="native_operation",
-            target={
-                "operation_id": request.operation_id,
-                "main_assembly": request.main_assembly,
-            },
+            target=transfer_target,
             expected_state={
                 "schema_version": NATIVE_OBSERVATION_SCHEMA,
                 "operation_id": request.operation_id,
                 "request_digest": target_command.request_digest,
                 "source_inventory_sha256": request.source_inventory_sha256,
                 "source_archive_sha256": file_digest(archive),
+                "native_target_id": CANCEL_TARGET.target_id,
                 "native_tool_sha256": request.expected_native_tool_sha256,
                 "native_tool_record_sha256": (
                     request.expected_native_tool_record_sha256
@@ -361,12 +386,14 @@ class NativeCancellationAdapterTests(unittest.TestCase):
                 request.expected_native_tool_record_sha256
             ),
             output_contract=NATIVE_OBSERVATION_SCHEMA,
+            target_id=CANCEL_TARGET.target_id,
         )
         timestamp = self.now.isoformat()
         view = NativeOperationView(
             schema_version=OPERATION_VIEW_SCHEMA,
             operation_id=request.operation_id,
             kind=DISCOVER_KIND,
+            target_id=CANCEL_TARGET.target_id,
             payload_sha256=operation["payload_sha256"],
             state="unknown",
             request_sha256=digest(request.to_record()),
@@ -413,7 +440,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
             mode="success",
         )
         self.addCleanup(loopback.close)
-        client = NativeOperationClient(loopback.endpoint)
+        client = _client(loopback)
         adapter = native_operation_cancellation_adapter(
             client,
             facts=self.facts,
@@ -465,7 +492,10 @@ class NativeCancellationAdapterTests(unittest.TestCase):
             producer_stage=target.stage,
             producer_tool_sha256=observer_tool,
         )
-        settlement = self.facts.effect_settlement(effect.effect_id)
+        settlement = self.facts.effect_settlement(
+            effect.effect_id,
+            expected_command_id=target.command_id,
+        )
         self.assertIsNotNone(settlement.outbound_artifact)
         write_json(
             metadata_root / "metadata.json",
@@ -529,7 +559,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         )
         self.addCleanup(loopback.close)
         adapter = native_operation_cancellation_adapter(
-            NativeOperationClient(loopback.endpoint),
+            _client(loopback),
             facts=self.facts,
             artifacts=self.artifacts,
         )
@@ -572,7 +602,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         )
         self.addCleanup(loopback.close)
         adapter = native_operation_cancellation_adapter(
-            NativeOperationClient(loopback.endpoint),
+            _client(loopback),
             facts=self.facts,
             artifacts=self.artifacts,
         )
