@@ -48,19 +48,14 @@ NATIVE_TESSELLATION_PROPERTIES = {
 }
 
 
-def native_tessellation_request(face_references: Sequence[str]) -> dict[str, Any]:
-    references = tuple(face_references)
-    if not references:
-        raise ValueError("native tessellation request requires at least one face")
+def native_tessellation_request() -> dict[str, Any]:
     return {
         "api": "IBody2.GetTessellation",
         "argument_count": 1,
         "face_list": {
             "scope": "whole_body",
-            "variant_type": "VT_ARRAY|VT_DISPATCH",
-            "face_count": len(references),
-            "first_face_reference_sha256": references[0],
-            "last_face_reference_sha256": references[-1],
+            "variant_type": "VT_EMPTY",
+            "value": None,
         },
     }
 
@@ -869,20 +864,13 @@ def native_tessellation_fixture(
     for body_type, body_index in body_keys:
         body_key = (body_type, body_index)
         body = evidence_by_body[body_key]
-        body_face_references = tuple(
-            span["face_reference_sha256"]
-            for span in sorted(
-                body["spans"],
-                key=lambda item: item["face_index"],
-            )
-        )
         body_rows.append(
             {
                 "body_type": body_type,
                 "body_index": body_index,
                 "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
                 "tessellate_result": True,
-                "request": native_tessellation_request(body_face_references),
+                "request": native_tessellation_request(),
                 "property_requests": copy.deepcopy(
                     NATIVE_TESSELLATION_PROPERTIES
                 ),

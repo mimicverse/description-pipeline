@@ -8,7 +8,6 @@ import json
 import math
 import shutil
 import struct
-import sys
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -95,23 +94,20 @@ class FakeVariant:
         self.value = value
 
 
-def whole_body_request(face_references):
-    references = tuple(face_references)
+def whole_body_request():
     return {
         "api": "IBody2.GetTessellation",
         "argument_count": 1,
         "face_list": {
             "scope": "whole_body",
-            "variant_type": "VT_ARRAY|VT_DISPATCH",
-            "face_count": len(references),
-            "first_face_reference_sha256": references[0],
-            "last_face_reference_sha256": references[-1],
+            "variant_type": "VT_EMPTY",
+            "value": None,
         },
     }
 
 
-def fake_whole_body_face_list(_faces, face_reference_sha256):
-    return "VT_ARRAY|VT_DISPATCH", whole_body_request(face_reference_sha256)
+def fake_whole_body_tessellation_argument():
+    return FakeVariant(0, None), whole_body_request()
 
 
 def fake_read_end_params(curve):
@@ -535,13 +531,13 @@ class FakeHolder:
 
 class NativeFinCaptureTests(unittest.TestCase):
     def setUp(self):
-        self.production_whole_body_face_list = (
-            native_module._whole_body_face_list
+        self.production_whole_body_tessellation_argument = (
+            native_module._whole_body_tessellation_argument
         )
         helper_patch = patch.object(
             native_module,
-            "_whole_body_face_list",
-            fake_whole_body_face_list,
+            "_whole_body_tessellation_argument",
+            fake_whole_body_tessellation_argument,
         )
         helper_patch.start()
         self.addCleanup(helper_patch.stop)
@@ -1747,27 +1743,28 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertTrue(native_u_equal(0.0, boundary))
         self.assertFalse(native_u_equal(0.0, math.nextafter(boundary, math.inf)))
 
-    def test_whole_body_face_list_is_one_explicit_all_face_dispatch_array(self):
-        pythoncom = SimpleNamespace(VT_ARRAY=0x2000, VT_DISPATCH=9)
-        client = SimpleNamespace(VARIANT=FakeVariant)
-        faces = ("face-0", "face-1")
-        references = ("a" * 64, "b" * 64)
-        with patch.dict(sys.modules, {"pythoncom": pythoncom}), patch.object(
-            native_module,
-            "_win32",
-            return_value=client,
-        ):
-            face_list, request = self.production_whole_body_face_list(
-                faces,
-                references,
-            )
-
-        self.assertEqual(
-            face_list.varianttype,
-            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
+    def test_whole_body_request_is_one_explicit_vt_empty_argument(self):
+        argument, request = self.production_whole_body_tessellation_argument(
+            variant_factory=FakeVariant,
+            vt_empty=0,
         )
-        self.assertEqual(face_list.value, faces)
-        self.assertEqual(request, whole_body_request(references))
+
+        self.assertEqual(argument.varianttype, 0)
+        self.assertIsNone(argument.value)
+        self.assertEqual(request, whole_body_request())
+
+    def test_whole_body_argument_rejects_wrong_type_or_nonempty_value(self):
+        for variant_type, variant_value in ((1, None), (0, object())):
+            with self.subTest(
+                variant_type=variant_type,
+                has_value=variant_value is not None,
+            ):
+                argument = FakeVariant(variant_type, variant_value)
+                with self.assertRaisesRegex(RuntimeError, "VT_EMPTY"):
+                    self.production_whole_body_tessellation_argument(
+                        variant_factory=lambda _type, _value, argument=argument: argument,
+                        vt_empty=0,
+                    )
 
     def test_evaluate2_packed_status_counterexample_is_rejected(self):
         fixture = Path(__file__).with_name(
@@ -2817,7 +2814,9 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(face_10.display_calls, 0)
         self.assertEqual(face_20.display_calls, 0)
         self.assertEqual(body.tessellation_calls, 1)
-        self.assertEqual(body.tessellation_face_lists, ["VT_ARRAY|VT_DISPATCH"])
+        self.assertEqual(len(body.tessellation_face_lists), 1)
+        self.assertEqual(body.tessellation_face_lists[0].varianttype, 0)
+        self.assertIsNone(body.tessellation_face_lists[0].value)
         self.assertEqual(tessellation.tessellate_calls, 1)
         self.assertEqual(
             tessellation.requested,
@@ -2854,10 +2853,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         self.assertEqual(
             captured["itessellation_body"]["request"],
-            whole_body_request(
-                row["reference"]["typed_sha256"]
-                for row in captured["faces"]
-            ),
+            whole_body_request(),
         )
         self.assertEqual(
             captured["itessellation_body"]["properties"],
