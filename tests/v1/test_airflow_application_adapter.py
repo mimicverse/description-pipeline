@@ -54,6 +54,5 @@ class AirflowApplicationAdapterTests(unittest.TestCase):
         self.assertNotIn("from airflow.sdk import Param, dag, task", source)
         self.assertNotIn("max_active_runs=1", source)
 
-
 if __name__ == "__main__":
     unittest.main()

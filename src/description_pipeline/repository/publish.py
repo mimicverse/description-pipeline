@@ -166,18 +166,6 @@ class RepositorySnapshot:
         )
 
 
-def read_repository_snapshot(source: Path) -> RepositorySnapshot:
-    """Read and verify one sealed repository metadata record and Git bundle."""
-
-    source = Path(source)
-    snapshot = RepositorySnapshot.from_record(read_data(source / REPOSITORY_SNAPSHOT_METADATA))
-    bundle = source / REPOSITORY_SNAPSHOT_FILE
-    if not bundle.is_file() or bundle.is_symlink():
-        raise PublicationError("publish.snapshot_bundle")
-    if hashlib.sha256(bundle.read_bytes()).hexdigest() != snapshot.bundle_sha256:
-        raise PublicationError("publish.snapshot_bundle")
-    return snapshot
-
 def seal_repository_snapshot(
     repository: Path,
     destination: Path,

@@ -80,7 +80,7 @@ class BrowserAssetHealthTests(unittest.TestCase):
         self.assertIn("three.module.min.js: served bytes differ", result.stdout)
 
 
-class NativeCaptureControlOrderingTests(unittest.TestCase):
+class CanonicalEffectControlOrderingTests(unittest.TestCase):
     def test_native_reconcile_delegates_to_the_canonical_effect_entry(self) -> None:
         control = CONTROL.read_text(encoding="utf-8")
         marker = "  reconcile)\n"
