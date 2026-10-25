@@ -8,7 +8,12 @@ import struct
 from collections import defaultdict
 
 from ..io import PipelineError
-from ..schemas import NATIVE_TESSELLATION_SCHEMA
+from ..schemas import (
+    NATIVE_ID_ARRAY_SOURCE_FLAT,
+    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+    NATIVE_TESSELLATION_SCHEMA,
+)
 from .native_fin_topology import (
     NativeFinRelationError,
     validate_native_edge_fin_relations,
@@ -17,6 +22,8 @@ from .native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_COLLAPSED_U_FIN_RULE,
     NATIVE_COMPONENT_REFERENCE_ALIASED,
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
     NATIVE_FACE_IDENTITY_KEY_RULE,
     NATIVE_SCOPE_MAPPING_METHOD,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
@@ -28,31 +35,20 @@ from .native_u import (
     NATIVE_SCOPE_IDENTITY_RULE,
     NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
     NATIVE_TOPOLOGY_IDENTITY_DERIVED,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
-    NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS,
-    NATIVE_TOLERANT_EDGE_GAP_SOURCE,
-    NATIVE_TOLERANT_EDGE_GAP_WARNING,
-    NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
-    NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION,
-    NATIVE_TOLERANT_EDGE_WARNING_REASON,
-    NATIVE_U_CLOSEST_FALLBACK_RULE,
+    NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
     NATIVE_U_IDENTITY_RULE,
-    NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
+    native_evaluate2_evidence,
     native_fin_interval,
-    native_get_parameter_success,
-    native_open_edge_boundary_identity,
-    native_open_edge_scope_binding,
     native_point_error,
     native_point_roundtrip_tolerance,
-    native_point_within_euclidean_bound,
-    native_source_scope_is_valid,
-    native_tolerant_edge_boundary,
-    native_tolerant_edge_evidence,
+    native_point_within_max_coordinate_bound,
     native_u_equal,
     native_u_in_closed_interval,
     native_u_intervals_cover,
@@ -524,123 +520,31 @@ def _valid_evaluate2_packed_status(value: object) -> bool:
     )
 
 
-def _valid_edge_tolerance(value: object) -> bool:
-    """Validate the one IEdge.IsTolerant by-ref record on an edge row."""
-
-    keys = {
-        "api",
-        "call_form",
-        "argument_count",
-        "state",
-        "error",
-        "return_value",
-        "return_type",
-        "out_variant_type",
-        "gap_m",
-        "gap_type",
-        "gap_bits_u64",
-    }
-    if not isinstance(value, dict) or set(value) != keys:
-        return False
-    if (
-        value["api"]
-        != "IEdge.IsTolerant(out VARIANT VT_BYREF|VT_R8)"
-        or value["call_form"] != "one_argument_out_variant_r8"
-        or not _integer(value["argument_count"])
-        or value["argument_count"] != 1
-        or value["state"] not in {"not_requested", "success", "error"}
-    ):
-        return False
-    if value["state"] != "success":
-        return (
-            value["return_value"] is None
-            and value["return_type"] is None
-            and value["out_variant_type"] is None
-            and value["gap_m"] is None
-            and value["gap_type"] is None
-            and value["gap_bits_u64"] is None
-            and (
-                (value["state"] == "not_requested" and value["error"] is None)
-                or (
-                    value["state"] == "error"
-                    and isinstance(value["error"], str)
-                    and bool(value["error"])
-                )
-            )
-        )
-    gap = value["gap_m"]
-    return (
-        value["error"] is None
-        and type(value["return_value"]) is bool
-        and value["return_type"] == "bool"
-        and _integer(value["out_variant_type"])
-        and value["out_variant_type"] == 0x4005
-        and type(gap) is float
-        and math.isfinite(gap)
-        and 0.0
-        <= gap
-        <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-        and value["gap_type"] == "float"
-        and _integer(value["gap_bits_u64"])
-        and value["gap_bits_u64"]
-        == struct.unpack("<Q", struct.pack("<d", float(gap)))[0]
-    )
-
-
-def _valid_body_scope(value: object, component: str) -> bool:
-    """Validate one body-local occurrence/document/configuration scope."""
-
-    return native_source_scope_is_valid(value, component)
-
-
 def _valid_u_evidence(
     value: object,
     u_parameter: object,
     endpoint_point: object,
     domain_lower: object,
     domain_upper: object,
-    curve_start: object,
-    curve_end: object,
-    edge_reference_sha256: object,
-    edge_tolerance: object,
-    topology_accepted: object,
-    open_edge_identity_sha256: object,
 ) -> bool:
-    """Validate one retained GetClosestPointOn/GetParameter/Evaluate2 proof."""
+    """Validate one retained closest-point/U projection proof."""
 
     if not isinstance(value, dict) or set(value) != {
         "u",
         "u_parameter_rule",
-        "parameter_u_source",
-        "fallback_reason",
         "rule_version",
-        "point_roundtrip_rule",
         "projection_rule",
+        "projection_metric",
         "projection_tolerance_m",
         "source_point_m",
-        "projection_error_m",
-        "point_tolerance_m",
-        "point_error_m",
-        "closest_point_error_m",
-        "evaluate_point_error_m",
-        "source_evaluate_error_m",
-        "closest_evaluate_error_m",
-        "tolerant_edge_evidence",
         "closest_point_on_raw",
-        "parameter_input_point_m",
-        "parameter_raw",
-        "parameter_success_raw",
-        "parameter_success_raw_type",
-        "parameter_success_bit",
-        "parameter_success_parsed",
+        "evaluate2_raw",
         "evaluate_payload",
         "evaluate_packed_status",
-        "open_edge_identity_sha256",
-        "topology_endpoint_set_accepted",
+        "projection_errors_m",
     }:
         return False
     closest = value["closest_point_on_raw"]
-    parameter = value["parameter_raw"]
     evaluated = value["evaluate_payload"]
     numeric = (int, float)
     if (
@@ -651,7 +555,7 @@ def _valid_u_evidence(
             for item in endpoint_point
         )
         or not isinstance(closest, list)
-        or len(closest) != 5
+        or len(closest) != 4
         or not all(
             type(item) in numeric and math.isfinite(float(item))
             for item in closest
@@ -668,24 +572,6 @@ def _valid_u_evidence(
             type(item) in numeric and math.isfinite(float(item))
             for item in value["source_point_m"]
         )
-        or not isinstance(value["parameter_input_point_m"], list)
-        or len(value["parameter_input_point_m"]) != 3
-        or not all(
-            type(item) in numeric and math.isfinite(float(item))
-            for item in value["parameter_input_point_m"]
-        )
-        or not isinstance(curve_start, (list, tuple))
-        or len(curve_start) != 3
-        or not all(
-            type(item) in numeric and math.isfinite(float(item))
-            for item in curve_start
-        )
-        or not isinstance(curve_end, (list, tuple))
-        or len(curve_end) != 3
-        or not all(
-            type(item) in numeric and math.isfinite(float(item))
-            for item in curve_end
-        )
         or type(domain_lower) not in numeric
         or type(domain_upper) not in numeric
         or not math.isfinite(float(domain_lower))
@@ -694,214 +580,79 @@ def _valid_u_evidence(
         or not math.isfinite(float(u_parameter))
         or type(value["u"]) not in numeric
         or not math.isfinite(float(value["u"]))
-        or type(value["topology_endpoint_set_accepted"]) is not bool
-        or (
-            value["open_edge_identity_sha256"] is not None
-            and (
-                not isinstance(value["open_edge_identity_sha256"], str)
-                or HEX64.fullmatch(value["open_edge_identity_sha256"]) is None
-            )
-        )
-        or value["open_edge_identity_sha256"] != open_edge_identity_sha256
-        or (
-            value["open_edge_identity_sha256"] is not None
-            and value["topology_endpoint_set_accepted"] is not True
-        )
     ):
         return False
     closest_point = tuple(closest[:3])
+    closest_parameter = closest[3]
     evaluated_point = tuple(evaluated[:3])
     expected_point = tuple(float(item) for item in endpoint_point)
     source_point = tuple(value["source_point_m"])
-    projection_error = native_point_error(source_point, closest_point)
-    if (
-        source_point != expected_point
-        or tuple(value["parameter_input_point_m"]) != closest_point
-        or value["projection_rule"]
-        != NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
-        or value["projection_tolerance_m"]
-        != NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-        or projection_error > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+    projection_errors = value["projection_errors_m"]
+    if not isinstance(projection_errors, dict) or set(projection_errors) != {
+        "source_to_closest",
+        "closest_to_evaluate",
+        "source_to_evaluate",
+    }:
+        return False
+    if not all(
+        type(error) in numeric
+        and math.isfinite(float(error))
+        and float(error) >= 0.0
+        for error in projection_errors.values()
     ):
         return False
-    parameter_success = native_get_parameter_success(
-        parameter[1]
-    ) if isinstance(parameter, list) and len(parameter) == 2 else None
-    tolerant_edge_evidence = None
-    tolerant_edge_metrics = None
-    boundary_selected = False
-    boundary_point_error = None
-    if parameter_success is False:
-        computed_tolerance = (
-            NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-        )
-        point_roundtrip_rule = NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
-    elif native_u_equal(value["u"], domain_lower) or native_u_equal(
-        value["u"],
-        domain_upper,
-    ):
-        boundary_selected = True
-        if native_u_equal(value["u"], domain_lower):
-            boundary_name = "u_min"
-            curve_endpoint = curve_start
-            opposite_curve_endpoint = curve_end
-        else:
-            boundary_name = "u_max"
-            curve_endpoint = curve_end
-            opposite_curve_endpoint = curve_start
-        if edge_tolerance["state"] == "success":
-            try:
-                tolerant_edge_metrics = native_tolerant_edge_boundary(
-                    closest_point,
-                    evaluated_point,
-                    curve_endpoint,
-                    opposite_curve_endpoint,
-                    is_tolerant=edge_tolerance["return_value"],
-                    gap_m=edge_tolerance["gap_m"],
-                    topology_accepted=topology_accepted,
-                )
-            except ValueError:
-                return False
-            if tolerant_edge_metrics["accepted"] is not True:
-                return False
-            computed_tolerance = tolerant_edge_metrics[
-                "point_tolerance_m"
-            ]
-            boundary_point_error = tolerant_edge_metrics[
-                "evaluate_point_error_m"
-            ]
-            point_roundtrip_rule = (
-                tolerant_edge_metrics["point_roundtrip_rule"]
-                if tolerant_edge_metrics["gap_used"] is True
-                else NATIVE_CURVE_ENDPOINT_OPERATION_RULE
-            )
-            if tolerant_edge_metrics["gap_used"] is True:
-                if value["topology_endpoint_set_accepted"] is not True:
-                    return False
-                tolerant_edge_evidence = native_tolerant_edge_evidence(
-                    tolerant_edge_metrics,
-                    edge_reference_sha256=edge_reference_sha256,
-                    parameter_boundary=boundary_name,
-                    eligible_gap_m=edge_tolerance["gap_m"],
-                )
-        else:
-            computed_tolerance = native_curve_endpoint_operation_tolerance(
-                curve_endpoint,
-                evaluated_point,
-                opposite_curve_endpoint,
-            )
-            boundary_point_error = native_point_error(
-                curve_endpoint,
-                evaluated_point,
-            )
-            point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
-            if (
-                native_point_error(curve_endpoint, evaluated_point)
-                > computed_tolerance
-                or not native_point_within_euclidean_bound(
-                    closest_point,
-                    curve_endpoint,
-                    computed_tolerance,
-                )
-            ):
-                return False
-    else:
-        computed_tolerance = native_point_roundtrip_tolerance(
+    computed_projection_errors = {
+        "source_to_closest": native_point_error(
+            source_point,
+            closest_point,
+        ),
+        "closest_to_evaluate": native_point_error(
             closest_point,
             evaluated_point,
+        ),
+        "source_to_evaluate": native_point_error(
+            source_point,
+            evaluated_point,
+        ),
+    }
+    parsed_evaluate2 = native_evaluate2_evidence(value["evaluate2_raw"])
+    return not (
+        source_point != expected_point
+        or value["u_parameter_rule"]
+        != NATIVE_U_CLOSEST_POINT_PARAMETER_RULE
+        or value["rule_version"] != NATIVE_U_IDENTITY_RULE
+        or value["projection_rule"]
+        != NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
+        or value["projection_metric"]
+        != NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC
+        or value["projection_tolerance_m"]
+        != NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+        or not native_u_equal(value["u"], closest_parameter)
+        or not native_u_equal(u_parameter, closest_parameter)
+        or projection_errors != computed_projection_errors
+        or not all(
+            native_point_within_max_coordinate_bound(
+                left,
+                right,
+                NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+            )
+            for left, right in (
+                (source_point, closest_point),
+                (closest_point, evaluated_point),
+                (source_point, evaluated_point),
+            )
         )
-        point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
-    evaluate_error = native_point_error(closest_point, evaluated_point)
-    source_evaluate_error = native_point_error(
-        source_point,
-        evaluated_point,
-    )
-    closest_evaluate_error = native_point_error(
-        closest_point,
-        evaluated_point,
-    )
-    computed_point_error = (
-        boundary_point_error
-        if boundary_selected
-        else evaluate_error
-    )
-    computed_evaluate_error = computed_point_error
-    finite_values = (
-        value["u"],
-        value["point_tolerance_m"],
-        value["point_error_m"],
-        value["closest_point_error_m"],
-        value["evaluate_point_error_m"],
-        value["source_evaluate_error_m"],
-        value["closest_evaluate_error_m"],
-    )
-    fallback = parameter_success is False
-    expected_u_rule = (
-        NATIVE_U_CLOSEST_FALLBACK_RULE
-        if fallback
-        else NATIVE_U_POINT_PARAMETER_RULE
-    )
-    expected_u_source = (
-        "closest_point_fallback"
-        if fallback
-        else "get_parameter"
-    )
-    expected_fallback_reason = "get_parameter_false" if fallback else None
-    expected_success_bit = 0 if fallback else 1
-    authoritative_u = closest[3] if fallback else parameter[0]
-    return (
-        value["rule_version"] == NATIVE_U_IDENTITY_RULE
-        and value["u_parameter_rule"] == expected_u_rule
-        and value["parameter_u_source"] == expected_u_source
-        and value["fallback_reason"] == expected_fallback_reason
-        and value["point_roundtrip_rule"] == point_roundtrip_rule
-        and all(
-            type(item) in numeric and math.isfinite(float(item))
-            for item in finite_values
-        )
-        and value["point_tolerance_m"] >= 0.0
-        and value["point_tolerance_m"] == computed_tolerance
-        and value["point_error_m"] == computed_point_error
-        and value["projection_error_m"] == projection_error
-        and value["closest_point_error_m"] == projection_error
-        and value["evaluate_point_error_m"] == computed_evaluate_error
-        and value["evaluate_point_error_m"] <= computed_tolerance
-        and value["source_evaluate_error_m"] == source_evaluate_error
-        and value["closest_evaluate_error_m"] == closest_evaluate_error
-        and value["tolerant_edge_evidence"] == tolerant_edge_evidence
-        and (
-            boundary_selected
-            or max(evaluate_error, closest_evaluate_error)
-            <= computed_tolerance
-        )
-        and native_u_equal(value["u"], u_parameter)
-        and isinstance(parameter, list)
-        and len(parameter) == 2
-        and type(parameter[0]) in numeric
-        and math.isfinite(float(parameter[0]))
-        and parameter_success is not None
-        and native_u_in_closed_interval(
-            closest[3],
-            domain_lower,
-            domain_upper,
-        )
-        and value["parameter_success_raw"] == parameter[1]
-        and value["parameter_success_raw_type"] == type(parameter[1]).__name__
-        and value["parameter_success_bit"] == expected_success_bit
-        and value["parameter_success_parsed"] is (not fallback)
-        and native_u_equal(authoritative_u, value["u"])
-        and native_u_in_closed_interval(
-            authoritative_u,
-            domain_lower,
-            domain_upper,
-        )
-        and (
-            not fallback
-            or source_evaluate_error
-            <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-        )
-        and _valid_evaluate2_packed_status(
+        or parsed_evaluate2 is None
+        or parsed_evaluate2["payload"] != evaluated
+        or parsed_evaluate2["packed_status"]
+        != value["evaluate_packed_status"]
+        or not _valid_evaluate2_packed_status(
             value["evaluate_packed_status"]
+        )
+        or not native_u_in_closed_interval(
+            closest_parameter,
+            domain_lower,
+            domain_upper,
         )
     )
 
@@ -988,7 +739,7 @@ def _finite_fin_intervals(
     _require(
         0.0 < span <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
         component
-        + f": native tessellation v8 edge {reference} fin {fin_id} collapsed U span is invalid",
+        + f": native tessellation edge {reference} fin {fin_id} collapsed U span is invalid",
     )
     return [], span
 
@@ -1002,7 +753,6 @@ def parse_native_tessellation(
     *,
     native_fin_resolutions: list[dict] | None = None,
     native_identity_warnings: list[dict] | None = None,
-    expected_source_scope: dict | None = None,
 ) -> list[dict]:
     """Validate the one current tessellation schema and return its face spans."""
 
@@ -1262,6 +1012,9 @@ def parse_native_tessellation(
         "end_reference_error",
         "face_indices",
         "fin_ids",
+        "fin_ids_source",
+        "raw_fin_ids",
+        "warnings",
         "u_min",
         "u_max",
         "curve_start_point_m",
@@ -1270,7 +1023,6 @@ def parse_native_tessellation(
         "curve_type",
         "curve_closed",
         "curve_periodic",
-        "edge_tolerance",
         "curve_end_params",
         "curve_domain_transform",
         "curve_endpoint_evaluations",
@@ -1395,6 +1147,47 @@ def parse_native_tessellation(
             and isinstance(edge["fin_ids"], list)
             and edge["fin_ids"] == sorted(set(edge["fin_ids"]))
             and all(_integer(value) and value >= 0 for value in edge["fin_ids"])
+            and edge["fin_ids_source"]
+            in {
+                NATIVE_ID_ARRAY_SOURCE_FLAT,
+                NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+            }
+            and (
+                (
+                    edge["fin_ids_source"] == NATIVE_ID_ARRAY_SOURCE_FLAT
+                    and isinstance(edge["raw_fin_ids"], list)
+                    and all(
+                        _integer(value) and value >= 0
+                        for value in edge["raw_fin_ids"]
+                    )
+                    and sorted(edge["raw_fin_ids"]) == edge["fin_ids"]
+                )
+                or (
+                    edge["fin_ids_source"]
+                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                    and edge["body_type"] == 1
+                    and edge["raw_fin_ids"] is None
+                    and edge["fin_ids"] == []
+                    and all(
+                        face_spans_by_key[
+                            (
+                                edge["body_type"],
+                                edge["body_index"],
+                                face_index,
+                            )
+                        ]["triangle_count"]
+                        == 0
+                        for face_index in edge["face_indices"]
+                    )
+                )
+            )
+            and edge["warnings"]
+            == (
+                [NATIVE_EDGE_FIN_IDS_DERIVED]
+                if edge["fin_ids_source"]
+                == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                else []
+            )
             and type(edge["u_min"]) in (int, float)
             and type(edge["u_max"]) in (int, float)
             and math.isfinite(edge["u_min"])
@@ -1417,7 +1210,6 @@ def parse_native_tessellation(
             and type(edge["curve_sense"]) is bool
             and _integer(edge["curve_type"])
             and edge["curve_type"] >= 0
-            and _valid_edge_tolerance(edge["edge_tolerance"])
             and isinstance(edge["curve_end_params"], dict)
             and isinstance(edge["curve_domain_transform"], dict)
             and isinstance(edge["face_senses"], list),
@@ -1877,7 +1669,6 @@ def parse_native_tessellation(
         triangle_vertices,
         native_fin_resolutions,
         native_identity_warnings,
-        expected_source_scope,
     )
     return spans
 
@@ -1894,7 +1685,6 @@ def _parse_itessellation_evidence(
     triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None,
     native_fin_resolutions: list[dict] | None,
     native_identity_warnings: list[dict] | None,
-    expected_source_scope: dict | None,
 ) -> None:
     """Validate body-local ITessellation facet/fin evidence fail closed."""
 
@@ -1903,6 +1693,7 @@ def _parse_itessellation_evidence(
         "u_rule_version",
         "u_resolution_rule",
         "point_roundtrip_rule",
+        "property_requests",
         "properties",
         "identity_rule",
         "bodies",
@@ -2069,32 +1860,48 @@ def _parse_itessellation_evidence(
             "unique_observations",
             "cache_hits",
             "get_closest_point_on_calls",
-            "get_parameter_calls",
             "evaluate2_calls",
         }
         and all(_integer(item) and item >= 0 for item in stats.values())
         and stats["get_closest_point_on_calls"]
         == stats["unique_observations"]
-        and stats["get_parameter_calls"] == stats["unique_observations"]
         and stats["evaluate2_calls"] == stats["unique_observations"],
         component + ": native U observation statistics are inconsistent",
     )
     properties = value["properties"]
+    property_requests = value["property_requests"]
     expected_boolean_properties = (
+        "improved_quality",
+        "need_error_list",
         "need_face_facet_map",
         "need_edge_fin_map",
         "need_vertex_params",
     )
+
+    def properties_are_strict(candidate):
+        return (
+            isinstance(candidate, dict)
+            and set(candidate) == {"match_type", *expected_boolean_properties}
+            and type(candidate["match_type"]) is int
+            and candidate["match_type"] == 0
+            and all(
+                type(candidate[key]) is bool and candidate[key] is True
+                for key in expected_boolean_properties
+            )
+        )
+
     _require(
-        isinstance(properties, dict)
-        and set(properties) == {"match_type", *expected_boolean_properties}
-        and type(properties["match_type"]) is int
-        and properties["match_type"] == 0
-        and all(
-            type(properties[key]) is bool and properties[key] is True
-            for key in expected_boolean_properties
-        ),
+        properties_are_strict(property_requests),
+        component + ": native ITessellation property requests are incomplete",
+    )
+    _require(
+        properties_are_strict(properties),
         component + ": native ITessellation properties are incomplete",
+    )
+    _require(
+        properties == property_requests,
+        component
+        + ": native ITessellation requested and observed properties differ",
     )
     if triangle_vertices is not None:
         _require(
@@ -2120,7 +1927,7 @@ def _parse_itessellation_evidence(
     raw_bodies = value["bodies"]
     _require(
         isinstance(raw_bodies, list) and bool(raw_bodies),
-        component + ": native tessellation v8 body evidence is missing",
+        component + ": native tessellation body evidence is missing",
     )
 
     body_evidence = {}
@@ -2137,6 +1944,7 @@ def _parse_itessellation_evidence(
                 "body_reference_sha256",
                 "tessellate_result",
                 "request",
+                "property_requests",
                 "properties",
                 "facet_count",
                 "fin_count",
@@ -2152,6 +1960,7 @@ def _parse_itessellation_evidence(
                     "scope",
                     "tessellate_result",
                     "request",
+                    "property_requests",
                     "properties",
                     "facet_count",
                     "fin_count",
@@ -2161,7 +1970,7 @@ def _parse_itessellation_evidence(
                     "fins",
                 },
             ),
-            component + f": native tessellation v8 body {index} has an unknown shape",
+            component + f": native tessellation body {index} has an unknown shape",
         )
         body_key = (body["body_type"], body["body_index"])
         _require(
@@ -2170,36 +1979,40 @@ def _parse_itessellation_evidence(
             and _integer(body_key[1])
             and body_key[1] >= 0
             and body_key in expected_bodies,
-            component + f": native tessellation v8 body {index} is unknown",
+            component + f": native tessellation body {index} is unknown",
         )
         _require(
             previous_body is None or body_key > previous_body,
-            component + f": native tessellation v8 body {index} is duplicated or unordered",
+            component + f": native tessellation body {index} is duplicated or unordered",
+        )
+        _require(
+            properties_are_strict(body["property_requests"])
+            and properties_are_strict(body["properties"])
+            and body["property_requests"] == property_requests
+            and body["properties"] == properties,
+            component
+            + f": native tessellation body {index} properties differ from the request",
+        )
+        request = body["request"]
+        _require(
+            isinstance(request, dict)
+            and set(request) == {"api", "argument_count", "face_list"}
+            and request["api"] == "IBody2.GetTessellation"
+            and type(request["argument_count"]) is int
+            and request["argument_count"] == 1
+            and isinstance(request["face_list"], dict)
+            and set(request["face_list"])
+            == {"scope", "variant_type", "value"}
+            and request["face_list"]["scope"] == "whole_body"
+            and request["face_list"]["variant_type"] == "VT_EMPTY"
+            and request["face_list"]["value"] is None,
+            component
+            + f": native tessellation body {index} has an unsupported tessellation request",
         )
         previous_body = body_key
-        body_face_references = tuple(
-            span["face_reference_sha256"]
-            for span in sorted(
-                spans_by_body[body_key],
-                key=lambda item: item["face_index"],
-            )
-        )
         _require(
             body["body_reference_sha256"] == body_references[body_key]
             and body["tessellate_result"] is True
-            and body["request"]
-            == {
-                "api": "IBody2.GetTessellation",
-                "argument_count": 1,
-                "face_list": {
-                    "scope": "whole_body",
-                    "variant_type": "VT_ARRAY|VT_DISPATCH",
-                    "face_count": len(body_face_references),
-                    "first_face_reference_sha256": body_face_references[0],
-                    "last_face_reference_sha256": body_face_references[-1],
-                },
-            }
-            and body["properties"] == properties
             and _integer(body["facet_count"])
             and body["facet_count"] >= 0
             and _integer(body["fin_count"])
@@ -2209,34 +2022,13 @@ def _parse_itessellation_evidence(
             and isinstance(body["faces"], list)
             and isinstance(body["facets"], list)
             and isinstance(body["fins"], list),
-            component + f": native tessellation v8 body {body_key} is incomplete",
-        )
-        requires_scope = any(
-            isinstance(fin, dict)
-            and fin.get("open_edge_boundary_identity") is not None
-            for fin in body["fins"]
-        )
-        _require(
-            not requires_scope
-            or (
-                expected_source_scope is not None
-                and _valid_body_scope(expected_source_scope, component)
-                and "scope" in body
-                and _valid_body_scope(body["scope"], component)
-                and body["scope"] == expected_source_scope
-            ),
-            component
-            + f": native tessellation v8 body {body_key} "
-            + "lacks an exact open-edge scope",
+            component + f": native tessellation body {body_key} is incomplete",
         )
         body_evidence[body_key] = _parse_itessellation_body(
             component,
             body,
             spans_by_body[body_key],
             face_spans_by_key,
-        )
-        body_evidence[body_key]["scope"] = (
-            expected_source_scope if requires_scope else None
         )
         body_counts[body_key] = {
             "facet_count": body["facet_count"],
@@ -2245,13 +2037,13 @@ def _parse_itessellation_evidence(
         }
     _require(
         set(body_evidence) == expected_bodies,
-        component + ": native tessellation v8 evidence does not cover every body",
+        component + ": native tessellation evidence does not cover every body",
     )
 
     raw_vertices = value["vertices"]
     _require(
         isinstance(raw_vertices, list),
-        component + ": native tessellation v8 vertex point cache is missing",
+        component + ": native tessellation vertex point cache is missing",
     )
     vertices = {}
     previous_vertex = None
@@ -2259,7 +2051,7 @@ def _parse_itessellation_evidence(
         _require(
             isinstance(vertex, dict)
             and set(vertex) == {"body_type", "body_index", "vertex_id", "point_m"},
-            component + f": native tessellation v8 vertex {index} has an unknown shape",
+            component + f": native tessellation vertex {index} has an unknown shape",
         )
         body_key = (vertex["body_type"], vertex["body_index"])
         vertex_id = vertex["vertex_id"]
@@ -2278,12 +2070,12 @@ def _parse_itessellation_evidence(
                 type(coordinate) in (int, float) and math.isfinite(coordinate)
                 for coordinate in point
             ),
-            component + f": native tessellation v8 vertex {index} is malformed",
+            component + f": native tessellation vertex {index} is malformed",
         )
         order = (*body_key, vertex_id)
         _require(
             previous_vertex is None or order > previous_vertex,
-            component + f": native tessellation v8 vertex {index} is duplicated or unordered",
+            component + f": native tessellation vertex {index} is duplicated or unordered",
         )
         previous_vertex = order
         vertices[(body_key, vertex_id)] = tuple(point)
@@ -2974,11 +2766,11 @@ def _parse_itessellation_evidence(
     for body_key, evidence in body_evidence.items():
         _require(
             len(evidence["facets"]) == body_counts[body_key]["facet_count"],
-            component + f": native tessellation v8 facet count differs for body {body_key}",
+            component + f": native tessellation facet count differs for body {body_key}",
         )
         _require(
             len(evidence["fins"]) == body_counts[body_key]["fin_count"],
-            component + f": native tessellation v8 fin count differs for body {body_key}",
+            component + f": native tessellation fin count differs for body {body_key}",
         )
         cached = {vertex_id for owner, vertex_id in vertices if owner == body_key}
         referenced = {
@@ -2988,11 +2780,11 @@ def _parse_itessellation_evidence(
         }
         _require(
             len(cached) == body_counts[body_key]["vertex_count"],
-            component + f": native tessellation v8 vertex count differs for body {body_key}",
+            component + f": native tessellation vertex count differs for body {body_key}",
         )
         _require(
             cached == referenced,
-            component + ": native tessellation v8 vertex cache differs from fin vertices",
+            component + ": native tessellation vertex cache differs from fin vertices",
         )
         edges_by_reference = {
             edge["edge_reference_sha256"]: edge
@@ -3008,9 +2800,8 @@ def _parse_itessellation_evidence(
             }
             <= set(edges_by_reference),
             component
-            + f": native tessellation v8 edge references differ for body {body_key}",
+            + f": native tessellation edge references differ for body {body_key}",
         )
-        topology_assignments = {}
         for reference, edge in edges_by_reference.items():
             if (
                 edge["start_point_m"] is None
@@ -3019,10 +2810,9 @@ def _parse_itessellation_evidence(
                 _require(
                     edge["topology_endpoint_assignment"] is None,
                     component
-                    + f": native tessellation v8 edge {reference} "
+                    + f": native tessellation edge {reference} "
                     + "absent endpoints carry a topology assignment",
                 )
-                topology_assignments[reference] = None
                 continue
             topology_endpoints = native_curve_parameter_endpoints(
                 edge["curve_start_point_m"],
@@ -3037,10 +2827,9 @@ def _parse_itessellation_evidence(
             _require(
                 edge["topology_endpoint_assignment"] == assignment,
                 component
-                + f": native tessellation v8 edge {reference} "
+                + f": native tessellation edge {reference} "
                 + "topology endpoint assignment is not independently reproducible",
             )
-            topology_assignments[reference] = assignment
         for fin in evidence["fins"].values():
             if fin["classification"] == "internal_only":
                 continue
@@ -3051,220 +2840,7 @@ def _parse_itessellation_evidence(
                 component
                 + f": native fin {fin['fin_id']} has no captured edge domain",
             )
-            assignment = topology_assignments[reference]
-            unique_topology_accepted = (
-                assignment is not None
-                and assignment["accepted"] is True
-                and assignment["complete_match_count"] == 1
-            )
-            endpoint_set_mode = (
-                assignment is not None
-                and assignment["direct_error_m"]
-                <= assignment["tolerance_m"]
-                and assignment["swapped_error_m"]
-                <= assignment["tolerance_m"]
-            )
-            uses_tolerant_gap = any(
-                isinstance(evidence_value, dict)
-                and evidence_value["tolerant_edge_evidence"] is not None
-                for evidence_value in (
-                    fin["start_evidence"],
-                    fin["end_evidence"],
-                )
-            )
-            uses_closest_fallback = any(
-                isinstance(evidence_value, dict)
-                and evidence_value["parameter_u_source"]
-                == "closest_point_fallback"
-                for evidence_value in (
-                    fin["start_evidence"],
-                    fin["end_evidence"],
-                )
-            )
-            open_identity_candidate = (
-                body_key[0] == 1
-                and len(edge["face_indices"]) == 1
-                and fin["cofin_raw_id"] == -1
-            )
-            requires_open_identity = False
-            if uses_tolerant_gap:
-                requires_open_identity = not unique_topology_accepted
-                if requires_open_identity:
-                    _require(
-                        endpoint_set_mode and open_identity_candidate,
-                        component
-                        + f": native tessellation v8 edge {reference} "
-                        + "uses a tolerant gap without open-edge endpoint identity",
-                    )
-            elif (
-                uses_closest_fallback
-                and open_identity_candidate
-                and not unique_topology_accepted
-            ):
-                _require(
-                    endpoint_set_mode,
-                    component
-                    + f": native tessellation v8 edge {reference} "
-                    + "uses fallback boundary evidence without open-edge endpoint identity",
-                )
-                requires_open_identity = True
-            recomputed_open_identity = None
-            open_identity_sha256 = None
-            topology_accepted = unique_topology_accepted
-            if uses_tolerant_gap and unique_topology_accepted:
-                _require(
-                    fin["open_edge_boundary_identity"] is None,
-                    component
-                    + f": native tessellation v8 edge {reference} "
-                    + f"fin {fin['fin_id']} carries unnecessary open-edge identity",
-                )
-            elif requires_open_identity:
-                _require(
-                    endpoint_set_mode,
-                    component
-                    + f": native tessellation v8 edge {reference} "
-                    + "uses fallback boundary evidence without an open-edge endpoint identity",
-                )
-                try:
-                    face_span = face_spans_by_key[
-                        (*body_key, fin["face_index"])
-                    ]
-                    face_identity = face_span["face_identity"]
-                    scope_binding = native_open_edge_scope_binding(
-                        component=component,
-                        source_document_path=evidence["scope"][
-                            "source_document_path"
-                        ],
-                        source_copy_path=evidence["scope"][
-                            "source_copy_path"
-                        ],
-                        source_document_sha256=evidence["scope"][
-                            "source_document_sha256"
-                        ],
-                        source_copy_sha256=evidence["scope"][
-                            "source_copy_sha256"
-                        ],
-                        source_document_identity_sha256=evidence["scope"][
-                            "source_document_identity_sha256"
-                        ],
-                        source_document_identity_kind=evidence["scope"][
-                            "source_document_identity_kind"
-                        ],
-                        referenced_configuration=evidence["scope"][
-                            "referenced_configuration"
-                        ],
-                        occurrence_scope=evidence["scope"][
-                            "occurrence_scope"
-                        ],
-                        virtual_owner=evidence["scope"]["virtual_owner"],
-                        virtual_owner_sha256=evidence["scope"][
-                            "virtual_owner_sha256"
-                        ],
-                        virtual_session_document_path=evidence["scope"][
-                            "virtual_session_document_path"
-                        ],
-                        virtual_session_temp_root=evidence["scope"][
-                            "virtual_session_temp_root"
-                        ],
-                        virtual_native_api_pid=evidence["scope"][
-                            "virtual_native_api_pid"
-                        ],
-                        body_type=body_key[0],
-                        body_index=body_key[1],
-                        body_reference_sha256=face_span[
-                            "body_reference_sha256"
-                        ],
-                        native_body_reference_sha256=face_span[
-                            "native_body_reference_sha256"
-                        ],
-                        face_index=face_span["face_index"],
-                        face_reference_sha256=face_span[
-                            "face_reference_sha256"
-                        ],
-                        native_face_reference_sha256=face_span[
-                            "native_face_reference_sha256"
-                        ],
-                        face_identity_mode=face_span[
-                            "face_identity_mode"
-                        ],
-                        owner_scope_key=(
-                            face_identity["owner_scope_key"]
-                            if isinstance(face_identity, dict)
-                            else None
-                        ),
-                    )
-                    recomputed_open_identity = native_open_edge_boundary_identity(
-                        component=component,
-                        scope_binding=scope_binding,
-                        edge_reference_sha256=edge[
-                            "edge_reference_sha256"
-                        ],
-                        edge_endpoint_refs=(
-                            edge["start_vertex_reference_sha256"],
-                            edge["end_vertex_reference_sha256"],
-                        ),
-                        edge_start_point=tuple(edge["start_point_m"]),
-                        edge_end_point=tuple(edge["end_point_m"]),
-                        fin_id=fin["fin_id"],
-                        fin_vertex_ids=tuple(fin["vertex_ids"]),
-                        fin_start_point=vertices[
-                            (body_key, fin["vertex_ids"][0])
-                        ],
-                        fin_end_point=vertices[
-                            (body_key, fin["vertex_ids"][1])
-                        ],
-                        curve_start_point=tuple(
-                            edge["curve_start_point_m"]
-                        ),
-                        curve_end_point=tuple(edge["curve_end_point_m"]),
-                        curve_u_min=edge["u_min"],
-                        curve_u_max=edge["u_max"],
-                        fin_endpoint_u=(
-                            fin["start_u"],
-                            fin["end_u"],
-                        ),
-                        fin_endpoint_success=(
-                            fin["start_evidence"][
-                                "parameter_success_parsed"
-                            ],
-                            fin["end_evidence"][
-                                "parameter_success_parsed"
-                            ],
-                        ),
-                        curve_sense=edge["curve_sense"],
-                        gap_m=edge["edge_tolerance"]["gap_m"],
-                        body_type=body_key[0],
-                        face_count=len(edge["face_indices"]),
-                        cofin_raw_id=fin["cofin_raw_id"],
-                        edge_fin_ids=tuple(edge["fin_ids"]),
-                        topology_set_accepted=assignment["accepted"],
-                    )
-                except (KeyError, TypeError, ValueError) as error:
-                    raise PipelineError(
-                        component
-                        + f": native tessellation v8 edge {reference} "
-                        + "open-edge boundary identity is not reproducible"
-                    ) from error
-                _require(
-                    fin["open_edge_boundary_identity"]
-                    == recomputed_open_identity,
-                    component
-                    + f": native tessellation v8 edge {reference} "
-                    + f"fin {fin['fin_id']} open-edge identity is not "
-                    + "independently reproducible",
-                )
-                open_identity_sha256 = recomputed_open_identity[
-                    "identity_chain_sha256"
-                ]
-                topology_accepted = True
-            else:
-                _require(
-                    fin["open_edge_boundary_identity"] is None,
-                    component
-                    + f": native tessellation v8 edge {reference} "
-                    + f"fin {fin['fin_id']} carries unused open-edge identity",
-                )
-            for endpoint_name, vertex_id, u_value, evidence_value in (
+            for _endpoint_name, vertex_id, u_value, evidence_value in (
                 (
                     "start",
                     fin["vertex_ids"][0],
@@ -3285,98 +2861,10 @@ def _parse_itessellation_evidence(
                         vertices[(body_key, vertex_id)],
                         edge["u_min"],
                         edge["u_max"],
-                        edge["curve_start_point_m"],
-                        edge["curve_end_point_m"],
-                        edge["edge_reference_sha256"],
-                        edge["edge_tolerance"],
-                        topology_accepted,
-                        open_identity_sha256,
                     ),
                     component
                     + f": native fin {fin['fin_id']} U evidence is not independently reproducible",
                 )
-                tolerant = evidence_value["tolerant_edge_evidence"]
-                if (
-                    native_fin_resolutions is not None
-                    and tolerant is not None
-                    and tolerant["gap_used"] is True
-                ):
-                    _require(
-                        expected_source_scope is not None
-                        and _valid_body_scope(
-                            expected_source_scope,
-                            component,
-                        ),
-                        component
-                        + ": tolerant-edge warning has no immutable source scope",
-                    )
-                    native_fin_resolutions.append(
-                        {
-                            "code": NATIVE_TOLERANT_EDGE_GAP_WARNING,
-                            "blocking": False,
-                            "message": NATIVE_TOLERANT_EDGE_WARNING_MESSAGE,
-                            "component": component,
-                            "body_type": body_key[0],
-                            "body_index": body_key[1],
-                            "edge_reference_sha256": (
-                                fin["edge_reference_sha256"]
-                            ),
-                            "fin_id": fin["fin_id"],
-                            "fin_endpoint": endpoint_name,
-                            "parameter_boundary": tolerant[
-                                "parameter_boundary"
-                            ],
-                            "point_roundtrip_rule": tolerant[
-                                "point_roundtrip_rule"
-                            ],
-                            "evaluate_rule_version": tolerant[
-                                "evaluate_rule_version"
-                            ],
-                            "evaluate_metric": tolerant["evaluate_metric"],
-                            "evaluate_point_error_m": tolerant[
-                                "evaluate_point_error_m"
-                            ],
-                            "point_tolerance_m": tolerant[
-                                "point_tolerance_m"
-                            ],
-                            "projection_metric": tolerant[
-                                "projection_metric"
-                            ],
-                            "eligible_gap_m": tolerant["eligible_gap_m"],
-                            "gap_used": tolerant["gap_used"],
-                            "field": (
-                                f"{endpoint_name}_evidence."
-                                "tolerant_edge_evidence"
-                            ),
-                            "affected_fields": list(
-                                NATIVE_TOLERANT_EDGE_AFFECTED_FIELDS
-                            ),
-                            "gap_source_api": NATIVE_TOLERANT_EDGE_GAP_SOURCE,
-                            "gap_cap_m": (
-                                NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-                            ),
-                            "reason": NATIVE_TOLERANT_EDGE_WARNING_REASON,
-                            "projection_to_curve_l2_error_m": tolerant[
-                                "projection_to_curve_l2_error_m"
-                            ],
-                            "composed_projection_tolerance_m": tolerant[
-                                "composed_projection_tolerance_m"
-                            ],
-                            "edge_tolerance_out_variant_type": edge[
-                                "edge_tolerance"
-                            ][
-                                "out_variant_type"
-                            ],
-                            "qualification": (
-                                NATIVE_TOLERANT_EDGE_WARNING_QUALIFICATION
-                            ),
-                            "topology_endpoint_set": assignment,
-                            "source_scope": expected_source_scope,
-                            "open_edge_boundary_identity_sha256": (
-                                open_identity_sha256
-                            ),
-                        }
-                    )
         cycles = _validate_facet_side_coverage(component, body_key, evidence)
         if triangle_vertices is not None:
             _validate_facet_stl_binding(
@@ -3402,7 +2890,7 @@ def _parse_itessellation_evidence(
         body_edges = edges_by_body.get(body_key, {})
         _require(
             set(fins_by_edge_reference) <= set(body_edges),
-            component + f": native tessellation v8 edge references differ for body {body_key}",
+            component + f": native tessellation edge references differ for body {body_key}",
         )
         for reference, edge in body_edges.items():
             declared = set(edge["fin_ids"])
@@ -3410,7 +2898,7 @@ def _parse_itessellation_evidence(
             _require(
                 declared == actual,
                 component
-                + f": native tessellation v8 edge {reference} fin_ids are not bidirectional",
+                + f": native tessellation edge {reference} fin_ids are not bidirectional",
             )
             body_vertices = {
                 vertex_id: point
@@ -3427,6 +2915,12 @@ def _parse_itessellation_evidence(
                         "face_senses": edge["face_senses"],
                     },
                     edge_fins=sorted(actual),
+                    incident_face_facet_counts=[
+                        face_spans_by_key[
+                            (*body_key, face_index)
+                        ]["triangle_count"]
+                        for face_index in edge["face_indices"]
+                    ],
                     fins_by_id=evidence["fins"],
                     vertices_by_id=body_vertices,
                 )
@@ -3444,7 +2938,7 @@ def _parse_itessellation_evidence(
                     native_u_in_closed_interval(start_u, u_min, u_max)
                     and native_u_in_closed_interval(end_u, u_min, u_max),
                     component
-                    + f": native tessellation v8 edge {reference} fin {fin_id} U is invalid",
+                    + f": native tessellation edge {reference} fin {fin_id} U is invalid",
                 )
                 fin_start = vertices[(body_key, fin["vertex_ids"][0])]
                 fin_end = vertices[(body_key, fin["vertex_ids"][1])]
@@ -3471,7 +2965,7 @@ def _parse_itessellation_evidence(
                 _require(
                     native_u_intervals_cover(intervals, u_min, u_max),
                     component
-                    + f": native tessellation v8 edge {reference} face {face_index} does not cover its U domain",
+                    + f": native tessellation edge {reference} face {face_index} does not cover its U domain",
                 )
             curve_points = {
                 tuple(_float32(value) for value in edge["curve_start_point_m"]),
@@ -3495,40 +2989,20 @@ def _parse_itessellation_evidence(
                 _require(
                     edge["topology_endpoint_assignment"] == assignment,
                     component
-                    + f": native tessellation v8 edge {reference} "
+                    + f": native tessellation edge {reference} "
                     + "topology endpoint assignment is not independently reproducible",
                 )
-                endpoint_set_mode = (
-                    assignment["direct_error_m"]
-                    <= assignment["tolerance_m"]
-                    and assignment["swapped_error_m"]
-                    <= assignment["tolerance_m"]
-                )
-                current_edge_unique_topology = (
-                    assignment["accepted"] is True
-                    and assignment["complete_match_count"] == 1
-                )
-                open_identity_accepted = endpoint_set_mode and any(
-                    evidence["fins"][fin_id]["open_edge_boundary_identity"]
-                    is not None
-                    for fin_id in actual
-                )
                 _require(
-                    current_edge_unique_topology
-                    or open_identity_accepted
-                    or (
-                        endpoint_set_mode
-                        and bool(collapsed_fin_span)
-                    ),
+                    assignment["accepted"],
                     component
-                    + f": native tessellation v8 edge {reference} "
-                    + "topology endpoint set has no unique or open-edge proof",
+                    + f": native tessellation edge {reference} "
+                    + "unordered endpoint set is incomplete",
                 )
             else:
                 _require(
                     edge.get("topology_endpoint_assignment") is None,
                     component
-                    + f": native tessellation v8 edge {reference} "
+                    + f": native tessellation edge {reference} "
                     + "absent endpoints carry a topology assignment",
                 )
                 evaluations = edge["curve_endpoint_evaluations"]
@@ -3542,7 +3016,7 @@ def _parse_itessellation_evidence(
                 _require(
                     curve_points == edge_points,
                     component
-                    + f": native tessellation v8 edge {reference} curve endpoints differ",
+                    + f": native tessellation edge {reference} curve endpoints differ",
                 )
             evaluations = edge["curve_endpoint_evaluations"]
             for edge_endpoint in ("start", "end"):
@@ -3566,7 +3040,7 @@ def _parse_itessellation_evidence(
                         _require(
                             point_error <= point_tolerance,
                             component
-                            + f": native tessellation v8 edge {reference} "
+                            + f": native tessellation edge {reference} "
                             + f"{edge_endpoint} endpoint conflicts with fin {fin_id} "
                             + f"{fin_endpoint} at the same U",
                         )
@@ -3579,7 +3053,7 @@ def _parse_itessellation_evidence(
                     fin_id in collapsed_fin_span
                     and cofin_id in collapsed_fin_span,
                     component
-                    + f": native tessellation v8 fin {fin_id} "
+                    + f": native tessellation fin {fin_id} "
                     + "has unbound collapsed span evidence",
                 )
                 native_fin_resolutions.append(
@@ -3620,12 +3094,12 @@ def _parse_itessellation_evidence(
                     for face_index in active_faces
                 ),
                 component
-                + f": native tessellation v8 edge {reference} has a collapsed-only face without positive U coverage",
+                + f": native tessellation edge {reference} has a collapsed-only face without positive U coverage",
             )
             _require(
                 fin_faces == active_faces,
                 component
-                + f": native tessellation v8 edge {reference} does not cover its tessellated faces",
+                + f": native tessellation edge {reference} does not cover its tessellated faces",
             )
             _require(
                 bool(active_faces)
@@ -3634,7 +3108,7 @@ def _parse_itessellation_evidence(
                     for face_index in edge["face_indices"]
                 ),
                 component
-                + f": native tessellation v8 edge {reference} has no fin without an untessellated face",
+                + f": native tessellation edge {reference} has no fin without an untessellated face",
             )
 
 
@@ -3655,18 +3129,58 @@ def _parse_itessellation_body(
             == {
                 "face_index",
                 "facet_ids",
+                "facet_count",
+                "facet_ids_source",
+                "raw_facet_ids",
+                "warnings",
                 "face_identity_sha256",
             },
-            component + f": native tessellation v8 face {index} has an unknown shape",
+            component + f": native tessellation face {index} has an unknown shape",
         )
         face_index = face["face_index"]
         facet_ids = face["facet_ids"]
+        facet_count = face["facet_count"]
         _require(
             _integer(face_index)
             and face_index in face_spans
             and isinstance(facet_ids, list)
             and facet_ids == sorted(set(facet_ids))
             and all(_integer(facet_id) and facet_id >= 0 for facet_id in facet_ids)
+            and _integer(facet_count)
+            and facet_count >= 0
+            and facet_count == len(facet_ids)
+            and face["facet_ids_source"]
+            in {
+                NATIVE_ID_ARRAY_SOURCE_FLAT,
+                NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
+            }
+            and (
+                (
+                    face["facet_ids_source"] == NATIVE_ID_ARRAY_SOURCE_FLAT
+                    and isinstance(face["raw_facet_ids"], list)
+                    and all(
+                        _integer(value) and value >= 0
+                        for value in face["raw_facet_ids"]
+                    )
+                    and sorted(face["raw_facet_ids"]) == facet_ids
+                    and len(face["raw_facet_ids"]) == facet_count
+                )
+                or (
+                    face["facet_ids_source"]
+                    == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                    and body_key[0] == 1
+                    and facet_count == 0
+                    and facet_ids == []
+                    and face["raw_facet_ids"] is None
+                )
+            )
+            and face["warnings"]
+            == (
+                [NATIVE_FACE_FACET_IDS_DERIVED]
+                if face["facet_ids_source"]
+                == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                else []
+            )
             and face["face_identity_sha256"]
             == face_spans[face_index]["face_reference_sha256"]
             and (
@@ -3695,13 +3209,27 @@ def _parse_itessellation_body(
                 )
             )
             and (previous_face is None or face_index > previous_face),
-            component + f": native tessellation v8 face {index} is malformed",
+            component + f": native tessellation face {index} is malformed",
         )
         previous_face = face_index
         faces[face_index] = set(facet_ids)
     _require(
         set(faces) == set(face_spans),
-        component + f": native tessellation v8 body {body_key} does not cover every face",
+        component + f": native tessellation body {body_key} does not cover every face",
+    )
+    _require(
+        sum(len(facet_ids) for facet_ids in faces.values())
+        == body["facet_count"]
+        and len(
+            {
+                facet_id
+                for facet_ids in faces.values()
+                for facet_id in facet_ids
+            }
+        )
+        == body["facet_count"],
+        component
+        + f": native tessellation body {body_key} face arrays do not close the native facet total",
     )
 
     facets = {}
@@ -3718,7 +3246,7 @@ def _parse_itessellation_body(
                 "vertex_ids",
                 "triangle_record_index",
             },
-            component + f": native tessellation v8 facet {index} has an unknown shape",
+            component + f": native tessellation facet {index} has an unknown shape",
         )
         facet_id = facet["facet_id"]
         face_index = facet["face_index"]
@@ -3743,7 +3271,7 @@ def _parse_itessellation_body(
             and all(_integer(vertex_id) and vertex_id >= 0 for vertex_id in vertex_ids)
             and _integer(triangle_record_index)
             and triangle_record_index >= 0,
-            component + f": native tessellation v8 facet {index} is malformed",
+            component + f": native tessellation facet {index} is malformed",
         )
         previous_facet = facet_id
         span = face_spans_by_key[(*body_key, face_index)]
@@ -3755,7 +3283,7 @@ def _parse_itessellation_body(
             triangle_record_index in expected_records
             and triangle_record_index not in used_triangle_records,
             component
-            + f": native tessellation v8 facet {facet_id} has duplicate or misplaced triangle index",
+            + f": native tessellation facet {facet_id} has duplicate or misplaced triangle index",
         )
         used_triangle_records.add(triangle_record_index)
         facets[facet_id] = {
@@ -3776,7 +3304,7 @@ def _parse_itessellation_body(
     }
     _require(
         used_triangle_records == expected_triangle_records,
-        component + f": native tessellation v8 body {body_key} does not cover every triangle record",
+        component + f": native tessellation body {body_key} does not cover every triangle record",
     )
     _require(
         {
@@ -3785,7 +3313,7 @@ def _parse_itessellation_body(
             for facet_id in facet_ids
         }
         == set(facets),
-        component + f": native tessellation v8 body {body_key} face-to-facet map is not closed",
+        component + f": native tessellation body {body_key} face-to-facet map is not closed",
     )
     for face_index, facet_ids in faces.items():
         _require(
@@ -3796,7 +3324,7 @@ def _parse_itessellation_body(
                 if facet["face_index"] == face_index
             },
             component
-            + f": native tessellation v8 body {body_key} face {face_index} has misowned facets",
+            + f": native tessellation body {body_key} face {face_index} has misowned facets",
         )
 
     fins = {}
@@ -3819,9 +3347,8 @@ def _parse_itessellation_body(
                 "end_evidence",
                 "cofin_raw_id",
                 "cofin_id",
-                "open_edge_boundary_identity",
             },
-            component + f": native tessellation v8 fin {index} has an unknown shape",
+            component + f": native tessellation fin {index} has an unknown shape",
         )
         fin_id = fin["fin_id"]
         facet_id = fin["facet_id"]
@@ -3835,7 +3362,6 @@ def _parse_itessellation_body(
         end_evidence = fin["end_evidence"]
         cofin_raw_id = fin["cofin_raw_id"]
         cofin_id = fin["cofin_id"]
-        open_edge_boundary_identity = fin["open_edge_boundary_identity"]
         _require(
             _integer(fin_id)
             and fin_id >= 0
@@ -3859,10 +3385,6 @@ def _parse_itessellation_body(
                     and type(end_u) in (int, float)
                     and math.isfinite(start_u)
                     and math.isfinite(end_u)
-                    and (
-                        open_edge_boundary_identity is None
-                        or isinstance(open_edge_boundary_identity, dict)
-                    )
                     and _integer(cofin_raw_id)
                     and cofin_raw_id >= -1
                     and (
@@ -3885,20 +3407,19 @@ def _parse_itessellation_body(
                     and end_evidence is None
                     and cofin_raw_id is None
                     and cofin_id is None
-                    and open_edge_boundary_identity is None
                 )
             ),
-            component + f": native tessellation v8 fin {index} is malformed or unclassified",
+            component + f": native tessellation fin {index} is malformed or unclassified",
         )
         previous_fin = fin_id
         _require(
             fin_id in facets[facet_id]["fin_ids"],
-            component + f": native tessellation v8 fin {fin_id} is absent from its facet",
+            component + f": native tessellation fin {fin_id} is absent from its facet",
         )
         previous = facet_fin_membership.setdefault(fin_id, facet_id)
         _require(
             previous == facet_id,
-            component + f": native tessellation v8 fin {fin_id} belongs to multiple facets",
+            component + f": native tessellation fin {fin_id} belongs to multiple facets",
         )
         fins[fin_id] = {
             "fin_id": fin_id,
@@ -3913,7 +3434,6 @@ def _parse_itessellation_body(
             "end_evidence": end_evidence,
             "cofin_raw_id": cofin_raw_id,
             "cofin_id": cofin_id,
-            "open_edge_boundary_identity": open_edge_boundary_identity,
         }
     _require(
         set(facet_fin_membership)
@@ -3922,7 +3442,7 @@ def _parse_itessellation_body(
             for facet in facets.values()
             for fin_id in facet["fin_ids"]
         },
-        component + f": native tessellation v8 body {body_key} facet-to-fin map is not closed",
+        component + f": native tessellation body {body_key} facet-to-fin map is not closed",
     )
     return {"faces": faces, "facets": facets, "fins": fins}
 
@@ -3947,7 +3467,7 @@ def _validate_facet_side_coverage(
             and len(set(starts)) == 3
             and len(set(ends)) == 3,
             component
-            + f": native tessellation v8 facet {facet['facet_id']} is not a directed three-cycle",
+            + f": native tessellation facet {facet['facet_id']} is not a directed three-cycle",
         )
         cycle = [fins[0]["vertex_ids"][0]]
         current = fins[0]
@@ -3956,7 +3476,7 @@ def _validate_facet_side_coverage(
             _require(
                 current["fin_id"] not in used,
                 component
-                + f": native tessellation v8 facet {facet['facet_id']} repeats a directed fin",
+                + f": native tessellation facet {facet['facet_id']} repeats a directed fin",
             )
             used.add(current["fin_id"])
             cycle.append(current["vertex_ids"][1])
@@ -3968,7 +3488,7 @@ def _validate_facet_side_coverage(
             _require(
                 len(matches) == 1,
                 component
-                + f": native tessellation v8 facet {facet['facet_id']} has an ambiguous directed cycle",
+                + f": native tessellation facet {facet['facet_id']} has an ambiguous directed cycle",
             )
             current = matches[0]
         _require(
@@ -3976,7 +3496,7 @@ def _validate_facet_side_coverage(
             and cycle[0] == cycle[-1]
             and len(set(cycle[:-1])) == 3,
             component
-            + f": native tessellation v8 facet {facet['facet_id']} does not form one directed three-cycle",
+            + f": native tessellation facet {facet['facet_id']} does not form one directed three-cycle",
         )
         cycles[facet["facet_id"]] = (cycle[0], cycle[1], cycle[2])
     return cycles
@@ -4008,7 +3528,7 @@ def _validate_facet_stl_binding(
         _require(
             any(native == stl[offset:] + stl[:offset] for offset in range(3)),
             component
-            + f": native tessellation v8 facet {facet['facet_id']} does not bind "
+            + f": native tessellation facet {facet['facet_id']} does not bind "
             + f"triangle record {facet['triangle_record_index']}",
         )
 
@@ -4018,7 +3538,6 @@ def summarize_native_topology(
     spans: list[dict],
     *,
     component: str | None = None,
-    expected_source_scope: dict | None = None,
 ) -> dict:
     """Summarize native edge incidence without inventing geometric adjacency."""
 
@@ -4068,7 +3587,6 @@ def summarize_native_topology(
         body_counts,
         triangle_count,
         None,
-        expected_source_scope=expected_source_scope,
     )
     _require(
         spans == reparsed_spans,

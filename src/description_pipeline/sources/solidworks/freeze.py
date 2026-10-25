@@ -11,6 +11,7 @@ number in ``raw/`` comes from the CAD API during this capture.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -2606,6 +2607,45 @@ def _freeze_local(
         stage = "readings"
         _capture_note(activity, "readings")
         scene, raw = _capture_readings(backend, cfg, closure, staging / "source", activity=activity)
+        preparation = (scene.notes or {}).get("capture_preparation")
+        recovery = (
+            preparation.get("session_recovery")
+            if isinstance(preparation, dict)
+            else None
+        )
+        if recovery is not None:
+            # Keep the environment observed before the failure and replace the
+            # delivery environment with the session that actually produced the
+            # final readings.
+            write_json(
+                staging / "evidence" / "capture-environment-before-recovery.json",
+                environment,
+            )
+            final_environment = capture_environment(backend, worker_version)
+            final_copy = (
+                (final_environment.get("solidworks") or {}).get("sessions") or {}
+            ).get("copy")
+            if (
+                not isinstance(final_copy, dict)
+                or final_copy != preparation["session"]["identity"]
+            ):
+                raise BridgeError(
+                    "cad_rebuild_recovery_environment",
+                    "The final capture environment does not bind the recovered session",
+                    {
+                        "preparation_session": preparation.get("session"),
+                        "environment_copy": final_copy,
+                    },
+                    exit_code=3,
+                )
+            final_environment["session_boundary"] = copy.deepcopy(
+                environment["session_boundary"]
+            )
+            environment = final_environment
+            write_json(
+                staging / "evidence" / "environment.json",
+                environment,
+            )
         write_json(staging / "raw" / "scene_raw.json", raw)
         write_json(staging / "raw" / "document_state.json", state)
         write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])

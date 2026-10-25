@@ -15,10 +15,7 @@ from pathlib import PureWindowsPath
 
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    NATIVE_TOLERANT_EDGE_GAP_WARNING,
     native_scope_warning_details_match,
-    native_scope_warning_projection,
-    native_tolerant_edge_warning_set_matches,
 )
 from ..io import PipelineError
 from ..sources.solidworks.evidence import METADATA_WARNING_CODE
@@ -125,9 +122,6 @@ _DIAGNOSTIC_CODE_LABELS = {
     "cad_scope_local_identity_derived": "Scope-local native identity is derived (diagnostic)",
     "cad_part_identity_witness_derived": "Part identity witness is derived (diagnostic)",
     "cad_topology_identity_derived": "Topology identity is derived (diagnostic)",
-    "cad_native_tolerant_edge_boundary_projection": (
-        "Native tolerant edge projection used a bounded gap (diagnostic)"
-    ),
     "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
     "naming.motion_unresolved": "Joint motion classification unavailable; neutral name retained (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
@@ -900,8 +894,6 @@ def _warning_row(stage: dict, item: dict) -> dict:
         row["message"] = str(item["message"])
     elif code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
         row["message"] = str(row["label"])
-    if code == NATIVE_TOLERANT_EDGE_GAP_WARNING:
-        row["detail"] = detail
     for key in _WARNING_DETAIL_KEYS:
         value = context.get(key)
         if value is not None:
@@ -937,19 +929,7 @@ def _recorded_warnings(
         if isinstance(item, dict)
         and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
-    tolerant_diagnostics = [
-        item
-        for item in quality_diagnostics or []
-        if isinstance(item, dict)
-        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
-    ]
-    tolerant_expected = any(
-        isinstance(item, dict)
-        and item.get("code") == NATIVE_TOLERANT_EDGE_GAP_WARNING
-        for item in quality_diagnostics or []
-    )
     scope_compared = False
-    tolerant_compared = False
     native_gate_seen = False
     if stage.get("id") == "discover":
         warnings.extend(
@@ -972,15 +952,6 @@ def _recorded_warnings(
                 if isinstance(item, dict)
                 and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
             ]
-            if row.get("id") == "geometry.native_tessellation":
-                if not native_tolerant_edge_warning_set_matches(
-                    quality_diagnostics or [],
-                    recorded,
-                ):
-                    raise PipelineError(
-                        "Native tolerant-edge warnings differ from quality diagnostics"
-                    )
-                tolerant_compared = True
             if raw_scope:
                 if not native_scope_warning_details_match(
                     native_diagnostics,
@@ -999,17 +970,7 @@ def _recorded_warnings(
                 )
                 if row.get("code")
                 in NATIVE_SCOPE_IDENTITY_WARNING_CODES
-                else (
-                    next(
-                        item
-                        for item in tolerant_diagnostics
-                        if item["detail"]
-                        == native_scope_warning_projection(row)["detail"]
-                    )
-                    if row.get("code")
-                    == NATIVE_TOLERANT_EDGE_GAP_WARNING
-                    else row
-                )
+                else row
                 for row in recorded
             ]
             warnings.extend(
@@ -1029,10 +990,6 @@ def _recorded_warnings(
     ):
         raise PipelineError(
             "Native scope diagnostics have no matching gate warnings"
-        )
-    if tolerant_expected and not tolerant_compared:
-        raise PipelineError(
-            "Native tolerant-edge diagnostics have no matching gate warnings"
         )
     if stage.get("id") == "verify":
         metadata_diagnostics = [
