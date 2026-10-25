@@ -114,6 +114,7 @@ def _native_expectation(
         NATIVE_CAPTURE_EFFECT_SCHEMA,
         NATIVE_DISCOVER_EFFECT_SCHEMA,
     )
+    from ..pipeline.contracts import NativeTargetIdentity
     from .native_operation_client import MAX_OPERATION_JSON_BYTES
     from .native_operation_runtime import (
         CAPTURE_KIND,
@@ -204,8 +205,11 @@ def _native_expectation(
         request = NativeDiscoverRequest.from_record(
             parse_data(request_raw, Path("request.json"))
         )
-        if request_raw != canonical(request.to_record()):
+        if request_raw != canonical(request.to_record()) + b"\n":
             raise ValueError("The Discover pending request is not canonical")
+        target = NativeTargetIdentity.from_record(
+            command.request.get("native_target_identity")
+        )
         source_raw, _, _ = evidence.artifacts.read_metadata_member(
             outbound,
             "source.json",
@@ -219,7 +223,7 @@ def _native_expectation(
                 "source_files": dict(request.source_files),
                 "source_inventory_sha256": request.source_inventory_sha256,
             }
-            or source_raw != canonical(source)
+            or source_raw != canonical(source) + b"\n"
             or request.command_id != command.command_id
             or request.run_id != command.run_id
             or request.request_digest != command.request_digest
@@ -237,7 +241,7 @@ def _native_expectation(
             "request_digest": command.request_digest,
             "source_inventory_sha256": request.source_inventory_sha256,
             "source_archive_sha256": archive_member["sha256"],
-            "native_target_id": request.native_target_identity["target_id"],
+            "native_target_id": target.target_id,
             "native_tool_sha256": request.expected_native_tool_sha256,
             "native_tool_record_sha256": request.expected_native_tool_record_sha256,
             "native_tool_requirement_artifact_id": (
@@ -257,7 +261,7 @@ def _native_expectation(
                     request.expected_native_tool_record_sha256
                 ),
                 output_contract=NATIVE_OBSERVATION_SCHEMA,
-                target_id=request.native_target_identity["target_id"],
+                target_id=target.target_id,
             )
         except NativeOperationError as error:
             raise ValueError("The Discover pending operation is invalid") from error

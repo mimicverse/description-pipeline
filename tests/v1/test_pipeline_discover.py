@@ -16,7 +16,19 @@ from unittest.mock import patch
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.interface_records import config_snapshot_digest
-from description_pipeline.io import digest, file_digest, read_data, write_json
+from description_pipeline.io import (
+    digest,
+    file_digest,
+    read_data,
+    write_json,
+)
+from description_pipeline.orchestration.airflow_effect_trigger import (
+    _EffectEvidence,
+    _native_expectation,
+)
+from description_pipeline.orchestration.native_operation_runtime import (
+    DISCOVER_KIND,
+)
 from description_pipeline.orchestration.discover_protocol import (
     ArchiveDiscoverAdapter,
     admit_observation_bundle,
@@ -922,6 +934,7 @@ class DiscoverDomainTests(unittest.TestCase):
                 "request_digest": self.command.request_digest,
                 "source_inventory_sha256": digest(self.harness.source_files),
                 "source_archive_sha256": archive_sha256,
+                "native_target_id": NATIVE_TARGET.target_id,
                 "native_tool_sha256": TOOL_SHA256,
                 "native_tool_record_sha256": NATIVE_TOOL_RECORD_SHA256,
                 "native_tool_requirement_artifact_id": (
@@ -930,6 +943,27 @@ class DiscoverDomainTests(unittest.TestCase):
             },
             outbound_root=outbound,
         )
+        entry = self.harness.effects.by_key[
+            f"native-discover:{self.command.command_id}"
+        ]
+        settlement = prepare_effects.effect_settlement(entry["effect_id"])
+        evidence = _EffectEvidence(
+            artifacts=self.harness.store,
+            command=self.command,
+            intent=SimpleNamespace(
+                effect_kind="native_operation",
+                expected_state=entry["expected_state"],
+            ),
+            settlement=settlement,
+        )
+        with patch.object(
+            self.harness.store,
+            "materialize",
+            side_effect=AssertionError("trigger must not materialize"),
+        ):
+            kind, expected = _native_expectation(evidence)
+        self.assertEqual(kind, DISCOVER_KIND)
+        self.assertEqual(expected.target_id, NATIVE_TARGET.target_id)
         execute_claim, execute_effects = self.harness.effect_port(self.command, fence=2)
         adapter = self.harness.port()
         execution = DiscoverHandler(adapter).execute(
@@ -941,6 +975,106 @@ class DiscoverDomainTests(unittest.TestCase):
         self.assertEqual(execution.outcome, "completed")
         self.assertEqual(self.harness.effects.authorizations, 1)
         self.assertEqual(len(adapter.invocations), 1)
+
+    def test_trigger_rejects_noncanonical_discover_metadata_encodings(
+        self,
+    ) -> None:
+        request = self.harness.native_request(self.command)
+        prepare_claim, prepare_effects = self.harness.effect_port(
+            self.command,
+            fence=1,
+        )
+        outbound, archive_sha256 = DiscoverHandler._write_outbound(
+            self.harness.workspace(),
+            prepare_claim,
+            request,
+            self.harness.source,
+        )
+        expected_state = {
+            "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
+            "operation_id": request.operation_id,
+            "request_digest": self.command.request_digest,
+            "source_inventory_sha256": request.source_inventory_sha256,
+            "source_archive_sha256": archive_sha256,
+            "native_target_id": NATIVE_TARGET.target_id,
+            "native_tool_sha256": TOOL_SHA256,
+            "native_tool_record_sha256": NATIVE_TOOL_RECORD_SHA256,
+            "native_tool_requirement_artifact_id": (
+                NATIVE_TOOL_REQUIREMENT_ARTIFACT_ID
+            ),
+        }
+        effect_key = f"native-discover:{self.command.command_id}"
+        prepared = prepare_effects.prepare_effect(
+            effect_key=effect_key,
+            effect_kind="native_operation",
+            target={
+                "operation_id": self.command.command_id,
+                "main_assembly": MAIN,
+                "native_tool_sha256": TOOL_SHA256,
+            },
+            expected_state=expected_state,
+            outbound_root=outbound,
+        )
+        settlement = prepare_effects.effect_settlement(prepared.effect_id)
+        entry = self.harness.effects.by_key[effect_key]
+
+        def evidence_for_variant(
+            index: int,
+            filename: str,
+            transform,
+        ) -> _EffectEvidence:
+            variant = self.harness.root / f"discover-encoding-{index}"
+            shutil.copytree(outbound, variant)
+            path = variant / filename
+            path.write_bytes(transform(path.read_bytes()))
+            artifact = self.harness.store.seal_tree(
+                variant,
+                kind="effect_payload",
+                producer_run_id=self.command.run_id,
+                producer_stage=self.command.stage,
+                producer_tool_sha256=prepare_claim.executor_sha256,
+            )
+            return _EffectEvidence(
+                artifacts=self.harness.store,
+                command=self.command,
+                intent=SimpleNamespace(
+                    effect_kind="native_operation",
+                    expected_state=entry["expected_state"],
+                ),
+                settlement=replace(
+                    settlement,
+                    outbound_artifact=artifact,
+                ),
+            )
+
+        def reordered(data: bytes) -> bytes:
+            record = json.loads(data)
+            return (
+                json.dumps(
+                    dict(reversed(list(record.items()))),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+
+        variants = (
+            ("request.json", lambda data: data[:-1]),
+            ("request.json", lambda data: data + b"\n"),
+            ("source.json", lambda data: data[:-1]),
+            ("source.json", lambda data: b" " + data),
+            ("request.json", reordered),
+        )
+        for index, (filename, transform) in enumerate(variants):
+            with (
+                self.subTest(filename=filename, index=index),
+                self.assertRaises(ValueError),
+            ):
+                _native_expectation(
+                    evidence_for_variant(index, filename, transform)
+                )
 
     def test_package_outside_reference_is_refused_before_native_record_read(self) -> None:
         def outside(evidence):
