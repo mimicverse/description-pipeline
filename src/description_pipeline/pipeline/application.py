@@ -758,6 +758,17 @@ class StageApplication:
 
         if not isinstance(spec, AdmissionSpec):
             raise ApplicationError("application.admission_required", "AdmissionSpec is required")
+        if self.native_target_identity is not None:
+            admitted_target = spec.require_native_target_identity()
+            if admitted_target != self.native_target_identity:
+                raise ApplicationError(
+                    "application.native_target_mismatch",
+                    "The admission target differs from the registered target",
+                    detail={
+                        "application": self.native_target_identity.to_record(),
+                        "admission": admitted_target.to_record(),
+                    },
+                )
         if spec.from_stage not in {None, "freeze"}:
             raise ApplicationError(
                 "application.linked_admission_builder_missing",

@@ -416,6 +416,43 @@ class StageApplicationTests(unittest.TestCase):
             discover.command_id,
         })
 
+    def test_admit_refuses_a_spec_for_another_registered_target(self) -> None:
+        registered_target = self.harness.native_target_identity
+        foreign_target = NativeTargetIdentity.create(
+            install_id="win-" + "b" * 32,
+            pipeline_id="solidworks-to-urdf",
+        )
+        application = StageApplication(
+            services=self.backend,
+            facts=self.backend,
+            artifacts=self.harness.store,
+            handlers={"freeze": self.freeze, "discover": self.discover},
+            builders={},
+            native_target_identity=registered_target,
+        )
+
+        with self.assertRaises(ApplicationError) as raised:
+            application.admit(
+                replace(
+                    self.harness.spec,
+                    native_target_identity=foreign_target,
+                )
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "application.native_target_mismatch",
+        )
+        self.assertEqual(
+            raised.exception.detail,
+            {
+                "application": registered_target.to_record(),
+                "admission": foreign_target.to_record(),
+            },
+        )
+        self.assertEqual(self.backend.commands, {})
+        self.assertEqual(self.backend.dispatch_commands, {})
+
     def test_execute_run_resumes_after_a_completed_prefix(self):
         self.application.admit(self.harness.spec)
         freeze = self.application.run_stage("run-1", "freeze")
