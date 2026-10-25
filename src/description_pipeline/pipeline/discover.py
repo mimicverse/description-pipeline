@@ -393,6 +393,51 @@ def _native_operation_id(command: StageCommand) -> str:
     )
 
 
+def discover_effect_target(
+    command: StageCommand,
+    request: Mapping[str, Any],
+    target: NativeTargetIdentity,
+) -> dict[str, Any]:
+    """Return the one exact effect target for a Discover command."""
+
+    identity = {
+        "operation_id": _native_operation_id(command),
+        "main_assembly": request["main_assembly"],
+        "native_tool_sha256": request["expected_native_tool_sha256"],
+        "native_target_identity": target.to_record(),
+        "native_target_id": target.target_id,
+    }
+    return {
+        **identity,
+        "target_binding_digest": digest(identity),
+    }
+
+
+def discover_effect_expected_state(
+    command: StageCommand,
+    request: Mapping[str, Any],
+    source_archive_sha256: str,
+    target: NativeTargetIdentity,
+) -> dict[str, Any]:
+    """Return the one exact expected state for a Discover native effect."""
+
+    return {
+        "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
+        "operation_id": _native_operation_id(command),
+        "request_digest": command.request_digest,
+        "source_inventory_sha256": request["source_inventory_sha256"],
+        "source_archive_sha256": source_archive_sha256,
+        "native_tool_sha256": request["expected_native_tool_sha256"],
+        "native_tool_record_sha256": request[
+            "expected_native_tool_record_sha256"
+        ],
+        "native_tool_requirement_artifact_id": request[
+            "native_tool_requirement_artifact_id"
+        ],
+        "native_target_id": target.target_id,
+    }
+
+
 class DiscoverHandler:
     """Run one Discover command through the command-bound runtime effect port."""
 
@@ -405,17 +450,7 @@ class DiscoverHandler:
         request: Mapping[str, Any],
         target: NativeTargetIdentity,
     ) -> dict[str, Any]:
-        identity = {
-            "operation_id": _native_operation_id(command),
-            "main_assembly": request["main_assembly"],
-            "native_tool_sha256": request["expected_native_tool_sha256"],
-            "native_target_identity": target.to_record(),
-            "native_target_id": target.target_id,
-        }
-        return {
-            **identity,
-            "target_binding_digest": digest(identity),
-        }
+        return discover_effect_target(command, request, target)
 
     @staticmethod
     def _effect_expected_state(
@@ -424,21 +459,12 @@ class DiscoverHandler:
         source_archive_sha256: str,
         target: NativeTargetIdentity,
     ) -> dict[str, Any]:
-        return {
-            "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
-            "operation_id": _native_operation_id(command),
-            "request_digest": command.request_digest,
-            "source_inventory_sha256": request["source_inventory_sha256"],
-            "source_archive_sha256": source_archive_sha256,
-            "native_tool_sha256": request["expected_native_tool_sha256"],
-            "native_tool_record_sha256": request[
-                "expected_native_tool_record_sha256"
-            ],
-            "native_tool_requirement_artifact_id": request[
-                "native_tool_requirement_artifact_id"
-            ],
-            "native_target_id": target.target_id,
-        }
+        return discover_effect_expected_state(
+            command,
+            request,
+            source_archive_sha256,
+            target,
+        )
 
     @staticmethod
     def _verify_resume_wait(

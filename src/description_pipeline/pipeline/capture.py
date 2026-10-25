@@ -98,10 +98,12 @@ class CaptureUnresolved(PipelineError):
     """The native operation has a possible external effect with no safe terminal fact."""
 
 
-def _capture_target(
+def capture_effect_target(
     command: StageCommand,
     request: CaptureRequest,
 ) -> dict[str, Any]:
+    """Return the one exact effect target for a Capture command."""
+
     identity = NativeTargetIdentity.from_record(
         request.native_target_identity
     )
@@ -279,7 +281,7 @@ def validate_capture_effect_outbound(
     ):
         raise ProtocolError("capture.effect_outbound", {"where": "outbound.json"})
     request = CaptureRequest.from_command(command)
-    expected_target = _capture_target(command, request)
+    expected_target = capture_effect_target(command, request)
     if (
         record.get("schema_version") != NATIVE_CAPTURE_EFFECT_SCHEMA
         or record.get("command_id") != command.command_id
@@ -1311,7 +1313,7 @@ class CaptureHandler:
     ) -> dict[str, Any]:
         objects = list(inputs.object_names)
         prepared_files = dict(sorted(inputs.prepared_files.items()))
-        target = _capture_target(command, request)
+        target = capture_effect_target(command, request)
         identity = NativeTargetIdentity.from_record(
             request.native_target_identity
         )
@@ -1524,7 +1526,7 @@ class CaptureHandler:
             intent = effects.prepare_effect(
                 effect_key=request.effect_key,
                 effect_kind="native_operation",
-                target=_capture_target(command, request),
+                target=capture_effect_target(command, request),
                 expected_state=expected_state,
                 outbound_root=outbound_root,
             )

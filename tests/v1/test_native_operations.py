@@ -68,7 +68,10 @@ from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
 from description_pipeline.orchestration.windows import handler as windows_handler
-from description_pipeline.schemas import TOOL_SCHEMA
+from description_pipeline.schemas import (
+    NATIVE_DISCOVER_EFFECT_SCHEMA,
+    TOOL_SCHEMA,
+)
 from description_pipeline.sources.solidworks.discover_stage import (
     NATIVE_OBSERVATION_SCHEMA,
     NATIVE_REQUEST_SCHEMA,
@@ -2219,12 +2222,14 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             },
         )
         (outbound / "source-set.zip").write_bytes(archive.read_bytes())
+        command_request = request.to_record()
+        command_request["native_target_identity"] = TEST_TARGET.to_record()
         command = SimpleNamespace(
             stage="discover",
             command_id=request.command_id,
             run_id=request.run_id,
             request_digest=request.request_digest,
-            request=request.to_record(),
+            request=command_request,
         )
         intent = SimpleNamespace(
             effect_kind="native_operation",
@@ -2236,13 +2241,17 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                 "native_target_identity": TEST_TARGET.to_record(),
                 "native_target_id": TEST_TARGET_ID,
                 "native_tool_sha256": (
-                    request.expected_native_tool_record_sha256
+                    request.expected_native_tool_sha256
                 ),
                 "target_binding_digest": "f" * 64,
             },
             expected_state={
+                "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
+                "operation_id": request.operation_id,
                 "request_digest": request.request_digest,
+                "source_inventory_sha256": request.source_inventory_sha256,
                 "source_archive_sha256": file_digest(archive),
+                "native_tool_sha256": request.expected_native_tool_sha256,
                 "native_target_id": TEST_TARGET_ID,
                 "native_tool_record_sha256": (
                     request.expected_native_tool_record_sha256
@@ -2612,6 +2621,103 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         client.upload_input.assert_not_called()
         client.cancel_operation.assert_not_called()
 
+    def test_effect_observer_rejects_self_bound_foreign_discover_target(
+        self,
+    ) -> None:
+        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        backend = _CountingBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        other_target = NativeTargetIdentity.create(
+            install_id="win-" + "5" * 32,
+            pipeline_id=PIPELINE_ID,
+        )
+
+        def drop_operation_id(
+            target: dict[str, object],
+            expected_state: dict[str, object],
+            command: SimpleNamespace,
+        ) -> None:
+            del expected_state
+            target.pop("operation_id")
+            target["command_id"] = command.command_id
+
+        def replace_registered_target(
+            target: dict[str, object],
+            expected_state: dict[str, object],
+            command: SimpleNamespace,
+        ) -> None:
+            del command
+            target["native_target_identity"] = other_target.to_record()
+            target["native_target_id"] = other_target.target_id
+            expected_state["native_target_id"] = other_target.target_id
+
+        def replace_operation_state(
+            target: dict[str, object],
+            expected_state: dict[str, object],
+            command: SimpleNamespace,
+        ) -> None:
+            del target, command
+            expected_state["operation_id"] = "discover-foreign-operation"
+
+        for label, mutate in (
+            ("missing-operation-id", drop_operation_id),
+            ("foreign-target", replace_registered_target),
+            ("foreign-operation-state", replace_operation_state),
+            ("foreign-request-operation", None),
+        ):
+            with self.subTest(case=label):
+                workspace = self.root / f"observer-target-{label}"
+                archive = seal_source_archive(
+                    self.source,
+                    self.inventory,
+                    workspace / "input-source-set.zip",
+                )
+                command, intent, outbound = self.observer_fixture(
+                    f"discover-operation-observer-{label}",
+                    workspace,
+                    archive=archive,
+                )
+                target = dict(intent.target)
+                expected_state = dict(intent.expected_state)
+                if mutate is None:
+                    request_record = json.loads(
+                        (outbound / "request.json").read_text()
+                    )
+                    request_record["operation_id"] = (
+                        "discover-foreign-operation"
+                    )
+                    write_json(outbound / "request.json", request_record)
+                else:
+                    mutate(target, expected_state, command)
+                target["target_binding_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in target.items()
+                        if key != "target_binding_digest"
+                    }
+                )
+                altered = SimpleNamespace(**vars(intent))
+                altered.target = target
+                altered.expected_state = expected_state
+                client.get_operation = mock.Mock(
+                    side_effect=AssertionError(
+                        "foreign Discover target must be rejected before observation"
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    NativeOperationProtocolError,
+                    "Discover reconciliation",
+                ):
+                    NativeOperationEffectObserver(client).observe(
+                        command=command,
+                        intent=altered,
+                        outbound_root=outbound,
+                        workspace_root=workspace,
+                    )
+
+                client.get_operation.assert_not_called()
+
     def test_effect_observer_rejects_foreign_discover_executor(self) -> None:
         reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
@@ -2863,7 +2969,9 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             "discover-operation-terminal",
             workspace,
         )
-        request = NativeDiscoverRequest.from_record(command.request)
+        request = NativeDiscoverRequest.from_record(
+            json.loads((outbound / "request.json").read_text())
+        )
         archive = outbound / "source-set.zip"
         client = server.client()
         envelope = build_operation_record(

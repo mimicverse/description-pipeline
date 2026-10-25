@@ -985,12 +985,17 @@ def read_sealed_native_operation_request(
             CAPTURE_INPUT_ARCHIVE,
             CaptureRequest,
             _outbound_tree_sha256,
+            capture_effect_target,
             validate_capture_effect_outbound,
         )
 
         outbound = validate_capture_effect_outbound(outbound_root, command)
         request = CaptureRequest.from_command(command)
         target = _effect_target_identity(intent)
+        if dict(intent.target) != capture_effect_target(command, request):
+            raise NativeOperationProtocolError(
+                "Capture reconciliation effect intent differs from the frozen command"
+            )
         objects = outbound["objects"]
         expected_upstream = [
             artifact.to_record()
@@ -1088,10 +1093,31 @@ def read_sealed_native_operation_request(
         )
 
     if command.stage == "discover":
-        target = _effect_target_identity(intent)
+        from ..pipeline.discover import (
+            discover_effect_expected_state,
+            discover_effect_target,
+        )
+
+        command_target = NativeTargetIdentity.from_record(
+            command.request.get("native_target_identity")
+        )
+        intent_target = _effect_target_identity(intent)
+        if intent_target != command_target:
+            raise NativeOperationProtocolError(
+                "Discover reconciliation intent differs from the registered target"
+            )
         request = NativeDiscoverRequest.from_record(
             read_data(outbound_root / "request.json")
         )
+        expected_target = discover_effect_target(
+            command,
+            request.to_record(),
+            command_target,
+        )
+        if dict(intent.target) != expected_target:
+            raise NativeOperationProtocolError(
+                "Discover reconciliation effect intent differs from the frozen command"
+            )
         source = read_data(outbound_root / "source.json")
         archive = outbound_root / SOURCE_ARCHIVE
         if (
@@ -1103,6 +1129,7 @@ def read_sealed_native_operation_request(
             or request.command_id != command.command_id
             or request.run_id != command.run_id
             or request.request_digest != command.request_digest
+            or request.operation_id != expected_target["operation_id"]
             or request.expected_native_tool_sha256
             != command.request.get("expected_native_tool_sha256")
             or request.expected_native_tool_record_sha256
@@ -1116,19 +1143,11 @@ def read_sealed_native_operation_request(
                 "Discover reconciliation outbound differs from the frozen command"
             )
         source_archive_sha256 = file_digest(archive)
-        if (
-            intent.expected_state.get("source_archive_sha256")
-            != source_archive_sha256
-            or intent.expected_state.get("request_digest")
-            != command.request_digest
-            or intent.expected_state.get("native_tool_record_sha256")
-            != request.expected_native_tool_record_sha256
-            or intent.expected_state.get("native_target_id")
-            != target.target_id
-            or intent.expected_state.get(
-                "native_tool_requirement_artifact_id"
-            )
-            != request.native_tool_requirement_artifact_id
+        if dict(intent.expected_state) != discover_effect_expected_state(
+            command,
+            request.to_record(),
+            source_archive_sha256,
+            command_target,
         ):
             raise NativeOperationProtocolError(
                 "Discover reconciliation outbound differs from its effect intent"
@@ -1143,12 +1162,12 @@ def read_sealed_native_operation_request(
                 request.expected_native_tool_record_sha256
             ),
             output_contract=NATIVE_OBSERVATION_SCHEMA,
-            target_id=target.target_id,
+            target_id=command_target.target_id,
         )
         return SealedNativeOperationRequest(
             operation_id=request.operation_id,
             kind=DISCOVER_KIND,
-            target_id=target.target_id,
+            target_id=command_target.target_id,
             request=request,
             request_sha256=digest(request.to_record()),
             payload_sha256=operation["payload_sha256"],
@@ -1193,22 +1212,6 @@ class NativeOperationEffectObserver:
         if (
             intent.effect_kind != "native_operation"
             or intent.command_id != command.command_id
-            or intent.target.get("operation_id", intent.target.get("command_id"))
-            != (
-                native_capture_operation_id(
-                    run_id=command.run_id,
-                    command_id=command.command_id,
-                    effect_key=intent.effect_key,
-                )
-                if command.stage == "capture"
-                else native_discover_operation_id(
-                    run_id=command.run_id,
-                    command_id=command.command_id,
-                    request_digest=command.request_digest,
-                )
-                if command.stage == "discover"
-                else None
-            )
         ):
             raise NativeOperationProtocolError(
                 "native reconciliation intent belongs to another command"

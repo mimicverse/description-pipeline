@@ -1527,6 +1527,85 @@ class CaptureHandlerTests(unittest.TestCase):
         client.upload_input.assert_not_called()
         client.cancel_operation.assert_not_called()
 
+    def test_native_effect_observer_rejects_self_bound_foreign_capture_target(
+        self,
+    ) -> None:
+        effects = self.effects()
+        workspace = self.workspace(
+            name="workspace-foreign-capture-target"
+        )
+        with patch(
+            "description_pipeline.runtime.tool_record",
+            return_value=self.current_native_tool,
+        ):
+            completed = self.handler().execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(completed.outcome, "completed")
+        outbound_root = workspace.root / "capture-effect-outbound"
+        intent = next(
+            item
+            for item in self.effect_ledger.intents.values()
+            if item.command_id == self.command.command_id
+        )
+        variants = (
+            ("run_id", {"run_id": "foreign-run"}),
+            ("stage", {"stage": "discover"}),
+            (
+                "main_assembly",
+                {"main_assembly": "cad/foreign.SLDASM"},
+            ),
+            ("native_tool_sha256", {"native_tool_sha256": "f" * 64}),
+        )
+
+        for label, changes in variants:
+            with self.subTest(field=label):
+                target = dict(intent.target)
+                target["native_target_identity"] = dict(
+                    target["native_target_identity"]
+                )
+                target.update(changes)
+                target["target_binding_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in target.items()
+                        if key != "target_binding_digest"
+                    }
+                )
+                altered = replace(intent, target=target)
+                client = NativeOperationClient(
+                    NativeOperationEndpoint(
+                        "http://127.0.0.1:1",
+                        "t" * 32,
+                    ),
+                    target_id=CAPTURE_TARGET.target_id,
+                )
+                client.get_operation = Mock(
+                    side_effect=AssertionError(
+                        "foreign Capture target must be rejected before observation"
+                    )
+                )
+                observer_root = (
+                    self.root / f"capture-foreign-target-{label}"
+                )
+                observer_root.mkdir()
+
+                with self.assertRaisesRegex(
+                    Exception,
+                    "Capture reconciliation effect intent differs",
+                ):
+                    NativeOperationEffectObserver(client).observe(
+                        command=self.command,
+                        intent=altered,
+                        outbound_root=outbound_root,
+                        workspace_root=observer_root,
+                    )
+
+                client.get_operation.assert_not_called()
+
     def test_native_effect_observer_marks_missing_claimed_owner_unestablished(
         self,
     ) -> None:
