@@ -89,8 +89,9 @@ PR 绑定同一工程内容、工具、主体、报告与 commit。工程评审�
 description stage <verify-command-id>
 ```
 
-检查只读；上述命令只执行已登记的不可变 Verify command，由同一版
-`StageApplication` 在隔离执行环境中读取冻结输入和原始证据，独立复算并核验报告以及
-command、subject、policy、tool 与 execution 绑定。它不创建新的正式 run，不启动
-CAD，也不修改原始证据；复核结论不进入平台发布流程。发布恢复使用操作台的发布重跑，
+该命令执行已登记的正式 Verify 阶段。尚无决定时，它取得执行权，从原始证据运行验证，
+并提交正式 decision、certificate 与 receipt；结果按既有契约参与后续发布。已有决定时，
+命令只核验并返回原封存结果，不重新计算。Verify 对输入证据的读取不改写原件，但阶段
+执行会写入业务事实。真正隔离复算须绑定既有 `DiagnosticReplayScope` 并走受控诊断
+入口，不登记正式资格；不能把正式命令当作只读诊断。发布恢复使用操作台的发布重跑，
 以保持同一授权、目标和审计流程。命令与完整交付边界见[交付契约](contracts.md#delivery)。
