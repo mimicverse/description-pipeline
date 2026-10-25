@@ -552,6 +552,43 @@ def _stage_checks(view: dict) -> dict[str, dict]:
     return checks
 
 
+def _prepared_archive_inventory(input_inventory, native_files, *, capture_plan_sha256):
+    """Invert the fixed Capture archive layout without flattening source paths.
+
+    Native files move under input/cad; controlled records and discovery keep
+    their package-relative paths; the consumed plan moves into evidence.
+    Every mapping is bound to the actual archived digest and native inventory.
+    """
+
+    native = _casefold_inventory(native_files, "Native prepared files")
+    _casefold_inventory(input_inventory, "Archived prepared inputs")
+    prepared, archive_paths, folded = {}, {}, set()
+
+    def add(relative, checksum, archived_path):
+        artifact_path_parts(relative)
+        _require(relative.casefold() not in folded, "Prepared-to-archive paths are ambiguous: " + relative)
+        folded.add(relative.casefold())
+        prepared[relative] = checksum
+        archive_paths[relative] = archived_path
+
+    seen_native = set()
+    for archived_name, checksum in input_inventory.items():
+        if archived_name.startswith("cad/"):
+            name = archived_name.removeprefix("cad/")
+            row = native.get(name.casefold())
+            _require(row is not None and row[1] == checksum,
+                     "Archived CAD does not bind its prepared native file: " + archived_name)
+            prepared_name = row[0]
+            seen_native.add(name.casefold())
+        else:
+            prepared_name = archived_name
+        add(prepared_name, checksum, "input/" + archived_name)
+    _require(seen_native == set(native), "Prepared native files are missing from the Capture archive")
+    _require(_is_sha256(capture_plan_sha256), "Archived capture plan has no valid byte digest")
+    add("capture-plan.json", capture_plan_sha256, "evidence/capture-plan.json")
+    return prepared, archive_paths
+
+
 def expected_native_check_details(
     root: Path,
     *,
@@ -604,6 +641,11 @@ def expected_native_check_details(
     expected_evidence = {
         f"evidence/{name}": checksum for name, checksum in evidence_inventory.items() if name not in generated_top_level
     }
+    capture_plan = confined(root, "evidence/capture-plan.json")
+    prepared_inventory, _prepared_paths = _prepared_archive_inventory(
+        input_inventory, native_files,
+        capture_plan_sha256=file_digest(capture_plan),
+    )
     return {
         "discovery.inputs": {
             "files_sha256": handoff_sha256,
@@ -624,7 +666,7 @@ def expected_native_check_details(
             "manifest_sha256": file_digest(evidence_root / "manifest.json"),
         },
         "capture.input_stability": {
-            "files": {"input/" + _document_basename(name): checksum for name, checksum in input_inventory.items()},
+            "files": {"input/" + name: checksum for name, checksum in prepared_inventory.items()},
         },
     }
 
@@ -747,9 +789,14 @@ def _validate_stage_details(
         for name, checksum in inventory(Path(root) / "input").items()
         if name not in {"handoff.json", "request.json"}
     }
-    capture_plan = confined(root, "evidence/capture-plan.json", exists=False)
-    if capture_plan.is_file():
-        archived_inputs["evidence/capture-plan.json"] = file_digest(capture_plan)
+    capture_plan = confined(root, "evidence/capture-plan.json")
+    archived_inputs["evidence/capture-plan.json"] = file_digest(capture_plan)
+    _prepared_inventory, prepared_paths = _prepared_archive_inventory(
+        {name.removeprefix("input/"): checksum for name, checksum in archived_inputs.items()
+         if name.startswith("input/")},
+        native_files,
+        capture_plan_sha256=archived_inputs.get("evidence/capture-plan.json"),
+    )
     bound_paths = set()
     for relative, checksum in binding_files.items():
         _require(
@@ -758,20 +805,11 @@ def _validate_stage_details(
         )
         prepared_name = relative.removeprefix("input/")
         artifact_path_parts(prepared_name)
-        candidates = []
-        if relative in archived_inputs:
-            candidates.append(relative)
-        if prepared_name == "capture-plan.json":
-            candidates.append("evidence/capture-plan.json")
-        first = prepared_name.split("/", 1)[0]
-        if "/" in prepared_name and first in {"cad", "records"}:
-            candidates.append(f"input/{first}/{prepared_name}")
-        candidates = sorted({path for path in candidates if path in archived_inputs})
+        resolved = prepared_paths.get(prepared_name)
         _require(
-            len(candidates) == 1,
+            resolved is not None and resolved in archived_inputs,
             f"Discover discovery.binding path is absent or ambiguous: {relative}",
         )
-        resolved = candidates[0]
         _require(
             archived_inputs[resolved] == checksum,
             f"Discover discovery.binding file differs from the archive: {relative}",
