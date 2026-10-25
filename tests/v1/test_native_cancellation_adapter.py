@@ -20,7 +20,7 @@ except ImportError:
     psycopg2 = None
 
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import digest, file_digest, write_json
+from description_pipeline.io import canonical, digest, file_digest, write_json
 from description_pipeline.orchestration.discover_protocol import (
     SOURCE_ARCHIVE,
     seal_source_archive,
@@ -31,6 +31,7 @@ from description_pipeline.orchestration.native_operation_cancellation import (
 from description_pipeline.orchestration.native_operation_client import (
     NativeOperationClient,
     NativeOperationEndpoint,
+    native_discover_operation_id,
 )
 from description_pipeline.orchestration.native_operation_runtime import (
     DISCOVER_KIND,
@@ -59,6 +60,7 @@ from description_pipeline.pipeline.services import (
 )
 from description_pipeline.platform.facts import FactStore
 from description_pipeline.schemas import (
+    NATIVE_DISCOVER_EFFECT_SCHEMA,
     NATIVE_DISCOVER_REQUEST_SCHEMA,
     NATIVE_OBSERVATION_SCHEMA,
 )
@@ -194,6 +196,10 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         self.harness = AdmissionHarness(
             Path(self.directory.name) / "admission"
         )
+        self.harness.spec = replace(
+            self.harness.spec,
+            native_target_identity=CANCEL_TARGET,
+        )
         self.artifacts = self.harness.store
         self.facts = FactStore(self._connect, self.artifacts)
         self.now = datetime(2026, 10, 25, 8, tzinfo=UTC)
@@ -251,6 +257,10 @@ class NativeCancellationAdapterTests(unittest.TestCase):
             stage="discover",
             idempotency_key=f"{admission.run_id}/native-cancel",
             request={
+                "main_assembly": self.harness.spec.main_assembly,
+                "native_target_identity": (
+                    self.harness.spec.native_target_identity.to_record()
+                ),
                 "expected_native_tool_sha256": (
                     self.harness.spec.native_tool_source_sha256
                 ),
@@ -259,6 +269,11 @@ class NativeCancellationAdapterTests(unittest.TestCase):
                 ),
                 "native_tool_requirement_artifact_id": (
                     self.harness.spec.native_tool_requirement.ref.artifact_id
+                ),
+                "purpose": self.harness.spec.purpose,
+                "source_files": self.harness.spec.originals.inventory,
+                "source_inventory_sha256": (
+                    self.harness.spec.originals.inventory_sha256
                 ),
             },
             input_artifacts=(
@@ -301,7 +316,11 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         source_root = workspace.inputs[self.harness.spec.originals.ref.artifact_id]
         request = NativeDiscoverRequest(
             schema_version=NATIVE_DISCOVER_REQUEST_SCHEMA,
-            operation_id=target_command.command_id,
+            operation_id=native_discover_operation_id(
+                run_id=target_command.run_id,
+                command_id=target_command.command_id,
+                request_digest=target_command.request_digest,
+            ),
             command_id=target_command.command_id,
             run_id=target_command.run_id,
             request_digest=target_command.request_digest,
@@ -323,13 +342,19 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         )
         outbound = workspace.root / "native-outbound"
         outbound.mkdir()
-        write_json(outbound / "request.json", request.to_record())
-        write_json(
-            outbound / "source.json",
-            {
-                "source_files": dict(request.source_files),
-                "source_inventory_sha256": request.source_inventory_sha256,
-            },
+        (outbound / "request.json").write_bytes(
+            canonical(request.to_record()) + b"\n"
+        )
+        (outbound / "source.json").write_bytes(
+            canonical(
+                {
+                    "source_files": dict(request.source_files),
+                    "source_inventory_sha256": (
+                        request.source_inventory_sha256
+                    ),
+                }
+            )
+            + b"\n"
         )
         archive = seal_source_archive(
             source_root,
@@ -342,7 +367,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
             "main_assembly": request.main_assembly,
             "native_target_identity": CANCEL_TARGET.to_record(),
             "native_target_id": CANCEL_TARGET.target_id,
-            "native_tool_sha256": request.expected_native_tool_record_sha256,
+            "native_tool_sha256": request.expected_native_tool_sha256,
         }
         transfer_target["target_binding_digest"] = digest(transfer_target)
         effect = effects.prepare_effect(
@@ -350,7 +375,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
             effect_kind="native_operation",
             target=transfer_target,
             expected_state={
-                "schema_version": NATIVE_OBSERVATION_SCHEMA,
+                "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
                 "operation_id": request.operation_id,
                 "request_digest": target_command.request_digest,
                 "source_inventory_sha256": request.source_inventory_sha256,
