@@ -38,26 +38,38 @@
 | 独立验证失败 | 追溯原始证据与生成规则，保留失败产物与检查结果 |
 | 通信中断 | 恢复连接并查询同一原生操作，不重复发起 CAD 工作 |
 | 发布失败或结果未知 | 保留已验证交付与外部操作记录，恢复权限/服务后由发布阶段对账 |
-| 发布基线变化 | 检查目标候选与 base，创建固定新基线的新请求与关联发布运行 |
+| 发布基线变化 | 检查目标候选与 base；如仍要正式执行，使用 `Create new request from Freeze` 在新 Freeze 下重做全部下游 |
 
 观察数量不是缺陷零件数量。一处未解析约束可能影响多个实例，应先判定问题来源。机械事实的变化在 CAD/规格中修正，形成新提交；不编辑模型、URDF、网格或质量报告。
 
-## 恢复与重跑
+## 恢复、重试与新建请求
 
-“继续原作业”恢复通信并连接原操作，不重做工程阶段。“从此步骤重新运行”创建新请求与关联运行，固定本次目标、工具、策略和发布基线，执行所选阶段及其后续；原运行、输入和诊断保持不变。
+恢复区提供 `Retry` / `Continue original job` 与 `Create new request from Freeze` 两种
+操作；首页首次上传是独立的正式入口。
 
-| 起始阶段 | 核验后可复用的上游 |
-|---|---|
-| 冻结输入 | 完整留存上传原件 |
-| 解析结构 | 冻结输入 |
-| 采集证据 | 冻结输入、原始发现、规格快照和采集计划 |
-| 生成 URDF | 完整原生证据 |
-| 独立验证 | 完整生成交付 |
-| 提交评审 PR | 完整已验证交付及明确的发布基线 |
+- `Retry` / `Continue original job` 只针对同一已登记且不可变的 command。它可继续原
+  operation、处理传输恢复或执行受控 terminal resume；输入、expected target、tool、
+  effect identity 与既有资格不能通过 retry 改写。结果 UNKNOWN 时先对账原 operation，
+  不得新建 operation、重新上传不同 archive、重做 CAD 或创建新阶段 command。
+- `Create new request from Freeze` 只用于已有 run。它只从父运行已通过独立复核的
+  sealed Freeze originals 创建当前规则、配置、tool、policy 与发布基线下的新 Freeze
+  request；随后按顺序重新执行 Freeze、Discover、Capture、Generate、Verify 和 Publish。
+  原运行、原始证据和原 command 保持不变。重复提交返回同一幂等的新 request；其他来源
+  或任一前置缺失时拒绝。
 
-发起人和管理员可重跑已完成或失败的阶段。重复点击返回已创建的同一活动运行。缺少完整上游时，页面说明应从哪个阶段开始；不能用部分采集生成模型。
+首页首次上传提交本次完整受控原件并直接形成新的 Freeze request；它不调用
+`Create new request from Freeze`，也不复用任何旧运行的 sealed originals。所有正式新
+运行均从 Freeze 接纳，包括首次上传与已有 run 的封存复用；不能为正式运行选择任意起始
+阶段，也不存在“只重跑 Verify／Publish”的新运行入口。
 
-CAD、主装配、规格或工具版本变化从冻结重新开始。只重跑验证或发布不打开 SolidWorks。复用条件与终态恢复遵循[系统契约](contracts.md#recovery)。
+同一原始 CAD 字节下，规则、config、tool 版本、发布 base 或封存内主装配选择变化时，
+可从已有 run 使用 `Create new request from Freeze`。原始 CAD 字节变化必须重新上传新的
+受控输入，再从该输入形成 Freeze request；不得复用旧 bytes 冒充变化，也不得把已有
+上游结果拼入新规则组合。
+
+独立阶段诊断只能执行已登记且隔离授权的 exact command；它不是页面上的正式阶段起跑
+资格，不能创建新的正式 run 或绕过 Freeze。复用、UNKNOWN 对账与终态恢复的具体边界
+遵循[系统契约](contracts.md#recovery)。
 
 发起人和管理员可以请求取消尚未完成的运行。平台先停止自有操作并核对外部结果，确认后才显示取消；未决结果先对账，已完成发布不能被取消。取消保留请求、原始证据与诊断。
 
