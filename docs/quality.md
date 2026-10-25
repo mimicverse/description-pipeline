@@ -117,6 +117,8 @@ native edge 的 U 覆盖仍按每个实际三角面分别严格验收。对 clos
 
 provider 选择发生在任何 `Tessellate` 之前。不符合限定几何域且已获原生事实证明时，采用一次 ITessellation；原生读取失败、非法类型、身份冲突或未知不伪装成“不适用”。不能按名称、对象序号、面积、显示三角形数量或一次 tessellation 失败切换 provider。构造或交付精度失败也不能冒充几何域外而触发另一种网格路径。原生 API 明确的未使用槽不充当工程判据；例如 `ICoEdge.GetCurveParams` 的索引 `8..9` 不提供有效 sense 或 curve type，相关事实应由正式 API 读取。
 
+先对完整边集合读取并校验 `ICurve.IsLine`，存在非直边时不进入仅适用于直边的解析。对已经取得的读数，硬约束必须先于适用域判断：trim 不得越过已读原生 U 域；两端已读 tangent 的明确反向不得被非精确共线或顶点配对失败掩盖。所有边均为直线，但 binary64 原值不能证明精确共线、共面、切向平行或唯一顶点配对时，仅说明超出严格平面 provider 的域，转交一次原生 ITessellation；不能用半 ULP 输入舍入单元、float32 点界或新增 EPS 断言跨 API 内部误差或几何损坏。选择原因与同次已读原值保留在 `scene.notes.geometry_provider_selection`，成功与失败均可审计；该记录不作为几何权威，不替代所选 provider 的独立验证。
+
 平面 BRep 证明的主体是本次原生 API 实际观测并封存的 raw binary64 nominal analytic 模型。完整类型、plane／line／trim、顶点、coedge 邻接与有向边界建立唯一 nominal 域；不同 API 的真实冲突不能无证解释为 roundoff，未知冲突保留 unresolved，不新增逐对象 EPS。派生或构造如移动原始输入，须有明确通用规则、可复算位移和 warning；直接使用原值时零构造位移只表示算法未移动该输入。不得另立取得厂商未公开 hidden-kernel 无限精度或实物误差规范的准入门，也不宣称已建立这些资格。
 
 对合格平面域以稳定有向 fan 生成 `n-2` 三角形。独立消费者从原生事实证明有向外边界完整一致、内部边反向成对、无交叉或重复覆盖、正确朝向及完整覆盖，不能只再次调用 producer 的 triangulator。定向、相交和非退化判据采用 exact rational 或有可靠数值界的方法，同时覆盖三个轴及正负法向。实际 binary32 STL 必须逐顶点、逐有向三角形绑定；配对顶点的最大 L2 位移以同 barycentric 组合建立全部对应三角曲面的双向距离上界，构造、坐标变换及编码误差须有据计入。L∞ 点界和 U 的 ULP 身份不能直接冒称此 L2 证明。量化后的顶点合并、边界交叉、退化、翻向或拓扑变化独立拒绝，即使距离小于 `50 µm` 也不能通过；不得删除原生边或顶点以制造资格。

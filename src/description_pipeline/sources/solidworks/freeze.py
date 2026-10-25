@@ -2716,6 +2716,10 @@ def _freeze_local(
             _capture_note(activity, "geometry")
             geometry_entries = _export_geometry(backend, cfg, staging / "geometry", components, activity=activity)
             write_json(staging / "raw" / "geometry.json", geometry_entries)
+            selections = (getattr(backend, "notes", None) or {}).get("geometry_provider_selection")
+            if isinstance(selections, dict):
+                scene.notes["geometry_provider_selection"] = copy.deepcopy(selections)
+                write_json(staging / "raw" / "scene_raw.json", _raw_scene_payload(scene, cfg, staging / "source"))
 
         stage = "verify_sources"
         _capture_note(activity, "verify_sources")

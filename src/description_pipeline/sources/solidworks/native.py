@@ -54,6 +54,7 @@ from ...geometry.native_u import (
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_binary64_unit_vector,
+    native_binary64_sqrt,
     native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
@@ -7665,39 +7666,6 @@ class SolidWorksBackend(CadBackend):
                     for index in range(3)
                 )
 
-            def rounded_vector(vector):
-                # Closed binary64 rounding cells are used only to avoid
-                # declaring last-rounding ambiguity a native contradiction.
-                # They never admit a non-exact line into this provider.
-                cells = []
-                for value in vector:
-                    exact = Fraction(value)
-                    previous = math.nextafter(value, -math.inf)
-                    following = math.nextafter(value, math.inf)
-                    lower = Fraction(previous) if math.isfinite(previous) else exact - Fraction(math.ulp(value))
-                    upper = Fraction(following) if math.isfinite(following) else exact + Fraction(math.ulp(value))
-                    cells.append(((exact + lower) / 2, (exact + upper) / 2))
-                return tuple(cells)
-
-            def rounded_offset(first, second):
-                return tuple(
-                    (right[0] - left[1], right[1] - left[0])
-                    for left, right in zip(rounded_vector(first), rounded_vector(second), strict=True)
-                )
-
-            def rounding_may_explain_cross(first, second):
-                def product(left, right):
-                    endpoints = [a * b for a in left for b in right]
-                    return min(endpoints), max(endpoints)
-
-                for axis in range(3):
-                    one, two = (axis + 1) % 3, (axis + 2) % 3
-                    positive = product(first[one], second[two])
-                    negative = product(first[two], second[one])
-                    if positive[0] - negative[1] > 0 or positive[1] - negative[0] < 0:
-                        return False
-                return True
-
             def line_relation(
                 edge_line,
                 coedge_line,
@@ -7735,39 +7703,20 @@ class SolidWorksBackend(CadBackend):
                     or root_offset_cross != (0, 0, 0)
                     or any(value != (0, 0, 0) for value in trim_cross)
                 ):
-                    ambiguous = (
-                        (
-                            coedge_direction is None
-                            or rounding_may_explain_cross(
-                                rounded_vector(edge_direction), rounded_vector(coedge_direction)
-                            )
-                        )
-                        and (
-                            coedge_direction is None
-                            or rounding_may_explain_cross(
-                                rounded_vector(edge_direction), rounded_offset(edge_line[:3], coedge_line[:3])
-                            )
-                        )
-                        and all(
-                            rounding_may_explain_cross(
-                                rounded_vector(edge_direction), rounded_offset(edge_line[:3], point)
-                            )
-                            for point in trim_points
-                        )
-                    )
-                    if ambiguous:
-                        raise PlanarBrepNotApplicable("native line facts are outside the exact-line provider domain")
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "the edge, coedge, and trim points do not describe one native line",
-                        {
-                            **base,
-                            "coedge_index": coedge_index,
-                            "edge_line_params": edge_line,
-                            "coedge_line_params": coedge_line,
-                            "trim_points_m": [list(point) for point in trim_points],
-                        },
-                    )
+                    normal_squared = sum(Fraction(value)**2 for value in edge_direction)
+                    evidence["line_domain_predicate"] = {
+                        "rule": "native-planar-exact-line-domain-v1",
+                        "coedge_index": coedge_index,
+                        "direction_cross": [str(value) for value in direction_cross],
+                        "root_offset_cross": [str(value) for value in root_offset_cross],
+                        "trim_cross": [[str(value) for value in cross] for cross in trim_cross],
+                        "trim_line_residual_upper_bound_m": [
+                            native_binary64_sqrt(sum(value**2 for value in cross) / normal_squared, upward=True)
+                            for cross in trim_cross
+                        ],
+                        "classification": "outside_exact_provider_domain",
+                    }
+                    raise PlanarBrepNotApplicable("native line facts are outside the exact-line provider domain")
                 if coedge_direction is None:
                     return "not_observed"
                 return "same" if dot > 0.0 else "opposite"
@@ -7954,6 +7903,36 @@ class SolidWorksBackend(CadBackend):
             if coedge_count != edge_count or edge_count != len(edge_rows):
                 return provider_miss('edge_coedge_inventory_outside_provider_domain')
 
+            edge_line_types = {}
+            evidence["edge_type_facts"] = []
+            for edge_row in edge_rows:
+                evidence["current_edge_fact"] = {
+                    "edge_index": edge_row["index"],
+                    "native_edge_reference_sha256": edge_row["reference"]["raw_sha256"],
+                    "curve_type": edge_row["curve"]["curve_type"],
+                }
+                is_line = call(
+                    "ICurve.IsLine",
+                    lambda value=edge_curves[edge_row["index"]]: _method(value, "IsLine"),
+                    edge_index=edge_row["index"],
+                )
+                evidence["current_edge_fact"]["edge_is_line"] = is_line
+                if type(is_line) is not bool:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "ICurve.IsLine did not return a boolean",
+                        {**base, "edge_index": edge_row["index"]},
+                    )
+                edge_line_types[edge_row["index"]] = is_line
+                evidence["edge_type_facts"].append({
+                    "edge_index": edge_row["index"],
+                    "native_edge_reference_sha256": edge_row["reference"]["raw_sha256"],
+                    "curve_type": edge_row["curve"]["curve_type"],
+                    "is_line": is_line,
+                })
+            if not all(edge_line_types.values()):
+                return provider_miss("native_boundary_contains_non_line_edges")
+
             edge_by_pointer = {}
             for edge_row in edge_rows:
                 try:
@@ -8025,19 +8004,7 @@ class SolidWorksBackend(CadBackend):
                     "native_edge_reference_sha256": edge_row["reference"]["raw_sha256"],
                     "face_senses": copy.deepcopy(edge_row["face_senses"]),
                 }
-                is_line = call(
-                    "ICurve.IsLine",
-                    lambda value=edge_curve: _method(value, "IsLine"),
-                    edge_index=edge_row["index"],
-                )
-                if type(is_line) is not bool:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "ICurve.IsLine did not return a boolean",
-                        {**base, "edge_index": edge_row["index"]},
-                    )
-                if is_line is not True:
-                    return provider_miss('edge_curve_is_not_a_line')
+                is_line = edge_line_types[edge_row["index"]]
                 edge_line_params = line_params(
                     edge_curve,
                     api="ICurve.LineParams",
@@ -8102,12 +8069,6 @@ class SolidWorksBackend(CadBackend):
                 end_point = tuple(float(value) for value in curve_params[3:6])
                 start_parameter = float(curve_params[6])
                 end_parameter = float(curve_params[7])
-                line_orientation = line_relation(
-                    edge_line_params,
-                    coedge_line_params,
-                    (start_point, end_point),
-                    coedge_index=coedge_index,
-                )
                 evidence["current_edge_fact"].update(
                     {
                         "coedge_curve_present": coedge_curve is not None,
@@ -8115,7 +8076,6 @@ class SolidWorksBackend(CadBackend):
                         "end_point_m": list(end_point),
                         "start_parameter": start_parameter,
                         "end_parameter": end_parameter,
-                        "line_orientation": line_orientation,
                     }
                 )
                 if not native_u_in_closed_interval(
@@ -8136,6 +8096,13 @@ class SolidWorksBackend(CadBackend):
                             "edge_index": edge_row["index"],
                         },
                     )
+                line_orientation = line_relation(
+                    edge_line_params,
+                    coedge_line_params,
+                    (start_point, end_point),
+                    coedge_index=coedge_index,
+                )
+                evidence["current_edge_fact"]["line_orientation"] = line_orientation
                 same_direction = call(
                     "ICoEdge.GetSense",
                     lambda value=current: _method(value, "GetSense"),
@@ -8231,6 +8198,18 @@ class SolidWorksBackend(CadBackend):
                         }
                     )
                     evidence["current_evaluation"]["evidence"] = copy.deepcopy(evaluations[-1])
+                evidence["current_edge_fact"]["evaluations"] = copy.deepcopy(evaluations)
+                # Validate every observed direction before any domain miss.
+                # Evaluate2 and GetCurveParams share the coedge direction;
+                # increasing or decreasing parameter order does not change it.
+                exact_segment = point_offset(start_point, end_point)
+                for row in evaluations:
+                    if sum(exact_segment[axis] * Fraction(row["tangent"][axis]) for axis in range(3)) <= 0:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "the coedge evaluation tangent reverses its boundary line",
+                            {**base, "coedge_index": coedge_index, "endpoint": row["endpoint"]},
+                        )
                 endpoint = edge_row["endpoints"]
                 if (
                     endpoint["start"]["point_m"] is None
@@ -8243,6 +8222,12 @@ class SolidWorksBackend(CadBackend):
                         "a straight polygon edge has no complete vertex identity",
                         {**base, "edge_index": edge_row["index"]},
                     )
+                if endpoint["start"]["reference"]["typed_sha256"] == endpoint["end"]["reference"]["typed_sha256"]:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "coedge orientation disagrees with its native vertex order",
+                        {**base, "coedge_index": coedge_index},
+                    )
                 # IEdge endpoint labels carry no natural direction. Bind the
                 # native coedge order to its unordered vertex set by exact,
                 # unique point equality, never by distance ranking or GetSense.
@@ -8252,19 +8237,7 @@ class SolidWorksBackend(CadBackend):
                     if tuple(first["point_m"]) == start_point and tuple(second["point_m"]) == end_point
                 ]
                 if len(exact_orders) != 1:
-                    if any(
-                        native_point_error(start_point, first["point_m"])
-                        <= native_point_roundtrip_tolerance(start_point, first["point_m"])
-                        and native_point_error(end_point, second["point_m"])
-                        <= native_point_roundtrip_tolerance(end_point, second["point_m"])
-                        for first, second in orders
-                    ):
-                        return provider_miss('vertex_pairing_is_not_unique_and_exact')
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "coedge trim endpoints contradict the unordered native vertex set",
-                        {**base, "edge_index": edge_row["index"]},
-                    )
+                    return provider_miss("vertex_pairing_is_not_unique_and_exact")
                 start_expected, end_expected = exact_orders[0]
                 start_reference = start_expected["reference"]["typed_sha256"]
                 end_reference = end_expected["reference"]["typed_sha256"]
@@ -8294,29 +8267,18 @@ class SolidWorksBackend(CadBackend):
                         "coedge orientation disagrees with its native vertex order",
                         {**base, "coedge_index": coedge_index},
                     )
-                # ICoEdge.Evaluate2's tangent follows the coedge, and the
-                # GetCurveParams start/end points use that same coedge order.
-                # Numeric trim-parameter order can therefore be increasing or
-                # decreasing without changing this direction check.
-                exact_segment = point_offset(start_point, end_point)
                 for row in evaluations:
-                    if sum(exact_segment[axis] * Fraction(row["tangent"][axis]) for axis in range(3)) <= 0:
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "the coedge evaluation tangent reverses its boundary line",
-                            {**base, "coedge_index": coedge_index},
-                        )
                     if exact_cross(exact_segment, row["tangent"]) == (0, 0, 0):
                         continue
-                    if rounding_may_explain_cross(
-                        rounded_offset(start_point, end_point), rounded_vector(row["tangent"])
-                    ):
-                        return provider_miss('tangent_rounding_outside_exact_line_domain')
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "the coedge evaluation tangent contradicts its boundary line",
-                        {**base, "coedge_index": coedge_index},
-                    )
+                    evidence["tangent_domain_predicate"] = {
+                        "rule": "native-planar-exact-tangent-domain-v1",
+                        "coedge_index": coedge_index,
+                        "tangent": list(row["tangent"]),
+                        "segment": [str(value) for value in exact_segment],
+                        "cross": [str(value) for value in exact_cross(exact_segment, row["tangent"])],
+                        "classification": "outside_exact_provider_domain",
+                    }
+                    return provider_miss("tangent_is_outside_exact_line_provider_domain")
                 coedge_rows.append(
                     {
                         "coedge_index": coedge_index,
@@ -8760,6 +8722,16 @@ class SolidWorksBackend(CadBackend):
         planar_brep = planar_brep_candidate()
         if planar_brep is not None:
             return planar_brep
+
+        selection = copy.deepcopy(planar_selection_evidence)
+        if not (selection.get("surface") or {}).get("is_plane"):
+            selection = {key: value for key, value in selection.items() if key in {
+                "provider", "body_type", "body_index", "body_name", "body_reference_sha256",
+                "native_body_reference_sha256", "face_count", "selection_result", "miss_reason", "surface",
+            }}
+        self.notes.setdefault("geometry_provider_selection", {}).setdefault(component, {})[
+            f"{body_type}/{body_index}"
+        ] = selection
 
         tessellation_request = None
 
