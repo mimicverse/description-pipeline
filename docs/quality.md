@@ -91,6 +91,8 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 
 对同一次冻结 CAD、配置和实例，每个 body 由事前原生几何事实选择唯一采集 provider，最终汇入同一 triangle stream、face span 和 STL writer。ITessellation provider 的原生顶点、facet、fin 与边关系共同约束其交付网格；三角形必须由对应 facet 的有向顶点环生成。限定平面 BRep provider 则从原生 plane、完整有向边界与 trim 事实派生网格，不能伪造 ITessellation facet／fin／cofin 身份。两类事实以明确标签分别验证，再共同核对实例归属、完整覆盖、实际 STL 字节、来源 warning 与朝向；不得建立第二工程模型或复制 scene transform 权威。binary32 序列化、坐标转换及派生值保留原值、规则和 warning，由 Linux 从原始事实及实际交付字节独立复算。显示缓存的三角形数量不构成几何保证，也不拼接两套 tessellation；最终 `50 µm` 表面比较及其他必需验收保持。
 
+IEdge 的 GetStartVertex／GetEndVertex 标签不提供可预测的天然方向，原始标签、vertex 身份和读数继续保全。平面 provider 采用 `native-coedge-unordered-exact-vertex-pair-v1`：方向来自原生 coedge trim；仅当该有向端点与同一 edge 的无序原生 vertex 集合具有唯一精确配对时绑定身份，consumer 按 typed reference 与原始点独立复核。仅舍入界内兼容、无唯一精确配对时属于严格 provider 域外；不得按距离排名或把 GetSense 当作 IEdge 返回标签顺序。该身份关联属于派生规则，沿既有 triangulation 来源 warning 展示。事前 provider 未命中的原因和同次已读事实仅附后续原生失败诊断，不新增成功权威、不补读 CAD，也不遮盖 ITessellation 首因。
+
 `IFace2.GetArea` 按[官方 API 语义](https://help.solidworks.com/2019/english/api/sldworksapi/SOLIDWORKS.Interop.sldworks~SOLIDWORKS.Interop.sldworks.IFace2~GetArea.html)返回近似面积观察值，不承诺与独立边界公式逐位相等。保留其原始值、API 和具体 face 身份，读取失败、非法类型、非有限值或非正值仍拒绝；不得覆盖为重算面积。平面域的几何面积及完整覆盖由冻结 plane／line／trim、精确闭合边界和独立三角形覆盖证明建立，派生面积保留规则与来源 warning。原生近似面积与派生面积分别展示，差值仅作可追溯诊断，不按差值放行几何、不另造面积容差，也不以跨算法逐位相等作为准入条件；同一原始观察在重复记录间仍须精确绑定。
 
 原生曲线端点与 `Evaluate2` 的一致性采用版本化 `native-curve-endpoint-float32-operation-v4`：对参数序端点 `c`、同一 U 的求值点 `v` 和曲线另一端点 `o`，允许界 `v4(c,v,o)` 由 `pair(c,v) + pair(c,o)` 组成，其中 `pair` 是两个有限 XYZ 点逐坐标 binary32 邻接界之和的最大值。必须独立要求 `L∞(c,v) <= v4(c,v,o)`；不得用 tessellation 投影点 `p` 替换 `c`，也不得把 `Evaluate2`-到-`p` 的诊断误差当作该门。producer 与独立 parser 使用同一规则；该界不放宽 U 域、持久引用、拓扑端点、fin/cofin 或同 U 证据，也不允许把任何端点跳过验证。

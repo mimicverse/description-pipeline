@@ -19,6 +19,7 @@ from ..geometry.native_u import (
     native_binary64_unit_vector,
 )
 from ..io import PipelineError, confined
+from ..geometry.native_planar_brep import NATIVE_PLANAR_COEDGE_VERTEX_RULE
 from ..schemas import (
     NATIVE_FACETLESS_EVIDENCE_API,
     NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
@@ -234,6 +235,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                     {
                         "rule_version": planar_body["triangulation"]["rule_version"],
                         "native_face_area_api": "IFace2.GetArea",
+                        "vertex_identity_rule": NATIVE_PLANAR_COEDGE_VERTEX_RULE,
                         "native_face_area_approx_m2": planar_body["face_area_m2"],
                         "derived_boundary_area_m2": planar_body["triangulation"]["boundary_area_m2"],
                         "native_minus_derived_area_m2": float(

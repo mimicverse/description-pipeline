@@ -74,6 +74,7 @@ from ...geometry.native_fin_topology import (
 from ...geometry.native_planar_brep import (
     NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
     NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
+    NATIVE_PLANAR_COEDGE_VERTEX_RULE,
     NATIVE_PLANAR_BREP_PROVIDER,
     NATIVE_PLANAR_BREP_SCHEMA,
     PlanarBrepEvidenceError,
@@ -6850,6 +6851,16 @@ class SolidWorksBackend(CadBackend):
         owner_scope = dict(scope_context or {})
         body_scope = dict(source_scope or {})
         witness_cache = None
+        planar_selection_evidence = {}
+
+        def planar_selection_diagnostic():
+            if planar_selection_evidence.get("selection_result") != "not_applicable":
+                return {}
+            try:
+                facts = copy.deepcopy(planar_selection_evidence)
+            except Exception as error:  # noqa: BLE001 - diagnostics must not hide the native first cause
+                facts = {"selection_result": "not_applicable", "facts_unavailable": str(error)[:300]}
+            return {"planar_provider_selection": facts}
 
         def get_witness_rows():
             nonlocal witness_cache
@@ -6881,7 +6892,7 @@ class SolidWorksBackend(CadBackend):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
                     "the body tessellation graph could not be captured",
-                    {**base, **where, "api": api, "error": str(error)[:300]},
+                    {**base, **where, **planar_selection_diagnostic(), "api": api, "error": str(error)[:300]},
                 ) from error
 
         def native_id_array(
@@ -7616,6 +7627,10 @@ class SolidWorksBackend(CadBackend):
             edge_row["face_senses"] = face_senses
 
         def planar_brep_candidate_impl(evidence):
+            def provider_miss(reason):
+                evidence.update(selection_result="not_applicable", miss_reason=reason)
+                return None
+
             def line_params(curve, *, api, **where):
                 value = call(
                     api,
@@ -7808,7 +7823,7 @@ class SolidWorksBackend(CadBackend):
                 }
             )
             if body_type != 1 or len(face_rows) != 1:
-                return None
+                return provider_miss('body_is_not_a_single_face_sheet')
             mapped_edge_witnesses = {}
             face_row = face_rows[0]
             face = face_row["object"]
@@ -7838,7 +7853,8 @@ class SolidWorksBackend(CadBackend):
                     {**base, "face_index": face_row["index"]},
                 )
             if is_plane is not True:
-                return None
+                evidence["surface"] = {"is_plane": False}
+                return provider_miss("native_surface_is_not_a_plane")
             plane_params = call(
                 "ISurface.PlaneParams",
                 lambda: _member(surface, "PlaneParams"),
@@ -7871,7 +7887,7 @@ class SolidWorksBackend(CadBackend):
                 )
             evidence["loop_count"] = loop_count if type(loop_count) is int else repr(loop_count)[:60]
             if loop_count != 1:
-                return None
+                return provider_miss('loop_inventory_is_not_single')
             loops = call(
                 "IFace2.GetLoops",
                 lambda: _method(face, "GetLoops"),
@@ -7898,7 +7914,7 @@ class SolidWorksBackend(CadBackend):
                 )
             evidence["outer_loop"] = is_outer if type(is_outer) is bool else repr(is_outer)[:60]
             if is_outer is not True:
-                return None
+                return provider_miss('single_loop_is_not_outer')
             edge_count = call(
                 "ILoop2.GetEdgeCount",
                 lambda: _method(loop, "GetEdgeCount"),
@@ -7934,9 +7950,9 @@ class SolidWorksBackend(CadBackend):
                     },
                 )
             if edge_count < 3:
-                return None
+                return provider_miss('fewer_than_three_boundary_edges')
             if coedge_count != edge_count or edge_count != len(edge_rows):
-                return None
+                return provider_miss('edge_coedge_inventory_outside_provider_domain')
 
             edge_by_pointer = {}
             for edge_row in edge_rows:
@@ -8021,7 +8037,7 @@ class SolidWorksBackend(CadBackend):
                         {**base, "edge_index": edge_row["index"]},
                     )
                 if is_line is not True:
-                    return None
+                    return provider_miss('edge_curve_is_not_a_line')
                 edge_line_params = line_params(
                     edge_curve,
                     api="ICurve.LineParams",
@@ -8057,7 +8073,7 @@ class SolidWorksBackend(CadBackend):
                             },
                         )
                     if coedge_curve_is_line is False:
-                        return None
+                        return provider_miss('transient_coedge_curve_is_not_a_line')
                     evidence["current_edge_fact"]["coedge_curve_is_line"] = coedge_curve_is_line
                     coedge_line_params = line_params(
                         coedge_curve,
@@ -8216,21 +8232,40 @@ class SolidWorksBackend(CadBackend):
                     )
                     evidence["current_evaluation"]["evidence"] = copy.deepcopy(evaluations[-1])
                 endpoint = edge_row["endpoints"]
-                start_role = "start" if same_direction else "end"
-                end_role = "end" if same_direction else "start"
-                start_expected = endpoint[start_role]
-                end_expected = endpoint[end_role]
                 if (
-                    start_expected["point_m"] is None
-                    or start_expected["reference"] is None
-                    or end_expected["point_m"] is None
-                    or end_expected["reference"] is None
+                    endpoint["start"]["point_m"] is None
+                    or endpoint["start"]["reference"] is None
+                    or endpoint["end"]["point_m"] is None
+                    or endpoint["end"]["reference"] is None
                 ):
                     raise CadError(
                         "cad_native_tessellation_unreadable",
                         "a straight polygon edge has no complete vertex identity",
                         {**base, "edge_index": edge_row["index"]},
                     )
+                # IEdge endpoint labels carry no natural direction. Bind the
+                # native coedge order to its unordered vertex set by exact,
+                # unique point equality, never by distance ranking or GetSense.
+                orders = [(endpoint["start"], endpoint["end"]), (endpoint["end"], endpoint["start"])]
+                exact_orders = [
+                    (first, second) for first, second in orders
+                    if tuple(first["point_m"]) == start_point and tuple(second["point_m"]) == end_point
+                ]
+                if len(exact_orders) != 1:
+                    if any(
+                        native_point_error(start_point, first["point_m"])
+                        <= native_point_roundtrip_tolerance(start_point, first["point_m"])
+                        and native_point_error(end_point, second["point_m"])
+                        <= native_point_roundtrip_tolerance(end_point, second["point_m"])
+                        for first, second in orders
+                    ):
+                        return provider_miss('vertex_pairing_is_not_unique_and_exact')
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "coedge trim endpoints contradict the unordered native vertex set",
+                        {**base, "edge_index": edge_row["index"]},
+                    )
+                start_expected, end_expected = exact_orders[0]
                 start_reference = start_expected["reference"]["typed_sha256"]
                 end_reference = end_expected["reference"]["typed_sha256"]
                 start_tolerance = native_point_roundtrip_tolerance(
@@ -8276,7 +8311,7 @@ class SolidWorksBackend(CadBackend):
                     if rounding_may_explain_cross(
                         rounded_offset(start_point, end_point), rounded_vector(row["tangent"])
                     ):
-                        return None
+                        return provider_miss('tangent_rounding_outside_exact_line_domain')
                     raise CadError(
                         "cad_native_tessellation_unreadable",
                         "the coedge evaluation tangent contradicts its boundary line",
@@ -8293,6 +8328,7 @@ class SolidWorksBackend(CadBackend):
                         "coedge_line_params": coedge_line_params,
                         "line_orientation": line_orientation,
                         "same_direction_as_edge": same_direction,
+                        "vertex_identity_rule": NATIVE_PLANAR_COEDGE_VERTEX_RULE,
                         "tangent_direction_rule": (NATIVE_PLANAR_COEDGE_DIRECTION_RULE),
                         "start_parameter": start_parameter,
                         "end_parameter": end_parameter,
@@ -8374,7 +8410,7 @@ class SolidWorksBackend(CadBackend):
                 if row["end_point_m"] != next_row["start_point_m"]:
                     # Selecting either rounded endpoint would add a closure
                     # displacement excluded by this exact polygon provider.
-                    return None
+                    return provider_miss('raw_coedge_loop_is_not_exactly_closed')
             boundary_points = [tuple(row["start_point_m"]) for row in coedge_rows]
             boundary_references = [row["start_vertex_reference_sha256"] for row in coedge_rows]
             if len(set(boundary_references)) != len(boundary_references):
@@ -8386,8 +8422,10 @@ class SolidWorksBackend(CadBackend):
             vertex_rows = []
             for vertex_index, (coedge_row, reference) in enumerate(zip(coedge_rows, boundary_references, strict=True)):
                 edge_row = edge_rows[coedge_row["edge_index"]]
-                endpoint_role = "start" if coedge_row["same_direction_as_edge"] else "end"
-                endpoint = edge_row["endpoints"][endpoint_role]
+                endpoint = next(
+                    value for value in edge_row["endpoints"].values()
+                    if value["reference"]["typed_sha256"] == coedge_row["start_vertex_reference_sha256"]
+                )
                 typed_sha256 = endpoint["reference"]["typed_sha256"]
                 vertex_rows.append(
                     {
@@ -8427,8 +8465,8 @@ class SolidWorksBackend(CadBackend):
                     boundary_points,
                     source_displacements=source_displacements,
                 )
-            except PlanarBrepNotApplicable:
-                return None
+            except PlanarBrepNotApplicable as error:
+                return provider_miss(error.reason)
             except PlanarBrepEvidenceError as error:
                 raise CadError(
                     "cad_native_tessellation_unreadable",
@@ -8698,10 +8736,11 @@ class SolidWorksBackend(CadBackend):
             }
 
         def planar_brep_candidate():
-            evidence = {}
+            evidence = planar_selection_evidence
             try:
                 return planar_brep_candidate_impl(evidence)
-            except PlanarBrepNotApplicable:
+            except PlanarBrepNotApplicable as error:
+                evidence.update(selection_result="not_applicable", miss_reason=error.reason)
                 return None
             except CadError as error:
                 detail = error.detail if isinstance(error.detail, dict) else {"native_detail": error.detail}
@@ -8784,7 +8823,8 @@ class SolidWorksBackend(CadBackend):
             raise CadError(
                 "cad_native_tessellation_unreadable",
                 "ITessellation.Tessellate did not return a boolean",
-                {**base, "api": "ITessellation.Tessellate", "returned": repr(tessellate_result)[:60]},
+                {**base, **planar_selection_diagnostic(), "api": "ITessellation.Tessellate",
+                 "returned": repr(tessellate_result)[:60]},
             )
         if tessellate_result is False:
             native_totals = {}
@@ -8850,6 +8890,7 @@ class SolidWorksBackend(CadBackend):
                 {
                     **base,
                     "api": "ITessellation.Tessellate",
+                    **planar_selection_diagnostic(),
                     "tessellate_result": False,
                     "tessellation_request": copy.deepcopy(tessellation_request),
                     "tessellation_properties": copy.deepcopy(

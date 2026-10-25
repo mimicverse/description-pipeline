@@ -18,6 +18,7 @@ NATIVE_PLANAR_BREP_SCHEMA = "solidworks-to-urdf.native-planar-brep/v1"
 NATIVE_PLANAR_BREP_PROVIDER = "native-planar-brep-v1"
 NATIVE_PLANAR_CONVEX_FAN_RULE = "native-planar-convex-fan-v1"
 NATIVE_PLANAR_COEDGE_DIRECTION_RULE = "native-coedge-collinear-evaluate-tangent-v2"
+NATIVE_PLANAR_COEDGE_VERTEX_RULE = "native-coedge-unordered-exact-vertex-pair-v1"
 NATIVE_PLANAR_COEDGE_EVALUATION_RULE = "native-coedge-evaluate-float32-operation-v1"
 
 

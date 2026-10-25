@@ -23,6 +23,7 @@ from .native_fin_topology import (
 from .native_planar_brep import (
     NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
     NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
+    NATIVE_PLANAR_COEDGE_VERTEX_RULE,
     NATIVE_PLANAR_BREP_PROVIDER,
     NATIVE_PLANAR_CONVEX_FAN_RULE,
     NATIVE_PLANAR_BREP_SCHEMA,
@@ -1879,6 +1880,7 @@ def _parse_planar_brep_evidence(
         "coedge_line_params",
         "line_orientation",
         "same_direction_as_edge",
+        "vertex_identity_rule",
         "tangent_direction_rule",
         "start_parameter",
         "end_parameter",
@@ -2143,8 +2145,22 @@ def _parse_planar_brep_evidence(
                 and raw_curve_params[3:6] == coedge["end_point_m"],
                 component + f": native planar BRep curve parameters differ for coedge {coedge_index}",
             )
-            expected_edge_point = edge["start_point_m"] if coedge["same_direction_as_edge"] else edge["end_point_m"]
-            expected_edge_end = edge["end_point_m"] if coedge["same_direction_as_edge"] else edge["start_point_m"]
+            endpoint_by_reference = {
+                edge["start_vertex_reference_sha256"]: edge["start_point_m"],
+                edge["end_vertex_reference_sha256"]: edge["end_point_m"],
+            }
+            _require(
+                len(endpoint_by_reference) == 2
+                and {coedge["start_vertex_reference_sha256"], coedge["end_vertex_reference_sha256"]}
+                == set(endpoint_by_reference),
+                component + f": native planar BRep coedge {coedge_index} does not bind its unordered native vertex set",
+            )
+            _require(
+                coedge["vertex_identity_rule"] == NATIVE_PLANAR_COEDGE_VERTEX_RULE,
+                component + f": native planar BRep coedge {coedge_index} vertex identity rule is unsupported",
+            )
+            expected_edge_point = endpoint_by_reference[coedge["start_vertex_reference_sha256"]]
+            expected_edge_end = endpoint_by_reference[coedge["end_vertex_reference_sha256"]]
             start_tolerance = native_point_roundtrip_tolerance(
                 coedge["start_point_m"],
                 expected_edge_point,
@@ -2154,16 +2170,8 @@ def _parse_planar_brep_evidence(
                 expected_edge_end,
             )
             _require(
-                native_point_error(
-                    coedge["start_point_m"],
-                    expected_edge_point,
-                )
-                <= start_tolerance
-                and native_point_error(
-                    coedge["end_point_m"],
-                    expected_edge_end,
-                )
-                <= end_tolerance,
+                coedge["start_point_m"] == expected_edge_point
+                and coedge["end_point_m"] == expected_edge_end,
                 component + f": native planar BRep coedge {coedge_index} contradicts edge direction",
             )
             for endpoint, trim_point, vertex_point, vertex_tolerance in (
@@ -2190,6 +2198,7 @@ def _parse_planar_brep_evidence(
                 )
                 _require(
                     _finite_point(vertex_point)
+                    and vertex_point == (expected_edge_point if endpoint == "start" else expected_edge_end)
                     and coedge[f"{endpoint}_vertex_point_error_m"] == computed_error
                     and coedge[f"{endpoint}_vertex_point_tolerance_m"] == computed_tolerance
                     and computed_tolerance == vertex_tolerance
