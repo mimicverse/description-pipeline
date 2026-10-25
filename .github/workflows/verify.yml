@@ -454,7 +454,11 @@ jobs:
         if: always()
         run: |
           "$AIRFLOW_VENV/bin/python" -m unittest \
-            tests.v1.test_airflow_dag \
+            tests.v1.test_airflow_application_adapter \
+            tests.v1.test_airflow_stage_operator \
+            tests.v1.test_airflow_effect_trigger \
+            tests.v1.test_runtime_dag \
+            tests.v1.test_pipeline_application \
             tests.v1.test_linked_run_ownership \
             tests.v1.test_portal \
             tests.v1.test_run_metadata
