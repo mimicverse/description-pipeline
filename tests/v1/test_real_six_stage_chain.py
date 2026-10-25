@@ -203,6 +203,13 @@ class RealSixStageChainTests(unittest.TestCase):
         cls.server_root.cleanup()
 
     def setUp(self) -> None:
+        appearance_gate = patch(
+            "description_pipeline.sources.solidworks.appearance."
+            "require_deliverable_appearance",
+            return_value=None,
+        )
+        appearance_gate.start()
+        self.addCleanup(appearance_gate.stop)
         self.schema = "chain_" + uuid.uuid4().hex
         schema_sql = PLATFORM_SCHEMA.read_text(encoding="utf-8").replace(
             ':"platform_schema"',

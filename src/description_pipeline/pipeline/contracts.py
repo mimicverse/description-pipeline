@@ -187,13 +187,23 @@ def _require_stage(value: object, code: str, where: str) -> StageId:
     return value  # type: ignore[return-value]
 
 
+def _json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
 def _freeze_mapping(value: Mapping[str, Any], code: str, where: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ProtocolError(code, {"where": where})
     source = dict(value)
     # Canonical encoding is both the JSON-safety check and the digest identity.
+    # Existing immutable contracts contain MappingProxyType values; their JSON
+    # view is valid input when a StageFailure detail is promoted to an envelope.
     try:
-        canonical(source)
+        canonical(_json_value(source))
     except (TypeError, ValueError) as error:
         raise ProtocolError(code, {"where": where, "reason": str(error)}) from error
 
@@ -205,14 +215,6 @@ def _freeze_mapping(value: Mapping[str, Any], code: str, where: str) -> Mapping[
         return item
 
     return freeze(source)
-
-
-def _json_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {key: _json_value(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_json_value(item) for item in value]
-    return value
 
 
 @dataclass(frozen=True, slots=True)

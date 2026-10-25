@@ -97,7 +97,12 @@ def _mass_reading(mass: float, com: tuple[float, float, float], part_document: P
 
 
 class QualifiedFixtureBackend(AxisFixtureBackend):
-    """Prepared one-session fixture with hermetic native environment metadata."""
+    """Prepared one-session fixture with hermetic native environment metadata.
+
+    The backend emits the CAD evidence class required by native transfer, but
+    it has no native appearance facts. Tests that run past transfer must isolate
+    appearance qualification and must not claim a native appearance positive.
+    """
 
     name = "solidworks"
     evidence_class = "cad"
