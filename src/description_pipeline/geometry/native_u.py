@@ -121,6 +121,7 @@ NATIVE_EDGE_FIN_IDS_DERIVED = (
 )
 NATIVE_PLANAR_BREP_BOUNDARY = "cad_edge_fin_ids_not_applicable_for_planar_brep"
 NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED = "cad_planar_brep_unit_normal_derived"
+NATIVE_PLANAR_COEDGE_TANGENT_DERIVED = "cad_planar_coedge_tangent_derived"
 NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED = "cad_planar_brep_triangulation_derived"
 NATIVE_SCOPE_IDENTITY_WARNING_CODES = frozenset(
     {

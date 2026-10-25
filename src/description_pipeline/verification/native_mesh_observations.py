@@ -16,10 +16,11 @@ from ..geometry.native_u import (
     NATIVE_FACE_FACET_IDS_DERIVED,
     NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
     NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+    NATIVE_PLANAR_COEDGE_TANGENT_DERIVED,
     native_binary64_unit_vector,
 )
 from ..io import PipelineError, confined
-from ..geometry.native_planar_brep import NATIVE_PLANAR_COEDGE_VERTEX_RULE
+from ..geometry.native_planar_brep import NATIVE_PLANAR_COEDGE_DIRECTION_RULE, NATIVE_PLANAR_COEDGE_VERTEX_RULE
 from ..schemas import (
     NATIVE_FACETLESS_EVIDENCE_API,
     NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
@@ -274,6 +275,37 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                         },
                     }
                 )
+            edges_by_reference = {row["edge_reference_sha256"]: row for row in tessellation["native_edges"]}
+            for coedge in planar_body["loop"]["coedges"]:
+                edge = edges_by_reference[coedge["edge_reference_sha256"]]
+                same = edge["curve_sense"] is coedge["same_direction_as_edge"]
+                endpoint_names = ("start", "end") if same else ("end", "start")
+                warnings.append({
+                    "code": NATIVE_PLANAR_COEDGE_TANGENT_DERIVED,
+                    "blocking": False,
+                    "severity": "warning",
+                    "message": "Coedge endpoint tangents are derived from edge-native parameter derivatives "
+                    "and native senses.",
+                    "object": f"{object_id}:coedge:{coedge['coedge_index']}",
+                    "detail": {
+                        **common,
+                        "entity_kind": "coedge",
+                        "coedge_index": coedge["coedge_index"],
+                        "field": "endpoint_tangents",
+                        "rule_version": NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
+                        "edge_reference_sha256": coedge["edge_reference_sha256"],
+                        "source_api": "IEdge.Evaluate2",
+                        "curve_sense": edge["curve_sense"],
+                        "same_direction_as_edge": coedge["same_direction_as_edge"],
+                        "parameter_endpoints": list(endpoint_names),
+                        "tangent_sign": 1 if same else -1,
+                        "raw_derivatives": [edge["curve_endpoint_evaluations"][key]["payload"][3:6]
+                                            for key in endpoint_names],
+                        "endpoint_tangents": [[(1 if same else -1) * value
+                                               for value in edge["curve_endpoint_evaluations"][key]["payload"][3:6]]
+                                              for key in endpoint_names],
+                    },
+                })
         topology = summarize_native_topology(
             tessellation,
             spans,

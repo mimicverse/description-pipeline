@@ -37,6 +37,7 @@ from ...geometry.native_u import (
     NATIVE_PLANAR_BREP_BOUNDARY,
     NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
     NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+    NATIVE_PLANAR_COEDGE_TANGENT_DERIVED,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_SOURCE_SCOPE_RULE,
@@ -76,9 +77,6 @@ from ...geometry.native_fin_topology import (
 )
 from ...geometry.native_planar_brep import (
     NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
-    NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
-    NATIVE_PLANAR_COEDGE_INTERFACE_IID,
-    NATIVE_PLANAR_COEDGE_EVALUATE_DISPID,
     NATIVE_PLANAR_COEDGE_VERTEX_RULE,
     NATIVE_PLANAR_EDGE_VERTEX_RULE,
     NATIVE_PLANAR_BREP_PROVIDER,
@@ -139,7 +137,7 @@ IMATEENTITY2_IID = "{CE7FE69D-BCFA-441F-A37D-E740546458A4}"
 IBODY2_IID = "{3A075BFD-9962-4431-8321-7AF4903C55AD}"
 IFACE2_IID = "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}"
 IEDGE_IID = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
-ICOEDGE_IID = NATIVE_PLANAR_COEDGE_INTERFACE_IID
+ICOEDGE_IID = "{83A33D57-27C5-11CE-BFD4-00400513BB57}"
 ILOOP2_IID = "{9350CA6E-0ADB-485A-8941-9407DD7B3B8E}"
 IVERTEX_IID = "{83A33D63-27C5-11CE-BFD4-00400513BB57}"
 ISURFACE_IID = "{83A33D40-27C5-11CE-BFD4-00400513BB57}"
@@ -915,7 +913,7 @@ def _measured_component_state(component):
 
 
 def _hint_method(obj, name):
-    """Resolve a method once per dispatch and return its cached DISPID when known."""
+    """Resolve a method once per dispatch before late-bound invocation."""
     flag = getattr(obj, "_FlagAsMethod", None)
     if flag is not None:
         hints = vars(obj).setdefault("_description_method_hints_", set())
@@ -924,9 +922,6 @@ def _hint_method(obj, name):
             # Reuse successful metadata; initial resolution errors still block.
             flag(name)
             hints.add(name)
-    representation = getattr(obj, "_olerepr_", None)
-    descriptor = getattr(representation, "mapFuncs", {}).get(name)
-    return getattr(descriptor, "dispid", None)
 
 
 def _member(obj, name, *args):
@@ -8082,9 +8077,9 @@ class SolidWorksBackend(CadBackend):
                         "end_parameter": end_parameter,
                     }
                 )
-                # Coedge U belongs to GetCurveParams/Evaluate2, not to the
-                # edge-local ICurveParamData domain. Bind coverage through
-                # the native endpoint set and same-coedge evaluations below.
+                # Coedge U belongs only to GetCurveParams. Never pass it to
+                # IEdge.Evaluate2; bind the independent domains by native
+                # senses and the complete topological endpoint incidence.
                 if start_parameter == end_parameter and start_point != end_point:
                     raise CadError(
                         "cad_native_tessellation_unreadable",
@@ -8128,106 +8123,37 @@ class SolidWorksBackend(CadBackend):
                         "coedge and edge orientations disagree",
                         {**base, "coedge_index": coedge_index},
                     )
-                resolved_dispid = call(
-                    "ICoEdge.Evaluate2.GetIDsOfNames",
-                    lambda value=current: _hint_method(value, "Evaluate2"),
-                    coedge_index=coedge_index,
-                )
-                dispatch_binding = {
-                    "interface_iid": ICOEDGE_IID,
-                    "member": "Evaluate2",
-                    "resolved_dispid": resolved_dispid,
-                    "invoke_kind": "METHOD",
-                }
-                evidence["current_edge_fact"]["dispatch_binding"] = dispatch_binding
-                if (type(resolved_dispid) is not int
-                        or resolved_dispid != NATIVE_PLANAR_COEDGE_EVALUATE_DISPID):
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "ICoEdge.Evaluate2 resolved to an unexpected dispatch member",
-                        {**base, "coedge_index": coedge_index, "dispatch_binding": dispatch_binding},
-                    )
-                evaluations = []
-                for endpoint, parameter, expected_point, opposite_point in (
-                    ("start", start_parameter, start_point, end_point),
-                    ("end", end_parameter, end_point, start_point),
-                ):
-                    evidence["current_evaluation"] = {
-                        "endpoint": endpoint,
-                        "parameter": parameter,
-                        "expected_point_m": list(expected_point),
-                        "opposite_point_m": list(opposite_point),
+                # IEdge.Evaluate2 is evaluated in its own UMin/UMax domain.
+                # Its derivative must first follow increasing edge U. Apply
+                # the curve/coedge sense correspondence exactly once below.
+                edge_evaluations = edge_row["curve_endpoint_evaluations"]
+                parameter_points = tuple(edge_evaluations[key]["payload"][:3] for key in ("start", "end"))
+                parameter_segment = point_offset(*parameter_points)
+                for key in ("start", "end"):
+                    derivative = edge_evaluations[key]["payload"][3:6]
+                    if sum(parameter_segment[axis] * Fraction(derivative[axis]) for axis in range(3)) <= 0:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "the edge derivative does not follow its native parameter direction",
+                            {**base, "coedge_index": coedge_index, "edge_index": edge_row["index"], "endpoint": key},
+                        )
+                same_parameter_direction = edge_row["curve"]["sense"] is same_direction
+                source_endpoints = ("start", "end") if same_parameter_direction else ("end", "start")
+                tangent_sign = 1 if same_parameter_direction else -1
+                directed_evaluations = [
+                    {
+                        "point_m": edge_evaluations[key]["payload"][:3],
+                        "tangent": [tangent_sign * value for value in edge_evaluations[key]["payload"][3:6]],
                     }
-                    raw_evaluation = call(
-                        "ICoEdge.Evaluate2",
-                        lambda value=current, u=parameter: _method(
-                            value,
-                            "Evaluate2",
-                            u,
-                            1,
-                        ),
-                        coedge_index=coedge_index,
-                        endpoint=endpoint,
-                    )
-                    if (
-                        not isinstance(raw_evaluation, (list, tuple))
-                        or len(raw_evaluation) != 6
-                        or any(type(value) not in (int, float) or not math.isfinite(value) for value in raw_evaluation)
-                    ):
-                        evidence["current_evaluation"]["raw_response"] = repr(raw_evaluation)[:1000]
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "ICoEdge.Evaluate2 did not return six finite values",
-                            {**base, "coedge_index": coedge_index},
-                        )
-                    evidence["current_evaluation"]["raw_response"] = [float(value) for value in raw_evaluation]
-                    evaluated_point = tuple(float(value) for value in raw_evaluation[:3])
-                    tangent = tuple(float(value) for value in raw_evaluation[3:])
-                    tolerance = native_curve_endpoint_operation_tolerance(
-                        evaluated_point,
-                        expected_point,
-                        opposite_point,
-                    )
-                    error_m = native_point_error(
-                        evaluated_point,
-                        expected_point,
-                    )
-                    if error_m > tolerance or math.hypot(*tangent) == 0.0:
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "a coedge trim endpoint is inconsistent with its evaluation",
-                            {
-                                **base,
-                                "coedge_index": coedge_index,
-                                "endpoint": endpoint,
-                                "point_error_m": error_m,
-                                "point_tolerance_m": tolerance,
-                            },
-                        )
-                    evaluations.append(
-                        {
-                            "endpoint": endpoint,
-                            "rule_version": NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
-                            "parameter": parameter,
-                            "raw_response": [float(value) for value in raw_evaluation],
-                            "point_m": list(evaluated_point),
-                            "tangent": list(tangent),
-                            "point_error_m": error_m,
-                            "point_tolerance_m": tolerance,
-                        }
-                    )
-                    evidence["current_evaluation"]["evidence"] = copy.deepcopy(evaluations[-1])
-                evidence["current_edge_fact"]["evaluations"] = copy.deepcopy(evaluations)
-                # Validate every observed direction before any domain miss.
-                # Evaluate2 and GetCurveParams share the coedge direction;
-                # increasing or decreasing parameter order does not change it.
+                    for key in source_endpoints
+                ]
                 exact_segment = point_offset(start_point, end_point)
-                for row in evaluations:
-                    if sum(exact_segment[axis] * Fraction(row["tangent"][axis]) for axis in range(3)) <= 0:
+                for endpoint, evaluation in zip(("start", "end"), directed_evaluations, strict=True):
+                    if sum(exact_segment[axis] * Fraction(evaluation["tangent"][axis]) for axis in range(3)) <= 0:
                         raise CadError(
                             "cad_native_tessellation_unreadable",
-                            "the coedge evaluation tangent reverses its boundary line",
-                            {**base, "coedge_index": coedge_index, "endpoint": row["endpoint"]},
+                            "the derived coedge tangent reverses its boundary line",
+                            {**base, "coedge_index": coedge_index, "endpoint": endpoint},
                         )
                 coedge_rows.append(
                     {
@@ -8248,8 +8174,6 @@ class SolidWorksBackend(CadBackend):
                         "start_point_m": list(start_point),
                         "end_point_m": list(end_point),
                         "curve_params_raw": [float(value) for value in curve_params],
-                        "dispatch_binding": dict(dispatch_binding),
-                        "evaluations": evaluations,
                         "coedge_curve_present": coedge_curve is not None,
                     }
                 )
@@ -8350,7 +8274,14 @@ class SolidWorksBackend(CadBackend):
                     row[f"{endpoint}_vertex_point_error_m"] = native_point_error(raw_point, target)
                     row[f"{endpoint}_vertex_point_tolerance_m"] = native_point_roundtrip_tolerance(raw_point, target)
                     source_displacements.append((raw_point, target))
-                    evaluation = row["evaluations"][endpoint_index]
+                    native_edge = edge_rows[row["edge_index"]]
+                    same = native_edge["curve"]["sense"] is row["same_direction_as_edge"]
+                    parameter_endpoint = ("start", "end")[endpoint_index if same else 1 - endpoint_index]
+                    payload = native_edge["curve_endpoint_evaluations"][parameter_endpoint]["payload"]
+                    evaluation = {
+                        "point_m": payload[:3],
+                        "tangent": [(1 if same else -1) * value for value in payload[3:6]],
+                    }
                     if sum(segment[axis] * Fraction(evaluation["tangent"][axis]) for axis in range(3)) <= 0:
                         raise CadError(
                             "cad_native_tessellation_unreadable",
@@ -8530,6 +8461,7 @@ class SolidWorksBackend(CadBackend):
                 "warnings": [
                     NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
                     NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+                    NATIVE_PLANAR_COEDGE_TANGENT_DERIVED,
                 ],
                 "surface": {
                     "is_plane": True,

@@ -24,9 +24,6 @@ from .native_fin_topology import (
 )
 from .native_planar_brep import (
     NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
-    NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
-    NATIVE_PLANAR_COEDGE_INTERFACE_IID,
-    NATIVE_PLANAR_COEDGE_EVALUATE_DISPID,
     NATIVE_PLANAR_COEDGE_VERTEX_RULE,
     NATIVE_PLANAR_EDGE_VERTEX_RULE,
     NATIVE_PLANAR_BREP_PROVIDER,
@@ -47,6 +44,7 @@ from .native_u import (
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
     NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+    NATIVE_PLANAR_COEDGE_TANGENT_DERIVED,
     NATIVE_IDENTITY_POLICY_RULE,
     NATIVE_PART_WITNESS_DERIVED,
     NATIVE_SCOPE_IDENTITY_RULE,
@@ -1913,19 +1911,7 @@ def _parse_planar_brep_evidence(
         "start_vertex_point_tolerance_m",
         "end_vertex_point_tolerance_m",
         "curve_params_raw",
-        "dispatch_binding",
-        "evaluations",
         "coedge_curve_present",
-    }
-    evaluation_required = {
-        "endpoint",
-        "rule_version",
-        "parameter",
-        "raw_response",
-        "point_m",
-        "tangent",
-        "point_error_m",
-        "point_tolerance_m",
     }
     boundary_required = {
         "vertex_index",
@@ -1978,6 +1964,7 @@ def _parse_planar_brep_evidence(
             == [
                 NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
                 NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+                NATIVE_PLANAR_COEDGE_TANGENT_DERIVED,
             ],
             component + f": native planar BRep body {body_key} is malformed",
         )
@@ -2085,17 +2072,6 @@ def _parse_planar_brep_evidence(
             )
             edge_reference = coedge["edge_reference_sha256"]
             edge = edge_by_reference.get(edge_reference)
-            binding = coedge["dispatch_binding"]
-            _require(
-                isinstance(binding, dict)
-                and set(binding) == {"interface_iid", "member", "resolved_dispid", "invoke_kind"}
-                and binding["interface_iid"] == NATIVE_PLANAR_COEDGE_INTERFACE_IID
-                and binding["member"] == "Evaluate2"
-                and type(binding["resolved_dispid"]) is int
-                and binding["resolved_dispid"] == NATIVE_PLANAR_COEDGE_EVALUATE_DISPID
-                and binding["invoke_kind"] == "METHOD",
-                component + f": native planar BRep coedge {coedge_index} dispatch binding is invalid",
-            )
             _require(
                 coedge["coedge_index"] == coedge_index
                 and _integer(coedge["coedge_index"])
@@ -2242,52 +2218,28 @@ def _parse_planar_brep_evidence(
                         for axis in range(3)
                     ),
                 )
-            evaluations = coedge["evaluations"]
-            _require(
-                isinstance(evaluations, list) and len(evaluations) == 2,
-                component + f": native planar BRep coedge {coedge_index} lacks endpoint evaluations",
-            )
-            for evaluation_index, (endpoint, expected_point) in enumerate(
-                (
-                    ("start", coedge["start_point_m"]),
-                    ("end", coedge["end_point_m"]),
-                )
-            ):
-                evaluation = evaluations[evaluation_index]
-                opposite_point = coedge["end_point_m"] if endpoint == "start" else coedge["start_point_m"]
+            # Independently reconstruct the directed view from edge-native
+            # UMin/UMax payloads. Coedge-local parameters never enter this API.
+            edge_evaluations = edge["curve_endpoint_evaluations"]
+            parameter_points = tuple(edge_evaluations[key]["payload"][:3] for key in ("start", "end"))
+            parameter_segment = _vector_difference(*map(_fraction_point, parameter_points))
+            for key in ("start", "end"):
+                derivative = _fraction_point(edge_evaluations[key]["payload"][3:6])
                 _require(
-                    isinstance(evaluation, dict)
-                    and set(evaluation) == evaluation_required
-                    and evaluation["endpoint"] == endpoint
-                    and evaluation["rule_version"] == NATIVE_PLANAR_COEDGE_EVALUATION_RULE
-                    and evaluation["parameter"] == coedge[f"{endpoint}_parameter"]
-                    and isinstance(evaluation["raw_response"], list)
-                    and len(evaluation["raw_response"]) == 6
-                    and all(_finite_number(value) for value in evaluation["raw_response"])
-                    and _finite_point(evaluation["point_m"])
-                    and _finite_point(evaluation["tangent"])
-                    and evaluation["raw_response"] == evaluation["point_m"] + evaluation["tangent"]
-                    and math.hypot(*evaluation["tangent"]) > 0.0,
-                    component + f": native planar BRep coedge {coedge_index} {endpoint} evaluation is inconsistent",
+                    sum(parameter_segment[axis] * derivative[axis] for axis in range(3)) > 0,
+                    component + f": native planar coedge {coedge_index} edge derivative "
+                    "contradicts its parameter direction",
                 )
-                computed_tolerance = native_curve_endpoint_operation_tolerance(
-                    expected_point,
-                    evaluation["point_m"],
-                    opposite_point,
-                )
-                computed_error = native_point_error(
-                    expected_point,
-                    evaluation["point_m"],
-                )
-                _require(
-                    _finite_number(evaluation["point_error_m"])
-                    and evaluation["point_error_m"] == computed_error
-                    and _finite_number(evaluation["point_tolerance_m"])
-                    and evaluation["point_tolerance_m"] == computed_tolerance
-                    and computed_error <= computed_tolerance,
-                    component
-                    + f": native planar BRep coedge {coedge_index} {endpoint} evaluation bound is not reproducible",
-                )
+            same_parameter_direction = edge["curve_sense"] is coedge["same_direction_as_edge"]
+            source_endpoints = ("start", "end") if same_parameter_direction else ("end", "start")
+            tangent_sign = 1 if same_parameter_direction else -1
+            evaluations = [
+                {
+                    "point_m": edge_evaluations[key]["payload"][:3],
+                    "tangent": [tangent_sign * value for value in edge_evaluations[key]["payload"][3:6]],
+                }
+                for key in source_endpoints
+            ]
             segment = _vector_difference(_fraction_point(expected_edge_point), _fraction_point(expected_edge_end))
             raw_segment = _vector_difference(*trim_points)
             _require(
