@@ -20,8 +20,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-ARCHIVE_SCHEMA = "solidworks-to-urdf.legacy-lifecycle-archive/v1"
-EVIDENCE_SCHEMA = "solidworks-to-urdf.legacy-lifecycle-evidence/v1"
+ARCHIVE_SCHEMA = "solidworks-to-urdf.legacy-lifecycle-archive/v3"
+EVIDENCE_SCHEMA = "solidworks-to-urdf.legacy-lifecycle-evidence/v3"
 LEGACY_RELATIONS = ("request", "run", "stage", "operation", "run_event")
 CANONICAL_TABLES = {
     "admission",
@@ -39,10 +39,30 @@ CANONICAL_TABLES = {
 SAFE_IDENTIFIER = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 SAFE_DATABASE = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+PG_DUMP_RESTRICT_LINE = re.compile(
+    rb"^\\restrict ([A-Za-z0-9]+)\r?\n?$"
+)
+PG_DUMP_UNRESTRICT_LINE = re.compile(
+    rb"^\\unrestrict ([A-Za-z0-9]+)\r?\n?$"
+)
 MEMBER_KEYS = {"bytes", "kind", "sha256"}
 RECEIPT_KEYS = {
     "archive_sha256",
     "cluster_system_identifier",
+    "database_collate",
+    "database_collation_actual_version_source",
+    "database_collation_actual_version",
+    "database_collation_binding",
+    "database_collation_binding_source",
+    "database_collation_version",
+    "database_collation_version_source",
+    "database_ctype",
+    "database_encoding",
+    "database_icu_locale",
+    "database_icu_rules",
+    "database_locale_metadata_version",
+    "database_locale_provider",
+    "database_locale_provider_source",
     "database_name",
     "database_oid",
     "evidence_sha256",
@@ -51,7 +71,26 @@ RECEIPT_KEYS = {
     "platform_schema",
     "platform_schema_oid",
     "schema_version",
+    "server_version_num",
 }
+DATABASE_LOCALE_IDENTITY_FIELDS = (
+    "database_encoding",
+    "database_locale_metadata_version",
+    "database_locale_provider",
+    "database_locale_provider_source",
+    "database_collate",
+    "database_ctype",
+    "database_icu_locale",
+    "database_icu_rules",
+    "database_collation_binding",
+    "database_collation_binding_source",
+    "database_collation_version",
+    "database_collation_version_source",
+    "database_collation_actual_version",
+    "database_collation_actual_version_source",
+    "server_version_num",
+)
+STABLE_C_LOCALES = {"C", "C.UTF-8", "C.utf8", "POSIX"}
 
 
 class ArchiveError(RuntimeError):
@@ -97,12 +136,14 @@ def run(
     command: list[str],
     *,
     input_bytes: bytes | None = None,
+    env: dict[str, str] | None = None,
 ) -> bytes:
     completed = subprocess.run(
         command,
         input=input_bytes,
         check=False,
         capture_output=True,
+        env={**os.environ, **(env or {})},
     )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
@@ -146,7 +187,7 @@ def psql(args, query: str) -> bytes:
     ):
         command.extend(("-c", setting))
     command.extend(("-c", query))
-    return run(command)
+    return run(command, env={"PGCLIENTENCODING": "UTF8"})
 
 
 def psql_json(args, query: str) -> Any:
@@ -160,6 +201,18 @@ def psql_json(args, query: str) -> Any:
 
 
 def current_identity(args) -> dict[str, Any]:
+    server_version_num = psql_json(
+        args,
+        "SELECT to_jsonb(current_setting('server_version_num'))",
+    )
+    if (
+        not isinstance(server_version_num, str)
+        or not server_version_num.isdigit()
+        or int(server_version_num) // 10000 not in {14, 16}
+    ):
+        raise ArchiveError(
+            "legacy cutover supports only PostgreSQL 14 and 16 database metadata"
+        )
     schema_literal = sql_literal(args.platform_schema)
     value = psql_json(
         args,
@@ -176,10 +229,15 @@ def current_identity(args) -> dict[str, Any]:
             'platform_schema_oid', (
                 SELECT oid::text FROM pg_namespace WHERE nspname = {schema_literal}
             ),
-            'server_version_num', current_setting('server_version_num')
+            'server_version_num', {sql_literal(server_version_num)}
         )
         """,
     )
+    major = int(server_version_num) // 10000
+    if major == 14:
+        value.update(postgres14_database_locale_identity(args))
+    else:
+        value.update(postgres16_database_locale_identity(args))
     admission_exists = psql_json(
         args,
         f"SELECT to_jsonb(to_regclass({sql_literal(args.platform_schema + '.admission')}) IS NOT NULL)",
@@ -197,7 +255,218 @@ def current_identity(args) -> dict[str, Any]:
         value["admission_state"] = "absent"
     if value.get("platform_schema_oid") is None:
         raise ArchiveError("the requested platform schema does not exist")
+    validate_database_locale_identity(value)
     return value
+
+
+def postgres14_database_locale_identity(args) -> dict[str, Any]:
+    database = psql_json(
+        args,
+        """
+        SELECT jsonb_build_object(
+            'database_encoding', pg_encoding_to_char(encoding),
+            'database_collate', datcollate,
+            'database_ctype', datctype
+        )
+        FROM pg_database
+        WHERE datname = current_database()
+        """,
+    )
+    collate = sql_literal(database["database_collate"])
+    ctype = sql_literal(database["database_ctype"])
+    candidates = psql_json(
+        args,
+        f"""
+        SELECT COALESCE(
+            jsonb_agg(
+                jsonb_build_object(
+                    'binding', c.collname,
+                    'version', c.collversion,
+                    'actual_version', pg_collation_actual_version(c.oid)
+                )
+                ORDER BY c.collname, c.oid
+            ),
+            '[]'::jsonb
+        )
+        FROM pg_collation AS c
+        WHERE c.collprovider = 'c'
+          AND c.collcollate = {collate}
+          AND c.collctype = {ctype}
+          AND COALESCE(c.collversion, '')
+              = COALESCE(pg_collation_actual_version(c.oid), '')
+        """,
+    )
+    if candidates:
+        binding = candidates[0]
+        binding_source = "exact_pg_collation_definition"
+        actual_version_source = "pg_collation_actual_version(pg_collation.oid)"
+    else:
+        if (
+            database["database_collate"] not in STABLE_C_LOCALES
+            or database["database_ctype"] not in STABLE_C_LOCALES
+        ):
+            raise ArchiveError(
+                "the PostgreSQL 14 database locale has no matching libc collation"
+            )
+        binding = psql_json(
+            args,
+            """
+            SELECT jsonb_build_object(
+                'binding', collname,
+                'version', collversion,
+                'actual_version', pg_collation_actual_version(oid)
+            )
+            FROM pg_collation
+            WHERE oid = 100
+            """,
+        )
+        binding_source = "pg14_default_catalog_collation"
+        actual_version_source = "pg_collation_actual_version(100)"
+    return {
+        **database,
+        "database_locale_metadata_version": "postgresql_14_libc",
+        "database_locale_provider": "libc",
+        "database_locale_provider_source": (
+            "inferred_from_postgresql_14_database_default_collation"
+        ),
+        "database_icu_locale": None,
+        "database_icu_rules": None,
+        "database_collation_binding": binding["binding"],
+        "database_collation_binding_source": binding_source,
+        "database_collation_version": binding["version"],
+        "database_collation_version_source": "pg_collation.collversion",
+        "database_collation_actual_version": binding["actual_version"],
+        "database_collation_actual_version_source": actual_version_source,
+    }
+
+
+def postgres16_database_locale_identity(args) -> dict[str, Any]:
+    return psql_json(
+        args,
+        """
+        SELECT jsonb_build_object(
+            'database_encoding', pg_encoding_to_char(encoding),
+            'database_locale_metadata_version', 'postgresql_16',
+            'database_locale_provider', CASE datlocprovider
+                WHEN 'c' THEN 'libc'
+                WHEN 'i' THEN 'icu'
+                ELSE datlocprovider::text
+            END,
+            'database_locale_provider_source', 'pg_database.datlocprovider',
+            'database_collate', datcollate,
+            'database_ctype', datctype,
+            'database_icu_locale', daticulocale,
+            'database_icu_rules', daticurules,
+            'database_collation_binding', 'default',
+            'database_collation_binding_source', 'pg_database_default_collation',
+            'database_collation_version', datcollversion,
+            'database_collation_version_source', 'pg_database.datcollversion',
+            'database_collation_actual_version',
+                pg_database_collation_actual_version(oid),
+            'database_collation_actual_version_source',
+                'pg_database_collation_actual_version(pg_database.oid)'
+        )
+        FROM pg_database
+        WHERE datname = current_database()
+        """,
+    )
+
+
+def validate_database_locale_identity(identity: dict[str, Any]) -> None:
+    required_strings = (
+        "database_encoding",
+        "database_locale_metadata_version",
+        "database_locale_provider",
+        "database_locale_provider_source",
+        "database_collation_binding",
+        "database_collation_binding_source",
+        "database_collation_version_source",
+        "database_collation_actual_version_source",
+        "server_version_num",
+    )
+    for key in required_strings:
+        if not isinstance(identity.get(key), str) or not identity[key]:
+            raise ArchiveError(f"the database locale field is invalid: {key}")
+    if not identity["server_version_num"].isdigit():
+        raise ArchiveError("the database locale server version is invalid")
+    major = int(identity["server_version_num"]) // 10000
+    if major not in {14, 16}:
+        raise ArchiveError(
+            "legacy cutover supports only PostgreSQL 14 and 16 database metadata"
+        )
+    expected_metadata_version = (
+        "postgresql_14_libc" if major == 14 else "postgresql_16"
+    )
+    if identity["database_locale_metadata_version"] != expected_metadata_version:
+        raise ArchiveError("the database locale metadata version is inconsistent")
+
+    provider = identity["database_locale_provider"]
+    if provider not in {"libc", "icu"}:
+        raise ArchiveError(f"the database locale provider is unsupported: {provider}")
+    if major == 14:
+        if (
+            provider != "libc"
+            or identity["database_locale_provider_source"]
+            != "inferred_from_postgresql_14_database_default_collation"
+        ):
+            raise ArchiveError("the PostgreSQL 14 database locale provider is invalid")
+        if identity["database_collation_binding_source"] not in {
+            "exact_pg_collation_definition",
+            "pg14_default_catalog_collation",
+        }:
+            raise ArchiveError("the PostgreSQL 14 collation binding is invalid")
+    elif (
+        identity["database_locale_provider_source"] != "pg_database.datlocprovider"
+        or identity["database_collation_binding"] != "default"
+        or identity["database_collation_binding_source"]
+        != "pg_database_default_collation"
+    ):
+        raise ArchiveError("the PostgreSQL 16 database locale binding is invalid")
+
+    optional_keys = (
+        "database_collate",
+        "database_ctype",
+        "database_icu_locale",
+        "database_icu_rules",
+        "database_collation_version",
+        "database_collation_actual_version",
+    )
+    for key in optional_keys:
+        value = identity.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ArchiveError(f"the database locale field is invalid: {key}")
+
+    if provider == "libc":
+        if not identity.get("database_collate") or not identity.get("database_ctype"):
+            raise ArchiveError("the libc database locale is incomplete")
+        if identity.get("database_icu_locale") is not None or identity.get(
+            "database_icu_rules"
+        ) is not None:
+            raise ArchiveError("the libc database locale has unexpected ICU fields")
+    else:
+        if not identity.get("database_icu_locale"):
+            raise ArchiveError("the ICU database locale is missing its locale")
+
+    recorded_version = identity.get("database_collation_version")
+    actual_version = identity.get("database_collation_actual_version")
+    if recorded_version != actual_version:
+        raise ArchiveError(
+            "the database collation version differs from the active collation"
+        )
+    stable_c_locale = (
+        provider == "libc"
+        and identity.get("database_collate") in STABLE_C_LOCALES
+        and identity.get("database_ctype") in STABLE_C_LOCALES
+    )
+    if (
+        major == 14
+        and identity["database_collation_binding_source"]
+        == "pg14_default_catalog_collation"
+        and not stable_c_locale
+    ):
+        raise ArchiveError("the PostgreSQL 14 default collation binding is not stable C")
+    if actual_version is None and not stable_c_locale:
+        raise ArchiveError("the database collation version is unavailable")
 
 
 def relation_rows(args, schema_name: str, name: str) -> list[str]:
@@ -207,7 +476,7 @@ def relation_rows(args, schema_name: str, name: str) -> list[str]:
         args,
         f"""
         SELECT COALESCE(
-            jsonb_agg(row_text ORDER BY row_text),
+            jsonb_agg(row_text COLLATE "C" ORDER BY row_text COLLATE "C"),
             '[]'::jsonb
         )
         FROM (
@@ -535,6 +804,10 @@ def _manifest(members: dict[str, tuple[str, bytes]], evidence: dict[str, Any]) -
     return {
         "schema_version": ARCHIVE_SCHEMA,
         "cluster_system_identifier": evidence["identity"]["cluster_system_identifier"],
+        **{
+            key: evidence["identity"][key]
+            for key in DATABASE_LOCALE_IDENTITY_FIELDS
+        },
         "database_name": evidence["identity"]["database_name"],
         "database_oid": evidence["identity"]["database_oid"],
         "platform_schema": evidence["identity"]["platform_schema"],
@@ -672,7 +945,8 @@ def _run_dump(args, dump_path: Path) -> None:
             f"--schema={args.airflow_schema}",
             "--compress=9",
             f"--file={dump_path}",
-        ]
+        ],
+        env={"PGCLIENTENCODING": "UTF8"},
     )
 
 
@@ -687,8 +961,72 @@ def _dump_schema(args) -> bytes:
             "--format=plain",
             f"--schema={args.platform_schema}",
             f"--schema={args.airflow_schema}",
-        ]
+        ],
+        env={"PGCLIENTENCODING": "UTF8"},
     )
+
+
+def canonical_schema_sql(value: bytes) -> bytes:
+    lines = value.splitlines(keepends=True)
+
+    def is_metadata_line(line: bytes) -> bool:
+        content = line.rstrip(b"\r\n")
+        return not content or content.startswith(b"--")
+
+    restrict_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if PG_DUMP_RESTRICT_LINE.fullmatch(line)
+        ),
+        None,
+    )
+    unrestrict_index = next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if PG_DUMP_UNRESTRICT_LINE.fullmatch(lines[index])
+        ),
+        None,
+    )
+    if restrict_index is None or unrestrict_index is None:
+        return value
+    if restrict_index >= unrestrict_index:
+        return value
+    if any(
+        not is_metadata_line(line)
+        for line in lines[:restrict_index]
+    ):
+        return value
+    if any(
+        not is_metadata_line(line)
+        for line in lines[unrestrict_index + 1 :]
+    ):
+        return value
+    restrict_match = PG_DUMP_RESTRICT_LINE.fullmatch(lines[restrict_index])
+    unrestrict_match = PG_DUMP_UNRESTRICT_LINE.fullmatch(lines[unrestrict_index])
+    if (
+        restrict_match is None
+        or unrestrict_match is None
+        or restrict_match.group(1) != unrestrict_match.group(1)
+        or not any(
+            line.rstrip(b"\r\n") == b"-- PostgreSQL database dump complete"
+            for line in lines[restrict_index + 1 : unrestrict_index]
+        )
+    ):
+        return value
+    normalized = list(lines)
+    normalized[restrict_index] = lines[restrict_index].replace(
+        restrict_match.group(1),
+        b"<token>",
+        1,
+    )
+    normalized[unrestrict_index] = lines[unrestrict_index].replace(
+        unrestrict_match.group(1),
+        b"<token>",
+        1,
+    )
+    return b"".join(normalized)
 
 
 def _restore_text(args, dump_path: Path, *options: str) -> bytes:
@@ -698,7 +1036,8 @@ def _restore_text(args, dump_path: Path, *options: str) -> bytes:
             "--file=-",
             *options,
             str(dump_path),
-        ]
+        ],
+        env={"PGCLIENTENCODING": "UTF8"},
     )
 
 
@@ -724,12 +1063,61 @@ def _first_difference(expected: Any, actual: Any, path: str = "$") -> str:
     return f"{path}: {expected!r} != {actual!r}"
 
 
+def database_locale_create_options(identity: dict[str, Any]) -> list[str]:
+    validate_database_locale_identity(identity)
+    provider = identity["database_locale_provider"]
+    major = int(identity["server_version_num"]) // 10000
+    options = ["--encoding", identity["database_encoding"]]
+    if major == 14:
+        options.extend(
+            [
+                "--lc-collate",
+                identity["database_collate"],
+                "--lc-ctype",
+                identity["database_ctype"],
+            ]
+        )
+        return options
+
+    options.extend(["--locale-provider", provider])
+    if provider == "libc":
+        options.extend(
+            [
+                "--lc-collate",
+                identity["database_collate"],
+                "--lc-ctype",
+                identity["database_ctype"],
+            ]
+        )
+    else:
+        options.extend(
+            [
+                "--icu-locale",
+                identity["database_icu_locale"],
+            ]
+        )
+        if identity["database_icu_rules"] is not None:
+            options.extend(
+                [
+                    "--icu-rules",
+                    identity["database_icu_rules"],
+                ]
+            )
+        if identity["database_collate"] is not None:
+            options.extend(["--lc-collate", identity["database_collate"]])
+        if identity["database_ctype"] is not None:
+            options.extend(["--lc-ctype", identity["database_ctype"]])
+    return options
+
+
 def _restore_full(
     args,
     dump_path: Path,
     schema_sql: bytes,
     evidence: dict[str, Any],
 ) -> None:
+    database_locale = evidence["identity"]
+    database_locale_options = database_locale_create_options(database_locale)
     socket_handle = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     socket_handle.bind(("127.0.0.1", 0))
     port = socket_handle.getsockname()[1]
@@ -740,17 +1128,21 @@ def _restore_full(
         sockets = root / "socket"
         sockets.mkdir()
         log = root / "postgres.log"
-        run(
-            [
-                args.initdb,
-                "-D",
-                str(data),
-                "--auth=trust",
-                "--encoding=UTF8",
-                "--no-locale",
-                "--username=restore_admin",
-            ]
-        )
+        try:
+            run(
+                [
+                    args.initdb,
+                    "-D",
+                    str(data),
+                    "--auth=trust",
+                    "--username=restore_admin",
+                    *database_locale_options,
+                ]
+            )
+        except ArchiveError as error:
+            raise ArchiveError(
+                "the source database locale cannot be used to initialize the restore cluster"
+            ) from error
         started = False
         try:
             run(
@@ -776,13 +1168,20 @@ def _restore_full(
                 "-U",
                 "restore_admin",
             ]
-            run(
-                [
-                    args.createdb,
-                    *connection,
-                    database,
-                ]
-            )
+            try:
+                run(
+                    [
+                        args.createdb,
+                        *connection,
+                        "--template=template0",
+                        *database_locale_options,
+                        database,
+                    ]
+                )
+            except ArchiveError as error:
+                raise ArchiveError(
+                    "the source database locale cannot be reproduced in the restore cluster"
+                ) from error
             source_roles = psql_json(
                 args,
                 """
@@ -831,6 +1230,16 @@ def _restore_full(
                 }
             )
             restored = live_evidence(restored_args)
+            locale_difference = [
+                key
+                for key in DATABASE_LOCALE_IDENTITY_FIELDS
+                if restored["identity"][key] != database_locale[key]
+            ]
+            if locale_difference:
+                raise ArchiveError(
+                    "the independently restored database locale differs: "
+                    + ", ".join(locale_difference)
+                )
             for field in (
                 "schema_catalog",
                 "functions",
@@ -846,7 +1255,9 @@ def _restore_full(
                         f"the independently restored archive differs in {field}: {difference}"
                     )
             restored_schema_sql = _dump_schema(restored_args)
-            if restored_schema_sql != schema_sql:
+            if canonical_schema_sql(restored_schema_sql) != canonical_schema_sql(
+                schema_sql
+            ):
                 raise ArchiveError(
                     "the independently restored archive differs in complete schema or ACL SQL"
                 )
@@ -898,6 +1309,7 @@ def _load_receipt(path: Path) -> dict[str, Any]:
     for key in ("cluster_system_identifier", "database_oid", "platform_schema_oid"):
         if not isinstance(value.get(key), str) or not value[key].isdigit():
             raise ArchiveError(f"the archive receipt field is invalid: {key}")
+    validate_database_locale_identity(value)
     return value
 
 
@@ -929,6 +1341,13 @@ def _verify_existing(args, receipt_path: Path, archive_path: Path, evidence: dic
         raise ArchiveError(
             "the archive receipt belongs to another cluster, database, or schema"
         )
+    if any(
+        receipt[key] != identity[key]
+        for key in DATABASE_LOCALE_IDENTITY_FIELDS
+    ):
+        raise ArchiveError(
+            "the archive receipt database locale differs from the live database"
+        )
     if sha256_file(archive_path) != receipt["archive_sha256"]:
         raise ArchiveError("the archive digest differs from its receipt")
     manifest, values = _read_archive(archive_path)
@@ -954,10 +1373,13 @@ def _verify_existing(args, receipt_path: Path, archive_path: Path, evidence: dic
             "database_oid",
             "platform_schema",
             "platform_schema_oid",
+            *DATABASE_LOCALE_IDENTITY_FIELDS,
         )
     ):
         raise ArchiveError("the archive manifest identity differs from its evidence")
-    if _dump_schema(args) != values["schema.sql"]:
+    if canonical_schema_sql(_dump_schema(args)) != canonical_schema_sql(
+        values["schema.sql"]
+    ):
         raise ArchiveError(
             "the live legacy schema or ACL SQL differs from the archived snapshot"
         )
@@ -1037,6 +1459,10 @@ def ensure(args) -> tuple[str, dict[str, Any] | None]:
     receipt = {
         "archive_sha256": sha256_file(archive_path),
         "cluster_system_identifier": final["identity"]["cluster_system_identifier"],
+        **{
+            key: final["identity"][key]
+            for key in DATABASE_LOCALE_IDENTITY_FIELDS
+        },
         "database_name": final["identity"]["database_name"],
         "database_oid": final["identity"]["database_oid"],
         "evidence_sha256": sha256_bytes(evidence_bytes),

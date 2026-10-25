@@ -129,12 +129,14 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
     def _connect(self):
         return psycopg2.connect(
             self.server.get_uri(),
+            dbname=self.database,
             options=f"-c search_path={self.schema},public",
         )
 
     def _role_connect(self, role: str):
         return psycopg2.connect(
             self.server.get_uri(),
+            dbname=self.database,
             user=role,
             options=f"-c search_path={self.schema},public",
         )
@@ -1293,6 +1295,47 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
             [("run",)],
         )
 
+    def test_archive_receipt_without_database_locale_is_rejected(self) -> None:
+        self._create_legacy_lifecycle_schema()
+        self._insert_legacy_unresolved(
+            request_id="request-missing-locale",
+            run_id="run-missing-locale",
+            operation_id="operation-missing-locale",
+        )
+        directory = Path(
+            tempfile.mkdtemp(
+                prefix="missing-locale-receipt-",
+                dir=self.server_root.name,
+            )
+        )
+        receipt = directory / "receipt.json"
+        prepared = self._prepare_archive(receipt)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        receipt_record = json.loads(receipt.read_text(encoding="utf-8"))
+        tampered_locale = {
+            **receipt_record,
+            "database_collate": "POSIX",
+        }
+        receipt.write_text(
+            json.dumps(tampered_locale, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        locale_rejected = self._prepare_archive(receipt)
+        self.assertNotEqual(locale_rejected.returncode, 0)
+        self.assertIn("database locale differs", locale_rejected.stderr)
+
+        receipt_record.pop("database_encoding")
+        receipt.write_text(
+            json.dumps(receipt_record, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+
+        rejected = self._prepare_archive(receipt)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("invalid shape", rejected.stderr)
+
     def test_archive_receipt_cannot_authorize_another_database_schema(self) -> None:
         self._create_legacy_lifecycle_schema()
         self._insert_legacy_unresolved(
@@ -1524,6 +1567,366 @@ class CanonicalSchemaCutoverPostgresTests(unittest.TestCase):
                 (f"{self.schema}.run",),
             ),
             [("run",)],
+        )
+
+    def test_non_c_database_locale_round_trip_and_c_order_rows(self) -> None:
+        original_database = self.database
+        original_schema = self.schema
+        original_airflow_schema = self.airflow_schema
+        source_database = "locale_source_" + uuid.uuid4().hex
+        self.schema = "locale_platform_" + uuid.uuid4().hex
+        self.airflow_schema = "locale_airflow_" + uuid.uuid4().hex
+        admin = psycopg2.connect(self.server.get_uri())
+        admin.autocommit = True
+        try:
+            with admin.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        f'CREATE DATABASE "{source_database}" TEMPLATE template0 '
+                        "ENCODING 'UTF8' LC_COLLATE 'en_US.utf8' "
+                        "LC_CTYPE 'en_US.utf8'"
+                    )
+                except psycopg2.errors.InvalidParameterValue:
+                    self.skipTest("the en_US.utf8 locale is unavailable")
+
+            self.database = source_database
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    _sql(
+                        "bootstrap.sql",
+                        platform_schema=self.schema,
+                        airflow_schema=self.airflow_schema,
+                        database=self.database,
+                    )
+                )
+            self._create_legacy_lifecycle_schema()
+            self._insert_legacy_unresolved(
+                request_id="request-locale",
+                run_id="run-locale",
+                operation_id="operation-locale",
+            )
+            with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    f'CREATE TABLE "{self.schema}".sort_probe '
+                    "(value text PRIMARY KEY)"
+                )
+                cursor.execute(
+                    f'INSERT INTO "{self.schema}".sort_probe (value) '
+                    "VALUES ('only-row')"
+                )
+
+            source_locale = self._query(
+                """
+                SELECT
+                    pg_encoding_to_char(encoding),
+                    datlocprovider::text,
+                    datcollate,
+                    datctype,
+                    daticulocale,
+                    daticurules,
+                    datcollversion,
+                    pg_database_collation_actual_version(oid)
+                FROM pg_database
+                WHERE datname = current_database()
+                """
+            )[0]
+            default_order = self._query(
+                """
+                SELECT jsonb_agg(value ORDER BY value)
+                FROM (
+                    VALUES ('B'), ('a'), ('ä'), ('z')
+                ) AS probe(value)
+                """
+            )[0][0]
+            self.assertNotEqual(default_order, ["B", "a", "z", "ä"])
+            self.assertEqual(source_locale[1], "c")
+            self.assertEqual(source_locale[6], source_locale[7])
+            self.assertIsNotNone(source_locale[7])
+
+            directory = Path(
+                tempfile.mkdtemp(
+                    prefix="locale-receipt-",
+                    dir=self.server_root.name,
+                )
+            )
+            single_receipt = directory / "single.json"
+            single = self._prepare_archive(single_receipt)
+            self.assertEqual(single.returncode, 0, single.stderr)
+            receipt_record = json.loads(single_receipt.read_text(encoding="utf-8"))
+            self.assertEqual(receipt_record["database_encoding"], source_locale[0])
+            self.assertEqual(receipt_record["database_locale_provider"], "libc")
+            self.assertEqual(receipt_record["database_collate"], source_locale[2])
+            self.assertEqual(receipt_record["database_ctype"], source_locale[3])
+            self.assertEqual(
+                receipt_record["database_icu_locale"],
+                source_locale[4],
+            )
+            self.assertEqual(
+                receipt_record["database_icu_rules"],
+                source_locale[5],
+            )
+            self.assertEqual(
+                receipt_record["database_collation_version"],
+                source_locale[6],
+            )
+            self.assertEqual(
+                receipt_record["database_collation_actual_version"],
+                source_locale[7],
+            )
+
+            with self._role_connect("platform_migrate") as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    f'INSERT INTO "{self.schema}".sort_probe (value) '
+                    "VALUES ('B'), ('a'), ('ä'), ('z')"
+                )
+            multi_receipt = directory / "multi.json"
+            multi = self._prepare_archive(multi_receipt)
+            self.assertEqual(multi.returncode, 0, multi.stderr)
+            with tarfile.open(
+                str(multi_receipt) + ".archive.tar.gz",
+                "r:gz",
+            ) as bundle:
+                manifest = json.loads(bundle.extractfile("manifest.json").read())
+                evidence = json.loads(bundle.extractfile("evidence.json").read())
+            multi_record = json.loads(multi_receipt.read_text(encoding="utf-8"))
+            for key in (
+                "database_encoding",
+                "database_locale_provider",
+                "database_collate",
+                "database_ctype",
+                "database_icu_locale",
+                "database_icu_rules",
+                "database_collation_version",
+                "database_collation_actual_version",
+                "server_version_num",
+            ):
+                self.assertEqual(manifest[key], multi_record[key])
+                self.assertEqual(evidence["identity"][key], multi_record[key])
+            self.assertEqual(
+                evidence["relations"]["sort_probe"]["rows"],
+                [
+                    '{"value": "B"}',
+                    '{"value": "a"}',
+                    '{"value": "only-row"}',
+                    '{"value": "z"}',
+                    '{"value": "ä"}',
+                ],
+            )
+        finally:
+            self.database = original_database
+            self.schema = original_schema
+            self.airflow_schema = original_airflow_schema
+            try:
+                with admin.cursor() as cursor:
+                    cursor.execute(f'DROP DATABASE IF EXISTS "{source_database}" WITH (FORCE)')
+            finally:
+                admin.close()
+
+    def test_non_utf8_database_encoding_round_trip(self) -> None:
+        original_database = self.database
+        original_schema = self.schema
+        original_airflow_schema = self.airflow_schema
+        source_database = "encoding_source_" + uuid.uuid4().hex
+        self.schema = "encoding_platform_" + uuid.uuid4().hex
+        self.airflow_schema = "encoding_airflow_" + uuid.uuid4().hex
+        admin = psycopg2.connect(self.server.get_uri())
+        admin.autocommit = True
+        try:
+            with admin.cursor() as cursor:
+                cursor.execute(
+                    f'CREATE DATABASE "{source_database}" TEMPLATE template0 '
+                    "ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C'"
+                )
+            self.database = source_database
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    _sql(
+                        "bootstrap.sql",
+                        platform_schema=self.schema,
+                        airflow_schema=self.airflow_schema,
+                        database=self.database,
+                    )
+                )
+            self._create_legacy_lifecycle_schema()
+            self._insert_legacy_unresolved(
+                request_id="request-encoding",
+                run_id="run-encoding",
+                operation_id="operation-encoding",
+            )
+
+            directory = Path(
+                tempfile.mkdtemp(
+                    prefix="encoding-receipt-",
+                    dir=self.server_root.name,
+                )
+            )
+            receipt = directory / "receipt.json"
+            prepared = self._prepare_archive(receipt)
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            receipt_record = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(receipt_record["database_encoding"], "LATIN1")
+            self.assertEqual(receipt_record["database_locale_provider"], "libc")
+            self.assertEqual(receipt_record["database_collate"], "C")
+            self.assertEqual(receipt_record["database_ctype"], "C")
+        finally:
+            self.database = original_database
+            self.schema = original_schema
+            self.airflow_schema = original_airflow_schema
+            try:
+                with admin.cursor() as cursor:
+                    cursor.execute(f'DROP DATABASE IF EXISTS "{source_database}" WITH (FORCE)')
+            finally:
+                admin.close()
+
+    def test_unknown_or_unreproducible_database_locale_is_rejected(self) -> None:
+        module = _legacy_cutover_module()
+        identity = {
+            "database_encoding": "UTF8",
+            "database_locale_metadata_version": "postgresql_16",
+            "database_locale_provider": "libc",
+            "database_locale_provider_source": "pg_database.datlocprovider",
+            "database_collate": "C.UTF-8",
+            "database_ctype": "C.UTF-8",
+            "database_icu_locale": None,
+            "database_icu_rules": None,
+            "database_collation_binding": "default",
+            "database_collation_binding_source": "pg_database_default_collation",
+            "database_collation_version": None,
+            "database_collation_version_source": "pg_database.datcollversion",
+            "database_collation_actual_version": None,
+            "database_collation_actual_version_source": (
+                "pg_database_collation_actual_version(pg_database.oid)"
+            ),
+            "server_version_num": "160002",
+        }
+        module.validate_database_locale_identity(identity)
+
+        unknown_provider = {**identity, "database_locale_provider": "builtin"}
+        with self.assertRaises(module.ArchiveError):
+            module.validate_database_locale_identity(unknown_provider)
+
+        unknown_version = {**identity, "server_version_num": "170000"}
+        with self.assertRaises(module.ArchiveError):
+            module.validate_database_locale_identity(unknown_version)
+
+        missing_icu_locale = {
+            **identity,
+            "database_locale_provider": "icu",
+            "database_collate": None,
+            "database_ctype": None,
+            "database_icu_locale": None,
+            "database_collation_version": "153",
+            "database_collation_actual_version": "153",
+        }
+        with self.assertRaises(module.ArchiveError):
+            module.validate_database_locale_identity(missing_icu_locale)
+
+        stale_version = {
+            **identity,
+            "database_collate": "en_US.utf8",
+            "database_ctype": "en_US.utf8",
+            "database_collation_version": "2.42",
+            "database_collation_actual_version": "2.43",
+        }
+        with self.assertRaises(module.ArchiveError):
+            module.validate_database_locale_identity(stale_version)
+
+        unavailable_version = {
+            **identity,
+            "database_collate": "en_US.utf8",
+            "database_ctype": "en_US.utf8",
+        }
+        with self.assertRaises(module.ArchiveError):
+            module.validate_database_locale_identity(unavailable_version)
+
+        icu_identity = {
+            **identity,
+            "database_locale_provider": "icu",
+            "database_collate": None,
+            "database_ctype": None,
+            "database_icu_locale": "en-US",
+            "database_icu_rules": "und-x-private",
+            "database_collation_version": "153",
+            "database_collation_actual_version": "153",
+        }
+        options = module.database_locale_create_options(icu_identity)
+        self.assertIn("--locale-provider", options)
+        self.assertIn("icu", options)
+        self.assertIn("--icu-locale", options)
+        self.assertIn("en-US", options)
+        self.assertIn("--icu-rules", options)
+        self.assertIn("und-x-private", options)
+        self.assertNotIn("--no-locale", options)
+
+        postgres14_identity = {
+            **identity,
+            "database_locale_metadata_version": "postgresql_14_libc",
+            "database_locale_provider_source": (
+                "inferred_from_postgresql_14_database_default_collation"
+            ),
+            "database_collate": "en_US.utf8",
+            "database_ctype": "en_US.utf8",
+            "database_collation_binding": "en_US",
+            "database_collation_binding_source": "exact_pg_collation_definition",
+            "database_collation_version": "2.43",
+            "database_collation_version_source": "pg_collation.collversion",
+            "database_collation_actual_version": "2.43",
+            "database_collation_actual_version_source": (
+                "pg_collation_actual_version(pg_collation.oid)"
+            ),
+            "server_version_num": "140024",
+        }
+        options = module.database_locale_create_options(postgres14_identity)
+        self.assertIn("UTF8", options)
+        self.assertIn("--lc-collate", options)
+        self.assertIn("en_US.utf8", options)
+        self.assertNotIn("--locale-provider", options)
+
+    def test_schema_comparison_normalizes_only_pg_dump_restrict_tokens(self) -> None:
+        module = _legacy_cutover_module()
+        first = (
+            b"--\n-- PostgreSQL database dump\n--\n\n"
+            b"\\restrict firstToken\n"
+            b"CREATE TABLE probe (value text DEFAULT 'platform.value');\n"
+            b"COMMENT ON TABLE probe IS 'platform.value';\n"
+            b"CREATE FUNCTION probe_fn() RETURNS void AS $fn$\n"
+            b"\\restrict literalRestrict\n"
+            b"\\unrestrict literalUnrestrict\n"
+            b"$fn$ LANGUAGE sql;\n"
+            b"-- PostgreSQL database dump complete\n--\n\n"
+            b"\\unrestrict firstToken\n"
+        )
+        second = (
+            b"--\n-- PostgreSQL database dump\n--\n\n"
+            b"\\restrict secondToken\n"
+            b"CREATE TABLE probe (value text DEFAULT 'platform.value');\n"
+            b"COMMENT ON TABLE probe IS 'platform.value';\n"
+            b"CREATE FUNCTION probe_fn() RETURNS void AS $fn$\n"
+            b"\\restrict literalRestrict\n"
+            b"\\unrestrict literalUnrestrict\n"
+            b"$fn$ LANGUAGE sql;\n"
+            b"-- PostgreSQL database dump complete\n--\n\n"
+            b"\\unrestrict secondToken\n"
+        )
+        first_normalized = module.canonical_schema_sql(first)
+        self.assertEqual(first_normalized, module.canonical_schema_sql(second))
+        self.assertIn(b"\\restrict literalRestrict", first_normalized)
+        self.assertIn(b"\\unrestrict literalUnrestrict", first_normalized)
+
+        changed_literal = first.replace(b"'platform.value'", b"'value'", 1)
+        self.assertNotEqual(
+            first_normalized,
+            module.canonical_schema_sql(changed_literal),
+        )
+        pseudo_only = (
+            b"CREATE FUNCTION probe_fn() RETURNS void AS $fn$\n"
+            b"\\restrict notMetadata\n"
+            b"\\unrestrict notMetadata\n"
+            b"$fn$ LANGUAGE sql;\n"
+        )
+        self.assertEqual(
+            module.canonical_schema_sql(pseudo_only),
+            pseudo_only,
         )
 
     def test_archived_airflow_rows_change_blocks_cutover(self) -> None:
