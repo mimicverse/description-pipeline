@@ -364,6 +364,11 @@ def native_tessellation_fixture(
 
     spans = copy.deepcopy(list(face_spans))
     input_edges = copy.deepcopy(list(native_edges))
+    normalized_no_facets = copy.deepcopy(list(no_facets_faces))
+    for row in normalized_no_facets:
+        row.setdefault("source_rule", NATIVE_ID_ARRAY_SOURCE_FLAT)
+        row.setdefault("warnings", [])
+        row.setdefault("derived_empty_edges", [])
     for span in spans:
         span.setdefault(
             "native_body_reference_sha256",
@@ -505,6 +510,7 @@ def native_tessellation_fixture(
                     "facet_count": len(facet_ids),
                     "facet_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
                     "raw_facet_ids": list(facet_ids),
+                    "warnings": [],
                     "face_identity_sha256": span[
                         "face_reference_sha256"
                     ],
@@ -811,6 +817,7 @@ def native_tessellation_fixture(
                 "fin_ids": sorted(edge_fin_ids),
                 "fin_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
                 "raw_fin_ids": sorted(edge_fin_ids),
+                "warnings": [],
                 "u_min": u_min,
                 "u_max": u_max,
                 "curve_start_point_m": list(curve_start_point),
@@ -973,7 +980,7 @@ def native_tessellation_fixture(
         "faces": len(spans),
         "face_spans": spans,
         "native_edges": edge_rows,
-        "no_facets_faces": copy.deepcopy(list(no_facets_faces)),
+        "no_facets_faces": normalized_no_facets,
         "itessellation": {
             "interface_iid": ITESSELLATION_IID,
             "u_rule_version": NATIVE_U_IDENTITY_RULE,

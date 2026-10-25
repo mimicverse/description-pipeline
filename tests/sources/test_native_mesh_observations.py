@@ -20,10 +20,15 @@ from description_pipeline.geometry.native_fin_topology import (
     NativeFinRelationError,
     validate_native_edge_fin_relations,
 )
-from description_pipeline.geometry.native_u import native_curve_domain_transform
+from description_pipeline.geometry.native_u import (
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
+    native_curve_domain_transform,
+)
 from description_pipeline.io import PipelineError
 from description_pipeline.schemas import (
     NATIVE_FACETLESS_EVIDENCE_API,
+    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from description_pipeline.sources.snapshot import write_manifest
@@ -354,6 +359,40 @@ class NativeMeshObservationTests(unittest.TestCase):
                 self.row["tessellation"]["no_facets_faces"][0][key] = value
                 with self.assertRaises(PipelineError):
                     self.verify()
+
+    def test_untessellated_source_claims_bind_the_actual_native_records(self):
+        valid = copy.deepcopy(self.row)
+        edge = valid["tessellation"]["native_edges"][0]
+
+        forged_face_warning = copy.deepcopy(valid)
+        forged_face_warning["tessellation"]["no_facets_faces"][0][
+            "warnings"
+        ] = [NATIVE_FACE_FACET_IDS_DERIVED]
+        self.row = forged_face_warning
+        with self.assertRaisesRegex(
+            PipelineError,
+            "untessellated face source evidence is inconsistent",
+        ):
+            self.verify()
+
+        forged_edge_reference = copy.deepcopy(valid)
+        forged_edge_reference["tessellation"]["no_facets_faces"][0][
+            "derived_empty_edges"
+        ] = [
+            {
+                "edge_reference_sha256": edge["edge_reference_sha256"],
+                "source_rule": (
+                    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                ),
+                "warnings": [NATIVE_EDGE_FIN_IDS_DERIVED],
+            }
+        ]
+        self.row = forged_edge_reference
+        with self.assertRaisesRegex(
+            PipelineError,
+            "derived empty-edge source evidence is inconsistent",
+        ):
+            self.verify()
 
     def test_missing_native_accounting_fails(self):
         self.row.pop("tessellation")

@@ -40,6 +40,8 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_COLLAPSED_U_FIN_RULE,
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
     NATIVE_SCOPE_MAPPING_METHOD,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
     NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
@@ -64,9 +66,11 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
 )
 from description_pipeline.io import PipelineError  # noqa: E402
 from description_pipeline.schemas import (  # noqa: E402
+    NATIVE_FACETLESS_EVIDENCE_API,
     NATIVE_ID_ARRAY_SOURCE_FLAT,
     NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
     NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+    NATIVE_MESH_CAPTURE_API,
     NATIVE_TESSELLATION_SCHEMA,
 )
 import description_pipeline.sources.solidworks.native as native_module  # noqa: E402
@@ -2603,6 +2607,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
                 ),
                 "raw_facet_ids": None,
+                "warnings": [NATIVE_FACE_FACET_IDS_DERIVED],
             }
         )
         native_edge = evidence["native_edges"][0]
@@ -2612,6 +2617,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
                 ),
                 "raw_fin_ids": None,
+                "warnings": [NATIVE_EDGE_FIN_IDS_DERIVED],
             }
         )
 
@@ -2625,6 +2631,29 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertEqual(len(spans), 1)
         self.assertEqual(spans[0]["triangle_count"], 0)
+
+        for target, warnings in (
+            ("face", []),
+            ("face", ["invented"]),
+            ("edge", []),
+            ("edge", ["invented"]),
+        ):
+            with self.subTest(target=target, warnings=warnings):
+                broken = copy.deepcopy(evidence)
+                record = (
+                    broken["itessellation"]["bodies"][0]["faces"][0]
+                    if target == "face"
+                    else broken["native_edges"][0]
+                )
+                record["warnings"] = warnings
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation(
+                        "sheet",
+                        broken,
+                        {"solid": 0, "sheet": 1},
+                        0,
+                        [],
+                    )
 
     def test_face_facet_read_requires_a_flat_native_integer_array(self):
         for value in ([[]], [()], [None]):
@@ -2653,6 +2682,34 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         with self.assertRaisesRegex(CadError, "repeats a facet ID"):
             self.capture(body, extension, body_type=1)
+
+    def test_native_facet_fin_read_requires_a_flat_integer_array(self):
+        for value in (None, 100, [()], [None], [[100]]):
+            with self.subTest(value=value):
+                body, _face_10, _face_20, _edge, tessellation, extension = (
+                    self.fixture()
+                )
+                tessellation.GetFacetFins = lambda _facet, value=value: value
+
+                with self.assertRaisesRegex(
+                    CadError,
+                    "GetFacetFins returned an invalid fin ID array",
+                ):
+                    self.capture(body, extension)
+
+    def test_native_facet_fin_read_requires_three_unique_ids(self):
+        for value in ([], [100], [100, 100, 100]):
+            with self.subTest(value=value):
+                body, _face_10, _face_20, _edge, tessellation, extension = (
+                    self.fixture()
+                )
+                tessellation.GetFacetFins = lambda _facet, value=value: value
+
+                with self.assertRaisesRegex(
+                    CadError,
+                    "does not expose three distinct fin IDs",
+                ):
+                    self.capture(body, extension)
 
     def test_native_array_failures_preserve_same_pass_context(self):
         for api in ("GetFaceFacets", "GetEdgeFins"):
@@ -2684,6 +2741,20 @@ class NativeFinCaptureTests(unittest.TestCase):
                     },
                 )
                 self.assertIs(detail["tessellate_result"], True)
+
+    def test_capture_api_claims_match_the_native_closure_inputs(self):
+        self.assertEqual(
+            NATIVE_FACETLESS_EVIDENCE_API,
+            "IBody2.GetTessellation/ITessellation.Tessellate/"
+            "GetFaceFacets/GetFacetFins/GetEdgeFins/"
+            "GetFacetCount/GetFinCount",
+        )
+        self.assertEqual(
+            NATIVE_MESH_CAPTURE_API,
+            "IBody2.GetTessellation/ITessellation.Tessellate/"
+            "GetFaceFacets/GetFacetFins/GetEdgeFins/GetFinVertices/"
+            "GetVertexPoint/GetFacetCount/GetFinCount/GetVertexCount",
+        )
 
     def test_edge_fin_ids_are_canonicalized_after_native_read(self):
         body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()

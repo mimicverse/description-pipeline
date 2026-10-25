@@ -918,6 +918,9 @@ class ComponentMeshExportTests(unittest.TestCase):
                     "area_m2": 1.871564249915375e-13,
                     "tessellate_result": True,
                     "used_api": NATIVE_FACETLESS_EVIDENCE_API,
+                    "source_rule": "native-flat-array",
+                    "warnings": [],
+                    "derived_empty_edges": [],
                 }
             ],
         )

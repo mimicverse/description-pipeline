@@ -22,6 +22,8 @@ from .native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_COLLAPSED_U_FIN_RULE,
     NATIVE_COMPONENT_REFERENCE_ALIASED,
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
     NATIVE_FACE_IDENTITY_KEY_RULE,
     NATIVE_SCOPE_MAPPING_METHOD,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
@@ -1012,6 +1014,7 @@ def parse_native_tessellation(
         "fin_ids",
         "fin_ids_source",
         "raw_fin_ids",
+        "warnings",
         "u_min",
         "u_max",
         "curve_start_point_m",
@@ -1177,6 +1180,13 @@ def parse_native_tessellation(
                         for face_index in edge["face_indices"]
                     )
                 )
+            )
+            and edge["warnings"]
+            == (
+                [NATIVE_EDGE_FIN_IDS_DERIVED]
+                if edge["fin_ids_source"]
+                == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                else []
             )
             and type(edge["u_min"]) in (int, float)
             and type(edge["u_max"]) in (int, float)
@@ -3097,6 +3107,7 @@ def _parse_itessellation_body(
                 "facet_count",
                 "facet_ids_source",
                 "raw_facet_ids",
+                "warnings",
                 "face_identity_sha256",
             },
             component + f": native tessellation face {index} has an unknown shape",
@@ -3137,6 +3148,13 @@ def _parse_itessellation_body(
                     and facet_ids == []
                     and face["raw_facet_ids"] is None
                 )
+            )
+            and face["warnings"]
+            == (
+                [NATIVE_FACE_FACET_IDS_DERIVED]
+                if face["facet_ids_source"]
+                == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                else []
             )
             and face["face_identity_sha256"]
             == face_spans[face_index]["face_reference_sha256"]

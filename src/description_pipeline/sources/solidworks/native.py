@@ -28,6 +28,8 @@ from ...geometry.native_u import (
     NATIVE_CURVE_DOMAIN_RULE,
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_COMPONENT_REFERENCE_ALIASED,
+    NATIVE_EDGE_FIN_IDS_DERIVED,
+    NATIVE_FACE_FACET_IDS_DERIVED,
     NATIVE_FACE_IDENTITY_KEY_RULE,
     NATIVE_IDENTITY_POLICY_RULE,
     NATIVE_PART_WITNESS_DERIVED,
@@ -7612,15 +7614,32 @@ class SolidWorksBackend(CadBackend):
                     )
                 raw_fins = call(
                     "ITessellation.GetFacetFins",
-                    lambda facet=raw_facet_id: _as_list(
-                        _member(tessellation, "GetFacetFins", facet)
+                    lambda facet=raw_facet_id: _member(
+                        tessellation,
+                        "GetFacetFins",
+                        facet,
                     ),
                     face_index=face_index,
                     facet_id=raw_facet_id,
                 )
                 if (
-                    len(raw_fins) != 3
+                    not isinstance(raw_fins, (tuple, list))
                     or any(type(fin) is not int or fin < 0 for fin in raw_fins)
+                ):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "GetFacetFins returned an invalid fin ID array",
+                        {
+                            **base,
+                            "face_index": face_index,
+                            "facet_id": raw_facet_id,
+                            "raw_fins": repr(raw_fins)[:1000],
+                            "raw_fins_type": type(raw_fins).__name__,
+                            "native_totals": copy.deepcopy(native_totals),
+                        },
+                    )
+                if (
+                    len(raw_fins) != 3
                     or len(set(raw_fins)) != 3
                 ):
                     raise CadError(
@@ -9076,6 +9095,12 @@ class SolidWorksBackend(CadBackend):
                     "facet_count": row["facet_count"],
                     "facet_ids_source": row["facet_ids_source"],
                     "raw_facet_ids": row["raw_facet_ids"],
+                    "warnings": (
+                        [NATIVE_FACE_FACET_IDS_DERIVED]
+                        if row["facet_ids_source"]
+                        == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                        else []
+                    ),
                     "identity": row.get("identity"),
                 }
                 for row in face_rows
@@ -9091,6 +9116,12 @@ class SolidWorksBackend(CadBackend):
                     "fin_count": row["fin_count"],
                     "fin_ids_source": row["fin_ids_source"],
                     "raw_fin_ids": row["raw_fin_ids"],
+                    "warnings": (
+                        [NATIVE_EDGE_FIN_IDS_DERIVED]
+                        if row["fin_ids_source"]
+                        == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                        else []
+                    ),
                     "identity": row.get("identity"),
                 }
                 for row in edge_rows
@@ -9141,6 +9172,12 @@ class SolidWorksBackend(CadBackend):
                         "facet_count": row["facet_count"],
                         "facet_ids_source": row["facet_ids_source"],
                         "raw_facet_ids": row["raw_facet_ids"],
+                        "warnings": (
+                            [NATIVE_FACE_FACET_IDS_DERIVED]
+                            if row["facet_ids_source"]
+                            == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                            else []
+                        ),
                         "face_identity_sha256": row["reference"][
                             "typed_sha256"
                         ],
@@ -9247,6 +9284,12 @@ class SolidWorksBackend(CadBackend):
                     "fin_ids": sorted(row["fin_ids"]),
                     "fin_ids_source": row["fin_ids_source"],
                     "raw_fin_ids": row["raw_fin_ids"],
+                    "warnings": (
+                        [NATIVE_EDGE_FIN_IDS_DERIVED]
+                        if row["fin_ids_source"]
+                        == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                        else []
+                    ),
                     "u_min": row["curve"]["u_min"],
                     "u_max": row["curve"]["u_max"],
                     "curve_start_point_m": row["curve"]["start_point_m"],
@@ -9849,6 +9892,10 @@ class SolidWorksBackend(CadBackend):
                 row["face_index"]: row["facet_ids"]
                 for row in graph["itessellation_body"]["faces"]
             }
+            facet_sources_by_face = {
+                row["face_index"]: row["facet_ids_source"]
+                for row in graph["itessellation_body"]["faces"]
+            }
             for face_row in graph["faces"]:
                 face_index = face_row["index"]
                 records = records_by_face.get(face_index, [])
@@ -9898,6 +9945,33 @@ class SolidWorksBackend(CadBackend):
                             "area_m2": float(area),
                             "tessellate_result": graph["tessellate_result"],
                             "used_api": FACETLESS_EVIDENCE_API,
+                            "source_rule": facet_sources_by_face[face_index],
+                            "warnings": (
+                                [NATIVE_FACE_FACET_IDS_DERIVED]
+                                if facet_sources_by_face[face_index]
+                                == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
+                                else []
+                            ),
+                            "derived_empty_edges": sorted(
+                                (
+                                    {
+                                        "edge_reference_sha256": edge[
+                                            "edge_reference_sha256"
+                                        ],
+                                        "source_rule": edge["fin_ids_source"],
+                                        "warnings": list(edge["warnings"]),
+                                    }
+                                    for edge in graph["native_edge_rows"]
+                                    if (
+                                        face_index in edge["face_indices"]
+                                        and edge["fin_ids_source"]
+                                        == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                                    )
+                                ),
+                                key=lambda edge: edge[
+                                    "edge_reference_sha256"
+                                ],
+                            ),
                         }
                     )
                 edge_references = sorted(

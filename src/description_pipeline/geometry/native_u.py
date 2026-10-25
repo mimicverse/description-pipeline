@@ -52,6 +52,12 @@ NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED = "cad_scope_local_identity_derived"
 NATIVE_COMPONENT_REFERENCE_ALIASED = "cad_component_persistent_reference_aliased"
 NATIVE_PART_WITNESS_DERIVED = "cad_part_identity_witness_derived"
 NATIVE_TOPOLOGY_IDENTITY_DERIVED = "cad_topology_identity_derived"
+NATIVE_FACE_FACET_IDS_DERIVED = (
+    "cad_face_facet_ids_derived_by_body_global_closure"
+)
+NATIVE_EDGE_FIN_IDS_DERIVED = (
+    "cad_edge_fin_ids_derived_by_empty_incident_faces"
+)
 NATIVE_SCOPE_IDENTITY_WARNING_CODES = frozenset(
     {
         NATIVE_COMPONENT_REFERENCE_ALIASED,

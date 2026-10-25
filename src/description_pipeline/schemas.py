@@ -21,11 +21,13 @@ NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO = (
     "native-incident-faces-null-zero"
 )
 NATIVE_FACETLESS_EVIDENCE_API = (
-    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
+    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets/"
+    "GetFacetFins/GetEdgeFins/GetFacetCount/GetFinCount"
 )
 NATIVE_MESH_CAPTURE_API = (
-    "ITessellation.Tessellate/GetFaceFacets/GetFacetFins/"
-    "GetFinVertices/GetVertexPoint"
+    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets/"
+    "GetFacetFins/GetEdgeFins/GetFinVertices/GetVertexPoint/"
+    "GetFacetCount/GetFinCount/GetVertexCount"
 )
 NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
 NATIVE_DISCOVERY_FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
