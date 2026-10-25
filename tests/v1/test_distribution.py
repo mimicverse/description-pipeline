@@ -533,6 +533,33 @@ class DistributionTests(unittest.TestCase):
             ):
                 build_release.build(root, output)
 
+    def test_build_frontend_runs_inside_the_archived_source_tree(self):
+        from unittest.mock import patch
+
+        from tools import build_release
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir()
+            with patch.object(build_release.subprocess, "run") as run:
+                build_release.build_distributions(
+                    source,
+                    output,
+                    environment={"ONLY": "staging"},
+                )
+
+        self.assertEqual(run.call_args.kwargs["cwd"], source.resolve())
+        self.assertEqual(
+            run.call_args.kwargs["env"],
+            {"ONLY": "staging"},
+        )
+        self.assertEqual(
+            run.call_args.args[0][-1],
+            str(source.resolve()),
+        )
+
     def test_bytecode_caches_are_not_part_of_the_source_closure(self):
         from types import SimpleNamespace
 

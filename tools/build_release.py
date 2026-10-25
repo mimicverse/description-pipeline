@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,6 +138,32 @@ def source_inventory(directory: Path, bound: SimpleNamespace) -> dict[str, str]:
         for name, digest in bound.inventory(directory).items()
         if "__pycache__" not in Path(name).parts
     }
+
+
+def build_distributions(
+    source: Path,
+    output: Path,
+    *,
+    environment: Mapping[str, str],
+) -> None:
+    """Run the build frontend only inside the archived source staging tree."""
+
+    source = Path(source).resolve()
+    output = Path(output).resolve()
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--no-isolation",
+            "--outdir",
+            str(output),
+            str(source),
+        ],
+        cwd=source,
+        check=True,
+        env=dict(environment),
+    )
 
 
 def tracked_test_inventory(root: Path, bound: SimpleNamespace) -> dict[str, str]:
@@ -275,10 +302,10 @@ def build(root, output):
         }
         bound.write_json(package / "tool-release.json", identity)
         build_env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-        subprocess.run(
-            [sys.executable, "-m", "build", "--no-isolation", "--outdir", str(output), str(source)],
-            check=True,
-            env=build_env,
+        build_distributions(
+            source,
+            output,
+            environment=build_env,
         )
         (wheel,) = output.glob("*.whl")
         (sdist,) = output.glob("*.tar.gz")
