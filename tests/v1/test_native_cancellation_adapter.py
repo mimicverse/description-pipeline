@@ -433,7 +433,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         )
 
     def test_ack_reports_one_exact_post_and_does_not_finish_target(self) -> None:
-        target, effect, cancel_command, view, services, _claim = self._target()
+        target, effect, cancel_command, view, services, claim = self._target()
         loopback = _CancelServer(
             operation_id=view.operation_id,
             view=view,

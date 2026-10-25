@@ -22,6 +22,7 @@ from description_pipeline.io import digest, read_data, write_json
 from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.platform.storage import seal_stage_confirmation
 from description_pipeline.platform.store import PlatformStore
+from description_pipeline.schemas import VERIFICATION_CERTIFICATE_SCHEMA
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.solidworks_urdf import required_checks
 
@@ -577,7 +578,7 @@ class RegisteredPlatform:
             "purpose": "engineering",
             "request": request,
             "request_sha256": digest(request),
-            "schema_version": "solidworks-to-urdf.verification-certificate/v1",
+            "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
             "subject_sha256": subject,
         }
         certificate["verification_key"] = digest(certificate)

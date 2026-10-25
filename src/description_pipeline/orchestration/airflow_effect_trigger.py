@@ -21,6 +21,7 @@ from ..pipeline.contracts import (
 )
 from ..pipeline.effects import EffectIntent, EffectSettlement
 from ..platform.facts import FactStore
+from ..schemas import NATIVE_DISCOVER_EFFECT_SCHEMA
 
 if TYPE_CHECKING:
     from ..pipeline.application import EffectWakeupHint
@@ -228,7 +229,7 @@ def _native_expectation(
         ):
             raise ValueError("The Discover pending outbound differs from its command")
         expected_state = {
-            "schema_version": "solidworks-to-urdf.native-discover-effect/v1",
+            "schema_version": NATIVE_DISCOVER_EFFECT_SCHEMA,
             "operation_id": request.operation_id,
             "request_digest": command.request_digest,
             "source_inventory_sha256": request.source_inventory_sha256,

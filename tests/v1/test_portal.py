@@ -54,6 +54,11 @@ from description_pipeline.pipeline.contracts import DispatchConf
 from description_pipeline.pipeline.dispatch import DispatchResult
 from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.platform.facts import FactStoreError, RunNotAdmittedError
+from description_pipeline.schemas import (
+    AIRFLOW_DISPATCH_CONF_SCHEMA,
+    VERIFICATION_CERTIFICATE_SCHEMA,
+    VERIFY_REQUEST_SCHEMA,
+)
 from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import CONTRACT, stage_view
 
@@ -875,10 +880,10 @@ class FakePlatformStore:
                     "output_contract": "solidworks-to-urdf.verification-artifact/v1",
                     "policy_sha256": "1" * 64,
                     "purpose": preview.get("purpose") or "engineering",
-                    "schema_version": "solidworks-to-urdf.verify-request/v1",
+                    "schema_version": VERIFY_REQUEST_SCHEMA,
                 }
                 certificate = {
-                    "schema_version": "solidworks-to-urdf.verification-certificate/v1",
+                    "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
                     "decision": "PASS"
                     if preview.get("verified") is not False
                     else "FAIL",
@@ -1627,7 +1632,7 @@ class PortalTests(unittest.TestCase):
             dag_run_id=dag_run_id,
         )
         conf = DispatchConf(
-            schema_version="solidworks-to-urdf.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=request.run_id,
             freeze_command_id="freeze:" + digest(request.run_id),
         )
@@ -1661,7 +1666,7 @@ class PortalTests(unittest.TestCase):
             dag_run_id=dag_run_id,
         )
         conf = DispatchConf(
-            schema_version="solidworks-to-urdf.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=request.run_id,
             freeze_command_id="freeze:" + digest(request.run_id),
         )
@@ -1682,7 +1687,7 @@ class PortalTests(unittest.TestCase):
             dag_run_id=DAG_RUN_ID,
         )
         conf = DispatchConf(
-            schema_version="solidworks-to-urdf.airflow-dispatch-conf/v1",
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=RUN_ID,
             freeze_command_id="freeze:" + digest(RUN_ID),
         )
@@ -2540,7 +2545,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(admitted.change_summary, TEST_SUMMARY)
         self.assertEqual(admitted.purpose, "engineering")
         expected_conf = {
-            "schema_version": "solidworks-to-urdf.airflow-dispatch-conf/v1",
+            "schema_version": AIRFLOW_DISPATCH_CONF_SCHEMA,
             "run_id": native_run_id(dag_run_id),
             "freeze_command_id": next(
                 iter(self.production_application.dispatch_records.values())
@@ -2639,7 +2644,7 @@ class PortalTests(unittest.TestCase):
                     adapter.trigger(
                         command,
                         DispatchConf(
-                            schema_version="solidworks-to-urdf.airflow-dispatch-conf/v1",
+                            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
                             run_id=command.run_id,
                             freeze_command_id="freeze:" + command.run_id,
                         ),
