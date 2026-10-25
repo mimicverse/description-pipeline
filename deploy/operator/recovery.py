@@ -12520,6 +12520,16 @@ def _verify_deployment_files(
         )
 
 
+def _recovered_runtime_environment() -> dict[str, str]:
+    """Return only the caller environment needed to probe a recovered runtime."""
+
+    environment = os.environ.copy()
+    for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        environment.pop(name, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    return environment
+
+
 def verify_release_runtime(
     *,
     manifest: dict,
@@ -12573,6 +12583,7 @@ def verify_release_runtime(
         "recovery_release_missing",
         "recovered interpreter is not a real CPython environment",
     )
+    runtime_environment = _recovered_runtime_environment()
     completed = subprocess.run(
         [
             str(python),
@@ -12592,6 +12603,7 @@ def verify_release_runtime(
         text=True,
         timeout=60,
         check=False,
+        env=runtime_environment,
     )
     require(
         completed.returncode == 0,
@@ -12630,6 +12642,7 @@ def verify_release_runtime(
         text=True,
         timeout=60,
         check=False,
+        env=runtime_environment,
     )
     try:
         runtime_identity = json.loads(probe.stdout)
@@ -12699,11 +12712,12 @@ def verify_release_runtime(
         "recovered description entry point is missing or not executable",
     )
     pip_check = subprocess.run(
-        [str(python), "-m", "pip", "check"],
+        [str(python), "-I", "-B", "-m", "pip", "check"],
         capture_output=True,
         text=True,
         timeout=120,
         check=False,
+        env=runtime_environment,
     )
     require(
         pip_check.returncode == 0,
@@ -12719,6 +12733,7 @@ def verify_release_runtime(
             text=True,
             timeout=120,
             check=False,
+            env=runtime_environment,
         )
         require(
             entry_probe.returncode == 0 and bool(entry_probe.stdout.strip()),
@@ -12837,7 +12852,7 @@ def rehydrate_release_runtime(
         "recovery_release_missing",
         "release runtime rehydration requires the CPython 3.12 controller",
     )
-    env = os.environ.copy()
+    env = _recovered_runtime_environment()
     env.update(
         {
             "AIRFLOW_VENV": str(airflow_venv),

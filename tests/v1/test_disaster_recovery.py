@@ -2653,6 +2653,27 @@ class RecoveryControlFlowTests(unittest.TestCase):
             dir=HERE,
         )
         self.root = Path(self.temporary.name)
+        external_runtime_source = self.root / "external-runtime-source"
+        write(
+            external_runtime_source / "description_pipeline" / "__init__.py",
+            'VERSION = "1.5.0"\n',
+        )
+        write(
+            external_runtime_source
+            / "mimicverse_description-1.5.0.dist-info"
+            / "METADATA",
+            "Metadata-Version: 2.1\n"
+            "Name: mimicverse-description\n"
+            "Version: 1.5.0\n"
+            "Requires-Dist: packaging==26.3\n",
+        )
+        python_path = mock.patch.dict(
+            os.environ,
+            {"PYTHONPATH": str(external_runtime_source)},
+            clear=False,
+        )
+        python_path.start()
+        self.addCleanup(python_path.stop)
         self.fake_bin = install_fake_pg(
             self.root / "fake-bin",
             Fernet(Fernet.generate_key()).encrypt(b"unused").decode(),
@@ -3719,6 +3740,66 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 verify_only=False,
             )
         self.assertEqual(raised.exception.code, "recovery_target_path_unsafe")
+
+    def test_recovered_runtime_environment_strips_python_context(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTHONPATH": "/caller/python-path",
+                "PYTHONHOME": "/caller/python-home",
+                "VIRTUAL_ENV": "/caller/venv",
+                "PATH": "/runtime/bin",
+                "LD_LIBRARY_PATH": "/runtime/lib",
+                "SSL_CERT_FILE": "/runtime/ca.pem",
+            },
+            clear=False,
+        ):
+            environment = recovery._recovered_runtime_environment()
+        for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+            self.assertNotIn(name, environment)
+        self.assertEqual(environment["PYTHONNOUSERSITE"], "1")
+        self.assertEqual(environment["PATH"], "/runtime/bin")
+        self.assertEqual(environment["LD_LIBRARY_PATH"], "/runtime/lib")
+        self.assertEqual(environment["SSL_CERT_FILE"], "/runtime/ca.pem")
+
+    def test_recovered_runtime_environment_does_not_relax_pip_check(self) -> None:
+        venv = self.root / "missing-package-venv"
+        environment = recovery._recovered_runtime_environment()
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv)],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        site_packages = venv / "lib" / "python3.12" / "site-packages"
+        write(
+            site_packages / "missing_requirement-1.0.dist-info" / "METADATA",
+            "Metadata-Version: 2.1\n"
+            "Name: missing-requirement\n"
+            "Version: 1.0\n"
+            "Requires-Dist: intentionally-missing-runtime-package==1\n",
+        )
+        checked = subprocess.run(
+            [
+                str(venv / "bin" / "python"),
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "check",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertIn(
+            "intentionally-missing-runtime-package",
+            checked.stdout + checked.stderr,
+        )
 
     def test_release_runtime_rehydrates_from_offline_role_archives(self) -> None:
         release_root = self.root / "runtime-release"
