@@ -114,6 +114,10 @@ class NativeOperationClientConflict(NativeOperationClientError):
     """The same operation identity is bound to different immutable content."""
 
 
+class NativeOperationIdentityConflict(NativeOperationClientConflict):
+    """The endpoint returned a valid view for a different operation identity."""
+
+
 class NativeOperationNotFound(NativeOperationClientError):
     """The native operation identity is not known to the endpoint."""
 
@@ -638,8 +642,10 @@ class NativeOperationClient:
         )
         view = self._view(response)
         if view.operation_id != operation_id:
-            raise NativeOperationProtocolError(
-                "native operation endpoint answered for another operation"
+            raise NativeOperationIdentityConflict(
+                "native operation endpoint answered for another operation",
+                status=409,
+                code="native_operation_identity_mismatch",
             )
         return view
 
@@ -2362,6 +2368,7 @@ __all__ = [
     "NativeOperationDiscoverPort",
     "NativeOperationEffectObserver",
     "NativeOperationEndpoint",
+    "NativeOperationIdentityConflict",
     "NativeOperationNotFound",
     "NativeOperationProtocolError",
     "NativeOperationRemoteUnknown",

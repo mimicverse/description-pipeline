@@ -305,16 +305,15 @@ def _native_observation_retryable(error: Exception) -> bool:
         NativeOperationProtocolError,
     )
 
+    if getattr(error, "status", None) in {401, 403}:
+        return False
     if isinstance(error, NativeOperationNotFound):
         return True
     if not isinstance(error, NativeOperationClientError):
         return False
+    if isinstance(error, NativeOperationClientConflict):
+        return error.code == "native_target_mismatch"
     if isinstance(error, NativeOperationProtocolError):
-        return True
-    if (
-        isinstance(error, NativeOperationClientConflict)
-        and error.code == "native_target_mismatch"
-    ):
         return True
     return error.status is None or (
         isinstance(error.status, int) and error.status >= 500

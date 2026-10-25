@@ -31,6 +31,7 @@ from description_pipeline.orchestration.native_operation_client import (
     NativeOperationDiscoverPort,
     NativeOperationEffectObserver,
     NativeOperationEndpoint,
+    NativeOperationIdentityConflict,
     NativeOperationNotFound,
     NativeOperationProtocolError,
     NativeOperationStatusExpectation,
@@ -1090,6 +1091,61 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         )
         with self.assertRaises(NativeOperationClientConflict):
             expected.require(replace(view, target_id=foreign_target))
+
+    def test_get_operation_rejects_a_valid_foreign_operation_response(
+        self,
+    ) -> None:
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "foreign-operation-response-state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        self.addCleanup(runtime.close)
+        runtime.create(
+            _operation("operation-foreign-response", self.archive)
+        )
+        foreign_view = runtime.view("operation-foreign-response")
+        payload = json.dumps(foreign_view, sort_keys=True).encode("utf-8")
+        requests: list[str] = []
+
+        class Response:
+            def __init__(self) -> None:
+                self.headers = Message()
+                self.headers["Content-Type"] = "application/json"
+                self.headers["X-Native-Target-ID"] = TEST_TARGET_ID
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, limit: int) -> bytes:
+                return payload[:limit]
+
+        def opener(request, *, timeout):
+            del timeout
+            requests.append(request.full_url)
+            return Response()
+
+        client = NativeOperationClient(
+            NativeOperationEndpoint("http://127.0.0.1:1", TOKEN),
+            target_id=TEST_TARGET_ID,
+            opener=opener,
+        )
+        client._target_verified = True
+
+        with self.assertRaises(NativeOperationIdentityConflict) as raised:
+            client.get_operation("operation-requested")
+
+        self.assertEqual(
+            raised.exception.code,
+            "native_operation_identity_mismatch",
+        )
+        self.assertEqual(
+            requests,
+            ["http://127.0.0.1:1/operations/operation-requested"],
+        )
 
     def test_capture_executor_calls_the_shared_native_transaction(self) -> None:
         package = self.root / "prepared"

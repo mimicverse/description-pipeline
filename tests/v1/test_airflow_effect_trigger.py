@@ -22,6 +22,7 @@ from description_pipeline.orchestration.airflow_effect_trigger import (
 from description_pipeline.orchestration.native_operation_client import (
     NativeOperationClientConflict,
     NativeOperationClientError,
+    NativeOperationIdentityConflict,
     NativeOperationNotFound,
     NativeOperationProtocolError,
 )
@@ -238,10 +239,37 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
     async def test_authorization_failure_aborts_observation(self) -> None:
         wait = _wait()
         expected = SimpleNamespace(operation_id="operation-capture")
+        for status in (401, 403):
+            with self.subTest(status=status):
+                client = Mock()
+                client.get_operation.side_effect = NativeOperationClientError(
+                    "unauthorized",
+                    status=status,
+                )
+
+                with (
+                    patch.object(
+                        airflow_effect_trigger,
+                        "_native_probe_from_environment",
+                        return_value=(client, expected),
+                    ),
+                    self.assertRaises(NativeOperationClientError),
+                ):
+                    await anext(
+                        EffectPollTrigger(
+                            wait=wait.to_record(),
+                            poll_interval=0.1,
+                        ).run()
+                    )
+
+    async def test_operation_identity_conflict_aborts_observation(self) -> None:
+        wait = _wait()
+        expected = SimpleNamespace(operation_id="operation-capture")
         client = Mock()
-        client.get_operation.side_effect = NativeOperationClientError(
-            "unauthorized",
-            status=401,
+        client.get_operation.side_effect = NativeOperationIdentityConflict(
+            "native operation endpoint answered for another operation",
+            status=409,
+            code="native_operation_identity_mismatch",
         )
 
         with (
@@ -250,7 +278,31 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                 "_native_probe_from_environment",
                 return_value=(client, expected),
             ),
-            self.assertRaises(NativeOperationClientError),
+            self.assertRaises(NativeOperationIdentityConflict),
+        ):
+            await anext(
+                EffectPollTrigger(
+                    wait=wait.to_record(),
+                    poll_interval=0.1,
+                ).run()
+            )
+
+    async def test_non_target_conflict_without_status_aborts_observation(self) -> None:
+        wait = _wait()
+        expected = SimpleNamespace(operation_id="operation-capture")
+        client = Mock()
+        client.get_operation.side_effect = NativeOperationClientConflict(
+            "native operation differs from the frozen request",
+            code="native_operation_conflict",
+        )
+
+        with (
+            patch.object(
+                airflow_effect_trigger,
+                "_native_probe_from_environment",
+                return_value=(client, expected),
+            ),
+            self.assertRaises(NativeOperationClientConflict),
         ):
             await anext(
                 EffectPollTrigger(
