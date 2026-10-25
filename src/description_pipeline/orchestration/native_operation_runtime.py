@@ -997,7 +997,6 @@ class CaptureOperationExecutor:
                     run_id=capture.run_id,
                     on_event=self.on_event,
                     on_activity=self.on_activity,
-                    prior_events=(),
                     expected_inputs=dict(capture.package_files),
                     handoff_sha256=capture.handoff_sha256,
                     upload_sha256=capture.upload_sha256,
@@ -1005,7 +1004,6 @@ class CaptureOperationExecutor:
                     upstream_artifacts=tuple(capture.upstream_artifacts),
                     execution=dict(capture.execution),
                     native_tool_factory=lambda: dict(native_tool),
-                    execution_scope=("capture",),
                     request_evidence=dict(capture.request_evidence),
                 )
             )

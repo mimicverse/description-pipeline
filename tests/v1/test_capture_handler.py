@@ -2962,6 +2962,27 @@ class CaptureHandlerTests(unittest.TestCase):
 
 
 class CaptureTransactionPreservationTests(unittest.TestCase):
+    def test_initial_receipt_is_capture_only(self) -> None:
+        receipt = capture_module._capture_receipt(
+            CHILD,
+            handoff_sha256=digest({"handoff": 1}),
+        )
+        self.assertEqual(
+            canonical(receipt),
+            canonical(
+                {
+                    "schema_version": capture_module.BUNDLE_SCHEMA,
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": CHILD,
+                    "handoff_sha256": digest({"handoff": 1}),
+                    "state": "failed",
+                    "events": [],
+                    "execution_scope": ["capture"],
+                }
+            ),
+        )
+        self.assertNotIn("resume", receipt)
+
     def test_failure_evidence_failure_keeps_the_untouched_native_staging_root(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capture-preservation-") as temporary:
             root = Path(temporary)

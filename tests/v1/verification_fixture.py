@@ -24,6 +24,7 @@ from description_pipeline import solidworks
 from description_pipeline.delivery import read_delivery_manifest
 from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.io import digest
+from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.runtime import tool_record
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
@@ -589,7 +590,7 @@ class HermeticNativeFixture:
             main_assembly=MAIN_ASSEMBLY,
             on_event=self._record,
         )
-        prepared, _target, _discovery, prepared_files = steps.discover_structure(
+        prepared, _target, discovery, prepared_files = steps.discover_structure(
             self.handoff,
             self.root / "prepared",
             RUN_ID,
@@ -634,6 +635,40 @@ class HermeticNativeFixture:
             },
         )
         native_identity = _native_tool()
+        producer_tool_sha256 = digest(native_identity)
+        upstream_artifacts = tuple(
+            ArtifactRef(
+                artifact_id=f"fixture-{stage}-artifact",
+                kind=f"stage_output:{stage}",
+                locator=f"cas://artifact/fixture-{stage}-artifact",
+                manifest_sha256=digest({"manifest": payload}),
+                set_sha256=digest({stage: payload}),
+                producer_run_id=RUN_ID,
+                producer_stage=stage,
+                producer_tool_sha256=producer_tool_sha256,
+            ).to_record()
+            for stage, payload in (
+                ("freeze", frozen),
+                (
+                    "discover",
+                    {
+                        "discovery_sha256": discovery.discovery_sha256,
+                        "prepared_sha256": discovery.prepared_sha256,
+                        "revision": discovery.revision,
+                    },
+                ),
+            )
+        )
+        execution = {
+            "claim_id": "fixture-capture-claim",
+            "command_id": "fixture-capture-command",
+            "effect_key": "native",
+            "executor_sha256": digest({"executor": "capture"}),
+            "fence": 1,
+            "native_tool_sha256": digest(native_identity),
+            "owner_sha256": digest({"owner": "hermetic-capture"}),
+            "run_id": RUN_ID,
+        }
         with patch("description_pipeline.runtime.tool_record", return_value=native_identity):
             from description_pipeline.pipeline.capture import (
                 _capture_native_transaction,
@@ -648,10 +683,10 @@ class HermeticNativeFixture:
                 upload_sha256=handoff_digest,
                 main_assembly=MAIN_ASSEMBLY,
                 expected_inputs=prepared_files,
-                prior_events=self.events,
                 on_event=self._record,
                 native_tool_factory=lambda: dict(native_identity),
-                execution_scope=("freeze", "discover", "capture"),
+                upstream_artifacts=upstream_artifacts,
+                execution=execution,
             )
         self.assertEqual(capture["state"], "native_complete", capture.get("error"))
         request = build_request_evidence(

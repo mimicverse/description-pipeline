@@ -960,30 +960,20 @@ def _capture_output_lock(output: Path):
 
 def _capture_receipt(
     run_id: str,
-    prior_events,
     *,
-    resume: Mapping[str, Any] | None,
     handoff_sha256: str,
-    execution_scope: tuple[str, ...],
 ) -> dict[str, Any]:
-    """Create a native-only receipt; prior events are accepted only by the legacy adapter."""
+    """Create the initial Capture-only receipt."""
 
-    events = [event for event in (prior_events or ()) if isinstance(event, dict)]
-    receipt = {
+    return {
         "schema_version": BUNDLE_SCHEMA,
         "pipeline_id": PIPELINE_ID,
         "run_id": run_id or str(uuid.uuid4()),
         "handoff_sha256": handoff_sha256,
         "state": "failed",
-        "events": events,
-        "execution_scope": list(execution_scope),
+        "events": [],
+        "execution_scope": ["capture"],
     }
-    if resume:
-        receipt["resume"] = {
-            "parent_run": resume.get("parent_run"),
-            "from_stage": resume.get("from_stage"),
-        }
-    return receipt
 
 
 def _capture_event_sink(receipt: dict[str, Any], on_event=None):
@@ -1146,16 +1136,13 @@ def _capture_native_transaction(
     run_id: str,
     on_event=None,
     on_activity=None,
-    prior_events=None,
     expected_inputs: Mapping[str, str] | None = None,
     handoff_sha256: str,
     upload_sha256: str | None = None,
     main_assembly: str,
-    resume: Mapping[str, Any] | None = None,
     upstream_artifacts: tuple[dict[str, Any], ...] | None = None,
     execution: Mapping[str, Any] | None = None,
     native_tool_factory: Callable[[], dict[str, Any]] | None = None,
-    execution_scope: tuple[str, ...] = ("capture",),
     request_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the real native Capture transaction and seal its artifact.
@@ -1177,10 +1164,7 @@ def _capture_native_transaction(
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
         receipt = _capture_receipt(
             run_id,
-            prior_events,
-            resume=dict(resume) if resume is not None else None,
             handoff_sha256=handoff_sha256,
-            execution_scope=execution_scope,
         )
         event = _capture_event_sink(receipt, on_event)
         try:
@@ -1250,7 +1234,6 @@ def _invoke_native_operation(
         upload_sha256=upload_sha256,
         main_assembly=main_assembly,
         expected_inputs=inputs.prepared_files,
-        prior_events=(),
         upstream_artifacts=upstream_artifacts,
         execution=execution,
         native_tool_factory=lambda: native_tool,

@@ -1218,10 +1218,6 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         native_transaction.assert_called_once()
         self.assertEqual(captured["package_inventory"], prepared_files)
         self.assertEqual(
-            captured["kwargs"]["execution_scope"],
-            ("capture",),
-        )
-        self.assertEqual(
             captured["kwargs"]["native_tool_factory"](),
             NATIVE_TOOL,
         )
