@@ -2006,8 +2006,6 @@ def _parse_planar_brep_evidence(
                 and coedge["parameter_order"]
                 == ("increasing" if coedge["start_parameter"] < coedge["end_parameter"] else "decreasing")
                 and coedge["start_parameter"] != coedge["end_parameter"]
-                and edge["u_min"] <= coedge["start_parameter"] <= edge["u_max"]
-                and edge["u_min"] <= coedge["end_parameter"] <= edge["u_max"]
                 and _finite_point(coedge["start_point_m"])
                 and _finite_point(coedge["end_point_m"]),
                 component + f": native planar BRep coedge {coedge_index} is malformed for body {body_key}",

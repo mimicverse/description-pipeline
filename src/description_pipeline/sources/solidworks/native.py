@@ -8091,24 +8091,21 @@ class SolidWorksBackend(CadBackend):
                         "end_parameter": end_parameter,
                     }
                 )
-                if not native_u_in_closed_interval(
-                    start_parameter,
-                    edge_row["curve"]["u_min"],
-                    edge_row["curve"]["u_max"],
-                ) or not native_u_in_closed_interval(
-                    end_parameter,
-                    edge_row["curve"]["u_min"],
-                    edge_row["curve"]["u_max"],
-                ):
+                # Coedge U belongs to GetCurveParams/Evaluate2, not to the
+                # edge-local ICurveParamData domain. Bind coverage through
+                # the native endpoint set and same-coedge evaluations below.
+                if start_parameter == end_parameter and start_point != end_point:
                     raise CadError(
                         "cad_native_tessellation_unreadable",
-                        "a coedge trim interval escapes its native edge domain",
+                        "one coedge parameter identifies distinct trim endpoints",
                         {
                             **base,
                             "coedge_index": coedge_index,
                             "edge_index": edge_row["index"],
                         },
                     )
+                if start_parameter == end_parameter:
+                    return provider_miss("coedge_trim_has_no_parameter_span")
                 line_orientation = line_relation(
                     edge_line_params,
                     coedge_line_params,
