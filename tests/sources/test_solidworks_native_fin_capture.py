@@ -183,6 +183,11 @@ class FakeFace:
         self.display_calls += 1
         return list(self.display_triangles)
 
+    def GetSurface(self):  # noqa: N802 - SolidWorks API name
+        return SimpleNamespace(
+            IsPlane=lambda: False,
+        )
+
     def GetArea(self):  # noqa: N802 - SolidWorks API name
         points = [
             self.display_triangles[offset : offset + 3]
@@ -4495,6 +4500,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "native_edges",
                     "no_facets_faces",
                     "itessellation",
+                    "planar_brep",
                 },
             )
             self.assertEqual(

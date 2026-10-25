@@ -271,11 +271,8 @@ def _canonical_untessellated_faces(
 
     The file is a list of per-component entries; each row is returned with its
     component attached so the warning can name it.  Any schema deviation fails
-    closed.  Exactly two row shapes pass, mirroring the verification gate: the
-    proven-probe row (boolean ``tessellate_result`` with ``facet_count`` 0) and
-    the degenerate fallback row (no ``facet_count`` and no ``tessellate_result``;
-    a persistent ``com_error`` probe record) admitted only up to the same
-    numerically-zero area bound (1e-12 m2).  No area claim is derived anywhere.
+    closed. Each row records zero facets and strictly binds the successful
+    body tessellation. No area waiver or failed-probe variant is admitted.
     """
 
     import math
@@ -351,7 +348,7 @@ def _canonical_untessellated_faces(
         for row in rows:
             if not isinstance(row, dict):
                 return None
-            if set(row) not in (base | {"facet_count", "tessellate_result"}, base | {"tessellate_probe_error"}):
+            if set(row) != base | {"facet_count", "tessellate_result"}:
                 return None
             if row.get("body_type") != 1:
                 return None
@@ -365,22 +362,18 @@ def _canonical_untessellated_faces(
             area = row.get("area_m2")
             if isinstance(area, bool) or not isinstance(area, (int, float)) or not math.isfinite(area) or area < 0:
                 return None
-            if "tessellate_result" in row:
-                if type(row.get("facet_count")) is not int or row["facet_count"] != 0:
-                    return None
-                if not isinstance(row.get("tessellate_result"), bool):
-                    return None
-            else:
-                # A persistent DISP_E_EXCEPTION on a geometrically degenerate face
-                # is recorded as a probe error instead of a result: both facet_count
-                # and tessellate_result are products of the probe that failed, so
-                # this variant carries neither.  It is admissible only at
-                # numerically zero area, exactly as in the verification gate.
-                probe_error = row.get("tessellate_probe_error")
-                if not isinstance(probe_error, str) or not probe_error.startswith("com_error"):
-                    return None
-                if area > 1e-12:
-                    return None
+            if type(row.get("facet_count")) is not int or row["facet_count"] != 0:
+                return None
+            body_evidence = next(
+                body
+                for body in tessellation["itessellation"]["bodies"]
+                if (body["body_type"], body["body_index"]) == (row["body_type"], row["body_index"])
+            )
+            if (
+                row.get("tessellate_result") is not body_evidence["tessellate_result"]
+                or row["tessellate_result"] is not True
+            ):
+                return None
             if row.get("used_api") != pinned_api:
                 return None
             key = (row["body_type"], row["body_index"], row["face_index"])
@@ -883,14 +876,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             )
         else:
             for row in untessellated:
-                if "tessellate_probe_error" in row:
-                    facets = (
-                        "Native tessellation returned zero triangles, and the facet probe still "
-                        "failed when retried on the degenerate geometry"
-                        f" ({row['tessellate_probe_error']})"
-                    )
-                else:
-                    facets = "native tessellation returned zero triangles and zero facets"
+                facets = "native tessellation returned zero triangles and zero facets"
                 if (
                     row["source_rule"]
                     == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO

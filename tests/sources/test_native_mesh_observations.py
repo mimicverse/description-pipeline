@@ -193,7 +193,7 @@ class NativeMeshObservationTests(unittest.TestCase):
                     "triangle_count": 0,
                     "facet_count": 0,
                     "area_m2": 2e-13,
-                    "tessellate_result": False,
+                    "tessellate_result": True,
                     "used_api": NATIVE_FACETLESS_EVIDENCE_API,
                 }
             ],
@@ -232,13 +232,13 @@ class NativeMeshObservationTests(unittest.TestCase):
             self.verify()
         self.assertEqual(0, self.verify("fixture")["components"])
 
-    def test_native_refusal_is_explicit_unqualified_surface_warning(self):
+    def test_native_empty_face_is_explicit_unqualified_surface_warning(self):
         result = self.verify()
         self.assertEqual(result["components"], 1)
         self.assertEqual(result["untessellated_native_area_m2"], 2e-13)
         warning, = result["warnings"]
         self.assertEqual(warning["code"], "cad_sheet_face_untessellated")
-        self.assertFalse(warning["tessellate_result"])
+        self.assertTrue(warning["tessellate_result"])
         self.assertIn("unqualified", warning["qualification"])
 
     def test_source_scope_rejection_is_not_swallowed_by_mesh_consumer(self):
@@ -294,32 +294,22 @@ class NativeMeshObservationTests(unittest.TestCase):
         self.row["tessellation"]["no_facets_faces"][0]["tessellate_result"] = True
         self.assertEqual(len(self.verify()["warnings"]), 1)
 
-    def test_degenerate_probe_error_shape_is_accepted_for_zero_area(self):
-        face = self.row["tessellation"]["no_facets_faces"][0]
-        face.pop("tessellate_result")
-        face.pop("facet_count")
-        face["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION during Tessellate"
-        face["area_m2"] = 1.8716e-13
-        result = self.verify()
-        warning, = result["warnings"]
-        self.assertEqual(warning["code"], "cad_sheet_face_untessellated")
-        self.assertEqual(warning["tessellate_probe_error"], "com_error: DISP_E_EXCEPTION during Tessellate")
-        self.assertNotIn("tessellate_result", warning)
-        self.assertNotIn("facet_count", warning)
-        self.assertEqual(result["untessellated_native_area_m2"], 1.8716e-13)
-        self.assertIn("unqualified", warning["qualification"])
+    def test_legacy_probe_error_variant_is_rejected_at_every_area(self):
+        base = copy.deepcopy(self.row["tessellation"]["no_facets_faces"][0])
+        for area in (0.0, 1.8716e-13, 1e-12, 1.0):
+            with self.subTest(area=area):
+                face = copy.deepcopy(base)
+                face.pop("tessellate_result")
+                face.pop("facet_count")
+                face["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION"
+                face["area_m2"] = area
+                self.row["tessellation"]["no_facets_faces"] = [face]
+                with self.assertRaisesRegex(PipelineError, "malformed untessellated-face observation"):
+                    self.verify()
 
-        self.row = copy.deepcopy(self.row)
-        self.row["tessellation"]["no_facets_faces"][0]["area_m2"] = 1e-12
-        self.assertEqual(len(self.verify()["warnings"]), 1)
-
-    def test_probe_error_shape_is_rejected_above_numerically_zero_area(self):
-        face = self.row["tessellation"]["no_facets_faces"][0]
-        face.pop("tessellate_result")
-        face.pop("facet_count")
-        face["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION"
-        face["area_m2"] = 1e-11
-        with self.assertRaisesRegex(PipelineError, "zero native area"):
+    def test_face_cannot_override_successful_body_tessellation(self):
+        self.row["tessellation"]["no_facets_faces"][0]["tessellate_result"] = False
+        with self.assertRaisesRegex(PipelineError, "contradicts its successful body"):
             self.verify()
 
     def test_probe_error_and_tessellate_result_together_are_rejected(self):
@@ -1846,4 +1836,3 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
             "reciprocal cofin U intervals do not correspond",
         ):
             self.parse(tessellation, triangles)
-

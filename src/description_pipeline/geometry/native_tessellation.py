@@ -6,17 +6,26 @@ import math
 import re
 import struct
 from collections import defaultdict
+from fractions import Fraction
 
 from ..io import PipelineError
 from ..schemas import (
     NATIVE_ID_ARRAY_SOURCE_FLAT,
     NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
     NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
     NATIVE_TESSELLATION_SCHEMA,
 )
 from .native_fin_topology import (
     NativeFinRelationError,
     validate_native_edge_fin_relations,
+)
+from .native_planar_brep import (
+    NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
+    NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
+    NATIVE_PLANAR_BREP_PROVIDER,
+    NATIVE_PLANAR_CONVEX_FAN_RULE,
+    NATIVE_PLANAR_BREP_SCHEMA,
 )
 from .native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
@@ -30,6 +39,8 @@ from .native_u import (
     NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
     NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
+    NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+    NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
     NATIVE_IDENTITY_POLICY_RULE,
     NATIVE_PART_WITNESS_DERIVED,
     NATIVE_SCOPE_IDENTITY_RULE,
@@ -42,6 +53,9 @@ from .native_u import (
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
+    native_binary64_sqrt,
+    native_binary64_sum_upper,
+    native_binary64_unit_vector,
     native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
@@ -776,13 +790,15 @@ def parse_native_tessellation(
     )
     _require(
         isinstance(tessellation, dict)
-        and set(tessellation) == {
+        and set(tessellation)
+        == {
             "schema_version",
             "faces",
             "face_spans",
             "native_edges",
             "no_facets_faces",
             "itessellation",
+            "planar_brep",
         },
         component + ": unknown or legacy tessellation accounting",
     )
@@ -1082,10 +1098,7 @@ def parse_native_tessellation(
                 NATIVE_SCOPE_IDENTITY_RULE,
             }
             and (
-                (
-                    mapped_source_index is None
-                    and mapped_source_reference is None
-                )
+                (mapped_source_index is None and mapped_source_reference is None)
                 or (
                     _integer(mapped_source_index)
                     and mapped_source_index >= 0
@@ -1094,29 +1107,15 @@ def parse_native_tessellation(
                 )
             )
             and (
-                start_reference is None
-                or (
-                    isinstance(start_reference, str)
-                    and bool(HEX64.fullmatch(start_reference))
-                )
+                start_reference is None or (isinstance(start_reference, str) and bool(HEX64.fullmatch(start_reference)))
             )
-            and (
-                end_reference is None
-                or (
-                    isinstance(end_reference, str)
-                    and bool(HEX64.fullmatch(end_reference))
-                )
-            )
+            and (end_reference is None or (isinstance(end_reference, str) and bool(HEX64.fullmatch(end_reference))))
             and (
                 start_point is None
                 or (
                     isinstance(start_point, list)
                     and len(start_point) == 3
-                    and all(
-                        type(value) in (int, float)
-                        and math.isfinite(value)
-                        for value in start_point
-                    )
+                    and all(type(value) in (int, float) and math.isfinite(value) for value in start_point)
                 )
             )
             and (
@@ -1124,21 +1123,12 @@ def parse_native_tessellation(
                 or (
                     isinstance(end_point, list)
                     and len(end_point) == 3
-                    and all(
-                        type(value) in (int, float)
-                        and math.isfinite(value)
-                        for value in end_point
-                    )
+                    and all(type(value) in (int, float) and math.isfinite(value) for value in end_point)
                 )
             )
-            and all(
-                error is None or isinstance(error, str)
-                for error in endpoint_errors
-            )
-            and edge["start_vertex_state"]
-            in {"present", "absent", "read_failed"}
-            and edge["end_vertex_state"]
-            in {"present", "absent", "read_failed"}
+            and all(error is None or isinstance(error, str) for error in endpoint_errors)
+            and edge["start_vertex_state"] in {"present", "absent", "read_failed"}
+            and edge["end_vertex_state"] in {"present", "absent", "read_failed"}
             and type(edge["endpoint_points_derived_from_curve"]) is bool
             and isinstance(edge["face_indices"], list)
             and bool(edge["face_indices"])
@@ -1151,20 +1141,17 @@ def parse_native_tessellation(
             in {
                 NATIVE_ID_ARRAY_SOURCE_FLAT,
                 NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+                NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
             }
             and (
                 (
                     edge["fin_ids_source"] == NATIVE_ID_ARRAY_SOURCE_FLAT
                     and isinstance(edge["raw_fin_ids"], list)
-                    and all(
-                        _integer(value) and value >= 0
-                        for value in edge["raw_fin_ids"]
-                    )
+                    and all(_integer(value) and value >= 0 for value in edge["raw_fin_ids"])
                     and sorted(edge["raw_fin_ids"]) == edge["fin_ids"]
                 )
                 or (
-                    edge["fin_ids_source"]
-                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                    edge["fin_ids_source"] == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
                     and edge["body_type"] == 1
                     and edge["raw_fin_ids"] is None
                     and edge["fin_ids"] == []
@@ -1180,13 +1167,22 @@ def parse_native_tessellation(
                         for face_index in edge["face_indices"]
                     )
                 )
+                or (
+                    edge["fin_ids_source"] == NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP
+                    and edge["body_type"] == 1
+                    and edge["raw_fin_ids"] is None
+                    and edge["fin_ids"] == []
+                )
             )
             and edge["warnings"]
             == (
                 [NATIVE_EDGE_FIN_IDS_DERIVED]
-                if edge["fin_ids_source"]
-                == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
-                else []
+                if edge["fin_ids_source"] == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
+                else (
+                    ["cad_edge_fin_ids_not_applicable_for_planar_brep"]
+                    if edge["fin_ids_source"] == NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP
+                    else []
+                )
             )
             and type(edge["u_min"]) in (int, float)
             and type(edge["u_max"]) in (int, float)
@@ -1195,18 +1191,10 @@ def parse_native_tessellation(
             and edge["u_min"] < edge["u_max"]
             and isinstance(edge["curve_start_point_m"], list)
             and len(edge["curve_start_point_m"]) == 3
-            and all(
-                type(value) in (int, float)
-                and math.isfinite(value)
-                for value in edge["curve_start_point_m"]
-            )
+            and all(type(value) in (int, float) and math.isfinite(value) for value in edge["curve_start_point_m"])
             and isinstance(edge["curve_end_point_m"], list)
             and len(edge["curve_end_point_m"]) == 3
-            and all(
-                type(value) in (int, float)
-                and math.isfinite(value)
-                for value in edge["curve_end_point_m"]
-            )
+            and all(type(value) in (int, float) and math.isfinite(value) for value in edge["curve_end_point_m"])
             and type(edge["curve_sense"]) is bool
             and _integer(edge["curve_type"])
             and edge["curve_type"] >= 0
@@ -1657,6 +1645,16 @@ def parse_native_tessellation(
         ),
         component + ": body, face, edge and vertex identities must not alias",
     )
+    planar_bodies = _parse_planar_brep_evidence(
+        component,
+        tessellation["planar_brep"],
+        spans_by_body,
+        face_spans_by_key,
+        native_edges,
+        body_references,
+        expected_bodies,
+        triangle_vertices,
+    )
     _parse_itessellation_evidence(
         component,
         tessellation["itessellation"],
@@ -1664,13 +1662,890 @@ def parse_native_tessellation(
         face_spans_by_key,
         native_edges,
         body_references,
-        expected_bodies,
         triangles,
         triangle_vertices,
         native_fin_resolutions,
         native_identity_warnings,
+        expected_bodies - planar_bodies,
     )
     return spans
+
+
+def _finite_number(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _finite_point(value) -> bool:
+    return isinstance(value, list) and len(value) == 3 and all(_finite_number(coordinate) for coordinate in value)
+
+
+def _fraction_point(value):
+    return tuple(Fraction.from_float(float(coordinate)) for coordinate in value)
+
+
+def _fraction_vector(value):
+    return tuple(Fraction.from_float(float(item)) for item in value)
+
+
+def _vector_cross(first, second):
+    return (
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    )
+
+
+def _vector_difference(first, second):
+    return tuple(second[index] - first[index] for index in range(3))
+
+
+def _cross2(first, second, third) -> Fraction:
+    return (second[0] - first[0]) * (third[1] - first[1]) - (second[1] - first[1]) * (third[0] - first[0])
+
+
+def _point_on_segment(point, start, end) -> bool:
+    return (
+        _cross2(start, end, point) == 0
+        and min(start[0], end[0]) <= point[0] <= max(start[0], end[0])
+        and min(start[1], end[1]) <= point[1] <= max(start[1], end[1])
+    )
+
+
+def _segments_intersect(first, second) -> bool:
+    a, b = first
+    c, d = second
+    ab_c = _cross2(a, b, c)
+    ab_d = _cross2(a, b, d)
+    cd_a = _cross2(c, d, a)
+    cd_b = _cross2(c, d, b)
+    if ((ab_c > 0 and ab_d < 0) or (ab_c < 0 and ab_d > 0)) and ((cd_a > 0 and cd_b < 0) or (cd_a < 0 and cd_b > 0)):
+        return True
+    return (
+        (ab_c == 0 and _point_on_segment(c, a, b))
+        or (ab_d == 0 and _point_on_segment(d, a, b))
+        or (cd_a == 0 and _point_on_segment(a, c, d))
+        or (cd_b == 0 and _point_on_segment(b, c, d))
+    )
+
+
+def _segment_line_intersection(start, end, line_start, line_end):
+    direction = (
+        end[0] - start[0],
+        end[1] - start[1],
+    )
+    line_direction = (
+        line_end[0] - line_start[0],
+        line_end[1] - line_start[1],
+    )
+    denominator = direction[0] * line_direction[1] - direction[1] * line_direction[0]
+    if denominator == 0:
+        return end
+    offset = (
+        line_start[0] - start[0],
+        line_start[1] - start[1],
+    )
+    parameter = (offset[0] * line_direction[1] - offset[1] * line_direction[0]) / denominator
+    return (
+        start[0] + parameter * direction[0],
+        start[1] + parameter * direction[1],
+    )
+
+
+def _clip_convex_polygon(subject, clip):
+    output = list(subject)
+    for index, clip_start in enumerate(clip):
+        clip_end = clip[(index + 1) % len(clip)]
+        source = output
+        output = []
+        if not source:
+            break
+        previous = source[-1]
+        previous_inside = _cross2(clip_start, clip_end, previous) >= 0
+        for current in source:
+            current_inside = _cross2(clip_start, clip_end, current) >= 0
+            if current_inside is not previous_inside:
+                output.append(
+                    _segment_line_intersection(
+                        previous,
+                        current,
+                        clip_start,
+                        clip_end,
+                    )
+                )
+            if current_inside:
+                output.append(current)
+            previous = current
+            previous_inside = current_inside
+    return output
+
+
+def _polygon_area2(points) -> Fraction:
+    return sum(
+        points[index][0] * points[(index + 1) % len(points)][1]
+        - points[index][1] * points[(index + 1) % len(points)][0]
+        for index in range(len(points))
+    )
+
+
+def _triangles_overlap(first, second) -> bool:
+    intersection = _clip_convex_polygon(first, second)
+    return len(intersection) >= 3 and _polygon_area2(intersection) > 0
+
+
+def _outward_sqrt(value: Fraction) -> float:
+    return native_binary64_sqrt(value, upward=True)
+
+
+def _binary32_point(point):
+    try:
+        packed = struct.pack(
+            "<3f",
+            *(float(coordinate) for coordinate in point),
+        )
+    except (OverflowError, struct.error) as error:
+        raise PipelineError("planar provider point is outside binary32") from error
+    return struct.unpack("<3f", packed)
+
+
+def _projected_boundary(points, face_normal):
+    axis = max(range(3), key=lambda index: abs(face_normal[index]))
+    first = (axis + 1) % 3
+    second = (axis + 2) % 3
+    return (
+        face_normal[axis],
+        tuple(
+            (
+                Fraction.from_float(point[first]),
+                Fraction.from_float(point[second]),
+            )
+            for point in points
+        ),
+    )
+
+
+def _plane_residual_squared(point, plane_point, plane_normal):
+    normal = tuple(Fraction.from_float(value) for value in plane_normal)
+    numerator = sum(
+        normal[index] * (Fraction.from_float(point[index]) - Fraction.from_float(plane_point[index]))
+        for index in range(3)
+    )
+    return numerator * numerator / sum(value * value for value in normal)
+
+
+def _parse_planar_brep_evidence(
+    component: str,
+    value: object,
+    spans_by_body: dict,
+    face_spans_by_key: dict,
+    native_edges: list[dict],
+    body_references: dict,
+    expected_bodies: set,
+    triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None,
+) -> set:
+    """Validate planar provider facts and return the bodies it covers."""
+
+    _require(
+        isinstance(value, dict)
+        and set(value) == {"schema_version", "bodies"}
+        and value["schema_version"] == NATIVE_PLANAR_BREP_SCHEMA
+        and isinstance(value["bodies"], list),
+        component + ": native planar BRep evidence is missing or unsupported",
+    )
+    raw_bodies = value["bodies"]
+    body_required = {
+        "provider",
+        "schema_version",
+        "body_type",
+        "body_index",
+        "body_reference_sha256",
+        "native_body_reference_sha256",
+        "face_index",
+        "face_reference_sha256",
+        "native_face_reference_sha256",
+        "face_area_m2",
+        "warnings",
+        "surface",
+        "loop",
+        "boundary_vertices",
+        "triangulation",
+    }
+    coedge_required = {
+        "coedge_index",
+        "edge_index",
+        "edge_reference_sha256",
+        "native_edge_reference_sha256",
+        "edge_is_line",
+        "edge_line_params",
+        "coedge_line_params",
+        "line_orientation",
+        "same_direction_as_edge",
+        "tangent_direction_rule",
+        "start_parameter",
+        "end_parameter",
+        "parameter_order",
+        "start_point_m",
+        "end_point_m",
+        "start_vertex_reference_sha256",
+        "end_vertex_reference_sha256",
+        "start_vertex_point_m",
+        "end_vertex_point_m",
+        "start_vertex_point_error_m",
+        "end_vertex_point_error_m",
+        "start_vertex_point_tolerance_m",
+        "end_vertex_point_tolerance_m",
+        "curve_params_raw",
+        "evaluations",
+        "coedge_curve_present",
+    }
+    evaluation_required = {
+        "endpoint",
+        "rule_version",
+        "parameter",
+        "point_m",
+        "tangent",
+        "point_error_m",
+        "point_tolerance_m",
+    }
+    boundary_required = {
+        "vertex_index",
+        "vertex_reference_sha256",
+        "point_m",
+    }
+    triangle_required = {
+        "triangle_index",
+        "vertex_indices",
+        "native_points",
+        "stl_points",
+    }
+    covered_bodies = set()
+    previous_body = None
+    for body_index, body in enumerate(raw_bodies):
+        _require(
+            isinstance(body, dict) and set(body) == body_required,
+            component + f": native planar BRep body {body_index} has an unknown shape",
+        )
+        body_key = (body["body_type"], body["body_index"])
+        _require(
+            body["provider"] == NATIVE_PLANAR_BREP_PROVIDER
+            and body["schema_version"] == NATIVE_PLANAR_BREP_SCHEMA
+            and _integer(body["body_type"])
+            and body["body_type"] == 1
+            and _integer(body["body_index"])
+            and body["body_index"] >= 0
+            and body_key in expected_bodies
+            and (previous_body is None or body_key > previous_body),
+            component + f": native planar BRep body {body_index} has an unsupported identity",
+        )
+        previous_body = body_key
+        _require(
+            body_key not in covered_bodies,
+            component + f": native planar BRep body {body_key} is duplicated",
+        )
+        covered_bodies.add(body_key)
+        body_reference = body["body_reference_sha256"]
+        native_body_reference = body["native_body_reference_sha256"]
+        _require(
+            isinstance(body_reference, str)
+            and bool(HEX64.fullmatch(body_reference))
+            and body_reference == body_references[body_key]
+            and isinstance(native_body_reference, str)
+            and bool(HEX64.fullmatch(native_body_reference))
+            and _finite_number(body["face_area_m2"])
+            and body["face_area_m2"] > 0.0
+            and body["warnings"]
+            == [
+                NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+                NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+            ],
+            component + f": native planar BRep body {body_key} is malformed",
+        )
+        body_spans = spans_by_body[body_key]
+        _require(
+            len(body_spans) == 1
+            and body_spans[0]["face_index"] == body["face_index"]
+            and body_spans[0]["face_reference_sha256"] == body["face_reference_sha256"]
+            and body_spans[0]["native_face_reference_sha256"] == body["native_face_reference_sha256"],
+            component + f": native planar BRep body {body_key} does not bind one face",
+        )
+        span = body_spans[0]
+        face_key = (*body_key, body["face_index"])
+        _require(
+            face_key in face_spans_by_key,
+            component + f": native planar BRep body {body_key} names an unknown face",
+        )
+
+        surface = body["surface"]
+        _require(
+            isinstance(surface, dict)
+            and set(surface)
+            == {
+                "is_plane",
+                "plane_params",
+                "face_in_surface_sense",
+                "face_normal_raw",
+                "face_normal_unit",
+            }
+            and surface["is_plane"] is True
+            and isinstance(surface["plane_params"], list)
+            and len(surface["plane_params"]) == 6
+            and all(_finite_number(parameter) for parameter in surface["plane_params"])
+            and math.hypot(*surface["plane_params"][:3]) > 0.0
+            and type(surface["face_in_surface_sense"]) is bool
+            and _finite_point(surface["face_normal_raw"])
+            and _finite_point(surface["face_normal_unit"]),
+            component + f": native planar BRep surface is malformed for body {body_key}",
+        )
+        raw_normal = surface["plane_params"][:3]
+        expected_face_normal_raw = [(-value if surface["face_in_surface_sense"] else value) for value in raw_normal]
+        expected_face_normal_unit = list(native_binary64_unit_vector(expected_face_normal_raw))
+        _require(
+            surface["face_normal_raw"] == expected_face_normal_raw
+            and surface["face_normal_unit"] == expected_face_normal_unit,
+            component + f": native planar BRep face normal is inconsistent for body {body_key}",
+        )
+
+        loop = body["loop"]
+        _require(
+            isinstance(loop, dict)
+            and set(loop) == {"outer", "reference_sha256", "coedges"}
+            and loop["outer"] is True
+            and isinstance(loop["reference_sha256"], str)
+            and bool(HEX64.fullmatch(loop["reference_sha256"]))
+            and isinstance(loop["coedges"], list)
+            and len(loop["coedges"]) >= 3,
+            component + f": native planar BRep outer loop is malformed for body {body_key}",
+        )
+        native_edges_for_body = [edge for edge in native_edges if (edge["body_type"], edge["body_index"]) == body_key]
+        edge_by_reference = {edge["edge_reference_sha256"]: edge for edge in native_edges_for_body}
+        _require(
+            set(span["edge_references"]) == set(edge_by_reference) and bool(edge_by_reference),
+            component + f": native planar BRep face does not close its body edges for {body_key}",
+        )
+        coedges = loop["coedges"]
+        _require(
+            len(coedges) == len(edge_by_reference),
+            component + f": native planar BRep loop and edge counts differ for body {body_key}",
+        )
+        boundary_points = []
+        boundary_references = []
+        source_error_squared = Fraction(0, 1)
+        seen_edges = set()
+        for coedge_index, coedge in enumerate(coedges):
+            _require(
+                isinstance(coedge, dict) and set(coedge) == coedge_required,
+                component + f": native planar BRep coedge {coedge_index} has an unknown shape",
+            )
+            edge_reference = coedge["edge_reference_sha256"]
+            edge = edge_by_reference.get(edge_reference)
+            _require(
+                coedge["coedge_index"] == coedge_index
+                and coedge["edge_is_line"] is True
+                and type(coedge["same_direction_as_edge"]) is bool
+                and coedge["tangent_direction_rule"] == NATIVE_PLANAR_COEDGE_DIRECTION_RULE
+                and type(coedge["coedge_curve_present"]) is bool
+                and _integer(coedge["edge_index"])
+                and coedge["edge_index"] >= 0
+                and isinstance(coedge["native_edge_reference_sha256"], str)
+                and bool(HEX64.fullmatch(coedge["native_edge_reference_sha256"]))
+                and edge_reference not in seen_edges
+                and isinstance(edge, dict)
+                and edge["native_edge_reference_sha256"] == coedge["native_edge_reference_sha256"]
+                and edge["fin_ids_source"] == NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP
+                and edge["fin_ids"] == []
+                and edge["raw_fin_ids"] is None
+                and _finite_number(coedge["start_parameter"])
+                and _finite_number(coedge["end_parameter"])
+                and coedge["parameter_order"]
+                == ("increasing" if coedge["start_parameter"] < coedge["end_parameter"] else "decreasing")
+                and coedge["start_parameter"] != coedge["end_parameter"]
+                and edge["u_min"] <= coedge["start_parameter"] <= edge["u_max"]
+                and edge["u_min"] <= coedge["end_parameter"] <= edge["u_max"]
+                and _finite_point(coedge["start_point_m"])
+                and _finite_point(coedge["end_point_m"]),
+                component + f": native planar BRep coedge {coedge_index} is malformed for body {body_key}",
+            )
+            edge_line_raw = coedge["edge_line_params"]
+            coedge_line_raw = coedge["coedge_line_params"]
+            _require(
+                isinstance(edge_line_raw, list)
+                and len(edge_line_raw) == 6
+                and all(_finite_number(item) for item in edge_line_raw)
+                and (
+                    (
+                        coedge["coedge_curve_present"] is True
+                        and isinstance(coedge_line_raw, list)
+                        and len(coedge_line_raw) == 6
+                        and all(_finite_number(item) for item in coedge_line_raw)
+                    )
+                    or (
+                        coedge["coedge_curve_present"] is False
+                        and coedge_line_raw is None
+                        and coedge["line_orientation"] == "not_observed"
+                    )
+                ),
+                component + f": native planar line parameters are malformed for coedge {coedge_index}",
+            )
+            edge_line = _fraction_vector(edge_line_raw)
+            edge_direction = edge_line[3:6]
+            coedge_line = None if coedge_line_raw is None else _fraction_vector(coedge_line_raw)
+            coedge_direction = None if coedge_line is None else coedge_line[3:6]
+            trim_points = (
+                _fraction_point(coedge["start_point_m"]),
+                _fraction_point(coedge["end_point_m"]),
+            )
+            line_dot = (
+                sum(edge_direction[index] * coedge_direction[index] for index in range(3))
+                if coedge_direction is not None
+                else 0
+            )
+            _require(
+                any(edge_direction)
+                and (
+                    coedge_direction is None
+                    or (
+                        any(coedge_direction)
+                        and _vector_cross(
+                            edge_direction,
+                            coedge_direction,
+                        )
+                        == (0, 0, 0)
+                        and _vector_cross(
+                            edge_direction,
+                            _vector_difference(
+                                edge_line[:3],
+                                coedge_line[:3],
+                            ),
+                        )
+                        == (0, 0, 0)
+                    )
+                )
+                and all(
+                    _vector_cross(
+                        edge_direction,
+                        _vector_difference(edge_line[:3], point),
+                    )
+                    == (0, 0, 0)
+                    for point in trim_points
+                )
+                and coedge["line_orientation"]
+                == ("not_observed" if coedge_direction is None else ("same" if line_dot > 0 else "opposite")),
+                component + f": native planar edge, coedge, and trim lines differ for coedge {coedge_index}",
+            )
+            seen_edges.add(edge_reference)
+            raw_curve_params = coedge["curve_params_raw"]
+            _require(
+                isinstance(raw_curve_params, list)
+                and len(raw_curve_params) == 10
+                and all(_finite_number(parameter) for parameter in raw_curve_params[:8])
+                and raw_curve_params[6] == coedge["start_parameter"]
+                and raw_curve_params[7] == coedge["end_parameter"]
+                and raw_curve_params[:3] == coedge["start_point_m"]
+                and raw_curve_params[3:6] == coedge["end_point_m"],
+                component + f": native planar BRep curve parameters differ for coedge {coedge_index}",
+            )
+            expected_edge_point = edge["start_point_m"] if coedge["same_direction_as_edge"] else edge["end_point_m"]
+            expected_edge_end = edge["end_point_m"] if coedge["same_direction_as_edge"] else edge["start_point_m"]
+            start_tolerance = native_point_roundtrip_tolerance(
+                coedge["start_point_m"],
+                expected_edge_point,
+            )
+            end_tolerance = native_point_roundtrip_tolerance(
+                coedge["end_point_m"],
+                expected_edge_end,
+            )
+            _require(
+                native_point_error(
+                    coedge["start_point_m"],
+                    expected_edge_point,
+                )
+                <= start_tolerance
+                and native_point_error(
+                    coedge["end_point_m"],
+                    expected_edge_end,
+                )
+                <= end_tolerance,
+                component + f": native planar BRep coedge {coedge_index} contradicts edge direction",
+            )
+            for endpoint, trim_point, vertex_point, vertex_tolerance in (
+                (
+                    "start",
+                    coedge["start_point_m"],
+                    coedge["start_vertex_point_m"],
+                    start_tolerance,
+                ),
+                (
+                    "end",
+                    coedge["end_point_m"],
+                    coedge["end_vertex_point_m"],
+                    end_tolerance,
+                ),
+            ):
+                computed_error = native_point_error(
+                    trim_point,
+                    vertex_point,
+                )
+                computed_tolerance = native_point_roundtrip_tolerance(
+                    trim_point,
+                    vertex_point,
+                )
+                _require(
+                    _finite_point(vertex_point)
+                    and coedge[f"{endpoint}_vertex_point_error_m"] == computed_error
+                    and coedge[f"{endpoint}_vertex_point_tolerance_m"] == computed_tolerance
+                    and computed_tolerance == vertex_tolerance
+                    and computed_error <= computed_tolerance,
+                    component
+                    + f": native planar BRep coedge {coedge_index} {endpoint} vertex displacement is not reproducible",
+                )
+                source_error_squared = max(
+                    source_error_squared,
+                    sum(
+                        (Fraction.from_float(trim_point[axis]) - Fraction.from_float(vertex_point[axis])) ** 2
+                        for axis in range(3)
+                    ),
+                )
+            evaluations = coedge["evaluations"]
+            _require(
+                isinstance(evaluations, list) and len(evaluations) == 2,
+                component + f": native planar BRep coedge {coedge_index} lacks endpoint evaluations",
+            )
+            for evaluation_index, (endpoint, expected_point) in enumerate(
+                (
+                    ("start", coedge["start_point_m"]),
+                    ("end", coedge["end_point_m"]),
+                )
+            ):
+                evaluation = evaluations[evaluation_index]
+                opposite_point = coedge["end_point_m"] if endpoint == "start" else coedge["start_point_m"]
+                _require(
+                    isinstance(evaluation, dict)
+                    and set(evaluation) == evaluation_required
+                    and evaluation["endpoint"] == endpoint
+                    and evaluation["rule_version"] == NATIVE_PLANAR_COEDGE_EVALUATION_RULE
+                    and evaluation["parameter"] == coedge[f"{endpoint}_parameter"]
+                    and _finite_point(evaluation["point_m"])
+                    and _finite_point(evaluation["tangent"])
+                    and math.hypot(*evaluation["tangent"]) > 0.0,
+                    component + f": native planar BRep coedge {coedge_index} {endpoint} evaluation is inconsistent",
+                )
+                computed_tolerance = native_curve_endpoint_operation_tolerance(
+                    expected_point,
+                    evaluation["point_m"],
+                    opposite_point,
+                )
+                computed_error = native_point_error(
+                    expected_point,
+                    evaluation["point_m"],
+                )
+                _require(
+                    _finite_number(evaluation["point_error_m"])
+                    and evaluation["point_error_m"] == computed_error
+                    and _finite_number(evaluation["point_tolerance_m"])
+                    and evaluation["point_tolerance_m"] == computed_tolerance
+                    and computed_error <= computed_tolerance,
+                    component
+                    + f": native planar BRep coedge {coedge_index} {endpoint} evaluation bound is not reproducible",
+                )
+            segment = _vector_difference(
+                _fraction_point(coedge["start_point_m"]),
+                _fraction_point(coedge["end_point_m"]),
+            )
+            _require(
+                all(
+                    _vector_cross(segment, _fraction_point(row["tangent"])) == (0, 0, 0)
+                    and sum(segment[axis] * Fraction.from_float(row["tangent"][axis]) for axis in range(3)) > 0
+                    for row in evaluations
+                ),
+                component + f": native planar BRep coedge {coedge_index} tangent contradicts its boundary line",
+            )
+            start_reference = coedge["start_vertex_reference_sha256"]
+            end_reference = coedge["end_vertex_reference_sha256"]
+            _require(
+                isinstance(start_reference, str)
+                and bool(HEX64.fullmatch(start_reference))
+                and isinstance(end_reference, str)
+                and bool(HEX64.fullmatch(end_reference))
+                and start_reference != end_reference,
+                component + f": native planar BRep coedge {coedge_index} has invalid vertex identities",
+            )
+            boundary_references.append(start_reference)
+            boundary_points.append(tuple(coedge["start_point_m"]))
+        _require(
+            seen_edges == set(edge_by_reference),
+            component + f": native planar BRep loop does not cover every body edge for {body_key}",
+        )
+        for coedge_index, coedge in enumerate(coedges):
+            next_coedge = coedges[(coedge_index + 1) % len(coedges)]
+            _require(
+                coedge["end_vertex_reference_sha256"] == next_coedge["start_vertex_reference_sha256"]
+                and native_point_error(
+                    coedge["end_point_m"],
+                    next_coedge["start_point_m"],
+                )
+                <= native_point_roundtrip_tolerance(
+                    coedge["end_point_m"],
+                    next_coedge["start_point_m"],
+                ),
+                component + f": native planar BRep loop is open at coedge {coedge_index}",
+            )
+        _require(
+            len(set(boundary_references)) == len(boundary_references),
+            component + f": native planar BRep repeats a boundary vertex for {body_key}",
+        )
+        expected_loop_reference = native_scope_identity_sha256(
+            {
+                "rule": f"{NATIVE_PLANAR_BREP_PROVIDER}/loop",
+                "face_reference_sha256": span["face_reference_sha256"],
+                "edge_references": [coedge["edge_reference_sha256"] for coedge in coedges],
+            }
+        )
+        _require(
+            loop["reference_sha256"] == expected_loop_reference,
+            component + f": native planar BRep loop identity is not reproducible for {body_key}",
+        )
+
+        boundary_vertices = body["boundary_vertices"]
+        _require(
+            isinstance(boundary_vertices, list) and len(boundary_vertices) == len(boundary_points),
+            component + f": native planar BRep boundary inventory is incomplete for {body_key}",
+        )
+        for vertex_index, row in enumerate(boundary_vertices):
+            _require(
+                isinstance(row, dict)
+                and set(row) == boundary_required
+                and row["vertex_index"] == vertex_index
+                and row["vertex_reference_sha256"] == boundary_references[vertex_index]
+                and row["point_m"] == list(boundary_points[vertex_index]),
+                component + f": native planar BRep boundary vertex {vertex_index} is inconsistent",
+            )
+
+        triangulation = body["triangulation"]
+        _require(
+            isinstance(triangulation, dict)
+            and set(triangulation)
+            == {
+                "rule_version",
+                "face_normal",
+                "error_components_m",
+                "surface_error_upper_bound_m",
+                "surface_error_limit_m",
+                "boundary_area_m2",
+                "triangles",
+            }
+            and isinstance(triangulation["triangles"], list),
+            component + f": native planar BRep triangulation is malformed for {body_key}",
+        )
+        computed_face_normal = tuple(surface["face_normal_unit"])
+        projected_normal, projected_boundary = _projected_boundary(
+            boundary_points,
+            computed_face_normal,
+        )
+        _require(
+            projected_normal != 0.0,
+            component + ": planar normal has no projection",
+        )
+        orientation_sign = 1 if projected_normal > 0 else -1
+        boundary_area2_signed = _polygon_area2(projected_boundary)
+        _require(
+            boundary_area2_signed != 0 and orientation_sign * boundary_area2_signed > 0,
+            component + f": native planar BRep boundary does not follow face orientation for {body_key}",
+        )
+        turns = [
+            _cross2(
+                projected_boundary[index],
+                projected_boundary[(index + 1) % len(projected_boundary)],
+                projected_boundary[(index + 2) % len(projected_boundary)],
+            )
+            for index in range(len(projected_boundary))
+        ]
+        _require(
+            all(turn * orientation_sign > 0 for turn in turns),
+            component + f": native planar BRep boundary is not strictly convex for {body_key}",
+        )
+        for first_index in range(len(projected_boundary)):
+            first = (
+                projected_boundary[first_index],
+                projected_boundary[(first_index + 1) % len(projected_boundary)],
+            )
+            for second_index in range(
+                first_index + 1,
+                len(projected_boundary),
+            ):
+                if second_index in {
+                    first_index,
+                    (first_index + 1) % len(projected_boundary),
+                } or first_index in {
+                    second_index,
+                    (second_index + 1) % len(projected_boundary),
+                }:
+                    continue
+                second = (
+                    projected_boundary[second_index],
+                    projected_boundary[(second_index + 1) % len(projected_boundary)],
+                )
+                _require(
+                    not _segments_intersect(first, second),
+                    component + f": native planar BRep boundary self-intersects for {body_key}",
+                )
+
+        plane_point = tuple(float(value) for value in surface["plane_params"][3:6])
+        plane_residual_squared = max(
+            _plane_residual_squared(
+                point,
+                plane_point,
+                surface["plane_params"][:3],
+            )
+            for point in boundary_points
+        )
+        _require(
+            plane_residual_squared == 0,
+            component + f": native planar BRep boundary conflicts with its plane for {body_key}",
+        )
+        triangles = triangulation["triangles"]
+        _require(
+            len(triangles) == span["triangle_count"],
+            component + f": native planar BRep triangle count differs from its face span for {body_key}",
+        )
+        _require(
+            triangulation["rule_version"] == NATIVE_PLANAR_CONVEX_FAN_RULE
+            and triangulation["face_normal"] == list(computed_face_normal),
+            component + f": native planar BRep triangulation rule or normal differs for {body_key}",
+        )
+        normal_exact = _fraction_point(surface["face_normal_raw"])
+        dominant_axis = max(range(3), key=lambda axis: abs(computed_face_normal[axis]))
+        boundary_area = native_binary64_sqrt(
+            boundary_area2_signed**2 * sum(value**2 for value in normal_exact) / (4 * normal_exact[dominant_axis] ** 2)
+        )
+        _require(
+            triangulation["boundary_area_m2"] == boundary_area,
+            component + f": native planar BRep boundary area is not reproducible for {body_key}",
+        )
+        _require(
+            body["face_area_m2"] == boundary_area,
+            component + f": native planar BRep face and boundary areas conflict for {body_key}",
+        )
+        triangle_polygons = []
+        triangle_area2 = Fraction(0, 1)
+        binary32_error_squared = Fraction(0, 1)
+        directed_edges = defaultdict(int)
+        boundary_directed_edges = {(index, (index + 1) % len(boundary_points)) for index in range(len(boundary_points))}
+        for expected_index, triangle in enumerate(triangles):
+            _require(
+                isinstance(triangle, dict)
+                and set(triangle) == triangle_required
+                and triangle["triangle_index"] == expected_index
+                and isinstance(triangle["vertex_indices"], list)
+                and len(triangle["vertex_indices"]) == 3
+                and all(
+                    _integer(vertex_index) and 0 <= vertex_index < len(boundary_points)
+                    for vertex_index in triangle["vertex_indices"]
+                )
+                and len(set(triangle["vertex_indices"])) == 3
+                and isinstance(triangle["native_points"], list)
+                and len(triangle["native_points"]) == 3
+                and all(_finite_point(point) for point in triangle["native_points"])
+                and isinstance(triangle["stl_points"], list)
+                and len(triangle["stl_points"]) == 3
+                and all(_finite_point(point) for point in triangle["stl_points"])
+                and all(
+                    tuple(triangle["native_points"][position]) == boundary_points[vertex_index]
+                    for position, vertex_index in enumerate(triangle["vertex_indices"])
+                ),
+                component + f": native planar BRep triangle {expected_index} is malformed",
+            )
+            _, projected_triangle = _projected_boundary(
+                triangle["native_points"],
+                computed_face_normal,
+            )
+            triangle_orientation = _cross2(
+                projected_triangle[0],
+                projected_triangle[1],
+                projected_triangle[2],
+            )
+            _require(
+                triangle_orientation * orientation_sign > 0,
+                component + f": native planar BRep triangle {expected_index} reverses orientation",
+            )
+            native_triangle = tuple(_fraction_point(point) for point in triangle["native_points"])
+            for position in range(3):
+                expected_stl_point = _binary32_point(triangle["native_points"][position])
+                _require(
+                    expected_stl_point == tuple(triangle["stl_points"][position]),
+                    component
+                    + f": native planar BRep triangle {expected_index} "
+                    + "does not contain the exact binary32 point",
+                )
+                binary32_error_squared = max(
+                    binary32_error_squared,
+                    sum(
+                        (Fraction.from_float(triangle["stl_points"][position][axis]) - native_triangle[position][axis])
+                        ** 2
+                        for axis in range(3)
+                    ),
+                )
+            triangle_area2 += triangle_orientation * orientation_sign
+            triangle_polygons.append(projected_triangle)
+            first, second, third = triangle["vertex_indices"]
+            for edge in (
+                (first, second),
+                (second, third),
+                (third, first),
+            ):
+                directed_edges[edge] += 1
+            if triangle_vertices is not None:
+                stl_record = triangle_vertices[span["triangle_start"] + expected_index]
+                _require(
+                    [list(point) for point in stl_record] == triangle["stl_points"],
+                    component + f": native planar BRep triangle {expected_index} " + "does not bind its STL record",
+                )
+        _require(
+            all(directed_edges[edge] == 1 for edge in boundary_directed_edges)
+            and set(boundary_directed_edges) <= set(directed_edges),
+            component + f": native planar BRep triangles do not cover every directed boundary edge for {body_key}",
+        )
+        for edge, count in directed_edges.items():
+            if edge in boundary_directed_edges:
+                _require(
+                    count == 1,
+                    component + f": native planar BRep repeats a boundary edge for {body_key}",
+                )
+                continue
+            _require(
+                count == 1 and directed_edges[tuple(reversed(edge))] == 1,
+                component + f": native planar BRep internal edges are not reciprocal for {body_key}",
+            )
+        _require(
+            triangle_area2 == abs(boundary_area2_signed),
+            component + f": native planar BRep triangles do not preserve boundary area for {body_key}",
+        )
+        for first_index, first_triangle in enumerate(triangle_polygons):
+            for second_triangle in triangle_polygons[first_index + 1 :]:
+                _require(
+                    not _triangles_overlap(
+                        first_triangle,
+                        second_triangle,
+                    ),
+                    component + f": native planar BRep triangles overlap for {body_key}",
+                )
+        surface_error_limit = Fraction.from_float(NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M)
+        error_components = {
+            "native_plane_residual": _outward_sqrt(plane_residual_squared),
+            "constructive_vertex_displacement": 0.0,
+            "cross_api_vertex_displacement": _outward_sqrt(source_error_squared),
+            "binary32_vertex_displacement": _outward_sqrt(binary32_error_squared),
+        }
+        surface_error_bound = native_binary64_sum_upper(error_components.values())
+        _require(
+            Fraction.from_float(surface_error_bound) <= surface_error_limit,
+            component + f": native planar BRep complete surface bound exceeds its limit for {body_key}",
+        )
+        _require(
+            triangulation["error_components_m"] == error_components
+            and triangulation["surface_error_upper_bound_m"] == surface_error_bound
+            and triangulation["surface_error_limit_m"] == NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+            component + f": native planar BRep surface bound is not reproducible for {body_key}",
+        )
+    return covered_bodies
 
 
 def _parse_itessellation_evidence(
@@ -1680,11 +2555,11 @@ def _parse_itessellation_evidence(
     face_spans_by_key: dict,
     native_edges: list[dict],
     body_references: dict,
-    expected_bodies: set,
     triangles: int,
     triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None,
     native_fin_resolutions: list[dict] | None,
     native_identity_warnings: list[dict] | None,
+    itessellation_bodies: set,
 ) -> None:
     """Validate body-local ITessellation facet/fin evidence fail closed."""
 
@@ -1926,8 +2801,8 @@ def _parse_itessellation_evidence(
         )
     raw_bodies = value["bodies"]
     _require(
-        isinstance(raw_bodies, list) and bool(raw_bodies),
-        component + ": native tessellation body evidence is missing",
+        isinstance(raw_bodies, list),
+        component + ": native ITessellation body evidence is missing",
     )
 
     body_evidence = {}
@@ -1978,7 +2853,7 @@ def _parse_itessellation_evidence(
             and body_key[0] in (0, 1)
             and _integer(body_key[1])
             and body_key[1] >= 0
-            and body_key in expected_bodies,
+            and body_key in itessellation_bodies,
             component + f": native tessellation body {index} is unknown",
         )
         _require(
@@ -2036,8 +2911,8 @@ def _parse_itessellation_evidence(
             "vertex_count": body["vertex_count"],
         }
     _require(
-        set(body_evidence) == expected_bodies,
-        component + ": native tessellation evidence does not cover every body",
+        set(body_evidence) == itessellation_bodies,
+        component + ": native ITessellation evidence does not cover every assigned body",
     )
 
     raw_vertices = value["vertices"]
@@ -2148,15 +3023,12 @@ def _parse_itessellation_evidence(
             and row["body_type"] in (0, 1)
             and _integer(row["body_index"])
             and row["body_index"] >= 0
-            and body_key in body_evidence
+            and body_key in body_references
             and _integer(row["vertex_index"])
             and row["vertex_index"] >= 0
             and isinstance(point, list)
             and len(point) == 3
-            and all(
-                type(value) in (int, float) and math.isfinite(value)
-                for value in point
-            )
+            and all(type(value) in (int, float) and math.isfinite(value) for value in point)
             and identity_mode
             in {
                 NATIVE_PERSISTENT_IDENTITY_RULE,
@@ -2168,8 +3040,7 @@ def _parse_itessellation_evidence(
             and isinstance(row["native_reference_sha256"], str)
             and bool(HEX64.fullmatch(row["native_reference_sha256"]))
             and identity_valid,
-            component
-            + f": native scope-local vertex {index} is malformed",
+            component + f": native scope-local vertex {index} is malformed",
         )
         order = (*body_key, row["vertex_index"])
         _require(
@@ -2759,6 +3630,11 @@ def _parse_itessellation_evidence(
                 in scope_vertex_keys
             )
             for edge in native_edges
+            if (
+                edge["body_type"],
+                edge["body_index"],
+            )
+            in itessellation_bodies
         ),
         component + ": an edge endpoint is not a captured scope-local vertex",
     )
@@ -3545,7 +4421,9 @@ def summarize_native_topology(
         isinstance(tessellation, dict) and isinstance(spans, list),
         "native topology summary received malformed evidence",
     )
-    raw_bodies = (tessellation.get("itessellation") or {}).get("bodies")
+    itessellation_bodies = (tessellation.get("itessellation") or {}).get("bodies") or []
+    planar_bodies = (tessellation.get("planar_brep") or {}).get("bodies") or []
+    raw_bodies = [*itessellation_bodies, *planar_bodies]
     _require(
         isinstance(raw_bodies, list) and bool(raw_bodies),
         "native topology summary has no native bodies",
@@ -3561,6 +4439,11 @@ def summarize_native_topology(
             "native topology summary has malformed body identity",
         )
         body_counts["solid" if body["body_type"] == 0 else "sheet"] += 1
+    body_keys = [(body["body_type"], body["body_index"]) for body in raw_bodies]
+    _require(
+        len(set(body_keys)) == len(body_keys),
+        "native topology summary providers overlap or repeat a body",
+    )
     raw_spans = tessellation.get("face_spans")
     _require(
         isinstance(raw_spans, list) and bool(raw_spans),

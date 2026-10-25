@@ -701,7 +701,9 @@ def native_tessellation_fixture(
                         raise ValueError("native edge coface fins run in the same direction")
                     low = u_min + step * index
                     high = u_min + step * (index + 1)
-                    first_reversed = first_fin["vertex_ids"][0] != segment[0]
+                    first_reversed = (
+                        first_fin["vertex_ids"][0] != segment[0]
+                    )
                     second_reversed = second_fin["vertex_ids"][0] != segment[0]
                     first_start_u = high if first_reversed else low
                     first_end_u = low if first_reversed else high
@@ -974,6 +976,10 @@ def native_tessellation_fixture(
         "face_spans": spans,
         "native_edges": edge_rows,
         "no_facets_faces": normalized_no_facets,
+        "planar_brep": {
+            "schema_version": "solidworks-to-urdf.native-planar-brep/v1",
+            "bodies": [],
+        },
         "itessellation": {
             "interface_iid": ITESSELLATION_IID,
             "u_rule_version": NATIVE_U_IDENTITY_RULE,

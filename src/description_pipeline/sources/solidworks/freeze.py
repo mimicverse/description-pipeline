@@ -38,6 +38,7 @@ from .jsonio import digest_json, read_json, sha256_file, write_json
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
 from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA, NATIVE_TESSELLATION_SCHEMA
+from ...geometry.native_planar_brep import NATIVE_PLANAR_BREP_SCHEMA
 
 #: Freeze/capture record ids live in the ``solidworks-to-urdf.*`` family only.
 #: Sealed evidence from before the XC-01 rename is replayed with its era
@@ -2004,6 +2005,7 @@ def _export_geometry(
                 "native_edges",
                 "no_facets_faces",
                 "itessellation",
+                "planar_brep",
             }
             or tessellation.get("schema_version") != NATIVE_TESSELLATION_SCHEMA
             or not isinstance(tessellation.get("faces"), int)
@@ -2011,6 +2013,17 @@ def _export_geometry(
             or not isinstance(tessellation.get("native_edges"), list)
             or not isinstance(tessellation.get("no_facets_faces"), list)
             or not isinstance(tessellation.get("itessellation"), dict)
+            or not (
+                isinstance(tessellation.get("planar_brep"), dict)
+                and set(tessellation["planar_brep"])
+                == {"schema_version", "bodies"}
+                and tessellation["planar_brep"]["schema_version"]
+                == NATIVE_PLANAR_BREP_SCHEMA
+                and isinstance(
+                    tessellation["planar_brep"]["bodies"],
+                    list,
+                )
+            )
         ):
             raise BridgeError(
                 "cad_mesh_export_failed",

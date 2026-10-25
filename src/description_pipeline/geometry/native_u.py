@@ -9,6 +9,68 @@ import re
 import struct
 from fractions import Fraction
 
+
+def native_binary64_sqrt(value: Fraction, *, upward: bool = False) -> float:
+    """Round an exact nonnegative square root without platform libm results.
+
+    The integer square root locates adjacent binary64 values. Their exact
+    rational midpoint selects round-to-nearest, ties-to-even; upward selects
+    the least representable upper bound. Subnormal results use the same rule.
+    """
+
+    if value < 0:
+        raise ValueError("a native squared quantity must be nonnegative")
+    if value == 0:
+        return 0.0
+    numerator, denominator = value.numerator, value.denominator
+    exponent = numerator.bit_length() - denominator.bit_length()
+    if numerator < denominator << exponent if exponent >= 0 else numerator << -exponent < denominator:
+        exponent -= 1
+    quantum = max(exponent // 2 - 52, -1074)
+    if quantum >= 0:
+        scaled_numerator = numerator
+        scaled_denominator = denominator << (2 * quantum)
+        unit = Fraction(1 << quantum)
+    else:
+        scaled_numerator = numerator << (-2 * quantum)
+        scaled_denominator = denominator
+        unit = Fraction(1, 1 << -quantum)
+    significand = math.isqrt(scaled_numerator // scaled_denominator)
+    lower_exact = significand * unit
+    lower = float(lower_exact)
+    if lower_exact**2 == value:
+        return lower
+    upper = math.nextafter(lower, math.inf)
+    if not math.isfinite(upper):
+        raise ValueError("a native square root is outside binary64")
+    if upward:
+        return upper
+    midpoint = (lower_exact + Fraction.from_float(upper)) / 2
+    if value < midpoint**2:
+        return lower
+    if value > midpoint**2:
+        return upper
+    return lower if struct.unpack("<Q", struct.pack("<d", lower))[0] % 2 == 0 else upper
+
+
+def native_binary64_unit_vector(vector) -> tuple[float, ...]:
+    """Normalize exact binary64 coordinates with deterministic nearest rounding."""
+
+    exact = tuple(Fraction.from_float(float(value)) for value in vector)
+    squared_length = sum(value**2 for value in exact)
+    if squared_length == 0:
+        raise ValueError("a native direction must be nonzero")
+    return tuple(math.copysign(native_binary64_sqrt(value**2 / squared_length), float(value)) for value in exact)
+
+
+def native_binary64_sum_upper(values) -> float:
+    """Return the least binary64 upper bound of a sum of binary64 bounds."""
+
+    exact = sum(Fraction.from_float(value) for value in values)
+    result = float(exact)
+    return math.nextafter(result, math.inf) if Fraction.from_float(result) < exact else result
+
+
 NATIVE_U_IDENTITY_RULE = "native-u-identity-128ulp-v1"
 NATIVE_U_CLOSEST_POINT_PARAMETER_RULE = "native-u-closest-point-parameter-v1"
 NATIVE_U_IDENTITY_ULPS = 128
@@ -58,6 +120,9 @@ NATIVE_FACE_FACET_IDS_DERIVED = (
 NATIVE_EDGE_FIN_IDS_DERIVED = (
     "cad_edge_fin_ids_derived_by_empty_incident_faces"
 )
+NATIVE_PLANAR_BREP_BOUNDARY = "cad_edge_fin_ids_not_applicable_for_planar_brep"
+NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED = "cad_planar_brep_unit_normal_derived"
+NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED = "cad_planar_brep_triangulation_derived"
 NATIVE_SCOPE_IDENTITY_WARNING_CODES = frozenset(
     {
         NATIVE_COMPONENT_REFERENCE_ALIASED,

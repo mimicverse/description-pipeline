@@ -22,6 +22,7 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from fractions import Fraction
 from pathlib import Path
 
 from ...geometry.native_u import (
@@ -33,6 +34,9 @@ from ...geometry.native_u import (
     NATIVE_FACE_IDENTITY_KEY_RULE,
     NATIVE_IDENTITY_POLICY_RULE,
     NATIVE_PART_WITNESS_DERIVED,
+    NATIVE_PLANAR_BREP_BOUNDARY,
+    NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+    NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_SOURCE_SCOPE_RULE,
@@ -49,6 +53,7 @@ from ...geometry.native_u import (
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
+    native_binary64_unit_vector,
     native_curve_parameter_endpoints,
     native_curve_topology_endpoint_set_assignment,
     native_evaluate2_evidence,
@@ -66,11 +71,21 @@ from ...geometry.native_fin_topology import (
     NativeFinRelationError,
     validate_native_edge_fin_relations,
 )
+from ...geometry.native_planar_brep import (
+    NATIVE_PLANAR_COEDGE_DIRECTION_RULE,
+    NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
+    NATIVE_PLANAR_BREP_PROVIDER,
+    NATIVE_PLANAR_BREP_SCHEMA,
+    PlanarBrepEvidenceError,
+    PlanarBrepNotApplicable,
+    build_planar_convex_triangulation,
+)
 from ...schemas import (
     NATIVE_DISCOVERY_SCHEMA,
     NATIVE_ID_ARRAY_SOURCE_FLAT,
     NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
     NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
+    NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
     NATIVE_FACETLESS_EVIDENCE_API,
     NATIVE_MESH_CAPTURE_API,
     NATIVE_TESSELLATION_SCHEMA,
@@ -622,6 +637,7 @@ def _scope_vertex_rows(edge_rows, edge_index_map=None) -> list[dict]:
         }
         for vertex_index, (_, occurrence, group) in enumerate(ordered)
     ]
+
 
 def _scope_bijection(
     left: list[dict],
@@ -6845,6 +6861,7 @@ class SolidWorksBackend(CadBackend):
                     else scope_witnesses
                 )
             return witness_cache or {}
+
         deep_retry_apis = {
             "ITessellation.GetFaceFacets",
             "ITessellation.GetFacetFins",
@@ -7008,6 +7025,7 @@ class SolidWorksBackend(CadBackend):
                 }
             )
         edge_rows = []
+        edge_curves = {}
         for edge_index, raw_edge in enumerate(edges):
             edge = _interface(_dynamic(raw_edge), IEDGE_IID)
             reference = persistent(
@@ -7216,6 +7234,7 @@ class SolidWorksBackend(CadBackend):
                     "a native edge has no underlying curve",
                     {**base, "edge_index": edge_row["index"]},
                 )
+            edge_curves[edge_row["index"]] = curve
             curve_params = call(
                 "IEdge.GetCurveParams3",
                 lambda edge=edge_row["object"]: _interface(
@@ -7596,6 +7615,1103 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
             edge_row["face_senses"] = face_senses
+
+        def planar_brep_candidate_impl(evidence):
+            def line_params(curve, *, api, **where):
+                value = call(
+                    api,
+                    lambda: _member(curve, "LineParams"),
+                    **where,
+                )
+                if (
+                    not isinstance(value, (list, tuple))
+                    or len(value) != 6
+                    or any(type(item) not in (int, float) or not math.isfinite(item) for item in value)
+                    or math.hypot(*value[3:6]) == 0.0
+                ):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        f"{api} did not return six finite line parameters",
+                        {**base, **where},
+                    )
+                return [float(item) for item in value]
+
+            def exact_cross(first, second):
+                left = tuple(Fraction(value) for value in first)
+                right = tuple(Fraction(value) for value in second)
+                return (
+                    left[1] * right[2] - left[2] * right[1],
+                    left[2] * right[0] - left[0] * right[2],
+                    left[0] * right[1] - left[1] * right[0],
+                )
+
+            def point_offset(first, second):
+                return tuple(
+                    Fraction.from_float(float(second[index])) - Fraction.from_float(float(first[index]))
+                    for index in range(3)
+                )
+
+            def rounded_vector(vector):
+                # Closed binary64 rounding cells are used only to avoid
+                # declaring last-rounding ambiguity a native contradiction.
+                # They never admit a non-exact line into this provider.
+                cells = []
+                for value in vector:
+                    exact = Fraction(value)
+                    previous = math.nextafter(value, -math.inf)
+                    following = math.nextafter(value, math.inf)
+                    lower = Fraction(previous) if math.isfinite(previous) else exact - Fraction(math.ulp(value))
+                    upper = Fraction(following) if math.isfinite(following) else exact + Fraction(math.ulp(value))
+                    cells.append(((exact + lower) / 2, (exact + upper) / 2))
+                return tuple(cells)
+
+            def rounded_offset(first, second):
+                return tuple(
+                    (right[0] - left[1], right[1] - left[0])
+                    for left, right in zip(rounded_vector(first), rounded_vector(second), strict=True)
+                )
+
+            def rounding_may_explain_cross(first, second):
+                def product(left, right):
+                    endpoints = [a * b for a in left for b in right]
+                    return min(endpoints), max(endpoints)
+
+                for axis in range(3):
+                    one, two = (axis + 1) % 3, (axis + 2) % 3
+                    positive = product(first[one], second[two])
+                    negative = product(first[two], second[one])
+                    if positive[0] - negative[1] > 0 or positive[1] - negative[0] < 0:
+                        return False
+                return True
+
+            def line_relation(
+                edge_line,
+                coedge_line,
+                trim_points,
+                *,
+                coedge_index,
+            ):
+                edge_direction = edge_line[3:6]
+                coedge_direction = None if coedge_line is None else coedge_line[3:6]
+                direction_cross = (
+                    (0, 0, 0) if coedge_direction is None else exact_cross(edge_direction, coedge_direction)
+                )
+                root_offset_cross = (
+                    (0, 0, 0)
+                    if coedge_line is None
+                    else exact_cross(
+                        edge_direction,
+                        point_offset(edge_line[:3], coedge_line[:3]),
+                    )
+                )
+                trim_cross = [
+                    exact_cross(
+                        edge_direction,
+                        point_offset(edge_line[:3], point),
+                    )
+                    for point in trim_points
+                ]
+                dot = (
+                    sum(edge_direction[index] * coedge_direction[index] for index in range(3))
+                    if coedge_direction is not None
+                    else 0.0
+                )
+                if (
+                    direction_cross != (0, 0, 0)
+                    or root_offset_cross != (0, 0, 0)
+                    or any(value != (0, 0, 0) for value in trim_cross)
+                ):
+                    ambiguous = (
+                        (
+                            coedge_direction is None
+                            or rounding_may_explain_cross(
+                                rounded_vector(edge_direction), rounded_vector(coedge_direction)
+                            )
+                        )
+                        and (
+                            coedge_direction is None
+                            or rounding_may_explain_cross(
+                                rounded_vector(edge_direction), rounded_offset(edge_line[:3], coedge_line[:3])
+                            )
+                        )
+                        and all(
+                            rounding_may_explain_cross(
+                                rounded_vector(edge_direction), rounded_offset(edge_line[:3], point)
+                            )
+                            for point in trim_points
+                        )
+                    )
+                    if ambiguous:
+                        raise PlanarBrepNotApplicable("native line facts are outside the exact-line provider domain")
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "the edge, coedge, and trim points do not describe one native line",
+                        {
+                            **base,
+                            "coedge_index": coedge_index,
+                            "edge_line_params": edge_line,
+                            "coedge_line_params": coedge_line,
+                            "trim_points_m": [list(point) for point in trim_points],
+                        },
+                    )
+                if coedge_direction is None:
+                    return "not_observed"
+                return "same" if dot > 0.0 else "opposite"
+
+            def endpoint_evidence(endpoint):
+                reference = endpoint.get("reference")
+                return {
+                    "state": endpoint.get("state"),
+                    "point_m": copy.deepcopy(endpoint.get("point_m")),
+                    "reference": (
+                        None
+                        if reference is None
+                        else {
+                            "raw_sha256": reference.get("raw_sha256"),
+                            "typed_sha256": reference.get("typed_sha256"),
+                        }
+                    ),
+                    "vertex_error": endpoint.get("vertex_error"),
+                    "point_error": endpoint.get("point_error"),
+                    "reference_error": endpoint.get("reference_error"),
+                    "object_pointer": endpoint.get("object_pointer"),
+                }
+
+            evidence.update(
+                {
+                    "provider": NATIVE_PLANAR_BREP_PROVIDER,
+                    "schema_version": NATIVE_PLANAR_BREP_SCHEMA,
+                    "body_type": body_type,
+                    "body_index": body_index,
+                    "body_name": body_name,
+                    "body_reference_sha256": body_reference["typed_sha256"],
+                    "native_body_reference_sha256": body_reference["raw_sha256"],
+                    "face_count": len(face_rows),
+                    "edge_facts": [
+                        {
+                            "edge_index": row["index"],
+                            "edge_reference_sha256": row["reference"]["typed_sha256"],
+                            "native_edge_reference_sha256": row["reference"]["raw_sha256"],
+                            "endpoints": {
+                                name: endpoint_evidence(endpoint) for name, endpoint in row["endpoints"].items()
+                            },
+                            "face_indices": list(row["face_indices"]),
+                            "curve": copy.deepcopy(row["curve"]),
+                            "curve_end_params": copy.deepcopy(row["curve_end_params"]),
+                            "curve_domain_transform": copy.deepcopy(row["curve_domain_transform"]),
+                            "curve_endpoint_evaluations": copy.deepcopy(row["curve_endpoint_evaluations"]),
+                            "topology_endpoint_assignment": copy.deepcopy(row["topology_endpoint_assignment"]),
+                            "endpoint_points_derived_from_curve": row["endpoint_points_derived_from_curve"],
+                            "face_senses": copy.deepcopy(row["face_senses"]),
+                        }
+                        for row in edge_rows
+                    ],
+                }
+            )
+            if body_type != 1 or len(face_rows) != 1:
+                return None
+            mapped_edge_witnesses = {}
+            face_row = face_rows[0]
+            face = face_row["object"]
+            surface = call(
+                "IFace2.GetSurface",
+                lambda: _interface(
+                    _dynamic(_method(face, "GetSurface")),
+                    ISURFACE_IID,
+                ),
+                face_index=face_row["index"],
+            )
+            if surface is None:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the sheet face has no native surface",
+                    {**base, "face_index": face_row["index"]},
+                )
+            is_plane = call(
+                "ISurface.IsPlane",
+                lambda: _method(surface, "IsPlane"),
+                face_index=face_row["index"],
+            )
+            if type(is_plane) is not bool:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "ISurface.IsPlane did not return a boolean",
+                    {**base, "face_index": face_row["index"]},
+                )
+            if is_plane is not True:
+                return None
+            plane_params = call(
+                "ISurface.PlaneParams",
+                lambda: _member(surface, "PlaneParams"),
+                face_index=face_row["index"],
+            )
+            if (
+                not isinstance(plane_params, (list, tuple))
+                or len(plane_params) != 6
+                or any(type(value) not in (int, float) or not math.isfinite(value) for value in plane_params)
+            ):
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "ISurface.PlaneParams did not return six finite numbers",
+                    {**base, "face_index": face_row["index"]},
+                )
+            evidence["surface"] = {
+                "is_plane": True,
+                "plane_params": [float(value) for value in plane_params],
+            }
+            loop_count = call(
+                "IFace2.GetLoopCount",
+                lambda: _method(face, "GetLoopCount"),
+                face_index=face_row["index"],
+            )
+            if type(loop_count) is not int or loop_count < 0:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "IFace2.GetLoopCount did not return a non-negative integer",
+                    {**base, "face_index": face_row["index"]},
+                )
+            evidence["loop_count"] = loop_count if type(loop_count) is int else repr(loop_count)[:60]
+            if loop_count != 1:
+                return None
+            loops = call(
+                "IFace2.GetLoops",
+                lambda: _method(face, "GetLoops"),
+                face_index=face_row["index"],
+            )
+            if not isinstance(loops, (list, tuple)) or len(loops) != loop_count or loops[0] is None:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "IFace2.GetLoops did not return the complete loop inventory",
+                    {**base, "face_index": face_row["index"]},
+                )
+            evidence["loops_read"] = len(loops)
+            loop = _dynamic(loops[0])
+            is_outer = call(
+                "ILoop2.IsOuter",
+                lambda: _method(loop, "IsOuter"),
+                face_index=face_row["index"],
+            )
+            if type(is_outer) is not bool:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "ILoop2.IsOuter did not return a boolean",
+                    {**base, "face_index": face_row["index"]},
+                )
+            evidence["outer_loop"] = is_outer if type(is_outer) is bool else repr(is_outer)[:60]
+            if is_outer is not True:
+                return None
+            edge_count = call(
+                "ILoop2.GetEdgeCount",
+                lambda: _method(loop, "GetEdgeCount"),
+                face_index=face_row["index"],
+            )
+            evidence["edge_count"] = edge_count if type(edge_count) is int else repr(edge_count)[:60]
+            coedge_count = call(
+                "ILoop2.GetCoEdgeCount",
+                lambda: _method(loop, "GetCoEdgeCount"),
+                face_index=face_row["index"],
+            )
+            evidence["coedge_count"] = coedge_count if type(coedge_count) is int else repr(coedge_count)[:60]
+            if type(edge_count) is not int or type(coedge_count) is not int:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the outer loop has non-integer edge or coedge counts",
+                    {
+                        **base,
+                        "face_index": face_row["index"],
+                        "edge_count": repr(edge_count)[:60],
+                        "coedge_count": repr(coedge_count)[:60],
+                    },
+                )
+            if edge_count < 0 or coedge_count < 0:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the outer loop has a negative edge or coedge count",
+                    {
+                        **base,
+                        "face_index": face_row["index"],
+                        "edge_count": edge_count,
+                        "coedge_count": coedge_count,
+                    },
+                )
+            if edge_count < 3:
+                return None
+            if coedge_count != edge_count or edge_count != len(edge_rows):
+                return None
+
+            edge_by_pointer = {}
+            for edge_row in edge_rows:
+                try:
+                    pointer = _com_iunknown_pointer(edge_row["object"])
+                except Exception as error:  # noqa: BLE001
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "a native edge has no stable IUnknown identity",
+                        {
+                            **base,
+                            "edge_index": edge_row["index"],
+                            "error": str(error)[:300],
+                        },
+                    ) from error
+                edge_by_pointer[pointer] = edge_row
+            first_coedge = call(
+                "ILoop2.GetFirstCoEdge",
+                lambda: _method(loop, "GetFirstCoEdge"),
+                face_index=face_row["index"],
+            )
+            if first_coedge is None:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the outer loop has no first coedge",
+                    {**base, "face_index": face_row["index"]},
+                )
+            first_coedge = _dynamic(first_coedge)
+            first_pointer = _com_iunknown_pointer(first_coedge)
+            current = first_coedge
+            seen_coedges = set()
+            seen_edge_indices = set()
+            coedge_rows = []
+            source_displacements = []
+            evidence["coedge_facts"] = []
+            for coedge_index in range(coedge_count):
+                evidence["current_coedge_index"] = coedge_index
+                pointer = _com_iunknown_pointer(current)
+                if pointer in seen_coedges:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "the outer loop repeats a coedge before closure",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                seen_coedges.add(pointer)
+                raw_edge = call(
+                    "ICoEdge.GetEdge",
+                    lambda value=current: _method(value, "GetEdge"),
+                    coedge_index=coedge_index,
+                )
+                edge = _interface(_dynamic(raw_edge), IEDGE_IID)
+                if edge is None:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "a coedge has no owning native edge",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                edge_row = edge_by_pointer.get(_com_iunknown_pointer(edge))
+                if edge_row is None or edge_row["index"] in seen_edge_indices:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "a coedge does not map one-to-one to a native body edge",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                seen_edge_indices.add(edge_row["index"])
+                edge_curve = edge_curves[edge_row["index"]]
+                evidence["current_edge_fact"] = {
+                    "edge_index": edge_row["index"],
+                    "edge_reference_sha256": edge_row["reference"]["typed_sha256"],
+                    "native_edge_reference_sha256": edge_row["reference"]["raw_sha256"],
+                    "face_senses": copy.deepcopy(edge_row["face_senses"]),
+                }
+                is_line = call(
+                    "ICurve.IsLine",
+                    lambda value=edge_curve: _method(value, "IsLine"),
+                    edge_index=edge_row["index"],
+                )
+                if type(is_line) is not bool:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "ICurve.IsLine did not return a boolean",
+                        {**base, "edge_index": edge_row["index"]},
+                    )
+                if is_line is not True:
+                    return None
+                edge_line_params = line_params(
+                    edge_curve,
+                    api="ICurve.LineParams",
+                    coedge_index=coedge_index,
+                    edge_index=edge_row["index"],
+                )
+                evidence["current_edge_fact"]["edge_is_line"] = is_line
+                evidence["current_edge_fact"]["edge_line_params"] = edge_line_params
+                coedge_curve_raw = call(
+                    "ICoEdge.GetCurve",
+                    lambda value=current: _method(value, "GetCurve"),
+                    coedge_index=coedge_index,
+                )
+                coedge_curve = None
+                coedge_line_params = None
+                if coedge_curve_raw is not None:
+                    coedge_curve = _interface(
+                        _dynamic(coedge_curve_raw),
+                        ICURVE_IID,
+                    )
+                    coedge_curve_is_line = call(
+                        "ICoEdge.GetCurve.IsLine",
+                        lambda value=coedge_curve: _method(value, "IsLine"),
+                        coedge_index=coedge_index,
+                    )
+                    if type(coedge_curve_is_line) is not bool:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "ICoEdge.GetCurve.IsLine did not return a boolean",
+                            {
+                                **base,
+                                "coedge_index": coedge_index,
+                            },
+                        )
+                    if coedge_curve_is_line is False:
+                        return None
+                    evidence["current_edge_fact"]["coedge_curve_is_line"] = coedge_curve_is_line
+                    coedge_line_params = line_params(
+                        coedge_curve,
+                        api="ICoEdge.GetCurve.LineParams",
+                        coedge_index=coedge_index,
+                        edge_index=edge_row["index"],
+                    )
+                    evidence["current_edge_fact"]["coedge_line_params"] = coedge_line_params
+                curve_params = call(
+                    "ICoEdge.GetCurveParams",
+                    lambda value=current: _method(value, "GetCurveParams"),
+                    coedge_index=coedge_index,
+                )
+                if (
+                    not isinstance(curve_params, (list, tuple))
+                    or len(curve_params) != 10
+                    or any(type(value) not in (int, float) or not math.isfinite(value) for value in curve_params[:8])
+                ):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "ICoEdge.GetCurveParams did not return the documented values",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                evidence["current_edge_fact"]["curve_params_raw"] = [float(value) for value in curve_params]
+                start_point = tuple(float(value) for value in curve_params[:3])
+                end_point = tuple(float(value) for value in curve_params[3:6])
+                start_parameter = float(curve_params[6])
+                end_parameter = float(curve_params[7])
+                line_orientation = line_relation(
+                    edge_line_params,
+                    coedge_line_params,
+                    (start_point, end_point),
+                    coedge_index=coedge_index,
+                )
+                evidence["current_edge_fact"].update(
+                    {
+                        "coedge_curve_present": coedge_curve is not None,
+                        "start_point_m": list(start_point),
+                        "end_point_m": list(end_point),
+                        "start_parameter": start_parameter,
+                        "end_parameter": end_parameter,
+                        "line_orientation": line_orientation,
+                    }
+                )
+                if not native_u_in_closed_interval(
+                    start_parameter,
+                    edge_row["curve"]["u_min"],
+                    edge_row["curve"]["u_max"],
+                ) or not native_u_in_closed_interval(
+                    end_parameter,
+                    edge_row["curve"]["u_min"],
+                    edge_row["curve"]["u_max"],
+                ):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "a coedge trim interval escapes its native edge domain",
+                        {
+                            **base,
+                            "coedge_index": coedge_index,
+                            "edge_index": edge_row["index"],
+                        },
+                    )
+                same_direction = call(
+                    "ICoEdge.GetSense",
+                    lambda value=current: _method(value, "GetSense"),
+                    coedge_index=coedge_index,
+                )
+                if type(same_direction) is not bool:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "ICoEdge.GetSense did not return a boolean",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                evidence["current_edge_fact"]["same_direction_as_edge"] = same_direction
+                face_sense = next(
+                    (
+                        row["EdgeInFaceSense"]["value"]
+                        for row in edge_row["face_senses"]
+                        if row["face_index"] == face_row["index"]
+                    ),
+                    None,
+                )
+                if type(face_sense) is not bool or face_sense is not same_direction:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "coedge and edge orientations disagree",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                evaluations = []
+                for endpoint, parameter, expected_point, opposite_point in (
+                    ("start", start_parameter, start_point, end_point),
+                    ("end", end_parameter, end_point, start_point),
+                ):
+                    evidence["current_evaluation"] = {
+                        "endpoint": endpoint,
+                        "parameter": parameter,
+                        "expected_point_m": list(expected_point),
+                        "opposite_point_m": list(opposite_point),
+                    }
+                    raw_evaluation = call(
+                        "ICoEdge.Evaluate2",
+                        lambda value=current, u=parameter: _method(
+                            value,
+                            "Evaluate2",
+                            u,
+                            1,
+                        ),
+                        coedge_index=coedge_index,
+                        endpoint=endpoint,
+                    )
+                    if (
+                        not isinstance(raw_evaluation, (list, tuple))
+                        or len(raw_evaluation) != 6
+                        or any(type(value) not in (int, float) or not math.isfinite(value) for value in raw_evaluation)
+                    ):
+                        evidence["current_evaluation"]["raw_response"] = repr(raw_evaluation)[:1000]
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "ICoEdge.Evaluate2 did not return six finite values",
+                            {**base, "coedge_index": coedge_index},
+                        )
+                    evidence["current_evaluation"]["raw_response"] = [float(value) for value in raw_evaluation]
+                    evaluated_point = tuple(float(value) for value in raw_evaluation[:3])
+                    tangent = tuple(float(value) for value in raw_evaluation[3:])
+                    tolerance = native_curve_endpoint_operation_tolerance(
+                        evaluated_point,
+                        expected_point,
+                        opposite_point,
+                    )
+                    error_m = native_point_error(
+                        evaluated_point,
+                        expected_point,
+                    )
+                    if error_m > tolerance or math.hypot(*tangent) == 0.0:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "a coedge trim endpoint is inconsistent with its evaluation",
+                            {
+                                **base,
+                                "coedge_index": coedge_index,
+                                "endpoint": endpoint,
+                                "point_error_m": error_m,
+                                "point_tolerance_m": tolerance,
+                            },
+                        )
+                    evaluations.append(
+                        {
+                            "endpoint": endpoint,
+                            "rule_version": NATIVE_PLANAR_COEDGE_EVALUATION_RULE,
+                            "parameter": parameter,
+                            "point_m": list(evaluated_point),
+                            "tangent": list(tangent),
+                            "point_error_m": error_m,
+                            "point_tolerance_m": tolerance,
+                        }
+                    )
+                    evidence["current_evaluation"]["evidence"] = copy.deepcopy(evaluations[-1])
+                endpoint = edge_row["endpoints"]
+                start_role = "start" if same_direction else "end"
+                end_role = "end" if same_direction else "start"
+                start_expected = endpoint[start_role]
+                end_expected = endpoint[end_role]
+                if (
+                    start_expected["point_m"] is None
+                    or start_expected["reference"] is None
+                    or end_expected["point_m"] is None
+                    or end_expected["reference"] is None
+                ):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "a straight polygon edge has no complete vertex identity",
+                        {**base, "edge_index": edge_row["index"]},
+                    )
+                start_reference = start_expected["reference"]["typed_sha256"]
+                end_reference = end_expected["reference"]["typed_sha256"]
+                start_tolerance = native_point_roundtrip_tolerance(
+                    start_point,
+                    start_expected["point_m"],
+                )
+                end_tolerance = native_point_roundtrip_tolerance(
+                    end_point,
+                    end_expected["point_m"],
+                )
+                start_vertex_point_error = native_point_error(
+                    start_point,
+                    start_expected["point_m"],
+                )
+                end_vertex_point_error = native_point_error(
+                    end_point,
+                    end_expected["point_m"],
+                )
+                if (
+                    start_reference == end_reference
+                    or start_vertex_point_error > start_tolerance
+                    or end_vertex_point_error > end_tolerance
+                ):
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "coedge orientation disagrees with its native vertex order",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                # ICoEdge.Evaluate2's tangent follows the coedge, and the
+                # GetCurveParams start/end points use that same coedge order.
+                # Numeric trim-parameter order can therefore be increasing or
+                # decreasing without changing this direction check.
+                exact_segment = point_offset(start_point, end_point)
+                for row in evaluations:
+                    if sum(exact_segment[axis] * Fraction(row["tangent"][axis]) for axis in range(3)) <= 0:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "the coedge evaluation tangent reverses its boundary line",
+                            {**base, "coedge_index": coedge_index},
+                        )
+                    if exact_cross(exact_segment, row["tangent"]) == (0, 0, 0):
+                        continue
+                    if rounding_may_explain_cross(
+                        rounded_offset(start_point, end_point), rounded_vector(row["tangent"])
+                    ):
+                        return None
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "the coedge evaluation tangent contradicts its boundary line",
+                        {**base, "coedge_index": coedge_index},
+                    )
+                coedge_rows.append(
+                    {
+                        "coedge_index": coedge_index,
+                        "edge_index": edge_row["index"],
+                        "edge_reference_sha256": edge_row["reference"]["typed_sha256"],
+                        "native_edge_reference_sha256": edge_row["reference"]["raw_sha256"],
+                        "edge_is_line": is_line,
+                        "edge_line_params": edge_line_params,
+                        "coedge_line_params": coedge_line_params,
+                        "line_orientation": line_orientation,
+                        "same_direction_as_edge": same_direction,
+                        "tangent_direction_rule": (NATIVE_PLANAR_COEDGE_DIRECTION_RULE),
+                        "start_parameter": start_parameter,
+                        "end_parameter": end_parameter,
+                        "parameter_order": ("increasing" if start_parameter < end_parameter else "decreasing"),
+                        "start_point_m": list(start_point),
+                        "end_point_m": list(end_point),
+                        "start_vertex_reference_sha256": start_reference,
+                        "end_vertex_reference_sha256": end_reference,
+                        "start_vertex_point_m": list(start_expected["point_m"]),
+                        "end_vertex_point_m": list(end_expected["point_m"]),
+                        "start_vertex_point_error_m": (start_vertex_point_error),
+                        "end_vertex_point_error_m": end_vertex_point_error,
+                        "start_vertex_point_tolerance_m": start_tolerance,
+                        "end_vertex_point_tolerance_m": end_tolerance,
+                        "curve_params_raw": [float(value) for value in curve_params],
+                        "evaluations": evaluations,
+                        "coedge_curve_present": coedge_curve is not None,
+                    }
+                )
+                evidence["coedge_facts"].append(copy.deepcopy(coedge_rows[-1]))
+                source_displacements.extend(
+                    (
+                        (start_point, start_expected["point_m"]),
+                        (end_point, end_expected["point_m"]),
+                    )
+                )
+                current = _dynamic(
+                    call(
+                        "ICoEdge.GetNext",
+                        lambda value=current: _method(value, "GetNext"),
+                        coedge_index=coedge_index,
+                    )
+                )
+                if current is None:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "the outer loop ended before its declared coedge count",
+                        {**base, "coedge_index": coedge_index},
+                    )
+            if _com_iunknown_pointer(current) != first_pointer:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the outer loop does not return to its first coedge",
+                    {**base, "face_index": face_row["index"]},
+                )
+            if seen_edge_indices != {row["index"] for row in edge_rows}:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the outer loop does not cover every body edge",
+                    {**base, "face_index": face_row["index"]},
+                )
+            for index, row in enumerate(coedge_rows):
+                next_row = coedge_rows[(index + 1) % len(coedge_rows)]
+                tolerance = native_point_roundtrip_tolerance(
+                    row["end_point_m"],
+                    next_row["start_point_m"],
+                )
+                error_m = native_point_error(
+                    row["end_point_m"],
+                    next_row["start_point_m"],
+                )
+                if error_m > tolerance:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "coedge endpoints do not form one closed loop",
+                        {
+                            **base,
+                            "coedge_index": index,
+                            "point_error_m": error_m,
+                            "point_tolerance_m": tolerance,
+                        },
+                    )
+            boundary_points = [tuple(row["start_point_m"]) for row in coedge_rows]
+            boundary_references = [row["start_vertex_reference_sha256"] for row in coedge_rows]
+            if len(set(boundary_references)) != len(boundary_references):
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the planar outer loop repeats a native boundary vertex",
+                    {**base, "face_index": face_row["index"]},
+                )
+            vertex_rows = []
+            for vertex_index, (coedge_row, reference) in enumerate(zip(coedge_rows, boundary_references, strict=True)):
+                edge_row = edge_rows[coedge_row["edge_index"]]
+                endpoint_role = "start" if coedge_row["same_direction_as_edge"] else "end"
+                endpoint = edge_row["endpoints"][endpoint_role]
+                typed_sha256 = endpoint["reference"]["typed_sha256"]
+                vertex_rows.append(
+                    {
+                        "body_type": body_type,
+                        "body_index": body_index,
+                        "vertex_index": vertex_index,
+                        "point_m": list(coedge_row["start_point_m"]),
+                        "identity_mode": NATIVE_PERSISTENT_IDENTITY_RULE,
+                        "native_reference_sha256": endpoint["reference"]["raw_sha256"],
+                        "identity": None,
+                        "identity_sha256": typed_sha256,
+                    }
+                )
+                if typed_sha256 != reference:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "the planar boundary reference changed during capture",
+                        {**base, "vertex_index": vertex_index},
+                    )
+            face_in_surface_sense = call(
+                "IFace2.FaceInSurfaceSense",
+                lambda: _method(face, "FaceInSurfaceSense"),
+                face_index=face_row["index"],
+            )
+            if type(face_in_surface_sense) is not bool:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "IFace2.FaceInSurfaceSense did not return a boolean",
+                    {**base, "face_index": face_row["index"]},
+                )
+            surface_normal = tuple(float(value) for value in plane_params[:3])
+            face_normal = tuple(-value for value in surface_normal) if face_in_surface_sense else surface_normal
+            try:
+                triangulation = build_planar_convex_triangulation(
+                    face_normal,
+                    tuple(float(value) for value in plane_params[3:6]),
+                    boundary_points,
+                    source_displacements=source_displacements,
+                )
+            except PlanarBrepNotApplicable:
+                return None
+            except PlanarBrepEvidenceError as error:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    f"native planar BRep evidence is inconsistent: {error.reason}",
+                    {
+                        **base,
+                        "face_index": face_row["index"],
+                        "provider": NATIVE_PLANAR_BREP_PROVIDER,
+                        "reason": error.reason,
+                    },
+                ) from error
+            raw_edge_references = {row["reference"]["raw_sha256"] for row in edge_rows}
+            if len(raw_edge_references) != len(edge_rows):
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the planar BRep body has aliased native edge references",
+                    {**base, "raw_edge_reference_sha256": sorted(raw_edge_references)},
+                )
+            face_area = call(
+                "IFace2.GetArea",
+                lambda: _method(face, "GetArea"),
+                face_index=face_row["index"],
+            )
+            if type(face_area) not in (int, float) or not math.isfinite(face_area) or face_area <= 0.0:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "the planar sheet face has no positive finite area",
+                    {**base, "face_index": face_row["index"]},
+                )
+            for vertex_row in vertex_rows:
+                registry.claim(
+                    kind="vertex",
+                    raw_sha256=vertex_row["native_reference_sha256"],
+                    typed_sha256=vertex_row["identity_sha256"],
+                    owner={
+                        "kind": "vertex",
+                        **base,
+                        "vertex_index": vertex_row["vertex_index"],
+                    },
+                    base=base,
+                )
+            registry.claim(
+                kind="face",
+                raw_sha256=face_row["reference"]["raw_sha256"],
+                typed_sha256=face_row["reference"]["typed_sha256"],
+                owner={
+                    "kind": "face",
+                    **base,
+                    "face_index": face_row["index"],
+                },
+                base=base,
+            )
+            for edge_row in edge_rows:
+                registry.claim(
+                    kind="edge",
+                    raw_sha256=edge_row["reference"]["raw_sha256"],
+                    typed_sha256=edge_row["reference"]["typed_sha256"],
+                    owner={
+                        "kind": "edge",
+                        **base,
+                        "edge_index": edge_row["index"],
+                    },
+                    base=base,
+                )
+            loop_reference = native_scope_identity_sha256(
+                {
+                    "rule": f"{NATIVE_PLANAR_BREP_PROVIDER}/loop",
+                    "face_reference_sha256": face_row["reference"]["typed_sha256"],
+                    "edge_references": [row["edge_reference_sha256"] for row in coedge_rows],
+                }
+            )
+            provider_body = {
+                "provider": NATIVE_PLANAR_BREP_PROVIDER,
+                "schema_version": NATIVE_PLANAR_BREP_SCHEMA,
+                "body_type": body_type,
+                "body_index": body_index,
+                "body_reference_sha256": body_reference["typed_sha256"],
+                "native_body_reference_sha256": body_reference["raw_sha256"],
+                "face_index": face_row["index"],
+                "face_reference_sha256": face_row["reference"]["typed_sha256"],
+                "native_face_reference_sha256": face_row["reference"]["raw_sha256"],
+                "face_area_m2": float(face_area),
+                "warnings": [
+                    NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+                    NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+                ],
+                "surface": {
+                    "is_plane": True,
+                    "plane_params": [float(value) for value in plane_params],
+                    "face_in_surface_sense": face_in_surface_sense,
+                    "face_normal_raw": list(face_normal),
+                    "face_normal_unit": list(triangulation["face_normal"]),
+                },
+                "loop": {
+                    "outer": True,
+                    "reference_sha256": loop_reference,
+                    "coedges": coedge_rows,
+                },
+                "boundary_vertices": [
+                    {
+                        "vertex_index": index,
+                        "vertex_reference_sha256": reference,
+                        "point_m": list(point),
+                    }
+                    for index, (reference, point) in enumerate(
+                        zip(
+                            boundary_references,
+                            boundary_points,
+                            strict=True,
+                        )
+                    )
+                ],
+                "triangulation": triangulation,
+            }
+            triangle_records = [
+                {
+                    "triangle_record_index": triangle["triangle_index"],
+                    "face_index": face_row["index"],
+                    "facet_id": None,
+                    "vertex_indices": list(triangle["vertex_indices"]),
+                    "vertex_references": [boundary_references[index] for index in triangle["vertex_indices"]],
+                    "native_binary64_points": triangle["native_points"],
+                    "output_float32_points": triangle["stl_points"],
+                    "output_float32_key": _canonical_triangle_key(triangle["stl_points"]),
+                }
+                for triangle in triangulation["triangles"]
+            ]
+            return {
+                "provider": NATIVE_PLANAR_BREP_PROVIDER,
+                "body_name": body_name,
+                "body_reference": body_reference,
+                "faces": tuple(
+                    {
+                        "index": face_row["index"],
+                        "reference": face_row["reference"],
+                        "owner_body_reference": face_row["owner_body_reference"],
+                        "facet_ids": (),
+                        "facet_count": 0,
+                        "facet_ids_source": NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
+                        "raw_facet_ids": None,
+                        "warnings": [],
+                        "identity": face_row.get("identity"),
+                    }
+                    for face_row in face_rows
+                ),
+                "edges": tuple(
+                    {
+                        "index": row["index"],
+                        "reference": row["reference"],
+                        "owner_body_reference": row["owner_body_reference"],
+                        "endpoints": row["endpoints"],
+                        "face_indices": row["face_indices"],
+                        "fin_ids": (),
+                        "fin_count": 0,
+                        "fin_ids_source": NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
+                        "raw_fin_ids": None,
+                        "warnings": [NATIVE_PLANAR_BREP_BOUNDARY],
+                        "identity": row.get("identity"),
+                    }
+                    for row in edge_rows
+                ),
+                "facets": {},
+                "fins": {},
+                "vertex_points_binary64": dict(enumerate(boundary_points)),
+                "vertex_points_float32": {index: _float32_xyz(point) for index, point in enumerate(boundary_points)},
+                "vertex_identity_rows": tuple(
+                    {
+                        "vertex_id": index,
+                        "reference": reference,
+                        "point_m": list(point),
+                    }
+                    for index, (reference, point) in enumerate(
+                        zip(
+                            boundary_references,
+                            boundary_points,
+                            strict=True,
+                        )
+                    )
+                ),
+                "triangle_records": tuple(triangle_records),
+                "internal_fin_ids": (),
+                "tessellate_result": None,
+                "counts": {
+                    "faces": len(face_rows),
+                    "edges": len(edge_rows),
+                    "facets": 0,
+                    "fins": 0,
+                    "vertices": len(boundary_points),
+                    "triangles": len(triangle_records),
+                    "internal_fins": 0,
+                },
+                "native_totals": {
+                    "facets": None,
+                    "fins": None,
+                    "vertices": None,
+                },
+                "u_observation_stats": {
+                    "unique_observations": 0,
+                    "cache_hits": 0,
+                    "get_closest_point_on_calls": 0,
+                    "evaluate2_calls": 0,
+                },
+                "reference_alias_audit": dict(registry.alias_audit()),
+                "cross_kind_raw_aliases": registry.cross_kind_aliases(),
+                "itessellation_body": None,
+                "planar_brep_body": provider_body,
+                "native_edge_rows": tuple(
+                    {
+                        "body_type": body_type,
+                        "body_index": body_index,
+                        "edge_reference_sha256": row["reference"]["typed_sha256"],
+                        "native_edge_reference_sha256": row["reference"]["raw_sha256"],
+                        "edge_identity_mode": (
+                            NATIVE_SCOPE_IDENTITY_RULE
+                            if row.get("identity") is not None
+                            else NATIVE_PERSISTENT_IDENTITY_RULE
+                        ),
+                        "edge_identity": row.get("identity"),
+                        "mapping_source_edge_index": (
+                            mapped_edge_witnesses.get(
+                                row["index"],
+                                {},
+                            ).get("edge_index")
+                        ),
+                        "mapping_source_edge_persistent_reference_sha256": (
+                            mapped_edge_witnesses.get(
+                                row["index"],
+                                {},
+                            ).get("persistent_reference_sha256")
+                        ),
+                        "start_vertex_reference_sha256": (row["endpoints"]["start"]["reference"]["typed_sha256"]),
+                        "end_vertex_reference_sha256": (row["endpoints"]["end"]["reference"]["typed_sha256"]),
+                        "start_point_m": list(row["endpoints"]["start"]["point_m"]),
+                        "end_point_m": list(row["endpoints"]["end"]["point_m"]),
+                        "start_vertex_error": row["endpoints"]["start"]["vertex_error"],
+                        "end_vertex_error": row["endpoints"]["end"]["vertex_error"],
+                        "start_point_error": row["endpoints"]["start"]["point_error"],
+                        "end_point_error": row["endpoints"]["end"]["point_error"],
+                        "start_vertex_state": row["endpoints"]["start"]["state"],
+                        "end_vertex_state": row["endpoints"]["end"]["state"],
+                        "start_reference_error": row["endpoints"]["start"]["reference_error"],
+                        "end_reference_error": row["endpoints"]["end"]["reference_error"],
+                        "face_indices": list(row["face_indices"]),
+                        "fin_ids": [],
+                        "fin_ids_source": NATIVE_ID_ARRAY_SOURCE_PLANAR_BREP,
+                        "raw_fin_ids": None,
+                        "warnings": [NATIVE_PLANAR_BREP_BOUNDARY],
+                        "u_min": row["curve"]["u_min"],
+                        "u_max": row["curve"]["u_max"],
+                        "curve_start_point_m": row["curve"]["start_point_m"],
+                        "curve_end_point_m": row["curve"]["end_point_m"],
+                        "curve_sense": row["curve"]["sense"],
+                        "curve_type": row["curve"]["curve_type"],
+                        "curve_closed": row["curve_end_params"]["is_closed"],
+                        "curve_periodic": row["curve_end_params"]["is_periodic"],
+                        "curve_end_params": row["curve_end_params"],
+                        "curve_domain_transform": row["curve_domain_transform"],
+                        "curve_endpoint_evaluations": row["curve_endpoint_evaluations"],
+                        "topology_endpoint_assignment": row["topology_endpoint_assignment"],
+                        "endpoint_points_derived_from_curve": row["endpoint_points_derived_from_curve"],
+                        "face_senses": row["face_senses"],
+                    }
+                    for row in edge_rows
+                ),
+                "vertex_rows": (),
+                "solidworks_vertex_identities": tuple(vertex_rows),
+            }
+
+        def planar_brep_candidate():
+            evidence = {}
+            try:
+                return planar_brep_candidate_impl(evidence)
+            except PlanarBrepNotApplicable:
+                return None
+            except CadError as error:
+                detail = error.detail if isinstance(error.detail, dict) else {"native_detail": error.detail}
+                try:
+                    serialized = copy.deepcopy(evidence)
+                except Exception as diagnostic_error:  # noqa: BLE001
+                    serialized = {
+                        "status": "unavailable",
+                        "error": (f"{type(diagnostic_error).__name__}: {diagnostic_error}")[:300],
+                    }
+                error.detail = {
+                    **detail,
+                    "planar_brep_evidence": serialized,
+                }
+                raise
+
+        planar_brep = planar_brep_candidate()
+        if planar_brep is not None:
+            return planar_brep
 
         tessellation_request = None
 
@@ -9783,6 +10899,7 @@ class SolidWorksBackend(CadBackend):
             "face_spans": [],
             "native_edges": [],
             "no_facets_faces": [],
+            "planar_brep_bodies": [],
             "reference_alias_audit": {
                 "body": [],
                 "face": [],
@@ -9844,6 +10961,7 @@ class SolidWorksBackend(CadBackend):
                     component
                 ][1],
             }
+
         def read_body_rows(current_bodies):
             rows = []
             for body_index, raw_body in enumerate(current_bodies):
@@ -10091,19 +11209,14 @@ class SolidWorksBackend(CadBackend):
             )
             for key, value in graph["u_observation_stats"].items():
                 evidence["u_observation_stats"][key] += value
+            provider = graph.get("provider", "itessellation")
             body_triangle_start = len(values) // 9
             triangle_records = graph["triangle_records"]
             records_by_face = {}
             for record in triangle_records:
                 records_by_face.setdefault(record["face_index"], []).append(record)
-            facet_ids_by_face = {
-                row["face_index"]: row["facet_ids"]
-                for row in graph["itessellation_body"]["faces"]
-            }
-            facet_sources_by_face = {
-                row["face_index"]: row["facet_ids_source"]
-                for row in graph["itessellation_body"]["faces"]
-            }
+            facet_ids_by_face = {row["index"]: row["facet_ids"] for row in graph["faces"]}
+            facet_sources_by_face = {row["index"]: row["facet_ids_source"] for row in graph["faces"]}
             for face_row in graph["faces"]:
                 face_index = face_row["index"]
                 records = records_by_face.get(face_index, [])
@@ -10226,10 +11339,13 @@ class SolidWorksBackend(CadBackend):
                 completed_faces += 1
                 evidence["faces"] += 1
             evidence["native_edges"].extend(graph["native_edge_rows"])
-            itessellation_body = graph["itessellation_body"]
-            for facet in itessellation_body["facets"]:
-                facet["triangle_record_index"] += body_triangle_start
-            evidence["itessellation_bodies"].append(itessellation_body)
+            if provider == NATIVE_PLANAR_BREP_PROVIDER:
+                evidence["planar_brep_bodies"].append(graph["planar_brep_body"])
+            else:
+                itessellation_body = graph["itessellation_body"]
+                for facet in itessellation_body["facets"]:
+                    facet["triangle_record_index"] += body_triangle_start
+                evidence["itessellation_bodies"].append(itessellation_body)
             evidence["itessellation_vertices"].extend(graph["vertex_rows"])
             evidence["solidworks_vertex_identities"].extend(
                 graph["solidworks_vertex_identities"]
@@ -10244,6 +11360,7 @@ class SolidWorksBackend(CadBackend):
         evidence["itessellation_bodies"].sort(
             key=lambda row: (row["body_type"], row["body_index"])
         )
+        evidence["planar_brep_bodies"].sort(key=lambda row: (row["body_type"], row["body_index"]))
         evidence["itessellation_vertices"].sort(
             key=lambda row: (
                 row["body_type"],
@@ -10421,6 +11538,7 @@ class SolidWorksBackend(CadBackend):
             "face_spans": [],
             "native_edges": [],
             "no_facets_faces": [],
+            "planar_brep_bodies": [],
             "itessellation": {
                 "interface_iid": ITESSELLATION_IID,
                 "u_rule_version": NATIVE_U_IDENTITY_RULE,
@@ -10477,9 +11595,13 @@ class SolidWorksBackend(CadBackend):
                 )
                 triangle_offset = len(values) // 9
                 values.extend(body_values)
-                sources.append(source)
+                if body_evidence["itessellation_bodies"]:
+                    sources.append(source)
+                if body_evidence["planar_brep_bodies"]:
+                    sources.append(NATIVE_PLANAR_BREP_PROVIDER)
                 tessellation["faces"] += body_evidence["faces"]
                 tessellation["native_edges"].extend(body_evidence["native_edges"])
+                tessellation["planar_brep_bodies"].extend(body_evidence["planar_brep_bodies"])
                 for body_record in body_evidence["itessellation_bodies"]:
                     for facet in body_record["facets"]:
                         facet["triangle_record_index"] += triangle_offset
@@ -10504,6 +11626,7 @@ class SolidWorksBackend(CadBackend):
                         }
                     )
                 tessellation["no_facets_faces"].extend(body_evidence["no_facets_faces"])
+        tessellation["planar_brep_bodies"].sort(key=lambda row: (row["body_type"], row["body_index"]))
         tessellation["itessellation"]["reference_alias_audit"] = {
             kind: list(references)
             for kind, references in reference_registry.alias_audit().items()
@@ -10542,23 +11665,23 @@ class SolidWorksBackend(CadBackend):
                 "faces": tessellation["faces"],
                 "no_facets_faces": tessellation["no_facets_faces"][:20],
             }
-        # Native ITessellation facets, in metres, independent of global STL
+        # Native provider facets, in metres, independent of global STL
         # preferences. No claim of machining-grade surface approximation.
         with open(dest_path, "xb") as handle:
-            handle.write(b"SolidWorks ITessellation facets, metres".ljust(80, b" "))
+            handle.write(b"SolidWorks native geometry, metres".ljust(80, b" "))
             handle.write(struct.pack("<I", len(values) // 9))
             for triangle_index, offset in enumerate(range(0, len(values), 9)):
                 xyz = values[offset : offset + 9]
                 a, b, c = xyz[:3], xyz[3:6], xyz[6:9]
                 u, v = [b[i] - a[i] for i in range(3)], [c[i] - a[i] for i in range(3)]
                 n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
-                size = math.sqrt(sum(t * t for t in n))
-                if size == 0:
+                if not any(n):
                     raise CadError("cad_mesh_degenerate", component)
+                unit_normal = native_binary64_unit_vector(n)
                 handle.write(
                     struct.pack(
                         "<12fH",
-                        *(t / size for t in n),
+                        *unit_normal,
                         *xyz,
                         triangle_owners[triangle_index],
                     )
@@ -10568,7 +11691,21 @@ class SolidWorksBackend(CadBackend):
         # tessellation count; no reader pass is needed (the Linux verifier
         # parses the delivered bytes and owns all mesh quality checks).
         triangles = len(values) // 9
-        api = NATIVE_MESH_CAPTURE_API
+        api_parts = []
+        if any(source.endswith("_itessellation") for source in sources):
+            api_parts.append(NATIVE_MESH_CAPTURE_API)
+        if NATIVE_PLANAR_BREP_PROVIDER in sources:
+            api_parts.append(NATIVE_PLANAR_BREP_PROVIDER)
+        api = "+".join(api_parts)
+        representation = (
+            "CAD_native_planar_brep"
+            if sources == [NATIVE_PLANAR_BREP_PROVIDER]
+            else (
+                "CAD_native_itessellation"
+                if NATIVE_PLANAR_BREP_PROVIDER not in sources
+                else "CAD_native_planar_brep_and_itessellation"
+            )
+        )
         self.notes["mesh:" + component] = api
         return {
             "component": component,
@@ -10576,7 +11713,7 @@ class SolidWorksBackend(CadBackend):
             "used_api": api,
             "triangles": triangles,
             "units": "m",
-            "representation": "CAD_native_itessellation",
+            "representation": representation,
             "tessellation_sources": sources,
             "bodies": body_counts,
             "source_scope": self._component_source_scope(component),
@@ -10587,6 +11724,10 @@ class SolidWorksBackend(CadBackend):
                 "native_edges": tessellation["native_edges"],
                 "no_facets_faces": tessellation["no_facets_faces"],
                 "itessellation": tessellation["itessellation"],
+                "planar_brep": {
+                    "schema_version": NATIVE_PLANAR_BREP_SCHEMA,
+                    "bodies": tessellation["planar_brep_bodies"],
+                },
             },
         }
 

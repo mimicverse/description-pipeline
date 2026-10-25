@@ -747,9 +747,7 @@ class StructuralReportTests(unittest.TestCase):
                 "body_type": body_type,
                 "body_index": body_index,
                 "body_name": f"Body{body_type}-{body_index}",
-                "body_reference_sha256": hashlib.sha256(
-                    f"body-{body_type}-{body_index}".encode()
-                ).hexdigest(),
+                "body_reference_sha256": hashlib.sha256(f"body-{body_type}-{body_index}".encode()).hexdigest(),
                 "face_index": face_index,
                 "face_reference_sha256": hashlib.sha256(
                     f"face-{body_type}-{body_index}-{face_index}".encode()
@@ -761,17 +759,9 @@ class StructuralReportTests(unittest.TestCase):
                 "triangle_records_sha256": "0" * 64,
             }
 
-        solid_spans = [
-            span(0, body, face, body * 4 + face, 1)
-            for body in range(3)
-            for face in range(4)
-        ]
-        sheet_spans = [
-            span(1, body, 0, body, 1)
-            for body in range(5)
-        ] + [
-            span(1, 5, face, 5, 0)
-            for face in range(len(rows))
+        solid_spans = [span(0, body, face, body * 4 + face, 1) for body in range(3) for face in range(4)]
+        sheet_spans = [span(1, body, 0, body, 1) for body in range(5)] + [
+            span(1, 5, face, 5, 0) for face in range(len(rows))
         ]
         return [
             {
@@ -803,7 +793,7 @@ class StructuralReportTests(unittest.TestCase):
             "triangle_count": 0,
             "facet_count": 0,
             "area_m2": 0.0004,
-            "tessellate_result": False,
+            "tessellate_result": True,
             "used_api": NATIVE_FACETLESS_EVIDENCE_API,
         }
         row.update(overrides)
@@ -831,29 +821,18 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIs(findings[2]["evidence"]["tessellate_result"], True)
             self.assertEqual(report["summary"]["blockers"], 0)
 
-    def test_degenerate_probe_error_row_is_admitted_at_zero_area(self):
-        row = self._untessellated_row(area_m2=1.8716e-13)
+    def test_legacy_probe_error_row_is_rejected_even_at_zero_area(self):
+        row = self._untessellated_row(area_m2=0.0)
         row.pop("facet_count")
         row.pop("tessellate_result")
-        row["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION during Tessellate"
+        row["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION"
         with TemporaryDirectory() as directory:
             root = Path(directory)
             write_json(root / "evidence/raw/geometry.json", self._geometry_list([row]))
             pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
             report = json.loads((root / pins["json"]["path"]).read_text())
-            findings = [item for item in report["findings"] if item["code"] == "cad_sheet_face_untessellated"]
-            self.assertEqual(len(findings), 1)
-            self.assertEqual(findings[0]["object"], "board-1 sheet body 5 face 0")
-            self.assertEqual(
-                findings[0]["evidence"]["tessellate_probe_error"],
-                "com_error: DISP_E_EXCEPTION during Tessellate",
-            )
-            self.assertNotIn("tessellate_result", findings[0]["evidence"])
-            self.assertNotIn("facet_count", findings[0]["evidence"])
-            self.assertNotIn("zero facets", findings[0]["message"])
-            self.assertIn("native area is 1.8716e-13", findings[0]["message"])
-            self.assertIn("without claiming zero area", findings[0]["message"])
-            self.assertEqual(report["summary"]["blockers"], 0)
+            self.assertIn("report.geometry_metadata_invalid", {item["code"] for item in report["findings"]})
+            self.assertGreater(report["summary"]["blockers"], 0)
 
     def test_v3_untessellated_warning_is_not_masked_and_missing_evidence_fails_closed(self):
         row = self._untessellated_row()
@@ -869,6 +848,7 @@ class StructuralReportTests(unittest.TestCase):
                 "native_edges",
                 "no_facets_faces",
                 "itessellation",
+                "planar_brep",
             },
         )
 
@@ -917,7 +897,7 @@ class StructuralReportTests(unittest.TestCase):
             [self._untessellated_row(body_index=9)],
             [self._untessellated_row(used_api="other")],
             [{**probe, "area_m2": 1e-11}],
-            [{**probe, "tessellate_result": False}],
+            [{**probe, "tessellate_result": True}],
             [{**probe, "facet_count": 0}],
             [{**probe, "tessellate_probe_error": "DISP_E_EXCEPTION"}],
             [no_result],
@@ -946,9 +926,7 @@ class StructuralReportTests(unittest.TestCase):
 
     def test_untessellated_warning_source_must_match_native_face_evidence(self):
         geometry = self._geometry_list([self._untessellated_row()])
-        geometry[1]["tessellation"]["no_facets_faces"][0]["warnings"] = [
-            NATIVE_FACE_FACET_IDS_DERIVED
-        ]
+        geometry[1]["tessellation"]["no_facets_faces"][0]["warnings"] = [NATIVE_FACE_FACET_IDS_DERIVED]
         with TemporaryDirectory() as directory:
             root = Path(directory)
             write_json(
@@ -960,9 +938,7 @@ class StructuralReportTests(unittest.TestCase):
                 {"run_id": "m3", "state": "failed"},
                 evidence_root=root,
             )
-            report = json.loads(
-                (root / pins["json"]["path"]).read_text()
-            )
+            report = json.loads((root / pins["json"]["path"]).read_text())
             codes = [item["code"] for item in report["findings"]]
             self.assertIn("report.geometry_metadata_invalid", codes)
             self.assertNotIn("cad_sheet_face_untessellated", codes)

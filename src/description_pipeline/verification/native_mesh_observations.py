@@ -13,6 +13,9 @@ from ..geometry.native_tessellation import (
 from ..geometry.native_u import (
     NATIVE_EDGE_FIN_IDS_DERIVED,
     NATIVE_FACE_FACET_IDS_DERIVED,
+    NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+    NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+    native_binary64_unit_vector,
 )
 from ..io import PipelineError, confined
 from ..schemas import (
@@ -97,6 +100,63 @@ def _stl_triangle_vertices(path: Path, triangles: int) -> list[tuple[tuple[float
     ]
 
 
+def _verify_planar_stl_normals(
+    path: Path,
+    tessellation: dict,
+    spans: list[dict],
+) -> None:
+    """Bind every planar STL normal to its actual outward triangle winding."""
+
+    data = path.read_bytes()
+    spans_by_face = {
+        (
+            span["body_type"],
+            span["body_index"],
+            span["face_index"],
+        ): span
+        for span in spans
+    }
+    for body in tessellation["planar_brep"]["bodies"]:
+        key = (
+            body["body_type"],
+            body["body_index"],
+            body["face_index"],
+        )
+        span = spans_by_face[key]
+        for local_index, triangle in enumerate(body["triangulation"]["triangles"]):
+            record_offset = 84 + 50 * (span["triangle_start"] + local_index)
+            stored_normal = struct.unpack_from(
+                "<3f",
+                data,
+                record_offset,
+            )
+            vertices = tuple(tuple(float(value) for value in point) for point in triangle["stl_points"])
+            first, second = (
+                tuple(vertices[1][axis] - vertices[0][axis] for axis in range(3)),
+                tuple(vertices[2][axis] - vertices[0][axis] for axis in range(3)),
+            )
+            cross = (
+                first[1] * second[2] - first[2] * second[1],
+                first[2] * second[0] - first[0] * second[2],
+                first[0] * second[1] - first[1] * second[0],
+            )
+            _require(
+                any(cross) and all(math.isfinite(value) for value in stored_normal),
+                "a planar STL triangle has an invalid stored normal",
+            )
+            expected_normal = struct.unpack(
+                "<3f",
+                struct.pack(
+                    "<3f",
+                    *native_binary64_unit_vector(cross),
+                ),
+            )
+            _require(
+                stored_normal == expected_normal,
+                "a planar STL normal does not follow its outward triangle winding",
+            )
+
+
 def verify_native_mesh_observations(bundle: Path) -> dict:
     manifest = verify_snapshot(Path(bundle) / "evidence")
     evidence.source_scopes(bundle)
@@ -138,6 +198,64 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         )
         warnings.extend(native_fin_resolutions)
         warnings.extend(native_identity_warnings)
+        for planar_body in tessellation["planar_brep"]["bodies"]:
+            body_key = (
+                planar_body["body_type"],
+                planar_body["body_index"],
+            )
+            object_id = f"{component}:body:{body_key[0]}/{body_key[1]}"
+            common = {
+                "component": component,
+                "entity_kind": "body",
+                "body_type": body_key[0],
+                "body_index": body_key[1],
+                "face_index": planar_body["face_index"],
+                "provider": planar_body["provider"],
+                "native_body_reference_sha256": planar_body["native_body_reference_sha256"],
+                "native_face_reference_sha256": planar_body["native_face_reference_sha256"],
+            }
+            for code, field, message, extra in (
+                (
+                    NATIVE_PLANAR_BREP_UNIT_NORMAL_DERIVED,
+                    "face_normal_unit",
+                    "Planar BRep face normal is derived from the native surface normal and face sense.",
+                    {
+                        "plane_params": planar_body["surface"]["plane_params"],
+                        "face_in_surface_sense": planar_body["surface"]["face_in_surface_sense"],
+                        "face_normal_raw": planar_body["surface"]["face_normal_raw"],
+                        "face_normal_unit": planar_body["surface"]["face_normal_unit"],
+                    },
+                ),
+                (
+                    NATIVE_PLANAR_BREP_TRIANGULATION_DERIVED,
+                    "triangles",
+                    "Planar BRep mesh triangles are derived from the native plane, ordered boundary, and trim facts.",
+                    {
+                        "rule_version": planar_body["triangulation"]["rule_version"],
+                        "triangle_count": len(planar_body["triangulation"]["triangles"]),
+                        "error_components_m": planar_body["triangulation"]["error_components_m"],
+                        "surface_error_upper_bound_m": planar_body["triangulation"]["surface_error_upper_bound_m"],
+                        "surface_error_limit_m": planar_body["triangulation"]["surface_error_limit_m"],
+                        "boundary_vertex_reference_sha256": [
+                            row["vertex_reference_sha256"] for row in planar_body["boundary_vertices"]
+                        ],
+                    },
+                ),
+            ):
+                warnings.append(
+                    {
+                        "code": code,
+                        "blocking": False,
+                        "severity": "warning",
+                        "message": message,
+                        "object": object_id,
+                        "detail": {
+                            **common,
+                            "field": field,
+                            **extra,
+                        },
+                    }
+                )
         topology = summarize_native_topology(
             tessellation,
             spans,
@@ -149,6 +267,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         )
         topologies.append({"component": component, **topology})
         _span_digests(path, spans)
+        _verify_planar_stl_normals(path, tessellation, spans)
         seen = set()
         component_untessellated = []
         face_evidence = {
@@ -182,7 +301,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         for face in omitted:
             keys = set(face) if isinstance(face, dict) else None
             _require(
-                keys in (base | {"facet_count", "tessellate_result"}, base | {"tessellate_probe_error"}),
+                keys == base | {"facet_count", "tessellate_result"},
                 component + ": malformed untessellated-face observation",
             )
             _require(
@@ -208,29 +327,19 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                 type(face["area_m2"]) in (int, float) and math.isfinite(face["area_m2"]) and face["area_m2"] >= 0,
                 component + ": invalid untessellated native area",
             )
-            if "tessellate_result" in face:
-                _require(
-                    type(face["facet_count"]) is int and face["facet_count"] == 0,
-                    component + ": native facets cannot be omitted",
-                )
-                _require(
-                    type(face["tessellate_result"]) is bool, component + ": native tessellation result is unreadable"
-                )
-            else:
-                # A persistent DISP_E_EXCEPTION on geometrically degenerate faces is
-                # recorded as a probe error instead of a result: both facet_count and
-                # tessellate_result are products of the probe that failed, so the
-                # variant carries neither; it is admissible only for numerically zero
-                # area and never loosens any other check.
-                probe_error = face["tessellate_probe_error"]
-                _require(
-                    isinstance(probe_error, str) and probe_error.startswith("com_error"),
-                    component + ": native tessellation probe error is unreadable",
-                )
-                _require(
-                    face["area_m2"] <= 1e-12,
-                    component + ": a degenerate-face probe error is only admissible at zero native area",
-                )
+            _require(
+                type(face["facet_count"]) is int and face["facet_count"] == 0,
+                component + ": native facets cannot be omitted",
+            )
+            body_evidence = next(
+                body
+                for body in tessellation["itessellation"]["bodies"]
+                if (body["body_type"], body["body_index"]) == key[:2]
+            )
+            _require(
+                face["tessellate_result"] is body_evidence["tessellate_result"] is True,
+                component + ": untessellated face contradicts its successful body tessellation",
+            )
             _require(
                 face["used_api"] == NATIVE_FACETLESS_EVIDENCE_API,
                 component + ": unsupported untessellated-face evidence API",
