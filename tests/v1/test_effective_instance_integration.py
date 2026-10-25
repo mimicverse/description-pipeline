@@ -1,9 +1,9 @@
 """True producer -> independent verifier integration for effective instances.
 
-The snapshot is built through the native producer entry points
-(``freeze._mass_closure`` and ``freeze._effective_instance_record``), and the
+The snapshot is built from native getter-shaped facts, released, projected
+offline, and then folded through ``freeze._effective_instance_record``. The
 acceptance decision runs through the independent physics verifier and the real
-snapshot ``load_scene``.  Nothing here hand-builds the producer's derived block.
+snapshot ``load_scene``. Nothing here hand-builds the producer's derived block.
 """
 
 from __future__ import annotations
@@ -22,13 +22,98 @@ from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.solidworks_physics import verify_physics
 from tests.sources import support
 from tests.sources.test_solidworks_metadata_provenance import (
-    environment as _metadata_environment,
     runtime_environment as _runtime_metadata_environment,
 )
 
 # The package re-exports ``freeze`` as a function; bind the modules explicitly.
 freeze_module = importlib.import_module("description_pipeline.sources.solidworks.freeze")
+native_module = importlib.import_module("description_pipeline.sources.solidworks.native")
 scene_module = importlib.import_module("description_pipeline.sources.solidworks.scene")
+
+
+def _native_mass_reading(reading: dict) -> dict:
+    """Wrap one CAD-double projection in the native getter shape."""
+
+    result = copy.deepcopy(reading)
+    reference = result.get("reference") or {}
+    overrides = copy.deepcopy(reference.get("overrides"))
+    if overrides is None:
+        overrides = {
+            "OverrideMass": False,
+            "OverrideCenterOfMass": False,
+            "OverrideMomentsOfInertia": False,
+        }
+    native_raw = {
+        "mass_kg": float(result["mass"]),
+        "center_of_mass_m": [float(value) for value in result["com"]],
+        "inertia_values": [
+            float(value)
+            for row in result["inertia"]
+            for value in row
+        ],
+        "overrides": overrides,
+    }
+    for key in ("volume_m3", "density_kg_m3"):
+        if type(reference.get(key)) in (int, float):
+            native_raw[key] = float(reference[key])
+    part_measurement = result.pop("part_measurement", None)
+    if isinstance(part_measurement, dict):
+        result["part_measurement_raw"] = _native_mass_reading(
+            {
+                "mass": part_measurement["mass_kg"],
+                "com": part_measurement["center_of_mass_m"],
+                "inertia": part_measurement["inertia_kg_m2"],
+                "reference": {
+                    key: value
+                    for key, value in part_measurement.items()
+                    if key not in {"mass_kg", "center_of_mass_m", "inertia_kg_m2"}
+                },
+            }
+        )
+    result["native_raw"] = native_raw
+    result.setdefault("read_errors", {})
+    return result
+
+
+def _project_mass_after_release(backend) -> tuple[dict, dict]:
+    """Run the production raw getter -> release -> offline projection sequence."""
+
+    assembly_raw = native_module._raw_mass_fact(
+        backend.assembly_mass_properties(COLLECTED)
+    )
+    component_raw = native_module._raw_component_mass_fact(
+        backend.assembly_component_mass_properties(COLLECTED)
+    )
+    backend.release()
+    raw_facts = {
+        "scene_raw": {
+            "document": COLLECTED,
+            "configuration": "Default",
+            "occurrences": [],
+            "components": [],
+            "coordinate_systems": {},
+        },
+        "part_mass_raw": {},
+        "assembly_mass_raw": assembly_raw,
+        "component_mass_raw": component_raw,
+        "link_group_mass_raw": {
+            "assembly": COLLECTED,
+            "configuration": "Default",
+            "used_api": "IMassProperty2 (SelectedItems = component set)",
+            "selection_rule": "top_most_providers+uncovered_leaves",
+            "links": {},
+        },
+        "source_scopes": {},
+        "notes": {},
+    }
+    projected = native_module.project_prepared_capture(raw_facts)
+    native = freeze_module._mass_closure_from_projection(
+        projected["assembly_mass"],
+        projected["component_mass"],
+    )
+    if not isinstance(native, dict):
+        raise AssertionError("offline mass projection produced no closure")
+    return native, projected["effective_instances"]
 
 
 def _fixture_link_group_record(source, components, notes, masses, assembly):
@@ -135,20 +220,46 @@ def _write_native_metadata_fixture(evidence: Path, *, closure_top_level: str) ->
     from description_pipeline.io import write_json
 
     runtime = _runtime_metadata_environment()
-    boundary = runtime["session_boundary"]
-    boundary["closure_top_level"] = closure_top_level
-    boundary["capture_state"]["path"] = closure_top_level
-    boundary["capture_state"]["title"] = Path(closure_top_level).name
-    boundary["opened"]["path"] = closure_top_level
-    boundary["opened"]["opened"] = Path(closure_top_level).name
+    copy_session = runtime["solidworks"]["sessions"]["copy"]
+    runtime["solidworks"]["sessions"] = {"copy": copy_session}
+    closure_parts = str(closure_top_level).replace("/", "\\").rsplit("\\", 1)
+    search_root, closure_name = closure_parts
+    runtime["prepared_capture"] = {
+        "mode": "single_read_only_prepared_capture",
+        "policy": {
+            "mode": "prepared_read_only_copy",
+            "source_root": search_root,
+            "assembly": closure_top_level,
+            "requested_configuration": "Default",
+            "session_role": "copy",
+            "search_root": search_root,
+            "sealed_documents": [closure_top_level],
+            "com_started": False,
+        },
+        "opened": {
+            "opened": closure_name,
+            "path": closure_top_level,
+            "read_only": True,
+            "errors": 0,
+            "warnings": 0,
+        },
+        "state_before": {
+            "path": closure_top_level,
+            "title": closure_name,
+            "saved": True,
+            "save_flag": False,
+            "active_configuration": "Default",
+            "configurations": ["Default"],
+            "read_only": True,
+            "lightweight": None,
+            "unsupported": ["lightweight"],
+        },
+    }
     runtime_path = evidence / "native-runtime.json"
-    rewrite_path = evidence / "evidence/rewrite-environment.json"
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
-    rewrite_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(evidence / "raw/dependency_closure.json", {"top_level": closure_top_level})
     write_json(runtime_path, runtime)
     write_json(evidence.parent / "reports/native-tool.json", runtime["toolchain"])
-    write_json(rewrite_path, _metadata_environment())
 
 
 def placement(rotation, translation):
@@ -174,18 +285,26 @@ class StubProbeBackend:
     def __init__(self, top, instances):
         self._top = top
         self._instances = instances
+        self.released = False
 
     def assembly_mass_properties(self, path):
-        return copy.deepcopy(self._top)
+        return _native_mass_reading(self._top)
 
     def assembly_component_mass_properties(self, path):
+        instances = copy.deepcopy(self._instances)
+        for row in instances:
+            if isinstance(row, dict) and isinstance(row.get("effective"), dict):
+                row["effective"] = _native_mass_reading(row["effective"])
         return {
             "assembly": path,
             "configuration": "Default",
-            "instances": copy.deepcopy(self._instances),
+            "instances": instances,
             "errors": [],
             "reference": {"method": "IMassProperty2 (SelectedItems = component instance)"},
         }
+
+    def release(self):
+        self.released = True
 
 
 class EffectiveInstanceIntegrationTests(unittest.TestCase):
@@ -456,8 +575,8 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             },
             instances,
         )
-        native = freeze_module._mass_closure(backend, self.source, COLLECTED)
-        self.assertIsInstance(native, dict)
+        native, readings = _project_mass_after_release(backend)
+        self.assertTrue(backend.released)
         scene_obj = type(
             "Scene",
             (),
@@ -481,7 +600,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
                 "notes": copy.deepcopy(self.raw_scene["notes"]),
             },
         )()
-        record = freeze_module._effective_instance_record(scene_obj, self.source, self.readings)
+        record = freeze_module._effective_instance_record(scene_obj, self.source, readings)
         raw = self.evidence / "raw"
         (raw / "scene_raw.json").write_text(json.dumps(self.raw_scene), encoding="utf-8")
         (raw / "mass_properties.json").write_text(json.dumps(self.masses), encoding="utf-8")
@@ -508,7 +627,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        support.write_link_group_mass_record_from_recombination(self.bundle, self.source)
         # Seal the carrier inputs through the canonical producer: a fixture backend emits the
         # native observation record for this nested scene and the real
         # ``prepare_native_package`` derives the sealed payload consumers rebuild from
@@ -705,25 +823,29 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
 class StubInstanceBackend:
     """CAD-API double that also exposes the cached singleton readings."""
 
-    def __init__(self, top, rows, readings):
+    def __init__(self, top, rows):
         self._top = top
         self._rows = rows
-        self._readings = readings
+        self.released = False
 
     def assembly_mass_properties(self, path):
-        return copy.deepcopy(self._top)
+        return _native_mass_reading(self._top)
 
     def assembly_component_mass_properties(self, path):
+        rows = copy.deepcopy(self._rows)
+        for row in rows:
+            if isinstance(row, dict) and isinstance(row.get("effective"), dict):
+                row["effective"] = _native_mass_reading(row["effective"])
         return {
             "assembly": path,
             "configuration": "Default",
-            "instances": copy.deepcopy(self._rows),
+            "instances": rows,
             "errors": [],
             "reference": {"method": "IMassProperty2 (SelectedItems = component instance)"},
         }
 
-    def effective_instance_readings(self):
-        return copy.deepcopy(self._readings)
+    def release(self):
+        self.released = True
 
 
 class InstanceMeasurementIntegrationTests(unittest.TestCase):
@@ -842,9 +964,9 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
         }
 
     def _build(self):
-        backend = StubInstanceBackend(self.top, self.rows, {self.PART: self.singleton})
-        native = freeze_module._mass_closure(backend, self.source, COLLECTED)
-        readings = backend.effective_instance_readings()
+        backend = StubInstanceBackend(self.top, self.rows)
+        native, readings = _project_mass_after_release(backend)
+        self.assertTrue(backend.released)
         scene_obj = type(
             "Scene",
             (),
@@ -941,7 +1063,6 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        support.write_link_group_mass_record_from_recombination(self.bundle, self.source)
         # Seal the carrier inputs through the canonical producer (fixture backend emits the
         # native observation; inputs only - no consumer output is injected).
         from description_pipeline.io import file_digest as _file_digest

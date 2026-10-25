@@ -431,7 +431,6 @@ def capture_root(
         "captured_at": "2026-10-10T00:00:00Z",
         "platform": "Windows-11",
         "python": "3.12.10",
-        "session_boundary": {},
         "solidworks": {
             "revision": "34.4.1",
             "sessions": {},
@@ -456,8 +455,6 @@ def capture_root(
             "collected_document": str(root / "input/cad" / main),
             "originals_unchanged": {
                 "files_checked": 1,
-                "states_recorded": 1,
-                "state_scope": "initial_source_observation",
             },
             "source_hashes": {main.casefold(): {"sha256": native_files[main]}},
         },
@@ -1055,8 +1052,6 @@ class StageTransferTests(unittest.TestCase):
 
         from tests.sources import support
 
-        from description_pipeline.sources.solidworks.freeze import freeze
-
         work = self.base / "freeze"
         try:
             assembly = support.make_cad_tree(work / "cad")
@@ -1121,8 +1116,8 @@ class StageTransferTests(unittest.TestCase):
                 "description_pipeline.runtime.tool_record",
                 return_value=native_identity,
             ):
-                freeze(
-                    support.capture_requests(config),
+                support.capture_prepared_fixture(
+                    config,
                     snapshot,
                     backend=backend,
                     worker_version=native_identity["version"],

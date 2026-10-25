@@ -8,7 +8,6 @@ from pathlib import Path
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import validate_source_config as _validate_source_config  # noqa: E402
 
 from . import support  # noqa: E402
@@ -16,7 +15,7 @@ from .test_solidworks_freeze import _Backend, _compose_scene_inputs  # noqa: E40
 
 
 def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
-    return _freeze(support.capture_requests(config), *args, **kwargs)
+    return support.capture_prepared_fixture(config, *args, **kwargs)
 
 
 def validate_source_config(config):  # noqa: F811 - fixture adapter for the request sets

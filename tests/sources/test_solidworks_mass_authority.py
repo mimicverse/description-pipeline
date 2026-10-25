@@ -10,13 +10,12 @@ from pathlib import Path
 from . import _paths  # noqa: F401
 from . import support
 from description_pipeline.sources.solidworks.errors import ConfigError
-from description_pipeline.sources.solidworks.freeze import freeze as _freeze
 from description_pipeline.sources.solidworks.freeze import validate_source_config as _validate_source_config
 from description_pipeline.sources.solidworks.scene import load_scene
 
 
 def freeze(config, *args, **kwargs):
-    return _freeze(support.capture_requests(config), *args, **kwargs)
+    return support.capture_prepared_fixture(config, *args, **kwargs)
 
 
 def validate_source_config(config):
@@ -96,7 +95,7 @@ class CadMassAuthorityTests(unittest.TestCase):
             "assembly": str(self.assembly),
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
-            "geometry": {"enabled": False},
+            "geometry": {"enabled": True},
             "coordinate_systems": ["CS_base_link", "CS_arm_link"],
             "bodies": [
                 {

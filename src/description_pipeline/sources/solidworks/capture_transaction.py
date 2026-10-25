@@ -35,9 +35,9 @@ from .discovery import (
     PLAN_FILE,
     native_component_identity,
 )
-from .freeze import freeze
-from .input import native_source_closure
+from .freeze import capture_prepared
 from .revision import package_inventory
+from .selection import verify_selection
 
 
 def _state(emit, stage: str, state: str, **details) -> None:
@@ -207,6 +207,7 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
         "effective_instances": "raw/effective_instances.json",
         "geometry": "raw/geometry.json",
         "axes": "raw/axis_references.json",
+        "native_capture_facts": "raw/native_capture_facts.json",
         "collection": "evidence/collection.json",
     }
     capture = {
@@ -473,6 +474,52 @@ def capture_native_package(
             raise PipelineError(
                 "The sealed capture plan carries no saved configuration"
             )
+        discovery = read_data(package / DISCOVERY_FILE)
+        native_files = (
+            discovery.get("native_files")
+            if isinstance(discovery, dict)
+            else None
+        )
+        if (
+            not isinstance(native_files, dict)
+            or not native_files
+            or any(
+                not isinstance(name, str)
+                or not isinstance(checksum, str)
+                for name, checksum in native_files.items()
+            )
+        ):
+            raise PipelineError(
+                "The sealed discovery record carries no CAD file inventory"
+            )
+        raw = discovery.get("raw") if isinstance(discovery, dict) else None
+        source_selection = (
+            raw.get("source_selection")
+            if isinstance(raw, dict)
+            else None
+        )
+        if not isinstance(source_selection, dict):
+            raise PipelineError(
+                "The sealed discovery record carries no source selection"
+            )
+        selected = source_selection.get("files")
+        excluded = source_selection.get("excluded_files")
+        if (
+            not isinstance(selected, dict)
+            or not isinstance(excluded, dict)
+            or set(selected) & set(excluded)
+            or selected != native_files
+            or selected != raw.get("files")
+        ):
+            raise PipelineError(
+                "The sealed discovery source selection differs from its file inventory"
+            )
+        verify_selection(
+            source_selection,
+            {**excluded, **selected},
+            selected,
+            reader_sha256=source_selection.get("reader_sha256"),
+        )
         prepared_files = package_inventory(package)
         _archive_input(package, staging)
         report["package_files"] = {
@@ -486,21 +533,18 @@ def capture_native_package(
             "provider": "solidworks",
             "assembly": str(assembly.resolve()),
             "configuration": configuration,
-            "require_saved": True,
-            "document_suffixes": [".sldasm", ".sldprt"],
-            "geometry": {
-                "enabled": True,
-                "format": "stl_binary",
-            },
+            "geometry": {"enabled": True, "format": "stl_binary"},
             "coordinate_systems": [
                 str(name) for name in plan["datums"]
             ],
-            "allowed_roots": [str(package.resolve())],
             "groups": plan["groups"],
             "axis_requests": plan["axis_requests"],
-            "closure": native_source_closure(package),
         }
-        definition = {"source": source, "plan": plan}
+        definition = {
+            "source": source,
+            "plan": plan,
+            "native_files": dict(native_files),
+        }
         write_json(staging / "input/handoff.json", report)
         return definition, report, prepared_files
 
@@ -554,9 +598,12 @@ def capture_native_package(
         package_inventory(package) == original_files,
         "Prepared inputs changed before native capture",
     )
-    freeze(
+    capture_prepared(
         definition["source"],
         staging / "evidence",
+        package=package,
+        prepared_root=staging / "input/cad",
+        native_files=definition["native_files"],
         backend=backend,
         worker_version=__version__,
         on_activity=on_activity,

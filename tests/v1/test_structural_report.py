@@ -1,21 +1,12 @@
 """The generated team report retains evidence on both successful and failed runs."""
 
-import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from description_pipeline.geometry.native_u import (
-    NATIVE_FACE_FACET_IDS_DERIVED,
-)
 from description_pipeline.io import file_digest, write_json
-from description_pipeline.schemas import (
-    NATIVE_FACETLESS_EVIDENCE_API,
-    NATIVE_TESSELLATION_SCHEMA,
-)
 from description_pipeline.structural_report import write_structural_report
-from tests.sources import support
 
 
 class StructuralReportTests(unittest.TestCase):
@@ -92,74 +83,6 @@ class StructuralReportTests(unittest.TestCase):
             data = json.loads((root / pins["json"]["path"]).read_text())
             self.assertIn("report.evidence_unreadable", [item["code"] for item in data["findings"]])
             self.assertIn("original native failure", (root / pins["markdown"]["path"]).read_text())
-
-    def test_stale_stored_references_are_warnings_with_exact_document_evidence(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(
-                root / "evidence/raw/dependency_closure.json",
-                {
-                    "stale_stored_references": [
-                        {
-                            "document": "cad/shank.SLDPRT",
-                            "location": r"C:\author\stale\stale_part.SLDASM",
-                            "resolved_path": r"C:\author\stale\stale_part.SLDASM",
-                            "exists": False,
-                        },
-                        {
-                            "document": "cad/arm.SLDPRT",
-                            "location": r"D:\outside\external_part.SLDASM",
-                            "resolved_path": r"D:\outside\external_part.SLDASM",
-                            "exists": True,
-                        },
-                    ]
-                },
-            )
-            receipt = {"run_id": "m3", "state": "verified", "passed": True}
-            before = dict(receipt)
-            pins = write_structural_report(root, receipt, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            self.assertEqual(before, receipt)
-            warnings = [item for item in report["findings"] if item["code"] == "native.stale_stored_reference"]
-            self.assertEqual(len(warnings), 2)
-            self.assertTrue(all(item["severity"] == "warning" for item in warnings))
-            first = next(item for item in warnings if item["evidence"]["document"] == "cad/shank.SLDPRT")
-            self.assertEqual(first["evidence"]["location"], r"C:\author\stale\stale_part.SLDASM")
-            self.assertEqual(first["evidence"]["resolved_path"], r"C:\author\stale\stale_part.SLDASM")
-            self.assertIs(first["evidence"]["exists"], False)
-            self.assertEqual(first["object"], "cad/shank.SLDPRT")
-            self.assertIn("neither read nor copied", first["message"])
-            self.assertEqual(report["summary"], {"warnings": 2, "blockers": 0})
-            markdown = (root / pins["markdown"]["path"]).read_text()
-            self.assertIn("stale_part.SLDASM", markdown)
-
-    def test_failed_run_reports_stale_references_beside_the_failure(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(
-                root / "evidence/raw/dependency_closure.json",
-                {
-                    "stale_stored_references": [
-                        {
-                            "document": "cad/shank.SLDPRT",
-                            "location": r"C:\author\stale\stale_part.SLDASM",
-                            "resolved_path": r"C:\author\stale\stale_part.SLDASM",
-                            "exists": False,
-                        }
-                    ]
-                },
-            )
-            pins = write_structural_report(
-                root,
-                {"run_id": "m3", "status": "failed", "error": "capture failed", "error_code": "cad_capture_failed"},
-                evidence_root=root,
-            )
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            codes = [item["code"] for item in report["findings"]]
-            self.assertIn("native.stale_stored_reference", codes)
-            self.assertIn("cad_capture_failed", codes)
-            self.assertEqual(report["summary"], {"warnings": 1, "blockers": 1})
-            self.assertIn("capture failed", (root / pins["markdown"]["path"]).read_text())
 
     @staticmethod
     def _provenance(warnings):
@@ -739,233 +662,147 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn("native.material_provenance_missing", codes)
             self.assertIn("cad_surface_only_effective_instance", codes)
 
-    def _geometry_list(self, rows):
-        owner_ids = iter(range(1, 100))
+    def test_quality_warning_is_projected_without_reparsing_geometry(self):
+        from description_pipeline.geometry.native_tessellation import native_triangle_stl_warning
+        from description_pipeline.verification.solidworks_urdf import native_gate_warning_diagnostics
+        from tests.v1.test_native_scope_warning_projection import raw_warnings
 
-        def span(body_type, body_index, face_index, start, count):
-            return {
-                "body_type": body_type,
-                "body_index": body_index,
-                "body_name": f"Body{body_type}-{body_index}",
-                "body_reference_sha256": hashlib.sha256(
-                    f"body-{body_type}-{body_index}".encode()
-                ).hexdigest(),
-                "face_index": face_index,
-                "face_reference_sha256": hashlib.sha256(
-                    f"face-{body_type}-{body_index}-{face_index}".encode()
-                ).hexdigest(),
-                "face_owner_id": next(owner_ids),
-                "edge_references": [],
-                "triangle_start": start,
-                "triangle_count": count,
-                "triangle_records_sha256": "0" * 64,
-            }
-
-        solid_spans = [
-            span(0, body, face, body * 4 + face, 1)
-            for body in range(3)
-            for face in range(4)
-        ]
-        sheet_spans = [
-            span(1, body, 0, body, 1)
-            for body in range(5)
-        ] + [
-            span(1, 5, face, 5, 0)
-            for face in range(len(rows))
-        ]
-        return [
-            {
-                "component": "arm-1",
-                "triangles": 12,
-                "bodies": {"solid": 3, "sheet": 0},
-                "tessellation": support.native_tessellation_fixture(
-                    solid_spans,
-                    [],
-                ),
-            },
-            {
-                "component": "board-1",
-                "triangles": 5,
-                "bodies": {"solid": 0, "sheet": 6},
-                "tessellation": support.native_tessellation_fixture(
-                    sheet_spans,
-                    [],
-                    rows,
-                ),
-            },
-        ]
-
-    def _untessellated_row(self, **overrides):
-        row = {
-            "body_type": 1,
-            "body_index": 5,
-            "face_index": 0,
-            "triangle_count": 0,
-            "facet_count": 0,
-            "area_m2": 0.0004,
-            "tessellate_result": False,
-            "used_api": NATIVE_FACETLESS_EVIDENCE_API,
-        }
-        row.update(overrides)
-        return row
-
-    def test_untessellated_sheet_faces_warn_without_zero_area_claims(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            rows = [
-                self._untessellated_row(face_index=0),
-                self._untessellated_row(face_index=1, area_m2=0.0),
-                self._untessellated_row(face_index=2, tessellate_result=True),
-            ]
-            write_json(root / "evidence/raw/geometry.json", self._geometry_list(rows))
-            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            findings = [item for item in report["findings"] if item["code"] == "cad_sheet_face_untessellated"]
-            self.assertEqual(len(findings), 3)
-            self.assertEqual(findings[0]["object"], "board-1 sheet body 5 face 0")
-            self.assertIn("native area is 0.0004 m^2", findings[0]["message"])
-            self.assertIn("without claiming zero area", findings[0]["message"])
-            self.assertNotIn("positive area", findings[0]["message"])
-            self.assertEqual(findings[0]["evidence"]["component"], "board-1")
-            self.assertEqual(findings[1]["evidence"]["area_m2"], 0.0)
-            self.assertIs(findings[2]["evidence"]["tessellate_result"], True)
-            self.assertEqual(report["summary"]["blockers"], 0)
-
-    def test_degenerate_probe_error_row_is_admitted_at_zero_area(self):
-        row = self._untessellated_row(area_m2=1.8716e-13)
-        row.pop("facet_count")
-        row.pop("tessellate_result")
-        row["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION during Tessellate"
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(root / "evidence/raw/geometry.json", self._geometry_list([row]))
-            pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            findings = [item for item in report["findings"] if item["code"] == "cad_sheet_face_untessellated"]
-            self.assertEqual(len(findings), 1)
-            self.assertEqual(findings[0]["object"], "board-1 sheet body 5 face 0")
-            self.assertEqual(
-                findings[0]["evidence"]["tessellate_probe_error"],
-                "com_error: DISP_E_EXCEPTION during Tessellate",
-            )
-            self.assertNotIn("tessellate_result", findings[0]["evidence"])
-            self.assertNotIn("facet_count", findings[0]["evidence"])
-            self.assertNotIn("zero facets", findings[0]["message"])
-            self.assertIn("native area is 1.8716e-13", findings[0]["message"])
-            self.assertIn("without claiming zero area", findings[0]["message"])
-            self.assertEqual(report["summary"]["blockers"], 0)
-
-    def test_v3_untessellated_warning_is_not_masked_and_missing_evidence_fails_closed(self):
-        row = self._untessellated_row()
-        geometry = self._geometry_list([row])
-        tessellation = geometry[1]["tessellation"]
-        self.assertEqual(tessellation["schema_version"], NATIVE_TESSELLATION_SCHEMA)
-        self.assertEqual(
-            set(tessellation),
-            {
-                "schema_version",
-                "faces",
-                "face_spans",
-                "native_edges",
-                "no_facets_faces",
-                "itessellation",
-            },
+        warning = native_triangle_stl_warning(
+            "board-1",
+            raw_path="raw/triangles/" + "a" * 64 + ".triangles",
+            raw_sha="a" * 64,
+            path="geometry/" + "b" * 64 + ".stl",
+            sha="b" * 64,
+            triangles=1,
         )
-
+        raw = [*raw_warnings(), warning]
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            write_json(root / "evidence/raw/geometry.json", geometry)
+            write_json(
+                root / "reports/quality.json",
+                {
+                    "checks": [{
+                        "id": "geometry.native_tessellation",
+                        "state": "passed",
+                        "passed": True,
+                        "details": {"warnings": raw},
+                    }],
+                    "diagnostics": native_gate_warning_diagnostics({"warnings": raw}),
+                },
+            )
+            write_json(
+                root / "evidence/raw/geometry.json",
+                {"unsupported": "raw geometry is owned by native mesh verification"},
+            )
             pins = write_structural_report(
                 root,
                 {"run_id": "m3", "state": "verified"},
                 evidence_root=root,
             )
             report = json.loads((root / pins["json"]["path"]).read_text())
-            self.assertIn(
-                "cad_sheet_face_untessellated",
-                [item["code"] for item in report["findings"]],
+            findings = [
+                item
+                for item in report["findings"]
+                if item["code"] == "cad_native_triangle_stl_derived"
+            ]
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["severity"], "warning")
+            self.assertEqual(findings[0]["object"], warning["object"])
+            self.assertEqual(findings[0]["message"], warning["message"])
+            self.assertEqual(findings[0]["evidence"]["detail"], warning["detail"])
+            self.assertEqual(
+                report["summary"],
+                {"warnings": 2, "blockers": 0},
             )
             self.assertNotIn(
                 "report.geometry_metadata_invalid",
-                [item["code"] for item in report["findings"]],
+                {item["code"] for item in report["findings"]},
             )
 
-        geometry[1]["tessellation"].pop("itessellation")
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(root / "evidence/raw/geometry.json", geometry)
-            pins = write_structural_report(
-                root,
-                {"run_id": "m3", "state": "failed"},
-                evidence_root=root,
-            )
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            codes = [item["code"] for item in report["findings"]]
-            self.assertIn("report.geometry_metadata_invalid", codes)
-            self.assertNotIn("cad_sheet_face_untessellated", codes)
-
-    def test_untessellated_sheet_metadata_fails_closed_outside_schema(self):
-        probe = self._untessellated_row(area_m2=1.8716e-13)
-        probe.pop("facet_count")
-        probe.pop("tessellate_result")
-        probe["tessellate_probe_error"] = "com_error: DISP_E_EXCEPTION"
-        no_result = self._untessellated_row()
-        no_result.pop("tessellate_result")
-        cases = [
-            [self._untessellated_row(triangle_count=1)],
-            [self._untessellated_row(), self._untessellated_row()],
-            [self._untessellated_row(body_index=9)],
-            [self._untessellated_row(used_api="other")],
-            [{**probe, "area_m2": 1e-11}],
-            [{**probe, "tessellate_result": False}],
-            [{**probe, "facet_count": 0}],
-            [{**probe, "tessellate_probe_error": "DISP_E_EXCEPTION"}],
-            [no_result],
-        ]
-        for rows in cases:
-            with TemporaryDirectory() as directory:
-                root = Path(directory)
-                write_json(root / "evidence/raw/geometry.json", self._geometry_list(rows))
-                pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
-                report = json.loads((root / pins["json"]["path"]).read_text())
-                codes = [item["code"] for item in report["findings"]]
-                self.assertIn("report.geometry_metadata_invalid", codes)
-                self.assertNotIn("cad_sheet_face_untessellated", codes)
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(root / "evidence/raw/geometry.json", {"bodies": {"solid": 1, "sheet": 0}})
-            pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            self.assertIn("report.geometry_metadata_invalid", [item["code"] for item in report["findings"]])
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_json(root / "evidence/manifest.json", {"files": {"raw/geometry.json": "0" * 64}})
-            pins = write_structural_report(root, {"run_id": "m3", "state": "failed"}, evidence_root=root)
-            report = json.loads((root / pins["json"]["path"]).read_text())
-            self.assertIn("report.geometry_metadata_missing", [item["code"] for item in report["findings"]])
-
-    def test_untessellated_warning_source_must_match_native_face_evidence(self):
-        geometry = self._geometry_list([self._untessellated_row()])
-        geometry[1]["tessellation"]["no_facets_faces"][0]["warnings"] = [
-            NATIVE_FACE_FACET_IDS_DERIVED
-        ]
+    def test_failed_native_gate_is_projected_as_a_blocker(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             write_json(
-                root / "evidence/raw/geometry.json",
-                geometry,
+                root / "reports/quality.json",
+                {
+                    "checks": [
+                        {
+                            "id": "geometry.native_tessellation",
+                            "state": "failed",
+                            "passed": False,
+                            "message": "Native tessellation verification failed",
+                            "details": {"warnings": []},
+                        }
+                    ],
+                    "diagnostics": [],
+                },
             )
             pins = write_structural_report(
                 root,
                 {"run_id": "m3", "state": "failed"},
                 evidence_root=root,
             )
-            report = json.loads(
-                (root / pins["json"]["path"]).read_text()
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            blocker = next(
+                item
+                for item in report["findings"]
+                if item["code"] == "geometry.native_tessellation"
             )
-            codes = [item["code"] for item in report["findings"]]
-            self.assertIn("report.geometry_metadata_invalid", codes)
-            self.assertNotIn("cad_sheet_face_untessellated", codes)
+            self.assertEqual(blocker["severity"], "blocker")
+            self.assertEqual(
+                blocker["message"],
+                "Native tessellation verification failed",
+            )
+            self.assertNotIn(
+                "cad_native_triangle_stl_derived",
+                {item["code"] for item in report["findings"]},
+            )
+
+    def test_manifest_required_geometry_missing_is_a_diagnostic_blocker(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(
+                root / "evidence/manifest.json",
+                {"files": {"raw/geometry.json": "0" * 64}},
+            )
+            pins = write_structural_report(
+                root,
+                {"run_id": "m3", "state": "failed"},
+                evidence_root=root,
+            )
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            blocker = next(
+                item
+                for item in report["findings"]
+                if item["code"] == "report.geometry_metadata_missing"
+            )
+            self.assertEqual(blocker["severity"], "blocker")
+            self.assertIn("diagnostic-completeness blocker only", blocker["message"])
+            self.assertEqual(blocker["evidence"], {"required_by_manifest": True})
+
+    def test_unreadable_geometry_is_a_diagnostic_blocker(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "evidence/raw").mkdir(parents=True)
+            (root / "evidence/raw/geometry.json").write_text(
+                "{invalid json",
+                encoding="utf-8",
+            )
+            pins = write_structural_report(
+                root,
+                {"run_id": "m3", "state": "failed"},
+                evidence_root=root,
+            )
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            codes = {item["code"] for item in report["findings"]}
+            self.assertIn("report.evidence_unreadable", codes)
+            blocker = next(
+                item
+                for item in report["findings"]
+                if item["code"] == "report.geometry_metadata_invalid"
+            )
+            self.assertEqual(blocker["severity"], "blocker")
+            self.assertIn("diagnostic-completeness blocker only", blocker["message"])
 
 
 if __name__ == "__main__":

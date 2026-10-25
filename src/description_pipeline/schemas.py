@@ -13,22 +13,19 @@ ENGINEERING_MODEL_SCHEMA = "solidworks-to-urdf.engineering-model/v1"
 TOOL_SCHEMA = "solidworks-to-urdf.tool/v1"
 EFFECTIVE_INSTANCES_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
-NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v13"
-NATIVE_ID_ARRAY_SOURCE_FLAT = "native-flat-array"
-NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO = (
-    "native-body-global-null-zero"
-)
-NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO = (
-    "native-incident-faces-null-zero"
-)
-NATIVE_FACETLESS_EVIDENCE_API = (
-    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets/"
-    "GetFacetFins/GetEdgeFins/GetFacetCount/GetFinCount"
-)
-NATIVE_MESH_CAPTURE_API = (
-    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets/"
-    "GetFacetFins/GetEdgeFins/GetFinVertices/GetVertexPoint/"
-    "GetFacetCount/GetFinCount/GetVertexCount"
+NATIVE_TESSELLATION_SCHEMA = "native-triangles/v1"
+NATIVE_TRIANGLE_STREAM_VERSION = 1
+NATIVE_TRIANGLE_STREAM_MAGIC = b"SWTESS64        "
+NATIVE_CAPTURE_FACTS_KEYS = frozenset(
+    {
+        "scene_raw",
+        "part_mass_raw",
+        "assembly_mass_raw",
+        "component_mass_raw",
+        "link_group_mass_raw",
+        "source_scopes",
+        "notes",
+    }
 )
 NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
 NATIVE_DISCOVERY_FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"

@@ -33,21 +33,17 @@ class CopyCoverageTests(unittest.TestCase):
         self.root = Path(temporary.name)
 
     def _build(self, mutate=None) -> None:
-        """The target tree: the frozen originals under input/cad, the closure
-        copies (possibly engine-rewritten) under evidence/source.
-
-        Originals stay in the platform's frozen upload storage; their identity
-        is the handoff upload index and the discovery inventory, never an
-        equality with the (possibly engine-rewritten) copy bytes.
-        """
+        """Bind every captured copy to the immutable prepared bytes."""
 
         root = self.root
         prepared = "C:\\prepared"
-        rewritten_main, rewritten_shank = b"MAIN-REWRITTEN", b"SHANK-REWRITTEN"
-        copies = {"robot.SLDASM": rewritten_main, "shank.SLDPRT": rewritten_shank, "imported_part.step": NP}
         originals = {"robot.SLDASM": MAIN, "shank.SLDPRT": SHANK, "imported_part.step": NP}
+        copies = dict(originals)
         closure = {
-            "declared_unresolved": [],
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "method": "sealed_prepared_inventory",
+            "source_dir": r"C:\capture\source",
+            "top_level": r"C:\capture\source\robot.SLDASM",
             "configuration": "Default",
             "original_files": {prepared + "\\" + name: _sha(data) for name, data in originals.items()},
             "mapping": [
@@ -65,9 +61,6 @@ class CopyCoverageTests(unittest.TestCase):
                 )
             ],
             "copy_files": {"source/" + name: _sha(data) for name, data in copies.items()},
-            "suppressed_instances": 0,
-            "stale_stored_references": [],
-            "seeded_required_leaves": [prepared + "\\imported_part.step"],
         }
         if mutate is not None:
             mutate(root, closure, originals, copies)
@@ -86,10 +79,6 @@ class CopyCoverageTests(unittest.TestCase):
                 "files": dict(native),
                 "source_selection": {
                     "files": {name: _sha(data) for name, data in originals.items()},
-                    "closure": {
-                        "stage_root": "C:\\stage",
-                        "documents": {"shank.SLDPRT": {"stored_references": [], "resolved_edges": []}},
-                    },
                 },
                 "selection": {"main_assembly": "robot.SLDASM"},
             },
@@ -111,8 +100,6 @@ class CopyCoverageTests(unittest.TestCase):
                     "capture": {
                         "originals_unchanged": {
                             "files_checked": len(closure["original_files"]),
-                            "states_recorded": len(closure["original_files"]),
-                            "state_scope": "initial_source_observation",
                         }
                     }
                 },
@@ -137,7 +124,7 @@ class CopyCoverageTests(unittest.TestCase):
         closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("imported_part.step")]
         closure["copy_files"].pop("source/imported_part.step")
 
-    def test_full_coverage_passes_with_rewritten_native_bytes(self) -> None:
+    def test_full_coverage_passes_with_unchanged_prepared_bytes(self) -> None:
         self._build()
         _dependencies(self.root, self.definition)
 
@@ -199,62 +186,6 @@ class CopyCoverageTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             _dependencies(self.root, self.definition)
 
-    def test_seeded_leaves_must_be_covered_and_selected(self) -> None:
-        def uncovered_seed(root: Path, closure: dict, originals: dict, copies: dict) -> None:
-            closure["seeded_required_leaves"].append(str(root / "prepared" / "ghost.SLDASM"))
-
-        def unselected_seed(root: Path, closure: dict, originals: dict, copies: dict) -> None:
-            decoy = b"DECOY"
-            copies["decoy.SLDASM"] = decoy
-            path = str(root / "prepared" / "decoy.SLDASM")
-            closure["original_files"][path] = _sha(decoy)
-            closure["mapping"].append(
-                {
-                    "source": path,
-                    "source_sha256": _sha(decoy),
-                    "copy": "source/decoy.SLDASM",
-                    "copy_sha256": _sha(decoy),
-                    "instance": "decoy-1",
-                }
-            )
-            closure["copy_files"]["source/decoy.SLDASM"] = _sha(decoy)
-            closure["seeded_required_leaves"].append(path)
-
-        def malformed_seed(root: Path, closure: dict, originals: dict, copies: dict) -> None:
-            closure["seeded_required_leaves"] = [""]
-
-        for label, mutate in (
-            ("uncovered_seed", uncovered_seed),
-            ("unselected_seed", unselected_seed),
-            ("malformed_seed", malformed_seed),
-        ):
-            with self.subTest(case=label):
-                temporary = tempfile.TemporaryDirectory(prefix="copy-coverage-mut-")
-                self.addCleanup(temporary.cleanup)
-                self.root = Path(temporary.name)
-                self._build(mutate)
-                with self.assertRaises(PipelineError):
-                    _dependencies(self.root, self.definition)
-
-    def test_falsy_or_absent_seeded_field_policy(self) -> None:
-        def absent(root: Path, closure: dict, originals: dict, copies: dict) -> None:
-            closure.pop("seeded_required_leaves")
-
-        self._build(absent)
-        _dependencies(self.root, self.definition)
-        for label, value in (("empty_mapping", {}), ("empty_string", ""), ("zero", 0)):
-            with self.subTest(case=label):
-                temporary = tempfile.TemporaryDirectory(prefix="copy-coverage-falsy-")
-                self.addCleanup(temporary.cleanup)
-                self.root = Path(temporary.name)
-                self._build(
-                    lambda root, closure, originals, copies, value=value: closure.update(
-                        seeded_required_leaves=value
-                    )
-                )
-                with self.assertRaises(PipelineError):
-                    _dependencies(self.root, self.definition)
-
     def test_swapped_native_original_hashes_are_refused(self) -> None:
         def mutate(root: Path, closure: dict, originals: dict, copies: dict) -> None:
             main_key = next(key for key in closure["original_files"] if key.endswith("robot.SLDASM"))
@@ -284,18 +215,20 @@ class CopyCoverageTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             _dependencies(self.root, self.definition)
 
-    def test_changed_retained_non_native_bytes_are_refused(self) -> None:
-        def mutate(root: Path, closure: dict, originals: dict, copies: dict) -> None:
-            changed = b"NP-STEP-CHANGED"
-            copies["imported_part.step"] = changed
-            for row in closure["mapping"]:
-                if row["copy"].endswith("imported_part.step"):
-                    row["copy_sha256"] = _sha(changed)
-            closure["copy_files"]["source/imported_part.step"] = _sha(changed)
+    def test_changed_retained_copy_bytes_are_refused(self) -> None:
+        for name in ("robot.SLDASM", "shank.SLDPRT", "imported_part.step"):
+            with self.subTest(path=name):
+                def mutate(root: Path, closure: dict, originals: dict, copies: dict, name=name) -> None:
+                    changed = b"CHANGED-COPY"
+                    copies[name] = changed
+                    for row in closure["mapping"]:
+                        if row["copy"] == "source/" + name:
+                            row["copy_sha256"] = _sha(changed)
+                    closure["copy_files"]["source/" + name] = _sha(changed)
 
-        self._build(mutate)
-        with self.assertRaises(PipelineError):
-            _dependencies(self.root, self.definition)
+                self._build(mutate)
+                with self.assertRaises(PipelineError):
+                    _dependencies(self.root, self.definition)
 
     def test_selected_native_omitted_consistently_is_refused(self) -> None:
         def mutate(root: Path, closure: dict, originals: dict, copies: dict) -> None:

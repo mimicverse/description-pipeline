@@ -818,7 +818,6 @@ class CapturePlanTests(unittest.TestCase):
             "provider": "solidworks",
             "assembly": "/tmp/a/robot.SLDASM",
             "configuration": "Default",
-            "require_saved": True,
             "groups": [{"name": "base_link", "components": ["base-1"]}],
             "axis_requests": [],
         }

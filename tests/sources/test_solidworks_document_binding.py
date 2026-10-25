@@ -10,7 +10,6 @@ from typing import ClassVar
 
 from description_pipeline.sources.solidworks import native
 from description_pipeline.sources.solidworks.native import (
-    IASSEMBLYDOC_IID,
     ICONFIGURATION_IID,
     ICONFIGURATIONMANAGER_IID,
     IMODELDOC2_IID,
@@ -18,7 +17,6 @@ from description_pipeline.sources.solidworks.native import (
     SolidWorksBackend,
     _active_configuration,
     _active_configuration_view,
-    _assembly_components,
     _component_document,
     _configuration_context,
     _configuration,
@@ -103,14 +101,6 @@ class DocumentInterfaceBindingTests(unittest.TestCase):
         self.assertIs(captured["obj"], self.stubs.view)
         self.assertEqual(captured["method"], "GetMaterialPropertyName2")
         self.assertEqual(captured["configuration"], "Default")
-
-    def test_assembly_traversal_binds_iassemblydoc(self):
-        self.stubs.view.GetComponents = Mock(spec=lambda flag: None, return_value=("component-1",))
-        with patch.dict(sys.modules, self.stubs.modules):
-            components = _assembly_components(self.stubs.raw())
-        self.assertEqual(components, ["component-1"])
-        self.stubs.assert_bound_once(IASSEMBLYDOC_IID)
-        self.stubs.view.GetComponents.assert_called_once_with(False)
 
     def test_configuration_manager_and_configuration_bind_their_published_interfaces(self):
         with patch.dict(sys.modules, self.stubs.modules):
@@ -341,20 +331,49 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
     def test_flagless_instance_difference_retains_both_native_measurements(self):
         backend, _document, _configuration_view = self._backend()
         part = {
-            "mass": 1.0, "com": [0.1, 0.2, 0.3],
-            "inertia": [[0.001, 0, 0], [0, 0.001, 0], [0, 0, 0.001]],
-            "reference": {"scope": "part_document", "used_api": "IMassProperty2.GetMomentOfInertia(0)",
-                          "product_convention": "solidworks_standard"},
+            "mass": 1.0,
+            "com": [0.1, 0.2, 0.3],
+            "native_raw": {
+                "mass_kg": 1.0,
+                "center_of_mass_m": [0.1, 0.2, 0.3],
+                "inertia_values": [
+                    0.001,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.001,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.001,
+                ],
+                "overrides": {
+                    "OverrideMass": False,
+                    "OverrideCenterOfMass": False,
+                    "OverrideMomentsOfInertia": False,
+                },
+            },
+            "read_errors": {},
+            "reference": {
+                "scope": "part_document",
+                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+                "product_convention": "solidworks_standard",
+            },
         }
         backend._part_mass_properties = {"arm-1": part}
         result = backend.assembly_component_mass_properties("C:/captures/robot.SLDASM")
         self.assertEqual(result["errors"], [])
         reading = result["instances"][0]["effective"]
-        self.assertEqual(reading["mass"], 1.5)
-        self.assertEqual(reading["part_measurement"]["mass_kg"], 1.0)
+        self.assertEqual(reading["native_raw"]["mass_kg"], 1.5)
+        self.assertEqual(
+            reading["part_measurement_raw"]["native_raw"]["mass_kg"],
+            1.0,
+        )
         self.assertEqual(reading["reference"]["measurement_basis"], "cad_assembly_instance_measurement")
         self.assertFalse(any(reading["reference"]["overrides"].values()))
-        self.assertEqual(backend.effective_instance_readings()["arm-1"], reading)
+        projected = native._project_effective_reading(reading)
+        self.assertEqual(projected["mass"], 1.5)
+        self.assertEqual(projected["part_measurement"]["mass_kg"], 1.0)
         self.assertEqual(part["mass"], 1.0)
 
     def test_equal_flagless_instance_does_not_create_a_difference_record(self):
@@ -440,7 +459,7 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         self.assertEqual(result["reference"]["density_kg_m3"], 7900.0)
         self.assertEqual(result["reference"]["configuration"], "Default")
 
-    def test_strict_part_mass_reader_still_refuses_an_unreadable_material(self):
+    def test_raw_mass_reader_retains_unreadable_material_for_offline_refusal(self):
         body = object()
         inner = types.SimpleNamespace(
             GetType=Mock(spec=lambda: None, return_value=1),
@@ -458,9 +477,18 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         with (
             patch.object(native, "_part_bodies", return_value=[body]),
             patch.object(native, "_material_assignments_document", side_effect=error),
-            self.assertRaises(native.CadError) as raised,
         ):
-            backend._mass_properties_document(document, require_material=True)
+            result = backend._mass_properties_document(document, require_material=True)
+        self.assertEqual(
+            result["read_errors"]["material"]["code"],
+            "cad_material_read_failed",
+        )
+        self.assertEqual(
+            result["reference"]["material_assignment"]["unverified_reason"],
+            "cad_material_read_failed",
+        )
+        with self.assertRaises(native.CadError) as raised:
+            native._project_mass_reading(native._raw_mass_fact(result))
         self.assertEqual(raised.exception.code, "cad_material_read_failed")
 
     def test_unreadable_component_path_keeps_other_rows_and_records_the_error(self):
@@ -519,16 +547,12 @@ class ReturnViewRegistryTests(unittest.TestCase):
         "MateEntity": native.IMATEENTITY2_IID,
         "GetSurface": native.ISURFACE_IID,
         "GetCurve": native.ICURVE_IID,
-        "GetCurveParams3": native.ICURVEPARAMDATA_IID,
-        "GetStartVertex": native.IVERTEX_IID,
-        "GetEndVertex": native.IVERTEX_IID,
         "GetTotalTransform": native.IMATHTRANSFORM_IID,
         "OpenDoc6": native.IMODELDOC2_IID,
     }
     EXPECTED_ARRAYS: ClassVar[dict[str, str]] = {
         "GetBodies2": native.IBODY2_IID,
         "GetFaces": native.IFACE2_IID,
-        "GetEdges": native.IEDGE_IID,
     }
 
     def setUp(self):
@@ -745,7 +769,6 @@ class ReturnViewRegistryTests(unittest.TestCase):
         )
         backend = SolidWorksBackend()
         backend._ensure_document = lambda path: doc
-        backend.list_configurations = lambda path: ["Default"]
         state = backend.document_state("C:/captures/robot.SLDASM")
         self.assertIsNone(state["lightweight"])
         self.assertEqual(state["unsupported"], ["lightweight"])
@@ -768,12 +791,17 @@ class ReturnViewRegistryTests(unittest.TestCase):
             and isinstance(node.args[1], ast.Constant)
             and node.args[1].value == "GetModelDoc2"
         ]
-        # Exactly three raw calls: one inside _component_document itself and
-        # the two documented presence-only checks. Every acquisition that is
-        # read afterwards goes through _component_document (declared sites:
-        # collect_scene traversal and inspect_copy).
+        # Three raw calls remain: one inside _component_document and two
+        # presence-only checks. The single post-acquisition read uses the helper.
         self.assertEqual(len(raw_sites), 3, raw_sites)
-        self.assertEqual(source.count("_component_document("), 4, "definition + three acquisition sites")
+        acquisition_sites = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_component_document"
+        ]
+        self.assertEqual(len(acquisition_sites), 1, acquisition_sites)
 
 
 if __name__ == "__main__":

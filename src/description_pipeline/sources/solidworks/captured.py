@@ -14,7 +14,6 @@ from ...io import PipelineError, confined, digest, inventory, read_data
 def derive_engineering_input(root: Path, manifest: dict) -> dict:
     """Construct Generate input using only a verified SolidWorks snapshot."""
     from .evidence import (
-        REWRITE_ENVIRONMENT_EVIDENCE,
         RUNTIME_EVIDENCE,
         metadata_value_warnings,
     )
@@ -95,23 +94,13 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
         return payload, digest
 
     runtime, runtime_sha256 = evidence_source(RUNTIME_EVIDENCE, "native-runtime.json")
-    rewrite, rewrite_sha256 = evidence_source(
-        REWRITE_ENVIRONMENT_EVIDENCE,
-        "evidence/rewrite-environment.json",
-    )
     native_tool_path = confined(delivery, "reports/native-tool.json")
     native_tool = read_data(native_tool_path)
-    closure = read_data(confined(root, "raw/dependency_closure.json"))
-    if not isinstance(closure, dict):
-        raise PipelineError("Captured dependency closure must be an object")
     metadata_warnings = metadata_value_warnings(
         runtime,
-        rewrite,
         expected_tool=native_tool,
         runtime_sha256=runtime_sha256,
-        rewrite_sha256=rewrite_sha256,
         expected_configuration=str(config.get("configuration") or ""),
-        closure_top_level=str(closure.get("top_level") or ""),
     )
     provenance = scene.setdefault("provenance", {})
     # Native producer paths remain in raw evidence. The model retains only a

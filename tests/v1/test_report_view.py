@@ -358,52 +358,6 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(failure["raw_detail"], {"body": "r_thigh_yaw"})
         self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
 
-    def test_codified_native_failure_projects_its_recorded_context(self) -> None:
-        job = passed_job()
-        job["status"] = "failed"
-        job["events"] = protocol_events(subject=SHA, failed_stage="capture")
-        job["error"] = "Capture preparation did not end in a fully rebuilt read-only state"
-        job["error_code"] = "cad_rebuild_incomplete"
-        job["detail"] = {
-            "path": (
-                "C:\\description-v1-review\\endpoint-deliveries\\capture\\"
-                "evidence.partial\\source\\M3.0.3_20261016.SLDASM"
-            ),
-            "rebuilt": True,
-            "state": {
-                "configuration": "Default",
-                "configuration_needs_rebuild": False,
-                "needs_rebuild2_value": 1,
-                "read_only": True,
-                "save_flag": True,
-            },
-        }
-        job["activity_final"] = {
-            "action": "prepare_capture",
-            "current_object": "M3.0.3_20261016.SLDASM",
-            "phase": "capture",
-        }
-        job["diagnostic_path"] = (
-            "C:\\description-v1-review\\endpoint-deliveries\\261ea3ec-5eb0-5746-9760-389b1c21c2d4.failed"
-        )
-
-        failure = build_report(job)["failure"]
-
-        self.assertEqual(failure["stage"], "capture")
-        self.assertEqual(failure["title"], "Native CAD stage failed")
-        self.assertEqual(failure["kind"], "runtime")
-        self.assertEqual(failure["error_code"], "cad_rebuild_incomplete")
-        self.assertEqual(failure["object"], "M3.0.3_20261016.SLDASM")
-        self.assertEqual(failure["phase"], "prepare_capture")
-        self.assertEqual(
-            failure["cause"],
-            "Capture preparation did not end in a fully rebuilt read-only state",
-        )
-        self.assertEqual(failure["values"]["rebuilt"], True)
-        self.assertEqual(failure["values"]["state"]["needs_rebuild2_value"], 1)
-        self.assertEqual(failure["evidence_path"], job["diagnostic_path"])
-        self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
-
     def test_publish_failure_does_not_use_stale_capture_activity(self) -> None:
         job = passed_job()
         job.update(status="failed", error="Publish rejected", error_code="git_push_failed",
@@ -773,7 +727,7 @@ class ReportViewTests(unittest.TestCase):
         metadata_object = {
             "object_type": "metadata",
             "object": "evidence/native-runtime.json",
-            "fields": ["/session_boundary/opened/read_only"],
+            "fields": ["/solidworks/revision"],
             "source": "open_document operation claim",
             "rule_id": "metadata.operation_claim",
             "rule_version": "v1",

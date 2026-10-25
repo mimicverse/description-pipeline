@@ -614,9 +614,9 @@ def build_scene(
                 "kind": "mesh",
                 "name": visual_name(reading.name, link=name),
                 "filename": entry["path"],
-                "sha256": entry.get("sha256"),
+                "sha256": entry["sha"],
                 "mesh_name": mesh_path(
-                    str(entry.get("sha256") or ""),
+                    entry["sha"],
                     namespace=mesh_namespace,
                 ),
                 "material": DISPLAY_MATERIAL_FALLBACK_NAME,

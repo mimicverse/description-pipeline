@@ -55,6 +55,7 @@ class GenerateHandlerTests(unittest.TestCase):
         shutil.copytree(self.capture / "raw", evidence / "raw")
         shutil.copytree(self.capture / "source", evidence / "source")
         shutil.copytree(self.capture / "evidence", evidence / "evidence")
+        shutil.copytree(self.capture / "geometry", evidence / "geometry")
         shutil.copyfile(self.capture / "evidence" / "discovery.json", evidence / "discovery.json")
         shutil.copytree(self.capture / "reports", artifact_source / "reports")
         shutil.copyfile(self.capture / "native-runtime.json", evidence / "native-runtime.json")

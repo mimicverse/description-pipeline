@@ -42,11 +42,14 @@ def metadata_value_warning() -> dict:
             {
                 "object_type": "metadata",
                 "object": "evidence/native-runtime.json",
-                "fields": ["/session_boundary/opened/read_only"],
-                "source": "native operation claim",
-                "rule_id": "metadata.operation_claim",
+                "fields": ["/solidworks/sessions/copy"],
+                "source": "owned native process and session observation",
+                "rule_id": "metadata.process_observation",
                 "rule_version": "v1",
-                "reason": "read_only is declared, not observed",
+                "reason": (
+                    "PID, process, lease, role, and lifecycle fields are "
+                    "controlled platform metadata"
+                ),
                 "file": "evidence/native-runtime.json",
                 "sha256": "c" * 64,
                 "reference": "evidence/native-runtime.json",
@@ -345,7 +348,7 @@ class ValueWarningTests(unittest.TestCase):
                     {
                         "component": "part-1",
                         "path": "geometry/mesh.stl",
-                        "sha256": self.digest,
+                        "sha": self.digest,
                     }
                 ],
             )
@@ -363,7 +366,7 @@ class ValueWarningTests(unittest.TestCase):
                     {
                         "component": "part-1",
                         "path": "geometry/mesh.stl",
-                        "sha256": self.digest,
+                        "sha": self.digest,
                         "material": "cad_gray",
                         "rgba": [0.7, 0.7, 0.7, 1.0],
                     }

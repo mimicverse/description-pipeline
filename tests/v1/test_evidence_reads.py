@@ -68,7 +68,7 @@ class EvidenceReadTests(unittest.TestCase):
             "geometry": [{"component": "a", "faces": 1}],
             "mass_closure": {"top_level": {}, "component_context": {"instances": []}, "unassigned": []},
             "material_provenance": {"a": {"density": 1}},
-            "dependency_closure": {"declared_unresolved": [], "configuration": "Default"},
+            "dependency_closure": {"configuration": "Default"},
             "link_group_mass_properties": {"a": {"mass": 1}},
             "collection": {
                 "kind": "solidworks",

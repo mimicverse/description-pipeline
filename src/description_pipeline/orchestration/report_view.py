@@ -13,9 +13,10 @@ from __future__ import annotations
 
 from pathlib import PureWindowsPath
 
-from ..geometry.native_u import (
+from ..geometry.native_scope import (
+    NATIVE_GATE_WARNING_CODES,
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_scope_warning_details_match,
+    native_gate_warning_details_match,
 )
 from ..io import PipelineError
 from ..sources.solidworks.evidence import METADATA_WARNING_CODE
@@ -118,10 +119,7 @@ _DISCOVERY_CODE_LABELS = {
 
 #: Readable names for verifier diagnostics carried on check details (recorded warnings).
 _DIAGNOSTIC_CODE_LABELS = {
-    "cad_component_persistent_reference_aliased": "CAD component persistent reference is aliased (diagnostic)",
     "cad_scope_local_identity_derived": "Scope-local native identity is derived (diagnostic)",
-    "cad_part_identity_witness_derived": "Part identity witness is derived (diagnostic)",
-    "cad_topology_identity_derived": "Topology identity is derived (diagnostic)",
     "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
     "naming.motion_unresolved": "Joint motion classification unavailable; neutral name retained (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
@@ -846,12 +844,6 @@ _WARNING_DETAIL_KEYS = (
     "rule_id",
     "rule_version",
     "reason",
-    "native_reference_sha256",
-    "mapping_source_part_document_sha256",
-    "mapping_source_body_reference_sha256",
-    "mapped_source_indices",
-    "mapped_source_persistent_reference_sha256",
-    "topology_signature_sha256s",
 )
 _WARNING_RESIDUAL_KEYS = ("max_abs_residual", "max_normalized_residual", "threshold")
 
@@ -894,6 +886,8 @@ def _warning_row(stage: dict, item: dict) -> dict:
         row["message"] = str(item["message"])
     elif code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
         row["message"] = str(row["label"])
+    if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
+        row.update(detail)
     for key in _WARNING_DETAIL_KEYS:
         value = context.get(key)
         if value is not None:
@@ -927,9 +921,9 @@ def _recorded_warnings(
         item
         for item in quality_diagnostics or []
         if isinstance(item, dict)
-        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        and item.get("code") in NATIVE_GATE_WARNING_CODES
     ]
-    scope_compared = False
+    projection_compared = False
     native_gate_seen = False
     if stage.get("id") == "discover":
         warnings.extend(
@@ -946,33 +940,28 @@ def _recorded_warnings(
             native_gate_seen = True
         recorded = details.get("warnings") if isinstance(details, dict) else None
         if isinstance(recorded, list):
-            raw_scope = [
+            raw_native = [
                 item
                 for item in recorded
                 if isinstance(item, dict)
-                and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+                and item.get("code") in NATIVE_GATE_WARNING_CODES
             ]
-            if raw_scope:
-                if not native_scope_warning_details_match(
+            if row.get("id") == "geometry.native_tessellation" and row_passed and not any(
+                item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES for item in raw_native
+            ):
+                raise PipelineError(
+                    "Passed native tessellation gate carries no scope identity warnings"
+                )
+            if raw_native:
+                if not native_gate_warning_details_match(
                     native_diagnostics,
                     recorded,
                 ):
                     raise PipelineError(
-                        "Native scope warnings differ from quality diagnostics"
+                        "Native gate warnings differ from quality diagnostics"
                     )
-                scope_compared = True
-            recorded = [
-                next(
-                    item
-                    for item in native_diagnostics
-                    if item["code"] == row["code"]
-                    and item["detail"] == row.get("detail")
-                )
-                if row.get("code")
-                in NATIVE_SCOPE_IDENTITY_WARNING_CODES
-                else row
-                for row in recorded
-            ]
+                projection_compared = True
+                recorded = native_diagnostics
             warnings.extend(
                 _warning_row(stage, item) for item in recorded if isinstance(item, dict) and item.get("code")
             )
@@ -986,10 +975,10 @@ def _recorded_warnings(
                 _warning_row(stage, item) for item in diagnostics if isinstance(item, dict) and item.get("code")
             )
     if native_diagnostics and (
-        not scope_compared or not native_gate_seen
+        not projection_compared or not native_gate_seen
     ):
         raise PipelineError(
-            "Native scope diagnostics have no matching gate warnings"
+            "Native gate diagnostics have no matching gate warnings"
         )
     if stage.get("id") == "verify":
         metadata_diagnostics = [

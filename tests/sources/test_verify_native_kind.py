@@ -11,8 +11,6 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-
 from description_pipeline.io import PipelineError, inventory, write_json
 from description_pipeline.verification import solidworks_urdf as quality
 
@@ -73,10 +71,7 @@ class NativeEvidenceKindTests(unittest.TestCase):
         )
 
     def _native(self) -> dict:
-        # Preparation has its own producer/consumer matrix; this test isolates
-        # the manifest kind and configuration authority.
-        with patch.object(quality, "_capture_preparation", return_value={}):
-            return quality._native(self.root, quality.verify_snapshot(self.root / "evidence"))
+        return quality._native(self.root, quality.verify_snapshot(self.root / "evidence"))
 
     def test_snapshot_manifest_is_the_kind_authority(self) -> None:
         self._build()

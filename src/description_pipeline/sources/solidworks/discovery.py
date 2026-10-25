@@ -318,16 +318,15 @@ def _authored_multiline_text(value: Any) -> bool:
 
 
 def _saved_configuration_observed(record: dict, name: str) -> bool:
-    """Prove the delivery configuration from immutable bytes and native state.
+    """Prove the delivery configuration from immutable bytes and native facts.
 
     The sealed source-selection inventory is the pre-read authority; the native
     record's file inventory is the post-read authority.  Both must agree, and
     both document-state readings must come from a read-only document whose
-    active configuration is the requested name.  ``NeedsRebuild2`` is the
-    documented rebuild-status enum, not a boolean: the initial reading may be
-    non-frozen (1) or frozen-feature dirty (2), but the final reading must be
-    fully rebuilt (0).  ``GetSaveFlag`` is diagnostic only because benign
-    native reads may make an in-memory document dirty.
+    active configuration is the requested name.  Rebuild flags are observations,
+    not acquisition qualifications, so this predicate never resets or requires
+    them to be zero.  ``GetSaveFlag`` is diagnostic only because benign native
+    reads may make an in-memory document dirty.
     """
 
     state = record.get("document_state")
@@ -346,18 +345,13 @@ def _saved_configuration_observed(record: dict, name: str) -> bool:
         return False
 
     def proven(reading: dict) -> bool:
-        rebuild = reading.get("needs_rebuild2_value")
         return (
             reading.get("read_only") is True
-            and reading.get("configuration_needs_rebuild") is False
             and isinstance(reading.get("configuration"), str)
             and reading["configuration"].strip() == name
-            and type(rebuild) is int
-            and rebuild in {0, 1, 2}
         )
 
-    before, after = readings
-    return proven(before) and proven(after) and after["needs_rebuild2_value"] == 0
+    return all(proven(reading) for reading in readings)
 
 
 def _snake(value: Any) -> str | None:
@@ -5084,7 +5078,7 @@ def _identity(
             _finding(
                 "discovery.configuration_unproven",
                 "assembly",
-                "the delivery configuration and its read-only rebuild state are not proven "
+                "the delivery configuration and its read-only native state are not proven "
                 "by the native before/after readings",
                 {"configuration": delivery, "document_state": record.get("document_state")},
             )

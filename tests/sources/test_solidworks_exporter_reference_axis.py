@@ -164,10 +164,15 @@ class ReferenceAxisReadTests(unittest.TestCase):
     def feature(self, endpoints=(1, 2, 3, 1, 5, 7), **kwargs):
         return _Feature("a_joint", "RefAxis", specific=SimpleNamespace(GetRefAxisParams=lambda: endpoints), **kwargs)
 
-    def test_endpoint_geometry_is_preserved_and_derived_in_explicit_frame(self):
+    def test_raw_endpoints_project_only_after_capture(self):
         for component, frame in (("", "assembly"), ("arm-1/part-2", "component_local")):
             with self.subTest(component=component):
-                record = N._reference_axis_record(_doc(self.feature()), "a_joint", component)
+                raw = N._capture_reference_axis_raw(_doc(self.feature()), "a_joint", component)
+                self.assertEqual(raw["endpoints_raw"], [1.0, 2.0, 3.0, 1.0, 5.0, 7.0])
+                self.assertNotIn("raw_endpoints_m", raw)
+                self.assertNotIn("axis_point_m", raw)
+                self.assertNotIn("axis_direction", raw)
+                record = N.project_axis_references([{"joint": "hinge", **raw}])[0]
                 self.assertEqual(record["raw_endpoints_m"], [1.0, 2.0, 3.0, 1.0, 5.0, 7.0])
                 self.assertEqual(record["axis_point_m"], [1.0, 2.0, 3.0])
                 self.assertEqual(record["axis_direction"], [0.0, 0.6, 0.8])
@@ -188,26 +193,37 @@ class ReferenceAxisReadTests(unittest.TestCase):
             self.feature(error_code=1),
         ):
             with self.subTest(feature=feature), self.assertRaises(CadError) as caught:
-                N._reference_axis_record(_doc(feature), "a_joint")
+                raw = N._capture_reference_axis_raw(_doc(feature), "a_joint")
+                N.project_axis_references([{"joint": "hinge", **raw}])
             self.assertEqual(caught.exception.code, "cad_axis_reference_unreadable")
 
-    def test_empty_component_uses_the_captured_assembly(self):
+    def test_capture_keeps_the_assembly_selector_raw_until_projection(self):
         backend = N.SolidWorksBackend()
         backend._scene_document_key = "saved-assembly"
         reference = {"kind": "reference_axis", "component": "", "feature_name": "a_joint"}
         with patch.object(backend, "_captured_document", return_value=_doc(self.feature())) as captured:
-            result = backend.capture_axis_reference(reference)
+            raw = backend.capture_axis_reference(reference)
         captured.assert_called_once_with("saved-assembly", phase="axis_reference")
-        self.assertEqual(result["coordinate_frame"], "assembly")
+        self.assertEqual(raw["coordinate_frame"], "assembly")
+        self.assertNotIn("axis_point_m", raw)
+        projected = N.project_axis_references([{"joint": "hinge", **raw}])[0]
+        self.assertEqual(projected["coordinate_frame"], "assembly")
 
-    def test_missing_component_and_wrong_selector_do_not_fall_back(self):
+    def test_capture_retains_selector_errors_and_projection_refuses_them(self):
         backend = N.SolidWorksBackend()
         for reference in (
             {"kind": "reference_axis", "component": "missing", "feature_name": "a_joint"},
             {"kind": "reference_axis", "component": "", "face_index": 0},
         ):
-            with self.subTest(reference=reference), self.assertRaises(CadError):
-                backend.capture_axis_reference(reference)
+            with self.subTest(reference=reference):
+                raw = backend.capture_axis_reference(reference)
+                self.assertTrue(raw["read_errors"])
+                self.assertIsNone(raw["endpoints_raw"])
+                with self.assertRaises(
+                    CadError,
+                    msg="raw selector failures must not be replaced by a fallback axis",
+                ):
+                    N.project_axis_references([{"joint": "hinge", **raw}])
 
 
 def session_materialization(directory: Path, name: str) -> Path:
@@ -261,20 +277,18 @@ class ImportedSourceBindingTests(unittest.TestCase):
             self.assertEqual(row["document"], component_row["document"])
             self.assertEqual(component_row["source_provenance"]["state"], "cached_materialization")
 
-    def test_discovery_records_staleness_without_rebuilding_the_saved_model(self):
+    def test_discovery_does_not_invoke_a_saved_model_rebuild(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
             doc = _Doc(assembly)
             doc.ForceRebuild3 = _raiser(AssertionError("saved-state discovery must never rebuild"))
             doc.GetSaveFlag = lambda: False
-            doc.Extension.NeedsRebuild2 = 1
             app = _App({assembly: doc})
             backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
             with _com_stubs():
                 record = backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
         self.assertIs(record["document_state"]["before"]["save_flag"], False)
-        self.assertEqual(record["document_state"]["before"]["needs_rebuild2_value"], 1)
         self.assertIs(record["document_state"]["after"]["save_flag"], False)
 
     def test_discovery_records_cached_materialization_without_hashing_the_generated_temp_file(self):

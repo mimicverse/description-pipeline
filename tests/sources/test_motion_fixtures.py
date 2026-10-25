@@ -47,6 +47,41 @@ def evaluate(doc: dict, *, poses: dict | None = None) -> dict:
     )
 
 
+def cylinder_axis_record(
+    *,
+    component: str,
+    feature_name: str,
+    point,
+    direction,
+    radius: float,
+) -> dict:
+    """Explicit native cylinder facts, independent of the product derivation."""
+
+    point = [float(value) for value in point]
+    direction = [float(value) for value in direction]
+    selector = {
+        "feature_name": feature_name,
+        "component": component,
+        "body_type": "solid",
+    }
+    return {
+        "component": component,
+        "surface": "cylinder",
+        "body_type": "solid",
+        "radius_m": radius,
+        "selector": selector,
+        "coordinate_frame": "assembly",
+        "is_cylinder_raw": True,
+        "cylinder_params_raw": [
+            *point,
+            *direction,
+            float(radius),
+        ],
+        "axis_point_m": point,
+        "axis_direction": direction,
+    }
+
+
 class MotionFixtureTests(unittest.TestCase):
     def test_fixture_members_match_their_manifest(self):
         for line in (FIXTURES / "motion-fixtures.sha256").read_text(encoding="utf-8").splitlines():
@@ -187,20 +222,23 @@ class MotionFixtureTests(unittest.TestCase):
             "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
             "axis_reference": {"component": "base_part", "feature_name": "Cyl1"},
         }
-        record = {
-            "component": "base_part",
-            "surface": "cylinder",
-            "selector": {"feature_name": "Cyl1", "component": "base_part", "body_type": "solid"},
-            "body_type": "solid",
-            "radius_m": 0.01,
-            "coordinate_frame": "assembly",
-            "axis_point_m": [0.0, 0.0, 0.5],
-            "axis_direction": [0.0, 0.0, 1.0],
-        }
+        record = cylinder_axis_record(
+            component="base_part",
+            feature_name="Cyl1",
+            point=(0.0, 0.0, 0.5),
+            direction=(0.0, 0.0, 1.0),
+            radius=0.01,
+        )
         native = {joints[0]["name"]: record}
         details = _motion(authored, joints, components, datums, bodies, record, native_axes=native)
         self.assertLessEqual(details["worst_matrix_element_delta"], 5e-5)
-        flipped = {**record, "axis_direction": [0.0, 0.0, -1.0]}
+        flipped = cylinder_axis_record(
+            component="base_part",
+            feature_name="Cyl1",
+            point=(0.0, 0.0, 0.5),
+            direction=(0.0, 0.0, -1.0),
+            radius=0.01,
+        )
         with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
             _motion(
                 authored, joints, components, datums, bodies, flipped,
@@ -233,16 +271,13 @@ class MotionFixtureTests(unittest.TestCase):
             "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
             "axis_reference": {"component": "base_part", "feature_name": "Cyl1"},
         }
-        record = {
-            "component": "base_part",
-            "surface": "cylinder",
-            "selector": {"feature_name": "Cyl1", "component": "base_part", "body_type": "solid"},
-            "body_type": "solid",
-            "radius_m": 0.01,
-            "coordinate_frame": "assembly",
-            "axis_point_m": list(point),
-            "axis_direction": [0.0, 0.0, 1.0],
-        }
+        record = cylinder_axis_record(
+            component="base_part",
+            feature_name="Cyl1",
+            point=point,
+            direction=(0.0, 0.0, 1.0),
+            radius=0.01,
+        )
         details = _motion(
             authored, [authored], components, datums, bodies, record,
             native_axes={authored["name"]: record},
@@ -269,16 +304,13 @@ class MotionFixtureTests(unittest.TestCase):
 
     @staticmethod
     def _serial_record(name, point, owner):
-        return {
-            "component": owner,
-            "surface": "cylinder",
-            "body_type": "solid",
-            "radius_m": 0.01,
-            "selector": {"feature_name": "Cyl-" + name, "component": owner, "body_type": "solid"},
-            "coordinate_frame": "assembly",
-            "axis_point_m": list(point),
-            "axis_direction": [0.0, 0.0, 1.0],
-        }
+        return cylinder_axis_record(
+            component=owner,
+            feature_name="Cyl-" + name,
+            point=point,
+            direction=(0.0, 0.0, 1.0),
+            radius=0.01,
+        )
 
     def _serial_setup(self):
         datums = {
@@ -505,16 +537,13 @@ class MotionFixtureTests(unittest.TestCase):
             "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
             "axis_reference": {"component": "base_part", "feature_name": "Cyl1"},
         }
-        record = {
-            "component": "base_part",
-            "surface": "cylinder",
-            "body_type": "solid",
-            "radius_m": 0.01,
-            "selector": {"feature_name": "Cyl1", "component": "base_part", "body_type": "solid"},
-            "coordinate_frame": "assembly",
-            "axis_point_m": [0.2, 0.0, 0.5],
-            "axis_direction": [0.0, 0.0, 1.0],
-        }
+        record = cylinder_axis_record(
+            component="base_part",
+            feature_name="Cyl1",
+            point=(0.2, 0.0, 0.5),
+            direction=(0.0, 0.0, 1.0),
+            radius=0.01,
+        )
         details = _motion(
             authored, [authored], components, datums, bodies, record,
             native_axes={authored["name"]: record},

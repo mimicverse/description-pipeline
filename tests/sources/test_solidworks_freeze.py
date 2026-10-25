@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-import os
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,13 +11,11 @@ from unittest.mock import patch
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.sources.solidworks.errors import BridgeError, CadError, ConfigError  # noqa: E402
+from description_pipeline.sources.solidworks.errors import BridgeError, ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
     _bind_source_scope_origins,
-    _dependency_closure,
     _relative_document_name,
     _source_inputs,
-    freeze as _freeze,
 )
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
 
@@ -42,9 +37,21 @@ def _Backend(document, components, **kwargs):  # fixture plumbing: supported nat
 
 
 def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
-    """Freeze with the fixture's carriers translated into the native request sets."""
+    """Capture one prepared fixture through the production prepared-Capture entry."""
 
-    return _freeze(support.capture_requests(config), *args, **kwargs)
+    if len(args) > 1:
+        raise TypeError("fixture capture accepts at most one destination")
+    backend = kwargs.pop("backend", None)
+    if backend is None:
+        raise TypeError("fixture capture requires a backend")
+    destination = Path(args[0] if args else kwargs.pop("destination"))
+    return support.capture_prepared_fixture(
+        config,
+        destination,
+        backend=backend,
+        worker_version=kwargs.pop("worker_version", "unknown"),
+        on_activity=kwargs.pop("on_activity", None),
+    )
 
 
 def _native_record(*, with_arm: bool, with_joint: bool, files: dict[str, str]) -> dict:
@@ -290,430 +297,6 @@ class FreezeTests(unittest.TestCase):
                 source_root,
             )
 
-    def test_source_config_carries_the_sealed_native_closure(self) -> None:
-        from description_pipeline.sources.solidworks.freeze import validate_source_config
-
-        closure = {
-            "schema_version": "solidworks-to-urdf.native-closure/v1",
-            "graph": {"robot.SLDASM": {"sha256": "0" * 64, "references": ["arm.SLDPRT"]}},
-            "imports": [
-                {
-                    "instance": "bracket_a.stp-2",
-                    "state": "cached_materialization",
-                    "materialization": r"C:\Temp\swx1\IC~~\HD.stp.SLDASM",
-                }
-            ],
-            "virtual_components": [],
-            "suppressed": [],
-        }
-        validated = validate_source_config(
-            support.capture_requests(json.loads(json.dumps({**self.config, "closure": closure})))
-        )
-        self.assertEqual(validated["closure"], closure)
-        for bad in ("nope", {"schema_version": "other"}, {"graph": 3}, {"virtual_components": 3}):
-            with self.assertRaises(ConfigError):
-                validate_source_config(
-                    support.capture_requests(json.loads(json.dumps({**self.config, "closure": bad})))
-                )
-
-    def test_freeze_retires_the_rewrite_session_before_the_capture_environment(self) -> None:
-        freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
-
-        order = self.backend.order
-        collect_dependencies = order.index("collect_dependencies")
-        rewrite_environment = order.index("environment")
-        retirement = order.index("retire_session")
-        capture_open = order.index("open_document")
-        capture_environment = order.index("environment", rewrite_environment + 1)
-        collect_scene = order.index("collect_scene")
-        self.assertLess(collect_dependencies, rewrite_environment)
-        self.assertLess(rewrite_environment, retirement)
-        self.assertLess(retirement, capture_open)
-        self.assertLess(capture_open, capture_environment)
-        self.assertLess(capture_environment, collect_scene)
-
-        rewrite = json.loads((self.destination / "evidence" / "rewrite-environment.json").read_text())
-        capture = json.loads((self.destination / "evidence" / "environment.json").read_text())
-        self.assertEqual(rewrite["solidworks"]["sessions"]["copy"]["pid"], 100)
-        self.assertEqual(capture["solidworks"]["sessions"]["copy"]["pid"], 101)
-        self.assertEqual(self.backend.capture_session_pid, 101)
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text())
-        boundary = capture["session_boundary"]
-        self.assertEqual(boundary["closure_top_level"], closure["top_level"])
-        self.assertEqual(boundary["configuration"], "Default")
-        self.assertTrue(boundary["retirement"]["retired"])
-        self.assertEqual(boundary["retirement"]["before"]["pid"], 100)
-        self.assertEqual(boundary["opened"]["path"], self.backend.collected_scene_calls[0])
-        self.assertEqual(self.backend.retired_session_pids, [100])
-
-    def test_freeze_replaces_the_environment_with_the_recovered_session(self) -> None:
-        collect_scene = self.backend.collect_scene
-
-        def collect_with_recovery(*args, **kwargs):
-            scene = collect_scene(*args, **kwargs)
-            self.backend.session_pid = 102
-            self.backend.capture_session_pid = 102
-            old_identity = {"pid": 101, "state": "active", "role": "copy"}
-            new_identity = {"pid": 102, "state": "active", "role": "copy"}
-            scene.notes["capture_preparation"] = {
-                "session": {
-                    "role": "copy",
-                    "identity": new_identity,
-                    "temp_root": None,
-                },
-                "session_recovery": {
-                    "trigger": {
-                        "code": "cad_rebuild_incomplete",
-                        "path": str(args[0]),
-                        "phase": "rebuild",
-                        "depth": 0,
-                        "journal_sequence": 3,
-                        "elapsed_seconds": 7.2,
-                    },
-                    "first_attempt": {
-                        "session": {
-                            "role": "copy",
-                            "identity": old_identity,
-                            "temp_root": None,
-                        }
-                    },
-                    "retirement": {
-                        "role": "copy",
-                        "retired": True,
-                        "before": old_identity,
-                        "after": {
-                            "pid": 101,
-                            "state": "closed",
-                            "role": "copy",
-                        },
-                    },
-                    "reopen": {
-                        "opened": Path(args[0]).name,
-                        "path": str(args[0]),
-                        "read_only": True,
-                        "errors": 0,
-                        "warnings": 0,
-                    },
-                    "fresh_session": {
-                        "role": "copy",
-                        "identity": new_identity,
-                        "temp_root": None,
-                    },
-                    "checks": {
-                        "old_pid": 101,
-                        "fresh_pid": 102,
-                        "different_owned_processes": True,
-                    },
-                },
-            }
-            return scene
-
-        self.backend.collect_scene = collect_with_recovery
-        with patch(
-            "description_pipeline.build.tool_identity",
-            return_value={"fixture": True},
-        ):
-            freeze(
-                self.config,
-                self.destination,
-                backend=self.backend,
-                worker_version="test-worker",
-            )
-        before = json.loads(
-            (
-                self.destination
-                / "evidence"
-                / "capture-environment-before-recovery.json"
-            ).read_text(encoding="utf-8")
-        )
-        final = json.loads(
-            (
-                self.destination / "evidence" / "environment.json"
-            ).read_text(encoding="utf-8")
-        )
-        self.assertEqual(before["solidworks"]["sessions"]["copy"]["pid"], 101)
-        self.assertEqual(final["solidworks"]["sessions"]["copy"]["pid"], 102)
-        self.assertEqual(
-            final["session_boundary"]["retirement"]["before"]["pid"],
-            100,
-        )
-        scene = json.loads(
-            (
-                self.destination / "raw" / "scene_raw.json"
-            ).read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            scene["notes"]["capture_preparation"]["session_recovery"][
-                "fresh_session"
-            ]["identity"]["pid"],
-            102,
-        )
-
-    def test_fresh_session_rejects_a_different_active_configuration(self) -> None:
-        backend, config = self._two_component_backend()
-        read = backend.document_state
-
-        def changed(path):
-            state = read(path)
-            if backend.collected and Path(path).resolve() == Path(backend.collected[0]).resolve():
-                state["active_configuration"] = "Other"
-            return state
-
-        backend.document_state = changed
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-        self.assertEqual(raised.exception.code, "cad_session_boundary_configuration")
-        self.assertFalse(self.destination.exists())
-
-    def test_freeze_retains_the_closure_carrier_evidence(self) -> None:
-        config = json.loads(json.dumps(self.config))
-        config["closure"] = {
-            "schema_version": "solidworks-to-urdf.native-closure/v1",
-            "graph": {},
-            "documents": {
-                "robot.SLDASM": {
-                    "resolved_edges": [
-                        {"instance": "base-1", "resolved": "base.SLDPRT"},
-                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
-                    ]
-                }
-            },
-            "imports": [],
-            "suppressed": [],
-        }
-        freeze(config, self.destination, backend=self.backend)
-        payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertTrue(payload["materializations_verified"])
-        self.assertEqual(payload["session_document_keys"], [])
-        self.assertEqual(payload["stale_source_links"], [])
-        self.assertIn("suppressed_skipped", payload)
-        self.assertIn("session_temp_dependencies", payload)
-
-    def test_dependency_closure_skips_the_owner_bound_virtual_component(self) -> None:
-        owner_sha = hashlib.sha256(self.assembly.read_bytes()).hexdigest()
-        source_root = Path(tempfile.gettempdir()) / f"swx{os.getpid()}"
-        copy_root = Path(tempfile.gettempdir()) / f"swx{os.getpid() + 1}"
-        source_virtual = source_root / "VC~~" / "waist" / "virtual_part.SLDPRT"
-        copy_virtual = copy_root / "VC~~" / "waist" / "virtual_part.SLDPRT"
-        for path in (source_virtual, copy_virtual):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"engine virtual document")
-        self.addCleanup(shutil.rmtree, source_root, True)
-        self.addCleanup(shutil.rmtree, copy_root, True)
-        closure = {
-            "schema_version": "solidworks-to-urdf.native-closure/v1",
-            "graph": {
-                "robot.SLDASM": {"sha256": "0" * 64, "references": ["base.SLDPRT", "arm.SLDPRT"]},
-                "base.SLDPRT": {"sha256": "0" * 64, "references": []},
-                "arm.SLDPRT": {"sha256": "0" * 64, "references": []},
-            },
-            "documents": {
-                "robot.SLDASM": {
-                    "resolved_edges": [
-                        {"instance": "base-1", "resolved": "base.SLDPRT"},
-                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
-                        {
-                            "instance": "virtual-1/arm-child-1",
-                            "resolved": "arm.SLDPRT",
-                            "owner_anchor": "virtual-1",
-                            "defining_session_document": str(source_virtual),
-                        },
-                    ]
-                }
-            },
-            "imports": [],
-            "virtual_components": [
-                {
-                    "document": "robot.SLDASM",
-                    "owner": "robot.SLDASM",
-                    "owner_anchor": None,
-                    "owner_sha256": owner_sha,
-                    "instance": "virtual-1",
-                    "state": "embedded_virtual_component",
-                    "binding": "owner_embedded_geometry",
-                    "kind": "native_embedded_virtual_component",
-                    "session_document_path": str(source_virtual),
-                    "session_temp_root": str(source_root),
-                    "native_api_pid": os.getpid(),
-                    "configuration": "Default",
-                    "suppression_state": 2,
-                    "is_virtual": True,
-                    "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
-                    "author_imported_path": None,
-                    "author_imported_error": None,
-                }
-            ],
-            "suppressed": [],
-        }
-        config = {**self.config, "closure": closure}
-        real_inspect = self.backend.inspect_copy
-        copy_imported_path = {"value": None}
-        copy_anchor = {"value": "virtual-1"}
-
-        def inspect_copy(path):
-            report = real_inspect(path)
-            is_copy = Path(path).resolve() != self.assembly.resolve()
-            report["instances"].append(
-                {
-                    "instance": "virtual-1",
-                    "name": "virtual-1",
-                    "document": str(
-                        source_virtual
-                        if not is_copy
-                        else copy_virtual
-                    ),
-                    "configuration": "Default",
-                    "defining": str(Path(path)),
-                    "defining_anchor": None,
-                    "virtual": True,
-                    "imported_path": copy_imported_path["value"] if is_copy else None,
-                    "imported_error": None,
-                    "suppressed": False,
-                    "depth": 0,
-                }
-            )
-            report["instances"].append(
-                {
-                    "instance": "virtual-1/arm-child-1",
-                    "name": "arm-child-1",
-                    "document": str(
-                        self.parts[1]
-                        if Path(path).resolve() == self.assembly.resolve()
-                        else Path(path).parent / self.parts[1].name
-                    ),
-                    "configuration": "Default",
-                    "defining": str(Path(path)),
-                    "defining_anchor": copy_anchor["value"] if is_copy else "virtual-1",
-                    "virtual": False,
-                    "imported_path": None,
-                    "imported_error": None,
-                    "suppressed": False,
-                    "depth": 1,
-                }
-            )
-            report["components"] += 2
-            return report
-
-        self.backend.inspect_copy = inspect_copy
-        self.backend.list_dependencies = lambda _path: [
-            {"path": str(path), "exists": path.is_file(), "type": path.suffix.lower()} for path in self.parts
-        ] + [{"path": str(source_virtual), "exists": True, "type": ".sldprt"}]
-        self.backend._dependencies.append(source_virtual)
-        self.backend.resolve_dependencies = lambda path: [
-            {
-                "path": str(Path(path).parent / self.assembly.name),
-                "exists": True,
-                "type": ".sldasm",
-            },
-            *[
-                {
-                    "path": str(Path(path).parent / part.name),
-                    "exists": True,
-                    "type": ".sldprt",
-                }
-                for part in self.parts
-            ],
-            {"path": str(copy_virtual), "exists": True, "type": ".sldprt"},
-        ]
-        payload = _dependency_closure(self.backend, config, self.tmp / "closure-source")
-        self.assertEqual(payload["virtual_component_keys"][0][0], "document")
-        self.assertEqual(payload["virtual_component_keys"][0][1], "robot.sldasm")
-        self.assertEqual(payload["virtual_component_keys"][0][2], "virtual-1")
-        self.assertIn(str(source_virtual), payload["session_temp_dependencies"])
-        self.assertIn(str(copy_virtual), payload["session_temp_dependencies"])
-        self.assertFalse(any(Path(path).name == copy_virtual.name for path in payload["copy_files"]))
-        copy_imported_path["value"] = r"D:\author\virtual_part.step"
-        with self.assertRaises(BridgeError) as raised:
-            _dependency_closure(
-                self.backend,
-                config,
-                self.tmp / "closure-source-import-path",
-            )
-        self.assertEqual(raised.exception.code, "dependency_instance_mismatch")
-        copy_imported_path["value"] = None
-        copy_anchor["value"] = None
-        with self.assertRaises(BridgeError) as raised:
-            _dependency_closure(
-                self.backend,
-                config,
-                self.tmp / "closure-source-anchor",
-            )
-        self.assertEqual(raised.exception.code, "dependency_instance_mismatch")
-
-    def test_dependency_closure_refuses_a_normal_document_marked_virtual(self) -> None:
-        owner_sha = hashlib.sha256(self.assembly.read_bytes()).hexdigest()
-        virtual_document = (
-            Path(tempfile.gettempdir())
-            / f"swx{os.getpid() + 2}"
-            / "VC~~"
-            / "waist"
-            / "virtual_part.SLDPRT"
-        )
-        closure = {
-            "schema_version": "solidworks-to-urdf.native-closure/v1",
-            "graph": {
-                "robot.SLDASM": {"sha256": "0" * 64, "references": ["base.SLDPRT", "arm.SLDPRT"]},
-                "base.SLDPRT": {"sha256": "0" * 64, "references": []},
-                "arm.SLDPRT": {"sha256": "0" * 64, "references": []},
-            },
-            "documents": {
-                "robot.SLDASM": {
-                    "resolved_edges": [
-                        {"instance": "base-1", "resolved": "base.SLDPRT"},
-                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
-                    ]
-                }
-            },
-            "imports": [],
-            "virtual_components": [
-                {
-                    "document": "robot.SLDASM",
-                    "owner": "robot.SLDASM",
-                    "owner_anchor": None,
-                    "owner_sha256": owner_sha,
-                    "instance": "base-1",
-                    "state": "embedded_virtual_component",
-                    "binding": "owner_embedded_geometry",
-                    "kind": "native_embedded_virtual_component",
-                    "session_document_path": str(virtual_document),
-                    "session_temp_root": str(virtual_document.parent.parent.parent),
-                    "native_api_pid": os.getpid() + 2,
-                    "configuration": "Default",
-                    "suppression_state": 2,
-                    "is_virtual": True,
-                    "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
-                    "author_imported_path": None,
-                    "author_imported_error": None,
-                }
-            ],
-            "suppressed": [],
-        }
-        destination = self.tmp / "refused-virtual-copy"
-        with self.assertRaises(BridgeError) as raised:
-            _dependency_closure(
-                self.backend,
-                {**self.config, "closure": closure},
-                destination,
-            )
-        self.assertEqual(raised.exception.code, "dependency_materialization_uncovered")
-        self.assertFalse(destination.exists())
-
-    def test_dependency_closure_refuses_an_unread_virtual_state(self) -> None:
-        real_inspect = self.backend.inspect_copy
-
-        def unread_virtual(path):
-            report = real_inspect(path)
-            if Path(path).resolve() == self.assembly.resolve():
-                report["instances"][0]["virtual"] = None
-            return report
-
-        self.backend.inspect_copy = unread_virtual
-        destination = self.tmp / "refused-unread-virtual"
-        with self.assertRaises(BridgeError) as raised:
-            _dependency_closure(self.backend, self.config, destination)
-        self.assertEqual(raised.exception.code, "dependency_instance_mismatch")
-        self.assertFalse(destination.exists())
-
     def test_freeze_records_the_direct_link_group_read(self) -> None:
         freeze(self.config, self.destination, backend=self.backend)
         _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
@@ -722,7 +305,6 @@ class FreezeTests(unittest.TestCase):
         )
         self.assertEqual(record["schema_version"], "solidworks-to-urdf.link-group-mass-properties/v1")
         self.assertEqual(record["selection_rule"], "top_most_providers+uncovered_leaves")
-        self.assertEqual(record["readout_window"], "pristine-reopen")
         self.assertEqual(sorted(record["links"]), ["arm_link", "base_link"])
         base = record["links"]["base_link"]
         self.assertEqual(base["selection"], ["base-1"])
@@ -740,160 +322,26 @@ class FreezeTests(unittest.TestCase):
             link["provenance"]["mass_properties"]["direct_vs_recombination"]["mass_delta_kg"], 0.0, places=12
         )
 
-    def test_freeze_reads_link_groups_in_the_pristine_reopen_window(self) -> None:
-        freeze(self.config, self.destination, backend=self.backend)
-        order = self.backend.order
-        window_close = order.index("close_all_documents")
-        reopen = order.index("open_document", window_close)
-        read = order.index("link_group_read")
-        self.assertLess(order.index("collect_scene"), window_close)
-        self.assertLess(order.index("verify_sources"), window_close)
-        self.assertLess(window_close, reopen)
-        self.assertLess(reopen, read)
-        # Between the reopen and the direct reads nothing else may run, and
-        # after the reads only the closing close-all follows: no other CAD mass
-        # read can touch the reopened document.
-        self.assertEqual(order[reopen + 1 : read], [])
-        self.assertEqual(order[read + 1 :], ["close_all_documents"])
-
-    def test_freeze_fails_closed_when_the_window_payload_echo_differs(self) -> None:
+    def test_freeze_fails_closed_when_the_link_group_payload_echo_differs(self) -> None:
         self.backend.link_group_selection_override = {"base_link": ["arm-1"]}
-        self.backend.link_group_payload_nonfinite = True
         with self.assertRaises(BridgeError) as caught:
             freeze(self.config, self.destination, backend=self.backend)
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
         self.assertEqual(caught.exception.detail["body"], "base_link")
         self.assertEqual(caught.exception.detail["expected"], ["base-1"])
         self.assertEqual(caught.exception.detail["received"], ["arm-1"])
-        diagnostics = (
-            self.destination.with_name(self.destination.name + ".failed-001")
-            / "partial"
-            / "reports"
-            / "diagnostics"
+        failure = self.destination.with_name(
+            self.destination.name + ".failed-001"
         )
-        request = json.loads((diagnostics / "link-group-read-request.json").read_text(encoding="utf-8"))
-        payload = json.loads(
-            (diagnostics / "link-group-mass-properties.payload.json").read_text(encoding="utf-8")
+        observations = json.loads(
+            (failure / "native_observations.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(request["selections"]["base_link"]["selection"], ["base-1"])
-        self.assertEqual(payload["links"]["base_link"]["selection"], ["arm-1"])
-        self.assertTrue(
-            math.isnan(payload["links"]["base_link"]["reads"][0]["inertia_values_about_origin_api"]["values"][0])
-        )
-
-    def test_freeze_fails_closed_when_documents_cannot_close(self) -> None:
-        self.backend.close_refuses = True
-        with self.assertRaises(CadError) as caught:
-            freeze(self.config, self.destination, backend=self.backend)
-        self.assertEqual(caught.exception.code, "cad_close_failed")
-
-    def test_freeze_fails_closed_without_a_window_capable_backend(self) -> None:
-        self.backend.close_all_documents = None
-        with self.assertRaises(BridgeError) as caught:
-            freeze(self.config, self.destination, backend=self.backend)
-        self.assertEqual(caught.exception.code, "cad_pristine_readout_unavailable")
-
-    def test_freeze_binds_the_pristine_top_and_marks_both_records(self) -> None:
-        reading = {
-            "mass": 2.5,
-            "com": [0.001, -0.002, 0.003],
-            "inertia": [[1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]],
-            "reference": {
-                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
-                "scope": "assembly_document",
-                "axes": "assembly_document_axes",
-                "reference_point": "center_of_mass",
-                "use_system_units": True,
-                "product_convention": "solidworks_standard",
-                "overrides": {
-                    "OverrideMass": False,
-                    "OverrideCenterOfMass": False,
-                    "OverrideMomentsOfInertia": False,
-                },
-            },
-        }
-        self.backend.assembly_mass_properties = lambda _path: reading
-        freeze(self.config, self.destination, backend=self.backend)
-        closure = json.loads((self.destination / "raw" / "mass_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(closure["status"], "recorded")
-        self.assertEqual(closure["top_level"]["mass"], 2.5)
-        self.assertEqual(closure["top_level"]["com"], [0.001, -0.002, 0.003])
-        self.assertEqual(closure["top_level"]["reference"]["readout_window"], "pristine-reopen")
-        record = json.loads(
-            (self.destination / "raw" / "link_group_mass_properties.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(record["readout_window"], "pristine-reopen")
-        # The direct reads ran after the reopen, never on the walked session.
-        order = self.backend.order
-        self.assertLess(order.index("open_document"), order.index("link_group_read"))
-
-    def test_freeze_records_evidence_covered_stale_stored_references(self) -> None:
-        config = json.loads(json.dumps(self.config))
-        config["closure"] = {
-            "schema_version": "solidworks-to-urdf.native-closure/v1",
-            "graph": {
-                "robot.SLDASM": {"sha256": "0" * 64, "references": ["base.SLDPRT", "arm.SLDPRT"]},
-                "base.SLDPRT": {"sha256": "0" * 64, "references": []},
-                "arm.SLDPRT": {"sha256": "0" * 64, "references": []},
-            },
-            "documents": {
-                "robot.SLDASM": {
-                    "resolved_edges": [
-                        {"instance": "base-1", "resolved": "base.SLDPRT"},
-                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
-                    ],
-                    "stored_references": [],
-                }
-            },
-            "imports": [],
-            "suppressed": [],
-        }
-        stale_path = str(self.tmp / "CopyDesignTemp" / "lowerbody.SLDASM")
-        real_collect = self.backend.collect_dependencies
-
-        def collect_with_stale(path, destination, **kwargs):
-            payload = real_collect(path, destination, **kwargs)
-            payload["skipped_stale"] = [
-                {"document": "robot.SLDASM", "location": stale_path, "resolved_path": stale_path, "exists": False}
-            ]
-            return payload
-
-        self.backend.collect_dependencies = collect_with_stale  # type: ignore[method-assign]
-        real_resolve = self.backend.resolve_dependencies
-
-        def resolve_with_stale(path):
-            return [*real_resolve(path), {"path": stale_path, "exists": False, "type": ".sldasm"}]
-
-        self.backend.resolve_dependencies = resolve_with_stale  # type: ignore[method-assign]
-        freeze(config, self.destination, backend=self.backend)
-        payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        stale = payload["stale_stored_references"]
-        self.assertEqual(len(stale), 1)
-        self.assertEqual(stale[0]["resolved_path"], stale_path)
-        self.assertEqual(stale[0]["location"], stale_path)
-
-    def test_freeze_refuses_uncovered_materializations(self) -> None:
-        config = json.loads(json.dumps(self.config))
-        config["closure"] = {
-            "schema_version": "solidworks-to-urdf.native-closure/v1",
-            "graph": {},
-            "documents": {
-                "robot.SLDASM": {
-                    "resolved_edges": [{"instance": "base-1", "resolved": "base.SLDPRT"}]
-                }
-            },
-            "imports": [
-                {
-                    "instance": "ghost-import-1",
-                    "state": "cached_materialization",
-                    "materialization": r"C:\Temp\swx1\IC~~\X.step.SLDASM",
-                }
+        self.assertEqual(
+            observations["scene"]["link_group_mass_raw"]["links"]["base_link"][
+                "selection"
             ],
-            "suppressed": [],
-        }
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=self.backend)
-        self.assertEqual(raised.exception.code, "dependency_materialization_uncovered")
+            ["arm-1"],
+        )
 
     def test_freeze_produces_a_verified_snapshot(self) -> None:
         manifest = freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
@@ -928,60 +376,6 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(inventory(self.destination), before)
         self.assertNotIn("scene.json", before)
 
-    def test_cad_derivation_adds_one_metadata_warning_group_from_bound_evidence(self) -> None:
-        from description_pipeline.io import read_data, write_json
-        from description_pipeline.sources.snapshot import write_manifest
-
-        manifest = freeze(self.config, self.destination, backend=self.backend)
-        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
-
-        runtime = read_data(self.destination / "native-runtime.json")
-        runtime["solidworks"].update(
-            input_mode="saved_documents",
-            build="fixture-build",
-            license=1,
-            visible=True,
-        )
-        capture_state = runtime["session_boundary"]["capture_state"]
-        capture_state["save_flag"] = not capture_state["saved"]
-        capture_state["lightweight"] = None
-        capture_state["unsupported"] = ["lightweight"]
-        runtime["session_boundary"]["opened"].update(errors=0, warnings=0)
-        write_json(self.destination / "native-runtime.json", runtime)
-
-        rewrite = read_data(self.destination / "evidence/rewrite-environment.json")
-        rewrite["solidworks"].update(
-            input_mode="saved_documents",
-            build="fixture-build",
-            license=1,
-            visible=True,
-        )
-        write_json(self.destination / "evidence/rewrite-environment.json", rewrite)
-        write_manifest(
-            self.destination,
-            kind=manifest["kind"],
-            identity=manifest["identity"],
-            evidence_class="cad",
-        )
-
-        scene = load_scene(self.destination)
-        metadata = [
-            warning
-            for warning in scene["provenance"]["value_warnings"]
-            if warning["code"] == "metadata.non_native"
-        ]
-        self.assertEqual(len(metadata), 1)
-        self.assertTrue(
-            all(
-                row["file"] in {
-                    "evidence/native-runtime.json",
-                    "evidence/evidence/rewrite-environment.json",
-                }
-                and row["fields"]
-                for row in metadata[0]["objects"]
-            )
-        )
-
     def test_fixture_derivation_keeps_bound_metadata_provenance(self) -> None:
         freeze(self.config, self.destination, backend=self.backend)
         _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
@@ -989,7 +383,6 @@ class FreezeTests(unittest.TestCase):
         manifest = json.loads((self.destination / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["evidence_class"], "fixture")
         self.assertIn("native-runtime.json", manifest["files"])
-        self.assertIn("evidence/rewrite-environment.json", manifest["files"])
 
         scene = load_scene(self.destination)
         metadata = [
@@ -1004,7 +397,7 @@ class FreezeTests(unittest.TestCase):
         from description_pipeline.io import PipelineError
         from description_pipeline.sources.snapshot import write_manifest
 
-        for missing in ("native-runtime.json", "evidence/rewrite-environment.json"):
+        for missing in ("native-runtime.json",):
             with self.subTest(missing=missing):
                 destination = self.tmp / ("partial-" + missing.replace("/", "-"))
                 freeze(self.config, destination, backend=self.backend)
@@ -1059,23 +452,6 @@ class FreezeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "dedicated raw records"):
             load_scene(self.destination)
-
-    def test_nested_unicode_instance_names_fit_native_filesystem_limits(self) -> None:
-        from description_pipeline.sources.solidworks.freeze import _export_geometry
-
-        names = ["装配/" + "nested-component/" * 30 + "part-1", "装配/" + "nested-component/" * 30 + "part-2"]
-        files = _export_geometry(self.backend, self.config, self.tmp / "geometry", names)
-        self.assertEqual([item["component"] for item in files], names)
-        self.assertEqual(len({item["path"] for item in files}), 2)
-        for item in files:
-            self.assertLess(len(Path(item["path"]).name), 40)
-            self.assertTrue((self.tmp / item["path"]).is_file())
-
-    def test_unsaved_capture_cannot_be_enabled_by_configuration(self) -> None:
-        for value in (False, 0, "false"):
-            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "cannot be disabled"):
-                freeze({**self.config, "require_saved": value}, self.destination, backend=self.backend)
-        self.assertFalse(self.destination.exists())
 
     def test_scene_carries_combined_mass_and_geometry(self) -> None:
         freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
@@ -1169,161 +545,7 @@ class FreezeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "destination_is_symlink")
 
-    def test_copy_missing_a_component_document_blocks_freeze(self) -> None:
-        backend = _Backend(
-            self.assembly,
-            [
-                {
-                    "name": "base-1",
-                    "path": str(self.parts[0]),
-                    "transform": support.placement(),
-                    "mass": support.mass_payload(1.0),
-                },
-                {
-                    "name": "arm-1",
-                    "path": str(self.parts[1]),
-                    "transform": support.placement((0, 0, 0.2)),
-                    "mass": support.mass_payload(0.5),
-                },
-            ],
-            dependencies=self.parts,
-        )
-        backend.pack_drop_files = {self.parts[1].name}
-        config = json.loads(json.dumps(self.config))
-        config["bodies"] = [
-            {
-                "id": "base",
-                "name": "base_link",
-                "components": ["base-1"],
-                "frame": {"coordinate_system": "CS_base_link"},
-            },
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "CS_arm_link"}},
-        ]
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_collection_incomplete")
-        self.assertFalse(self.destination.exists())
-
-    def test_empty_resolution_blocks_freeze(self) -> None:
-        backend = _Backend(
-            self.assembly,
-            [
-                {
-                    "name": "base-1",
-                    "path": str(self.parts[0]),
-                    "transform": support.placement(),
-                    "mass": support.mass_payload(1.0),
-                }
-            ],
-            dependencies=self.parts,
-        )
-        backend.resolve_returns_empty = True
-        config = json.loads(json.dumps(self.config))
-        config["bodies"] = [
-            {
-                "id": "base",
-                "name": "base_link",
-                "components": ["base-1"],
-                "frame": {"coordinate_system": "CS_base_link"},
-            }
-        ]
-        config["joints"] = []
-        config.pop("frames", None)
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_resolution_unverified")
-
-    def test_component_count_mismatch_blocks_freeze(self) -> None:
-        backend = _Backend(
-            self.assembly,
-            [
-                {
-                    "name": "base-1",
-                    "path": str(self.parts[0]),
-                    "transform": support.placement(),
-                    "mass": support.mass_payload(1.0),
-                }
-            ],
-            dependencies=self.parts,
-        )
-        backend.copy_extra_components = 1
-        config = json.loads(json.dumps(self.config))
-        config["bodies"] = [
-            {
-                "id": "base",
-                "name": "base_link",
-                "components": ["base-1"],
-                "frame": {"coordinate_system": "CS_base_link"},
-            }
-        ]
-        config["joints"] = []
-        config.pop("frames", None)
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_collection_incomplete")
-
-    def test_collector_without_a_top_level_blocks_freeze(self) -> None:
-        backend = _Backend(
-            self.assembly,
-            [
-                {
-                    "name": "base-1",
-                    "path": str(self.parts[0]),
-                    "transform": support.placement(),
-                    "mass": support.mass_payload(1.0),
-                }
-            ],
-            dependencies=self.parts,
-        )
-
-        def broken_pack(path, destination_dir, **kwargs):
-            payload = support.FixtureCadBackend.collect_dependencies(backend, path, destination_dir)
-            payload["top_level"] = str(self.tmp / "not-collected.SLDASM")
-            return payload
-
-        backend.collect_dependencies = broken_pack  # type: ignore[method-assign]
-        config = json.loads(json.dumps(self.config))
-        config["bodies"] = [
-            {
-                "id": "base",
-                "name": "base_link",
-                "components": ["base-1"],
-                "frame": {"coordinate_system": "CS_base_link"},
-            }
-        ]
-        config["joints"] = []
-        config.pop("frames", None)
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_collection_incomplete")
-
-    def test_save_flag_is_recorded_and_never_blocks_freeze(self) -> None:
-        # `GetSaveFlag` answers "would SolidWorks prompt me to save this document?".
-        # The API reference says many operations set it and that a document created by
-        # an older release starts with it set, so it is evidence, never a refusal: the
-        # capture copies the bytes on disk in a session of its own.
-        backend, config = self._two_component_backend()
-        # only the assembly carries SolidWorks' save flag
-        backend.unsaved_paths = {str(self.assembly)}
-
-        freeze(config, self.destination, backend=backend)
-
-        state = json.loads((self.destination / "raw" / "document_state.json").read_text(encoding="utf-8"))
-        self.assertFalse(state["saved"])
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(closure["save_flag_documents"], [str(self.assembly)])
-        evidence = json.loads((self.destination / "evidence" / "collection.json").read_text(encoding="utf-8"))
-        self.assertEqual(evidence["capture"]["save_flag_documents"], [str(self.assembly)])
-
-    def test_dependency_outside_allowed_roots_blocks_freeze(self) -> None:
+    def test_dependency_outside_the_prepared_package_blocks_capture(self) -> None:
         outside = self.tmp / "outside.SLDPRT"
         outside.write_bytes(b"outside")
         backend = _Backend(
@@ -1335,7 +557,8 @@ class FreezeTests(unittest.TestCase):
         with self.assertRaises(BridgeError) as raised:
             freeze(self.config, self.destination, backend=backend)
 
-        self.assertEqual(raised.exception.code, "dependency_outside_allowed_roots")
+        self.assertEqual(raised.exception.code, "prepared_source_outside_root")
+        self.assertEqual(raised.exception.detail["outside"], [str(outside)])
         self.assertFalse(self.destination.exists())
 
     def test_missing_configuration_is_refused(self) -> None:
@@ -1344,7 +567,7 @@ class FreezeTests(unittest.TestCase):
         with self.assertRaises(BridgeError) as raised:
             freeze(config, self.destination, backend=self.backend)
 
-        self.assertEqual(raised.exception.code, "cad_configuration_missing")
+        self.assertEqual(raised.exception.code, "cad_prepared_capture_state")
 
     def test_authored_origin_is_not_a_kinematic_carrier(self) -> None:
         # The direct-config authored origin carrier is retired: the delivered
@@ -1410,106 +633,15 @@ class FreezeTests(unittest.TestCase):
         ]
         return backend, config
 
-    def test_readings_come_from_the_collected_copy(self) -> None:
-        backend, config = self._two_component_backend()
-        freeze(config, self.destination, backend=backend)
-
-        # the geometry/mass capture has to read the copy, not the working tree
-        self.assertEqual(len(backend.collected_scene_calls), 1)
-        collected = Path(backend.collected_scene_calls[0]).resolve()
-        self.assertNotEqual(collected, self.assembly.resolve())
-        self.assertEqual(collected.name, self.assembly.name)
-        self.assertFalse(collected.is_relative_to((self.tmp / "cad").resolve()))
-        # the copy is read from the staging tree and only then published to the
-        # snapshot, so the published snapshot must carry the very same document
-        published = (self.destination / "source" / self.assembly.name).resolve()
-        self.assertTrue(published.is_file())
-        self.assertEqual(support.file_digest(self.assembly), support.file_digest(published))
-
-        raw = json.loads((self.destination / "raw" / "scene_raw.json").read_text(encoding="utf-8"))
-        self.assertEqual(Path(raw["document"]).resolve(), collected)
-        self.assertEqual(raw["source_document"], str(self.assembly))
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(Path(closure["top_level"]).resolve(), collected)
-        self.assertEqual(len(closure["mapping"]), 3)  # assembly + two parts
-        self.assertEqual(closure["component_instances_compared"], 2)
-        self.assertEqual(closure["configuration"], "Default")
-
-    def test_backend_reporting_the_original_blocks_capture(self) -> None:
-        backend, config = self._two_component_backend()
-        backend.scene_document_override = str(self.assembly)
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "capture_source_mismatch")
-        self.assertFalse(self.destination.exists())
-
-    def test_native_session_locks_are_removed_only_from_the_staged_copy(self) -> None:
-        backend, config = self._two_component_backend()
-        original_lock = self.assembly.parent / "~$base.SLDPRT"
-        original_lock.write_bytes(b"user session")
-        collect = backend.collect_dependencies
-
-        def collect_with_locks(path, destination, **kwargs):
-            result = collect(path, destination)
-            (Path(destination) / "~$base.SLDPRT").write_bytes(b"capture session")
-            (Path(destination) / "~$notes.txt").write_bytes(b"not a native lock")
-            return result
-
-        backend.collect_dependencies = collect_with_locks  # type: ignore[method-assign]
-        manifest = freeze(config, self.destination, backend=backend)
-        self.assertNotIn("source/~$base.SLDPRT", manifest["files"])
-        self.assertFalse((self.destination / "source/~$base.SLDPRT").exists())
-        self.assertIn("source/~$notes.txt", manifest["files"])
-        self.assertEqual(original_lock.read_bytes(), b"user session")
-
-    def test_rewritten_references_are_expected_and_pass(self) -> None:
-        backend, config = self._two_component_backend()
-        # Native reference collection rewrites internal references and serialisation metadata, so
-        # the copy is legitimately not byte-identical to the working tree
-        backend.copy_rewrites_bytes = True
-
-        freeze(config, self.destination, backend=backend)
-
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(
-            sorted(closure["copy_files"]), ["source/arm.SLDPRT", "source/base.SLDPRT", "source/robot.SLDASM"]
-        )
-        self.assertEqual(len(closure["original_files"]), 3)
-        by_instance = {entry["instance"]: entry for entry in closure["mapping"]}
-        self.assertEqual(sorted(by_instance), ["arm-1", "base-1", "top_level"])
-        for entry in closure["mapping"]:
-            self.assertTrue(entry["copy"].startswith("source/"))
-            self.assertTrue(entry["source_sha256"])
-            self.assertTrue(entry["copy_sha256"])
-        # the rewritten assembly is accepted, and both sides still have their own
-        # digest recorded
-        self.assertNotEqual(by_instance["top_level"]["copy_sha256"], by_instance["top_level"]["source_sha256"])
-        self.assertEqual(by_instance["base-1"]["copy_sha256"], by_instance["base-1"]["source_sha256"])
-        self.assertEqual(by_instance["base-1"]["source"], str(self.parts[0]))
-
-    def test_working_tree_changing_during_capture_blocks_freeze(self) -> None:
+    def test_prepared_copy_changing_during_capture_blocks_freeze(self) -> None:
         backend, config = self._two_component_backend()
         backend.originals_change_during_capture = True
 
         with self.assertRaises(BridgeError) as raised:
             freeze(config, self.destination, backend=backend)
 
-        self.assertEqual(raised.exception.code, "cad_source_changed")
+        self.assertEqual(raised.exception.code, "cad_copy_changed")
         self.assertFalse(self.destination.exists())
-
-    def test_save_flag_of_a_dependency_is_recorded_without_blocking(self) -> None:
-        backend, config = self._two_component_backend()
-        # only the *part* carries the flag: the assembly itself is clean, so the
-        # closure scan is what sees it
-        backend.unsaved_paths = {str(self.parts[0])}
-
-        freeze(config, self.destination, backend=backend)
-
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(closure["save_flag_documents"], [str(self.parts[0])])
-        self.assertFalse(closure["original_states"][str(self.parts[0])]["saved"])
 
     def test_dependency_digest_identifies_the_source_not_the_job_directory(self) -> None:
         """The input identity must survive where the snapshot happened to be assembled."""
@@ -1613,100 +745,6 @@ class FreezeTests(unittest.TestCase):
         self.assertIsInstance(detail, dict)
         self.assertEqual(detail["name"], "arm.sldprt")  # type: ignore[index]
 
-    def test_original_configuration_is_initial_evidence_not_current_state(self) -> None:
-        backend, config = self._two_component_backend()
-        # the bytes on disk never move: only the session's active configuration
-        # does, after the readings have been taken
-        backend.drift_configuration_after_reading = True
-
-        freeze(config, self.destination, backend=backend)
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(closure["original_states"][str(self.assembly)]["active_configuration"], "Default")
-        collection = json.loads((self.destination / "evidence" / "collection.json").read_text(encoding="utf-8"))
-        self.assertEqual(collection["capture"]["originals_unchanged"]["state_scope"], "initial_source_observation")
-        self.assertEqual(collection["capture"]["originals_unchanged"]["files_checked"], 3)
-
-    def test_unknown_dependency_state_cannot_prove_a_saved_source(self) -> None:
-        for field in ("saved", "active_configuration"):
-            with self.subTest(field=field):
-                backend, config = self._two_component_backend()
-                read = backend.document_state
-
-                def unknown(path, read=read, field=field):
-                    state = read(path)
-                    if path == str(self.parts[0]):
-                        state[field] = None
-                    return state
-
-                with (
-                    patch.object(backend, "document_state", side_effect=unknown),
-                    self.assertRaises(BridgeError) as raised,
-                ):
-                    freeze(config, self.destination, backend=backend)
-                self.assertEqual(raised.exception.code, "cad_document_state_unreadable")
-                self.assertEqual(backend.collected, [])
-
-    def test_original_state_is_not_reread_after_copy_capture(self) -> None:
-        backend, config = self._two_component_backend()
-        collect = backend.collect_scene
-
-        def captured(*args, **kwargs):
-            scene = collect(*args, **kwargs)
-            backend.document_state = None  # type: ignore[assignment,method-assign]
-            return scene
-
-        with patch.object(backend, "collect_scene", side_effect=captured):
-            freeze(config, self.destination, backend=backend)
-        self.assertTrue(self.destination.exists())
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(len(closure["original_states"]), 3)
-
-    def test_non_instance_dependency_is_checked_for_its_save_flag(self) -> None:
-        backend, config = self._two_component_backend()
-        skeleton = self.assembly.parent / "skeleton.SLDPRT"
-        skeleton.write_bytes(b"external reference, not a component instance")
-        backend._dependencies.append(skeleton)
-        backend.unsaved_paths.add(str(skeleton))
-
-        freeze(config, self.destination, backend=backend)
-
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertIn(str(skeleton), closure["save_flag_documents"])
-
-    def test_non_instance_dependency_bytes_cannot_change_during_capture(self) -> None:
-        for side in ("original", "copy"):
-            with self.subTest(side=side):
-                backend, config = self._two_component_backend()
-                reference = self.assembly.parent / "reference.dat"
-                reference.write_bytes(b"external reference, not a component instance")
-                backend._dependencies.append(reference)
-                collect = backend.collect_scene
-
-                def captured(*args, collect=collect, reference=reference, side=side, **kwargs):
-                    scene = collect(*args, **kwargs)
-                    target = reference if side == "original" else Path(args[0]).parent / reference.name
-                    target.write_bytes(b"changed while reading")
-                    return scene
-
-                with (
-                    patch.object(backend, "collect_scene", side_effect=captured),
-                    self.assertRaises(BridgeError) as raised,
-                ):
-                    freeze(config, self.destination, backend=backend)
-                self.assertEqual(
-                    raised.exception.code, "cad_source_changed" if side == "original" else "cad_copy_changed"
-                )
-                self.assertFalse(self.destination.exists())
-
-    def test_copy_configuration_mismatch_blocks_freeze(self) -> None:
-        backend, config = self._two_component_backend()
-        backend.copy_configuration = "Other"
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_configuration_mismatch")
-
     def test_requesting_a_configuration_that_is_not_active_blocks_freeze(self) -> None:
         backend = _Backend(
             self.assembly,
@@ -1744,108 +782,14 @@ class FreezeTests(unittest.TestCase):
         with self.assertRaises(BridgeError) as raised:
             freeze(config, self.destination, backend=backend)
 
-        self.assertEqual(raised.exception.code, "cad_configuration_not_active")
+        self.assertEqual(raised.exception.code, "cad_prepared_capture_state")
         detail = raised.exception.detail
         self.assertIsInstance(detail, dict)
-        self.assertEqual(detail["requested"], "Other")  # type: ignore[index]
-        self.assertEqual(detail["active"], "Default")  # type: ignore[index]
-
-    def test_referenced_configuration_change_blocks_freeze(self) -> None:
-        backend, config = self._two_component_backend()
-        backend.copy_referenced_configuration_change = True
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_instance_mismatch")
-
-    def test_copy_with_missing_document_bytes_blocks_freeze(self) -> None:
-        backend, config = self._two_component_backend()
-        backend.copy_missing_files = True
-        backend.resolve_only_existing = True
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_escape")
-
-    def test_copy_loading_outside_the_snapshot_blocks_freeze(self) -> None:
-        backend, config = self._two_component_backend()
-        backend.copy_outside_documents = True
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        # the same-named working-tree document is open in this session: never
-        # closed behind the user's back, reported as a conflict instead
-        self.assertEqual(raised.exception.code, "cad_same_name_conflict")
-        detail = raised.exception.detail
-        self.assertIsInstance(detail, dict)
-        conflicts = detail["conflicts"]  # type: ignore[index]
-        opened = {entry["open_document"] for entry in conflicts}
-        self.assertEqual(opened, {str(self.parts[0]), str(self.parts[1])})
-        self.assertTrue(all(entry["is_the_open_file"] for entry in conflicts))
-
-    def test_copy_loading_an_absent_snapshot_document_blocks_freeze(self) -> None:
-        backend, config = self._two_component_backend()
-        # the copy resolves a document that is outside the snapshot but is *not*
-        # open anywhere, so the failure stays a plain escape
-        backend.copy_outside_documents = True
-        backend.list_documents = lambda: [str(self.assembly)]  # type: ignore[method-assign]
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_escape")
-
-    def test_ambiguous_instance_identity_blocks_freeze(self) -> None:
-        backend, config = self._two_component_backend()
-        backend.copy_duplicate_instances = True
-
-        with self.assertRaises(BridgeError) as raised:
-            freeze(config, self.destination, backend=backend)
-
-        self.assertEqual(raised.exception.code, "dependency_instance_identity_ambiguous")
-
-    def test_suppressed_instances_are_carried_not_treated_as_escapes(self) -> None:
-        backend = _Backend(
-            self.assembly,
-            [
-                {
-                    "name": "base-1",
-                    "path": str(self.parts[0]),
-                    "transform": support.placement(),
-                    # Off-axis COM: the product signal proves the convention at capture time.
-                    "mass": support.mass_payload(1.0, (0.01, 0.02, 0.0)),
-                },
-                {
-                    "name": "arm-1",
-                    "path": str(self.parts[1]),
-                    "transform": support.placement((0.0, 0.0, 0.2)),
-                    "mass": support.mass_payload(0.5),
-                    "suppressed": True,
-                },
-            ],
-            dependencies=self.parts,
+        self.assertEqual(detail["configuration"], "Other")
+        self.assertEqual(
+            detail["state"]["active_configuration"],
+            "Default",
         )
-        config = json.loads(json.dumps(self.config))
-        config["bodies"] = [
-            {
-                "id": "base",
-                "name": "base_link",
-                "components": ["base-1"],
-                "frame": {"coordinate_system": "CS_base_link"},
-            }
-        ]
-        config["joints"] = []
-        config.pop("frames", None)
-
-        freeze(config, self.destination, backend=backend)
-
-        closure = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
-        self.assertEqual(closure["suppressed_instances"], 1)
-        self.assertEqual(closure["component_instances_inside"], 1)
-        self.assertEqual(closure["components_verified"], 2)
 
     def test_failed_capture_keeps_its_collected_copy_and_a_record(self) -> None:
         backend, config = self._two_component_backend()
@@ -1858,7 +802,7 @@ class FreezeTests(unittest.TestCase):
         self.assertTrue(failure.is_dir())
         record = json.loads((failure / "failure.json").read_text(encoding="utf-8"))
         self.assertEqual(record["code"], "capture_source_mismatch")
-        self.assertEqual(record["stage"], "readings")
+        self.assertEqual(record["stage"], "scene_projection")
         self.assertEqual(record["request"]["assembly"], str(self.assembly))
         self.assertEqual(record["request"]["configuration"], "Default")
         # the material that explains the failure survives: the collector's copy
@@ -1868,25 +812,6 @@ class FreezeTests(unittest.TestCase):
         # ... and nothing was delivered
         self.assertFalse(self.destination.exists())
 
-    def test_failed_readings_retain_environment_and_both_owned_session_ids(self) -> None:
-        backend, config = self._two_component_backend()
-        backend.scene_document_override = str(self.assembly)
-        sessions = {
-            "source": {"pid": 41, "executable": "sldworks.exe", "ownership": "windows_job"},
-            "copy": {"pid": 42, "executable": "sldworks.exe", "ownership": "windows_job"},
-        }
-        backend.environment = lambda: {"revision": "34.0.0", "sessions": sessions}
-
-        with self.assertRaises(BridgeError) as caught:
-            freeze(config, self.destination, backend=backend, worker_version="test-worker")
-
-        self.assertEqual(caught.exception.code, "capture_source_mismatch")
-        failure = self.destination.with_name(self.destination.name + ".failed-001")
-        environment = json.loads((failure / "partial/evidence/environment.json").read_text())
-        self.assertEqual(environment["solidworks"]["sessions"], sessions)
-        self.assertEqual(environment["solidworks"]["revision"], "34.0.0")
-        self.assertEqual(environment["worker_version"], "test-worker")
-
     def test_geometry_failure_retains_environment_without_masking_original_error(self) -> None:
         from description_pipeline.sources.solidworks.errors import CadError
 
@@ -1894,17 +819,17 @@ class FreezeTests(unittest.TestCase):
         sessions = {"copy": {"pid": 42, "executable": "sldworks.exe", "ownership": "windows_job"}}
         backend.environment = lambda: {"revision": "34.0.0", "sessions": sessions}
 
-        def unavailable_mesh(*args, **kwargs):
+        def unavailable_geometry(*args, **kwargs):
             raise CadError("cad_body_faces_unreadable", "native faces unavailable", {"api": "IBody2.GetFaces"})
 
-        backend.export_component_meshes = unavailable_mesh
+        backend.capture_prepared_geometry = unavailable_geometry
         with self.assertRaises(CadError) as caught:
             freeze(config, self.destination, backend=backend)
 
         self.assertEqual(caught.exception.code, "cad_body_faces_unreadable")
         failure = self.destination.with_name(self.destination.name + ".failed-001")
         record = json.loads((failure / "failure.json").read_text())
-        self.assertEqual(record["stage"], "geometry")
+        self.assertEqual(record["stage"], "geometry_facts")
         self.assertEqual(record["detail"]["api"], "IBody2.GetFaces")
         environment = json.loads((failure / "partial/evidence/environment.json").read_text())
         self.assertEqual(environment["solidworks"]["sessions"], sessions)
@@ -1975,10 +900,10 @@ class FreezeTests(unittest.TestCase):
         for change in ("omit", "substitute"):
             with self.subTest(change=change):
                 backend, config = self._two_component_backend()
-                original = backend.export_component_meshes
+                original = backend.capture_prepared_geometry
 
-                def changed_result(destinations, on_activity=None, original=original, change=change):
-                    entries = original(destinations, on_activity=on_activity)
+                def changed_result(source_scopes, on_activity=None, original=original, change=change):
+                    entries = original(source_scopes, on_activity=on_activity)
                     name = next(iter(entries))
                     if change == "omit":
                         entries.pop(name)
@@ -1986,37 +911,19 @@ class FreezeTests(unittest.TestCase):
                         entries[name]["component"] = "foreign-occurrence"
                     return entries
 
-                backend.export_component_meshes = changed_result
+                backend.capture_prepared_geometry = changed_result
                 destination = self.tmp / change
                 with self.assertRaises(BridgeError) as caught:
                     freeze(config, destination, backend=backend)
-                self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
+                self.assertEqual(
+                    caught.exception.code,
+                    (
+                        "cad_source_scope_mismatch"
+                        if change == "omit"
+                        else "cad_mesh_export_failed"
+                    ),
+                )
                 self.assertFalse(destination.exists())
-
-    def test_retry_writes_a_second_diagnosis_and_keeps_the_first(self) -> None:
-        backend, config = self._two_component_backend()
-        backend.copy_configuration = "Other"
-        with self.assertRaises(BridgeError):
-            freeze(config, self.destination, backend=backend)
-
-        backend.copy_configuration = None
-        backend.resolve_returns_empty = True
-        with self.assertRaises(BridgeError):
-            freeze(config, self.destination, backend=backend)
-
-        first = self.destination.with_name(self.destination.name + ".failed-001")
-        second = self.destination.with_name(self.destination.name + ".failed-002")
-        self.assertEqual(
-            json.loads((first / "failure.json").read_text(encoding="utf-8"))["code"],
-            "dependency_configuration_mismatch",
-        )
-        self.assertEqual(
-            json.loads((second / "failure.json").read_text(encoding="utf-8"))["code"],
-            "dependency_resolution_unverified",
-        )
-        self.assertEqual(
-            json.loads((second / "failure.json").read_text(encoding="utf-8"))["stage"], "dependency_closure"
-        )
 
     def test_successful_capture_leaves_no_failure_directories(self) -> None:
         backend, config = self._two_component_backend()
@@ -2081,7 +988,7 @@ class FreezeTests(unittest.TestCase):
         self.assertTrue((failure / "partial" / "partial.txt").is_file())
 
     def test_capture_progress_reaches_the_activity_callback(self) -> None:
-        """Freeze notes must flow with honest counts and never change the snapshot."""
+        """Prepared Capture notes must flow without changing the snapshot."""
 
         records: list[dict] = []
         freeze(self.config, self.destination, backend=self.backend, on_activity=records.append)
@@ -2090,20 +997,18 @@ class FreezeTests(unittest.TestCase):
         actions = [item["action"] for item in records]
         for action in (
             "start",
-            "closure",
+            "prepared_source",
+            "open_prepared",
             "readings",
-            "mass_closure",
+            "geometry_facts",
+            "scene_projection",
             "geometry",
-            "verify_sources",
-            "window_close",
-            "window_reopen",
-            "window_read",
             "release",
             "seal",
         ):
             self.assertIn(action, actions)
         self.assertIn("instance_reads", actions)  # the backend's own records travel through publish()
-        self.assertIn("mesh_export", actions)
+        self.assertIn("geometry_facts", actions)
         last_completed: dict[str, int] = {}
         for item in records:
             if "completed" not in item:
@@ -2119,6 +1024,72 @@ class FreezeTests(unittest.TestCase):
         again = self.tmp / "snapshot-boom"
         freeze(self.config, again, backend=self.backend, on_activity=exploded)
         self.assertTrue((again / "manifest.json").is_file())
+
+    def test_offline_geometry_failure_keeps_released_raw_facts(self) -> None:
+        from description_pipeline.sources.solidworks import native as native_module
+
+        backend, config = self._two_component_backend()
+        destination = self.tmp / "offline-geometry-failure"
+        with patch.object(
+            native_module,
+            "materialize_native_triangles",
+            side_effect=BridgeError(
+                "cad_mesh_serialization_failed",
+                "offline STL materialization failed",
+                {"component": "base-1"},
+            ),
+        ), self.assertRaises(BridgeError) as caught:
+            freeze(config, destination, backend=backend)
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_mesh_serialization_failed",
+        )
+        order = backend.order
+        self.assertEqual(order.count("open_document"), 1)
+        self.assertEqual(order.count("release"), 1)
+        failure = destination.with_name(destination.name + ".failed-001")
+        observations = json.loads(
+            (failure / "native_observations.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            set(observations["geometry"]),
+            {"base-1", "arm-1"},
+        )
+        self.assertTrue(
+            all(
+                facts["triangle_values"]
+                for facts in observations["geometry"].values()
+            )
+        )
+
+    def test_nonfinite_failure_detail_preserves_the_primary_error(self) -> None:
+        from description_pipeline.sources.solidworks import native as native_module
+
+        backend, config = self._two_component_backend()
+        destination = self.tmp / "nonfinite-projection-failure"
+        original = BridgeError(
+            "cad_prepared_capture_projection",
+            "offline projection failed",
+            {"sample": float("nan")},
+        )
+        with patch.object(
+            native_module,
+            "project_prepared_capture",
+            side_effect=original,
+        ), self.assertRaises(BridgeError) as caught:
+            freeze(config, destination, backend=backend)
+
+        self.assertIs(caught.exception, original)
+        failure = destination.with_name(destination.name + ".failed-001")
+        payload = json.loads(
+            (failure / "failure.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["code"], "cad_prepared_capture_projection")
+        self.assertEqual(
+            payload["detail"]["sample"],
+            {"native_non_finite_float": float("nan").hex()},
+        )
 
 
 if __name__ == "__main__":

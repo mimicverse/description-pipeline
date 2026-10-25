@@ -10,7 +10,6 @@ from . import _paths  # noqa: F401
 
 from description_pipeline.io import PipelineError  # noqa: E402
 from description_pipeline.schemas import TOOL_SCHEMA  # noqa: E402
-from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.evidence import (  # noqa: E402
     METADATA_WARNING_CODE,
     METADATA_WARNING_MESSAGE,
@@ -43,11 +42,6 @@ def environment(*, copy_pid: int = 100) -> dict:
             "revision": "34.4.1",
             "input_mode": "saved_documents",
             "sessions": {
-                "source": {
-                    "pid": 80,
-                    "state": "closed",
-                    "lease": {"held": False, "holder_pid": None, "path": r"C:\state\cad.lease"},
-                },
                 "copy": {
                     "pid": copy_pid,
                     "state": "active",
@@ -58,57 +52,67 @@ def environment(*, copy_pid: int = 100) -> dict:
             "license": 1,
             "visible": True,
         },
+        "prepared_capture": {
+            "mode": "single_read_only_prepared_capture",
+            "policy": {
+                "mode": "prepared_read_only_copy",
+                "source_root": r"C:\captures",
+                "assembly": r"C:\captures\robot.SLDASM",
+                "requested_configuration": "Default",
+                "session_role": "copy",
+                "search_root": r"C:\captures",
+                "sealed_documents": [r"C:\captures\robot.SLDASM"],
+                "com_started": False,
+            },
+            "opened": {
+                "opened": "robot.SLDASM",
+                "path": r"C:\captures\robot.SLDASM",
+                "read_only": True,
+                "errors": 0,
+                "warnings": 0,
+            },
+            "state_before": {
+                "path": r"C:\captures\robot.SLDASM",
+                "title": None,
+                "title_error": {
+                    "code": "cad_title_unavailable",
+                    "message": "title is diagnostic only",
+                },
+                "save_flag": None,
+                "save_flag_error": {
+                    "code": "cad_save_flag_unavailable",
+                    "message": "save flag is diagnostic only",
+                },
+                "saved": None,
+                "active_configuration": "Default",
+                "configurations": None,
+                "configurations_error": {
+                    "code": "cad_configuration_names_unavailable",
+                    "message": "configuration names are diagnostic only",
+                },
+                "read_only": True,
+                "lightweight": None,
+                "unsupported": ["lightweight"],
+            },
+        },
     }
 
 
 def runtime_environment() -> dict:
-    payload = environment(copy_pid=110)
-    payload["session_boundary"] = {
-        "closure_top_level": r"C:\captures\robot.SLDASM",
-        "configuration": "Default",
-        "observed_configuration": "Default",
-        "capture_state": {
-            "path": r"C:\captures\robot.SLDASM",
-            "title": "robot.SLDASM",
-            "saved": True,
-            "save_flag": False,
-            "active_configuration": "Default",
-            "configurations": ["Default"],
-            "read_only": True,
-            "lightweight": None,
-            "unsupported": ["lightweight"],
-        },
-        "retirement": {
-            "role": "copy",
-            "retired": True,
-            "before": {"pid": 100, "state": "active"},
-            "after": {"pid": 100, "state": "closed"},
-        },
-        "opened": {
-            "opened": "robot.SLDASM",
-            "path": r"C:\captures\robot.SLDASM",
-            "read_only": True,
-            "errors": 0,
-            "warnings": 0,
-        },
-    }
-    return payload
+    return environment(copy_pid=110)
 
 
 class MetadataProvenanceTests(unittest.TestCase):
-    def warnings(self, runtime=None, rewrite=None, expected_tool=None) -> list[dict]:
+    def warnings(self, runtime=None, expected_tool=None) -> list[dict]:
         return metadata_value_warnings(
             runtime or runtime_environment(),
-            rewrite or environment(),
             expected_tool=expected_tool or environment()["toolchain"],
             runtime_sha256="c" * 64,
-            rewrite_sha256="d" * 64,
             expected_configuration="Default",
-            closure_top_level=r"C:\captures\robot.SLDASM",
         )
 
-    def objects(self, runtime=None, rewrite=None) -> list[dict]:
-        warnings = self.warnings(runtime=runtime, rewrite=rewrite)
+    def objects(self, runtime=None) -> list[dict]:
+        warnings = self.warnings(runtime=runtime)
         self.assertEqual(len(warnings), 1)
         self.assertEqual(warnings[0]["code"], METADATA_WARNING_CODE)
         self.assertEqual(warnings[0]["message"], METADATA_WARNING_MESSAGE)
@@ -119,20 +123,12 @@ class MetadataProvenanceTests(unittest.TestCase):
         by_rule = {row["rule_id"]: row for row in objects if row["file"].endswith("native-runtime.json")}
         all_fields = {field for row in objects for field in row["fields"]}
 
-        self.assertIn("/session_boundary/capture_state/saved", all_fields)
-        self.assertIn("/session_boundary/opened/read_only", all_fields)
-        self.assertIn("/session_boundary/observed_configuration", all_fields)
-        self.assertIn("/session_boundary/configuration", all_fields)
-        self.assertNotIn("/session_boundary/capture_state/save_flag", all_fields)
-        self.assertNotIn("/session_boundary/capture_state/read_only", all_fields)
         self.assertNotIn("/solidworks/revision", all_fields)
-        self.assertEqual(by_rule["metadata.save_flag_inversion"]["rule_version"], "v1")
-        self.assertEqual(by_rule["metadata.operation_claim"]["rule_version"], "v1")
-
-    def test_recovered_capture_keeps_the_initial_session_boundary(self) -> None:
-        runtime = runtime_environment()
-        runtime["solidworks"]["sessions"]["copy"]["pid"] = 202
-        self.objects(runtime=runtime)
+        self.assertEqual(
+            by_rule["metadata.platform_diagnostic"]["rule_version"],
+            "v1",
+        )
+        self.assertEqual(by_rule["metadata.source_configuration_echo"]["rule_version"], "v1")
 
     def test_getter_failure_placeholders_are_bound_to_their_actual_fields(self) -> None:
         runtime = runtime_environment()
@@ -145,32 +141,23 @@ class MetadataProvenanceTests(unittest.TestCase):
                 "GetCurrentLicenseType": "license getter failed",
             },
         )
-        rewrite = environment()
-        rewrite["solidworks"].update(
-            build=None,
-            license=None,
-            visible=None,
-            unavailable={
-                "GetBuildNumbers": "build getter failed",
-                "GetCurrentLicenseType": "license getter failed",
-            },
-        )
-        objects = self.objects(runtime=runtime, rewrite=rewrite)
+        objects = self.objects(runtime=runtime)
         unavailable = {
             row["file"]: set(row["fields"])
             for row in objects
-            if row["rule_id"] == "metadata.platform_unavailable"
+            if row["rule_id"] == "metadata.platform_diagnostic"
         }
-        self.assertEqual(
-            unavailable["evidence/native-runtime.json"],
-            {"/solidworks/build", "/solidworks/license", "/solidworks/visible"},
-        )
-        self.assertEqual(
-            unavailable["evidence/evidence/rewrite-environment.json"],
-            {"/solidworks/build", "/solidworks/license", "/solidworks/visible"},
+        self.assertTrue(
+            {
+                "/solidworks/build",
+                "/solidworks/license",
+                "/solidworks/visible",
+                "/solidworks/unavailable",
+            }
+            <= unavailable["evidence/native-runtime.json"]
         )
 
-    def test_invalid_optional_api_types_and_unbound_null_fail_closed(self) -> None:
+    def test_optional_api_diagnostics_are_retained_without_type_coercion(self) -> None:
         for key, value in (
             ("build", ""),
             ("build", ["2026", "1"]),
@@ -180,65 +167,16 @@ class MetadataProvenanceTests(unittest.TestCase):
             with self.subTest(key=key):
                 runtime = runtime_environment()
                 runtime["solidworks"][key] = value
-                with self.assertRaisesRegex(PipelineError, "documented native type"):
-                    self.warnings(runtime=runtime)
-
-        runtime = runtime_environment()
-        runtime["solidworks"]["visible"] = None
-        self.assertIn(
-            "/solidworks/visible",
-            {
-                field
-                for row in self.objects(runtime=runtime)
-                if row["rule_id"] == "metadata.platform_unavailable"
-                for field in row["fields"]
-            },
-        )
-
-        runtime = runtime_environment()
-        runtime["solidworks"]["build"] = None
-        with self.assertRaisesRegex(PipelineError, "no bound unavailable diagnostic"):
-            self.warnings(runtime=runtime)
-
-    def test_session_projection_and_save_inversion_are_revalidated(self) -> None:
-        runtime = runtime_environment()
-        runtime["session_boundary"]["observed_configuration"] = "Other"
-        with self.assertRaisesRegex(PipelineError, "differs from the native active configuration"):
-            self.warnings(runtime=runtime)
-
-        runtime = runtime_environment()
-        runtime["session_boundary"]["capture_state"]["saved"] = False
-        with self.assertRaisesRegex(PipelineError, "boolean inversion"):
-            self.warnings(runtime=runtime)
-
-        runtime = runtime_environment()
-        runtime["session_boundary"]["capture_state"]["read_only"] = None
-        with self.assertRaisesRegex(PipelineError, "observed true boolean"):
-            self.warnings(runtime=runtime)
-
-    def test_boundary_conflicts_are_rejected_instead_of_warninged(self) -> None:
-        runtime = runtime_environment()
-        runtime["session_boundary"]["observed_configuration"] = "Other"
-        runtime["session_boundary"]["capture_state"]["active_configuration"] = "Other"
-        runtime["session_boundary"]["capture_state"]["configurations"] = ["Other"]
-        with self.assertRaisesRegex(PipelineError, "differs from the frozen source configuration"):
-            self.warnings(runtime=runtime)
-
-        runtime = runtime_environment()
-        other = r"C:\captures\other.SLDASM"
-        runtime["session_boundary"]["opened"]["path"] = other
-        runtime["session_boundary"]["capture_state"]["path"] = other
-        with self.assertRaisesRegex(PipelineError, "do not match the dependency closure"):
-            self.warnings(runtime=runtime)
-
-        runtime = runtime_environment()
-        runtime["session_boundary"]["opened"]["errors"] = 1
-        with self.assertRaisesRegex(PipelineError, "failed or invalid open"):
-            self.warnings(runtime=runtime)
-
-        runtime = runtime_environment()
-        runtime["session_boundary"]["opened"]["warnings"] = 1
-        self.assertTrue(self.objects(runtime=runtime))
+                objects = self.objects(runtime=runtime)
+                self.assertIn(
+                    f"/solidworks/{key}",
+                    {
+                        field
+                        for row in objects
+                        if row["rule_id"] == "metadata.platform_diagnostic"
+                        for field in row["fields"]
+                    },
+                )
 
     def test_unknown_or_mismatched_toolchain_is_rejected(self) -> None:
         mutations = (
@@ -254,43 +192,36 @@ class MetadataProvenanceTests(unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     self.warnings(runtime=runtime)
 
-        rewrite = environment()
-        rewrite["toolchain"]["runtime"]["packages"]["pywin32"] = "999"
+        runtime = runtime_environment()
+        runtime["toolchain"]["runtime"]["packages"]["pywin32"] = "999"
         with self.assertRaisesRegex(PipelineError, "runtime differs"):
-            self.warnings(rewrite=rewrite)
-
-    def test_fresh_session_boundary_is_revalidated(self) -> None:
-        runtime = runtime_environment()
-        runtime["session_boundary"]["retirement"]["role"] = "source"
-        with self.assertRaisesRegex(PipelineError, "retirement.role"):
             self.warnings(runtime=runtime)
 
+    def test_unknown_state_diagnostics_are_allowed_without_fabricated_success(self) -> None:
         runtime = runtime_environment()
-        runtime["session_boundary"]["retirement"]["after"]["pid"] = 101
-        with self.assertRaisesRegex(PipelineError, "changed the retired process pid"):
-            self.warnings(runtime=runtime)
+        state = runtime["prepared_capture"]["state_before"]
+        self.assertIsNone(state["title"])
+        self.assertIsNone(state["configurations"])
+        self.assertIsNone(state["save_flag"])
+        self.assertIsNone(state["saved"])
 
-        runtime = runtime_environment()
-        runtime["solidworks"]["sessions"]["copy"]["pid"] = 100
-        with self.assertRaisesRegex(PipelineError, "capture reused the retired rewrite process"):
-            self.warnings(runtime=runtime)
+        warnings = self.warnings(runtime=runtime)
+        self.assertTrue(warnings)
+        files = {row["file"] for row in warnings[0]["objects"]}
+        self.assertEqual(files, {"evidence/native-runtime.json"})
 
-        runtime = runtime_environment()
-        runtime["solidworks"]["sessions"]["source"]["state"] = "active"
-        runtime["solidworks"]["sessions"]["source"]["lease"]["held"] = True
-        with self.assertRaisesRegex(PipelineError, "source.*closed"):
-            self.warnings(runtime=runtime)
-
-    def test_session_process_fields_are_projected(self) -> None:
-        objects = self.objects(runtime=runtime_environment(), rewrite=environment())
-        rewrite_fields = {
+    def test_single_prepared_copy_session_fields_are_projected(self) -> None:
+        objects = self.objects(runtime=runtime_environment())
+        fields = {
             field
             for row in objects
-            if row["file"] == "evidence/evidence/rewrite-environment.json"
+            if row["file"] == "evidence/native-runtime.json"
             for field in row["fields"]
         }
-        self.assertIn("/solidworks/sessions/source", rewrite_fields)
-        self.assertIn("/solidworks/sessions/copy", rewrite_fields)
+        self.assertIn("/solidworks/sessions/copy", fields)
+        self.assertNotIn("/solidworks/sessions/source", fields)
+        self.assertIn("/prepared_capture/opened/opened", fields)
+        self.assertIn("/prepared_capture/policy/mode", fields)
 
 
 class NativeMetadataTests(unittest.TestCase):
@@ -309,7 +240,6 @@ class NativeMetadataTests(unittest.TestCase):
         doc = self.document(False)
         backend = SolidWorksBackend()
         backend._ensure_document = lambda path: doc
-        backend.list_configurations = lambda path: ["Default"]
 
         state = backend.document_state(r"C:\captures\robot.SLDASM")
 
@@ -317,19 +247,18 @@ class NativeMetadataTests(unittest.TestCase):
         self.assertIs(state["saved"], True)
         self.assertEqual(doc.GetSaveFlag.call_count, 1)
 
-    def test_document_state_rejects_non_native_save_flag_types(self) -> None:
+    def test_document_state_retains_unknown_save_flag_diagnostics(self) -> None:
         for value in (None, 0, 1, "", "false", []):
             with self.subTest(value=value):
                 backend = SolidWorksBackend()
                 doc = self.document(value)
                 backend._ensure_document = lambda path, doc=doc: doc
-                backend.list_configurations = lambda path: ["Default"]
-                with self.assertRaises(CadError) as raised:
-                    backend.document_state(r"C:\captures\robot.SLDASM")
-                self.assertEqual(raised.exception.code, "cad_save_flag_invalid")
-                self.assertIn("value", raised.exception.detail)
+                state = backend.document_state(r"C:\captures\robot.SLDASM")
+                self.assertIn("save_flag", state)
+                self.assertIsNone(state["saved"])
+                self.assertTrue(state.get("save_flag_error"))
 
-    def test_environment_retains_optional_failures_and_rejects_invalid_success_types(self) -> None:
+    def test_environment_retains_optional_failures_and_invalid_types(self) -> None:
         def unavailable():
             raise RuntimeError("unavailable")
 
@@ -348,10 +277,10 @@ class NativeMetadataTests(unittest.TestCase):
         self.assertEqual(facts["unavailable"]["GetBuildNumbers"], "unavailable")
         self.assertEqual(facts["unavailable"]["GetCurrentLicenseType"], "unavailable")
 
-        for member, value in (
-            ("GetBuildNumbers", ["2026", "1"]),
-            ("GetCurrentLicenseType", True),
-            ("Visible", 1),
+        for member, key, value in (
+            ("GetBuildNumbers", "build", ["2026", "1"]),
+            ("GetCurrentLicenseType", "license", True),
+            ("Visible", "visible", 1),
         ):
             with self.subTest(member=member):
                 app = SimpleNamespace(
@@ -363,9 +292,9 @@ class NativeMetadataTests(unittest.TestCase):
                 setattr(app, member, lambda value=value: value)
                 backend = SolidWorksBackend()
                 backend._app_obj = lambda app=app: app
-                with self.assertRaises(CadError) as raised:
-                    backend.environment()
-                self.assertEqual(raised.exception.code, "cad_environment_value_invalid")
+                facts = backend.environment()
+                self.assertIn(key, facts)
+                self.assertIn(member, facts["unavailable"])
 
 
 if __name__ == "__main__":

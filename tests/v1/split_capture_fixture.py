@@ -22,11 +22,13 @@ def fixture_backend(
         [
             {
                 "name": "base-1",
+                "path": str(prepared_package / "cad/base.SLDPRT"),
                 "transform": support.placement((0.0, 0.0, 0.0)),
                 "mass": fixture_mass_payload(0.192, (0.01, 0.02, 0.0)),
             },
             {
                 "name": "arm-1",
+                "path": str(prepared_package / "cad/arm.SLDPRT"),
                 "transform": support.placement((0.0, 0.0, 0.1)),
                 "mass": fixture_mass_payload(
                     0.105654866776462,

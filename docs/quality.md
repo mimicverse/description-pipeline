@@ -19,7 +19,7 @@
 | 原生来源 | 原生 API/build 与环境已资格化；每个依赖及物化导入件绑定封存原件、所有者和实例；无包外或未知来源 |
 | 机械解释 | 独立判定声明存在性；有声明时独立解码，确证无声明时独立重建完整配合集合；模式、成员和结构一致 |
 | 对象与拓扑 | 每个纳入实例恰属一个刚体，其余显式未分配；名称唯一且合规；唯一 `base_link`、连通无环树，模型/XML 集合一致 |
-| 配置与状态 | 正确引用配置、活动实例和抑制状态；原生重建成功；读取及恢复有效；原件和采集副本的字节保持不变 |
+| 配置与来源 | 正确引用冻结配置、活动实例和抑制状态；原生读数、实际读取错误和对象绑定保真；原件字节保持不变；派生计算在 CAD 释放后独立复核 |
 | 坐标与零姿态 | 有限 SI 齐次变换、正交右手基准；独立从原生根基准计算零姿态 FK，实际产物的放置一致 |
 | 关节与轴线 | 类型、两端、完整原点、正向、限位一致；轴线绑定正确实例中的独立重读原生参考轴或圆柱面 |
 | 运动一致性 | 从原生刚性归属与接口端点独立计算非零姿态的逐叶实例运动；核对随动、组内相对变换及接口连续性，覆盖适用的单关节与关联组合 |
@@ -87,41 +87,15 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 
 有效变换必须具有齐次末行、单位正交旋转与正行列式；schema 和检查策略规定这些数值合法性门。非有限值、零/负质量、非正主惯量和不满足惯量三角不等式始终失败。
 
-近零体积网格须有绑定具体实例的异常几何依据。原生曲面片记录正面积却返回零三角形和零 facets 时，可保留精确警告，包含实例、面及原生面积；其曲面几何完整性不获得资格。实体无网格、三角数据损坏、非空曲面缺失必要事实均失败。
+Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随后释放 CAD。坐标、物性投影、三角流序列化、STL 生成及工程校验均在离线执行；原生读取错误和必要对象、配置、来源及会话安全绑定仍须保全和核验。
 
-对同一次冻结 CAD、配置和实例，原生 ITessellation 的顶点、facet、fin 与边关系是交付 STL 和拓扑证据的共同来源。交付三角形必须由该 facet 的有向顶点环生成；binary32 序列化、坐标转换和必要的派生值保留原生原值、转换依据及 warning，并由 Linux 从原点、原始关系和实际 STL 字节独立复算。不得把另一种显示缓存的三角形数量当作相同网格的隐含保证，也不得拼接两套 tessellation；原件绑定、`50 µm` 表面比较、完整覆盖及朝向验收不变。
+几何唯一主读取链为 `IComponent2.GetBodies2` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`。`True` 表示不进行系统单位到用户单位转换，原始坐标以米计且位于 component local frame。每个实际 occurrence 分别读取，不按文档与配置提前合并，以免丢失 assembly-level feature 的几何差异。装配 placement 单独保留 `GetTotalTransform(False).ArrayData` 的原始 16 项，离线按 SolidWorks 变换语义转换，不将原始 SW16 当作 canonical 4×4。
 
-原生曲线端点与 `Evaluate2` 的一致性采用版本化 `native-curve-endpoint-float32-operation-v4`：对参数序端点 `c`、同一 U 的求值点 `v` 和曲线另一端点 `o`，允许界 `v4(c,v,o)` 由 `pair(c,v) + pair(c,o)` 组成，其中 `pair` 是两个有限 XYZ 点逐坐标 binary32 邻接界之和的最大值。必须独立要求 `L∞(c,v) <= v4(c,v,o)`；不得用 tessellation 投影点 `p` 替换 `c`，也不得把 `Evaluate2`-到-`p` 的诊断误差当作该门。producer 与独立 parser 使用同一规则；该界不放宽 U 域、持久引用、拓扑端点、fin/cofin 或同 U 证据，也不允许把任何端点跳过验证。
+`native-triangles/v1` 保留完整 body／face inventory、face span、实例来源 scope、placement 原值和原始 binary64 三角形流。原始流使用 `SWTESS64` 固定头、版本、数量及逐三角九项坐标；文件按实际 payload 摘要登记为 `raw/triangles/{sha}.triangles`。释放 CAD 后生成 `geometry/{sha}.stl`，仅对已经实际读得的相同 payload 按摘要复用文件，各 occurrence 的 placement 和来源绑定独立保留。派生的 STL 法向、binary32 坐标和 scope-local 身份必须携带对象及字段级 warning。
 
-原生曲线与 `IEdge` 端点采用版本化 `native-curve-topology-endpoint-set-v3`：分别保留参数域 endpoint-set 和实际 edge endpoint-set 的原始点，以 `max_abs_coordinate` 独立复算 direct 与 swapped 两种完整映射误差，二者共用既有 50 µm native tessellation projection 界，并保留两种完整接受状态。该集合检查证明几何覆盖，不通过最近距离或唯一匹配猜测方向；双匹配保留 `complete_match_count=2`。同一原生 `IEdge.GetCurveParams3` 的严格布尔 `ICurveParamData.Sense` 声明 curve 与 edge 的方向关系：`true` 同向、`false` 反向；它用于有据的方向解释和周期参数提升，不选择或替换原生 closest U。原始 `UMinValue`、`UMaxValue`、`StartPoint`、`EndPoint` 和 `Sense` 均保留；反向及负参数空间沿原生参数化规则独立复核。对象引用、component/body/face/edge/fin/vertex/cofin 归属、open sheet 的单面边界、完整逐面 U 覆盖及原始网格字节绑定分别验收；不再为参数几何建立第二套 open-edge scope 或距离选向身份。
+独立消费者从原始三角流、face span、来源 scope 和 SW16 重新核对实际 STL 的三角形数量、顺序、坐标、法向、归属及摘要，并核对场景 placement。原生读取失败、缺失必要几何、非法数值、错误归属或交付字节不对应原始事实均失败。拓扑审计记录实际观察，不把显示三角形天然宣称为闭合流形或精度证明；最终逐对象 `50 µm` 曲面等价及其他工程验收保持。
 
-方向关系依据 [SOLIDWORKS `ICurveParamData.Sense` 官方契约](https://help.solidworks.com/2020/english/api/sldworksapi/solidworks.interop.sldworks~solidworks.interop.sldworks.icurveparamdata~sense.html)。edge row 中保留的原生 tolerance 元数据必须如实记录来源、原值或读取失败；它不决定 closest U 的资格，不改变投影允许界，也不产生未实际使用 gap 的警告。
-
-原生 tessellation fin 端点采用版本化 `tessellation-edge-projection-v1` 绑定。令 `s` 为原始 tessellation vertex，`p/u` 为同一次 `IEdge.GetClosestPointOn(s)` 的原生返回，`v` 为 `IEdge.Evaluate2(u,1)` 返回点。全部 fin endpoint 共用同一几何条件：`L∞(s,p) <= 5e-5 m`、`L∞(p,v) <= 5e-5 m`、`L∞(s,v) <= 5e-5 m`；三者必须分别由原始点独立复算，不能仅以两个中间界代替第三个整体界。U 有效域、128 ULP 参数身份、原生响应与 packed success、Source scope、拓扑和覆盖保持严格；不按旧 API 的成功状态或 U 是否靠近边界选择另一几何预算。独立曲线参数端点 `c` 与其同 U 求值点的 v4 数值一致性仍单独验收，不能把 `s` 或 `p` 代入 `c`。v3 在同点身份、cofin 反向坐标等有独立必要性的比较中保持，不充当此 closest 来源的 `p/v` 几何门。删除此链的 `p/c <= v4` 普通门、tolerant gap 救援分类、相关 open-edge identity 与未实际使用的 gap warning；不新增回退、默认值或逐 fin 例外。交付网格顶点保持原值；上述 L∞ 点投影检查不等于已证明最终双向 L2 曲面距离，最终 50 µm 曲面上界、拓扑、覆盖和朝向资格仍须另行完整证明。
-
-原生 `GetPersistReference3` 的原始字节可能由同一 owner 的不同实体类型共同返回，因而不能单独充当全局实体身份。正常可区分对象继续使用按实体 kind 域分离的 typed persistent reference；不得把这类原生身份降级为派生值。仅当同一 body 内某一 kind 的全部对象返回同一个 body-scope reference、该 reference 不能识别具体 face/edge/vertex 时，才采用版本化 `native-scope-entity-id-v1`：该 identity 明确标记 `persistent=false`，绑定 source document identity、configuration、occurrence、body、object kind/index，并以原生 area、精确 binary64 bbox、tessellation coordinate/topology 或 edge endpoint/curve/相邻面证据生成唯一摘要。冻结 part 的唯一且可解析 reference 只作为映射 witness，不接管生产几何。原 raw reference、alias 审计和对象级 `cad_component_persistent_reference_aliased`／`cad_scope_local_identity_derived` warning 必须保留；scope-local 不得用于跨运行解析、恢复或宣称 persistent。若同 kind 出现 unique 与 alias 混合、scope 摘要重复/缺失、owner/configuration/body 不符或映射不是双向一一对应，必须 fail closed。跨 kind raw alias 仍须显式审计，不能用 alias 放宽拓扑归属、对象绑定或覆盖检查。原始网格点到最近点的 50 µm projection 只证明既定几何关系，不建立持久对象身份，也不能替代上述 scope-local 来源、映射和归属核验。
-
-fin endpoint 的唯一 U 来源为版本化 `native-u-closest-point-parameter-v1`：`IEdge.GetClosestPointOn(s)` 同次返回 `[PointX, PointY, PointZ, UParameter, NotUsed]`，前四项必须为有限原生值；最后一项为未使用槽，不作工程判据。严格要求 U 位于同一 edge 的有效参数域，保留负参数和周期参数的原值及既有绑定；不以 clamp、插值、另一次反求或其他对象的 U 替换。`Evaluate2` 必须 packed 成功，并由上述三条既有 50 µm 点投影条件独立接纳；原生曲线端点 v4、cofin/同点 v3、覆盖、Sense、Source scope、有效 warning 和网格字节绑定各保留真实语义。删除 `GetParameter` 二次反求、成功优先／失败 fallback、闲置状态字段与兼容开关；历史失败原件保全，不拼接新旧响应。域外、非有限、错误绑定、packed 失败或任一必要几何条件不闭合均拒绝，不切换另一 U。失败记录须定位具体对象与 predicate，保留原始 s、同次 p/U、域、Sense、edge/face 引用、Evaluate2 原始 payload/状态，以及所检关系的度量、误差、阈值和规则；声明的 tolerance 原生事实另列，不能以派生 evidence 为 null 推断原生状态。该来源依据 [SOLIDWORKS `IEdge.GetClosestPointOn` 官方契约](https://help.solidworks.com/2024/english/api/sldworksapi/solidworks.interop.sldworks~solidworks.interop.sldworks.iedge~getclosestpointon.html)。
-
-native edge 的 U 覆盖仍按每个实际三角面分别严格验收。对 closed+periodic edge 中跨越参数缝的 fin，采用版本化 `native-periodic-fin-interval-v1`：在 edge `[u_min,u_max]` 内比较直接区间与补区间，只有较短且无歧义的一侧可作为该 tessellation 段的覆盖证据，另一侧表示为沿 seam 的两段；半个 edge 域的歧义区间必须 unresolved。原始 fin start/end、面归属、cofin 反向关系及全部 fin 端点域检查均保留，不得用 edge-wide 并集放宽单面覆盖。
-
-面方向以可读的 `IEdge::EdgeInFaceSense` 为主证据；SolidWorks 2026 中 `IEdgeInFaceSense2` 为只写属性，其带错误记录的不可用结果可保留为诊断，但仅在它成功返回布尔值时才要求与主证据一致，主证据缺失或不合法仍拒绝。fin/cofin 跨面时允许使用各自 face-local 的 tessellation vertex ID；独立验证须确认 reciprocal cofin、不同面、反向 U、端点 U 对应以及反向端点坐标落在 v3 点界内，不得仅凭 vertex ID 相同或不同作结论。
-
-原生 tessellation schema v10 将 `ITessellation.GetFinCoFin` 的严格整数 `-1` 定义为开放 sheet body（`body_type=1`）的 boundary sentinel：记录必须保留原始 `cofin_raw_id=-1`，并将归一化 `cofin_id` 写为 `null`。只有唯一 incident face 的 sheet edge 可包含 boundary fins；该 face 具有 facet 时，edge 必须包含实际 fin，每个 fin 都须携带该 sentinel、指向该唯一 face，并由逐 face 的 U interval 证据证明完整覆盖。solid body（`body_type=0`）不得使用 boundary semantics。具有两个 incident faces 的 edge 不得包含 boundary fin；其实际 fin 都必须指向同一 edge fin set 内的非负 cofin，形成双向 reciprocal pair，并满足不同面、反向 U、端点 U 与坐标对应。允许同一 shared edge 以多段 reciprocal pairs 表示；实际 fin 任一端为 `null`、类型不是严格整数、cofin 不在该 edge set、非 reciprocal、在 shared edge 出现 `-1`、在 open edge 出现非负 cofin，或 incident face 数不为 1 或 2，均 fail closed。
-
-原生 body 的唯一 `IBody2.GetTessellation` 请求统一使用显式 `VARIANT(VT_EMPTY, None)`，对应 [SOLIDWORKS 官方 VBA 示例](https://help.solidworks.com/2020/english/api/sldworksapi/Create_and_Convert_Non-manifold_Bodies_Example_VB.htm) 的 `GetTessellation(Empty)`。这是一次 whole-body 主请求，不在失败后切换参数。请求原件保留恰好一个参数、`VT_EMPTY` 和空值；不得以裸 Python `None`、零长度 SAFEARRAY 或显式全 face 数组冒称同一 Variant 类型。完整原生 face inventory、引用、body 归属和后续集合闭包分别保留，不将未传入的 face 列表写入请求，也不在身份派生后改写请求。独立 consumer 严格核对请求字段、参数数量的整数类型及空值，拒绝旧请求变体。
-
-原生 body 统一采用一次 analysis tessellation：在唯一一次 `Tessellate` 前设置并严格回读 `ImprovedQuality=true`、`NeedErrorList=true`，保留原有 `MatchType=0`、`NeedFaceFacetMap=true`、`NeedEdgeFinMap=true`、`NeedVertexParams=true`。同次请求规则与实际属性保留来源和执行身份；独立 consumer 对顶层及每个 body 的字段集、精确类型和值分别核验，不能因 Python 的布尔／整数相等而混同读数。analysis 模式用于工程读取，不在失败后切换模式再 tessellate，不另猜 chord／angle／width 参数，也不替代最终曲面距离验收。`Tessellate=false` 明确为原生失败，以该 API 为首错停止；可从同次对象记录原始错误列表、face 身份／面积和失败态数量作诊断，但不得把失败后的零数量或空返回解释为无 facet。错误列表不可读或原始返回为 `None` 时如实保全，不推成无错误，不依赖不支持的原生指针接口。
-
-`GetFaceFacets` 与 `GetEdgeFins` 保留同次成功 tessellation、同一 typed face／edge 的原始返回。list／tuple 必须是不含重复项的扁平非负严格整数数组，未经递归展平、去重或排序的原值须封存；`GetFacetFins` 的原始返回同样须为恰好三个不同的非负严格整数，不能先展平再验收。嵌套数组、标量、未知或任一 COM 读取失败均拒绝；不增加另一套 tessellation 或备用网格。
-
-`native-tessellation/v13` 从完整集合闭包证明狭义空集合。对同一 body 的全部原生 face，分别保留 `GetFaceFacets(face)` 原始 nullable 返回、对象绑定和完整 face inventory；全部成功数组中的 facet IDs 必须跨 face 互不重叠，长度之和与并集大小均严格等于同次原生 `GetFacetCount`。依据原生 API 返回的是对应 face 的 facet 子集，完整无重叠子集达到原生总数，才可证明其余成功返回 `None` 的 face 无 facet。此推导仅适用于严格 `body_type=1`、`Tessellate=true`、全部所需属性真实回读正确的情形；solid、缺失 face、错误归属、重复 ID、总量不足或超出均拒绝。保留原始 `None`，零计数和空数组明确标为按完整 body 闭包派生，记录规则与对象／字段级来源 warning，不能冒称原生逐字直返；consumer 从原始数组、inventory 和原生全局数量独立重算。
-
-仅当严格 `body_type=1`，edge 的一或两个唯一 incident faces 均归属于同一 body，且每个 incident face 已由上述完整闭包证明 facet 数为 `0` 时，才允许该 edge 的空 `fin_ids=[]`。除同次 `Tessellate=true` 与所需 map 属性正确外，全部原始 facet→fin 关系也须完整、唯一归属，并与同次原生 `GetFinCount` 闭合。`GetEdgeFins` 成功返回的直接空数组如实保留；若成功返回 `None`，只有这些原生拓扑与全局闭包事实全部成立，才可依据 fin 必须属于其 incident face 的 facet 推导为空，并保留原始 `None`、具体规则和对象／字段级来源 warning。consumer 从原始 face／facet／fin、全局数量、face span 和实际三角形记录独立复算，不信任自报允许标志。此规则不要求或伪称读取了 `GetFacetFace`／`GetFinEdge`，也不增加反向 API 前置。边、端点、曲线、参数域、sense 及原生身份仍完整保留，不生成 fin、cofin 或虚假 U 区间，也不删边。任一相邻面具有 facet 时缺 fin、solid/未知 body、非法返回类型、COM 读取失败、缺失面、全局总量不闭合或归属矛盾均拒绝。无 facet 的原生曲面片继续保留既有的实例、face、正面积及精确 warning；空边不贡献 U coverage，不赋予该曲面片几何完整性、最终曲面距离或参考拓扑一致资格，其余几何、身份、覆盖及交付验收保持。
-
-v10 同时记录 immutable `raw/source_scopes.json`：file source 分开保存原文件与冻结 copy hash/path；virtual source 保存 path-derived identity、owner hash、`VC~~` session document/root 和 PID。包级验证须把 scope 与 discovery、scene、capture、geometry、dependency closure 和实际冻结字节交叉核对；允许 discovery 与 capture 使用不同的虚拟 session、root 和 PID；owner、实例、配置及 `VC~~` 相对身份必须一致，各自 session 的文档路径、root 与 PID 必须内部绑定自洽。producer、独立 parser 与 topology summary 使用同一规则；该规则不放宽 curve endpoint、U、surface、身份或 mesh 验收。
-
-极短 fin 的两个端点经原生 128-ULP U identity 视为同一参数时，可采用版本化 `native-fin-u-collapse-v1`：保留两端原始 U、坐标、投影和求值证据，要求 reciprocal cofin、不同面、反向坐标 v3 一致、主 sense 相反、两端投影/Evaluate2/U 域证据有效，且几何端点跨度严格大于零并不超过 50 µm。collapsed fin 只保留为零测度拓扑段，贡献零 U coverage；其余非 collapsed intervals 仍须对每个实际面独立覆盖完整 edge 域。零跨度、部分坍缩、跨度超过 50 µm、cofin/sense 异常、证据不可读或依赖该 fin 补洞的情形必须 unresolved。fin 输入保持 exact schema；规则名、跨度和 warning 是从上述原始证据复算得到的归一化输出，不属于可注入的原始真值，parser 不得修改调用方输入对象。
+原始证据记录 immutable `raw/source_scopes.json`：file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将 scope 与 discovery、scene、capture、geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
 
 <a id="qualification"></a>
 ## 警告与资格

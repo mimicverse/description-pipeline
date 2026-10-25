@@ -51,9 +51,10 @@ from ..stages import (
     publication_succeeded,
     stage_view,
 )
-from ..geometry.native_u import (
+from ..geometry.native_scope import (
+    NATIVE_GATE_WARNING_CODES,
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_scope_warning_details_match,
+    native_gate_warning_details_match,
 )
 from ..artifacts import ArtifactStore
 from .airflow_client import (
@@ -301,10 +302,10 @@ def _quality_warnings(report: dict | None) -> list[dict]:
         "diagnostics",
         code_required=True,
     )
-    native_scope = [
+    native_warnings = [
         item
         for item in diagnostics
-        if str(item["code"]) in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        if str(item["code"]) in NATIVE_GATE_WARNING_CODES
     ]
     native_gate_warnings = None
     native_gate_passed = False
@@ -326,18 +327,24 @@ def _quality_warnings(report: dict | None) -> list[dict]:
             if isinstance(gate_warning_rows, list):
                 native_gate_warnings = gate_warning_rows
             break
-    raw_scope = [
+    raw_native = [
         item
         for item in native_gate_warnings or []
         if isinstance(item, dict)
-        and str(item.get("code")) in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        and str(item.get("code")) in NATIVE_GATE_WARNING_CODES
     ]
-    if (native_gate_passed and native_gate_warnings is None) or (
-        (native_scope or raw_scope)
+    if (
+        native_gate_passed
+        and not any(
+            item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+            for item in raw_native
+        )
+    ) or (
+        (native_warnings or raw_native)
         and (
             native_gate_warnings is None
-            or not native_scope_warning_details_match(
-                native_scope,
+            or not native_gate_warning_details_match(
+                native_warnings,
                 native_gate_warnings,
             )
         )

@@ -41,19 +41,12 @@ from pathlib import Path, PurePosixPath
 import yaml
 
 from ..delivery import read_delivery_manifest, read_source_record
+from ..geometry.native_scope import native_source_scope_is_valid
 from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data, read_data
-from ..geometry.native_u import native_source_scope_is_valid
+from ..schemas import NATIVE_DISCOVERY_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.direction import canonicalize_axis
 from ..sources.solidworks.naming import robot_name as format_robot_name
-from ..schemas import NATIVE_DISCOVERY_SCHEMA, exporter_declaration_present
-from ..sources.solidworks.session_artifacts import (
-    SESSION_DOCUMENT_API,
-    embedded_virtual_component_under_root,
-    has_session_document_marker,
-    session_materialization_under_root,
-    session_root_pid,
-)
 from ..sources.solidworks.native_limits import (
     ENGINEERING_DEFAULT_POLICY_ID,
     ROTATION_WINDOW_RAD,
@@ -63,6 +56,13 @@ from ..sources.solidworks.native_limits import (
     native_limit_inventory_complete,
     rotation_window_policy,
     validate_native_limit,
+)
+from ..sources.solidworks.session_artifacts import (
+    SESSION_DOCUMENT_API,
+    embedded_virtual_component_under_root,
+    has_session_document_marker,
+    session_materialization_under_root,
+    session_root_pid,
 )
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
@@ -220,10 +220,10 @@ def _saved_configuration_observed(raw: dict, name: str) -> bool:
 
     The sealed selection inventory must equal the native post-read inventory.
     Both document-state readings must be read-only, name the requested active
-    configuration and have ``IConfiguration.NeedsRebuild`` explicitly false.
-    ``NeedsRebuild2`` uses the documented integer enum (0/1/2); only the final
-    reading must be fully rebuilt (0).  ``GetSaveFlag`` is diagnostic because
-    native reads can legitimately dirty the in-memory document.
+    configuration and preserve the same sealed source bytes.  Rebuild flags are
+    recorded observations, not source qualifications, and are deliberately not
+    consulted here.  ``GetSaveFlag`` is diagnostic because native reads can
+    legitimately dirty the in-memory document.
     """
 
     state = raw.get("document_state")
@@ -242,18 +242,13 @@ def _saved_configuration_observed(raw: dict, name: str) -> bool:
         return False
 
     def proven(reading: dict) -> bool:
-        rebuild = reading.get("needs_rebuild2_value")
         return (
             reading.get("read_only") is True
-            and reading.get("configuration_needs_rebuild") is False
             and isinstance(reading.get("configuration"), str)
             and reading["configuration"].strip() == name
-            and type(rebuild) is int
-            and rebuild in {0, 1, 2}
         )
 
-    before, after = readings
-    return proven(before) and proven(after) and after["needs_rebuild2_value"] == 0
+    return all(proven(reading) for reading in readings)
 
 
 REQUEST_RECORD = "input/request.json"
@@ -3450,7 +3445,7 @@ def verify_discovery(package: Path) -> dict:
         _require(
             _saved_configuration_observed(raw, expected_configuration),
             "discovery.configuration",
-            "the delivery configuration and its read-only rebuild state are not proven",
+            "the delivery configuration and its read-only native state are not proven",
             {"field": "delivery_configuration"},
         )
         configuration = claimed.get("delivery_configuration")
@@ -4705,6 +4700,7 @@ CAPTURE = "evidence/capture.json"
 DISCOVERY = "evidence/discovery.json"
 RUNTIME = "evidence/native-runtime.json"
 HANDOFF = "input/handoff.json"
+INERTIA_CONVENTION = "evidence/raw/inertia_convention.json"
 
 
 def _delivery_root(root: Path) -> Path:
@@ -4783,6 +4779,21 @@ def effective_instances(root) -> dict:
     """The verbatim effective-instance record (schema/warnings/readings keys intact)."""
 
     return block(root, "effective_instances")
+
+
+def native_capture_facts(root) -> dict:
+    """The sealed raw native facts consumed by the independent projector check."""
+
+    return block(root, "native_capture_facts")
+
+
+def inertia_convention(root) -> dict:
+    """The sealed product-of-inertia decision applied after projection."""
+
+    record = read_data(confined(_delivery_root(root), INERTIA_CONVENTION))
+    if not isinstance(record, dict):
+        raise PipelineError("Inertia convention evidence is not an object")
+    return record
 
 
 def geometry(root):
@@ -5041,11 +5052,6 @@ def source_scopes(root) -> dict:
         if isinstance(copy_files, dict)
         else {}
     )
-    session_documents = {
-        canonical
-        for value in dependency.get("session_temp_documents") or []
-        if (canonical := _canonical_evidence_path(value)) is not None
-    }
     delivery_root = _delivery_root(root)
     for name, scope in record.items():
         if not native_source_scope_is_valid(scope, name):
@@ -5302,7 +5308,6 @@ def source_scopes(root) -> dict:
                     provenance.get("session_document_path"),
                     provenance.get("session_temp_root"),
                 )
-                or normalized_scope_path not in session_documents
             ):
                 raise PipelineError(
                     f"Virtual source owner/path/root differs: {name}"

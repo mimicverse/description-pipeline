@@ -32,7 +32,6 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.sources.solidworks import inertia_convention as convention  # noqa: E402
 from description_pipeline.sources.solidworks.errors import BridgeError  # noqa: E402
-from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
 from description_pipeline.verification.solidworks_physics import (  # noqa: E402
     CLOSURE_TENSOR_RTOL,
 )
@@ -41,7 +40,7 @@ from . import support  # noqa: E402
 
 
 def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
-    return _freeze(support.capture_requests(config), *args, **kwargs)
+    return support.capture_prepared_fixture(config, *args, **kwargs)
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "inertia-convention"
 STANDARD_RUN = FIXTURES / "standard-34.0.0"
@@ -384,7 +383,7 @@ class CaptureThroatTests(unittest.TestCase):
             "assembly": str(assembly),
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
-            "geometry": {"enabled": False},
+            "geometry": {"enabled": True},
             "bodies": [
                 {
                     "id": "base",

@@ -15,9 +15,8 @@ stays owned by the native owner.
 
 from __future__ import annotations
 
-import hashlib
+import copy
 import os
-import struct
 import sys
 import threading
 import types
@@ -27,19 +26,16 @@ from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
-from . import support
-
-from description_pipeline.geometry.stl import read as read_stl
-from description_pipeline.sources.solidworks.errors import CadError
-from description_pipeline.sources.solidworks.freeze import _raw_scene_payload
+from description_pipeline.sources.solidworks.errors import BridgeError, CadError
 from description_pipeline.sources.solidworks.isolation import CadSession
 from description_pipeline.sources.solidworks.jsonio import read_json, write_json
 from description_pipeline.sources.solidworks.native import (
     SolidWorksBackend,
-    normalize_document_path,
-    _read_only_document,
+    _project_mass_reading,
+    _project_link_group_mass,
+    _raw_mass_fact,
     _temporary_configuration,
 )
 import description_pipeline.sources.solidworks.native as native_module
@@ -326,13 +322,11 @@ class _Extension:
         coordinate_systems=None,
         manager=_AUTO,
         scope_managers=None,
-        needs_rebuild2=0,
     ):
         self._scopes = scopes
         self._coordinate_systems = dict(coordinate_systems or {})
         self._manager = manager
         self._scope_managers = dict(scope_managers or {})
-        self.NeedsRebuild2 = needs_rebuild2
 
     def CustomPropertyManager(self, scope):
         if scope in self._scope_managers:
@@ -353,9 +347,47 @@ class _Extension:
             raise RuntimeError("fixture entity has no persistent reference")
         return list(reference)
 
-    def Rebuild(self, options):
-        self.NeedsRebuild2 = 0
-        return True
+    def CreateMassProperty2(self):
+        return _PortableMassProperty()
+
+
+class _PortableMassProperty:
+    """Minimal native mass-property result for ordinary capture fixtures."""
+
+    def __init__(self):
+        self.UseSystemUnits = None
+        self.IncludeHiddenBodiesOrComponents = None
+        self.SelectedItems = None
+        self.Mass = 1.0
+        self.Volume = 0.001
+        self.Density = 1000.0
+        self.CenterOfMass = [0.0, 0.0, 0.0]
+
+    def Recalculate(self):
+        selected = tuple(component.Name2 for component in self.SelectedItems.value)
+        self.Mass = float(max(1, len(selected)))
+
+    def GetOverrideOptions(self):
+        return types.SimpleNamespace(
+            OverrideMass=False,
+            OverrideCenterOfMass=False,
+            OverrideMomentsOfInertia=False,
+        )
+
+    def GetMomentOfInertia(self, kind):
+        if kind == 0:
+            return [
+                1e-6,
+                0.0,
+                0.0,
+                0.0,
+                1e-6,
+                0.0,
+                0.0,
+                0.0,
+                1e-6,
+            ]
+        raise RuntimeError("about-origin inertia is unavailable")
 
 
 class _ConfigurationManager:
@@ -402,7 +434,6 @@ class _Doc:
         doc_type=1,
         show_success=True,
         show_effect=True,
-        needs_rebuild2=0,
         custom_property_manager=_AUTO,
         scope_managers=None,
     ):
@@ -422,7 +453,6 @@ class _Doc:
             coordinate_systems,
             custom_property_manager,
             scope_managers,
-            needs_rebuild2,
         )
         self.ConfigurationManager = _ConfigurationManager(self)
         self._first_feature = first_feature
@@ -445,9 +475,6 @@ class _Doc:
 
     def GetTitle(self):
         return os.path.basename(self._path)
-
-    def ForceRebuild3(self, _force):
-        raise AssertionError("capture rebuild must use IModelDocExtension.Rebuild")
 
     def GetType(self):
         return self._doc_type
@@ -489,6 +516,18 @@ class _App:
             for path, entries in (dependencies or {}).items()
         }
         self._dependency_error = dependency_error
+        self._search_folders: list[str] = []
+
+    def GetSearchFolders(self, _folder_type):  # noqa: N802
+        return ";".join(self._search_folders)
+
+    def SetSearchFolders(self, _folder_type, folders):  # noqa: N802
+        self._search_folders = [
+            item
+            for item in str(folders).split(";")
+            if item
+        ]
+        return True
 
     def GetOpenDocumentByName(self, path):
         key = os.path.normcase(os.path.abspath(str(path)))
@@ -576,15 +615,44 @@ class _Session:
 
 
 class _CaptureBackend(SolidWorksBackend):
-    """Real ``collect_scene`` frame loop; only heavy CAD reads are stubbed."""
+    """Prepared-Capture seam over the native COM doubles."""
 
-    def _rebuild_capture_copy(self, doc, path):
-        return doc, {
-            "rebuilt": True,
-            "path": str(path),
-            "document": str(path),
-            "configuration": str(doc.active_configuration),
-        }
+    def capture_scene_for_test(self, doc_path, coordinate_systems, on_activity=None):
+        from description_pipeline.sources.solidworks.native import project_prepared_capture
+
+        root = str(Path(doc_path).resolve().parent)
+        self.prepare_prepared_capture(root, str(doc_path), "Default")
+        document = self._document_by_path(str(doc_path))
+        leaves = []
+        pending = list(document.children_for("Default"))
+        while pending:
+            component = pending.pop()
+            if component._children:
+                pending.extend(component._children)
+            else:
+                leaves.append(str(component.Name2))
+        component = None
+        pending.clear()
+        document = None
+        raw_facts = self.collect_prepared_scene(
+            str(doc_path),
+            coordinate_systems,
+            groups=[
+                {
+                    "name": "fixture-leaf-group",
+                    "components": sorted(leaves),
+                }
+            ],
+            on_activity=on_activity,
+        )
+        self._fixture_source_scopes = copy.deepcopy(raw_facts["source_scopes"])
+        return project_prepared_capture(raw_facts)["scene"]
+
+    def capture_geometry_for_test(self, on_activity=None):
+        return self.capture_prepared_geometry(
+            self._fixture_source_scopes,
+            on_activity=on_activity,
+        )
 
     def _record_save_flag(self, doc, path):
         self.save_flags[str(path)] = False
@@ -594,12 +662,72 @@ class _CaptureBackend(SolidWorksBackend):
 
     def _mass_properties_document(self, doc, require_material=True):
         return {
-            "mass_kg": 1.0,
-            "volume_m3": 0.001,
-            "material": None,
-            "reference": {"used_api": "portable-capture-mock", "configuration": None},
+            "mass": 1.0,
+            "com": (0.0, 0.0, 0.0),
+            "native_raw": {
+                "mass_kg": 1.0,
+                "center_of_mass_m": [0.0, 0.0, 0.0],
+                "inertia_values": [
+                    1e-6,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1e-6,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1e-6,
+                ],
+                "volume_m3": 0.001,
+                "density_kg_m3": 1000.0,
+                "overrides": {
+                    "OverrideMass": False,
+                    "OverrideCenterOfMass": False,
+                    "OverrideMomentsOfInertia": False,
+                },
+            },
+            "read_errors": {},
+            "mode": "full",
+            "reference": {
+                "used_api": "portable-capture-mock",
+                "configuration": None,
+                "reference_point": "center_of_mass",
+                "axes": "part_document_axes",
+                "use_system_units": True,
+            },
         }
 
+    def assembly_component_mass_properties(self, path):
+        instances = []
+        for name in sorted(self._components):
+            instances.append(
+                {
+                    "name": name,
+                    "parent": None,
+                    "depth": 0,
+                    "document": str(path),
+                    "document_type": "part",
+                    "context_mass_kg": 1.0,
+                    "context_volume_m3": 0.001,
+                    "overrides": {
+                        "OverrideMass": False,
+                        "OverrideCenterOfMass": False,
+                        "OverrideMomentsOfInertia": False,
+                    },
+                    "read_errors": {},
+                    "effective": None,
+                    "effective_error": None,
+                }
+            )
+        return {
+            "assembly": str(path),
+            "configuration": "Default",
+            "instances": instances,
+            "errors": [],
+            "reference": {
+                "method": "IMassProperty2 (SelectedItems = component instance)",
+            },
+        }
 
 def _write(root: Path, name: str) -> Path:
     path = root / name
@@ -633,137 +761,19 @@ def _mesh_body(faces, key: str):
             face._fixture_values = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
             face._fixture_readable = True
             face.GetTessTriangles = lambda _quality, values=face._fixture_values: list(values)
-    triangles = [
-        tuple(
-            tuple(values[offset : offset + 3])
-            for offset in range(triangle_start, triangle_start + 9, 3)
-        )
-        for face in faces
-        for values in (list(face._fixture_values),)
-        for triangle_start in range(0, len(values), 9)
-    ]
-    spans = []
-    triangle_start = 0
-    body_reference = f"fixture-body-{key}".encode()
-    for face_index, face in enumerate(faces):
-        values = list(face._fixture_values)
-        triangle_count = len(values) // 9
-        record_points = [
-            point
-            for triangle in triangles[
-                triangle_start : triangle_start + triangle_count
-            ]
-            for point in triangle
-        ]
-        spans.append(
-            {
-                "body_type": 0,
-                "body_index": 0,
-                "body_name": f"fixture-body-{key}",
-                "body_reference_sha256": hashlib.sha256(body_reference).hexdigest(),
-                "face_index": face_index,
-                "face_reference_sha256": hashlib.sha256(face._persist_reference).hexdigest(),
-                "face_owner_id": face_index + 1,
-                "edge_references": [],
-                "triangle_start": triangle_start,
-                "triangle_count": triangle_count,
-                "triangle_records_sha256": hashlib.sha256(
-                    b"".join(
-                        struct.pack("<3f", *point) for point in record_points
-                    )
-                ).hexdigest(),
-            }
-        )
-        triangle_start += triangle_count
-    tessellation = support.native_tessellation_fixture(
-        spans,
-        [],
-        triangle_vertices=triangles,
-    )
-    cursor = 0
-    for span, face in zip(spans, faces, strict=True):
-        values = [
-            coordinate
-            for triangle in tessellation.triangle_vertices[
-                cursor : cursor + span["triangle_count"]
-            ]
-            for point in triangle
-            for coordinate in point
-        ]
-        cursor += span["triangle_count"]
-        if face._fixture_readable:
-            face.GetTessTriangles = lambda _quality, values=values: list(values)
-    body_graph = tessellation["itessellation"]["bodies"][0]
-    facets_by_face = {
-        face_index: row["facet_ids"]
-        for face_index, row in enumerate(body_graph["faces"])
-    }
-    facets_by_reference = {
-        hashlib.sha256(face._persist_reference).hexdigest(): facets_by_face[face_index]
-        for face_index, face in enumerate(faces)
-    }
-    fins_by_facet = {
-        row["facet_id"]: row["fin_ids"] for row in body_graph["facets"]
-    }
-    fin_vertices = {
-        row["fin_id"]: row["vertex_ids"] for row in body_graph["fins"]
-    }
-    vertex_points = {
-        row["vertex_id"]: row["point_m"]
-        for row in tessellation["itessellation"]["vertices"]
-    }
-    face_by_id = {id(face): index for index, face in enumerate(faces)}
-
-    class _MeshTessellation:
-        ImprovedQuality = True
-        MatchType = 0
-        NeedErrorList = True
-        NeedFaceFacetMap = True
-        NeedEdgeFinMap = True
-        NeedVertexParams = True
-
-        def Tessellate(self):  # noqa: N802 - SolidWorks API name
-            return True
-
-        def GetFaceFacets(self, face):  # noqa: N802 - SolidWorks API name
-            values = facets_by_face.get(face_by_id.get(id(face)))
-            if values is None:
-                values = facets_by_reference[
-                    hashlib.sha256(face._persist_reference).hexdigest()
-                ]
-            return list(values)
-
-        def GetFacetFins(self, facet_id):  # noqa: N802 - SolidWorks API name
-            return list(fins_by_facet[facet_id])
-
-        def GetEdgeFins(self, _edge):  # noqa: N802 - SolidWorks API name
-            return []
-
-        def GetFinVertices(self, fin_id):  # noqa: N802 - SolidWorks API name
-            return list(fin_vertices[fin_id])
-
-        def GetVertexPoint(self, vertex_id):  # noqa: N802 - SolidWorks API name
-            return list(vertex_points[vertex_id])
-
-        def GetFacetCount(self):  # noqa: N802 - SolidWorks API name
-            return len(fins_by_facet)
-
-        def GetFinCount(self):  # noqa: N802 - SolidWorks API name
-            return len(fin_vertices)
-
-        def GetVertexCount(self):  # noqa: N802 - SolidWorks API name
-            return len(vertex_points)
-
     body = types.SimpleNamespace(
         Name=f"fixture-body-{key}",
         GetFaces=lambda: list(faces),
         GetEdges=list,
-        GetTessellation=lambda _face_list: _MeshTessellation(),
-        _persist_reference=body_reference,
+        GetVertexCount=list,
+        GetVertices=list,
+        _persist_reference=f"fixture-body-{key}".encode(),
     )
     for face in faces:
         face.GetBody = lambda body=body: body
     return body
+
+
 
 
 @contextmanager
@@ -1602,7 +1612,7 @@ class SolverObservationTests(unittest.TestCase):
 
 
 class CaptureSceneTests(unittest.TestCase):
-    def test_capture_excludes_embedded_virtual_session_documents_from_source_files(self) -> None:
+    def test_capture_binds_embedded_virtual_documents_in_raw_source_scopes(self) -> None:
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
             virtual_path = (
@@ -1625,11 +1635,9 @@ class CaptureSceneTests(unittest.TestCase):
             assembly = _write(root, "robot.SLDASM")
             main = _Doc(assembly, doc_type=2, children=[virtual])
             backend = _CaptureBackend(session_factory=lambda: _Session(_App({assembly: main})))
-            scene = backend.collect_scene(str(assembly), [])
+            scene = backend.capture_scene_for_test(str(assembly), [])
 
             self.assertIn(str(virtual_path), {component.path for component in scene.components})
-            self.assertNotIn(str(virtual_path), backend.source_files)
-            self.assertNotIn(str(virtual_path), backend.verify_sources_unchanged())
             scopes = backend.source_scopes([virtual.Name2])
             scope = scopes[virtual.Name2]
             self.assertEqual(
@@ -1668,57 +1676,11 @@ class CaptureSceneTests(unittest.TestCase):
                     _App({assembly: main, part: _Doc(part)})
                 )
             )
-            backend.collect_scene(str(assembly), [])
+            backend.capture_scene_for_test(str(assembly), [])
             part.unlink()
 
             with self.assertRaises(CadError):
                 backend.source_scopes([component.Name2])
-
-    def test_copy_inspection_releases_occurrences_before_read_only_mutation(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            borrowed = []
-            events = []
-
-            class PartDocument(_Doc):
-                read_only = False
-
-                def IsOpenedReadOnly(self):
-                    return self.read_only
-
-                def SetReadOnlyState(self, value):
-                    if any(ref() is not None for ref in borrowed):
-                        raise RuntimeError("borrowed occurrences survived a read-only boundary")
-                    events.append(("read_only", self._path))
-                    self.read_only = value
-                    return True
-
-            paths = [_write(root, name + ".SLDPRT") for name in ("arm1", "arm2")]
-            documents = {path: PartDocument(path) for path in paths}
-            assembly = _write(root, "robot.SLDASM")
-            main = _Doc(assembly, doc_type=2)
-            documents[assembly] = main
-
-            def occurrences(_configuration):
-                result = []
-                for path in paths:
-                    component = _Component(path.stem, path, doc=documents[path])
-                    borrowed.append(weakref.ref(component))
-                    events.append(("occurrence", path.stem))
-                    result.append(component)
-                return result
-
-            main.children_for = occurrences
-            app = _App(documents)
-            app.OpenDoc6 = lambda *_args: main
-            backend = SolidWorksBackend(session_factory=lambda: _Session(app))
-            result = backend.inspect_copy(str(assembly))
-
-            self.assertEqual({item["instance"] for item in result["instances"]}, {"arm1", "arm2"})
-            self.assertEqual(result["configuration"], "Default")
-            self.assertEqual(result["unresolved"], [])
-            self.assertTrue(all(doc.read_only for path, doc in documents.items() if path != assembly))
-            self.assertEqual([kind for kind, _ in events], ["occurrence", "occurrence", "read_only", "read_only"])
 
     def test_read_only_mutation_waits_until_all_occurrence_primitives_are_collected(self):
         with TemporaryDirectory() as tmp, _com_stubs():
@@ -1761,7 +1723,7 @@ class CaptureSceneTests(unittest.TestCase):
             assembly = _write(root, "robot.SLDASM")
             documents[assembly] = _Doc(assembly, doc_type=2, children=components)
             backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
-            scene = backend.collect_scene(str(assembly), [])
+            scene = backend.capture_scene_for_test(str(assembly), [])
 
             self.assertEqual({c.name for c in scene.components}, {"arm1", "arm2"})
             paths = [i for i, event in enumerate(events) if event[0] == "path"]
@@ -1797,7 +1759,7 @@ class CaptureSceneTests(unittest.TestCase):
     def _capture(self, app, assembly, requested):
         backend = _CaptureBackend(session_factory=lambda: _Session(app))
         with _com_stubs():
-            return backend.collect_scene(str(assembly), requested)
+            return backend.capture_scene_for_test(str(assembly), requested)
 
     def _configured_occurrences(self, root, *, nested=False):
         class ConfiguredDocument(_Doc):
@@ -1853,22 +1815,8 @@ class CaptureSceneTests(unittest.TestCase):
         assembly = _write(root, "robot.SLDASM")
         main = _Doc(assembly, doc_type=2, children=children)
         backend = ConfiguredBackend(session_factory=lambda: _Session(_App({assembly: main})))
-        scene = backend.collect_scene(str(assembly), [])
+        scene = backend.capture_scene_for_test(str(assembly), [])
         return backend, scene, shared, short, part
-
-    def test_repeated_configurations_keep_their_own_mass_mesh_and_restored_state(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, scene, shared, _, _ = self._configured_occurrences(root)
-            self.assertEqual(scene.mass_properties["part-short"]["mass_kg"], 2.0)
-            self.assertEqual(scene.mass_properties["part-long"]["mass_kg"], 3.0)
-            for name, triangles, extent in (("part-long", 2, 2.0), ("part-short", 1, 1.0)):
-                path = root / f"{name}.stl"
-                result = backend.export_component_meshes({name: path})[name]
-                self.assertEqual(result["triangles"], triangles)
-                self.assertEqual(read_stl(path).high, (extent, extent, 0.0))
-                self.assertEqual(shared.active_configuration, "Parked")
-            backend.verify_sources_unchanged()
 
     def test_capture_does_not_reuse_occurrence_interfaces_after_configuration_switches(self):
         borrowed_occurrences = []
@@ -1887,8 +1835,31 @@ class CaptureSceneTests(unittest.TestCase):
 
         class ConfiguredBackend(_CaptureBackend):
             def _mass_properties_document(self, doc, require_material=True):
+                mass = {"Short": 2.0, "Long": 3.0}[doc.active_configuration]
                 return {
-                    "mass_kg": {"Short": 2.0, "Long": 3.0}[doc.active_configuration],
+                    "mass": mass,
+                    "com": (0.0, 0.0, 0.0),
+                    "native_raw": {
+                        "mass_kg": mass,
+                        "center_of_mass_m": [0.0, 0.0, 0.0],
+                        "inertia_values": [
+                            1e-6,
+                            0.0,
+                            0.0,
+                            0.0,
+                            1e-6,
+                            0.0,
+                            0.0,
+                            0.0,
+                            1e-6,
+                        ],
+                        "overrides": {
+                            "OverrideMass": False,
+                            "OverrideCenterOfMass": False,
+                            "OverrideMomentsOfInertia": False,
+                        },
+                    },
+                    "read_errors": {},
                     "reference": {"used_api": "portable-config-mass", "configuration": doc.active_configuration},
                 }
 
@@ -1930,15 +1901,20 @@ class CaptureSceneTests(unittest.TestCase):
 
             main.children_for = current_occurrences
             backend = ConfiguredBackend(session_factory=lambda: _Session(_App({assembly: main, path: shared})))
-            scene = backend.collect_scene(str(assembly), [])
-            self.assertEqual(scene.mass_properties["part-short"]["mass_kg"], 2.0)
-            self.assertEqual(scene.mass_properties["part-long"]["mass_kg"], 3.0)
-            self.assertEqual(scene.notes["bodies:part-short"], {"solid": 1, "sheet": 0})
-            self.assertEqual(scene.notes["bodies:part-long"], {"solid": 2, "sheet": 0})
+            scene = backend.capture_scene_for_test(str(assembly), [])
+            self.assertEqual(scene.mass_properties["part-short"]["mass"], 2.0)
+            self.assertEqual(scene.mass_properties["part-long"]["mass"], 3.0)
+            self.assertEqual(
+                scene.notes["bodies:part-short"],
+                {"solid": 1, "sheet": 0, "errors": {}},
+            )
+            self.assertEqual(
+                scene.notes["bodies:part-long"],
+                {"solid": 2, "sheet": 0, "errors": {}},
+            )
             self.assertEqual(shared.active_configuration, "Parked")
             self.assertGreater(shared.generation, 0)
             self.assertEqual(expired_reads, [])
-            backend.verify_sources_unchanged()
 
     def test_leaf_mass_failure_names_the_occurrence_and_recorded_body_counts(self):
         """A failed leaf mass read keeps its classification and gains context.
@@ -1972,7 +1948,7 @@ class CaptureSceneTests(unittest.TestCase):
             main = _Doc(assembly, doc_type=2, children=[component])
             backend = FailingBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
             with self.assertRaises(CadError) as caught:
-                backend.collect_scene(str(assembly), [])
+                backend.capture_scene_for_test(str(assembly), [])
         error = caught.exception
         self.assertEqual(error.code, "cad_empty_model")
         self.assertEqual(error.message, "part has no solid bodies")
@@ -1980,9 +1956,15 @@ class CaptureSceneTests(unittest.TestCase):
         self.assertEqual(error.detail["component"], "sub-1/empty-1")
         self.assertEqual(error.detail["document"], str(part))
         self.assertEqual(error.detail["referenced_configuration"], "Default")
-        self.assertEqual(error.detail["bodies"], {"solid": 0, "sheet": 1})
+        self.assertEqual(
+            error.detail["bodies"],
+            {"solid": 0, "sheet": 1, "errors": {}},
+        )
         self.assertEqual(error.detail["phase"], "leaf_mass_read")
-        self.assertEqual(error.detail["fallback_error"], "cad_group_unavailable")
+        self.assertIn(
+            "no assembly context here",
+            backend.notes["mass_error:sub-1/empty-1"]["fallback_error"],
+        )
 
     def test_sheet_only_fallback_records_the_effective_instance_row(self):
         class FallbackBackend(_CaptureBackend):
@@ -2008,9 +1990,25 @@ class CaptureSceneTests(unittest.TestCase):
                     "configuration": "Default",
                     "group": list(names),
                     "members": {names[0]: flags},
-                    "mass": 0.026,
-                    "com": [0.0, 0.0, 0.05],
-                    "inertia": [[1e-6, 1e-8, 0.0], [1e-8, 1.2e-6, 0.0], [0.0, 0.0, 2e-6]],
+                    "native_raw": {
+                        "mass_kg": 0.026,
+                        "center_of_mass_m": [0.0, 0.0, 0.05],
+                        "inertia_values": [
+                            1e-6,
+                            1e-8,
+                            0.0,
+                            1e-8,
+                            1.2e-6,
+                            0.0,
+                            0.0,
+                            0.0,
+                            2e-6,
+                        ],
+                        "volume_m3": 3.3e-6,
+                        "density_kg_m3": 7878.0,
+                        "overrides": flags,
+                    },
+                    "read_errors": {},
                     "reference": {
                         "used_api": "IMassProperty2.GetMomentOfInertia(0)",
                         "selection_api": "IMassProperty2 (SelectedItems = component instance)",
@@ -2040,7 +2038,7 @@ class CaptureSceneTests(unittest.TestCase):
             assembly = _write(root, "robot.SLDASM")
             main = _Doc(assembly, doc_type=2, children=[component])
             backend = FallbackBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
-            scene = backend.collect_scene(str(assembly), [])
+            scene = backend.capture_scene_for_test(str(assembly), [])
         row = scene.mass_properties["part-sheet"]
         self.assertEqual(row["mode"], "effective_instance")
         self.assertEqual(row["state"], "sheet_only")
@@ -2100,346 +2098,16 @@ class CaptureSceneTests(unittest.TestCase):
             main = _Doc(assembly, doc_type=2, children=[component])
             backend = NoBodyBackend(session_factory=lambda: _Session(_App({assembly: main, part: shared})))
             with self.assertRaises(CadError) as caught:
-                backend.collect_scene(str(assembly), [])
+                backend.capture_scene_for_test(str(assembly), [])
         error = caught.exception
         self.assertEqual(error.code, "cad_empty_model")
         self.assertEqual(error.detail["component"], "part-empty")
-        self.assertEqual(error.detail["bodies"], {"solid": 0, "sheet": 0})
+        self.assertEqual(
+            error.detail["bodies"],
+            {"solid": 0, "sheet": 0, "errors": {}},
+        )
         self.assertNotIn("fallback_error", error.detail)
         self.assertEqual(backend.group_calls, 0)
-
-    def test_geometry_phase_does_not_release_and_reacquire_parents_between_occurrences(self):
-        from contextlib import contextmanager
-
-        from description_pipeline.sources.solidworks.freeze import _export_geometry
-
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, shared, _, _ = self._configured_occurrences(root)
-            original = backend._current_components
-            acquisitions = []
-
-            @contextmanager
-            def live_phase(phase):
-                if phase == "geometry":
-                    if acquisitions:
-                        raise CadError("cad_source_state_unreadable", "geometry owner released between occurrences")
-                    acquisitions.append(phase)
-                with original(phase) as current:
-                    yield current
-
-            backend._current_components = live_phase
-            entries = _export_geometry(backend, {}, root / "geometry", ["part-long", "part-short"])
-            self.assertEqual([entry["triangles"] for entry in entries], [2, 1])
-            self.assertEqual(read_stl(root / entries[0]["path"]).high, (2.0, 2.0, 0.0))
-            self.assertEqual(read_stl(root / entries[1]["path"]).high, (1.0, 1.0, 0.0))
-            self.assertEqual(shared.active_configuration, "Parked")
-            backend.verify_sources_unchanged()
-
-    def test_geometry_batch_rejects_shared_destinations_before_writing(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, _, _, _ = self._configured_occurrences(root)
-            target = root / "same.stl"
-            with self.assertRaises(CadError) as caught:
-                backend.export_component_meshes({"part-long": target, "part-short": root / "unused/../same.stl"})
-            self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
-            self.assertFalse(target.exists())
-
-    def test_repeated_configuration_source_guard_still_rejects_real_drift(self):
-        for drift in ("reference", "active", "file", "path", "suppression", "added", "removed", "renamed", "duplicate"):
-            with self.subTest(drift=drift), TemporaryDirectory() as tmp, _com_stubs():
-                backend, _, shared, short, part = self._configured_occurrences(Path(tmp))
-                if drift == "reference":
-                    short.ReferencedConfiguration = "Long"
-                elif drift == "active":
-                    self.assertTrue(shared.ShowConfiguration2("Long"))
-                elif drift == "path":
-                    short._path = str(_write(Path(tmp), "foreign.SLDPRT"))
-                elif drift == "suppression":
-                    short.IsSuppressed = True
-                elif drift in {"added", "removed", "renamed", "duplicate"}:
-                    main = backend._document_by_path(str(Path(tmp) / "robot.SLDASM"))
-                    if drift == "added":
-                        main._children.append(_Component("extra-1", part, doc=shared, configuration="Short"))
-                    elif drift == "removed":
-                        main._children.remove(short)
-                    elif drift == "renamed":
-                        short.Name2 = "renamed-1"
-                    else:
-                        main._children.append(short)
-                else:
-                    part.write_bytes(b"changed native source")
-                with self.assertRaises(CadError) as caught:
-                    backend.verify_sources_unchanged()
-                self.assertEqual(caught.exception.code, "cad_source_changed")
-
-    def test_mesh_and_guard_use_fresh_occurrence_after_scene_handle_expires(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, shared, stale, part = self._configured_occurrences(root)
-            fresh = type(stale)(stale.Name2, part, doc=shared, configuration="Short")
-            main = backend._document_by_path(str(root / "robot.SLDASM"))
-            main._children[main._children.index(stale)] = fresh
-            stale.GetBodies2 = _raiser(RuntimeError("RPC_S_UNKNOWN_IF: expired occurrence"))
-            stale.GetPathName = _raiser(RuntimeError("expired occurrence"))
-            path = root / "fresh.stl"
-            backend.export_component_meshes({"part-short": path})["part-short"]
-            self.assertEqual(read_stl(path).high, (1.0, 1.0, 0.0))
-            backend.verify_sources_unchanged()
-
-    def _borrowed_occurrence_geometry(self, backend, root):
-        """Model vendor geometry that is valid only while its parent interfaces live."""
-        path = str(root / "robot.SLDASM")
-        main = backend._document_by_path(path)
-        lifetimes = []
-
-        class Borrowed:
-            def __init__(self, inner, parents):
-                self.inner = inner
-                self.parents = parents
-
-            def check(self):
-                if not all(parent() is not None for parent in self.parents):
-                    raise RuntimeError("borrowed geometry outlived its native parent interfaces")
-
-            def __getattr__(self, name):
-                self.check()
-                return getattr(self.inner, name)
-
-        class Body(Borrowed):
-            def GetFaces(self):
-                self.check()
-                return [Borrowed(face, self.parents) for face in self.inner.GetFaces()]
-
-        class Component(Borrowed):
-            def GetBodies2(self, body_type):
-                self.check()
-                return [Body(body, self.parents) for body in self.inner.GetBodies2(body_type)]
-
-        class Root:
-            def __init__(self, manager, configuration):
-                self.parents = (manager, weakref.ref(configuration), weakref.ref(self))
-                lifetimes.append(self.parents)
-
-            def GetChildren(self):
-                return [Component(child, self.parents) for child in main._children]
-
-        class Configuration:
-            Name = main.active_configuration
-
-            def __init__(self, manager):
-                self.manager = weakref.ref(manager)
-
-            def GetRootComponent3(self, _resolved):
-                return Root(self.manager, self)
-
-        class Manager:
-            @property
-            def ActiveConfiguration(self):
-                return Configuration(self)
-
-        class Document:
-            @property
-            def ConfigurationManager(self):
-                return Manager()
-
-            def __getattr__(self, name):
-                return getattr(main, name)
-
-        backend._app_obj()._docs[os.path.normcase(os.path.abspath(path))] = Document()
-        return lifetimes
-
-    def test_mesh_keeps_borrowed_parent_interfaces_alive_until_all_faces_are_read(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, _, _, _ = self._configured_occurrences(root)
-            lifetimes = self._borrowed_occurrence_geometry(backend, root)
-            path = root / "borrowed.stl"
-            with patch.object(
-                native_module,
-                "_com_iunknown_pointer",
-                side_effect=lambda value: id(
-                    getattr(value, "inner", value)
-                ),
-            ):
-                backend.export_component_meshes({"part-long": path})[
-                    "part-long"
-                ]
-            self.assertEqual(read_stl(path).triangles, 2)
-            self.assertEqual(read_stl(path).high, (2.0, 2.0, 0.0))
-            self.assertTrue(lifetimes)
-            self.assertTrue(all(parent() is None for parents in lifetimes for parent in parents))
-
-    def test_shaft_keeps_borrowed_parents_alive_through_the_surface_read(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, _, short, _ = self._configured_occurrences(root)
-            face = types.SimpleNamespace(
-                GetFeature=lambda: types.SimpleNamespace(Name="shaft"),
-                GetSurface=lambda: _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), 0.02),
-            )
-            face.GetEdges = list
-            face._persist_reference = b"fixture-shaft-face"
-            shaft_body = _mesh_body([face], "shaft")
-            short.GetBodies2 = lambda body_type: [shaft_body]
-            lifetimes = self._borrowed_occurrence_geometry(backend, root)
-            result = backend.capture_axis_reference({"component": "part-short", "feature_name": "shaft"})
-            self.assertEqual(result["axis_direction"], [0.0, 0.0, 1.0])
-            self.assertEqual(result["radius_m"], 0.02)
-            self.assertTrue(all(parent() is None for parents in lifetimes for parent in parents))
-
-    def test_display_read_failure_is_isolated_from_the_tessellation_graph(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, _, short, _ = self._configured_occurrences(root)
-            good = _mesh_face(lambda _quality: [0, 0, 0, 1, 0, 0, 0, 1, 0], "good")
-            failed = _mesh_face(_raiser(RuntimeError("RPC_S_UNKNOWN_IF")), "failed")
-            failure_body = _mesh_body([good, failed], "failure")
-            short.GetBodies2 = lambda body_type: (
-                [failure_body] if body_type == 0 else []
-            )
-            path = root / "failed.stl"
-            with self.assertRaises(CadError) as caught:
-                backend.export_component_meshes({"part-short": path})["part-short"]
-            self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
-            self.assertEqual(caught.exception.detail["component"], "part-short")
-            self.assertEqual(caught.exception.detail["face_index"], 1)
-            self.assertEqual(caught.exception.detail["completed_faces"], 0)
-            self.assertEqual(caught.exception.detail["classification"], "empty")
-            self.assertFalse(path.exists())
-
-    def test_fresh_nested_occurrences_keep_duplicate_leaf_names_distinct(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, shared, _, _ = self._configured_occurrences(root, nested=True)
-            main = backend._document_by_path(str(root / "robot.SLDASM"))
-            main._children.reverse()
-            for name, count, extent in (("sub-1/part-1", 1, 1.0), ("sub-2/part-1", 2, 2.0)):
-                path = root / f"{count}.stl"
-                backend.export_component_meshes({name: path})[name]
-                self.assertEqual(read_stl(path).triangles, count)
-                self.assertEqual(read_stl(path).high, (extent, extent, 0.0))
-            self.assertEqual(shared.active_configuration, "Parked")
-            backend.verify_sources_unchanged()
-
-    def test_unreadable_fresh_occurrence_blocks_with_context_and_no_cached_fallback(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, _, short, _ = self._configured_occurrences(root)
-            short.GetChildren = _raiser(RuntimeError("fresh occurrence tree unavailable"))
-            path = root / "blocked.stl"
-            with self.assertRaises(CadError) as caught:
-                backend.export_component_meshes({"part-short": path})["part-short"]
-            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
-            self.assertEqual(caught.exception.detail["phase"], "geometry")
-            self.assertEqual(caught.exception.detail["component"], "part-short")
-            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
-            self.assertFalse(path.exists())
-
-    def test_geometry_cannot_restart_a_lost_capture_session(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, _, _, _ = self._configured_occurrences(root)
-            backend._sessions.clear()
-            backend._session_factory = _raiser(AssertionError("a new CAD application must not be started"))
-            with self.assertRaises(CadError) as caught:
-                backend.export_component_meshes({"part-short": root / "blocked.stl"})["part-short"]
-            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
-            self.assertEqual(caught.exception.detail["phase"], "geometry")
-            self.assertIn("original owned capture session", caught.exception.detail["error"])
-
-    def test_unreadable_fresh_occurrence_fields_are_not_reported_as_drift(self):
-        for field in ("Name2", "IsSuppressed", "ReferencedConfiguration"):
-            with self.subTest(field=field), TemporaryDirectory() as tmp, _com_stubs():
-                root = Path(tmp)
-                backend, _, _, short, _ = self._configured_occurrences(root)
-                setattr(short, field, None)
-                with self.assertRaises(CadError) as caught:
-                    backend.export_component_meshes({"part-short": root / "blocked.stl"})["part-short"]
-                self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
-                self.assertEqual(caught.exception.detail["phase"], "geometry")
-
-    def test_unreadable_name_does_not_report_the_previous_occurrence(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            backend, _, shared, short, part = self._configured_occurrences(root)
-
-            class UnreadableName(type(short)):
-                def __getattribute__(self, name):
-                    if name == "Name2":
-                        raise RuntimeError("current occurrence name unavailable")
-                    return super().__getattribute__(name)
-
-            main = backend._document_by_path(str(root / "robot.SLDASM"))
-            main._children[main._children.index(short)] = UnreadableName(
-                "part-short", part, doc=shared, configuration="Short"
-            )
-            with self.assertRaises(CadError) as caught:
-                backend.export_component_meshes({"part-short": root / "blocked.stl"})["part-short"]
-            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
-            self.assertEqual(caught.exception.detail["component"], "")
-            self.assertEqual(caught.exception.detail["phase"], "geometry")
-
-    def test_source_guard_reacquires_assembly_instead_of_reading_retained_proxy(self):
-        class Expired:
-            @property
-            def ActiveConfiguration(self):
-                raise RuntimeError("retained assembly interface is unavailable")
-
-        with TemporaryDirectory() as tmp, _com_stubs():
-            backend, _, _, _, _ = self._configured_occurrences(Path(tmp))
-            path = str(Path(tmp) / "robot.SLDASM")
-            app = backend._app_obj()
-            original = backend._document_by_path(path)
-            app._docs[os.path.normcase(os.path.abspath(path))] = _Doc(
-                path,
-                doc_type=2,
-                children=original._children,
-            )
-            original.ConfigurationManager = Expired()
-            self.assertIn(str(Path(tmp) / "robot.SLDASM"), backend.verify_sources_unchanged())
-
-    def test_source_guard_reads_owned_document_when_component_document_proxy_is_lost(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            backend, _, shared, short, part = self._configured_occurrences(Path(tmp))
-            app = backend._app_obj()
-            app._docs[os.path.normcase(os.path.abspath(str(part)))] = shared
-            short.GetModelDoc2 = lambda: None
-            self.assertIn(str(part), backend.verify_sources_unchanged())
-
-    def test_source_guard_unreadable_document_keeps_path_and_occurrence_context(self):
-        class Unreadable(_Doc):
-            def __getattribute__(self, name):
-                if name == "ConfigurationManager":
-                    raise RuntimeError("current document configuration interface is unavailable")
-                return super().__getattribute__(name)
-
-        with TemporaryDirectory() as tmp, _com_stubs():
-            backend, _, _, _, part = self._configured_occurrences(Path(tmp))
-            app = backend._app_obj()
-            app._docs[os.path.normcase(os.path.abspath(str(part)))] = Unreadable(part, configuration="Parked")
-            with self.assertRaises(CadError) as caught:
-                backend.verify_sources_unchanged()
-            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
-            self.assertEqual(caught.exception.detail["path"], str(part))
-            self.assertIn(caught.exception.detail["component"], {"part-short", "part-long"})
-            self.assertEqual(caught.exception.detail["phase"], "verify_sources")
-            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
-
-    def test_source_guard_does_not_start_a_session_when_the_original_is_lost(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            backend, _, _, _, _ = self._configured_occurrences(Path(tmp))
-            backend._sessions.clear()
-
-            def forbidden_factory():
-                raise AssertionError("verification cannot start another CAD application")
-
-            backend._session_factory = forbidden_factory
-            with self.assertRaises(CadError) as caught:
-                backend.verify_sources_unchanged()
-            self.assertEqual(caught.exception.code, "cad_source_state_unreadable")
-            self.assertIn("original owned capture session", caught.exception.detail["error"])
 
     def _expiring_document(self, root, *, foreign_replacement=False):
         part = _write(root, "shared.SLDPRT")
@@ -2599,7 +2267,9 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertAlmostEqual(right_matrix[3], 0.0, msg=f"right datum wrong: {right_matrix}")
             self.assertAlmostEqual(right_matrix[7], 2.5, msg=f"right datum wrong: {right_matrix}")
 
-    def test_missing_and_duplicate_requested_datums_fail(self) -> None:
+    def test_missing_datums_are_diagnostic_and_duplicate_unqualified_datums_fail(
+        self,
+    ) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             arm_path = _write(root, "arm.SLDPRT")
@@ -2607,11 +2277,16 @@ class CaptureSceneTests(unittest.TestCase):
             arm_component = _Component("arm-1", arm_path, doc=arm_doc)
             assembly = _write(root, "robot.SLDASM")
             main_doc = _Doc(assembly, doc_type=2, children=[arm_component])
-            with self.assertRaises(CadError) as caught:
-                self._capture(_App({assembly: main_doc}), assembly, ["CS_missing"])
-            error = caught.exception
-            self.assertEqual(error.code, "cad_missing_coordinate_system")
-            self.assertIn("CS_missing", f"{error.message} {error.detail}")
+            scene = self._capture(
+                _App({assembly: main_doc}),
+                assembly,
+                ["CS_missing"],
+            )
+            self.assertEqual(scene.coordinate_systems, {})
+            self.assertEqual(
+                scene.notes["missing_coordinate_systems"],
+                ["CS_missing"],
+            )
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2636,351 +2311,6 @@ class CaptureSceneTests(unittest.TestCase):
             error = caught.exception
             self.assertEqual(error.code, "cad_coordinate_system_ambiguous")
             self.assertEqual(error.detail["datum"], "CS_tip")
-
-    def test_collect_scene_continues_on_the_refreshed_document_after_rebuild(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            part_path = _write(root, "part.SLDPRT")
-            part = _Doc(part_path, doc_type=1)
-            component = _Component("part-1", part_path, doc=part)
-            assembly = _write(root, "robot.SLDASM")
-            first = _Doc(assembly, doc_type=2, children=[component])
-            refreshed = _Doc(assembly, doc_type=2, children=[component])
-
-            class RefreshingBackend(_CaptureBackend):
-                def __init__(self, **kwargs):
-                    super().__init__(**kwargs)
-                    self.lookups = []
-                    self.save_flag_docs = []
-
-                def _rebuild_capture_copy(self, doc, path):
-                    assert doc is first, "the pre-rebuild handle is the collected copy"
-                    refreshed_doc = self._document_by_path(path)
-                    return refreshed_doc, {
-                        "rebuilt": True,
-                        "document": str(path),
-                        "configuration": str(first.active_configuration),
-                    }
-
-                def _document_by_path(self, path):
-                    self._app_for_path(path)  # keep the owned session registered
-                    self.lookups.append(str(path))
-                    if str(path) == str(assembly):
-                        return first if self.lookups.count(str(assembly)) == 1 else refreshed
-                    return part
-
-                def _record_save_flag(self, doc, path):
-                    self.save_flag_docs.append(doc)
-                    self.save_flags[str(path)] = False
-
-            backend = RefreshingBackend(session_factory=lambda: _Session(_App({assembly: first})))
-            backend.collect_scene(str(assembly), [])
-            self.assertEqual(backend.lookups[:2], [str(assembly), str(assembly)])
-            self.assertTrue(backend.save_flag_docs)
-            self.assertIs(backend.save_flag_docs[0], refreshed)
-
-    def test_collect_scene_success_persists_production_rebuild_preparation(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            left_path = _write(root, "left.SLDPRT")
-            right_path = _write(root, "right.SLDPRT")
-            subassembly_path = _write(root, "arm-stack.SLDASM")
-            assembly_path = _write(root, "robot.SLDASM")
-
-            class SaveTrackingDocument(_Doc):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self.save_calls = 0
-
-                def GetSaveFlag(self):
-                    return False
-
-                def Save(self):
-                    self.save_calls += 1
-                    return True
-
-            class RebuildTrackingExtension:
-                def __init__(self, extension, calls):
-                    self._extension = extension
-                    self._calls = calls
-
-                @property
-                def NeedsRebuild2(self):
-                    return self._extension.NeedsRebuild2
-
-                def Rebuild(self, options):
-                    self._calls.append(options)
-                    return self._extension.Rebuild(options)
-
-            left_document = SaveTrackingDocument(left_path, doc_type=1)
-            right_document = SaveTrackingDocument(right_path, doc_type=1)
-            left = _Component("left-1", left_path, doc=left_document)
-            right = _Component("right-1", right_path, doc=right_document)
-            subassembly_document = SaveTrackingDocument(
-                subassembly_path,
-                doc_type=2,
-                children=[left, right],
-            )
-            subassembly = _Component(
-                "arm-stack-1",
-                subassembly_path,
-                children=[left, right],
-                doc=subassembly_document,
-            )
-            first = SaveTrackingDocument(
-                assembly_path,
-                doc_type=2,
-                children=[subassembly],
-                needs_rebuild2=1,
-            )
-            refreshed = SaveTrackingDocument(
-                assembly_path,
-                doc_type=2,
-                children=[subassembly],
-            )
-            rebuild_calls = []
-            first.Extension = RebuildTrackingExtension(first.Extension, rebuild_calls)
-            documents = {
-                str(left_path): left_document,
-                str(right_path): right_document,
-                str(subassembly_path): subassembly_document,
-                str(assembly_path): first,
-            }
-
-            class ProductionRebuildBackend(_CaptureBackend):
-                def __init__(self, **kwargs):
-                    super().__init__(**kwargs)
-                    self.lookups = []
-                    self._capture_roots = [normalize_document_path(os.path.abspath(str(root)))]
-
-                def _rebuild_capture_copy(self, doc, path):
-                    return SolidWorksBackend._rebuild_capture_copy(self, doc, path)
-
-                def _document_by_path(self, path):
-                    self._app_for_path(path)
-                    self.lookups.append(str(path))
-                    if str(path) == str(assembly_path):
-                        return (
-                            first
-                            if self.lookups.count(str(assembly_path)) == 1
-                            else refreshed
-                        )
-                    return documents[str(path)]
-
-            backend = ProductionRebuildBackend(
-                session_factory=lambda: _Session(
-                    _App(
-                        {
-                            assembly_path: first,
-                            subassembly_path: subassembly_document,
-                            left_path: left_document,
-                            right_path: right_document,
-                        }
-                    )
-                )
-            )
-            source_documents = (
-                assembly_path,
-                subassembly_path,
-                left_path,
-                right_path,
-            )
-            hashes_before = {
-                path: hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in source_documents
-            }
-
-            scene = backend.collect_scene(str(assembly_path), [])
-
-            hashes_after = {
-                path: hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in source_documents
-            }
-            preparation = scene.notes["capture_preparation"]
-            raw = _raw_scene_payload(
-                scene,
-                {"assembly": str(assembly_path)},
-                root,
-            )
-            raw_path = root / "raw" / "scene_raw.json"
-            raw_path.parent.mkdir()
-            write_json(raw_path, raw)
-            persisted = read_json(raw_path)
-
-            self.assertEqual({component.name for component in scene.components}, {"left-1", "right-1"})
-            self.assertEqual(rebuild_calls, [2])
-            self.assertEqual(backend.lookups[:2], [str(assembly_path), str(assembly_path)])
-            self.assertTrue(preparation["rebuild_performed"])
-            self.assertIs(preparation["saved_to_disk"], False)
-            self.assertEqual(
-                preparation["source_sha256_before"],
-                hashes_before[assembly_path],
-            )
-            self.assertEqual(
-                preparation["source_sha256_after"],
-                hashes_before[assembly_path],
-            )
-            self.assertEqual(hashes_after, hashes_before)
-            self.assertEqual(
-                persisted["notes"]["capture_preparation"],
-                preparation,
-            )
-            self.assertTrue(
-                all(
-                    document.save_calls == 0
-                    for document in (
-                        first,
-                        refreshed,
-                        subassembly_document,
-                        left_document,
-                        right_document,
-                    )
-                )
-            )
-
-    def test_collect_scene_enforces_read_only_on_the_refreshed_handle(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            part_path = _write(root, "part.SLDPRT")
-            part = _Doc(part_path, doc_type=1)
-            component = _Component("part-1", part_path, doc=part)
-            assembly = _write(root, "robot.SLDASM")
-
-            class MutableReadOnly(_Doc):
-                def SetReadOnlyState(self, value):
-                    self.read_only_calls.append(value)
-                    self.IsOpenedReadOnly = value
-                    return True
-
-            first = _Doc(assembly, doc_type=2, children=[component])
-            refreshed = MutableReadOnly(assembly, doc_type=2, children=[component])
-            refreshed.IsOpenedReadOnly = False
-            refreshed.read_only_calls = []
-            refreshed.rebuilt_generation = 0
-
-            class ReadOnlyRefreshingBackend(_CaptureBackend):
-                def __init__(self, **kwargs):
-                    super().__init__(**kwargs)
-                    self.lookups = []
-                    self.reopens = []
-                    self.save_flag_docs = []
-
-                def _rebuild_capture_copy(self, doc, path):
-                    refreshed.rebuilt_generation += 1
-                    refreshed_doc = self._document_by_path(path)
-                    return refreshed_doc, {
-                        "rebuilt": True,
-                        "document": str(path),
-                        "configuration": str(first.active_configuration),
-                    }
-
-                def _document_by_path(self, path):
-                    self._app_for_path(path)
-                    self.lookups.append(str(path))
-                    doc = part
-                    if str(path) == str(assembly):
-                        doc = first if self.lookups.count(str(assembly)) == 1 else refreshed
-                    return _read_only_document(doc)
-
-                def _record_save_flag(self, doc, path):
-                    self.save_flag_docs.append(doc)
-                    self.save_flags[str(path)] = False
-
-                def open_document(self, path):
-                    self.reopens.append(path)
-                    raise AssertionError("a refreshed handle must not reopen the document")
-
-                def _ensure_document(self, path):
-                    raise AssertionError("no reopen fallback is allowed")
-
-            backend = ReadOnlyRefreshingBackend(session_factory=lambda: _Session(_App({assembly: first})))
-            backend.collect_scene(str(assembly), [])
-            self.assertEqual(refreshed.read_only_calls, [True])
-            self.assertIs(refreshed.IsOpenedReadOnly, True)
-            self.assertEqual(refreshed.rebuilt_generation, 1)
-            self.assertEqual(backend.lookups[:2], [str(assembly), str(assembly)])
-            self.assertTrue(backend.save_flag_docs)
-            self.assertIs(backend.save_flag_docs[0], refreshed)
-            self.assertEqual(backend.reopens, [])
-
-    def test_collect_scene_rejects_configuration_change_at_the_refresh_boundary(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            part_path = _write(root, "part.SLDPRT")
-            part = _Doc(part_path, doc_type=1)
-            component = _Component("part-1", part_path, doc=part)
-            assembly = _write(root, "robot.SLDASM")
-
-            class RebuildableDoc(_Doc):
-                def GetSaveFlag(self):
-                    return False
-
-            first = RebuildableDoc(
-                assembly,
-                doc_type=2,
-                children=[component],
-                needs_rebuild2=1,
-            )
-            refreshed = RebuildableDoc(assembly, doc_type=2, children=[component], configuration="Other")
-
-            class ConfigChangingBackend(_CaptureBackend):
-                def __init__(self, **kwargs):
-                    super().__init__(**kwargs)
-                    self.lookups = []
-                    self._capture_roots = [normalize_document_path(os.path.abspath(str(root)))]
-
-                def _rebuild_capture_copy(self, doc, path):
-                    return SolidWorksBackend._rebuild_capture_copy(self, doc, path)
-
-                def _document_by_path(self, path):
-                    self._app_for_path(path)
-                    self.lookups.append(str(path))
-                    if str(path) == str(assembly):
-                        return first if self.lookups.count(str(assembly)) == 1 else refreshed
-                    return part
-
-            backend = ConfigChangingBackend(session_factory=lambda: _Session(_App({assembly: first})))
-            with self.assertRaises(CadError) as caught:
-                backend.collect_scene(str(assembly), [])
-            self.assertEqual(caught.exception.code, "cad_configuration_mismatch")
-            self.assertEqual(backend.lookups[:2], [str(assembly), str(assembly)])
-
-    def test_collect_scene_performs_one_post_rebuild_document_lookup(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            part_path = _write(root, "part.SLDPRT")
-            part = _Doc(part_path, doc_type=1)
-            component = _Component("part-1", part_path, doc=part)
-            assembly = _write(root, "robot.SLDASM")
-            first = _Doc(assembly, doc_type=2, children=[component])
-            refreshed = _Doc(assembly, doc_type=2, children=[component])
-
-            class CountingBackend(_CaptureBackend):
-                """Mimics production: the rebuild resolves the document once itself."""
-
-                def __init__(self, **kwargs):
-                    super().__init__(**kwargs)
-                    self.lookups = []
-
-                def _rebuild_capture_copy(self, doc, path):
-                    refreshed_doc = self._document_by_path(path)
-                    return refreshed_doc, {
-                        "rebuilt": True,
-                        "document": str(path),
-                        "configuration": str(first.active_configuration),
-                    }
-
-                def _document_by_path(self, path):
-                    self._app_for_path(path)
-                    self.lookups.append(str(path))
-                    if str(path) == str(assembly):
-                        return first if self.lookups.count(str(assembly)) == 1 else refreshed
-                    return part
-
-            backend = CountingBackend(session_factory=lambda: _Session(_App({assembly: first})))
-            backend.collect_scene(str(assembly), [])
-            self.assertEqual(backend.lookups.count(str(assembly)), 2)
-
 
 class PropertyContractTests(unittest.TestCase):
     """Vendor six-argument Get6 by-ref contract, no deprecated Get fallback."""
@@ -4087,8 +3417,6 @@ class MateEntityReferenceTests(unittest.TestCase):
             self.assertEqual(reference["geometry"]["kind"], "line")
 
     def test_frame_matrix_requires_proper_rigid_rotation(self) -> None:
-        from description_pipeline.sources.solidworks import native as native_module
-
         identity = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
         scaled = (2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
         reflected = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
@@ -4252,31 +3580,6 @@ class ComponentSuppressionStateTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "cad_component_state_unsupported")
         self.assertEqual(caught.exception.detail["state"], 7)
 
-    def test_inspect_copy_refuses_a_mismatched_binding_that_is_not_suppressed(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            bad = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=5)
-            assembly = _write(root, "robot.SLDASM")
-            documents = {assembly: _Doc(assembly, doc_type=2, children=[bad])}
-            backend = SolidWorksBackend(session_factory=lambda: _Session(_App(documents)))
-            self.assertFalse(bad.IsSuppressed)
-            with self.assertRaises(CadError) as caught:
-                backend.inspect_copy(str(assembly))
-            self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
-
-    def test_inspect_copy_emits_raw_state_with_coherent_flags(self):
-        with TemporaryDirectory() as tmp, _com_stubs():
-            root = Path(tmp)
-            resolved = _Component("arm-1", _write(root, "arm.SLDPRT"), suppression=3)
-            shim = _Component("shim-1", _write(root, "shim.SLDPRT"), suppression=0)
-            assembly = _write(root, "robot.SLDASM")
-            documents = {assembly: _Doc(assembly, doc_type=2, children=[resolved, shim])}
-            backend = SolidWorksBackend(session_factory=lambda: _Session(_App(documents)))
-            result = backend.inspect_copy(str(assembly))
-            by_name = {item["name"]: item for item in result["instances"]}
-            self.assertEqual((by_name["arm-1"]["suppression_state"], by_name["arm-1"]["suppressed"]), (3, False))
-            self.assertEqual((by_name["shim-1"]["suppression_state"], by_name["shim-1"]["suppressed"]), (0, True))
-
     def test_collect_scene_refuses_a_mismatched_binding(self):
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
@@ -4285,7 +3588,7 @@ class ComponentSuppressionStateTests(unittest.TestCase):
             documents = {assembly: _Doc(assembly, doc_type=2, children=[bad])}
             backend = _CaptureBackend(session_factory=lambda: _Session(_App(documents)))
             with self.assertRaises(CadError) as caught:
-                backend.collect_scene(str(assembly), [])
+                backend.capture_scene_for_test(str(assembly), [])
             self.assertEqual(caught.exception.code, "cad_component_internal_id_mismatch")
 
     def test_measurement_paths_refuse_lightweight_occurrences(self):
@@ -4309,7 +3612,7 @@ class ComponentSuppressionStateTests(unittest.TestCase):
                 documents = {assembly: _Doc(assembly, doc_type=2, children=[light])}
                 backend = _CaptureBackend(session_factory=lambda documents=documents: _Session(_App(documents)))
                 with self.assertRaises(CadError) as caught:
-                    backend.collect_scene(str(assembly), [])
+                    backend.capture_scene_for_test(str(assembly), [])
                 self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
 
     def test_geometry_capture_refuses_a_lightweight_occurrence_after_discovery(self):
@@ -4324,7 +3627,7 @@ class ComponentSuppressionStateTests(unittest.TestCase):
                 entry = next(item for item in record["components"] if item["name2"] == "arm-1")
                 self.assertEqual((entry["suppression_state"], entry["lightweight"]), (1, True))
                 with self.assertRaises(CadError) as caught:
-                    backend.collect_scene(str(assembly), [])
+                    backend.capture_scene_for_test(str(assembly), [])
             self.assertEqual(caught.exception.code, "cad_component_lightweight_unresolved")
 
     def test_discover_native_refuses_mismatch_and_emits_raw_state_otherwise(self):
@@ -4723,7 +4026,7 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
 class _LinkMassProperty:
     """Fake IMassProperty2 for the direct link group reader."""
 
-    def __init__(self, state, reads):
+    def __init__(self, state, reads, getter_calls=None):
         self.UseSystemUnits = None
         self.IncludeHiddenBodiesOrComponents = None
         self.SelectedItems = None
@@ -4735,6 +4038,9 @@ class _LinkMassProperty:
         self._reads = reads
         self._overrides = {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
         self._tensor = [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]]
+        self._origin = None
+        self._origin_error = None
+        self._getter_calls = getter_calls
 
     def Recalculate(self):
         names = tuple(component.Name2 for component in self.SelectedItems.value)
@@ -4745,27 +4051,49 @@ class _LinkMassProperty:
         self.CenterOfMass = [float(value) for value in payload["com_m"]]
         self._tensor = [[float(value) for value in row] for row in payload["inertia_tensor_about_com"]]
         self._overrides = dict(payload.get("overrides") or self._overrides)
+        self._origin = copy.deepcopy(payload.get("origin"))
+        self._origin_error = payload.get("origin_error")
 
     def GetOverrideOptions(self):
         return types.SimpleNamespace(**self._overrides)
 
     def GetMomentOfInertia(self, kind):
+        if self._getter_calls is not None:
+            self._getter_calls.append((id(self), kind))
         if kind == 0:
             return [value for row in self._tensor for value in row]
-        raise RuntimeError("about-origin read unavailable")
+        if self._origin_error is not None:
+            raise RuntimeError(str(self._origin_error))
+        if self._origin is None:
+            raise RuntimeError("about-origin read unavailable")
+        return copy.deepcopy(self._origin)
 
 
 class LinkGroupMassPropertiesTests(unittest.TestCase):
     """The direct one-shot reader: exact paths, two fresh reads, fail closed."""
 
-    def _read(self, mass, com=(0.1, 0.2, 0.3), tensor=None, overrides=None):
-        return {
+    def _read(
+        self,
+        mass,
+        com=(0.1, 0.2, 0.3),
+        tensor=None,
+        overrides=None,
+        *,
+        origin=None,
+        origin_error=None,
+    ):
+        row = {
             "mass_kg": mass,
             "com_m": list(com),
             "inertia_tensor_about_com": tensor or [[1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]],
             "overrides": overrides
             or {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
         }
+        if origin is not None:
+            row["origin"] = list(origin)
+        if origin_error is not None:
+            row["origin_error"] = str(origin_error)
+        return row
 
     @contextmanager
     def _backend(self, reads, *, doc_type=2, extra_components=()):
@@ -4777,12 +4105,26 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
             assembly = _write(root, "robot.SLDASM")
             doc = _Doc(assembly, doc_type=doc_type, children=components)
             state: list = []
-            doc.Extension.CreateMassProperty2 = lambda: _LinkMassProperty(state, reads)
-            backend = _CaptureBackend(session_factory=lambda: _Session(_App({assembly: doc})))
+            getter_calls: list = []
+            doc.Extension.CreateMassProperty2 = lambda: _LinkMassProperty(
+                state,
+                reads,
+                getter_calls,
+            )
+            backend = SolidWorksBackend(
+                session_factory=lambda: _Session(_App({assembly: doc}))
+            )
+            backend._link_mass_getter_calls = getter_calls
             yield backend, assembly, state
 
     def test_reads_each_body_twice_with_the_exact_sorted_selection(self):
-        reads = {("c-1", "sub-1"): [self._read(2.0), self._read(2.0)]}
+        origin = [0.260001, -0.04, -0.06, -0.04, 0.200002, -0.12, -0.06, -0.12, 0.100003]
+        reads = {
+            ("c-1", "sub-1"): [
+                self._read(2.0, origin=origin),
+                self._read(2.0, origin=origin),
+            ]
+        }
         with self._backend(reads) as (backend, assembly, state):
             payload = backend.link_group_mass_properties(str(assembly), {"body": ["sub-1", "c-1"]})
         self.assertEqual(payload["used_api"], "IMassProperty2 (SelectedItems = component set)")
@@ -4791,9 +4133,6 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
         row = payload["links"]["body"]
         self.assertEqual(row["selection"], ["c-1", "sub-1"])
         self.assertEqual(len(row["reads"]), 2)
-        self.assertEqual(
-            row["reproducibility"], {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0}
-        )
         self.assertEqual(row["reads"][0]["mass_kg"], 2.0)
         self.assertEqual(row["reads"][0]["volume_m3"], 0.001)
         self.assertEqual(row["reads"][0]["density_kg_m3"], 1.0)
@@ -4802,13 +4141,139 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
             {"OverrideMass": False, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False},
         )
         self.assertEqual(state, [("c-1", "sub-1"), ("c-1", "sub-1")])
+        projected = _project_link_group_mass(payload)["links"]["body"]
+        self.assertEqual(
+            projected["reproducibility"],
+            {
+                "mass_delta_kg": 0.0,
+                "com_delta_norm_m": 0.0,
+                "tensor_delta_max_abs": 0.0,
+            },
+        )
+
+    def test_origin_getter_reaches_projected_seal_convention(self):
+        from description_pipeline.sources.solidworks.inertia_convention import (
+            STANDARD,
+            normalize_capture_inertia,
+        )
+
+        origin = [
+            0.260001,
+            -0.04,
+            -0.06,
+            -0.04,
+            0.200002,
+            -0.12,
+            -0.06,
+            -0.12,
+            0.100003,
+        ]
+        reads = {
+            ("c-1", "sub-1"): [
+                self._read(2.0, origin=origin),
+                self._read(2.0, origin=origin),
+            ]
+        }
+        with self._backend(reads) as (backend, assembly, state):
+            payload = backend.link_group_mass_properties(
+                str(assembly),
+                {"body": ["c-1", "sub-1"]},
+            )
+        self.assertEqual(state, [("c-1", "sub-1"), ("c-1", "sub-1")])
+        calls = backend._link_mass_getter_calls
+        self.assertEqual([kind for _reader, kind in calls], [0, 1, 0, 1])
+        self.assertEqual(calls[0][0], calls[1][0])
+        self.assertEqual(calls[2][0], calls[3][0])
+        self.assertNotEqual(calls[0][0], calls[2][0])
+        for read in payload["links"]["body"]["reads"]:
+            self.assertEqual(read["inertia_values_about_origin_api"], origin)
+            self.assertNotIn(
+                "inertia_values_about_origin_api",
+                read["read_errors"],
+            )
+
+        projected = _project_link_group_mass(payload)
+        for read in projected["links"]["body"]["reads"]:
+            self.assertEqual(read["inertia_values_about_origin_api"], origin)
+        report = normalize_capture_inertia(
+            {"link_group_mass_properties.json": projected}
+        )
+        self.assertEqual(report["detected"], STANDARD)
+        self.assertFalse(report["capture_transform"]["applied"])
+
+    def test_origin_getter_failure_is_preserved_and_refused_independently(self):
+        from description_pipeline.sources.solidworks.inertia_convention import (
+            normalize_capture_inertia,
+        )
+
+        reads = {
+            ("c-1", "sub-1"): [
+                self._read(2.0, origin_error="native origin failed"),
+                self._read(2.0, origin_error="native origin failed"),
+            ]
+        }
+        with self._backend(reads) as (backend, assembly, _state):
+            payload = backend.link_group_mass_properties(
+                str(assembly),
+                {"body": ["c-1", "sub-1"]},
+            )
+        calls = backend._link_mass_getter_calls
+        self.assertEqual([kind for _reader, kind in calls], [0, 1, 0, 1])
+        self.assertEqual(calls[0][0], calls[1][0])
+        self.assertEqual(calls[2][0], calls[3][0])
+        self.assertNotEqual(calls[0][0], calls[2][0])
+        for read in payload["links"]["body"]["reads"]:
+            self.assertEqual(read["mass_kg"], 2.0)
+            self.assertEqual(read["volume_m3"], 0.001)
+            self.assertEqual(read["density_kg_m3"], 1.0)
+            self.assertEqual(
+                read["inertia_values_raw"],
+                [1e-6, 0.0, 0.0, 0.0, 2e-6, 0.0, 0.0, 0.0, 3e-6],
+            )
+            self.assertEqual(
+                read["inertia_values_about_origin_api"]["code"],
+                "RuntimeError",
+            )
+            self.assertEqual(
+                read["inertia_values_about_origin_api"]["message"],
+                "native origin failed",
+            )
+            self.assertEqual(
+                read["read_errors"]["inertia_values_about_origin_api"],
+                read["inertia_values_about_origin_api"],
+            )
+
+        projected = _project_link_group_mass(payload)
+        for read in projected["links"]["body"]["reads"]:
+            self.assertEqual(
+                read["inertia_values_about_origin_api"]["message"],
+                "native origin failed",
+            )
+        with self.assertRaises(BridgeError) as caught:
+            normalize_capture_inertia(
+                {"link_group_mass_properties.json": projected}
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "inertia_convention_insufficient_samples",
+        )
+        self.assertEqual(caught.exception.detail["total_samples"], 0)
 
     def test_reproducibility_records_the_repeat_deltas(self):
-        first = self._read(2.0, (0.1, 0.2, 0.3))
-        second = self._read(2.001, (0.1, 0.2, 0.31), [[1.1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]])
+        first = self._read(
+            2.0,
+            (0.1, 0.2, 0.3),
+            origin=[1.26e-6, -0.04, -0.06, -0.04, 2.2e-6, -0.12, -0.06, -0.12, 3.1e-6],
+        )
+        second = self._read(
+            2.001,
+            (0.1, 0.2, 0.31),
+            [[1.1e-6, 0.0, 0.0], [0.0, 2e-6, 0.0], [0.0, 0.0, 3e-6]],
+            origin=[1.36e-6, -0.04, -0.06, -0.04, 2.2e-6, -0.12, -0.06, -0.12, 3.1e-6],
+        )
         with self._backend({("c-1", "sub-1"): [first, second]}) as (backend, assembly, _state):
             payload = backend.link_group_mass_properties(str(assembly), {"body": ["c-1", "sub-1"]})
-        row = payload["links"]["body"]
+        row = _project_link_group_mass(payload)["links"]["body"]
         self.assertAlmostEqual(row["reproducibility"]["mass_delta_kg"], 0.001, places=12)
         self.assertAlmostEqual(row["reproducibility"]["com_delta_norm_m"], 0.01, places=12)
         self.assertAlmostEqual(row["reproducibility"]["tensor_delta_max_abs"], 1e-7, places=15)
@@ -4836,7 +4301,13 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
 
     def test_single_instance_object_override_is_recorded_and_repeats(self):
         overrides = {"OverrideMass": True, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
-        reads = {("c-1",): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
+        origin = [0.260001, -0.04, -0.06, -0.04, 0.200002, -0.12, -0.06, -0.12, 0.100003]
+        reads = {
+            ("c-1",): [
+                self._read(2.0, overrides=overrides, origin=origin),
+                self._read(2.0, overrides=overrides, origin=origin),
+            ]
+        }
         with self._backend(reads) as (backend, assembly, state):
             payload = backend.link_group_mass_properties(str(assembly), {"body": ["c-1"]})
         self.assertEqual(state, [("c-1",), ("c-1",)])
@@ -4845,7 +4316,12 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
         self.assertEqual(len(row["reads"]), 2)
         for read in row["reads"]:
             self.assertEqual(read["overrides"], overrides)
-        self.assertEqual(row["reproducibility"]["com_delta_norm_m"], 0.0)
+        self.assertEqual(
+            _project_link_group_mass(payload)["links"]["body"][
+                "reproducibility"
+            ]["com_delta_norm_m"],
+            0.0,
+        )
 
     def test_multi_instance_object_override_is_recorded_verbatim(self):
         overrides = {"OverrideMass": True, "OverrideCenterOfMass": True, "OverrideMomentsOfInertia": False}
@@ -4858,8 +4334,12 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
     def test_whole_assembly_override_refusal_is_unchanged(self):
         overrides = {"OverrideMass": True, "OverrideCenterOfMass": False, "OverrideMomentsOfInertia": False}
         reads = {("robot",): [self._read(2.0, overrides=overrides), self._read(2.0, overrides=overrides)]}
-        with self._backend(reads) as (backend, assembly, _state), self.assertRaises(CadError) as caught:
-            backend.assembly_mass_properties(str(assembly))
+        with self._backend(reads) as (backend, assembly, _state):
+            raw = _raw_mass_fact(
+                backend.assembly_mass_properties(str(assembly))
+            )
+        with self.assertRaises(CadError) as caught:
+            _project_mass_reading(raw)
         self.assertEqual(caught.exception.code, "cad_mass_override")
         self.assertTrue(caught.exception.detail["OverrideMass"])
 
@@ -4868,117 +4348,6 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
             with self.assertRaises(CadError) as caught:
                 backend.link_group_mass_properties(str(assembly), {"body": ["c-1"]})
             self.assertEqual(caught.exception.code, "cad_not_assembly")
-
-
-class CloseAllDocumentsTests(unittest.TestCase):
-    """The pristine readout window's close-all helper fails closed on leftovers."""
-
-    def _backend(self, app):
-        return SolidWorksBackend(session_factory=lambda: _Session(app))
-
-    def _fast_settle(self):
-        return (
-            patch("description_pipeline.sources.solidworks.native.CLOSE_ALL_SETTLE_ATTEMPTS", 2),
-            patch("description_pipeline.sources.solidworks.native.CLOSE_ALL_SETTLE_DELAY_S", 0.0),
-        )
-
-    def test_close_all_documents_closes_without_saving_dirty_documents(self):
-        calls = []
-        app = _App({})
-
-        def close(confirm):
-            calls.append(confirm)
-            return True
-
-        def documents():
-            # The real capture's read-write copy only releases with the
-            # close-without-save flag; a False call leaves it open.
-            if calls and calls[-1] is True:
-                return []
-            return [types.SimpleNamespace(GetTitle=lambda: "dirty", GetPathName=lambda: "C:/dirty.SLDASM")]
-
-        app.CloseAllDocuments = close
-        app.GetDocuments = documents
-        attempts, delay = self._fast_settle()
-        with _com_stubs(), attempts, delay:
-            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
-        self.assertEqual(calls, [True])
-
-    def test_close_all_documents_settles_before_concluding_leftovers(self):
-        state = {"enumerations": 0}
-        app = _App({})
-        app.CloseAllDocuments = lambda confirm: True
-
-        def documents():
-            state["enumerations"] += 1
-            if state["enumerations"] == 1:
-                return [types.SimpleNamespace(GetTitle=lambda: "slow", GetPathName=lambda: "C:/slow.SLDASM")]
-            return []
-
-        app.GetDocuments = documents
-        attempts, delay = self._fast_settle()
-        with _com_stubs(), attempts, delay:
-            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
-        self.assertEqual(state["enumerations"], 2)
-
-    def test_close_all_documents_force_closes_remaining_documents_once(self):
-        closed = []
-        state = {"settled": False}
-        app = _App({})
-        app.CloseAllDocuments = lambda confirm: True
-
-        def documents():
-            if state["settled"]:
-                return []
-            return [types.SimpleNamespace(GetTitle=lambda: "stuck", GetPathName=lambda: "C:/stuck.SLDASM")]
-
-        def close_doc(name):
-            closed.append(name)
-            state["settled"] = True
-            return 1
-
-        app.GetDocuments = documents
-        app.CloseDoc = close_doc
-        attempts, delay = self._fast_settle()
-        with _com_stubs(), attempts, delay:
-            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
-        self.assertEqual(closed, ["stuck"])
-
-    def test_close_all_documents_persistent_leftover_fails_closed(self):
-        closed = []
-        calls = []
-        app = _App({})
-        app.CloseAllDocuments = lambda confirm: calls.append(confirm) or True
-        app.GetDocuments = lambda: [
-            types.SimpleNamespace(GetTitle=lambda: "left", GetPathName=lambda: "C:/left.SLDASM")
-        ]
-        app.CloseDoc = lambda name: closed.append(name) or 0
-        attempts, delay = self._fast_settle()
-        with _com_stubs(), attempts, delay, self.assertRaises(CadError) as caught:
-            self._backend(app).close_all_documents()
-        self.assertEqual(caught.exception.code, "cad_close_failed")
-        self.assertEqual(caught.exception.detail["open"], ["C:/left.SLDASM"])
-        self.assertEqual(caught.exception.detail["count"], 1)
-        self.assertEqual(calls, [True])
-        self.assertEqual(closed, ["left"])
-
-    def test_close_all_documents_reports_success(self):
-        app = _App({})
-        app.CloseAllDocuments = lambda confirm: True
-        app.GetDocuments = list
-        with _com_stubs():
-            self.assertEqual(self._backend(app).close_all_documents(), {"closed": True})
-
-    def test_close_all_documents_failure_is_fail_closed(self):
-        def refuse(_confirm):
-            raise RuntimeError("server busy")
-
-        app = _App({})
-        app.CloseAllDocuments = refuse
-        app.GetDocuments = list
-        with _com_stubs(), self.assertRaises(CadError) as caught:
-            self._backend(app).close_all_documents()
-        self.assertEqual(caught.exception.code, "cad_close_failed")
 
 
 if __name__ == "__main__":
