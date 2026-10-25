@@ -30,7 +30,11 @@ from ..repository.publish import (
 )
 from ..repository.review_branch import review_branch
 from ..runtime import scoped_executor_sha256, tool_record
-from ..schemas import NATIVE_TOOL_REQUIREMENT_KIND, TOOL_SCHEMA
+from ..schemas import (
+    NATIVE_TOOL_REQUIREMENT_KIND,
+    PRODUCTION_ADMISSION_INTENT_SCHEMA,
+    TOOL_SCHEMA,
+)
 from ..sources.solidworks.handoff import describe_handoff
 from ..stages import CONTRACT_SHA256
 from .admission import (
@@ -538,9 +542,7 @@ class AdmissionOutcomePort(Protocol):
     dispatch_command: DispatchCommand
 
 
-_ADMINISTRATIVE_INTENT_SCHEMA = (
-    "description-pipeline.production-admission-intent/v1"
-)
+_ADMINISTRATIVE_INTENT_SCHEMA = PRODUCTION_ADMISSION_INTENT_SCHEMA
 
 
 def _intent_differences(

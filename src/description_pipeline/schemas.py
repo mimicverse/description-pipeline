@@ -80,6 +80,7 @@ NATIVE_CAPTURE_OPERATION_SCHEMA = "solidworks-to-urdf.native-capture-operation/v
 NATIVE_OPERATION_REQUEST_SCHEMA = "solidworks-to-urdf.native-operation-request/v2"
 NATIVE_OPERATION_VIEW_SCHEMA = "solidworks-to-urdf.native-operation-view/v2"
 NATIVE_OPERATION_OBSERVATION_SCHEMA = "solidworks-to-urdf.native-operation-observation/v1"
+NATIVE_OPERATION_IDENTITY_SCHEMA = "solidworks-to-urdf.native-operation-identity/v1"
 CANCEL_REQUEST_SCHEMA = "solidworks-to-urdf.cancel-request/v1"
 OPERATION_CANCEL_EFFECT_SCHEMA = "solidworks-to-urdf.operation-cancel-effect/v1"
 PRODUCTION_ADMISSION_INTENT_SCHEMA = "solidworks-to-urdf.production-admission-intent/v1"

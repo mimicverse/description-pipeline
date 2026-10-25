@@ -38,7 +38,11 @@ from ..native_transfer import (
     MAX_MANIFEST_BYTES,
 )
 from ..pipeline.contracts import NativeTargetIdentity
-from ..schemas import NATIVE_CAPTURE_EFFECT_SCHEMA
+from ..schemas import (
+    NATIVE_CAPTURE_EFFECT_SCHEMA,
+    NATIVE_OPERATION_IDENTITY_SCHEMA,
+    NATIVE_OPERATION_OBSERVATION_SCHEMA,
+)
 from ..sources.solidworks.discover_stage import (
     NATIVE_OBSERVATION_SCHEMA,
     NativeDiscoverRefusal,
@@ -1370,9 +1374,7 @@ class NativeOperationEffectObserver:
         write_json(
             root / "operation.json",
             {
-                "schema_version": (
-                    "description-pipeline.native-operation-observation/v1"
-                ),
+                "schema_version": NATIVE_OPERATION_OBSERVATION_SCHEMA,
                 "operation_id": operation_id,
                 "state_class": state_class,
                 "reason": reason,
@@ -1404,9 +1406,7 @@ class NativeOperationEffectObserver:
         write_json(
             root / "operation.json",
             {
-                "schema_version": (
-                    "description-pipeline.native-operation-observation/v1"
-                ),
+                "schema_version": NATIVE_OPERATION_OBSERVATION_SCHEMA,
                 "operation_id": view.operation_id,
                 "state_class": "absent",
                 "reason": terminal_basis,
@@ -1447,9 +1447,7 @@ class NativeOperationEffectObserver:
         write_json(
             root / "operation.json",
             {
-                "schema_version": (
-                    "description-pipeline.native-operation-observation/v1"
-                ),
+                "schema_version": NATIVE_OPERATION_OBSERVATION_SCHEMA,
                 "operation_id": view.operation_id,
                 "state": view.state,
                 "operation": view.to_record(),
@@ -1524,9 +1522,7 @@ class NativeOperationEffectObserver:
             }
         native_owner = view.owner_sha256
         return {
-            "schema_version": (
-                "description-pipeline.native-operation-identity/v1"
-            ),
+            "schema_version": NATIVE_OPERATION_IDENTITY_SCHEMA,
             "target_id": view.target_id,
             "platform_origin": platform_origin,
             "native_runtime": {
