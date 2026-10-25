@@ -66,8 +66,11 @@ os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 sys.dont_write_bytecode = True
 
 RELEASE_SOURCE = Path(__file__).resolve().parents[2] / "src"
-if str(RELEASE_SOURCE) not in sys.path:
-    sys.path.insert(0, str(RELEASE_SOURCE))
+release_source = str(RELEASE_SOURCE)
+sys.path[:] = [
+    release_source,
+    *(entry for entry in sys.path if entry != release_source),
+]
 
 from description_pipeline.pipeline.contracts import RunStatus  # noqa: E402
 from description_pipeline.platform.facts import read_admitted_runs  # noqa: E402
