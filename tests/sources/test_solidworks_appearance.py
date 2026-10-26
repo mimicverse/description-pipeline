@@ -374,14 +374,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "matched_identity": {
                             "occurrences": [],
                             "bodies": [],
-                            "faces": [
-                                {
-                                    "component": COMPONENT,
-                                    "body_type": 0,
-                                    "body_index": 0,
-                                    "face_index": 0,
-                                }
-                            ],
+                            "faces": [],
                             "features": [],
                         },
                         "read_errors": {},
