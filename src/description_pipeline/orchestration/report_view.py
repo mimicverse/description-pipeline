@@ -847,7 +847,6 @@ _WARNING_DETAIL_KEYS = (
     "technical_label",
     "label_source",
     "mass_kg",
-    "masses",
     "objects",
     "component",
     "entity_kind",

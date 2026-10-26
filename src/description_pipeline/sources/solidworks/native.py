@@ -7030,7 +7030,7 @@ class SolidWorksBackend(CadBackend):
         process's owned session and records the primitives discovery needs:
         identity properties, the component graph with occurrence transforms,
         mate features with component-frame entity geometry, coordinate systems
-        (assembly and component scope), materials/masses and per-document
+        (assembly and component scope), materials and per-document
         hashes.  Every read fails closed; nothing is defaulted.  The delivered
         assembly is named by ``settings["main_assembly"]``; without one, a
         frozen directory holding exactly one ``.SLDASM`` is accepted as the
@@ -7205,7 +7205,6 @@ class SolidWorksBackend(CadBackend):
             by_component = {}
             by_document: dict[str, str] = {}
             owner_hashes: dict[str, str] = {}
-            masses = []
             mates: list[dict] = []
             components_total = 0
             components_done = 0
@@ -7364,40 +7363,6 @@ class SolidWorksBackend(CadBackend):
                     # configuration changes must not reuse borrowed occurrences.
                     by_component[path_name] = (str(document_path), _method(component, "GetModelDoc2") is not None)
                     by_document[path_name] = entry["document"]
-                    try:
-                        mass_property = _member(_member(assembly, "Extension"), "CreateMassProperty2")
-                        if mass_property is not None and entry["lightweight"]:
-                            # Informational per-component mass: a lightweight
-                            # occurrence is not measured and is never silently
-                            # reported as if it had no mass.
-                            notes.append(f"mass:{path_name}:lightweight_state_{entry['suppression_state']}_unmeasured")
-                        if (
-                            mass_property is not None
-                            and not entry["suppressed"]
-                            and not entry["lightweight"]
-                            and not entry["document"].lower().endswith(".sldasm")
-                        ):
-                            mass_property.UseSystemUnits = True
-                            mass_property.IncludeHiddenBodiesOrComponents = True
-                            import pythoncom
-
-                            mass_property.SelectedItems = _win32().VARIANT(
-                                pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (component,)
-                            )
-                            _member(mass_property, "Recalculate")
-                            mass = float(_member(mass_property, "Mass"))
-                            volume = float(_member(mass_property, "Volume"))
-                            if math.isfinite(mass) and mass > 0:
-                                masses.append(
-                                    {
-                                        "component": path_name,
-                                        "mass_kg": mass,
-                                        "volume_m3": volume if math.isfinite(volume) else None,
-                                        "material": None,
-                                    }
-                                )
-                    except Exception as error:  # noqa: BLE001 - masses are informational here
-                        notes.append(f"mass:{path_name}:{error}")
                     children = list(_method(component, "GetChildren") or [])
                     if children:
                         if not transform:
@@ -7684,7 +7649,7 @@ class SolidWorksBackend(CadBackend):
                 # The next assembly selection may invalidate this entire borrowed
                 # tree. Pending assemblies and occurrence records contain paths
                 # and primitives only; release all native traversal handles now.
-                component = raw = root = active_config = part = children = holder = mass_property = None
+                component = raw = root = active_config = part = children = holder = None
                 root_children = mate_list = None
                 entity = reference = target = feature = specific = assembly = None
             activity.emit("read_components", completed=components_done, total=components_total, force=True)
@@ -7901,7 +7866,6 @@ class SolidWorksBackend(CadBackend):
                 "datums": datums,
                 "reference_axes": reference_axes,
                 "exporter": exporter_block,
-                "masses": masses,
                 "properties": property_buckets,
                 "files": files,
                 "selection": {

@@ -1941,7 +1941,6 @@ def native_record(
         "components": [dict(item) for item in components],
         "mates": [dict(item) for item in mates],
         "datums": [dict(item) for item in datums],
-        "masses": [dict(item) for item in masses],
         "assembly_mass_kg": float(
             assembly_mass_kg if assembly_mass_kg is not None else sum(float(row["mass_kg"]) for row in masses)
         ),

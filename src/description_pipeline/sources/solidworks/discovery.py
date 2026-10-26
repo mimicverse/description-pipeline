@@ -44,8 +44,6 @@ the backend and re-read by the independent verifier:
     ``{name, owner, array: [16 floats]}`` coordinate systems with the
     transform expressed in the assembly frame (owner ``""`` is assembly
     scope).
-``masses``
-    ``{component, mass_kg, material}`` per component read from CAD.
 ``properties``
     ``{document: {..}, components: {name2: {..}}, mates: {mate: {..}}}`` of
     scalar ``dp.*`` custom properties - the only channel for facts SolidWorks

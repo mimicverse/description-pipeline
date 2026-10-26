@@ -275,10 +275,6 @@ def record() -> dict:
             {"name": "CS_base_link", "owner": "base-1", "array": copy.deepcopy(IDENTITY)},
             {"name": "CS_arm_link", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.1)},
         ],
-        "masses": [
-            {"component": "base-1", "mass_kg": 0.192, "material": "Alloy Steel"},
-            {"component": "arm-1", "mass_kg": 0.105654866776462, "material": "Alloy Steel"},
-        ],
         "assembly_mass_kg": 0.2976548667764616,
         "assembly_extent_m": 0.42,
         "properties": {

@@ -6239,6 +6239,7 @@ class ComponentSuppressionStateTests(unittest.TestCase):
             lightweight = _Component("arm-2", _write(root, "arm2.SLDPRT"), suppression=1)
             assembly = _write(root, "robot.SLDASM")
             record = _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[resolved, lightweight])}))
+            self.assertNotIn("masses", record)
             by_name = {item["name2"]: item for item in record["components"]}
 
             def triple(name):

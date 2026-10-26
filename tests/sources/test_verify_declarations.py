@@ -536,11 +536,6 @@ class DeclarationConsumerTests(unittest.TestCase):
             mutate_raw(raw)
         raw["files"] = native_files
         raw["source_selection"] = sealed_selection(native_files, "robot.SLDASM", edges={"robot.SLDASM": []})
-        raw["masses"] = [
-            {"component": item["name2"], "mass_kg": 1.0}
-            for item in raw["components"]
-            if not item["document"].endswith(".SLDASM")
-        ]
         robot = {"hardware_id": "fixture", "source": source_claims(), "checks": {}}
         robot["source"]["robot_name"] = "fixture"
         payload = support.frozen_discovery_payload(
@@ -1699,11 +1694,6 @@ class NativeDeclarationsTests(unittest.TestCase):
             raw = fixture()
             raw["files"] = native_files
             raw["source_selection"] = sealed_selection(native_files, "robot.SLDASM", edges={"robot.SLDASM": []})
-            raw["masses"] = [
-                {"component": item["name2"], "mass_kg": 1.0}
-                for item in raw["components"]
-                if not item["document"].endswith(".SLDASM")
-            ]
             robot = {
                 "hardware_id": "fixture",
                 "source": source_claims(),

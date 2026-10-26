@@ -718,12 +718,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
                 },
             ],
             "datums": [{"name": "CS_base_link", "owner": CHASSIS, "array": [float(value) for value in identity4]}],
-            "masses": [
-                {"component": PARENT, "mass_kg": float(self.parent_reading["mass"]), "material": "Alloy Steel"},
-                {"component": DEV, "mass_kg": float(self.dev_payload["mass"]), "material": "Alloy Steel"},
-                {"component": PCB, "mass_kg": float(self.pcb_payload["mass"]), "material": "Alloy Steel"},
-                {"component": CHASSIS, "mass_kg": float(self.chassis_payload["mass"]), "material": "Alloy Steel"},
-            ],
             "assembly_mass_kg": float(self.parent_reading["mass"]) + float(self.chassis_payload["mass"]),
             "assembly_extent_m": 1.0,
             "properties": {"document": {}, "components": {}, "mates": {}},
@@ -1117,13 +1111,6 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             ],
             "mates": [],
             "datums": [{"name": "CS_base_link", "owner": self.PART, "array": [float(value) for value in identity4]}],
-            "masses": [
-                {
-                    "component": self.PART,
-                    "mass_kg": float(self.singleton["mass"]),
-                    "material": "Alloy Steel",
-                }
-            ],
             "assembly_mass_kg": float(self.singleton["mass"]),
             "assembly_extent_m": 1.0,
             "properties": {"document": {}, "components": {}, "mates": {}},

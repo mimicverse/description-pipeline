@@ -18,8 +18,7 @@ an exporter-declaration capture keeps the declaration suite, while a capture who
 exporter state is a proven ``absent`` runs the mate-inference suite.  Gate ownership
 (VER-01):
   * both regimes: ``discovery.binding``, ``suppression_state``, ``selection``,
-    ``files``, ``imported_sources``, ``identity``, ``revision``, ``budgets``,
-    ``masses``;
+    ``files``, ``imported_sources``, ``identity``, ``revision``, ``budgets``;
   * mate-inference only: ``graph``, ``frame_attachment``, ``bodies``, ``names``,
     ``joints``, ``tree``, ``frames``;
   * exporter-declaration only: ``discovery.declarations``
@@ -3828,50 +3827,6 @@ def verify_discovery(package: Path) -> dict:
         _require("base_link" in seen, "discovery.bodies", "no base_link body")
         return {"bodies": len(source_bodies)}
 
-    def masses():
-        raw = state["payload"]["raw"]
-        by_name = _components_by_name(raw)
-        entries = raw.get("masses") or []
-        _require(isinstance(entries, list), "discovery.masses", "the mass inventory is not a list")
-        seen: set[str] = set()
-        containers: list[str] = []
-        material: set[str] = set()
-        for entry in entries:
-            _require(isinstance(entry, dict), "discovery.masses", "a mass entry is not an object")
-            component = str(entry.get("component") or "")
-            _require(
-                component in by_name,
-                "discovery.masses",
-                "a mass entry names an unknown component",
-                {"component": component},
-            )
-            _require(
-                component not in seen,
-                "discovery.masses",
-                "a component appears twice in the mass inventory",
-                {"component": component},
-            )
-            seen.add(component)
-            _require(
-                _finite_limit(entry.get("mass_kg")) and float(entry["mass_kg"]) > 0,
-                "discovery.masses",
-                "a recorded component mass is not finite and positive",
-                {"component": component},
-            )
-            if is_container(by_name[component]):
-                containers.append(component)
-            else:
-                material.add(component)
-        for container in containers:
-            duplicated = sorted(name for name in material if name.startswith(container + "/"))
-            _require(
-                not duplicated,
-                "discovery.masses",
-                "an assembly container mass duplicates its material parts",
-                {"container": container, "parts": duplicated[:8]},
-            )
-        return {"components": len(seen), "containers": len(containers)}
-
     def names():
         payload = state["payload"]
         raw = payload["raw"]
@@ -4548,7 +4503,6 @@ def verify_discovery(package: Path) -> dict:
         ("discovery.graph", graph),
         ("discovery.frame_attachment", frame_attachment),
         ("discovery.bodies", bodies),
-        ("discovery.masses", masses),
         ("discovery.names", names),
         ("discovery.joints", joints),
         ("discovery.tree", tree),
@@ -4566,7 +4520,7 @@ def verify_discovery(package: Path) -> dict:
     if bound["passed"] and declaration_capture:
         # Explicit native declarations do not require incomplete mate inference to
         # rediscover memberships or impose unrelated CS_/dp.* naming conventions.
-        # Capture/file/mass binding remains mandatory. A declaration carries no
+        # Capture/file binding remains mandatory. A declaration carries no
         # external design budget; never invent nominal mass or extent ranges.
         dependent = (
             ("discovery.suppression_state", suppression),
@@ -4576,7 +4530,6 @@ def verify_discovery(package: Path) -> dict:
             ("discovery.identity", identity),
             ("discovery.revision", revision),
             ("discovery.budgets", budgets),
-            ("discovery.masses", masses),
             ("discovery.declarations", declarations),
         )
     if bound["passed"]:
