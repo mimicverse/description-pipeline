@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
@@ -116,10 +117,6 @@ class ReleaseRecoveryTests(unittest.TestCase):
         operatorctl = root / "operatorctl.sh"
         operatorctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         operatorctl.chmod(0o700)
-        windows_identity = root / "windows_identity.py"
-        windows_identity.write_bytes(
-            (REPOSITORY / "deploy/operator/windows_identity.py").read_bytes()
-        )
         target_plan = root / "target-plan.json"
         target_plan.write_text("{}\n", encoding="utf-8")
         manifest = root / "recovery-manifest.json"
@@ -140,7 +137,6 @@ class ReleaseRecoveryTests(unittest.TestCase):
             status_dir=str(status_dir or (root / "status")),
             config=str(config),
             operatorctl=str(operatorctl),
-            windows_identity_py=str(root / "windows_identity.py"),
             expected_release=str(expected),
             runner=None,
         )
@@ -250,7 +246,6 @@ class ReleaseRecoveryTests(unittest.TestCase):
             config=restore.config,
             operatorctl=restore.operatorctl,
             recovery_py=restore.recovery_py,
-            windows_identity_py=restore.windows_identity_py,
             expected_release=restore.expected_release,
             restore_status_dir=str(status),
             code_rollback_receipt=str(code_rollback),
@@ -331,11 +326,13 @@ class ReleaseRecoveryTests(unittest.TestCase):
             before = len(calls)
             self.assertEqual(release_recovery.restore(args), 0)
             self.assertEqual(len(calls), before)
-            Path(args.windows_identity_py).write_text(
-                "# substituted identity validator\n", encoding="utf-8"
-            )
-            with self.assertRaisesRegex(
-                release_recovery.GateError, "different inputs"
+            with mock.patch.object(
+                release_recovery.windows_identity,
+                "__file__",
+                args.recovery_py,
+            ), self.assertRaisesRegex(
+                release_recovery.GateError,
+                "differs from the fixed release path",
             ):
                 release_recovery.restore(args)
             self.assertEqual(len(calls), before)
@@ -349,54 +346,29 @@ class ReleaseRecoveryTests(unittest.TestCase):
             self.assertEqual(receipt["health"], "NOT_RUN")
             self.assertFalse(any("start" in row for row in calls))
 
-    def test_parser_supplies_windows_identity_validator(self):
-        parsed = release_recovery.parser().parse_args(
-            [
-                "restore",
-                "--manifest",
-                "manifest.json",
-                "--key",
-                "key",
-                "--target-plan",
-                "target.json",
-                "--status-dir",
-                "status",
-                "--config",
-                "platform.json",
-                "--operatorctl",
-                "operatorctl.sh",
-                "--expected-release",
-                "release.json",
-            ]
-        )
-        self.assertEqual(
-            Path(parsed.windows_identity_py),
-            Path(release_recovery.__file__).with_name("windows_identity.py"),
-        )
-        substituted = release_recovery.parser().parse_args(
-            [
-                "--windows-identity-py",
-                "/fixed/windows_identity.py",
-                "verify",
-                "--manifest",
-                "manifest.json",
-                "--key",
-                "key",
-                "--target-plan",
-                "target.json",
-                "--status-dir",
-                "status",
-                "--config",
-                "platform.json",
-                "--operatorctl",
-                "operatorctl.sh",
-                "--expected-release",
-                "release.json",
-            ]
-        )
-        self.assertEqual(
-            substituted.windows_identity_py, "/fixed/windows_identity.py"
-        )
+    def test_parser_refuses_windows_identity_override(self):
+        with self.assertRaises(SystemExit):
+            release_recovery.parser().parse_args(
+                [
+                    "--windows-identity-py",
+                    "/fixed/windows_identity.py",
+                    "verify",
+                    "--manifest",
+                    "manifest.json",
+                    "--key",
+                    "key",
+                    "--target-plan",
+                    "target.json",
+                    "--status-dir",
+                    "status",
+                    "--config",
+                    "platform.json",
+                    "--operatorctl",
+                    "operatorctl.sh",
+                    "--expected-release",
+                    "release.json",
+                ]
+            )
 
     def test_restore_release_mismatch_refuses_before_runner(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -753,10 +725,6 @@ class ReleaseRecoveryTests(unittest.TestCase):
                 release_recovery.RELEASE_ROOT = original
             self.assertEqual(Path(parsed.recovery_py), operator_root / "recovery.py")
             self.assertEqual(Path(parsed.operatorctl), operator_root / "operatorctl.sh")
-            self.assertEqual(
-                Path(parsed.windows_identity_py),
-                operator_root / "windows_identity.py",
-            )
             self.assertEqual(Path(parsed.expected_release), release_root / "release.json")
             self.assertEqual(parsed.status_dir, str(status))
 
