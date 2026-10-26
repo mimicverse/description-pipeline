@@ -120,6 +120,8 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 | 退化三角形 | 面积 `≤1e-14 m²` 定义为退化；逐原生网格及其对应完整交付分片集检查：退化数/总三角形数 `≤1%` 且退化面积/总面积 `≤1e-6`，两者同时通过，禁止跨对象摊平；零分母失败 |
 | 交付网格分片 | 每片不超过 `199999` 个三角形，保持全部原始三角形记录 |
 
+原生三角流派生 STL 时，精确为零的叉积无法定义单位法向，因此明确失败；不能为通过比例检查伪造法向或删除记录。面积小但非零的三角形仍按实际数值派生法向，并纳入上表的面积与数量比例检查，不将其整体归零。
+
 有效变换必须具有齐次末行、单位正交旋转与正行列式；schema 和检查策略规定这些数值合法性门。非有限值、零/负质量、非正主惯量和不满足惯量三角不等式始终失败。
 
 Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随后释放 CAD。坐标、物性投影、三角流序列化、STL 生成及工程校验均在离线执行；原生读取错误和必要对象、配置、来源及会话安全绑定仍须保全和核验。
@@ -128,7 +130,7 @@ Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随�
 
 `native-triangles/v1` 保留完整 body／face inventory、face span、实例来源 scope、placement 原值和原始 binary64 三角形流。原始流使用 `SWTESS64` 固定头、版本、数量及逐三角九项坐标；文件按实际 payload 摘要登记为 `raw/triangles/{sha}.triangles`。释放 CAD 后生成 `geometry/{sha}.stl`，仅对已经实际读得的相同 payload 按摘要复用文件，各 occurrence 的 placement 和来源绑定独立保留。派生的 STL 法向、binary32 坐标和 scope-local 身份必须携带对象及字段级 warning。
 
-独立消费者从原始三角流、face span、来源 scope 和 SW16 重新核对实际 STL 的三角形数量、顺序、坐标、法向、归属及摘要，并核对场景 placement。原生读取失败、缺失必要几何、非法数值、错误归属或交付字节不对应原始事实均失败。拓扑审计记录实际观察，不把显示三角形天然宣称为闭合流形或精度证明；最终逐对象 `50 µm` 曲面等价及其他工程验收保持。
+独立消费者从原始三角流、face span、来源 scope 和 SW16 重新核对实际 STL 的三角形数量、顺序、坐标、法向、归属及摘要，并核对场景 placement。原生读取失败、缺失必要几何、非法数值、错误归属或交付字节不对应原始事实均失败。拓扑审计记录实际观察，不把显示三角形天然宣称为闭合流形或精度证明；当前 CAD 的独立工程检查保持，`50 µm` 曲面等价仅用于下文声明适用输入的独立参考回归，不是生产或正式发布前置。
 
 原始证据记录 immutable `raw/source_scopes.json`：file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将 scope 与 discovery、scene、capture、geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
 
