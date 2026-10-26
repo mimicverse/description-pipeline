@@ -933,12 +933,6 @@ def _upstream_records(inputs: CaptureInputs) -> tuple[dict[str, Any], ...]:
     )
 
 
-def _native_tool_record() -> dict[str, Any]:
-    from ..runtime import tool_record
-
-    return tool_record(role="native")
-
-
 @contextmanager
 def _capture_output_lock(output: Path):
     """One attempt owns the destination lock for the complete native transaction."""
