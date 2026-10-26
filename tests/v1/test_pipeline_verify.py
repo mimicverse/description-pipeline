@@ -914,6 +914,14 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "component": "arm-1",
                             "api": "IModelDocExtension.GetPersistReference3",
                         },
+                        "source_persistent_reference": None,
+                        "source_read_errors": {
+                            "interface_query": {
+                                "code": "interface_query_failed",
+                                "message": "source QI failed",
+                                "detail": None,
+                            }
+                        },
                         "native_identity": {
                             "kind": "object",
                             "state": "observed",

@@ -452,6 +452,14 @@ class AppearanceResolutionTests(unittest.TestCase):
                             owner_document_path=r"C:\capture\robot.SLDASM",
                             api="IModelDocExtension.GetPersistReference3",
                         ),
+                        "source_persistent_reference": None,
+                        "source_read_errors": {
+                            "interface_query": {
+                                "code": "interface_query_failed",
+                                "message": "source QI failed",
+                                "detail": None,
+                            }
+                        },
                         "native_identity": _native_identity(
                             "object",
                             owner_scope="top_assembly",
