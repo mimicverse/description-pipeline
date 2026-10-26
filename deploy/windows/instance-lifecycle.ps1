@@ -309,16 +309,59 @@ function Start-BoundTask([object]$binding) {
   Start-ScheduledTask @parameters
 }
 function Test-ActionConfigArgument([string]$Arguments, [string]$ConfigPath) {
-  $options = @([regex]::Matches(
-    $Arguments,
-    '(?:^|\s)--config(?=\s|=|$)'))
-  $canonical = @([regex]::Matches(
-    $Arguments,
-    '(?:^|\s)--config\s+"([^"]+)"(?=\s|$)'))
+  $tokens = @()
+  $current = [System.Text.StringBuilder]::new()
+  $hasToken = $false
+  $quoted = $false
+  $inQuotes = $false
+  foreach ($character in $Arguments.ToCharArray()) {
+    if ($character -eq '"') {
+      $hasToken = $true
+      $quoted = $true
+      $inQuotes = -not $inQuotes
+      continue
+    }
+    if ([char]::IsWhiteSpace($character) -and -not $inQuotes) {
+      if ($hasToken) {
+        $tokens += [pscustomobject]@{
+          text=$current.ToString()
+          quoted=$quoted
+        }
+        $current = [System.Text.StringBuilder]::new()
+        $hasToken = $false
+        $quoted = $false
+      }
+      continue
+    }
+    [void]$current.Append($character)
+    $hasToken = $true
+  }
+  if ($inQuotes) { return $false }
+  if ($hasToken) {
+    $tokens += [pscustomobject]@{
+      text=$current.ToString()
+      quoted=$quoted
+    }
+  }
+  $optionIndexes = @(
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+      $text = [string]$tokens[$index].text
+      if ($text -ceq '--config' -or
+          $text.StartsWith('--config=', [System.StringComparison]::Ordinal)) {
+        $index
+      }
+    }
+  )
+  if ($optionIndexes.Count -ne 1) { return $false }
+  $optionIndex = [int]$optionIndexes[0]
+  if ([string]$tokens[$optionIndex].text -cne '--config' -or
+      $optionIndex + 1 -ge $tokens.Count) {
+    return $false
+  }
+  $value = $tokens[$optionIndex + 1]
   return (
-    $options.Count -eq 1 -and
-    $canonical.Count -eq 1 -and
-    (Normalize-PathIdentity $canonical[0].Groups[1].Value) -eq
+    [bool]$value.quoted -and
+    (Normalize-PathIdentity ([string]$value.text)) -eq
       (Normalize-PathIdentity $ConfigPath)
   )
 }

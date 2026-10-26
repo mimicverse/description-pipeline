@@ -907,6 +907,12 @@ $windowsArguments = (
   '-I -B -m description_pipeline serve --config "C:\root\old\generation\endpoint.json"')
 Check 'task.action_config_path_is_separator_neutral' (
   Test-ActionConfigArgument $windowsArguments $windowsConfigPath)
+$textualWindowsConfigPath = 'C:/root/name --config text/generation/endpoint.json'
+Check 'task.action_config_text_inside_quoted_value_is_not_an_option' (
+  Test-ActionConfigArgument (
+    '-I -B -m description_pipeline serve --config ' +
+      '"C:\root\name --config text\generation\endpoint.json"'
+  ) $textualWindowsConfigPath)
 Check 'task.action_config_path_suffix_refused' (
   -not (Test-ActionConfigArgument (
     '-I -B -m description_pipeline serve --config "C:\root\old\generation\endpoint.json.bak"'
