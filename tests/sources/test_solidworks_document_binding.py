@@ -753,11 +753,10 @@ class ReturnViewRegistryTests(unittest.TestCase):
         self.assertNotIn('"IsLightweight"', source)
         self.assertIn('state["lightweight"] = None', source)
         self.assertIn('state["unsupported"] = ["lightweight"]', source)
-        # The per-component lightweight member is now declared by the supported
-        # GetSuppression2 state; the retired unsupported-declared note is gone and
-        # the state-based mass note reports an unmeasured lightweight occurrence.
+        # The per-component lightweight member is declared by the supported
+        # GetSuppression2 state; discovery does not run a separate mass probe.
         self.assertNotIn("unsupported_declared", source)
-        self.assertIn("lightweight_state_", source)
+        self.assertNotIn("lightweight_state_", source)
 
     def test_document_state_reports_unsupported_lightweight_without_probing(self):
         doc = types.SimpleNamespace(
