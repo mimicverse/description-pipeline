@@ -535,7 +535,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             {
                                 "face_index": span["face_index"],
                                 "appearance": owner(
-                                    "IFace2.GetMaterialPropertyValues2"
+                                    "IFace2.MaterialPropertyValues"
                                 ),
                             }
                             for span in spans
