@@ -16,6 +16,8 @@
 
 Linux 负责上传冻结、受控规格、结构推导、模型生成、独立验证、报告、预览和发布。Windows 只在自有只读会话中一次读取 CAD 原生几何、轴线、配合、物性及对象归属，随后释放 CAD；坐标转换、网格序列化和工程复算在释放后离线完成，不修改 CAD。
 
+外观读取在同一个只读会话中保留 document/face 的无参 active-configuration 属性（仅当 active 与 referenced configuration 相同）、各 owner 自己的 configuration/display-state wrapper、render-material 原生总数与 NULL 原值，以及同 owner 的持久引用和对象观察索引。Generate 与 Verify 分别从这些 raw 事实重建绑定；原生总数确证为 0 不等于把 NULL 改写成空数组，无法绑定或无法证明无关的实体不会被静默忽略。
+
 每份交付绑定输入、原生证据、工具身份、模型和实际文件。独立验证从原始证据重新建立预期值，并检查交付的 XML、网格与 MuJoCo 加载结果。发布再次核对 Git 中的字节和远端 PR。
 
 验证通过表示[规定检查](docs/quality.md)通过。工程批准、仿真、训练与实机控制分别验收；候选 PR 不赋予这些资格，且绑定所选用途——不同用途的候选与发布恢复身份相互隔离。模型交付包含视觉网格和物理属性，碰撞模型及控制接口由对应用途的工程流程负责。

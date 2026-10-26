@@ -159,15 +159,20 @@ CAD 方向表达偏离规范时给出明确 warning，按 CAD 运动关系和统
 
 材料核对实体级、零件级与配置级生效状态，来源库和密度固定可追溯。颜色、外观或材料名称文本不能代替赋值。缺少显式材料时保留原生质量、COM 和惯量并警告，但不建立材料真实性。
 
-外观在同一只读原生会话中按 document、occurrence、body 分别记录实际 API、配置参数、
-九值数组、`HasMaterialPropertyValues`、纹理指针、`MaterialName` 和读取错误，并封存
-在 `native_capture_facts.scene_raw.occurrences[].appearance_raw`。该 raw 不是最终有效
-外观的证明，不得自行规定三层优先级或继承；`-1`、Has 和读取错误不能跨 owner/配置
-解释为全局缺失。只有实际交付面的完整观测能证明唯一 RGBA 且纹理确证 absent 时才可
-生成单色材质；必需读错、对象或配置错绑、未证明冲突及无法忠实输出的纹理必须让
-Generate 失败并让 Verify 从原始记录独立拒绝。记录缺失、所有观测层均为 `Has=False`
-但无法排除未读覆盖，或只有同色多层 raw 时同样缺证；当前系统明确失败，不输出默认色，
-也不以 warning 后继续生成。
+外观在同一只读原生会话中记录 document 与 face 的无参 active-configuration 属性，并
+要求实际 active configuration 与 occurrence referenced configuration 相同。top、
+parent 和 component-document owner 分别保留自己的 configuration/display-state 与读取
+错误；`GetRenderMaterials2` 的 NULL 原值、原生 material count、
+`native_reference_index`、实体 persistent reference 和纹理事实分别封存。只有成功读取的
+原生总数确证为 0 时，NULL 才可证明没有 state render assignment；非零或未知总数下仍是
+未知。Generate 与 Verify 必须从 entity reference 与同一 owner 索引独立 join，不信任
+Source 预填匹配；没有成功索引的实体不能被当作无关对象。
+
+最终表示按实际交付 face 的 triangle spans 生成一个或多个 visual/material；alpha 从原生
+透明度派生并保留来源 warning。present texture 缺少资产、UV 或绑定消费能力、参与交付
+的颜色编码未证明、对象或配置错绑以及未证明冲突必须失败。与交付无关且由非空原生绑定
+证明在 scope 外的辅助事实可以保留为诊断，不为所有辅助错误另设全阻断门；不以默认色、
+伪造 empty、预填 effective 值或 warning 代替颜色与纹理资格。
 
 覆盖质量、COM 或惯量必须有可信来源、范围、配置、参考点、轴和单位；不向运动链接分摊父级覆盖。完整张量保留非对角项，不混用原点与质心惯量。平台按[质量规范](quality.md#physics)读取、转换与独立核验，工程师不抄写张量。
 

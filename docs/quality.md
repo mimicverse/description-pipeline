@@ -20,7 +20,7 @@
 | 机械解释 | 独立判定声明存在性；有声明时独立解码，确证无声明时独立重建完整配合集合；模式、成员和结构一致 |
 | 对象与拓扑 | 每个纳入实例恰属一个刚体，其余显式未分配；名称唯一且合规；唯一 `base_link`、连通无环树，模型/XML 集合一致 |
 | 配置与来源 | 正确引用冻结配置、活动实例和抑制状态；原生读数、实际读取错误和对象绑定保真；原件字节保持不变；派生计算在 CAD 释放后独立复核 |
-| 外观与表示 | `appearance_raw` 保留 document/occurrence/body 实际 API、配置、九值、Has、纹理名称和错误；已观测外观必须能证明实际交付面的唯一颜色与纹理表示，否则 Generate 和 Verify 明确失败 |
+| 外观与表示 | `appearance_raw` 保留 document/face 的 active property（active 必须等于 referenced configuration）、各 owner 配置/显示状态、九值、Has、原生 material count/NULL、持久引用索引、纹理和错误；独立 join 必须证明实际交付面的表示，未知绑定或无法消费的纹理使 Generate 和 Verify 明确失败 |
 | 坐标与零姿态 | 有限 SI 齐次变换、正交右手基准；独立从原生根基准计算零姿态 FK，实际产物的放置一致 |
 | 关节与轴线 | 类型、两端、完整原点、正向、限位一致；轴线绑定正确实例中的独立重读原生参考轴或圆柱面 |
 | 运动一致性 | 从原生刚性归属与接口端点独立计算非零姿态的逐叶实例运动；核对随动、组内相对变换及接口连续性，覆盖适用的单关节与关联组合 |
@@ -35,15 +35,21 @@
 
 原生读取以每个实例的实际引用配置为准，不借用共享零件文档的当前配置。网格从当前装配实例的实体和曲面取得，保持相关 COM 父接口存活；完整批次前后核对实例路径、配置和抑制状态。临时选择与配置恢复须有可核验结果。不可读活动基准、未知抑制状态或读取失败不能被静默省略，失败保留环境、会话和部分观察。
 
-外观 raw 位于 `native_capture_facts.scene_raw.occurrences[].appearance_raw`，只保留各
-owner 的原生观察，不表示已取得每个交付面的 effective appearance。三个 owner 的 raw
-值相同也不能证明不存在未读取的 face、feature 或 display-state 覆盖。Generate 必须
-拒绝实际交付外观所必需的读错、对象/配置错绑、无法唯一表达的 owner 或 body 冲突，
-以及当前没有资产、UV 和绑定消费能力的 present texture；Verify 必须从同一封存 raw
-独立复算该边界。仅在所有实际交付面可证明同一 RGBA 且纹理确证 absent 时交付单色
-材质。记录缺失、无法排除未读覆盖或只有同色多层 raw 时同样不满足交付资格，平台
-不输出默认色，也不以 warning 代替失败；名称差异的非阻塞许可不扩及颜色、纹理或
-对象绑定。
+外观 raw 位于 `native_capture_facts.scene_raw.occurrences[].appearance_raw`。document
+和 face 使用无参 active-configuration 属性，且只有实际 active 与 occurrence referenced
+configuration 相同时才能采用。top、parent 与 component-document owner 各自保留原生
+configuration/display-state，`GetRenderMaterials2` 的 NULL 原值与
+`GetRenderMaterialsCount` 分开保存：只有成功读取的原生总数确证为 0 时才可证明没有
+state render assignment；非零或未知总数下的 NULL 仍是未解析事实。
+
+state material 的原生对象绑定由 entity persistent reference 与同一 owner 的
+`native_reference_index` 独立 join，不能信任 Source 预填的 `matched_identity`。没有索引
+或索引失败的 entity 视为未知；只有索引明确指向当前交付 scope 外对象时才能忽略。
+Generate 与 Verify 分别执行该 join，并按交付 face 的 triangle span 无损分组为多个
+visual/material；alpha 从原生 index 7 的透明度派生并显示来源 warning。当前没有资产、
+UV 和绑定消费能力的 present texture、参与交付但无法证明的颜色编码、对象/配置错绑或
+冲突必须失败，不输出默认色，也不以 warning 代替失败。名称差异的非阻塞许可不扩及
+颜色、纹理或对象绑定。
 
 声明存在性是封存原生观察中的 `present / absent / unreadable / unknown`。`absent` 只在交付配置中成功完成原生声明存储查询并证明不存在时成立，必须保留查询对象、接口、返回状态及结果；缺少记录、读取失败或空的损坏载荷不是不存在。`present` 必须支持格式版本、可完整解码、适用于交付配置，全部持久组件/基准/轴引用可解析，且与原生几何和可比较工作限位一致；否则失败。推导和验证分别执行语义核对，只有存在性契约共享。
 
