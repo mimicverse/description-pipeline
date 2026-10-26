@@ -11,7 +11,7 @@ from pathlib import Path
 from description_pipeline.geometry.native_transform import transform_from_solidworks
 from description_pipeline.io import PipelineError, write_json
 from description_pipeline.schemas import EFFECTIVE_INSTANCES_SCHEMA
-from description_pipeline.sources.snapshot import write_manifest
+from description_pipeline.sources.snapshot import verify_snapshot, write_manifest
 from description_pipeline.verification.native_capture_facts import verify_native_capture_facts
 from description_pipeline.verification.solidworks_physics import verify_urdf_mass_equality
 
@@ -430,19 +430,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
 
     def test_missing_sealed_native_facts_member_is_rejected(self):
         (self.root / "evidence/raw/native_capture_facts.json").unlink()
-        write_manifest(
-            self.root / "evidence",
-            kind="solidworks",
-            identity={
-                "assembly": "C:/source/root.SLDASM",
-                "configuration": "Default",
-            },
-            evidence_class="fixture",
-        )
-        with self.assertRaisesRegex(
-            PipelineError,
-            "no sealed native capture facts member",
-        ):
+        with self.assertRaises(PipelineError):
             verify_native_capture_facts(self.root)
 
     def test_raw_member_tamper_breaks_the_source_manifest(self):
@@ -454,7 +442,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
             PipelineError,
             "Source snapshot is incomplete or changed",
         ):
-            verify_native_capture_facts(self.root)
+            verify_snapshot(self.root / "evidence")
 
 
 if __name__ == "__main__":

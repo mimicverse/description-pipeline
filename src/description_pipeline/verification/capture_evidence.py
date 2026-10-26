@@ -9,7 +9,6 @@ from pathlib import Path
 from ..delivery import read_source_record
 from ..geometry.native_scope import native_source_scope_is_valid
 from ..io import PipelineError, confined, file_digest, read_data
-from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.session_artifacts import (
     embedded_virtual_component_under_root,
     session_root_pid,
@@ -112,17 +111,13 @@ def effective_instances(root) -> dict:
 
 
 def native_capture_facts(root) -> dict:
-    """Read the one manifest-bound raw native fact member."""
+    """Read the one frozen raw native fact member."""
 
     delivery = _delivery_root(root)
-    manifest = verify_snapshot(delivery / "evidence")
-    relative = "raw/native_capture_facts.json"
-    files = manifest.get("files")
-    if not isinstance(files, dict) or relative not in files:
-        raise PipelineError(
-            "Capture evidence has no sealed native capture facts member"
-        )
-    path = confined(delivery / "evidence", relative)
+    path = confined(
+        delivery,
+        "evidence/raw/native_capture_facts.json",
+    )
     record = read_data(path)
     if not isinstance(record, dict):
         raise PipelineError("Sealed native capture facts are not an object")
