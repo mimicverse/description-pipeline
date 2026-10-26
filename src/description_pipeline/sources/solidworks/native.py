@@ -70,6 +70,8 @@ IFACE2_IID = "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}"
 ISURFACE_IID = "{83A33D40-27C5-11CE-BFD4-00400513BB57}"
 ICURVE_IID = "{83A33D44-27C5-11CE-BFD4-00400513BB57}"
 IMATHTRANSFORM_IID = "{F7D97F82-162E-11D4-AEAB-00C04FA0AC51}"
+IENTITY_IID = "{83A33D65-27C5-11CE-BFD4-00400513BB57}"
+E_NOINTERFACE_HRESULT = -2147467262
 
 # Members whose declared return is one published interface of the installed
 # SolidWorks type library. Bound inside the adapter so no caller can keep a
@@ -930,12 +932,75 @@ def _appearance_persistent_reference(extension, entity):
     return value, None
 
 
+def _appearance_interface(value, iid: str, name: str):
+    """Query one published interface and keep a failed QI separate from absence."""
+
+    if hasattr(value, "_oleobj_"):
+        try:
+            return _interface(value, iid), None
+        except Exception as error:  # noqa: BLE001 - QI failure is unresolved
+            if getattr(error, "hresult", None) == E_NOINTERFACE_HRESULT:
+                return None, None
+            return None, _native_error_record(error)
+    fixture_interfaces = getattr(value, "_fixture_interfaces", ())
+    return (value if name in fixture_interfaces else None), None
+
+
+def _appearance_active_configuration(document):
+    """Read the active configuration from the document already under observation."""
+
+    try:
+        _manager, active = _active_configuration_view(document)
+        if active is None:
+            raise ValueError("the document has no active configuration")
+        value = _json_raw_value(_member(active, "Name"))
+    except Exception as error:  # noqa: BLE001 - identity remains field-local
+        return None, _native_error_record(error)
+    if not _is_text_name(value):
+        return value, _appearance_read_error(
+            "cad_appearance_active_configuration_invalid",
+            "the document active configuration did not return a name",
+            value,
+        )
+    return value, None
+
+
 def _appearance_reference_key(value):
     if not isinstance(value, list) or not value:
         return None
     if any(type(item) is not int for item in value):
         return None
     return tuple(item & 0xFF for item in value)
+
+
+def _appearance_binding_key(reference, context):
+    reference_key = _appearance_reference_key(reference)
+    if not isinstance(context, Mapping) or reference_key is None:
+        return None
+    owner_scope = context.get("owner_scope")
+    document_path = context.get("owner_document_path")
+    component = context.get("component")
+    api = context.get("api")
+    if not all(
+        isinstance(value, str) and value
+        for value in (owner_scope, document_path, component, api)
+    ):
+        return None
+    return (
+        owner_scope,
+        normalize_document_path(document_path),
+        component,
+        api,
+        reference_key,
+    )
+
+
+def _appearance_unique_targets(targets):
+    unique = []
+    for target in targets:
+        if target not in unique:
+            unique.append(copy.deepcopy(target))
+    return unique
 
 
 def _appearance_feature_identity(face, extension):
@@ -976,7 +1041,7 @@ def _appearance_feature_identity(face, extension):
     }, feature
 
 
-def _appearance_render_material(material, index: int, extension) -> dict:
+def _appearance_render_material(material, index: int, extension):
     errors = {}
     linked_display_states, error = _appearance_value(
         material,
@@ -1005,19 +1070,50 @@ def _appearance_render_material(material, index: int, extension) -> dict:
         )
     entity_records = []
     for entity_index, entity in enumerate(entity_objects):
-        reference, reference_error = _appearance_persistent_reference(
-            extension,
-            entity,
-        )
         record_errors = {}
-        if reference_error is not None:
-            record_errors["persistent_reference"] = reference_error
+        document, interface_error = _appearance_interface(
+            entity,
+            IMODELDOC2_IID,
+            "IModelDoc2",
+        )
+        if interface_error is not None:
+            native_interface_kind = None
+            reference = None
+            record_errors["interface_query"] = interface_error
+        elif document is not None:
+            native_interface_kind = "IModelDoc2"
+            reference = None
+        else:
+            entity_interface, interface_error = _appearance_interface(
+                entity,
+                IENTITY_IID,
+                "IEntity",
+            )
+            if interface_error is not None:
+                native_interface_kind = None
+                reference = None
+                record_errors["interface_query"] = interface_error
+            else:
+                native_interface_kind = (
+                    "IEntity" if entity_interface is not None else None
+                )
+                reference, reference_error = (
+                    _appearance_persistent_reference(
+                        extension,
+                        entity,
+                    )
+                )
+                if reference_error is not None:
+                    record_errors["persistent_reference"] = (
+                        reference_error
+                    )
         entity_records.append(
             {
                 "entity_index": entity_index,
                 "native_object_type": type(entity).__name__,
-                "persistent_reference": reference,
-                "read_errors": record_errors,
+                "native_interface_kind": native_interface_kind,
+                "source_persistent_reference": reference,
+                "source_read_errors": record_errors,
             }
         )
     fields = {}
@@ -1032,7 +1128,7 @@ def _appearance_render_material(material, index: int, extension) -> dict:
         fields[key] = value
         if error is not None:
             errors[key] = error
-    return {
+    record = {
         "material_index": index,
         "linked_display_states": linked_display_states,
         "entities": entities,
@@ -1045,6 +1141,7 @@ def _appearance_render_material(material, index: int, extension) -> dict:
         "surface_finish_file": fields["surface_finish_file"],
         "read_errors": errors,
     }
+    return record, entity_objects
 
 
 def _appearance_display_state(holder):
@@ -1123,13 +1220,16 @@ def _state_render_materials_raw(
     *,
     configuration,
     display_state,
-) -> tuple[dict, dict | None]:
+) -> tuple[dict, dict | None, list[list]]:
     """Read one exact document/configuration/display-state owner result."""
 
     record = {
         "api": "IModelDocExtension.GetRenderMaterials2",
         "display_state_option": 3,
         "display_state": display_state,
+        "native_render_material_count_api": (
+            "IModelDocExtension.GetRenderMaterialsCount2"
+        ),
         "native_render_material_count": None,
         "native_render_material_count_error": None,
         "call_state": "error",
@@ -1144,18 +1244,24 @@ def _state_render_materials_raw(
             "message": "the apparent owner document is unavailable",
             "detail": {},
         }
-        return record, None
+        return record, None, []
     if not _is_text_name(display_state):
         record["call_state"] = "state_unavailable"
-        return record, None
+        return record, None, []
     try:
         import pythoncom
 
         extension = _member(document, "Extension")
+        display_state_names = _win32().VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_BSTR,
+            (display_state,),
+        )
         try:
             native_count = _method(
                 extension,
-                "GetRenderMaterialsCount",
+                "GetRenderMaterialsCount2",
+                3,
+                display_state_names,
             )
         except Exception as error:  # noqa: BLE001 - count stays field-local
             count_error = _native_error_record(error)
@@ -1166,7 +1272,7 @@ def _state_render_materials_raw(
             else:
                 count_error = _appearance_read_error(
                     "cad_appearance_render_material_count_invalid",
-                    "GetRenderMaterialsCount did not return a nonnegative integer",
+                    "GetRenderMaterialsCount2 did not return a nonnegative integer",
                     _json_raw_value(native_count),
                 )
         if count_error is not None:
@@ -1174,10 +1280,6 @@ def _state_render_materials_raw(
             record["read_errors"]["native_render_material_count"] = copy.deepcopy(
                 count_error
             )
-        display_state_names = _win32().VARIANT(
-            pythoncom.VT_ARRAY | pythoncom.VT_BSTR,
-            (display_state,),
-        )
         raw_materials = _member(
             extension,
             "GetRenderMaterials2",
@@ -1186,8 +1288,9 @@ def _state_render_materials_raw(
         )
     except Exception as error:  # noqa: BLE001 - appearance remains field-local
         record["read_errors"]["materials"] = _native_error_record(error)
-        return record, None
+        return record, None, []
     materials = _as_list(raw_materials)
+    material_entities = []
     if raw_materials is None:
         record["call_state"] = "null_result"
         record["materials"] = None
@@ -1195,11 +1298,17 @@ def _state_render_materials_raw(
         record["call_state"] = "empty"
     else:
         record["call_state"] = "observed"
-        record["materials"] = [
-            _appearance_render_material(material, index, extension)
-            for index, material in enumerate(materials)
-        ]
-    return record, extension
+        material_records = []
+        for index, material in enumerate(materials):
+            material_record, entity_objects = _appearance_render_material(
+                material,
+                index,
+                extension,
+            )
+            material_records.append(material_record)
+            material_entities.append(entity_objects)
+        record["materials"] = material_records
+    return record, extension, material_entities
 
 
 def _appearance_texture_raw(owner, configuration, read_errors):
@@ -4924,60 +5033,267 @@ class SolidWorksBackend(CadBackend):
         return rows, ancestors
 
     @staticmethod
+    def _appearance_corresponding_reference(
+        entity,
+        *,
+        source_reference,
+        source_error,
+        native_interface_kind,
+        owner_scope,
+        primary_component,
+        extension,
+    ):
+        """Resolve one underlying-document object into the assembly owner context."""
+
+        record = {
+            "owner_scope": owner_scope,
+            "input_kind": (
+                native_interface_kind
+                if native_interface_kind is not None
+                else "persistent_object"
+            ),
+            "api": None,
+            "state": "error",
+            "persistent_reference": None,
+            "read_errors": {},
+        }
+        if owner_scope != "component_document":
+            if source_reference is None or source_error is not None:
+                error = source_error or {
+                    "code": "cad_appearance_persistent_reference_missing",
+                    "message": (
+                        "the owner-context object has no persistent reference"
+                    ),
+                    "detail": {},
+                }
+                record["read_errors"]["source"] = copy.deepcopy(error)
+                return record, None
+            record["state"] = "owner_context"
+            record["api"] = "IModelDocExtension.GetPersistReference3"
+            record["persistent_reference"] = copy.deepcopy(source_reference)
+            return record, copy.deepcopy(source_reference)
+        if primary_component is None:
+            error = {
+                "code": "cad_appearance_component_unavailable",
+                "message": "the primary component occurrence is unavailable",
+                "detail": {},
+            }
+            record["read_errors"]["component"] = error
+            return record, None
+        if extension is None:
+            error = {
+                "code": "cad_appearance_owner_unavailable",
+                "message": (
+                    "the corresponding assembly document extension is "
+                    "unavailable"
+                ),
+                "detail": {},
+            }
+            record["read_errors"]["corresponding_owner"] = error
+            return record, None
+        if native_interface_kind == "IEntity":
+            api = "GetCorrespondingEntity"
+        else:
+            if source_reference is None or source_error is not None:
+                error = {
+                    "code": "cad_appearance_persistent_reference_missing",
+                    "message": (
+                        "GetCorresponding requires a source persistent reference"
+                    ),
+                    "detail": {
+                        "native_interface_kind": native_interface_kind,
+                        "reference_error": copy.deepcopy(source_error),
+                    },
+                }
+                record["read_errors"]["source"] = error
+                return record, None
+            api = "GetCorresponding"
+        record["api"] = f"IComponent2.{api}"
+        try:
+            corresponding = _member(primary_component, api, entity)
+        except Exception as error:  # noqa: BLE001 - conversion stays field-local
+            record["read_errors"]["conversion"] = _native_error_record(error)
+            return record, None
+        if corresponding is None:
+            record["state"] = "null_result"
+            return record, None
+        reference, error = _appearance_persistent_reference(
+            extension,
+            corresponding,
+        )
+        record["persistent_reference"] = reference
+        if error is not None:
+            record["read_errors"]["persistent_reference"] = copy.deepcopy(error)
+            return record, None
+        record["state"] = "observed"
+        return record, reference
+
+    @staticmethod
     def _appearance_identity_maps(
         extension,
+        *,
+        owner_scope,
+        component,
+        component_name,
+        binding_document_path,
+        corresponding_extension,
         holders,
         bodies,
         faces,
         features,
     ):
-        """Build exact persistent-reference maps for one occurrence context."""
+        """Build raw reference observations from the objects already enumerated."""
 
-        maps = {
-            "occurrences": {},
-            "bodies": {},
-            "faces": {},
-            "features": {},
-        }
+        maps = {}
         mapping_errors = []
         native_reference_index = []
+        if (
+            owner_scope == "component_document"
+            and corresponding_extension is None
+        ):
+            mapping_errors.append(
+                {
+                    "entity_kind": "owner_context",
+                    "identity": {"component": component_name},
+                    "error": {
+                        "code": "cad_appearance_owner_unavailable",
+                        "message": (
+                            "the corresponding assembly document extension is "
+                            "unavailable"
+                        ),
+                        "detail": {},
+                    },
+                }
+            )
+            return maps, mapping_errors, native_reference_index
 
         def add(kind, entity, identity):
-            reference, error = _appearance_persistent_reference(
-                extension,
+            document, interface_error = _appearance_interface(
                 entity,
+                IMODELDOC2_IID,
+                "IModelDoc2",
             )
-            if error is not None:
+            if interface_error is not None:
                 mapping_errors.append(
                     {
                         "entity_kind": kind,
                         "identity": copy.deepcopy(identity),
-                        "error": copy.deepcopy(error),
+                        "error": copy.deepcopy(interface_error),
                     }
                 )
                 return
-            key = _appearance_reference_key(reference)
-            if key is not None:
-                maps[kind].setdefault(key, []).append(identity)
-                target = copy.deepcopy(identity)
-                target.pop("persistent_reference", None)
-                native_reference_index.append(
+            if document is not None:
+                mapping_errors.append(
                     {
-                        "persistent_reference": copy.deepcopy(reference),
-                        "target": {
-                            "kind": {
-                                "occurrences": "occurrence",
-                                "bodies": "body",
-                                "faces": "face",
-                                "features": "feature",
-                            }[kind],
-                            **target,
+                        "entity_kind": kind,
+                        "identity": copy.deepcopy(identity),
+                        "error": {
+                            "code": "cad_appearance_reference_not_applicable",
+                            "message": (
+                                "a model document has a path identity, not a "
+                                "persistent reference"
+                            ),
+                            "detail": {},
                         },
                     }
                 )
+                return
+            entity_interface, interface_error = _appearance_interface(
+                entity,
+                IENTITY_IID,
+                "IEntity",
+            )
+            if interface_error is not None:
+                mapping_errors.append(
+                    {
+                        "entity_kind": kind,
+                        "identity": copy.deepcopy(identity),
+                        "error": copy.deepcopy(interface_error),
+                    }
+                )
+                return
+            native_interface_kind = (
+                "IEntity" if entity_interface is not None else None
+            )
+            source_reference, source_error = (
+                _appearance_persistent_reference(
+                    extension,
+                    entity,
+                )
+            )
+            if (
+                source_error is not None
+                and native_interface_kind != "IEntity"
+            ):
+                mapping_errors.append(
+                    {
+                        "entity_kind": kind,
+                        "identity": copy.deepcopy(identity),
+                        "error": copy.deepcopy(source_error),
+                    }
+                )
+                return
+            context, reference = SolidWorksBackend._appearance_corresponding_reference(
+                entity,
+                source_reference=source_reference,
+                source_error=source_error,
+                native_interface_kind=native_interface_kind,
+                owner_scope=owner_scope,
+                primary_component=component,
+                extension=corresponding_extension,
+            )
+            if context["state"] not in {"observed", "owner_context"}:
+                mapping_errors.append(
+                    {
+                        "entity_kind": kind,
+                        "identity": copy.deepcopy(identity),
+                        "conversion": context,
+                        "error": copy.deepcopy(
+                            next(
+                                iter(context["read_errors"].values()),
+                                {
+                                    "code": "cad_appearance_reference_unresolved",
+                                    "message": context["state"],
+                                    "detail": {},
+                                },
+                            )
+                        ),
+                    }
+                )
+                return
+            binding_context = {
+                "owner_scope": owner_scope,
+                "owner_document_path": binding_document_path,
+                "component": component_name,
+                "api": context["api"],
+            }
+            key = _appearance_binding_key(
+                reference,
+                binding_context,
+            )
+            if key is None:
+                return
+            target = {
+                "kind": {
+                    "occurrences": "occurrence",
+                    "bodies": "body",
+                    "faces": "face",
+                    "features": "feature",
+                }[kind],
+                **copy.deepcopy(identity),
+            }
+            maps.setdefault(key, []).append(target)
+            native_reference_index.append(
+                {
+                    "persistent_reference": copy.deepcopy(reference),
+                    "binding_context": copy.deepcopy(binding_context),
+                    "target": copy.deepcopy(target),
+                }
+            )
 
-        for name, component in holders:
-            add("occurrences", component, {"component": name})
+        if owner_scope != "component_document":
+            for name, holder in holders:
+                add("occurrences", holder, {"component": name})
         for row in bodies:
             add(
                 "bodies",
@@ -4999,17 +5315,48 @@ class SolidWorksBackend(CadBackend):
                     "face_index": row["face_index"],
                 },
             )
-        for row in features:
-            add(
-                "features",
-                row["feature"],
+        feature_groups = {}
+        for position, row in enumerate(features):
+            feature = row["feature"]
+            native_object = getattr(feature, "_oleobj_", feature)
+            group = feature_groups.setdefault(
+                id(native_object),
                 {
-                    "component": row["component"],
+                    "feature": feature,
+                    "position": position,
+                    "rows": [],
+                },
+            )
+            group["rows"].append(row)
+        for feature_index, group in enumerate(
+            sorted(
+                feature_groups.values(),
+                key=lambda value: value["position"],
+            )
+        ):
+            rows = group["rows"]
+            first = rows[0]
+            faces = []
+            for row in rows:
+                face = {
                     "body_type": row["body_type"],
                     "body_index": row["body_index"],
                     "face_index": row["face_index"],
-                    "name": row["identity"]["name"],
-                    "type_name": row["identity"]["type_name"],
+                }
+                if face not in faces:
+                    faces.append(face)
+            add(
+                "features",
+                group["feature"],
+                {
+                    "component": first["component"],
+                    "feature_index": feature_index,
+                    "name": first["identity"]["name"],
+                    "type_name": first["identity"]["type_name"],
+                    "persistent_reference": copy.deepcopy(
+                        first["identity"]["persistent_reference"]
+                    ),
+                    "faces": faces,
                 },
             )
         return maps, mapping_errors, native_reference_index
@@ -5043,6 +5390,42 @@ class SolidWorksBackend(CadBackend):
             for name in ancestors
             if name in current
         )
+        top_owner = next(
+            (
+                row
+                for row in owner_rows
+                if row["owner_scope"] == "top_assembly"
+            ),
+            None,
+        )
+        parent_owners = [
+            row
+            for row in owner_rows
+            if row["owner_scope"] == "parent_assembly"
+        ]
+        component_owner = (
+            parent_owners[-1] if parent_owners else top_owner
+        )
+        component_owner_document = (
+            component_owner["document"]
+            if component_owner is not None
+            else None
+        )
+        component_owner_document_path = (
+            component_owner["document_path"]
+            if component_owner is not None
+            else None
+        )
+        component_extension = None
+        component_extension_error = None
+        if component_owner_document is not None:
+            try:
+                component_extension = _member(
+                    component_owner_document,
+                    "Extension",
+                )
+            except Exception as error:  # noqa: BLE001 - owner-local conversion
+                component_extension_error = _native_error_record(error)
         records = []
         for owner in owner_rows:
             try:
@@ -5059,8 +5442,16 @@ class SolidWorksBackend(CadBackend):
                 record = {
                     "owner_document_path": owner["document_path"],
                     "owner_scope": owner["owner_scope"],
+                    "corresponding_owner_document_path": (
+                        component_owner_document_path
+                        if owner["owner_scope"] == "component_document"
+                        else owner["document_path"]
+                    ),
                     "api": "IModelDocExtension.GetRenderMaterials2",
                     "display_state_option": 3,
+                    "native_render_material_count_api": (
+                        "IModelDocExtension.GetRenderMaterialsCount2"
+                    ),
                     "native_render_material_count": None,
                     "native_render_material_count_error": None,
                     "configuration": _json_raw_value(owner_configuration),
@@ -5100,8 +5491,15 @@ class SolidWorksBackend(CadBackend):
                         configuration=owner_configuration,
                         display_state=display_state,
                     )
-                raw_record, extension = cache[key]
+                raw_record, extension, material_entities = cache[key]
                 record.update(copy.deepcopy(raw_record))
+                if (
+                    owner["owner_scope"] == "component_document"
+                    and component_extension_error is not None
+                ):
+                    record["read_errors"]["corresponding_owner"] = (
+                        copy.deepcopy(component_extension_error)
+                    )
                 if (
                     record["call_state"] == "observed"
                     and extension is not None
@@ -5112,36 +5510,85 @@ class SolidWorksBackend(CadBackend):
                         native_reference_index,
                     ) = self._appearance_identity_maps(
                         extension,
-                        holder_rows,
-                        bodies,
-                        faces,
-                        features,
+                        owner_scope=owner["owner_scope"],
+                        component=(
+                            holder
+                            if owner["owner_scope"]
+                            == "component_document"
+                            else None
+                        ),
+                        component_name=component,
+                        binding_document_path=(
+                            component_owner_document_path
+                            if owner["owner_scope"]
+                            == "component_document"
+                            else owner["document_path"]
+                        ),
+                        corresponding_extension=(
+                            component_extension
+                            if owner["owner_scope"]
+                            == "component_document"
+                            else extension
+                        ),
+                        holders=holder_rows,
+                        bodies=bodies,
+                        faces=faces,
+                        features=features,
                     )
                     record["mapping_errors"] = mapping_errors
                     record["native_reference_index"] = (
                         native_reference_index
                     )
-                    for material in record["materials"]:
-                        for entity in material["entity_records"]:
-                            entity["matched_identity"] = {
-                                kind: copy.deepcopy(
-                                    values.get(
-                                        _appearance_reference_key(
-                                            entity["persistent_reference"]
-                                        ),
-                                        [],
-                                    )
+                    for material_index, material in enumerate(
+                        record["materials"]
+                    ):
+                        entity_objects = material_entities[material_index]
+                        for entity_index, entity in enumerate(
+                            material["entity_records"]
+                        ):
+                            context = self._appearance_entity_context(
+                                entity_objects[entity_index],
+                                entity,
+                                owner_scope=owner["owner_scope"],
+                                primary_component=holder,
+                                component_name=component,
+                                binding_document_path=(
+                                    component_owner_document_path
+                                    if owner["owner_scope"]
+                                    == "component_document"
+                                    else owner["document_path"]
+                                ),
+                                corresponding_extension=(
+                                    component_extension
+                                    if owner["owner_scope"]
+                                    == "component_document"
+                                    else extension
+                                ),
+                                owner_document_path=owner[
+                                    "document_path"
+                                ],
+                                owner_configuration=owner_configuration,
+                                display_state=display_state,
+                            )
+                            entity.update(context["record"])
+                            entity.update(
+                                self._appearance_entity_binding(
+                                    context,
+                                    maps,
                                 )
-                                for kind, values in maps.items()
-                            }
+                            )
                 records.append(record)
             except Exception as error:  # noqa: BLE001 - owner-local failure
                 records.append(
                     {
                         "owner_document_path": owner.get("document_path"),
                         "owner_scope": owner.get("owner_scope", "unresolved"),
+                        "corresponding_owner_document_path": None,
                         "api": "IModelDocExtension.GetRenderMaterials2",
                         "display_state_option": 3,
+                        "native_render_material_count_api": (
+                            "IModelDocExtension.GetRenderMaterialsCount2"
+                        ),
                         "native_render_material_count": None,
                         "native_render_material_count_error": None,
                         "configuration": _json_raw_value(
@@ -5164,6 +5611,259 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
         return records
+
+    @staticmethod
+    def _appearance_entity_context(
+        entity,
+        entity_record,
+        *,
+        owner_scope,
+        primary_component,
+        component_name,
+        binding_document_path,
+        corresponding_extension,
+        owner_document_path,
+        owner_configuration,
+        display_state,
+    ):
+        """Record the entity's native identity in its actual owner context."""
+
+        native_interface_kind = entity_record.get(
+            "native_interface_kind"
+        )
+        if native_interface_kind == "IModelDoc2":
+            document, interface_error = _appearance_interface(
+                entity,
+                IMODELDOC2_IID,
+                "IModelDoc2",
+            )
+            binding_context = {
+                "owner_scope": owner_scope,
+                "owner_document_path": binding_document_path,
+                "component": component_name,
+                "api": (
+                    "IModelDoc2.GetPathName"
+                    "+ConfigurationManager.ActiveConfiguration.Name"
+                ),
+            }
+            if interface_error is not None:
+                identity = {
+                    "kind": "unresolved",
+                    "owner_document_path": owner_document_path,
+                    "owner_configuration": _json_raw_value(
+                        owner_configuration
+                    ),
+                    "owner_display_state": display_state,
+                    "binding_context": binding_context,
+                    "state": "error",
+                    "read_errors": {
+                        "interface_query": interface_error,
+                    },
+                }
+                return {
+                    "record": {
+                        "persistent_reference": None,
+                        "read_errors": copy.deepcopy(
+                            identity["read_errors"]
+                        ),
+                        "binding_context": binding_context,
+                        "native_identity": identity,
+                    },
+                    "persistent_reference": None,
+                }
+            path, path_error = _appearance_value(
+                document,
+                "GetPathName",
+                method=True,
+            )
+            active_configuration, configuration_error = (
+                _appearance_active_configuration(document)
+            )
+            errors = {}
+            if path_error is not None:
+                errors["document_path"] = path_error
+            if configuration_error is not None:
+                errors["active_configuration"] = configuration_error
+            identity = {
+                "kind": "document",
+                "qi_iid": IMODELDOC2_IID,
+                "document_path": path,
+                "active_configuration": active_configuration,
+                "owner_document_path": owner_document_path,
+                "owner_configuration": _json_raw_value(
+                    owner_configuration
+                ),
+                "owner_display_state": display_state,
+                "binding_context": binding_context,
+                "state": (
+                    "observed"
+                    if not errors
+                    else "partial"
+                    if path is not None or active_configuration is not None
+                    else "error"
+                ),
+                "read_errors": errors,
+            }
+            return {
+                "record": {
+                    "persistent_reference": None,
+                    "read_errors": {},
+                    "binding_context": binding_context,
+                    "native_identity": identity,
+                },
+                "persistent_reference": None,
+            }
+
+        source_errors = entity_record.get("source_read_errors", {})
+        source_reference = entity_record.get(
+            "source_persistent_reference"
+        )
+        source_error = source_errors.get("persistent_reference")
+        if source_errors.get("interface_query") is not None:
+            context = {
+                "owner_scope": owner_scope,
+                "input_kind": "unresolved",
+                "api": None,
+                "state": "error",
+                "persistent_reference": None,
+                "read_errors": {
+                    "interface_query": copy.deepcopy(
+                        source_errors["interface_query"]
+                    )
+                },
+            }
+            binding_context = {
+                "owner_scope": owner_scope,
+                "owner_document_path": binding_document_path,
+                "component": component_name,
+                "api": None,
+            }
+            identity = {
+                "kind": "unresolved",
+                "owner_document_path": owner_document_path,
+                "owner_configuration": _json_raw_value(
+                    owner_configuration
+                ),
+                "owner_display_state": display_state,
+                "binding_context": binding_context,
+                "context": context,
+            }
+            return {
+                "record": {
+                    "persistent_reference": None,
+                    "read_errors": copy.deepcopy(
+                        context["read_errors"]
+                    ),
+                    "binding_context": binding_context,
+                    "native_identity": identity,
+                },
+                "persistent_reference": None,
+            }
+        context, reference = (
+            SolidWorksBackend._appearance_corresponding_reference(
+                entity,
+                source_reference=source_reference,
+                source_error=source_error,
+                native_interface_kind=native_interface_kind,
+                owner_scope=owner_scope,
+                primary_component=primary_component,
+                extension=corresponding_extension,
+            )
+        )
+        binding_context = {
+            "owner_scope": owner_scope,
+            "owner_document_path": binding_document_path,
+            "component": component_name,
+            "api": context["api"],
+        }
+        identity = {
+            "kind": (
+                "entity"
+                if native_interface_kind == "IEntity"
+                else "object"
+            ),
+            "owner_document_path": owner_document_path,
+            "owner_configuration": _json_raw_value(owner_configuration),
+            "owner_display_state": display_state,
+            "binding_context": binding_context,
+            "context": context,
+        }
+        return {
+            "record": {
+                "persistent_reference": copy.deepcopy(reference),
+                "read_errors": copy.deepcopy(
+                    context["read_errors"]
+                ),
+                "binding_context": binding_context,
+                "native_identity": identity,
+            },
+            "persistent_reference": reference,
+        }
+
+    @staticmethod
+    def _appearance_entity_binding(context, maps):
+        """Join one context-qualified reference to zero, one, or many targets."""
+
+        indexed_targets = _appearance_unique_targets(
+            maps.get(
+                _appearance_binding_key(
+                    context["persistent_reference"],
+                    context["record"]["binding_context"],
+                ),
+                [],
+            )
+        )
+        document_identity = context["record"]["native_identity"]
+        allowed_target_kinds = (
+            {"face"}
+            if document_identity.get("kind") == "entity"
+            else {"occurrence", "body", "feature"}
+        )
+        targets = [
+            target
+            for target in indexed_targets
+            if target.get("kind") in allowed_target_kinds
+        ]
+        matched_identity = {
+            kind: []
+            for kind in (
+                "occurrences",
+                "bodies",
+                "faces",
+                "features",
+            )
+        }
+        if (
+            document_identity.get("kind") == "document"
+            and document_identity.get("state") in {"observed", "partial"}
+            and isinstance(document_identity.get("document_path"), str)
+        ):
+            binding_state = "document"
+            binding_candidates = [copy.deepcopy(document_identity)]
+        elif len(targets) == 1:
+            binding_state = "unique"
+            binding_candidates = targets
+            target = copy.deepcopy(targets[0])
+            target_kind = target.pop("kind")
+            matched_identity[
+                {
+                    "occurrence": "occurrences",
+                    "body": "bodies",
+                    "face": "faces",
+                    "feature": "features",
+                }[target_kind]
+            ].append(target)
+        elif targets:
+            binding_state = "ambiguous"
+            binding_candidates = targets
+        else:
+            binding_state = "unbound"
+            binding_candidates = []
+        return {
+            "binding_state": binding_state,
+            "binding_candidates": binding_candidates,
+            "matched_identity": matched_identity,
+        }
 
     def capture_prepared_geometry(self, source_scopes, on_activity=None):
         """Capture direct raw triangles for every occurrence in memory.
@@ -5672,6 +6372,9 @@ class SolidWorksBackend(CadBackend):
                     "owner_scope": "unresolved",
                     "api": "IModelDocExtension.GetRenderMaterials2",
                     "display_state_option": 3,
+                    "native_render_material_count_api": (
+                        "IModelDocExtension.GetRenderMaterialsCount2"
+                    ),
                     "native_render_material_count": None,
                     "native_render_material_count_error": None,
                     "configuration": None,

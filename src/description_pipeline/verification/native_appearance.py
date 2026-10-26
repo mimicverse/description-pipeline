@@ -50,6 +50,115 @@ def _persistent_reference_key(value: object) -> tuple[int, ...] | None:
     return tuple(item & 0xFF for item in value)
 
 
+def _document_path_key(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value.replace("\\", "/").casefold()
+
+
+def _binding_context_key(value: object):
+    _require(isinstance(value, Mapping), "A native binding context is malformed")
+    owner_scope = value.get("owner_scope")
+    document_path = _document_path_key(value.get("owner_document_path"))
+    component = value.get("component")
+    api = value.get("api")
+    _require(
+        isinstance(owner_scope, str)
+        and bool(owner_scope)
+        and document_path is not None
+        and isinstance(component, str)
+        and bool(component)
+        and isinstance(api, str)
+        and bool(api),
+        "A native binding context is incomplete",
+    )
+    return owner_scope, document_path, component, api
+
+
+def _unique_current_targets(targets: Sequence[Mapping], *, component: str):
+    current = {}
+    for target in targets:
+        target_component = target.get("component")
+        _require(
+            isinstance(target_component, str) and bool(target_component),
+            "A native reference target has no exact component",
+        )
+        if target_component != component:
+            continue
+        kind = target["kind"]
+        if kind == "occurrence":
+            identity = ("occurrence", component, 0, 0, 0)
+        elif kind == "feature":
+            feature_identity = _feature_target_identity(target)
+            _require(
+                isinstance(target.get("faces"), list),
+                "A native feature target has no footprint",
+            )
+            for face in target["faces"]:
+                _require(
+                    isinstance(face, Mapping)
+                    and _face_key(
+                        face.get("body_type"),
+                        face.get("body_index"),
+                        face.get("face_index"),
+                    )
+                    is not None,
+                    "A native feature footprint has an invalid face",
+                )
+            identity = (
+                "feature",
+                component,
+                0,
+                0,
+                0,
+                feature_identity,
+            )
+        else:
+            face_key = _face_key(
+                target.get("body_type"),
+                target.get("body_index"),
+                target.get("face_index", 0),
+            )
+            identity = (
+                kind,
+                component,
+                face_key[0],
+                face_key[1],
+                face_key[2],
+            )
+        current.setdefault(identity, target)
+    return current
+
+
+def _feature_target_identity(target: Mapping):
+    name = target.get("name")
+    type_name = target.get("type_name")
+    _require(
+        isinstance(name, str)
+        and bool(name)
+        and isinstance(type_name, str)
+        and bool(type_name),
+        "A feature target has no native feature identity",
+    )
+    persistent_identity = target.get("persistent_identity")
+    if persistent_identity is None:
+        persistent_identity = target.get("persistent_reference")
+    if isinstance(persistent_identity, list):
+        persistent_identity = tuple(persistent_identity)
+    elif isinstance(persistent_identity, Mapping):
+        persistent_identity = tuple(
+            sorted(
+                (str(key), str(value))
+                for key, value in persistent_identity.items()
+            )
+        )
+    elif persistent_identity is not None and type(
+        persistent_identity
+    ) not in (int, str):
+        raise PipelineError("A feature target identity is not canonical")
+    return name, type_name, persistent_identity
+
+
 def _valid_values(value: object) -> bool:
     return (
         isinstance(value, list)
@@ -309,6 +418,8 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             and isinstance(owner.get("mapping_errors"), list)
             and isinstance(owner.get("native_reference_index"), list)
             and isinstance(owner.get("materials"), (list, type(None)))
+            and owner.get("native_render_material_count_api")
+            == "IModelDocExtension.GetRenderMaterialsCount2"
             and (
                 (
                     owner.get("native_render_material_count") is None
@@ -371,15 +482,22 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             indexed_key = _persistent_reference_key(
                 indexed.get("persistent_reference")
             )
+            indexed_context = _binding_context_key(
+                indexed.get("binding_context")
+            )
             target = indexed.get("target")
             _require(
                 indexed_key is not None
+                and indexed_context is not None
                 and isinstance(target, Mapping)
                 and target.get("kind")
                 in {"occurrence", "body", "face", "feature"},
                 f"{index_path} cannot be bound exactly",
             )
-            reference_index.setdefault(indexed_key, []).append(target)
+            reference_index.setdefault(
+                (indexed_key, indexed_context),
+                [],
+            ).append(target)
         for index, material in enumerate(owner["materials"]):
             material_path = f"{owner_path}.materials[{index}]"
             _require(
@@ -423,56 +541,91 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     ,
                     f"{entity_path} is malformed",
                 )
-                entity_key = _persistent_reference_key(
-                    entity.get("persistent_reference")
+                context_key = _binding_context_key(
+                    entity.get("binding_context")
                 )
                 _require(
-                    entity_key is not None
-                    and not entity["read_errors"],
-                    f"{entity_path} has no usable native identity",
+                    context_key[2] == component,
+                    f"{entity_path} binding context names another component",
                 )
-                targets = reference_index.get(entity_key)
-                _require(
-                    bool(targets),
-                    f"{entity_path} has no native reference-index binding",
+                native_identity = entity.get("native_identity")
+                document_identity = (
+                    native_identity
+                    if isinstance(native_identity, Mapping)
+                    and native_identity.get("kind") == "document"
+                    else None
                 )
-                current_targets = {}
-                for target in targets:
-                    target_component = target.get("component")
+                if document_identity is not None:
                     _require(
-                        isinstance(target_component, str)
-                        and bool(target_component),
-                        f"{entity_path} target has no exact component",
+                        not entity["read_errors"]
+                        and document_identity.get("state") == "observed"
+                        and not document_identity.get("read_errors")
+                        and _document_path_key(
+                            document_identity.get("document_path")
+                        )
+                        == _document_path_key(raw.get("source_document_path"))
+                        and document_identity.get("active_configuration")
+                        == configuration
+                        and _document_path_key(
+                            document_identity.get("owner_document_path")
+                        )
+                        == _document_path_key(raw.get("source_document_path"))
+                        and document_identity.get("owner_configuration")
+                        == configuration
+                        and document_identity.get("owner_display_state")
+                        == display_state,
+                        f"{entity_path} document identity is not the current leaf",
                     )
-                    if target_component != component:
-                        continue
-                    kind = target["kind"]
-                    if kind == "occurrence":
-                        identity = ("occurrence", component, 0, 0, 0)
-                    else:
-                        face_key = _face_key(
-                            target.get("body_type"),
-                            target.get("body_index"),
-                            target.get("face_index", 0),
-                        )
-                        _require(
-                            face_key is not None,
-                            f"{entity_path} target identity is invalid",
-                        )
-                        identity = (
-                            kind,
-                            component,
-                            face_key[0],
-                            face_key[1],
-                            face_key[2],
-                        )
-                    current_targets.setdefault(identity, target)
+                    current_targets = {
+                        ("occurrence", component, 0, 0, 0): {}
+                    }
+                else:
+                    entity_key = _persistent_reference_key(
+                        entity.get("persistent_reference")
+                    )
+                    _require(
+                        entity_key is not None and not entity["read_errors"],
+                        f"{entity_path} has no usable native identity",
+                    )
+                    targets = reference_index.get(
+                        (entity_key, context_key)
+                    )
+                    _require(
+                        bool(targets),
+                        f"{entity_path} has no native reference-index binding",
+                    )
+                    current_targets = _unique_current_targets(
+                        targets,
+                        component=component,
+                    )
+                if not current_targets:
+                    continue
+                if all(
+                    identity[0] == "feature"
+                    for identity in current_targets
+                ):
+                    feature_identities = {
+                        _feature_target_identity(target)
+                        for target in current_targets.values()
+                    }
+                    _require(
+                        len(feature_identities) == 1,
+                        f"{entity_path} native reference aliases multiple features",
+                    )
+                    for target in current_targets.values():
+                        for item in target["faces"]:
+                            face = (
+                                item["body_type"],
+                                item["body_index"],
+                                item["face_index"],
+                            )
+                            if face in all_faces:
+                                faces_by_scope["feature"].add(face)
+                    continue
                 _require(
                     len(current_targets) <= 1,
                     f"{entity_path} native reference aliases multiple targets",
                 )
-                if not current_targets:
-                    continue
                 kind, _component, body_type, body_index, face_index = next(
                     iter(current_targets)
                 )

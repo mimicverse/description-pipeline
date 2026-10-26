@@ -200,14 +200,37 @@ def _issue(
     }
 
 
+def _document_path_key(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return posixpath.normpath(value.replace("\\", "/")).casefold()
+
+
 def _same_document_path(left: object, right: object) -> bool:
-    if not isinstance(left, str) or not isinstance(right, str) or not left or not right:
-        return False
+    left_key = _document_path_key(left)
+    return left_key is not None and left_key == _document_path_key(right)
 
-    def normalized(value: str) -> str:
-        return posixpath.normpath(value.replace("\\", "/")).casefold()
 
-    return normalized(left) == normalized(right)
+def _binding_context_key(value: object):
+    if not isinstance(value, Mapping):
+        return None
+    owner_scope = value.get("owner_scope")
+    owner_document_path = _document_path_key(
+        value.get("owner_document_path")
+    )
+    component = value.get("component")
+    api = value.get("api")
+    if (
+        not isinstance(owner_scope, str)
+        or not owner_scope
+        or owner_document_path is None
+        or not isinstance(component, str)
+        or not component
+        or not isinstance(api, str)
+        or not api
+    ):
+        return None
+    return owner_scope, owner_document_path, component, api
 
 
 def _valid_values(value: object) -> bool:
@@ -262,6 +285,116 @@ def _persistent_reference_key(value: object) -> tuple[int, ...] | None:
     ):
         return None
     return tuple(item & 0xFF for item in value)
+
+
+def _unique_current_targets(
+    targets: Sequence[Mapping[str, Any]],
+    *,
+    component: str,
+    path: str,
+) -> dict[tuple, Mapping[str, Any]]:
+    current: dict[tuple, Mapping[str, Any]] = {}
+    for target in targets:
+        target_component = target.get("component")
+        if not isinstance(target_component, str) or not target_component:
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_render_entity_invalid",
+                path,
+                "a native reference target has no exact component",
+            )
+        if target_component != component:
+            continue
+        kind = target["kind"]
+        if kind == "occurrence":
+            identity = ("occurrence", component, 0, 0, 0)
+        elif kind == "feature":
+            feature_identity = _feature_target_identity(target)
+            if feature_identity is None or not isinstance(
+                target.get("faces"),
+                list,
+            ):
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_entity_invalid",
+                    path,
+                    "a native feature target has no exact footprint",
+                )
+            for face in target["faces"]:
+                if (
+                    not isinstance(face, Mapping)
+                    or _face_key(
+                        face.get("body_type"),
+                        face.get("body_index"),
+                        face.get("face_index"),
+                    )
+                    is None
+                ):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_invalid",
+                        path,
+                        "a native feature footprint has an invalid face",
+                    )
+            identity = (
+                "feature",
+                component,
+                0,
+                0,
+                0,
+                feature_identity,
+            )
+        else:
+            face_key = _face_key(
+                target.get("body_type"),
+                target.get("body_index"),
+                target.get("face_index", 0),
+            )
+            if face_key is None:
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_entity_invalid",
+                    path,
+                    "a native reference target identity is invalid",
+                )
+            identity = (
+                kind,
+                component,
+                face_key[0],
+                face_key[1],
+                face_key[2],
+            )
+        current.setdefault(identity, target)
+    return current
+
+
+def _feature_target_identity(target: Mapping[str, Any]):
+    name = target.get("name")
+    type_name = target.get("type_name")
+    if (
+        not isinstance(name, str)
+        or not name
+        or not isinstance(type_name, str)
+        or not type_name
+    ):
+        return None
+    persistent_identity = target.get("persistent_identity")
+    if persistent_identity is None:
+        persistent_identity = target.get("persistent_reference")
+    if isinstance(persistent_identity, list):
+        persistent_identity = tuple(persistent_identity)
+    elif isinstance(persistent_identity, Mapping):
+        persistent_identity = tuple(
+            sorted(
+                (str(key), str(value))
+                for key, value in persistent_identity.items()
+            )
+        )
+    elif persistent_identity is not None and type(
+        persistent_identity
+    ) not in (int, str):
+        return None
+    return name, type_name, persistent_identity
 
 
 def _rgba_from_material_values(
@@ -830,6 +963,8 @@ def resolve_deliverable_appearance(
                     or owner.get("native_render_material_count_error") is not None
                 )
             )
+            or owner.get("native_render_material_count_api")
+            != "IModelDocExtension.GetRenderMaterialsCount2"
             or not isinstance(owner.get("mapping_errors"), list)
             or not isinstance(owner.get("native_reference_index"), list)
             or not isinstance(owner.get("read_errors"), Mapping)
@@ -907,7 +1042,10 @@ def resolve_deliverable_appearance(
                     else None
                 ),
             )
-        reference_index: dict[tuple[int, ...], list[Mapping[str, Any]]] = {}
+        reference_index: dict[
+            tuple[tuple[int, ...], tuple[str, str, str, str]],
+            list[Mapping[str, Any]],
+        ] = {}
         for index_position, indexed in enumerate(
             owner["native_reference_index"]
         ):
@@ -925,9 +1063,13 @@ def resolve_deliverable_appearance(
             indexed_key = _persistent_reference_key(
                 indexed.get("persistent_reference")
             )
+            indexed_context = _binding_context_key(
+                indexed.get("binding_context")
+            )
             target = indexed.get("target")
             if (
                 indexed_key is None
+                or indexed_context is None
                 or not isinstance(target, Mapping)
                 or target.get("kind")
                 not in {"occurrence", "body", "face", "feature"}
@@ -938,7 +1080,10 @@ def resolve_deliverable_appearance(
                     index_path,
                     "a native reference index entry cannot be bound exactly",
                 )
-            reference_index.setdefault(indexed_key, []).append(target)
+            reference_index.setdefault(
+                (indexed_key, indexed_context),
+                [],
+            ).append(target)
         for material_position, material in enumerate(owner["materials"]):
             path = f"{owner_path}.materials[{material_position}]"
             if not isinstance(material, Mapping):
@@ -1006,68 +1151,121 @@ def resolve_deliverable_appearance(
                         entity_path,
                         "a display-state render-material entity cannot be bound exactly",
                     )
-                entity_key = _persistent_reference_key(
-                    entity.get("persistent_reference")
+                context_key = _binding_context_key(
+                    entity.get("binding_context")
                 )
-                if entity_key is None or entity["read_errors"]:
+                if context_key is None or (
+                    context_key[2] != component
+                ):
                     raise _appearance_resolution_error(
                         component,
                         "cad_appearance_render_entity_binding_unproven",
-                        entity_path + ".persistent_reference",
-                        "a display-state render-material entity has no usable native identity",
-                        observed=entity.get("persistent_reference"),
-                        errors=dict(entity["read_errors"]),
+                        entity_path + ".binding_context",
+                        "a display-state entity has no exact current binding context",
                     )
-                targets = reference_index.get(entity_key)
-                if not targets:
-                    raise _appearance_resolution_error(
-                        component,
-                        "cad_appearance_render_entity_binding_unproven",
-                        entity_path + ".persistent_reference",
-                        "the native reference index does not bind this entity",
-                    )
-                current_targets: dict[
-                    tuple[str, str, int, int, int],
-                    Mapping[str, Any],
-                ] = {}
-                for target in targets:
-                    target_component = target.get("component")
+                native_identity = entity.get("native_identity")
+                document_identity = (
+                    native_identity
+                    if isinstance(native_identity, Mapping)
+                    and native_identity.get("kind") == "document"
+                    else None
+                )
+                if document_identity is not None:
                     if (
-                        not isinstance(target_component, str)
-                        or not target_component
+                        entity["read_errors"]
+                        or document_identity.get("state") != "observed"
+                        or document_identity.get("read_errors")
+                        or _document_path_key(
+                            document_identity.get("document_path")
+                        )
+                        != _document_path_key(expected_document_path)
+                        or document_identity.get("active_configuration")
+                        != configuration
+                        or _document_path_key(
+                            document_identity.get("owner_document_path")
+                        )
+                        != _document_path_key(expected_document_path)
+                        or document_identity.get("owner_configuration")
+                        != configuration
+                        or document_identity.get("owner_display_state")
+                        != display_state
                     ):
                         raise _appearance_resolution_error(
                             component,
-                            "cad_appearance_render_entity_invalid",
+                            "cad_appearance_render_entity_binding_unproven",
+                            entity_path + ".native_identity",
+                            "a document entity is not the exact current leaf target",
+                            observed=dict(document_identity),
+                        )
+                    current_targets = {
+                        ("occurrence", component, 0, 0, 0): {}
+                    }
+                else:
+                    entity_key = _persistent_reference_key(
+                        entity.get("persistent_reference")
+                    )
+                    if entity_key is None or entity["read_errors"]:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_binding_unproven",
                             entity_path + ".persistent_reference",
-                            "a native reference target has no exact component",
+                            "a display-state render-material entity has no usable native identity",
+                            observed=entity.get("persistent_reference"),
+                            errors=dict(entity["read_errors"]),
                         )
-                    if target_component != component:
-                        continue
-                    kind = target["kind"]
-                    if kind == "occurrence":
-                        identity = ("occurrence", component, 0, 0, 0)
-                    else:
-                        face_key = _face_key(
-                            target.get("body_type"),
-                            target.get("body_index"),
-                            target.get("face_index", 0),
+                    targets = reference_index.get(
+                        (entity_key, context_key)
+                    )
+                    if not targets:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_binding_unproven",
+                            entity_path + ".persistent_reference",
+                            "the native reference index does not bind this entity",
                         )
-                        if face_key is None:
+                    current_targets = _unique_current_targets(
+                        targets,
+                        component=component,
+                        path=entity_path + ".persistent_reference",
+                    )
+                if not current_targets:
+                    continue
+                if all(
+                    identity[0] == "feature"
+                    for identity in current_targets
+                ):
+                    feature_identities = set()
+                    for target in current_targets.values():
+                        feature_identity = _feature_target_identity(target)
+                        if feature_identity is None:
                             raise _appearance_resolution_error(
                                 component,
                                 "cad_appearance_render_entity_invalid",
                                 entity_path + ".persistent_reference",
-                                "a native reference target identity is invalid",
+                                "a feature target has no native feature identity",
                             )
-                        identity = (
-                            kind,
+                        feature_identities.add(feature_identity)
+                    if len(feature_identities) != 1:
+                        raise _appearance_resolution_error(
                             component,
-                            face_key[0],
-                            face_key[1],
-                            face_key[2],
+                            "cad_appearance_render_entity_ambiguous",
+                            entity_path + ".persistent_reference",
+                            "a native reference aliases multiple distinct features",
+                            feature_identities=[
+                                list(identity)
+                                for identity in sorted(feature_identities)
+                            ],
                         )
-                    current_targets.setdefault(identity, target)
+                    for target in current_targets.values():
+                        for item in target["faces"]:
+                            face = (
+                                item["body_type"],
+                                item["body_index"],
+                                item["face_index"],
+                            )
+                            if face in all_faces:
+                                faces_by_scope["feature"].add(face)
+                    continue
                 if len(current_targets) > 1:
                     raise _appearance_resolution_error(
                         component,
@@ -1085,8 +1283,6 @@ def resolve_deliverable_appearance(
                             for identity in sorted(current_targets)
                         ],
                     )
-                if not current_targets:
-                    continue
                 kind, _component, body_type, body_index, face_index = next(
                     iter(current_targets)
                 )

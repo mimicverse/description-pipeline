@@ -284,6 +284,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         "entity_index": 0,
                         "native_object_type": "_CDispatch",
                         "persistent_reference": [1, 2, 3],
+                        "binding_context": {
+                            "owner_scope": "component_document",
+                            "owner_document_path": "C:/cad/arm.SLDPRT",
+                            "component": "arm-1",
+                            "api": "IComponent2.GetCorresponding",
+                        },
                         "matched_identity": {
                             "occurrences": [],
                             "bodies": [],
@@ -338,6 +344,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         owner["native_reference_index"] = [
             {
                 "persistent_reference": [1, 2, 3],
+                "binding_context": {
+                    "owner_scope": "component_document",
+                    "owner_document_path": "C:/cad/arm.SLDPRT",
+                    "component": "arm-1",
+                    "api": "IComponent2.GetCorrespondingEntity",
+                },
                 "target": {
                     "kind": "face",
                     "component": "arm-1",
@@ -359,6 +371,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         "entity_index": 0,
                         "native_object_type": "_CDispatch",
                         "persistent_reference": [1, 2, 3],
+                        "binding_context": {
+                            "owner_scope": "component_document",
+                            "owner_document_path": "C:/cad/arm.SLDPRT",
+                            "component": "arm-1",
+                            "api": "IComponent2.GetCorrespondingEntity",
+                        },
                         "matched_identity": {},
                         "read_errors": {},
                     }
@@ -380,6 +398,200 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 configuration="Painted",
                 where="capture",
             )
+
+    def test_independent_appearance_merges_only_one_feature_footprint(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        for feature_names, should_pass in (
+            (("Boss-Extrude1", "Boss-Extrude1"), True),
+            (("Boss-Extrude1", "Cut-Extrude1"), False),
+        ):
+            with self.subTest(feature_names=feature_names):
+                raw = hermetic._fixture_appearance_raw(
+                    "arm-1",
+                    {
+                        "source_document_path": "C:/cad/arm.SLDPRT",
+                        "referenced_configuration": "Painted",
+                    },
+                    [
+                        {"body_type": 0, "body_index": 0, "face_index": 0},
+                        {"body_type": 0, "body_index": 0, "face_index": 1},
+                    ],
+                )
+                owner = raw["state_render_materials"][-1]
+                owner["call_state"] = "observed"
+                owner["native_render_material_count"] = 1
+                binding_context = {
+                    "owner_scope": "component_document",
+                    "owner_document_path": "C:/cad/arm.SLDPRT",
+                    "component": "arm-1",
+                    "api": "IComponent2.GetCorresponding",
+                }
+                feature_identities = (
+                    [(feature_names[0], [0, 1])]
+                    if should_pass
+                    else [("Boss-Extrude1", [0]), ("Cut-Extrude1", [1])]
+                )
+                owner["native_reference_index"] = [
+                    {
+                        "persistent_reference": [1, 2, 3],
+                        "binding_context": binding_context,
+                        "target": {
+                            "kind": "feature",
+                            "component": "arm-1",
+                            "name": feature_name,
+                            "type_name": "Extrusion",
+                            "persistent_reference": [4, 5, 6 + index],
+                            "faces": [
+                                {
+                                    "body_type": 0,
+                                    "body_index": 0,
+                                    "face_index": face_index,
+                                }
+                                for face_index in face_indices
+                            ],
+                        },
+                    }
+                    for index, (feature_name, face_indices) in enumerate(
+                        feature_identities
+                    )
+                ]
+                owner["materials"] = [
+                    {
+                        "material_index": 0,
+                        "linked_display_states": ["Default_Display_State"],
+                        "entities": ["feature"],
+                        "entities_state": "observed",
+                        "entity_records": [
+                            {
+                                "entity_index": 0,
+                                "native_object_type": "_CDispatch",
+                                "persistent_reference": [1, 2, 3],
+                                "binding_context": binding_context,
+                                "matched_identity": {},
+                                "read_errors": {},
+                            }
+                        ],
+                        "primary_color": 0x000000FF,
+                        "transparency": 0.0,
+                        "color_form": 1,
+                        "texture_filename": "",
+                        "surface_finish_file": "",
+                        "read_errors": {},
+                    }
+                ]
+                for base_owner in (
+                    raw["document"],
+                    raw["occurrence"],
+                ):
+                    base_owner["material_property_values"] = None
+                    base_owner["has_material_property_values"] = False
+                for body in raw["bodies"]:
+                    body["appearance"]["material_property_values"] = None
+                    body["appearance"]["has_material_property_values"] = False
+                    for face in body["faces"]:
+                        face["appearance"]["material_property_values"] = None
+                        face["appearance"]["has_material_property_values"] = False
+                if should_pass:
+                    resolved = _resolved_faces(
+                        raw,
+                        configuration="Painted",
+                        where="capture",
+                    )
+                    self.assertEqual(
+                        {
+                            face["rgba"]
+                            for face in resolved["faces"].values()
+                        },
+                        {(1.0, 0.0, 0.0, 1.0)},
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        PipelineError,
+                        "aliases multiple features",
+                    ):
+                        _resolved_faces(
+                            raw,
+                            configuration="Painted",
+                            where="capture",
+                        )
+
+    def test_independent_document_material_precedes_legacy_texture(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        raw = hermetic._fixture_appearance_raw(
+            "arm-1",
+            {
+                "source_document_path": "C:/cad/arm.SLDPRT",
+                "referenced_configuration": "Painted",
+            },
+            [
+                {"body_type": 0, "body_index": 0, "face_index": 0},
+                {"body_type": 0, "body_index": 0, "face_index": 1},
+            ],
+        )
+        owner = raw["state_render_materials"][-1]
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Default_Display_State"],
+                "entities": ["document"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "IModelDoc2",
+                        "persistent_reference": None,
+                        "binding_context": {
+                            "owner_scope": "component_document",
+                            "owner_document_path": "fixture-top.SLDASM",
+                            "component": "arm-1",
+                            "api": (
+                                "IModelDoc2.GetPathName"
+                                "+ConfigurationManager.ActiveConfiguration.Name"
+                            ),
+                        },
+                        "native_identity": {
+                            "kind": "document",
+                            "document_path": "C:/cad/arm.SLDPRT",
+                            "active_configuration": "Painted",
+                            "owner_document_path": "C:/cad/arm.SLDPRT",
+                            "owner_configuration": "Painted",
+                            "owner_display_state": "Default_Display_State",
+                            "state": "observed",
+                            "read_errors": {},
+                        },
+                        "matched_identity": {},
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x000000FF,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        raw["document"]["texture"] = {
+            "configuration": "Painted",
+            "state": "present",
+            "material_name": "",
+        }
+        resolved = _resolved_faces(
+            raw,
+            configuration="Painted",
+            where="capture",
+        )
+        self.assertEqual(
+            {
+                face["rgba"]
+                for face in resolved["faces"].values()
+            },
+            {(1.0, 0.0, 0.0, 1.0)},
+        )
 
     def test_independent_appearance_accepts_null_with_zero_native_count(self):
         from description_pipeline.verification.native_appearance import _resolved_faces
@@ -431,6 +643,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         owner["native_reference_index"] = [
             {
                 "persistent_reference": [4, 5, 6],
+                "binding_context": {
+                    "owner_scope": "top_assembly",
+                    "owner_document_path": "fixture-top.SLDASM",
+                    "component": "arm-1",
+                    "api": "IComponent2.GetCorrespondingEntity",
+                },
                 "target": {
                     "kind": "occurrence",
                     "component": "arm-1",
@@ -448,6 +666,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         "entity_index": 0,
                         "native_object_type": "IFace2",
                         "persistent_reference": [4, 5, 6],
+                        "binding_context": {
+                            "owner_scope": "top_assembly",
+                            "owner_document_path": "fixture-top.SLDASM",
+                            "component": "arm-1",
+                            "api": "IComponent2.GetCorrespondingEntity",
+                        },
                         "matched_identity": {
                             "occurrences": [],
                             "bodies": [],
@@ -627,6 +851,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         "display_state": "Display State 1",
                         "display_states": None,
                         "display_states_state": "not_applicable",
+                        "native_render_material_count_api": (
+                            "IModelDocExtension.GetRenderMaterialsCount2"
+                        ),
                         "native_render_material_count": 0,
                         "native_render_material_count_error": None,
                         "call_state": "empty",

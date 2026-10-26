@@ -125,6 +125,9 @@ def _empty_state_owner(
         "display_state": display_state,
         "display_states": display_states,
         "display_states_state": display_states_state,
+        "native_render_material_count_api": (
+            "IModelDocExtension.GetRenderMaterialsCount2"
+        ),
         "native_render_material_count": 0,
         "native_render_material_count_error": None,
         "call_state": "empty",
@@ -132,6 +135,20 @@ def _empty_state_owner(
         "mapping_errors": [],
         "native_reference_index": [],
         "read_errors": {},
+    }
+
+
+def _binding_context(
+    *,
+    owner_scope: str,
+    owner_document_path: str,
+    api: str = "IComponent2.GetCorrespondingEntity",
+):
+    return {
+        "owner_scope": owner_scope,
+        "owner_document_path": owner_document_path,
+        "component": COMPONENT,
+        "api": api,
     }
 
 
@@ -352,6 +369,10 @@ class AppearanceResolutionTests(unittest.TestCase):
         top["native_reference_index"] = [
             {
                 "persistent_reference": [4, 5, 6],
+                "binding_context": _binding_context(
+                    owner_scope="top_assembly",
+                    owner_document_path=r"C:\capture\robot.SLDASM",
+                ),
                 "target": {
                     "kind": "occurrence",
                     "component": COMPONENT,
@@ -369,6 +390,10 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "entity_index": 0,
                         "native_object_type": "IFace2",
                         "persistent_reference": [4, 5, 6],
+                        "binding_context": _binding_context(
+                            owner_scope="top_assembly",
+                            owner_document_path=r"C:\capture\robot.SLDASM",
+                        ),
                         "matched_identity": {
                             "occurrences": [],
                             "bodies": [],
@@ -561,6 +586,11 @@ class AppearanceResolutionTests(unittest.TestCase):
         owner["native_reference_index"] = [
             {
                 "persistent_reference": [1, 2, 3],
+                "binding_context": _binding_context(
+                    owner_scope="component_document",
+                    owner_document_path=DOCUMENT,
+                    api="IComponent2.GetCorresponding",
+                ),
                 "target": {"kind": "occurrence", "component": COMPONENT},
             }
         ]
@@ -575,6 +605,11 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "entity_index": 0,
                         "native_object_type": "_CDispatch",
                         "persistent_reference": [1, 2, 3],
+                        "binding_context": _binding_context(
+                            owner_scope="component_document",
+                            owner_document_path=DOCUMENT,
+                            api="IComponent2.GetCorresponding",
+                        ),
                         "matched_identity": {},
                         "read_errors": {},
                     }
@@ -628,6 +663,11 @@ class AppearanceResolutionTests(unittest.TestCase):
         owner["native_reference_index"] = [
             {
                 "persistent_reference": [1, 2, 3],
+                "binding_context": _binding_context(
+                    owner_scope="component_document",
+                    owner_document_path=DOCUMENT,
+                    api="IComponent2.GetCorrespondingEntity",
+                ),
                 "target": {
                     "kind": "face",
                     "component": COMPONENT,
@@ -649,6 +689,11 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "entity_index": 0,
                         "native_object_type": "_CDispatch",
                         "persistent_reference": [1, 2, 3],
+                        "binding_context": _binding_context(
+                            owner_scope="component_document",
+                            owner_document_path=DOCUMENT,
+                            api="IComponent2.GetCorrespondingEntity",
+                        ),
                         "matched_identity": {},
                         "read_errors": {},
                     }
@@ -683,6 +728,224 @@ class AppearanceResolutionTests(unittest.TestCase):
         self.assertEqual(
             caught.exception.appearance["issues"][0]["code"],
             "cad_appearance_render_entity_ambiguous",
+        )
+
+    def test_feature_alias_merges_only_one_native_feature_footprint(self):
+        for feature_names, should_pass in (
+            (("Boss-Extrude1", "Boss-Extrude1"), True),
+            (("Boss-Extrude1", "Cut-Extrude1"), False),
+        ):
+            with self.subTest(feature_names=feature_names):
+                raw = _resolved_raw([None, None])
+                raw["document"] = _layer(
+                    owner_configuration=CONFIGURATION,
+                    values=[
+                        0.0,
+                        1.0,
+                        0.0,
+                        1.0,
+                        1.0,
+                        0.5,
+                        0.3125,
+                        0.0,
+                        0.0,
+                    ],
+                    has_values=True,
+                )
+                owner = _empty_state_owner(
+                    scope="component_document",
+                    document_path=DOCUMENT,
+                    configuration=CONFIGURATION,
+                    display_state="Display State 1",
+                )
+                owner["call_state"] = "observed"
+                owner["native_render_material_count"] = 1
+                binding_context = _binding_context(
+                    owner_scope="component_document",
+                    owner_document_path=DOCUMENT,
+                    api="IComponent2.GetCorresponding",
+                )
+                feature_identities = (
+                    [(feature_names[0], [0, 1])]
+                    if should_pass
+                    else [("Boss-Extrude1", [0]), ("Cut-Extrude1", [1])]
+                )
+                owner["native_reference_index"] = [
+                    {
+                        "persistent_reference": [1, 2, 3],
+                        "binding_context": binding_context,
+                        "target": {
+                            "kind": "feature",
+                            "component": COMPONENT,
+                            "name": feature_name,
+                            "type_name": "Extrusion",
+                            "persistent_reference": [4, 5, 6 + index],
+                            "faces": [
+                                {
+                                    "body_type": 0,
+                                    "body_index": 0,
+                                    "face_index": face_index,
+                                }
+                                for face_index in face_indices
+                            ],
+                        },
+                    }
+                    for index, (feature_name, face_indices) in enumerate(
+                        feature_identities
+                    )
+                ]
+                owner["materials"] = [
+                    {
+                        "material_index": 0,
+                        "linked_display_states": ["Display State 1"],
+                        "entities": ["feature"],
+                        "entities_state": "observed",
+                        "entity_records": [
+                            {
+                                "entity_index": 0,
+                                "native_object_type": "_CDispatch",
+                                "persistent_reference": [1, 2, 3],
+                                "binding_context": binding_context,
+                                "matched_identity": {},
+                                "read_errors": {},
+                            }
+                        ],
+                        "primary_color": 0x000000FF,
+                        "transparency": 0.0,
+                        "color_form": 1,
+                        "texture_filename": "",
+                        "surface_finish_file": "",
+                        "read_errors": {},
+                    }
+                ]
+                raw["state_render_materials"] = [owner]
+                spans = [
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": face_index,
+                        "triangle_start": face_index,
+                        "triangle_count": 1,
+                        "face_reference_sha256": str(face_index + 1) * 64,
+                    }
+                    for face_index in range(2)
+                ]
+                if should_pass:
+                    resolved = resolve_deliverable_appearance(
+                        raw,
+                        component=COMPONENT,
+                        expected_document_path=DOCUMENT,
+                        expected_configuration=CONFIGURATION,
+                        face_spans=spans,
+                    )
+                    self.assertEqual(
+                        {face.rgba for face in resolved.faces},
+                        {(1.0, 0.0, 0.0, 1.0)},
+                    )
+                else:
+                    with self.assertRaises(AppearanceError) as caught:
+                        resolve_deliverable_appearance(
+                            raw,
+                            component=COMPONENT,
+                            expected_document_path=DOCUMENT,
+                            expected_configuration=CONFIGURATION,
+                            face_spans=spans,
+                        )
+                    self.assertEqual(
+                        caught.exception.appearance["issues"][0]["code"],
+                        "cad_appearance_render_entity_ambiguous",
+                    )
+
+    def test_exact_document_material_is_not_overridden_by_legacy_texture(self):
+        raw = _resolved_raw([None, None])
+        raw["document"] = _layer(
+            owner_configuration=CONFIGURATION,
+            values=[
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                1.0,
+                0.5,
+                0.3125,
+                0.0,
+                0.0,
+            ],
+            has_values=True,
+            texture_state="present",
+            texture_name="",
+        )
+        owner = _empty_state_owner(
+            scope="component_document",
+            document_path=DOCUMENT,
+            configuration=CONFIGURATION,
+            display_state="Display State 1",
+        )
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        binding_context = _binding_context(
+            owner_scope="component_document",
+            owner_document_path=r"C:\capture\parent.SLDASM",
+            api=(
+                "IModelDoc2.GetPathName"
+                "+ConfigurationManager.ActiveConfiguration.Name"
+            ),
+        )
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Display State 1"],
+                "entities": ["document"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "IModelDoc2",
+                        "persistent_reference": None,
+                        "binding_context": binding_context,
+                        "native_identity": {
+                            "kind": "document",
+                            "document_path": DOCUMENT,
+                            "active_configuration": CONFIGURATION,
+                            "owner_document_path": DOCUMENT,
+                            "owner_configuration": CONFIGURATION,
+                            "owner_display_state": "Display State 1",
+                            "state": "observed",
+                            "read_errors": {},
+                        },
+                        "matched_identity": {},
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x000000FF,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        raw["state_render_materials"] = [owner]
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": face_index,
+                    "triangle_start": face_index,
+                    "triangle_count": 1,
+                    "face_reference_sha256": str(face_index + 1) * 64,
+                }
+                for face_index in (0, 1)
+            ],
+        )
+        self.assertEqual(
+            {face.rgba for face in resolved.faces},
+            {(1.0, 0.0, 0.0, 1.0)},
         )
 
     def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
@@ -727,6 +990,11 @@ class AppearanceResolutionTests(unittest.TestCase):
                     "entity_index": 0,
                     "native_object_type": "_CDispatch",
                     "persistent_reference": [1, 2, 3],
+                    "binding_context": _binding_context(
+                        owner_scope="component_document",
+                        owner_document_path=DOCUMENT,
+                        api="IComponent2.GetCorresponding",
+                    ),
                     "matched_identity": {
                         "occurrences": [],
                         "bodies": [],
@@ -818,6 +1086,9 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "display_state": "Display State 1",
                 "display_states": None,
                 "display_states_state": "not_applicable",
+                "native_render_material_count_api": (
+                    "IModelDocExtension.GetRenderMaterialsCount2"
+                ),
                 "native_render_material_count": 1,
                 "native_render_material_count_error": None,
                 "call_state": "observed",
@@ -832,6 +1103,11 @@ class AppearanceResolutionTests(unittest.TestCase):
                                 "entity_index": 0,
                                 "native_object_type": "IFace2",
                                 "persistent_reference": [1, 2, 3],
+                                "binding_context": _binding_context(
+                                    owner_scope="component_document",
+                                    owner_document_path=DOCUMENT,
+                                    api="IComponent2.GetCorrespondingEntity",
+                                ),
                                 "read_errors": {},
                                 "matched_identity": {
                                     "occurrences": [],
@@ -860,6 +1136,11 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "native_reference_index": [
                     {
                         "persistent_reference": [1, 2, 3],
+                        "binding_context": _binding_context(
+                            owner_scope="component_document",
+                            owner_document_path=DOCUMENT,
+                            api="IComponent2.GetCorrespondingEntity",
+                        ),
                         "target": {
                             "kind": "occurrence",
                             "component": COMPONENT,

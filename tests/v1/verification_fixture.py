@@ -186,6 +186,9 @@ def _fixture_appearance_raw(
                     "Alternate Top Display State",
                 ],
                 "display_states_state": "observed",
+                "native_render_material_count_api": (
+                    "IModelDocExtension.GetRenderMaterialsCount2"
+                ),
                 "native_render_material_count": 0,
                 "native_render_material_count_error": None,
                 "call_state": "empty",
@@ -203,6 +206,9 @@ def _fixture_appearance_raw(
                 "display_state": "Parent Display State",
                 "display_states": None,
                 "display_states_state": "not_applicable",
+                "native_render_material_count_api": (
+                    "IModelDocExtension.GetRenderMaterialsCount2"
+                ),
                 "native_render_material_count": 0,
                 "native_render_material_count_error": None,
                 "call_state": "empty",
@@ -220,6 +226,9 @@ def _fixture_appearance_raw(
                 "display_state": "Default_Display_State",
                 "display_states": None,
                 "display_states_state": "not_applicable",
+                "native_render_material_count_api": (
+                    "IModelDocExtension.GetRenderMaterialsCount2"
+                ),
                 "native_render_material_count": 0,
                 "native_render_material_count_error": None,
                 "call_state": "empty",

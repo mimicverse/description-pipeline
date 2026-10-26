@@ -2333,7 +2333,9 @@ class AppearanceRawTests(unittest.TestCase):
         face_enumeration_calls = []
         body_appearance_calls = []
         part_render_material_calls = []
+        part_render_material_count_calls = []
         top_render_material_calls = []
+        top_render_material_count_calls = []
         texture_calls = []
         document_values = [0.1, 0.2, 0.3, 0.2, 0.4, 0.5, 0.6, 0.0, 0.0]
         occurrence_values = [-1.0] * 9
@@ -2364,6 +2366,7 @@ class AppearanceRawTests(unittest.TestCase):
                 lambda _quality: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
                 "appearance",
             )
+            face._fixture_interfaces = {"IEntity"}
             face_feature = types.SimpleNamespace(
                 Name="PaintedFace",
                 GetTypeName2=lambda: "Extrusion",
@@ -2401,11 +2404,16 @@ class AppearanceRawTests(unittest.TestCase):
             )
             part_document.Extension.GetRenderMaterials2 = (
                 lambda option, names: part_render_material_calls.append(
-                    (option, tuple(names.value), names.varianttype)
+                    (option, names)
                 )
                 or [render_material, incomplete_render_material]
             )
-            part_document.Extension.GetRenderMaterialsCount = lambda: 2
+            part_document.Extension.GetRenderMaterialsCount2 = (
+                lambda option, names: part_render_material_count_calls.append(
+                    (option, names)
+                )
+                or 2
+            )
             body = _mesh_body([face], "appearance")
             body_faces = body.GetFaces
 
@@ -2457,6 +2465,8 @@ class AppearanceRawTests(unittest.TestCase):
                 )
                 or None
             )
+            component.GetCorrespondingEntity = lambda entity: face
+            component.GetCorresponding = lambda entity: entity
             assembly = _write(fixture_root, "robot.SLDASM")
             main = _Doc(
                 assembly,
@@ -2466,11 +2476,16 @@ class AppearanceRawTests(unittest.TestCase):
             )
             main.Extension.GetRenderMaterials2 = (
                 lambda option, names: top_render_material_calls.append(
-                    (option, tuple(names.value))
+                    (option, names)
                 )
                 or []
             )
-            main.Extension.GetRenderMaterialsCount = lambda: 0
+            main.Extension.GetRenderMaterialsCount2 = (
+                lambda option, names: top_render_material_count_calls.append(
+                    (option, names)
+                )
+                or 0
+            )
             backend = _CaptureBackend(
                 session_factory=lambda: _Session(_App({assembly: main}))
             )
@@ -2575,19 +2590,34 @@ class AppearanceRawTests(unittest.TestCase):
             self.assertEqual(body_appearance_calls, [])
             self.assertEqual(body_type_calls, [0, 1])
             self.assertEqual(face_enumeration_calls, [True])
+            self.assertEqual(len(part_render_material_calls), 1)
+            self.assertEqual(len(part_render_material_count_calls), 1)
+            count_option, count_names = part_render_material_count_calls[0]
+            material_option, material_names = (
+                part_render_material_calls[0]
+            )
+            self.assertEqual(count_option, material_option)
+            self.assertIs(count_names, material_names)
+            self.assertEqual(tuple(count_names.value), ("FaceState",))
             self.assertEqual(
-                part_render_material_calls,
-                [(3, ("FaceState",), 0x2000 | 8)],
+                count_names.varianttype,
+                0x2000 | 8,
             )
             state_materials = {
                 row["owner_scope"]: row
                 for row in raw["state_render_materials"]
             }
-            self.assertEqual(
-                top_render_material_calls,
-                [(3, ("TopState",))],
-                state_materials,
+            self.assertEqual(len(top_render_material_calls), 1, state_materials)
+            self.assertEqual(len(top_render_material_count_calls), 1)
+            top_count_option, top_count_names = (
+                top_render_material_count_calls[0]
             )
+            self.assertEqual(top_count_option, top_render_material_calls[0][0])
+            self.assertIs(
+                top_count_names,
+                top_render_material_calls[0][1],
+            )
+            self.assertEqual(tuple(top_count_names.value), ("TopState",))
             self.assertEqual(
                 state_materials["top_assembly"]["call_state"],
                 "empty",
@@ -2611,6 +2641,10 @@ class AppearanceRawTests(unittest.TestCase):
                 component_materials["native_render_material_count"],
                 2,
             )
+            self.assertEqual(
+                component_materials["native_render_material_count_api"],
+                "IModelDocExtension.GetRenderMaterialsCount2",
+            )
             material = component_materials["materials"][0]
             self.assertEqual(material["linked_display_states"], ["FaceState"])
             self.assertEqual(material["primary_color"], 0x00AABBCC)
@@ -2627,8 +2661,24 @@ class AppearanceRawTests(unittest.TestCase):
                 incomplete["read_errors"]["primary_color"]["code"],
                 "cad_member_missing",
             )
+            entity = material["entity_records"][0]
+            self.assertEqual(entity["native_interface_kind"], "IEntity")
             self.assertEqual(
-                material["entity_records"][0]["matched_identity"]["faces"],
+                entity["source_persistent_reference"],
+                list(face._persist_reference),
+            )
+            self.assertEqual(
+                entity["persistent_reference"],
+                list(face._persist_reference),
+            )
+            self.assertEqual(entity["source_read_errors"], {})
+            self.assertEqual(entity["read_errors"], {})
+            self.assertEqual(
+                entity["native_identity"]["context"]["api"],
+                "IComponent2.GetCorrespondingEntity",
+            )
+            self.assertEqual(
+                entity["matched_identity"]["faces"],
                 [
                     {
                         "component": "arm-1",
@@ -2641,13 +2691,23 @@ class AppearanceRawTests(unittest.TestCase):
             reference_index = component_materials["native_reference_index"]
             self.assertTrue(
                 any(
-                    row["target"] == {
-                        "kind": "face",
-                        "component": "arm-1",
-                        "body_type": 0,
-                        "body_index": 0,
-                        "face_index": 0,
-                    }
+                    (
+                        row["target"]
+                        == {
+                            "kind": "face",
+                            "component": "arm-1",
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": 0,
+                        }
+                        and row["binding_context"]
+                        == {
+                            "owner_scope": "component_document",
+                            "owner_document_path": str(assembly),
+                            "component": "arm-1",
+                            "api": "IComponent2.GetCorrespondingEntity",
+                        }
+                    )
                     for row in reference_index
                 )
             )
@@ -2914,7 +2974,7 @@ class AppearanceRawTests(unittest.TestCase):
             part_document.Extension.GetRenderMaterials2 = _raiser(
                 RuntimeError("render material read failed")
             )
-            part_document.Extension.GetRenderMaterialsCount = _raiser(
+            part_document.Extension.GetRenderMaterialsCount2 = _raiser(
                 RuntimeError("render material count failed")
             )
             face_base = _mesh_face(
@@ -2949,7 +3009,9 @@ class AppearanceRawTests(unittest.TestCase):
             main.Extension.GetRenderMaterials2 = (
                 lambda _option, _names: None
             )
-            main.Extension.GetRenderMaterialsCount = lambda: 0
+            main.Extension.GetRenderMaterialsCount2 = (
+                lambda option, names: 0
+            )
             backend = _CaptureBackend(
                 session_factory=lambda: _Session(_App({assembly: main}))
             )
@@ -3034,48 +3096,6 @@ class AppearanceRawTests(unittest.TestCase):
 
 
 class AppearanceHelperTests(unittest.TestCase):
-    def test_null_state_materials_retain_the_native_count_decision(self) -> None:
-        cases = (
-            (lambda: 1, 1, None, False),
-            (
-                _raiser(RuntimeError("count failed")),
-                None,
-                "RuntimeError",
-                True,
-            ),
-        )
-        for count_method, expected_count, expected_error, has_error in cases:
-            with self.subTest(count=expected_count), _com_stubs():
-                extension = types.SimpleNamespace(
-                    GetRenderMaterialsCount=count_method,
-                    GetRenderMaterials2=lambda _option, _names: None,
-                )
-                document = types.SimpleNamespace(Extension=extension)
-                record, _extension = native_module._state_render_materials_raw(
-                    document,
-                    configuration="Default",
-                    display_state="State",
-                )
-                self.assertEqual(record["call_state"], "null_result")
-                self.assertIsNone(record["materials"])
-                self.assertEqual(
-                    record["native_render_material_count"],
-                    expected_count,
-                )
-                if has_error:
-                    self.assertEqual(
-                        record["native_render_material_count_error"]["code"],
-                        expected_error,
-                    )
-                    self.assertIn(
-                        "native_render_material_count",
-                        record["read_errors"],
-                    )
-                else:
-                    self.assertIsNone(
-                        record["native_render_material_count_error"]
-                    )
-
     def test_display_state_preserves_null_and_empty_results(self) -> None:
         for raw_states, expected_state, expected_raw in (
             (None, "null_result", None),
@@ -3206,13 +3226,14 @@ class AppearanceHelperTests(unittest.TestCase):
             TextureFilename="",
             SurfaceFinishFile="",
         )
-        material_record = _appearance_render_material(
+        material_record, material_entities = _appearance_render_material(
             material,
             0,
             missing_extension,
         )
+        self.assertEqual(material_entities, [entity])
         self.assertEqual(
-            material_record["entity_records"][0]["read_errors"][
+            material_record["entity_records"][0]["source_read_errors"][
                 "persistent_reference"
             ]["code"],
             "cad_appearance_persistent_reference_missing",
@@ -3231,6 +3252,282 @@ class AppearanceHelperTests(unittest.TestCase):
             "cad_appearance_persistent_reference_invalid",
         )
 
+    def test_document_entity_uses_path_identity_without_persistent_reference(
+        self,
+    ) -> None:
+        persistent_calls = []
+        document = types.SimpleNamespace(
+            _fixture_interfaces={"IModelDoc2"},
+            GetPathName=lambda: "C:\\part.SLDPRT",
+        )
+        extension = types.SimpleNamespace(
+            GetPersistReference3=lambda entity: persistent_calls.append(
+                entity
+            )
+        )
+        material = types.SimpleNamespace(
+            GetLinkedDisplayStates=list,
+            GetEntities=lambda: [document],
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        record, entities = _appearance_render_material(
+            material,
+            0,
+            extension,
+        )
+        entity = record["entity_records"][0]
+        self.assertEqual(entities, [document])
+        self.assertEqual(entity["native_interface_kind"], "IModelDoc2")
+        self.assertIsNone(entity["source_persistent_reference"])
+        self.assertEqual(entity["source_read_errors"], {})
+        self.assertEqual(persistent_calls, [])
+
+        backend = _CaptureBackend(session_factory=lambda: None)
+        with patch.object(
+            native_module,
+            "_appearance_active_configuration",
+            return_value=("Configured", None),
+        ):
+            context = backend._appearance_entity_context(
+                document,
+                entity,
+                owner_scope="component_document",
+                primary_component=types.SimpleNamespace(),
+                component_name="arm-1",
+                binding_document_path="C:\\root.SLDASM",
+                corresponding_extension=extension,
+                owner_document_path="C:\\owner.SLDASM",
+                owner_configuration="OwnerConfig",
+                display_state="State",
+            )
+        self.assertEqual(
+            context["record"]["native_identity"]["document_path"],
+            "C:\\part.SLDPRT",
+        )
+        self.assertEqual(
+            context["record"]["native_identity"]["active_configuration"],
+            "Configured",
+        )
+        self.assertIsNone(context["persistent_reference"])
+        binding = backend._appearance_entity_binding(context, {})
+        self.assertEqual(binding["binding_state"], "document")
+        self.assertEqual(
+            binding["binding_candidates"][0]["document_path"],
+            "C:\\part.SLDPRT",
+        )
+        self.assertEqual(
+            binding["matched_identity"],
+            {
+                "occurrences": [],
+                "bodies": [],
+                "faces": [],
+                "features": [],
+            },
+        )
+        self.assertEqual(persistent_calls, [])
+
+    def test_binding_key_scopes_identical_reference_bytes(self) -> None:
+        reference = [1, 2, 3]
+        first = {
+            "owner_scope": "component_document",
+            "owner_document_path": "C:\\first.SLDASM",
+            "component": "left-1",
+            "api": "IComponent2.GetCorrespondingEntity",
+        }
+        second = {
+            **first,
+            "component": "right-1",
+        }
+        third = {
+            **first,
+            "owner_document_path": "C:\\second.SLDASM",
+        }
+        self.assertNotEqual(
+            native_module._appearance_binding_key(reference, first),
+            native_module._appearance_binding_key(reference, second),
+        )
+        self.assertNotEqual(
+            native_module._appearance_binding_key(reference, first),
+            native_module._appearance_binding_key(reference, third),
+        )
+        left_target = {
+            "kind": "face",
+            "component": "left-1",
+            "body_type": 0,
+            "body_index": 0,
+            "face_index": 0,
+        }
+        right_target = {
+            **left_target,
+            "component": "right-1",
+            "face_index": 1,
+        }
+        maps = {
+            native_module._appearance_binding_key(reference, first): [
+                left_target
+            ],
+            native_module._appearance_binding_key(reference, second): [
+                right_target
+            ],
+        }
+        binding = _CaptureBackend._appearance_entity_binding(
+            {
+                "persistent_reference": reference,
+                "record": {
+                    "binding_context": first,
+                    "native_identity": {"kind": "entity"},
+                },
+            },
+            maps,
+        )
+        self.assertEqual(binding["binding_state"], "unique")
+        self.assertEqual(
+            binding["matched_identity"]["faces"],
+            [
+                {
+                    "component": "left-1",
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                }
+            ],
+        )
+
+    def test_interface_query_failure_does_not_fall_back_to_reference_or_api(
+        self,
+    ) -> None:
+        entity = types.SimpleNamespace(_oleobj_=object())
+        persistent_calls = []
+        extension = types.SimpleNamespace(
+            GetPersistReference3=lambda value: persistent_calls.append(
+                value
+            )
+        )
+        material = types.SimpleNamespace(
+            GetLinkedDisplayStates=list,
+            GetEntities=lambda: [entity],
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        with patch.object(
+            native_module,
+            "_interface",
+            side_effect=RuntimeError("interface query failed"),
+        ):
+            record, entities = _appearance_render_material(
+                material,
+                0,
+                extension,
+            )
+        rendered = record["entity_records"][0]
+        self.assertEqual(entities, [entity])
+        self.assertEqual(rendered["native_interface_kind"], None)
+        self.assertIsNone(rendered["source_persistent_reference"])
+        self.assertEqual(
+            rendered["source_read_errors"]["interface_query"]["code"],
+            "RuntimeError",
+        )
+        self.assertEqual(persistent_calls, [])
+
+    def test_unsupported_interface_is_absence_not_a_qi_failure(self) -> None:
+        entity = types.SimpleNamespace(
+            _oleobj_=object(),
+            _persist_reference=b"generic",
+        )
+        unsupported = RuntimeError("unsupported interface")
+        unsupported.hresult = native_module.E_NOINTERFACE_HRESULT
+        material = types.SimpleNamespace(
+            GetLinkedDisplayStates=list,
+            GetEntities=lambda: [entity],
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        with patch.object(
+            native_module,
+            "_interface",
+            side_effect=unsupported,
+        ):
+            record, _ = _appearance_render_material(
+                material,
+                0,
+                types.SimpleNamespace(
+                    GetPersistReference3=lambda _entity: list(
+                        entity._persist_reference
+                    )
+                ),
+            )
+        rendered = record["entity_records"][0]
+        self.assertIsNone(rendered["native_interface_kind"])
+        self.assertEqual(
+            rendered["source_persistent_reference"],
+            list(entity._persist_reference),
+        )
+        self.assertEqual(rendered["source_read_errors"], {})
+
+    def test_document_entity_identity_never_falls_back_to_owner_values(
+        self,
+    ) -> None:
+        document = types.SimpleNamespace(
+            _fixture_interfaces={"IModelDoc2"},
+            GetPathName=_raiser(RuntimeError("path read failed")),
+        )
+        backend = _CaptureBackend(session_factory=lambda: None)
+        with patch.object(
+            native_module,
+            "_appearance_active_configuration",
+            return_value=(
+                None,
+                {
+                    "code": "configuration_read_failed",
+                    "detail": None,
+                    "message": "configuration read failed",
+                },
+            ),
+        ):
+            context = backend._appearance_entity_context(
+                document,
+                {"native_interface_kind": "IModelDoc2"},
+                owner_scope="top_assembly",
+                primary_component=None,
+                component_name="arm-1",
+                binding_document_path="C:\\owner.SLDASM",
+                corresponding_extension=None,
+                owner_document_path="C:\\owner.SLDASM",
+                owner_configuration="OwnerConfig",
+                display_state="OwnerState",
+            )
+        identity = context["record"]["native_identity"]
+        self.assertIsNone(identity["document_path"])
+        self.assertIsNone(identity["active_configuration"])
+        self.assertEqual(
+            identity["owner_document_path"],
+            "C:\\owner.SLDASM",
+        )
+        self.assertEqual(
+            identity["owner_configuration"],
+            "OwnerConfig",
+        )
+        self.assertEqual(identity["owner_display_state"], "OwnerState")
+        self.assertEqual(identity["state"], "error")
+        self.assertEqual(
+            identity["read_errors"]["document_path"]["code"],
+            "RuntimeError",
+        )
+        self.assertEqual(
+            identity["read_errors"]["active_configuration"]["code"],
+            "configuration_read_failed",
+        )
+
     def test_render_material_entities_preserve_null_and_error(self) -> None:
         null_material = types.SimpleNamespace(
             GetLinkedDisplayStates=list,
@@ -3241,11 +3538,12 @@ class AppearanceHelperTests(unittest.TestCase):
             TextureFilename="",
             SurfaceFinishFile="",
         )
-        null_record = _appearance_render_material(
+        null_record, null_entities = _appearance_render_material(
             null_material,
             0,
             object(),
         )
+        self.assertEqual(null_entities, [])
         self.assertEqual(null_record["entities_state"], "null_result")
         self.assertIsNone(null_record["entities"])
         self.assertNotIn("entities", null_record["read_errors"])
@@ -3259,37 +3557,42 @@ class AppearanceHelperTests(unittest.TestCase):
             TextureFilename="",
             SurfaceFinishFile="",
         )
-        failing_record = _appearance_render_material(
+        failing_record, failing_entities = _appearance_render_material(
             failing_material,
             0,
             object(),
         )
+        self.assertEqual(failing_entities, [])
         self.assertEqual(failing_record["entities_state"], "error")
         self.assertIn("entities", failing_record["read_errors"])
 
     def test_null_render_materials_retain_count_and_count_error(self) -> None:
         with _com_stubs():
             count_extension = types.SimpleNamespace(
-                GetRenderMaterialsCount=lambda: 1,
+                GetRenderMaterialsCount2=lambda _option, _names: 1,
                 GetRenderMaterials2=lambda _option, _names: None,
             )
-            count_record, _ = _state_render_materials_raw(
+            count_record, _, _ = _state_render_materials_raw(
                 types.SimpleNamespace(Extension=count_extension),
                 configuration="Default",
                 display_state="State",
             )
             self.assertEqual(count_record["call_state"], "null_result")
+            self.assertEqual(
+                count_record["native_render_material_count_api"],
+                "IModelDocExtension.GetRenderMaterialsCount2",
+            )
             self.assertEqual(count_record["native_render_material_count"], 1)
             self.assertIsNone(count_record["native_render_material_count_error"])
             self.assertIsNone(count_record["materials"])
 
             failing_count_extension = types.SimpleNamespace(
-                GetRenderMaterialsCount=_raiser(
+                GetRenderMaterialsCount2=_raiser(
                     RuntimeError("count read failed")
                 ),
                 GetRenderMaterials2=lambda _option, _names: None,
             )
-            failing_count_record, _ = _state_render_materials_raw(
+            failing_count_record, _, _ = _state_render_materials_raw(
                 types.SimpleNamespace(Extension=failing_count_extension),
                 configuration="Default",
                 display_state="State",
@@ -3307,6 +3610,243 @@ class AppearanceHelperTests(unittest.TestCase):
                 ]["code"],
                 "RuntimeError",
             )
+
+    def test_render_entity_context_uses_one_documented_conversion_per_kind(
+        self,
+    ) -> None:
+        backend = _CaptureBackend(session_factory=lambda: None)
+        owner_document = types.SimpleNamespace(
+            _fixture_interfaces={"IModelDoc2"},
+            GetPathName=lambda: "C:\\part.SLDPRT",
+        )
+        with patch.object(
+            native_module,
+            "_appearance_active_configuration",
+            return_value=("Configured", None),
+        ):
+            document_result = backend._appearance_entity_context(
+                owner_document,
+                {
+                    "native_interface_kind": "IModelDoc2",
+                    "source_persistent_reference": None,
+                    "source_read_errors": {},
+                },
+                owner_scope="component_document",
+                primary_component=types.SimpleNamespace(),
+                component_name="arm-1",
+                binding_document_path="C:\\root.SLDASM",
+                corresponding_extension=types.SimpleNamespace(),
+                owner_document_path="C:\\owner.SLDASM",
+                owner_configuration="OwnerConfig",
+                display_state="Display State1",
+            )
+        self.assertEqual(
+            document_result["record"]["native_identity"],
+            {
+                "kind": "document",
+                "qi_iid": native_module.IMODELDOC2_IID,
+                "document_path": "C:\\part.SLDPRT",
+                "active_configuration": "Configured",
+                "owner_document_path": "C:\\owner.SLDASM",
+                "owner_configuration": "OwnerConfig",
+                "owner_display_state": "Display State1",
+                "binding_context": {
+                    "owner_scope": "component_document",
+                    "owner_document_path": "C:\\root.SLDASM",
+                    "component": "arm-1",
+                    "api": (
+                        "IModelDoc2.GetPathName"
+                        "+ConfigurationManager.ActiveConfiguration.Name"
+                    ),
+                },
+                "state": "observed",
+                "read_errors": {},
+            },
+        )
+        self.assertIsNone(document_result["persistent_reference"])
+
+        part_entity = types.SimpleNamespace(
+            _persist_reference=b"part-face",
+            _fixture_interfaces={"IEntity"},
+        )
+        assembly_entity = types.SimpleNamespace(
+            _persist_reference=b"assembly-face"
+        )
+        component_calls = []
+        primary_component = types.SimpleNamespace(
+            GetCorrespondingEntity=lambda entity: component_calls.append(
+                ("entity", entity)
+            )
+            or assembly_entity,
+            GetCorresponding=_raiser(
+                AssertionError("IEntity must use GetCorrespondingEntity")
+            ),
+        )
+        corresponding_extension = types.SimpleNamespace(
+            GetPersistReference3=lambda entity: list(
+                entity._persist_reference
+            )
+        )
+        converted = backend._appearance_entity_context(
+            part_entity,
+            {
+                "native_interface_kind": "IEntity",
+                "source_persistent_reference": list(
+                    part_entity._persist_reference
+                ),
+                "source_read_errors": {},
+            },
+            owner_scope="component_document",
+            primary_component=primary_component,
+            component_name="arm-1",
+            binding_document_path="C:\\root.SLDASM",
+            corresponding_extension=corresponding_extension,
+            owner_document_path="C:\\part.SLDPRT",
+            owner_configuration="Configured",
+            display_state="Display State1",
+        )
+        self.assertEqual(component_calls, [("entity", part_entity)])
+        self.assertEqual(
+            converted["record"]["native_identity"]["context"]["state"],
+            "observed",
+        )
+        self.assertEqual(
+            converted["record"]["native_identity"]["context"]["api"],
+            "IComponent2.GetCorrespondingEntity",
+        )
+        self.assertEqual(
+            converted["record"]["persistent_reference"],
+            list(assembly_entity._persist_reference),
+        )
+
+        part_feature = types.SimpleNamespace(
+            _persist_reference=b"part-feature"
+        )
+        assembly_feature = types.SimpleNamespace(
+            _persist_reference=b"assembly-feature"
+        )
+        primary_component = types.SimpleNamespace(
+            GetCorresponding=lambda entity: (
+                assembly_feature if entity is part_feature else None
+            ),
+            GetCorrespondingEntity=_raiser(
+                AssertionError("generic object must use GetCorresponding")
+            ),
+        )
+        converted_feature = backend._appearance_entity_context(
+            part_feature,
+            {
+                "native_interface_kind": None,
+                "source_persistent_reference": list(
+                    part_feature._persist_reference
+                ),
+                "source_read_errors": {},
+            },
+            owner_scope="component_document",
+            primary_component=primary_component,
+            component_name="arm-1",
+            binding_document_path="C:\\root.SLDASM",
+            corresponding_extension=corresponding_extension,
+            owner_document_path="C:\\part.SLDPRT",
+            owner_configuration="Configured",
+            display_state="Display State1",
+        )
+        self.assertEqual(
+            converted_feature["record"]["native_identity"]["context"][
+                "api"
+            ],
+            "IComponent2.GetCorresponding",
+        )
+        self.assertEqual(
+            converted_feature["record"]["persistent_reference"],
+            list(assembly_feature._persist_reference),
+        )
+
+        primary_component = types.SimpleNamespace(
+            GetCorresponding=_raiser(
+                AssertionError(
+                    "GetCorresponding cannot run without a source reference"
+                )
+            )
+        )
+        missing_source = backend._appearance_entity_context(
+            part_feature,
+            {
+                "native_interface_kind": None,
+                "source_persistent_reference": None,
+                "source_read_errors": {
+                    "persistent_reference": {
+                        "code": "source_reference_missing",
+                        "message": "missing",
+                        "detail": None,
+                    }
+                },
+            },
+            owner_scope="component_document",
+            primary_component=primary_component,
+            component_name="arm-1",
+            binding_document_path="C:\\root.SLDASM",
+            corresponding_extension=corresponding_extension,
+            owner_document_path="C:\\part.SLDPRT",
+            owner_configuration="Configured",
+            display_state="Display State1",
+        )
+        self.assertEqual(
+            missing_source["record"]["native_identity"]["context"][
+                "state"
+            ],
+            "error",
+        )
+        self.assertIsNone(
+            missing_source["record"]["persistent_reference"]
+        )
+
+        primary_component = types.SimpleNamespace(
+            GetCorresponding=_raiser(
+                AssertionError("QI failure must not call GetCorresponding")
+            ),
+            GetCorrespondingEntity=_raiser(
+                AssertionError(
+                    "QI failure must not call GetCorrespondingEntity"
+                )
+            ),
+        )
+        interface_failure = backend._appearance_entity_context(
+            part_feature,
+            {
+                "native_interface_kind": None,
+                "source_persistent_reference": list(
+                    part_feature._persist_reference
+                ),
+                "source_read_errors": {
+                    "interface_query": {
+                        "code": "interface_query_failed",
+                        "message": "QI failed",
+                        "detail": None,
+                    }
+                },
+            },
+            owner_scope="component_document",
+            primary_component=primary_component,
+            component_name="arm-1",
+            binding_document_path="C:\\root.SLDASM",
+            corresponding_extension=corresponding_extension,
+            owner_document_path="C:\\part.SLDPRT",
+            owner_configuration="Configured",
+            display_state="Display State 1",
+        )
+        self.assertEqual(
+            interface_failure["record"]["native_identity"]["context"][
+                "state"
+            ],
+            "error",
+        )
+        self.assertEqual(
+            interface_failure["record"]["read_errors"][
+                "interface_query"
+            ]["code"],
+            "interface_query_failed",
+        )
 
     def test_state_unavailable_owner_record_is_explicit(self) -> None:
         backend = _CaptureBackend(session_factory=lambda: None)
@@ -3379,6 +3919,7 @@ class AppearanceHelperTests(unittest.TestCase):
                 "read_errors": {},
             },
             object(),
+            [],
         )
         with (
             patch.object(
@@ -3413,6 +3954,295 @@ class AppearanceHelperTests(unittest.TestCase):
 
 
 class AppearanceOwnerResolutionTests(unittest.TestCase):
+    def test_one_feature_identity_keeps_all_of_its_face_associations(
+        self,
+    ) -> None:
+        feature = types.SimpleNamespace(
+            _persist_reference=b"feature"
+        )
+        extension = types.SimpleNamespace(
+            GetPersistReference3=lambda entity: list(
+                entity._persist_reference
+            )
+        )
+        component = types.SimpleNamespace(
+            GetCorresponding=lambda entity: feature
+        )
+        feature_rows = [
+            {
+                "component": "arm-1",
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": face_index,
+                "feature": feature,
+                "identity": {
+                    "name": "Extrude",
+                    "type_name": "Extrusion",
+                    "persistent_reference": list(
+                        feature._persist_reference
+                    ),
+                },
+            }
+            for face_index in range(2)
+        ]
+        maps, errors, reference_index = (
+            _CaptureBackend._appearance_identity_maps(
+                extension,
+                owner_scope="component_document",
+                component=component,
+                component_name="arm-1",
+                binding_document_path="C:\\robot.SLDASM",
+                corresponding_extension=extension,
+                holders=[],
+                bodies=[],
+                faces=[],
+                features=feature_rows,
+            )
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(reference_index), 1)
+        self.assertEqual(
+            reference_index[0]["target"]["faces"],
+            [
+                {"body_type": 0, "body_index": 0, "face_index": 0},
+                {"body_type": 0, "body_index": 0, "face_index": 1},
+            ],
+        )
+        backend = _CaptureBackend(session_factory=lambda: None)
+        context = backend._appearance_entity_context(
+            feature,
+            {
+                "native_interface_kind": None,
+                "source_persistent_reference": list(
+                    feature._persist_reference
+                ),
+                "source_read_errors": {},
+            },
+            owner_scope="component_document",
+            primary_component=component,
+            component_name="arm-1",
+            binding_document_path="C:\\robot.SLDASM",
+            corresponding_extension=extension,
+            owner_document_path="C:\\arm.SLDPRT",
+            owner_configuration="Default",
+            display_state="State",
+        )
+        binding = backend._appearance_entity_binding(context, maps)
+        self.assertEqual(binding["binding_state"], "unique")
+        self.assertEqual(
+            binding["matched_identity"]["features"][0]["faces"],
+            [
+                {"body_type": 0, "body_index": 0, "face_index": 0},
+                {"body_type": 0, "body_index": 0, "face_index": 1},
+            ],
+        )
+
+    def test_distinct_feature_identities_sharing_bytes_are_ambiguous(
+        self,
+    ) -> None:
+        first = types.SimpleNamespace(
+            _persist_reference=b"shared-feature-reference"
+        )
+        second = types.SimpleNamespace(
+            _persist_reference=b"shared-feature-reference"
+        )
+        assembly_first = types.SimpleNamespace(
+            _persist_reference=b"shared-assembly-reference"
+        )
+        assembly_second = types.SimpleNamespace(
+            _persist_reference=b"shared-assembly-reference"
+        )
+        extension = types.SimpleNamespace(
+            GetPersistReference3=lambda entity: list(
+                entity._persist_reference
+            )
+        )
+        component = types.SimpleNamespace(
+            GetCorresponding=lambda entity: (
+                assembly_first if entity is first else assembly_second
+            )
+        )
+        feature_rows = [
+            {
+                "component": "arm-1",
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": index,
+                "feature": feature,
+                "identity": {
+                    "name": name,
+                    "type_name": "Extrusion",
+                    "persistent_reference": list(
+                        feature._persist_reference
+                    ),
+                },
+            }
+            for index, (feature, name) in enumerate(
+                ((first, "First"), (second, "Second"))
+            )
+        ]
+        maps, _, reference_index = (
+            _CaptureBackend._appearance_identity_maps(
+                extension,
+                owner_scope="component_document",
+                component=component,
+                component_name="arm-1",
+                binding_document_path="C:\\robot.SLDASM",
+                corresponding_extension=extension,
+                holders=[],
+                bodies=[],
+                faces=[],
+                features=feature_rows,
+            )
+        )
+        self.assertEqual(len(reference_index), 2)
+        context = _CaptureBackend._appearance_entity_context(
+            first,
+            {
+                "native_interface_kind": None,
+                "source_persistent_reference": list(
+                    first._persist_reference
+                ),
+                "source_read_errors": {},
+            },
+            owner_scope="component_document",
+            primary_component=component,
+            component_name="arm-1",
+            binding_document_path="C:\\robot.SLDASM",
+            corresponding_extension=extension,
+            owner_document_path="C:\\arm.SLDPRT",
+            owner_configuration="Default",
+            display_state="State",
+        )
+        binding = _CaptureBackend._appearance_entity_binding(
+            context,
+            maps,
+        )
+        self.assertEqual(binding["binding_state"], "ambiguous")
+        self.assertEqual(binding["matched_identity"]["features"], [])
+        self.assertEqual(len(binding["binding_candidates"]), 2)
+
+    def test_component_entity_conversion_uses_immediate_parent_extension(
+        self,
+    ) -> None:
+        source_face = types.SimpleNamespace(
+            _persist_reference=b"leaf-face",
+            _fixture_interfaces={"IEntity"},
+        )
+        assembly_face = types.SimpleNamespace(
+            _persist_reference=b"parent-face"
+        )
+        material = types.SimpleNamespace(
+            GetLinkedDisplayStates=lambda: ["LeafState"],
+            GetEntities=lambda: [source_face],
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        leaf_extension = types.SimpleNamespace(
+            GetRenderMaterialsCount2=lambda _option, _names: 1,
+            GetRenderMaterials2=lambda _option, _names: [material],
+            GetPersistReference3=lambda entity: list(
+                entity._persist_reference
+            ),
+        )
+        parent_reference_calls = []
+        parent_extension = types.SimpleNamespace(
+            GetPersistReference3=lambda entity: parent_reference_calls.append(
+                entity
+            )
+            or list(entity._persist_reference)
+        )
+        top_extension = types.SimpleNamespace(
+            GetPersistReference3=_raiser(
+                AssertionError("the root assembly is not the immediate owner")
+            )
+        )
+        leaf_document = types.SimpleNamespace(
+            Extension=leaf_extension,
+            GetPathName=lambda: "C:\\leaf.SLDPRT",
+        )
+        parent_document = types.SimpleNamespace(
+            Extension=parent_extension,
+            GetPathName=lambda: "C:\\parent.SLDASM",
+        )
+        top_document = types.SimpleNamespace(
+            Extension=top_extension,
+            GetPathName=lambda: "C:\\root.SLDASM",
+        )
+
+        def owner(document, path, scope, state):
+            return {
+                "document_path": path,
+                "owner_scope": scope,
+                "document": document,
+                "configuration": "Default",
+                "display_state": state,
+                "display_state_error": None,
+                "display_states": None,
+                "display_states_state": "not_applicable",
+                "owner_error": None,
+            }
+
+        owner_rows = [
+            owner(top_document, "C:\\root.SLDASM", "top_assembly", "Top"),
+            owner(
+                parent_document,
+                "C:\\parent.SLDASM",
+                "parent_assembly",
+                "Parent",
+            ),
+            owner(
+                leaf_document,
+                "C:\\leaf.SLDPRT",
+                "component_document",
+                "LeafState",
+            ),
+        ]
+        parent_component = types.SimpleNamespace()
+        holder = types.SimpleNamespace(
+            GetCorrespondingEntity=lambda entity: assembly_face
+        )
+        backend = _CaptureBackend(session_factory=lambda: None)
+        with _com_stubs(), patch.object(
+            backend,
+            "_appearance_owner_rows",
+            return_value=(owner_rows, ["sub-1"]),
+        ):
+            records = backend._capture_state_render_materials(
+                component="sub-1/leaf-1",
+                holder=holder,
+                current={"sub-1": parent_component},
+                leaf_document=leaf_document,
+                source_configuration="Default",
+                leaf_display_state="LeafState",
+                leaf_display_state_error=None,
+                bodies=[],
+                faces=[],
+                features=[],
+                cache={},
+            )
+
+        leaf_record = records[-1]
+        entity = leaf_record["materials"][0]["entity_records"][0]
+        self.assertEqual(
+            leaf_record["corresponding_owner_document_path"],
+            "C:\\parent.SLDASM",
+        )
+        self.assertEqual(entity["source_persistent_reference"], list(b"leaf-face"))
+        self.assertEqual(entity["persistent_reference"], list(b"parent-face"))
+        self.assertEqual(
+            entity["native_identity"]["context"]["api"],
+            "IComponent2.GetCorrespondingEntity",
+        )
+        self.assertEqual(
+            entity["binding_context"]["owner_document_path"],
+            "C:\\parent.SLDASM",
+        )
+        self.assertEqual(parent_reference_calls, [assembly_face])
+
     def test_top_parent_and_leaf_use_their_own_configuration_and_state(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3435,21 +4265,27 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 )
                 or []
             )
-            top_document.Extension.GetRenderMaterialsCount = lambda: 0
+            top_document.Extension.GetRenderMaterialsCount2 = (
+                lambda option, names: 0
+            )
             parent_document.Extension.GetRenderMaterials2 = (
                 lambda option, names: parent_calls.append(
                     (option, tuple(names.value))
                 )
                 or []
             )
-            parent_document.Extension.GetRenderMaterialsCount = lambda: 0
+            parent_document.Extension.GetRenderMaterialsCount2 = (
+                lambda option, names: 0
+            )
             leaf_document.Extension.GetRenderMaterials2 = (
                 lambda option, names: leaf_calls.append(
                     (option, tuple(names.value))
                 )
                 or []
             )
-            leaf_document.Extension.GetRenderMaterialsCount = lambda: 0
+            leaf_document.Extension.GetRenderMaterialsCount2 = (
+                lambda option, names: 0
+            )
             parent = _Component(
                 "sub-1",
                 parent_path,
@@ -3535,15 +4371,35 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
 
     def test_cached_owner_facts_are_remapped_per_occurrence(self) -> None:
         render_calls = []
-        face_a = types.SimpleNamespace(_persist_reference=b"face-a")
-        alias_face_a = types.SimpleNamespace(_persist_reference=b"face-a")
-        face_b = types.SimpleNamespace(_persist_reference=b"face-b")
-        failing_face = types.SimpleNamespace(_persist_reference=b"face-fail")
+        face_a = types.SimpleNamespace(
+            _persist_reference=b"face-a",
+            _fixture_interfaces={"IEntity"},
+        )
+        alias_face_a = types.SimpleNamespace(
+            _persist_reference=b"face-a",
+            _fixture_interfaces={"IEntity"},
+        )
+        face_b = types.SimpleNamespace(
+            _persist_reference=b"face-b",
+            _fixture_interfaces={"IEntity"},
+        )
+        failing_face = types.SimpleNamespace(
+            _persist_reference=b"face-fail",
+            _fixture_interfaces={"IEntity"},
+        )
         null_reference_face = types.SimpleNamespace(
-            _persist_reference=b"face-null"
+            _persist_reference=b"face-null",
+            _fixture_interfaces={"IEntity"},
         )
         invalid_reference_face = types.SimpleNamespace(
-            _persist_reference=b"face-invalid"
+            _persist_reference=b"face-invalid",
+            _fixture_interfaces={"IEntity"},
+        )
+        assembly_face_a = types.SimpleNamespace(
+            _persist_reference=b"assembly-face-a"
+        )
+        assembly_face_b = types.SimpleNamespace(
+            _persist_reference=b"assembly-face-b"
         )
         material = types.SimpleNamespace(
             GetLinkedDisplayStates=lambda: ["SharedState"],
@@ -3572,8 +4428,27 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             )
             or [material]
         )
-        extension.GetRenderMaterialsCount = lambda: 1
+        extension.GetRenderMaterialsCount2 = lambda _option, _names: 1
         owner_document = types.SimpleNamespace(Extension=extension)
+        context_extension = types.SimpleNamespace(
+            GetPersistReference3=lambda entity: list(
+                entity._persist_reference
+            )
+        )
+        top_document = types.SimpleNamespace(
+            Extension=context_extension
+        )
+        top_owner = {
+            "document_path": "C:\\robot.SLDASM",
+            "owner_scope": "top_assembly",
+            "document": top_document,
+            "configuration": "Default",
+            "display_state": "TopState",
+            "display_state_error": None,
+            "display_states": ["TopState"],
+            "display_states_state": "observed",
+            "owner_error": None,
+        }
         owner = {
             "document_path": "C:\\shared.SLDPRT",
             "owner_scope": "component_document",
@@ -3585,14 +4460,32 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             "display_states_state": "not_applicable",
             "owner_error": None,
         }
-        holder_a = types.SimpleNamespace(_persist_reference=b"component-a")
-        holder_b = types.SimpleNamespace(_persist_reference=b"component-b")
+
+        def corresponding_a(entity):
+            if entity is face_a or entity is alias_face_a:
+                return assembly_face_a
+            raise RuntimeError("unexpected component-a entity")
+
+        def corresponding_b(entity):
+            if entity is face_a or entity is face_b:
+                return assembly_face_b
+            raise RuntimeError("unexpected component-b entity")
+
+        holder_a = types.SimpleNamespace(
+            GetCorrespondingEntity=corresponding_a
+        )
+        holder_b = types.SimpleNamespace(
+            GetCorrespondingEntity=corresponding_b
+        )
         backend = _CaptureBackend(session_factory=lambda: None)
         cache = {}
         with _com_stubs(), patch.object(
             backend,
             "_appearance_owner_rows",
-            return_value=([owner], []),
+            side_effect=[
+                ([top_owner, owner], []),
+                ([top_owner, owner], []),
+            ],
         ):
             first = backend._capture_state_render_materials(
                 component="component-a",
@@ -3666,32 +4559,42 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             )
 
         self.assertEqual(render_calls, [(3, ("SharedState",))])
-        first_entity = first[0]["materials"][0]["entity_records"][0]
-        second_entity = second[0]["materials"][0]["entity_records"][0]
+        first_entity = first[1]["materials"][0]["entity_records"][0]
+        second_entity = second[1]["materials"][0]["entity_records"][0]
         self.assertEqual(
-            first_entity["matched_identity"]["faces"][0]["component"],
-            "component-a",
+            first_entity["binding_state"],
+            "ambiguous",
         )
+        self.assertEqual(first_entity["matched_identity"]["faces"], [])
         self.assertEqual(
             {
                 row["face_index"]
-                for row in first_entity["matched_identity"]["faces"]
+                for row in first_entity["binding_candidates"]
             },
             {0, 1},
         )
-        self.assertEqual(second_entity["matched_identity"]["faces"], [])
-        self.assertEqual(second[0]["mapping_errors"][0]["entity_kind"], "faces")
         self.assertEqual(
-            second[0]["mapping_errors"][0]["identity"]["component"],
-            "component-b",
+            second_entity["binding_state"],
+            "unique",
+        )
+        self.assertEqual(
+            second_entity["matched_identity"]["faces"],
+            [
+                {
+                    "component": "component-b",
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                }
+            ],
         )
         first_targets = [
             row["target"]
-            for row in first[0]["native_reference_index"]
+            for row in first[1]["native_reference_index"]
         ]
         second_targets = [
             row["target"]
-            for row in second[0]["native_reference_index"]
+            for row in second[1]["native_reference_index"]
         ]
         self.assertIn(
             {
@@ -3726,16 +4629,12 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         self.assertNotIn("component-a", {
             row.get("component") for row in second_targets
         })
-        error_codes = {
-            row["error"]["code"] for row in second[0]["mapping_errors"]
-        }
-        self.assertIn(
-            "cad_appearance_persistent_reference_missing",
-            error_codes,
-        )
-        self.assertIn(
-            "cad_appearance_persistent_reference_invalid",
-            error_codes,
+        self.assertEqual(
+            [
+                row["error"]["code"]
+                for row in second[1]["mapping_errors"]
+            ],
+            ["RuntimeError", "RuntimeError", "RuntimeError"],
         )
 
 
