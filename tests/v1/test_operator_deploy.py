@@ -2856,6 +2856,75 @@ class LifecycleTests(unittest.TestCase):
             multiline = status()
             self.assertEqual(multiline.returncode, 0, multiline.stdout + multiline.stderr)
 
+            rollback_intent = {
+                "state": "present",
+                "previous": "C:/description-e2e/state/instance-promotions/previous-0001",
+                "target_generation": "C:/description-e2e/state/lifecycle/gen-2/generation",
+                "restore_to": "C:/description-e2e/state/instance-promotions/previous-0001",
+                "current_snapshot": (
+                    "C:/description-e2e/state/instance-promotions/rollback-before-0001"
+                ),
+                "source_state_sha256": "f" * 64,
+            }
+            raw_sample["pending_rollback"] = rollback_intent
+            status_path.write_text(
+                json.dumps({"passed": True, "sample": raw_sample}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            intent_status = status()
+            self.assertEqual(
+                intent_status.returncode,
+                0,
+                intent_status.stdout + intent_status.stderr,
+            )
+            intent_sample = json.loads(intent_status.stdout.strip().splitlines()[-1])
+            self.assertEqual(intent_sample["pending_rollback"], rollback_intent)
+            self.assertEqual(intent_sample["task_state"], "Running")
+            self.assertGreater(intent_sample["listener_pid"], 0)
+            self.assertEqual(
+                intent_sample["source"]["install_id"],
+                intent_sample["install_id"],
+            )
+
+            unknown_intent = {
+                "state": "unknown",
+                "code": "rollback_intent_unreadable",
+                "path": "C:/description-e2e/state/instance-promotions/pending-rollback.json",
+                "error": "the pending rollback intent is incomplete or malformed",
+            }
+            raw_sample["pending_rollback"] = unknown_intent
+            status_path.write_text(
+                json.dumps({"passed": True, "sample": raw_sample}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            unknown_status = status()
+            self.assertEqual(
+                unknown_status.returncode,
+                0,
+                unknown_status.stdout + unknown_status.stderr,
+            )
+            unknown_sample = json.loads(
+                unknown_status.stdout.strip().splitlines()[-1]
+            )
+            self.assertEqual(unknown_sample["pending_rollback"], unknown_intent)
+            self.assertEqual(unknown_sample["task_state"], "Running")
+            self.assertGreater(unknown_sample["listener_pid"], 0)
+
+            raw_sample["pending_rollback"] = {
+                **rollback_intent,
+                "source_state_sha256": "bad",
+            }
+            status_path.write_text(
+                json.dumps({"passed": True, "sample": raw_sample}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            invalid_intent = status()
+            self.assertNotEqual(invalid_intent.returncode, 0)
+            self.assertIn(
+                "Windows process/identity probe differs from the install record",
+                invalid_intent.stderr,
+            )
+
             for name, content, expected in (
                 ("empty", "", "Windows probe returned no JSON"),
                 ("non-json", "not a JSON object\n", "Windows probe returned no JSON"),

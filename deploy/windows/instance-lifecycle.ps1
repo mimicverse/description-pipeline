@@ -272,6 +272,42 @@ function Assert-Single-TaskAction([object]$task) {
     Die 'task_ambiguous' 'the instance task must carry exactly one action'
   }
 }
+function Get-TaskSelectionParameters([object]$binding) {
+  $parameters = @{TaskName=[string]$binding.task_name}
+  if (-not [string]::IsNullOrWhiteSpace([string]$binding.task_path)) {
+    $parameters.TaskPath = [string]$binding.task_path
+  }
+  return $parameters
+}
+function Set-BindingTaskPath([object]$binding, [string]$TaskPath) {
+  if ($binding -is [hashtable]) {
+    $binding.task_path = $TaskPath
+  } else {
+    $binding | Add-Member -NotePropertyName task_path -NotePropertyValue $TaskPath -Force
+  }
+}
+function Get-BoundTask([object]$binding, [string]$ErrorAction = 'SilentlyContinue') {
+  $parameters = Get-TaskSelectionParameters $binding
+  $parameters.ErrorAction = $ErrorAction
+  return Get-ScheduledTask @parameters
+}
+function Get-InitialBoundTask([object]$binding) {
+  $parameters = Get-TaskSelectionParameters $binding
+  $parameters.ErrorAction = 'SilentlyContinue'
+  $tasks = @(Get-ScheduledTask @parameters)
+  if ($tasks.Count -eq 0) { return $null }
+  if ($tasks.Count -ne 1) {
+    Die 'windows_task_ambiguous' ('expected exactly one managed task, found ' + $tasks.Count)
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$binding.task_path)) {
+    Set-BindingTaskPath $binding ([string]$tasks[0].TaskPath)
+  }
+  return $tasks[0]
+}
+function Start-BoundTask([object]$binding) {
+  $parameters = Get-TaskSelectionParameters $binding
+  Start-ScheduledTask @parameters
+}
 function Get-TaskGeneration([object]$task) {
   Assert-Single-TaskAction $task
   $execute = [string]$task.Actions[0].Execute
@@ -389,7 +425,7 @@ function Wait-StartupHealthy([string]$configPath, [object]$binding) {
   $startupDeadline = (Get-Date).AddSeconds(30)
   $listenerPid = $null
   while ($true) {
-    $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+    $taskNow = Get-BoundTask $binding 'SilentlyContinue'
     if (-not $taskNow -or [string]$taskNow.State -notin @('Queued','Ready','Running')) {
       throw ('the settle startup window observed task state ' +
         $(if ($taskNow) { [string]$taskNow.State } else { 'missing' }))
@@ -425,7 +461,7 @@ function Wait-Settled([string]$configPath, [object]$binding) {
   $timer = [System.Diagnostics.Stopwatch]::StartNew()
   $settleDeadline = (Get-Date).AddSeconds(184)
   while ((Get-Date) -lt $settleDeadline) {
-    $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+    $taskNow = Get-BoundTask $binding 'SilentlyContinue'
     if (-not $taskNow -or [string]$taskNow.State -ne 'Running') {
       throw ('the settle window observed task state ' + $(if ($taskNow) { [string]$taskNow.State } else { 'missing' }))
     }
@@ -523,7 +559,7 @@ function Get-OwnershipRefusalFacts([string]$generation, [object]$binding) {
   # state and probe observer state are three-valued; a failed observation is unknown /
   # observer_failed and stops the switch instead of being read as a pass.  Nothing here kills a
   # process or deletes the lock.
-  $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+  $taskNow = Get-BoundTask $binding 'SilentlyContinue'
   if ($taskNow -and [string]$taskNow.State -eq 'Running') {
     return @{refused=$false; state='task_running'; reason='task_running'}
   }
@@ -566,7 +602,7 @@ function Start-OrRefuse([string]$configPath, [object]$binding, [string]$stageDir
   # on every path; nothing kills processes or deletes the lock.
   $script:SettleRefusal = @{lock_refusal=$null; retried_after_s=$null}
   $result = @{settled=$null; lock_refusal=$null; retried_after_s=$null}
-  Start-ScheduledTask -TaskName $binding.task_name
+  Start-BoundTask $binding
   try { $result.settled = Wait-Settled $configPath $binding; return $result }
   catch {
     $facts = Get-OwnershipRefusalFacts $stageDir $binding
@@ -598,7 +634,7 @@ function Start-OrRefuse([string]$configPath, [object]$binding, [string]$stageDir
     Wait-SettleRetryDelay 60
     $result.retried_after_s = 60
     $script:SettleRefusal.retried_after_s = 60
-    Start-ScheduledTask -TaskName $binding.task_name
+    Start-BoundTask $binding
     try { $result.settled = Wait-Settled $configPath $binding; return $result }
     catch {
       $second = Get-OwnershipRefusalFacts $stageDir $binding
@@ -792,48 +828,239 @@ result = {
 print(json.dumps(result, sort_keys=True))
 '@
 }
+function Get-SourceStateAuthorityHash([string]$SourceStatePath) {
+  if (-not (Test-Path -LiteralPath $SourceStatePath -PathType Leaf)) {
+    throw 'the source-state authority document is missing'
+  }
+  return Sha256 $SourceStatePath
+}
+function Read-ValidatedSnapshot(
+    [string]$Directory,
+    [string]$ExpectedTaskName,
+    [string]$ExpectedTaskPath,
+    [string]$ExpectedStateRoot,
+    [string]$ExpectedSourceStateSha256) {
+  $sourcePath = Join-Path $Directory 'source-state.json'
+  $taskPath = Join-Path $Directory 'task.xml'
+  $configPath = Join-Path $Directory 'endpoint-before.json'
+  foreach ($path in @($sourcePath, $taskPath, $configPath)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+      throw ('the source snapshot is missing ' + [System.IO.Path]::GetFileName($path))
+    }
+    Assert-NoReparseAncestor $path
+  }
+  if ($ExpectedSourceStateSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+      (Get-SourceStateAuthorityHash $sourcePath) -cne $ExpectedSourceStateSha256) {
+    throw 'the sealed source-state authority differs from the bound promotion'
+  }
+  $source = Read-Json $sourcePath
+  if ([string]$source.schema_version -cne 'solidworks-to-urdf.windows-source-state/v1') {
+    throw 'the source snapshot schema is unsupported'
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$source.task_name) -or
+      [string]$source.task_name -cne $ExpectedTaskName -or
+      [string]$source.task_path -cne $ExpectedTaskPath -or
+      (Normalize-PathIdentity ([string]$source.state_root)) -ne
+        (Normalize-PathIdentity $ExpectedStateRoot)) {
+    throw 'the source snapshot task or state-root identity differs from the binding'
+  }
+  foreach ($field in @(
+      'task_path',
+      'task_name',
+      'task_xml_sha256',
+      'task_semantic_sha256',
+      'task_acl_sha256',
+      'principal_sid',
+      'execute',
+      'arguments',
+      'working_directory',
+      'endpoint_root',
+      'config_path',
+      'config_sha256',
+      'config_digest',
+      'package_root',
+      'output_root',
+      'state_root',
+      'install_id_path',
+      'install_id',
+      'release_identity_sha256')) {
+    if ([string]::IsNullOrWhiteSpace([string]$source.$field)) {
+      throw ('the source snapshot misses ' + $field)
+    }
+  }
+  if ($null -eq $source.settings -or $null -eq $source.release -or
+      [string]$source.release.version -eq '' -or
+      [string]$source.release.source_commit -eq '' -or
+      [string]$source.release.source_sha256 -eq '' -or
+      [string]$source.release.role -cne 'native') {
+    throw 'the source snapshot misses task settings or release identity'
+  }
+  if ((Sha256 $taskPath) -ne [string]$source.task_xml_sha256 -or
+      (Sha256 $configPath) -ne [string]$source.config_sha256) {
+    throw 'the sealed source task or configuration digest differs'
+  }
+  if ((Normalize-PathIdentity ([string]$source.config_path)) -ne
+      (Normalize-PathIdentity (Config-Path ([string]$source.endpoint_root)))) {
+    throw 'the sealed source configuration is outside its generation'
+  }
+  $installIdPath = Join-Path ([string]$source.state_root) 'install-id'
+  if ((Normalize-PathIdentity ([string]$source.execute)) -ne
+        (Normalize-PathIdentity (Runtime-Python ([string]$source.endpoint_root))) -or
+      (Normalize-PathIdentity ([string]$source.working_directory)) -ne
+        (Normalize-PathIdentity ([string]$source.state_root)) -or
+      ([string]$source.arguments).IndexOf(
+        [string]$source.config_path,
+        [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+      (Normalize-PathIdentity ([string]$source.install_id_path)) -ne
+        (Normalize-PathIdentity $installIdPath)) {
+    throw 'the sealed source action or install identity is outside its generation'
+  }
+  $lifecycleRoot = Join-Path ([string]$source.state_root) 'lifecycle'
+  if (-not (Normalize-PathIdentity ([string]$source.endpoint_root)).StartsWith(
+        (Normalize-PathIdentity $lifecycleRoot) + '/',
+        [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw 'the sealed source generation is outside the managed lifecycle root'
+  }
+  $taskXml = Read-Utf8Text $taskPath
+  try { $xml = [xml]$taskXml } catch { throw 'the sealed source task XML is unreadable' }
+  if (@($xml.SelectNodes('//*[local-name()="Password" and string-length(normalize-space(.)) > 0]')).Count -ne 0) {
+    throw 'the sealed source task XML carries a password'
+  }
+  $xmlActions = @($xml.SelectNodes('//*[local-name()="Exec"]'))
+  $xmlExecute = @($xml.SelectNodes('//*[local-name()="Exec"]/*[local-name()="Command"]'))
+  $xmlArguments = @($xml.SelectNodes('//*[local-name()="Exec"]/*[local-name()="Arguments"]'))
+  $xmlWorking = @($xml.SelectNodes('//*[local-name()="Exec"]/*[local-name()="WorkingDirectory"]'))
+  if ($xmlActions.Count -ne 1 -or $xmlExecute.Count -ne 1 -or
+      $xmlArguments.Count -ne 1 -or $xmlWorking.Count -ne 1 -or
+      [string]$xmlExecute[0].InnerText -cne [string]$source.execute -or
+      [string]$xmlArguments[0].InnerText -cne [string]$source.arguments -or
+      [string]$xmlWorking[0].InnerText -cne [string]$source.working_directory) {
+    throw 'the sealed source task XML and source identity differ'
+  }
+  try { $probe = Read-EndpointRuntimeProbe ([string]$source.endpoint_root) $configPath }
+  catch { throw ('the sealed source runtime identity is unavailable: ' + $_.Exception.Message) }
+  if ([string]$source.config_digest -cne [string]$probe.config_digest -or
+      (Normalize-PathIdentity ([string]$source.package_root)) -ne
+        (Normalize-PathIdentity ([string]$probe.package_root)) -or
+      (Normalize-PathIdentity ([string]$source.output_root)) -ne
+        (Normalize-PathIdentity ([string]$probe.output_root)) -or
+      (Normalize-PathIdentity ([string]$source.state_root)) -ne
+        (Normalize-PathIdentity ([string]$probe.state_root)) -or
+      [int]$source.port -ne [int]$probe.port) {
+    throw 'the sealed source configuration identity differs from its runtime'
+  }
+  $embedded = $probe.release.release
+  if ($null -eq $embedded -or
+      [string]$source.release.version -cne [string]$probe.release.version -or
+      [string]$source.release.source_commit -cne [string]$embedded.source_commit -or
+      [string]$source.release.source_sha256 -cne [string]$probe.release.source_sha256 -or
+      [string]$source.release.role -cne 'native' -or
+      (Get-ReleaseIdentitySha256 $source.release) -cne [string]$source.release_identity_sha256) {
+    throw 'the sealed source release identity differs from its runtime'
+  }
+  if (-not (Test-Path -LiteralPath $installIdPath -PathType Leaf) -or
+      (Get-Content -LiteralPath $installIdPath -Raw).Trim() -cne
+        [string]$source.install_id) {
+    throw 'the sealed source install identity differs from the state root'
+  }
+  return @{
+    source = $source
+    source_path = $sourcePath
+    task_path = $taskPath
+    config_path = $configPath
+    task_xml = $taskXml
+  }
+}
+function Read-PromotionSourceAuthority(
+    [string]$Promotions,
+    [string]$Previous,
+    [string]$CurrentGeneration) {
+  $records = @()
+  foreach ($entry in @(
+      @{name='pending-promotion.json'; path=(Join-Path $Promotions 'pending-promotion.json')},
+      @{name='last-promotion.json'; path=(Join-Path $Promotions 'last-promotion.json')})) {
+    if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) { continue }
+    Assert-NoReparseAncestor $entry.path
+    $record = Read-Json $entry.path
+    if ((Normalize-PathIdentity ([string]$record.previous)) -eq
+          (Normalize-PathIdentity $Previous) -and
+        (Normalize-PathIdentity ([string]$record.generation)) -eq
+          (Normalize-PathIdentity $CurrentGeneration)) {
+      $records += @{name=$entry.name; record=$record}
+    }
+  }
+  if (@($records).Count -eq 0) {
+    throw 'no promotion receipt binds the requested previous and current generations'
+  }
+  $authorities = @()
+  foreach ($entry in $records) {
+    $record = $entry.record
+    $expectedIntent = if ($entry.name -eq 'pending-promotion.json') { $true } else { $null }
+    $expectedPassed = if ($entry.name -eq 'last-promotion.json') { $true } else { $null }
+    $authority = [string]$record.source_state_sha256
+    if ([string]$record.verb -cne 'promote' -or
+        ($null -ne $expectedIntent -and $record.intent -ne $expectedIntent) -or
+        ($null -ne $expectedPassed -and $record.passed -ne $expectedPassed) -or
+        (Normalize-PathIdentity ([string]$record.target.endpoint_root)) -ne
+          (Normalize-PathIdentity $CurrentGeneration) -or
+        $authority -cnotmatch '^[0-9a-f]{64}$') {
+      throw ('the promotion receipt does not bind a valid source-state authority: ' + $entry.name)
+    }
+    $authorities += $authority
+  }
+  $distinct = @($authorities | Select-Object -Unique)
+  if ($distinct.Count -ne 1) {
+    throw 'the pending and successful promotion receipts bind different source-state authorities'
+  }
+  return [string]$distinct[0]
+}
 function Restore-PreviousEndpoint(
     [object]$binding,
     [string]$previous,
-    [string]$stageDir) {
+    [string]$stageDir,
+    [string]$expectedTaskPath,
+    [string]$ExpectedSourceStateSha256) {
   # The safe stop/restore every promote failure path runs: stop whatever now serves the task,
   # restore the exact raw task XML and configuration sealed before the switch, then prove that
   # state from the managed generation runtime and the actual endpoint health. The task argument
   # text is opaque here: recovery never reapplies the new target launcher contract to old state.
   $restore = @{stopped=$false; restored=$false; start_gate=''; startable=$false; started=$false;
                healthy=$null; previous_generation=''; source=$null; error=''}
-  $sourcePath = Join-Path $previous 'source-state.json'
-  $taskPath = Join-Path $previous 'task.xml'
-  $configPath = Join-Path $previous 'endpoint-before.json'
   try {
-    $source = Read-Json $sourcePath
-    if (-not (Test-Path -LiteralPath $taskPath -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $configPath -PathType Leaf) -or
-        (Sha256 $taskPath) -ne [string]$source.task_xml_sha256 -or
-        (Sha256 $configPath) -ne [string]$source.config_sha256) {
-      throw 'the sealed source task or configuration digest differs'
+    $snapshotArguments = @{
+      Directory = $previous
+      ExpectedTaskName = [string]$binding.task_name
+      ExpectedTaskPath = $expectedTaskPath
+      ExpectedStateRoot = [string]$binding.state_root
+      ExpectedSourceStateSha256 = $ExpectedSourceStateSha256
     }
+    $snapshot = Read-ValidatedSnapshot @snapshotArguments
+    $source = $snapshot.source
   } catch {
     $restore.error = 'sealed source: ' + $_.Exception.Message
     return $restore
   }
+  Set-BindingTaskPath $binding ([string]$source.task_path)
   $restore.previous_generation = [string]$source.endpoint_root
   try {
-    Stop-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+    Stop-Endpoint $binding
     $restore.stopped = $true
-  } catch { if (-not $restore.error) { $restore.error = 'stop: ' + $_.Exception.Message } }
+  } catch {
+    $restore.error = 'stop: ' + $_.Exception.Message
+    return $restore
+  }
   try {
-    Register-ManagedTask -TaskName $binding.task_name -TaskPath ([string]$binding.task_path) `
-      -TaskXml (Read-Utf8Text $taskPath) -Force
+    Register-ManagedTask -TaskName $binding.task_name -TaskPath ([string]$source.task_path) `
+      -TaskXml $snapshot.task_xml -Force
     $restore.restored = $true
   } catch { if (-not $restore.error) { $restore.error = 'restore: ' + $_.Exception.Message } }
   if ($restore.restored) {
     try {
-      Copy-Item -LiteralPath $configPath -Destination ([string]$source.config_path) -Force
+      Copy-Item -LiteralPath ([string]$snapshot.config_path) -Destination ([string]$source.config_path) -Force
       if ((Sha256 ([string]$source.config_path)) -ne [string]$source.config_sha256) {
         throw 'the restored configuration digest differs'
       }
-      $restoredTask = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction Stop
+      $restoredTask = Get-BoundTask $binding 'Stop'
       $projection = Get-TaskProjection $restoredTask
       $identity = Get-EndpointIdentity $restoredTask $projection ([string]$binding.ssh_host)
       $current = New-EndpointSourceState $restoredTask $projection $identity
@@ -853,11 +1080,11 @@ function Restore-PreviousEndpoint(
   if ($restore.restored) {
     if ($restore.startable) {
       try {
-        Start-ScheduledTask -TaskName $binding.task_name
+        Start-BoundTask $binding
         $restore.started = $true
         $health = Read-EndpointHealth ([string]$source.config_path)
         Assert-HealthSourceMatch $health $source
-        $runningTask = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction Stop
+        $runningTask = Get-BoundTask $binding 'Stop'
         $runningProjection = Get-TaskProjection $runningTask
         $restore.listener = Get-ListenerEvidence $binding $runningProjection
         $restore.healthy = $true
@@ -882,7 +1109,9 @@ function Get-WriterResidue([object]$binding) {
   }
 }
 function Stop-Endpoint([object]$binding) {
-  Stop-ScheduledTask -TaskName $binding.task_name
+  $stopTask = Get-TaskSelectionParameters $binding
+  $stopTask.ErrorAction = 'Stop'
+  Stop-ScheduledTask @stopTask
   $deadline = (Get-Date).AddSeconds(30)
   while ($true) {
     $listening = Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue
@@ -891,7 +1120,7 @@ function Stop-Endpoint([object]$binding) {
     if ((Get-Date) -ge $deadline) { break }
     Start-Sleep -Milliseconds 500
   }
-  Die 'stop_failed' 'the old endpoint still listens or leaves a writing process under the generation/state root; refusing to switch'
+  throw 'stop_failed: the old endpoint still listens or leaves a writing process under the generation/state root; refusing to switch'
 }
 
 # The execution account's canonical domain pins: the endpoint service and same-host independent
@@ -1630,6 +1859,25 @@ function Get-RecoveryTask([string]$TaskName, [string]$TaskPath = '') {
   }
   return $tasks[0]
 }
+function New-TaskSemanticDocument(
+    [string]$TaskPath,
+    [string]$TaskName,
+    $Principal,
+    $Action,
+    $Settings,
+    [string]$TriggersSha256,
+    [string]$SecurityDescriptorSha256) {
+  return [ordered]@{
+    task_path = $TaskPath
+    task_name = $TaskName
+    uri = ($TaskPath + $TaskName)
+    principal = $Principal
+    action = $Action
+    settings = $Settings
+    triggers_sha256 = $TriggersSha256
+    security_descriptor_sha256 = $SecurityDescriptorSha256
+  }
+}
 function Get-TaskProjection($Task) {
   if (@($Task.Actions).Count -ne 1) {
     Die 'windows_action_invalid' 'the Windows task must carry exactly one action'
@@ -1699,16 +1947,9 @@ function Get-TaskProjection($Task) {
   if ($settings.multiple_instances -cne 'IgnoreNew') {
     Die 'windows_action_invalid' 'the scheduled task does not enforce a single instance'
   }
-  $semantic = [ordered]@{
-    task_path = [string]$Task.TaskPath
-    task_name = [string]$Task.TaskName
-    uri = ([string]$Task.TaskPath + [string]$Task.TaskName)
-    principal = $principal
-    action = $action
-    settings = $settings
-    triggers_sha256 = Get-JsonSha256 @($Task.Triggers)
-    security_descriptor_sha256 = [string]$taskFileAcl.projection_sha256
-  }
+  $semantic = New-TaskSemanticDocument ([string]$Task.TaskPath) ([string]$Task.TaskName) `
+    $principal $action $settings (Get-JsonSha256 @($Task.Triggers)) `
+    ([string]$taskFileAcl.projection_sha256)
   return [ordered]@{
     task_path = [string]$Task.TaskPath
     task_name = [string]$Task.TaskName
@@ -1735,6 +1976,24 @@ function Get-RecoveryFileRow([string]$Role, [string]$Path, [string]$Member) {
     bytes = [long]$item.Length
     sha256 = Sha256 $Path
   }
+}
+function Read-EndpointRuntimeProbe([string]$Generation, [string]$ConfigPath) {
+  $python = Runtime-Python $Generation
+  if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    throw 'the endpoint generation runtime is missing'
+  }
+  $program = "import json,sys;" +
+    "from description_pipeline.orchestration import windows;" +
+    "from description_pipeline.runtime import tool_record;" +
+    "c=windows.read_config(sys.argv[1]);" +
+    "print(json.dumps({'config_digest':c['config_digest'],'package_root':str(c['package_root'])," +
+    "'output_root':str(c['output_root']),'state_root':str(c['state_root'])," +
+    "'port':c['port'],'release':tool_record(role='native')},sort_keys=True))"
+  $output = & $python -I -B -c $program $ConfigPath
+  if ($LASTEXITCODE -ne 0) {
+    throw 'the installed endpoint runtime could not identify itself'
+  }
+  return (($output | Select-Object -Last 1) | ConvertFrom-Json)
 }
 function Get-EndpointIdentity($Task, $TaskProjection, [string]$SshHost) {
   $generation = Get-TaskGeneration $Task
@@ -1777,20 +2036,8 @@ function Get-EndpointIdentity($Task, $TaskProjection, [string]$SshHost) {
       (Normalize-PathIdentity ([string]$configDocument.state_root))) {
     Die 'windows_task_projection_mismatch' 'the task working directory differs from the endpoint state root'
   }
-  $python = Runtime-Python $generation
-  $program = "import json,sys;" +
-    "from description_pipeline.orchestration import windows;" +
-    "from description_pipeline.runtime import tool_record;" +
-    "c=windows.read_config(sys.argv[1]);" +
-    "print(json.dumps({'config_digest':c['config_digest'],'package_root':str(c['package_root'])," +
-    "'output_root':str(c['output_root']),'state_root':str(c['state_root'])," +
-    "'port':c['port']," +
-    "'release':tool_record(role='native')},sort_keys=True))"
-  $output = & $python -I -B -c $program $configPath
-  if ($LASTEXITCODE -ne 0) {
-    Die 'windows_recovery_identity_unreadable' 'the installed endpoint runtime could not identify itself'
-  }
-  $probe = ($output | Select-Object -Last 1) | ConvertFrom-Json
+  try { $probe = Read-EndpointRuntimeProbe $generation $configPath }
+  catch { Die 'windows_recovery_identity_unreadable' $_.Exception.Message }
   if ((Normalize-PathIdentity ([string]$configDocument.state_root)) -ne
         (Normalize-PathIdentity ([string]$probe.state_root)) -or
       (Normalize-PathIdentity ([string]$configDocument.package_root)) -ne
@@ -1877,6 +2124,7 @@ function New-EndpointSourceState($Task, $TaskProjection, $Identity) {
     task_semantic_sha256 = [string]$TaskProjection.semantic_sha256
     task_acl_sha256 = [string]$TaskProjection.security_descriptor_sha256
     principal_sid = [string]$TaskProjection.principal.sid
+    principal = $TaskProjection.principal
     execute = [string]$TaskProjection.action.execute
     arguments = [string]$TaskProjection.action.arguments
     working_directory = [string]$TaskProjection.action.working_directory
@@ -1898,6 +2146,8 @@ function New-EndpointSourceState($Task, $TaskProjection, $Identity) {
 }
 function Assert-EndpointSourceMatch($Expected, $Current) {
   $fields = @(
+    'task_path',
+    'task_name',
     'task_semantic_sha256',
     'task_acl_sha256',
     'principal_sid',
@@ -2427,7 +2677,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       Die 'windows_endpoint_not_provisioned' 'the existing endpoint runtime is missing'
     }
     if (-not $VerifyOnly) {
-      $existing = @(Get-ScheduledTask -TaskName ([string]$Binding.task_name) -ErrorAction SilentlyContinue)
+      $existing = @(Get-BoundTask $Binding 'SilentlyContinue')
       if ($existing.Count -gt 1) {
         Die 'windows_task_ambiguous' 'more than one task carries the managed name'
       }
@@ -2507,8 +2757,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
     $failedOwner = $ownedTask
     if (-not $VerifyOnly -and $registeringTask -and $state) {
       try {
-        $candidate = @(Get-ScheduledTask -TaskName ([string]$Binding.task_name) -ErrorAction Stop |
-          Where-Object { [string]$_.TaskPath -eq [string]$Binding.task_path })
+        $candidate = @(Get-BoundTask $Binding 'Stop')
         if ($candidate.Count -eq 1) {
           $candidateProjection = Get-TaskProjection $candidate[0]
           $failedOwner = $candidateProjection.xml_sha256 -eq [string]$state.task.xml_sha256 -and
@@ -2535,8 +2784,9 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
   }
 }
 function Invoke-RecoveryResume($Binding) {
-  $task = Get-RecoveryTask ([string]$Binding.task_name) ''
+  $task = Get-RecoveryTask ([string]$Binding.task_name) ([string]$Binding.task_path)
   $projection = Get-TaskProjection $task
+  Set-BindingTaskPath $Binding ([string]$projection.task_path)
   $identity = Get-EndpointIdentity $task $projection ([string]$Binding.ssh_host)
   if ($identity.install_id -ne [string]$Binding.install_id -or
       $identity.config_digest -ne [string]$Binding.config_digest -or
@@ -2600,13 +2850,14 @@ foreach ($field in ('task_name','state_root','generation','dir','archive','artif
                     'package_root','output_root','version','source_commit','source_sha256')) {
   if (-not $binding.$field) { Die 'binding_incomplete' "the binding misses $field" }
 }
-$task = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+$task = Get-InitialBoundTask $binding
 $promotions = Join-Path $binding.state_root 'instance-promotions'
 
 if ($Verb -eq 'health') {
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
   Assert-RunningTask $task
   $projection = Get-TaskProjection $task
+  Set-BindingTaskPath $binding ([string]$projection.task_path)
   $identity = Get-EndpointIdentity $task $projection ([string]$binding.ssh_host)
   if ([int]$identity.port -ne [int]$binding.port) {
     Die 'windows_task_projection_mismatch' 'the running endpoint port differs from the binding'
@@ -2630,6 +2881,46 @@ if ($Verb -eq 'status') {
   $last = $null
   $lastPath = Join-Path $promotions 'last-promotion.json'
   if (Test-Path -LiteralPath $lastPath) { $last = Read-Json $lastPath }
+  $pendingRollback = $null
+  $pendingRollbackPath = Join-Path $promotions 'pending-rollback.json'
+  try {
+    if (Test-Path -LiteralPath $pendingRollbackPath -ErrorAction Stop) {
+      $rollbackIntentItem = Get-Item -LiteralPath $pendingRollbackPath -Force -ErrorAction Stop
+      if ($rollbackIntentItem -isnot [System.IO.FileInfo] -or
+          ($rollbackIntentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw 'the pending rollback intent is not a regular file'
+      }
+      $unsafe = Find-ReparseAncestor $pendingRollbackPath
+      if ($unsafe) { throw ('the rollback intent crosses a reparse point: ' + $unsafe) }
+      $rollbackIntent = Read-Json $pendingRollbackPath
+      if ([string]$rollbackIntent.verb -cne 'rollback' -or
+          $rollbackIntent.intent -ne $true -or
+          [string]::IsNullOrWhiteSpace([string]$rollbackIntent.previous) -or
+          [string]::IsNullOrWhiteSpace([string]$rollbackIntent.rollback_generation) -or
+          [string]::IsNullOrWhiteSpace([string]$rollbackIntent.restore_to) -or
+          [string]::IsNullOrWhiteSpace([string]$rollbackIntent.current_snapshot) -or
+          [string]$rollbackIntent.source_state_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'the pending rollback intent is incomplete or malformed'
+      }
+      $pendingRollback = @{
+        state='present'
+        previous=[string]$rollbackIntent.previous
+        target_generation=[string]$rollbackIntent.rollback_generation
+        restore_to=[string]$rollbackIntent.restore_to
+        current_snapshot=[string]$rollbackIntent.current_snapshot
+        source_state_sha256=[string]$rollbackIntent.source_state_sha256
+        source=$rollbackIntent.source
+        target=$rollbackIntent.target
+      }
+    }
+  } catch {
+    $pendingRollback = @{
+      state='unknown'
+      code='rollback_intent_unreadable'
+      path=$pendingRollbackPath
+      error=$_.Exception.Message
+    }
+  }
   $target = Normalize-PathIdentity (Join-Path ([string]$binding.dir) 'generation')
   $live = $null
   if ($task) {
@@ -2656,6 +2947,7 @@ if ($Verb -eq 'status') {
     }
     try {
       $projection = Get-TaskProjection $task
+      Set-BindingTaskPath $binding ([string]$projection.task_path)
       $identity = Get-EndpointIdentity $task $projection ([string]$binding.ssh_host)
       $source = New-EndpointSourceState $task $projection $identity
       $listener = $null
@@ -2726,7 +3018,8 @@ if ($Verb -eq 'status') {
       }
     }
   }
-  Emit @{passed=$true; verb='status'; live_task=$live; pending=$pending; last_promotion=$last}
+  Emit @{passed=$true; verb='status'; live_task=$live; pending=$pending;
+    pending_rollback=$pendingRollback; last_promotion=$last}
   exit 0
 }
 
@@ -2739,6 +3032,7 @@ if ($Verb -eq 'stage') {
   # them - or a duplicate key stops the stage here, before any heavy work, and is never
   # silently dropped.
   $projection = Get-TaskProjection $task
+  Set-BindingTaskPath $binding ([string]$projection.task_path)
   $runningGeneration = Get-TaskGeneration $task
   $runningConfig = Config-Path $runningGeneration
   $early = Get-EndpointConfigEarlyProblems $runningConfig
@@ -2872,6 +3166,7 @@ if ($Verb -eq 'promote') {
     Die 'candidate_config_mismatch' ('the staged candidate configuration differs from the staged digest: ' + (Config-Path $StageDir))
   }
   $sourceProjection = Get-TaskProjection $task
+  Set-BindingTaskPath $binding ([string]$sourceProjection.task_path)
   $sourceIdentity = Get-EndpointIdentity $task $sourceProjection ([string]$binding.ssh_host)
   $previousConfig = [string]$sourceIdentity.config_path
   $previousGeneration = [string]$sourceIdentity.endpoint_root
@@ -2913,6 +3208,7 @@ if ($Verb -eq 'promote') {
     Die 'source_snapshot_mismatch' 'the sealed source task or configuration differs from the live projection'
   }
   Write-Receipt (Join-Path $previous 'source-state.json') $sourceState
+  $sourceStateSha256 = Get-SourceStateAuthorityHash (Join-Path $previous 'source-state.json')
   $pendingTarget = @{
     endpoint_root=(Normalize-PathIdentity $StageDir);
     config_path=(Normalize-PathIdentity (Config-Path $StageDir));
@@ -2928,11 +3224,11 @@ if ($Verb -eq 'promote') {
   Write-Receipt (Join-Path $promotions 'pending-promotion.json') @{
     intent=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
     previous=$previous; task_before=(Join-Path $previous 'task.xml');
-    source=$sourceState; source_listener=$sourceListener;
+    source=$sourceState; source_state_sha256=$sourceStateSha256; source_listener=$sourceListener;
     target=$pendingTarget}
   $mutationStarted = $false
   try {
-    $preStopTask = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction Stop
+    $preStopTask = Get-BoundTask $binding 'Stop'
     $preStopProjection = Get-TaskProjection $preStopTask
     $preStopIdentity = Get-EndpointIdentity $preStopTask $preStopProjection ([string]$binding.ssh_host)
     $preStopSource = New-EndpointSourceState $preStopTask $preStopProjection $preStopIdentity
@@ -2947,8 +3243,11 @@ if ($Verb -eq 'promote') {
       $installIdPath $taskFile
     $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
       -Argument (Runtime-LauncherArguments $StageDir) -WorkingDirectory $binding.state_root
-    Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
-    $targetTask = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction Stop
+    $setTask = Get-TaskSelectionParameters $binding
+    $setTask.Action = $action
+    $setTask.ErrorAction = 'Stop'
+    Set-ScheduledTask @setTask | Out-Null
+    $targetTask = Get-BoundTask $binding 'Stop'
     $targetProjection = Get-TaskProjection $targetTask
     if (-not (Test-Runtime-Launcher ([string]$targetProjection.action.execute) `
         ([string]$targetProjection.action.arguments) $StageDir)) {
@@ -2999,7 +3298,8 @@ if ($Verb -eq 'promote') {
     $targetListener = Get-ListenerEvidence $binding $targetProjection
     $receipt = @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-      previous=$previous; source=$sourceState; source_listener=$sourceListener;
+      previous=$previous; source=$sourceState;
+      source_state_sha256=$sourceStateSha256; source_listener=$sourceListener;
       target=$targetState; health=$health; listener=$targetListener;
       settled_seconds=$settled.settled_seconds; listener_pid=$settled.listener_pid}
     if ($lockRefusal) { $receipt['lock_refusal']=$lockRefusal; $receipt['retried']=@{after_s=$retriedAfter} }
@@ -3010,13 +3310,15 @@ if ($Verb -eq 'promote') {
     $restore = if ($mutationStarted) {
       Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $pins.previous_root
       Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' $pins.previous_ownership
-      Restore-PreviousEndpoint $binding $previous $StageDir
+      Restore-PreviousEndpoint -binding $binding -previous $previous -stageDir $StageDir `
+        -expectedTaskPath ([string]$sourceProjection.task_path) `
+        -ExpectedSourceStateSha256 $sourceStateSha256
     } else {
       @{stopped=$false; restored=$false; started=$false; healthy=$null; error='mutation did not begin'}
     }
     $failed = @{
       passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-      message=$_.Exception.Message; restore=$restore}
+      message=$_.Exception.Message; source_state_sha256=$sourceStateSha256; restore=$restore}
     $failureCode = 'promote_failed'
     if ($_.Exception.Message.StartsWith('lock_refused_unproven:')) { $failureCode = 'lock_refused_unproven' }
     elseif ($_.Exception.Message.StartsWith('lock_refused:')) { $failureCode = 'lock_refused' }
@@ -3042,20 +3344,32 @@ if ($Verb -eq 'promote') {
 if ($Verb -eq 'rollback') {
   # Exactly the sealed source snapshot the caller bounds - never "the latest promotion".
   if (-not $Previous) { Die 'previous_required' 'rollback needs -Previous (the bound previous generation directory)' }
-  foreach ($name in @('task.xml', 'endpoint-before.json', 'source-state.json')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $Previous $name) -PathType Leaf)) {
-      Die 'previous_missing' ('the bound previous snapshot is missing ' + $name + ': ' + $Previous)
-    }
-  }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
   Assert-RunningTask $task
   $currentProjection = Get-TaskProjection $task
+  Set-BindingTaskPath $binding ([string]$currentProjection.task_path)
   $currentIdentity = Get-EndpointIdentity $task $currentProjection ([string]$binding.ssh_host)
+  try {
+    $expectedSourceStateSha256 = Read-PromotionSourceAuthority $promotions $Previous `
+      ([string]$currentIdentity.endpoint_root)
+    $validatedPrevious = Read-ValidatedSnapshot `
+      -Directory $Previous `
+      -ExpectedTaskName ([string]$binding.task_name) `
+      -ExpectedTaskPath ([string]$currentProjection.task_path) `
+      -ExpectedStateRoot ([string]$currentIdentity.state_root) `
+      -ExpectedSourceStateSha256 $expectedSourceStateSha256
+  } catch {
+    $message = 'the bound previous snapshot is not safely readable: ' + $_.Exception.Message
+    Write-Receipt (Join-Path $promotions 'failed-rollback.json') @{
+      passed=$false; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
+      code='previous_invalid'; message=$message; previous=$Previous}
+    Die 'previous_invalid' $message
+  }
   $currentHealth = Read-EndpointHealth ([string]$currentIdentity.config_path)
   Assert-HealthSourceMatch $currentHealth $currentIdentity
   $currentListener = Get-ListenerEvidence $binding $currentProjection
   $currentSource = New-EndpointSourceState $task $currentProjection $currentIdentity
-  $targetSource = Read-Json (Join-Path $Previous 'source-state.json')
+  $targetSource = $validatedPrevious.source
   $pins = Assert-DomainPins $binding.state_root ([string]$currentIdentity.endpoint_root)
   New-Item -ItemType Directory -Path $promotions -ErrorAction SilentlyContinue | Out-Null
   $rollbackSnapshot = Join-Path $promotions ('rollback-before-' +
@@ -3066,17 +3380,21 @@ if ($Verb -eq 'rollback') {
   Copy-Item -LiteralPath ([string]$currentIdentity.config_path) `
     -Destination (Join-Path $rollbackSnapshot 'endpoint-before.json')
   Write-Receipt (Join-Path $rollbackSnapshot 'source-state.json') $currentSource
+  $currentSnapshotAuthority = Get-SourceStateAuthorityHash (
+    Join-Path $rollbackSnapshot 'source-state.json')
   if ((Sha256 (Join-Path $rollbackSnapshot 'task.xml')) -ne [string]$currentProjection.xml_sha256 -or
       (Sha256 (Join-Path $rollbackSnapshot 'endpoint-before.json')) -ne
-        [string]$currentIdentity.config_sha256) {
+        [string]$currentIdentity.config_sha256 -or
+      $currentSnapshotAuthority -cnotmatch '^[0-9a-f]{64}$') {
     Die 'source_snapshot_mismatch' 'the current rollback source could not be sealed exactly'
   }
   Write-Receipt (Join-Path $promotions 'pending-rollback.json') @{
     intent=$true; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
     rollback_generation=[string]$currentIdentity.endpoint_root;
     restore_to=[string]$targetSource.endpoint_root; previous=$Previous;
-    current_snapshot=$rollbackSnapshot; source=$currentSource; target=$targetSource}
-  $preStopTask = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction Stop
+    current_snapshot=$rollbackSnapshot; source=$currentSource;
+    source_state_sha256=$currentSnapshotAuthority; target=$targetSource}
+  $preStopTask = Get-BoundTask $binding 'Stop'
   $preStopProjection = Get-TaskProjection $preStopTask
   $preStopIdentity = Get-EndpointIdentity $preStopTask $preStopProjection ([string]$binding.ssh_host)
   $preStopSource = New-EndpointSourceState $preStopTask $preStopProjection $preStopIdentity
@@ -3086,23 +3404,46 @@ if ($Verb -eq 'rollback') {
   Assert-HealthSourceMatch $preStopHealth $currentSource
   Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' ([string]$targetSource.endpoint_root)
   Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' (Domain-OwnershipPath $binding.state_root)
-  $restore = Restore-PreviousEndpoint $binding $Previous ([string]$currentIdentity.endpoint_root)
+  $restore = Restore-PreviousEndpoint -binding $binding -previous $Previous `
+    -stageDir ([string]$currentIdentity.endpoint_root) `
+    -expectedTaskPath ([string]$currentProjection.task_path) `
+    -ExpectedSourceStateSha256 $expectedSourceStateSha256
   if (-not $restore.restored -or -not $restore.started -or $restore.healthy -ne $true) {
-    # Leave the candidate task disabled if the sealed source cannot be restored. A second silent
-    # start of the candidate would make the rollback outcome look successful when it is not.
-    Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $pins.previous_root
-    Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' $pins.previous_ownership
-    try {
-      $reverted = @(Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue |
-        Where-Object { [string]$_.TaskPath -eq [string]$binding.task_path })
-      if ($reverted.Count -eq 1) {
-        Disable-ManagedTask ([string]$binding.task_name) ([string]$binding.task_path)
-      }
-    } catch { }
+    Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' ([string]$currentIdentity.endpoint_root)
+    Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' (Domain-OwnershipPath $binding.state_root)
+    if (-not $restore.stopped) {
+      Write-Receipt (Join-Path $promotions 'failed-rollback.json') @{
+        passed=$false; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
+        code='rollback_stop_failed'; restore=$restore;
+        source_state_sha256=$expectedSourceStateSha256;
+        current_source_state_sha256=$currentSnapshotAuthority;
+        current_snapshot=$rollbackSnapshot; previous=$Previous}
+      Die 'rollback_stop_failed' (
+        'the current Windows endpoint was not stopped; no restored task was registered: ' +
+        [string]$restore.error)
+    }
+    $currentRecovery = Restore-PreviousEndpoint -binding $binding -previous $rollbackSnapshot `
+      -stageDir ([string]$currentIdentity.endpoint_root) `
+      -expectedTaskPath ([string]$currentProjection.task_path) `
+      -ExpectedSourceStateSha256 $currentSnapshotAuthority
     Write-Receipt (Join-Path $promotions 'failed-rollback.json') @{
       passed=$false; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
-      restore=$restore; current_snapshot=$rollbackSnapshot; previous=$Previous}
-    Die 'rollback_failed' ('the sealed source endpoint could not be restored: ' + [string]$restore.error)
+      code=$(if ($currentRecovery.healthy -eq $true) {
+        'rollback_failed_current_restored'
+      } else {
+        'rollback_failed_current_unrecovered'
+      });
+      restore=$restore; current_recovery=$currentRecovery;
+      source_state_sha256=$expectedSourceStateSha256;
+      current_source_state_sha256=$currentSnapshotAuthority;
+      current_snapshot=$rollbackSnapshot; previous=$Previous}
+    $recoveryMessage = if ($currentRecovery.healthy -eq $true) {
+      'the current endpoint was restored'
+    } else {
+      'the current endpoint could not be restored: ' + [string]$currentRecovery.error
+    }
+    Die 'rollback_failed' ('the sealed source endpoint could not be restored: ' +
+      [string]$restore.error + '; ' + $recoveryMessage)
   }
   Set-DomainPins $binding.state_root ([string]$targetSource.endpoint_root)
   $health = Read-EndpointHealth ([string]$targetSource.config_path)
@@ -3110,7 +3451,7 @@ if ($Verb -eq 'rollback') {
   Write-Receipt (Join-Path $promotions ('rollback-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') + '.json')) @{
     passed=$true; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
     restored_from=$Previous; rollback_source=$rollbackSnapshot; source=$targetSource;
-    restore=$restore; health=$health}
+    source_state_sha256=$expectedSourceStateSha256; restore=$restore; health=$health}
   Emit @{passed=$true; verb='rollback'; restored_from=$Previous}
   exit 0
 }

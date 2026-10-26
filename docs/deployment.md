@@ -119,10 +119,17 @@ launcher，也不得通过关闭 Device Guard/WDAC、添加例外或复制旧可
 既有受管对象，也不能接管外来任务、忽略身份冲突或把 UNKNOWN 当作已完成。
 
 在 Stop 或任何替换之前，先持久封存当前原始 task XML、配置、身份、必要权限与 pin、
-摘要和操作意图，再统一安装唯一目标状态。失败恢复只使用本次绑定的封存源状态；恢复任务
+摘要和操作意图，再统一安装唯一目标状态。封存 `source-state.json` 后，以其原始字节
+SHA 绑定同一 `previous`／当前 target 的 pending 与成功 promotion receipt；外部
+rollback 必须命中该既有操作记录，缺失或冲突一律拒绝。失败恢复只使用本次绑定的封存源状态；恢复任务
 按原始 XML 的安全语义和实际旧端点身份核验，不套用新目标的启动串，也不按历史版本
-枚举兼容形式。XML 原件摘要保持精确；任务系统导出格式差异不能放宽 action、账户、
-权限或设置。Windows 统一解释任务和运行状态，Linux operator 只消费源／目标身份明确的
+枚举兼容形式。Reader 在首次 mutation 前校验 receipt authority、XML 原件摘要、配置
+摘要、任务归属、生命周期边界及可取得的 runtime／release／install 身份；恢复直接向
+受管 Task API 提交原件，再读回核验实际 principal/action、settings、triggers、ACL
+及旧端点健康身份。导出格式差异不放宽这些必需语义，也不宣称已对每个 XML 字段独立
+复算等价。Rollback 恢复旧失败时，使用 mutation 前已保全的 current snapshot 与同一
+authority 恢复当前端点，不生成另一套回填摘要的日志。Windows
+统一解释任务和运行状态，Linux operator 只消费源／目标身份明确的
 结构化事实；status、health、reconcile、rollback、backup 和 restore 共用此边界。
 排空、维护锁、租约、不可变发行归档与 UNKNOWN 对账能力继续有效。
 

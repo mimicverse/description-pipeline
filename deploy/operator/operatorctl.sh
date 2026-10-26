@@ -1553,6 +1553,20 @@ function Get-Sample {{
   }}
   $health = $live.health
   $listener = $live.listener
+  $pendingRollback = $document.pending_rollback
+  if ($null -ne $pendingRollback) {{
+    if ($pendingRollback.state -eq 'present') {{
+      if (-not $pendingRollback.previous -or
+          -not $pendingRollback.target_generation -or
+          -not $pendingRollback.restore_to -or
+          -not $pendingRollback.current_snapshot -or
+          [string]$pendingRollback.source_state_sha256 -cnotmatch '^[0-9a-f]{{64}}$') {{
+        throw 'the managed lifecycle returned an incomplete rollback intent'
+      }}
+    }} elseif ($pendingRollback.state -ne 'unknown') {{
+      throw 'the managed lifecycle returned an invalid rollback intent state'
+    }}
+  }}
   [ordered]@{{
     task_name = [string]$task.TaskName
     task_path = [string]$task.TaskPath
@@ -1587,6 +1601,7 @@ function Get-Sample {{
     }}
     maintenance_relation = [string]$live.maintenance_relation
     source = $live.source
+    pending_rollback = $pendingRollback
   }}
 }}
 try {{
@@ -1729,6 +1744,7 @@ if not isinstance(result, dict) or result.get("passed") is not True:
     )
 sample = result.get("sample")
 source = sample.get("source") if isinstance(sample, dict) else None
+pending_rollback = sample.get("pending_rollback") if isinstance(sample, dict) else None
 if (
     not isinstance(sample, dict)
     or sample.get("task_name") != task_name
@@ -1774,6 +1790,37 @@ if (
     or type(sample.get("listener_pid")) is not int
     or not isinstance(sample.get("process_start_utc"), str)
     or not sample["process_start_utc"]
+    or (
+        pending_rollback is not None
+        and (
+            not isinstance(pending_rollback, dict)
+            or pending_rollback.get("state") not in {"present", "unknown"}
+            or (
+                pending_rollback.get("state") == "present"
+                and (
+                    not isinstance(pending_rollback.get("previous"), str)
+                    or not pending_rollback["previous"]
+                    or not isinstance(pending_rollback.get("target_generation"), str)
+                    or not pending_rollback["target_generation"]
+                    or not isinstance(pending_rollback.get("restore_to"), str)
+                    or not pending_rollback["restore_to"]
+                    or not isinstance(pending_rollback.get("current_snapshot"), str)
+                    or not pending_rollback["current_snapshot"]
+                    or not isinstance(
+                        pending_rollback.get("source_state_sha256"), str
+                    )
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        pending_rollback.get("source_state_sha256", ""),
+                    )
+                )
+            )
+            or (
+                pending_rollback.get("state") == "unknown"
+                and pending_rollback.get("code") != "rollback_intent_unreadable"
+            )
+        )
+    )
 ):
     persist_status_evidence(
         completed.stdout,
@@ -1814,6 +1861,7 @@ print(
             "process_user_sid": sample["process_user_sid"],
             "maintenance_relation": sample["maintenance_relation"],
             "source": source,
+            "pending_rollback": pending_rollback,
             "transport": getattr(completed, "transport", {}),
             "evidence": {
                 "stdout": str(stdout_path),
