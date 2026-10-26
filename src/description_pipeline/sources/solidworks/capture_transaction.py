@@ -206,7 +206,6 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
         "effective_instances": "raw/effective_instances.json",
         "geometry": "raw/geometry.json",
         "axes": "raw/axis_references.json",
-        "native_capture_facts": "raw/native_capture_facts.json",
         "collection": "evidence/collection.json",
     }
     capture = {

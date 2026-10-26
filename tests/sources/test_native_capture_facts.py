@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 from description_pipeline.geometry.native_transform import transform_from_solidworks
 from description_pipeline.io import PipelineError, write_json
 from description_pipeline.schemas import EFFECTIVE_INSTANCES_SCHEMA
+from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.native_capture_facts import verify_native_capture_facts
 from description_pipeline.verification.solidworks_physics import verify_urdf_mass_equality
 
@@ -193,8 +195,8 @@ class NativeCaptureFactsTests(unittest.TestCase):
             "inertia_values_about_origin_api": self.origin,
             "overrides": self.overrides,
         }
+        self.raw_facts = raw_facts
         self.capture = {
-            "native_capture_facts": raw_facts,
             "scene": {
                 "document": "/source/root.SLDASM",
                 "components": [
@@ -249,18 +251,47 @@ class NativeCaptureFactsTests(unittest.TestCase):
         }
         self.write_capture()
 
-    def write_capture(self):
+    def write_capture(
+        self,
+        *,
+        detected: str = "solidworks_standard",
+        applied: bool = False,
+    ):
+        write_json(
+            self.root / "evidence/raw/native_capture_facts.json",
+            self.raw_facts,
+        )
+        write_json(
+            self.root / "evidence/raw/scene_raw.json",
+            self.raw_facts["scene_raw"],
+        )
         write_json(self.root / "evidence/capture.json", self.capture)
         write_json(
             self.root / "evidence/raw/inertia_convention.json",
             {
                 "schema_version": "solidworks-to-urdf.inertia-convention/v1",
-                "detected": "solidworks_standard",
-                "capture_transform": {"applied": False},
+                "detected": detected,
+                "capture_transform": {"applied": applied},
             },
+        )
+        write_manifest(
+            self.root / "evidence",
+            kind="solidworks",
+            identity={
+                "assembly": "C:/source/root.SLDASM",
+                "configuration": "Default",
+            },
+            evidence_class="fixture",
         )
 
     def test_projected_values_are_bound_to_raw_facts(self):
+        capture = json.loads(
+            (self.root / "evidence/capture.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("native_capture_facts", capture)
+        self.assertTrue(
+            (self.root / "evidence/raw/native_capture_facts.json").is_file()
+        )
         result = verify_native_capture_facts(self.root)
         self.assertTrue(result["native_capture_facts"])
         self.assertEqual(result["inertia_family"], "solidworks_standard")
@@ -316,7 +347,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
 
     def test_positive_products_are_normalized_from_raw_facts(self):
         capture = copy.deepcopy(self.capture)
-        raw_facts = capture["native_capture_facts"]
+        raw_facts = copy.deepcopy(self.raw_facts)
         positive_about = [1.0, 0.04, 0.0, 0.04, 2.0, 0.0, 0.0, 0.0, 3.0]
         positive_origin = [1.08, 0.08, 0.0, 0.08, 2.02, 0.0, 0.0, 0.0, 3.10]
         normalized_about = [[1.0, -0.04, 0.0], [-0.04, 2.0, 0.0], [0.0, 0.0, 3.0]]
@@ -335,21 +366,15 @@ class NativeCaptureFactsTests(unittest.TestCase):
             read["inertia_tensor_about_com"] = normalized_about
             read["inertia_values_about_origin_api"] = normalized_origin
         self.capture = capture
-        self.write_capture()
-        write_json(
-            self.root / "evidence/raw/inertia_convention.json",
-            {
-                "schema_version": "solidworks-to-urdf.inertia-convention/v1",
-                "detected": "solidworks_positive",
-                "capture_transform": {"applied": True},
-            },
-        )
+        self.raw_facts = raw_facts
+        self.write_capture(detected="solidworks_positive", applied=True)
         result = verify_native_capture_facts(self.root)
         self.assertTrue(result["inertia_transform_applied"])
 
     def test_effective_projected_tamper_fails_with_raw_facts_unchanged(self):
         capture = copy.deepcopy(self.capture)
-        raw = capture["native_capture_facts"]["component_mass_raw"]["instances"][0]
+        raw_facts = copy.deepcopy(self.raw_facts)
+        raw = raw_facts["component_mass_raw"]["instances"][0]
         raw["effective"] = {
             "native_raw": {
                 "mass_kg": 1.0,
@@ -371,6 +396,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
         capture["effective_instances"]["readings"] = {"base": projected_effective}
         capture["scene"]["notes"]["effective_instances"] = {"base": projected_effective}
         self.capture = capture
+        self.raw_facts = raw_facts
         self.write_capture()
         verify_native_capture_facts(self.root)
         projected_effective["inertia"][0][1] = 1e-13
@@ -382,10 +408,11 @@ class NativeCaptureFactsTests(unittest.TestCase):
 
     def test_near_symmetric_raw_inertia_preserves_each_offdiagonal(self):
         capture = copy.deepcopy(self.capture)
-        capture["native_capture_facts"]["assembly_mass_raw"] = copy.deepcopy(
-            capture["native_capture_facts"]["assembly_mass_raw"]
+        raw_facts = copy.deepcopy(self.raw_facts)
+        raw_facts["assembly_mass_raw"] = copy.deepcopy(
+            raw_facts["assembly_mass_raw"]
         )
-        raw = capture["native_capture_facts"]["part_mass_raw"]["base"]["native_raw"]
+        raw = raw_facts["part_mass_raw"]["base"]["native_raw"]
         raw["inertia_values"] = [1.0, 1e-13, 0.0, 2e-13, 2.0, 0.0, 0.0, 0.0, 3.0]
         capture["components"][0]["mass_properties"]["inertia"] = [
             [1.0, 1e-13, 0.0],
@@ -393,11 +420,40 @@ class NativeCaptureFactsTests(unittest.TestCase):
             [0.0, 0.0, 3.0],
         ]
         self.capture = capture
+        self.raw_facts = raw_facts
         self.write_capture()
         verify_native_capture_facts(self.root)
         capture["components"][0]["mass_properties"]["inertia"][1][0] = 1e-13
         self.write_capture()
         with self.assertRaisesRegex(PipelineError, "projected inertia differs"):
+            verify_native_capture_facts(self.root)
+
+    def test_missing_sealed_native_facts_member_is_rejected(self):
+        (self.root / "evidence/raw/native_capture_facts.json").unlink()
+        write_manifest(
+            self.root / "evidence",
+            kind="solidworks",
+            identity={
+                "assembly": "C:/source/root.SLDASM",
+                "configuration": "Default",
+            },
+            evidence_class="fixture",
+        )
+        with self.assertRaisesRegex(
+            PipelineError,
+            "no sealed native capture facts member",
+        ):
+            verify_native_capture_facts(self.root)
+
+    def test_raw_member_tamper_breaks_the_source_manifest(self):
+        path = self.root / "evidence/raw/native_capture_facts.json"
+        record = self.raw_facts
+        record["assembly_mass_raw"]["native_raw"]["mass_kg"] = 2.01
+        write_json(path, record)
+        with self.assertRaisesRegex(
+            PipelineError,
+            "Source snapshot is incomplete or changed",
+        ):
             verify_native_capture_facts(self.root)
 
 

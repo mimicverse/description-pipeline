@@ -973,34 +973,6 @@ def _appearance_reference_key(value):
     return tuple(item & 0xFF for item in value)
 
 
-def _appearance_binding_key(reference, context):
-    reference_key = _appearance_reference_key(reference)
-    if not isinstance(context, Mapping) or reference_key is None:
-        return None
-    owner_scope = context.get("owner_scope")
-    document_path = context.get("owner_document_path")
-    component = context.get("component")
-    if not all(
-        isinstance(value, str) and value
-        for value in (owner_scope, document_path, component)
-    ):
-        return None
-    return (
-        owner_scope,
-        normalize_document_path(document_path),
-        component,
-        reference_key,
-    )
-
-
-def _appearance_unique_targets(targets):
-    unique = []
-    for target in targets:
-        if target not in unique:
-            unique.append(copy.deepcopy(target))
-    return unique
-
-
 def _appearance_feature_identity(face, extension):
     errors = {}
     try:
@@ -5146,7 +5118,7 @@ class SolidWorksBackend(CadBackend):
         return record, reference
 
     @staticmethod
-    def _appearance_identity_maps(
+    def _appearance_reference_index(
         extension,
         *,
         owner_scope,
@@ -5159,9 +5131,8 @@ class SolidWorksBackend(CadBackend):
         faces,
         features,
     ):
-        """Build raw reference observations from the objects already enumerated."""
+        """Project raw reference observations from the enumerated native objects."""
 
-        maps = {}
         mapping_errors = []
         native_reference_index = []
         if (
@@ -5182,7 +5153,7 @@ class SolidWorksBackend(CadBackend):
                     },
                 }
             )
-            return maps, mapping_errors, native_reference_index
+            return mapping_errors, native_reference_index
 
         def add(kind, entity, identity):
             document, document_interface_error = _appearance_interface(
@@ -5256,11 +5227,7 @@ class SolidWorksBackend(CadBackend):
                 "component": component_name,
                 "api": context["api"],
             }
-            key = _appearance_binding_key(
-                reference,
-                binding_context,
-            )
-            if key is None:
+            if _appearance_reference_key(reference) is None:
                 return
             target = {
                 "kind": {
@@ -5271,7 +5238,6 @@ class SolidWorksBackend(CadBackend):
                 }[kind],
                 **copy.deepcopy(identity),
             }
-            maps.setdefault(key, []).append(target)
             native_reference_index.append(
                 {
                     "persistent_reference": copy.deepcopy(reference),
@@ -5358,7 +5324,7 @@ class SolidWorksBackend(CadBackend):
                     "faces": faces,
                 },
             )
-        return maps, mapping_errors, native_reference_index
+        return mapping_errors, native_reference_index
 
     def _capture_state_render_materials(
         self,
@@ -5504,10 +5470,9 @@ class SolidWorksBackend(CadBackend):
                     and extension is not None
                 ):
                     (
-                        maps,
                         mapping_errors,
                         native_reference_index,
-                    ) = self._appearance_identity_maps(
+                    ) = self._appearance_reference_index(
                         extension,
                         owner_scope=owner["owner_scope"],
                         component=(
@@ -5570,12 +5535,6 @@ class SolidWorksBackend(CadBackend):
                                 display_state=display_state,
                             )
                             entity.update(context["record"])
-                            entity.update(
-                                self._appearance_entity_binding(
-                                    context,
-                                    maps,
-                                )
-                            )
                 records.append(record)
             except Exception as error:  # noqa: BLE001 - owner-local failure
                 records.append(
@@ -5759,75 +5718,6 @@ class SolidWorksBackend(CadBackend):
                 "native_identity": identity,
             },
             "persistent_reference": reference,
-        }
-
-    @staticmethod
-    def _appearance_entity_binding(context, maps):
-        """Join one context-qualified reference to zero, one, or many targets."""
-
-        indexed_targets = _appearance_unique_targets(
-            maps.get(
-                _appearance_binding_key(
-                    context["persistent_reference"],
-                    context["record"]["binding_context"],
-                ),
-                [],
-            )
-        )
-        document_identity = context["record"]["native_identity"]
-        allowed_target_kinds = (
-            {"face"}
-            if document_identity.get("kind") == "entity"
-            else {"occurrence", "body", "feature"}
-        )
-        targets = [
-            target
-            for target in indexed_targets
-            if target.get("kind") in allowed_target_kinds
-        ]
-        matched_identity = {
-            kind: []
-            for kind in (
-                "occurrences",
-                "bodies",
-                "faces",
-                "features",
-            )
-        }
-        if (
-            document_identity.get("kind") == "document"
-            and document_identity.get("state") in {"observed", "partial"}
-            and isinstance(document_identity.get("document_path"), str)
-            and isinstance(
-                document_identity.get("active_configuration"),
-                str,
-            )
-        ):
-            binding_state = "document"
-            binding_candidates = [copy.deepcopy(document_identity)]
-        elif len(targets) == 1:
-            binding_state = "unique"
-            binding_candidates = targets
-            target = copy.deepcopy(targets[0])
-            target_kind = target.pop("kind")
-            matched_identity[
-                {
-                    "occurrence": "occurrences",
-                    "body": "bodies",
-                    "face": "faces",
-                    "feature": "features",
-                }[target_kind]
-            ].append(target)
-        elif targets:
-            binding_state = "ambiguous"
-            binding_candidates = targets
-        else:
-            binding_state = "unbound"
-            binding_candidates = []
-        return {
-            "binding_state": binding_state,
-            "binding_candidates": binding_candidates,
-            "matched_identity": matched_identity,
         }
 
     def capture_prepared_geometry(self, source_scopes, on_activity=None):

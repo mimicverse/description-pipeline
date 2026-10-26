@@ -325,19 +325,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             },
                             "read_errors": {},
                         },
-                        "matched_identity": {
-                            "occurrences": [],
-                            "bodies": [],
-                            "faces": [
-                                {
-                                    "component": "arm-1",
-                                    "body_type": 0,
-                                    "body_index": 0,
-                                    "face_index": 0,
-                                }
-                            ],
-                            "features": [],
-                        },
                         "read_errors": {},
                     }
                 ],
@@ -442,7 +429,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             },
                             "read_errors": {},
                         },
-                        "matched_identity": {},
                         "read_errors": {},
                     }
                 ],
@@ -539,7 +525,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             },
                             "read_errors": {},
                         },
-                        "matched_identity": {},
                         "read_errors": {},
                     }
                 ],
@@ -696,7 +681,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                     },
                                     "read_errors": {},
                                 },
-                                "matched_identity": {},
                                 "read_errors": {},
                             }
                         ],
@@ -792,7 +776,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "state": "observed",
                             "read_errors": {},
                         },
-                        "matched_identity": {},
                         "read_errors": {},
                     }
                 ],
@@ -943,7 +926,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                 "state": "observed",
                                 "read_errors": {},
                             },
-                            "matched_identity": {},
                             "read_errors": {},
                         }
                     ],
@@ -1102,12 +1084,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                 "read_errors": {},
                             },
                             "read_errors": {},
-                        },
-                        "matched_identity": {
-                            "occurrences": [],
-                            "bodies": [],
-                            "faces": [],
-                            "features": [],
                         },
                         "read_errors": {},
                     }

@@ -364,7 +364,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                             persistent_reference=[4, 5, 6],
                             target_reference=[4, 5, 6],
                         ),
-                        "matched_identity": {},
                         "read_errors": {},
                     }
                 ],
@@ -576,12 +575,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                             persistent_reference=[4, 5, 6],
                             target_reference=[4, 5, 6],
                         ),
-                        "matched_identity": {
-                            "occurrences": [],
-                            "bodies": [],
-                            "faces": [],
-                            "features": [],
-                        },
                         "read_errors": {},
                     }
                 ],
@@ -795,7 +788,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "source_persistent_reference": [7, 8, 9],
                         "source_read_errors": {},
                         "native_identity": _native_identity("object"),
-                        "matched_identity": {},
                         "read_errors": {},
                     }
                 ],
@@ -882,7 +874,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "source_persistent_reference": [7, 8, 9],
                         "source_read_errors": {},
                         "native_identity": _native_identity("entity"),
-                        "matched_identity": {},
                         "read_errors": {},
                     }
                 ],
@@ -997,7 +988,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                                 "source_persistent_reference": [7, 8, 9],
                                 "source_read_errors": {},
                                 "native_identity": _native_identity("object"),
-                                "matched_identity": {},
                                 "read_errors": {},
                             }
                         ],
@@ -1105,7 +1095,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                             "state": "observed",
                             "read_errors": {},
                         },
-                        "matched_identity": {},
                         "read_errors": {},
                     }
                 ],
@@ -1232,12 +1221,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                     "source_persistent_reference": [7, 8, 9],
                     "source_read_errors": {},
                     "native_identity": _native_identity("object"),
-                    "matched_identity": {
-                        "occurrences": [],
-                        "bodies": [],
-                        "faces": [],
-                        "features": [],
-                    },
                     "read_errors": {},
                 }
                 if failure == "persistent_reference":
@@ -1263,14 +1246,19 @@ class AppearanceResolutionTests(unittest.TestCase):
                         }
                     ]
                 elif failure == "source_claim_without_index":
-                    entity["matched_identity"]["faces"] = [
-                        {
-                            "component": COMPONENT,
-                            "body_type": 0,
-                            "body_index": 0,
-                            "face_index": 0,
-                        }
-                    ]
+                    entity["matched_identity"] = {
+                        "occurrences": [],
+                        "bodies": [],
+                        "faces": [
+                            {
+                                "component": COMPONENT,
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                            }
+                        ],
+                        "features": [],
+                    }
                 elif failure == "wrong_owner":
                     entity["binding_context"]["component"] = "other-1"
                 elif failure == "reverse_conversion":
@@ -1367,19 +1355,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                                 "source_read_errors": {},
                                 "native_identity": _native_identity("entity"),
                                 "read_errors": {},
-                                "matched_identity": {
-                                    "occurrences": [],
-                                    "bodies": [],
-                                    "faces": [
-                                        {
-                                            "component": COMPONENT,
-                                            "body_type": 0,
-                                            "body_index": 0,
-                                            "face_index": 0,
-                                        }
-                                    ],
-                                    "features": [],
-                                },
                             }
                         ],
                         "primary_color": 0x00AABBCC,

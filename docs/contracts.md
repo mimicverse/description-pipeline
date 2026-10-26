@@ -670,6 +670,11 @@ COM；Freeze 保留初次准备职责。Capture 读取 scene 与内存几何事�
 三角形派生，保留 component-local 坐标，明确法向量和浮点编码的派生来源，不能重复
 应用 occurrence placement。原生错误及已取得的 partial facts 保全，不被离线异常替代。
 
+原生事实只在 `evidence/raw/native_capture_facts.json` 封存一份，由 source manifest 和
+Capture artifact 绑定其字节；`evidence/capture.json` 保留必要投影与其他证据块，不再
+内嵌完整原生事实。Generate 与独立 Verify 读取同一原始成员，各自执行匹配、派生与
+复算；原始事实缺失、被改写或与投影冲突时，按既有工程和完整性规则拒绝。
+
 独立 consumer 从 raw 字节、face spans、原始 placement、物性和基准读数复算实际
 输出，核验源绑定、单位、坐标、对象归属及派生 warning，不能只比较生产者的投影。
 三角网格拓扑和 raw/STL 一致性不自动建立原生 BRep、光滑曲面距离或最终工程资格；

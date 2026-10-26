@@ -2694,21 +2694,13 @@ class AppearanceRawTests(unittest.TestCase):
             )
             self.assertEqual(entity["source_read_errors"], {})
             self.assertEqual(entity["read_errors"], {})
+            self.assertNotIn("binding_state", entity)
+            self.assertNotIn("binding_candidates", entity)
+            self.assertNotIn("matched_identity", entity)
             self.assertEqual(corresponding_calls, [material_face])
             self.assertEqual(
                 entity["native_identity"]["context"]["api"],
                 "IComponent2.GetCorrespondingEntity",
-            )
-            self.assertEqual(
-                entity["matched_identity"]["faces"],
-                [
-                    {
-                        "component": "arm-1",
-                        "body_type": 0,
-                        "body_index": 0,
-                        "face_index": 0,
-                    }
-                ],
             )
             reference_index = component_materials["native_reference_index"]
             self.assertTrue(
@@ -3341,103 +3333,7 @@ class AppearanceHelperTests(unittest.TestCase):
             "Configured",
         )
         self.assertIsNone(context["persistent_reference"])
-        binding = backend._appearance_entity_binding(context, {})
-        self.assertEqual(binding["binding_state"], "document")
-        self.assertEqual(
-            binding["binding_candidates"][0]["document_path"],
-            "C:\\part.SLDPRT",
-        )
-        self.assertEqual(
-            binding["matched_identity"],
-            {
-                "occurrences": [],
-                "bodies": [],
-                "faces": [],
-                "features": [],
-            },
-        )
         self.assertEqual(persistent_calls, [])
-
-    def test_binding_key_scopes_identical_reference_bytes(self) -> None:
-        reference = [1, 2, 3]
-        first = {
-            "owner_scope": "component_document",
-            "owner_document_path": "C:\\first.SLDASM",
-            "component": "left-1",
-            "api": "IComponent2.GetCorrespondingEntity",
-        }
-        second = {
-            **first,
-            "component": "right-1",
-        }
-        third = {
-            **first,
-            "owner_document_path": "C:\\second.SLDASM",
-        }
-        self.assertNotEqual(
-            native_module._appearance_binding_key(reference, first),
-            native_module._appearance_binding_key(reference, second),
-        )
-        self.assertNotEqual(
-            native_module._appearance_binding_key(reference, first),
-            native_module._appearance_binding_key(reference, third),
-        )
-        direct_acquisition = {
-            **first,
-            "api": "IModelDocExtension.GetPersistReference3",
-        }
-        self.assertEqual(
-            native_module._appearance_binding_key(
-                reference,
-                first,
-            ),
-            native_module._appearance_binding_key(
-                reference,
-                direct_acquisition,
-            ),
-        )
-        left_target = {
-            "kind": "face",
-            "component": "left-1",
-            "body_type": 0,
-            "body_index": 0,
-            "face_index": 0,
-        }
-        right_target = {
-            **left_target,
-            "component": "right-1",
-            "face_index": 1,
-        }
-        maps = {
-            native_module._appearance_binding_key(reference, first): [
-                left_target
-            ],
-            native_module._appearance_binding_key(reference, second): [
-                right_target
-            ],
-        }
-        binding = _CaptureBackend._appearance_entity_binding(
-            {
-                "persistent_reference": reference,
-                "record": {
-                    "binding_context": first,
-                    "native_identity": {"kind": "entity"},
-                },
-            },
-            maps,
-        )
-        self.assertEqual(binding["binding_state"], "unique")
-        self.assertEqual(
-            binding["matched_identity"]["faces"],
-            [
-                {
-                    "component": "left-1",
-                    "body_type": 0,
-                    "body_index": 0,
-                    "face_index": 0,
-                }
-            ],
-        )
 
     def test_interface_query_failure_does_not_fall_back_to_reference_or_api(
         self,
@@ -3564,7 +3460,7 @@ class AppearanceHelperTests(unittest.TestCase):
             "IModelDocExtension.GetPersistReference3",
         )
 
-    def test_identity_maps_attempt_target_reference_after_source_qi_failure(
+    def test_reference_index_attempts_target_reference_after_source_qi_failure(
         self,
     ) -> None:
         face = types.SimpleNamespace(
@@ -3587,8 +3483,8 @@ class AppearanceHelperTests(unittest.TestCase):
             "_appearance_interface",
             side_effect=interface,
         ):
-            maps, errors, reference_index = (
-                _CaptureBackend._appearance_identity_maps(
+            errors, reference_index = (
+                _CaptureBackend._appearance_reference_index(
                     extension,
                     owner_scope="component_document",
                     component=types.SimpleNamespace(),
@@ -3610,7 +3506,6 @@ class AppearanceHelperTests(unittest.TestCase):
                 )
             )
         self.assertEqual(errors, [])
-        self.assertEqual(len(maps), 1)
         self.assertEqual(len(reference_index), 1)
         self.assertEqual(
             reference_index[0]["persistent_reference"],
@@ -3708,12 +3603,6 @@ class AppearanceHelperTests(unittest.TestCase):
             identity["read_errors"]["active_configuration"]["code"],
             "configuration_read_failed",
         )
-        self.assertEqual(
-            backend._appearance_entity_binding(context, {})[
-                "binding_state"
-            ],
-            "unbound",
-        )
 
     def test_document_identity_without_active_configuration_is_unbound(
         self,
@@ -3750,12 +3639,6 @@ class AppearanceHelperTests(unittest.TestCase):
         self.assertEqual(
             context["record"]["native_identity"]["state"],
             "partial",
-        )
-        self.assertEqual(
-            backend._appearance_entity_binding(context, {})[
-                "binding_state"
-            ],
-            "unbound",
         )
 
     def test_render_material_entities_preserve_null_and_error(self) -> None:
@@ -4228,8 +4111,8 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             }
             for face_index in range(2)
         ]
-        maps, errors, reference_index = (
-            _CaptureBackend._appearance_identity_maps(
+        errors, reference_index = (
+            _CaptureBackend._appearance_reference_index(
                 extension,
                 owner_scope="component_document",
                 component=component,
@@ -4251,36 +4134,8 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 {"body_type": 0, "body_index": 0, "face_index": 1},
             ],
         )
-        backend = _CaptureBackend(session_factory=lambda: None)
-        context = backend._appearance_entity_context(
-            feature,
-            {
-                "native_interface_kind": None,
-                "source_persistent_reference": list(
-                    feature._persist_reference
-                ),
-                "source_read_errors": {},
-            },
-            owner_scope="component_document",
-            primary_component=component,
-            component_name="arm-1",
-            binding_document_path="C:\\robot.SLDASM",
-            corresponding_extension=extension,
-            owner_document_path="C:\\arm.SLDPRT",
-            owner_configuration="Default",
-            display_state="State",
-        )
-        binding = backend._appearance_entity_binding(context, maps)
-        self.assertEqual(binding["binding_state"], "unique")
-        self.assertEqual(
-            binding["matched_identity"]["features"][0]["faces"],
-            [
-                {"body_type": 0, "body_index": 0, "face_index": 0},
-                {"body_type": 0, "body_index": 0, "face_index": 1},
-            ],
-        )
 
-    def test_distinct_feature_identities_sharing_bytes_are_ambiguous(
+    def test_distinct_feature_identities_sharing_bytes_remain_in_the_raw_index(
         self,
     ) -> None:
         first = types.SimpleNamespace(
@@ -4324,8 +4179,8 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 ((first, "First"), (second, "Second"))
             )
         ]
-        maps, _, reference_index = (
-            _CaptureBackend._appearance_identity_maps(
+        _, reference_index = (
+            _CaptureBackend._appearance_reference_index(
                 extension,
                 owner_scope="component_document",
                 component=component,
@@ -4339,31 +4194,13 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(reference_index), 2)
-        context = _CaptureBackend._appearance_entity_context(
-            first,
-            {
-                "native_interface_kind": None,
-                "source_persistent_reference": list(
-                    first._persist_reference
-                ),
-                "source_read_errors": {},
-            },
-            owner_scope="component_document",
-            primary_component=component,
-            component_name="arm-1",
-            binding_document_path="C:\\robot.SLDASM",
-            corresponding_extension=extension,
-            owner_document_path="C:\\arm.SLDPRT",
-            owner_configuration="Default",
-            display_state="State",
+        self.assertEqual(
+            [
+                row["target"]["name"]
+                for row in reference_index
+            ],
+            ["First", "Second"],
         )
-        binding = _CaptureBackend._appearance_entity_binding(
-            context,
-            maps,
-        )
-        self.assertEqual(binding["binding_state"], "ambiguous")
-        self.assertEqual(binding["matched_identity"]["features"], [])
-        self.assertEqual(len(binding["binding_candidates"]), 2)
 
     def test_component_entity_conversion_uses_immediate_parent_extension(
         self,
@@ -4826,33 +4663,8 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         self.assertEqual(render_calls, [(3, ("SharedState",))])
         first_entity = first[1]["materials"][0]["entity_records"][0]
         second_entity = second[1]["materials"][0]["entity_records"][0]
-        self.assertEqual(
-            first_entity["binding_state"],
-            "ambiguous",
-        )
-        self.assertEqual(first_entity["matched_identity"]["faces"], [])
-        self.assertEqual(
-            {
-                row["face_index"]
-                for row in first_entity["binding_candidates"]
-            },
-            {0, 1},
-        )
-        self.assertEqual(
-            second_entity["binding_state"],
-            "unique",
-        )
-        self.assertEqual(
-            second_entity["matched_identity"]["faces"],
-            [
-                {
-                    "component": "component-b",
-                    "body_type": 0,
-                    "body_index": 0,
-                    "face_index": 0,
-                }
-            ],
-        )
+        self.assertEqual(first_entity["read_errors"], {})
+        self.assertEqual(second_entity["read_errors"], {})
         first_targets = [
             row["target"]
             for row in first[1]["native_reference_index"]
