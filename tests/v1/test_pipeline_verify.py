@@ -271,6 +271,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         )
         owner = raw["state_render_materials"][-1]
         owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
         owner["mapping_errors"] = []
         owner["materials"] = [
             {
@@ -310,6 +311,33 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 where="capture",
             )
 
+    def test_independent_appearance_accepts_null_with_zero_native_count(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        raw = hermetic._fixture_appearance_raw(
+            "arm-1",
+            {
+                "source_document_path": "C:/cad/arm.SLDPRT",
+                "referenced_configuration": "Painted",
+            },
+            [
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                }
+            ],
+        )
+        owner = raw["state_render_materials"][-1]
+        owner["call_state"] = "null_result"
+        owner["materials"] = None
+        resolved = _resolved_faces(
+            raw,
+            configuration="Painted",
+            where="capture",
+        )
+        self.assertEqual(len(resolved["faces"]), 1)
+
     def test_independent_appearance_uses_the_material_owners_display_state(self):
         from description_pipeline.verification.native_appearance import _resolved_faces
 
@@ -329,6 +357,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         )
         owner = raw["state_render_materials"][0]
         owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
         owner["materials"] = [
             {
                 "material_index": 0,
@@ -526,6 +555,8 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         "display_state": "Display State 1",
                         "display_states": None,
                         "display_states_state": "not_applicable",
+                        "native_render_material_count": 0,
+                        "native_render_material_count_error": None,
                         "call_state": "empty",
                         "materials": [],
                         "mapping_errors": [],

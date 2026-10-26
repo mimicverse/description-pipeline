@@ -124,6 +124,8 @@ def _empty_state_owner(
         "display_state": display_state,
         "display_states": display_states,
         "display_states_state": display_states_state,
+        "native_render_material_count": 0,
+        "native_render_material_count_error": None,
         "call_state": "empty",
         "materials": [],
         "mapping_errors": [],
@@ -344,6 +346,7 @@ class AppearanceResolutionTests(unittest.TestCase):
             display_states_state="observed",
         )
         top["call_state"] = "observed"
+        top["native_render_material_count"] = 1
         top["materials"] = [
             {
                 "material_index": 0,
@@ -439,6 +442,37 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         self.assertEqual(resolved.faces[0].source["scopes"], ["document"])
 
+    def test_zero_native_count_proves_null_state_materials_are_empty(self):
+        raw = _resolved_raw(
+            [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
+        )
+        owner = _empty_state_owner(
+            scope="component_document",
+            document_path=DOCUMENT,
+            configuration=CONFIGURATION,
+            display_state="Display State 1",
+        )
+        owner["call_state"] = "null_result"
+        owner["materials"] = None
+        raw["state_render_materials"] = [owner]
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }
+            ],
+        )
+        self.assertEqual(resolved.faces[0].source["scopes"], ["face"])
+
     def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
         for failure in (
             "persistent_reference",
@@ -475,6 +509,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                     display_state="Display State 1",
                 )
                 owner["call_state"] = "observed"
+                owner["native_render_material_count"] = 1
                 entity = {
                     "entity_index": 0,
                     "native_object_type": "_CDispatch",
@@ -561,6 +596,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "display_state": "Display State 1",
                 "display_states": None,
                 "display_states_state": "not_applicable",
+                "native_render_material_count": 1,
+                "native_render_material_count_error": None,
                 "call_state": "observed",
                 "materials": [
                     {

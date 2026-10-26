@@ -289,11 +289,26 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             and isinstance(owner.get("owner_document_path"), str)
             and owner.get("api") == "IModelDocExtension.GetRenderMaterials2"
             and owner.get("display_state_option") == 3
-            and owner.get("call_state") in {"observed", "empty"}
+            and owner.get("call_state")
+            in {"observed", "empty", "null_result"}
             and isinstance(owner.get("read_errors"), Mapping)
             and not owner.get("read_errors")
             and isinstance(owner.get("mapping_errors"), list)
-            and isinstance(owner.get("materials"), list),
+            and isinstance(owner.get("materials"), (list, type(None)))
+            and (
+                (
+                    owner.get("native_render_material_count") is None
+                    and isinstance(
+                        owner.get("native_render_material_count_error"),
+                        Mapping,
+                    )
+                )
+                or (
+                    type(owner.get("native_render_material_count")) is int
+                    and owner.get("native_render_material_count") >= 0
+                    and owner.get("native_render_material_count_error") is None
+                )
+            ),
             f"{owner_path} has no successful exact display-state enumeration",
         )
         owner_display_state = _state_owner_display_state(
@@ -302,6 +317,14 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             expected_display_state=display_state,
             where=owner_path,
         )
+        zero_material_null = (
+            owner.get("call_state") == "null_result"
+            and owner.get("native_render_material_count") == 0
+            and owner.get("native_render_material_count_error") is None
+            and owner.get("materials") is None
+        )
+        if zero_material_null:
+            continue
         _require(
             (owner["call_state"] == "empty" and not owner["materials"])
             or (owner["call_state"] == "observed" and bool(owner["materials"])),

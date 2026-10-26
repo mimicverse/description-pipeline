@@ -802,6 +802,21 @@ def resolve_deliverable_appearance(
                 owner.get("materials") is not None
                 and not isinstance(owner.get("materials"), list)
             )
+            or (
+                owner.get("native_render_material_count") is None
+                and not isinstance(
+                    owner.get("native_render_material_count_error"),
+                    Mapping,
+                )
+            )
+            or (
+                owner.get("native_render_material_count") is not None
+                and (
+                    type(owner.get("native_render_material_count")) is not int
+                    or owner.get("native_render_material_count") < 0
+                    or owner.get("native_render_material_count_error") is not None
+                )
+            )
             or not isinstance(owner.get("mapping_errors"), list)
             or not isinstance(owner.get("read_errors"), Mapping)
         ):
@@ -818,8 +833,18 @@ def resolve_deliverable_appearance(
             expected_configuration=configuration,
             expected_display_state=display_state,
         )
+        zero_material_null = (
+            owner.get("call_state") == "null_result"
+            and owner.get("native_render_material_count") == 0
+            and owner.get("native_render_material_count_error") is None
+            and owner.get("materials") is None
+            and not owner.get("read_errors")
+        )
         if (
-            owner.get("call_state") not in {"observed", "empty"}
+            (
+                owner.get("call_state") not in {"observed", "empty"}
+                and not zero_material_null
+            )
             or owner.get("read_errors")
         ):
             raise _appearance_resolution_error(
@@ -830,6 +855,8 @@ def resolve_deliverable_appearance(
                 call_state=owner.get("call_state"),
                 errors=dict(owner["read_errors"]),
             )
+        if zero_material_null:
+            continue
         if owner.get("call_state") == "empty" and owner.get("materials"):
             raise _appearance_resolution_error(
                 component,
