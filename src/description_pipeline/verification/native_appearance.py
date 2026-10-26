@@ -436,6 +436,7 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     bool(targets),
                     f"{entity_path} has no native reference-index binding",
                 )
+                current_targets = {}
                 for target in targets:
                     target_component = target.get("component")
                     _require(
@@ -447,25 +448,46 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         continue
                     kind = target["kind"]
                     if kind == "occurrence":
-                        faces_by_scope["occurrence"] |= all_faces
-                        continue
-                    face_key = _face_key(
-                        target.get("body_type"),
-                        target.get("body_index"),
-                        target.get("face_index", 0),
-                    )
-                    _require(
-                        face_key is not None,
-                        f"{entity_path} target identity is invalid",
-                    )
-                    if kind == "body":
-                        faces_by_scope["body"] |= {
-                            face
-                            for face in all_faces
-                            if face[:2] == face_key[:2]
-                        }
-                    elif face_key in all_faces:
-                        faces_by_scope[kind].add(face_key)
+                        identity = ("occurrence", component, 0, 0, 0)
+                    else:
+                        face_key = _face_key(
+                            target.get("body_type"),
+                            target.get("body_index"),
+                            target.get("face_index", 0),
+                        )
+                        _require(
+                            face_key is not None,
+                            f"{entity_path} target identity is invalid",
+                        )
+                        identity = (
+                            kind,
+                            component,
+                            face_key[0],
+                            face_key[1],
+                            face_key[2],
+                        )
+                    current_targets.setdefault(identity, target)
+                _require(
+                    len(current_targets) <= 1,
+                    f"{entity_path} native reference aliases multiple targets",
+                )
+                if not current_targets:
+                    continue
+                kind, _component, body_type, body_index, face_index = next(
+                    iter(current_targets)
+                )
+                if kind == "occurrence":
+                    faces_by_scope["occurrence"] |= all_faces
+                    continue
+                face_key = (body_type, body_index, face_index)
+                if kind == "body":
+                    faces_by_scope["body"] |= {
+                        face
+                        for face in all_faces
+                        if face[:2] == face_key[:2]
+                    }
+                elif face_key in all_faces:
+                    faces_by_scope[kind].add(face_key)
             material_faces = set().union(*faces_by_scope.values())
             if not material_faces:
                 continue

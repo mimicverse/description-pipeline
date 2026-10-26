@@ -1026,6 +1026,10 @@ def resolve_deliverable_appearance(
                         entity_path + ".persistent_reference",
                         "the native reference index does not bind this entity",
                     )
+                current_targets: dict[
+                    tuple[str, str, int, int, int],
+                    Mapping[str, Any],
+                ] = {}
                 for target in targets:
                     target_component = target.get("component")
                     if (
@@ -1042,28 +1046,62 @@ def resolve_deliverable_appearance(
                         continue
                     kind = target["kind"]
                     if kind == "occurrence":
-                        faces_by_scope["occurrence"] |= set(all_faces)
-                        continue
-                    face_key = _face_key(
-                        target.get("body_type"),
-                        target.get("body_index"),
-                        target.get("face_index", 0),
-                    )
-                    if face_key is None:
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_invalid",
-                            entity_path + ".persistent_reference",
-                            "a native reference target identity is invalid",
+                        identity = ("occurrence", component, 0, 0, 0)
+                    else:
+                        face_key = _face_key(
+                            target.get("body_type"),
+                            target.get("body_index"),
+                            target.get("face_index", 0),
                         )
-                    if kind == "body":
-                        faces_by_scope["body"] |= {
-                            face
-                            for face in all_faces
-                            if face[:2] == face_key[:2]
-                        }
-                    elif face_key in all_faces:
-                        faces_by_scope[kind].add(face_key)
+                        if face_key is None:
+                            raise _appearance_resolution_error(
+                                component,
+                                "cad_appearance_render_entity_invalid",
+                                entity_path + ".persistent_reference",
+                                "a native reference target identity is invalid",
+                            )
+                        identity = (
+                            kind,
+                            component,
+                            face_key[0],
+                            face_key[1],
+                            face_key[2],
+                        )
+                    current_targets.setdefault(identity, target)
+                if len(current_targets) > 1:
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_ambiguous",
+                        entity_path + ".persistent_reference",
+                        "a native reference aliases multiple distinct current targets",
+                        targets=[
+                            {
+                                "kind": identity[0],
+                                "component": identity[1],
+                                "body_type": identity[2],
+                                "body_index": identity[3],
+                                "face_index": identity[4],
+                            }
+                            for identity in sorted(current_targets)
+                        ],
+                    )
+                if not current_targets:
+                    continue
+                kind, _component, body_type, body_index, face_index = next(
+                    iter(current_targets)
+                )
+                if kind == "occurrence":
+                    faces_by_scope["occurrence"] |= set(all_faces)
+                    continue
+                face_key = (body_type, body_index, face_index)
+                if kind == "body":
+                    faces_by_scope["body"] |= {
+                        face
+                        for face in all_faces
+                        if face[:2] == face_key[:2]
+                    }
+                elif face_key in all_faces:
+                    faces_by_scope[kind].add(face_key)
             for scoped_faces in faces_by_scope.values():
                 material_faces |= scoped_faces
             if not material_faces:

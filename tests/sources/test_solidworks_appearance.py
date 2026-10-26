@@ -610,6 +610,81 @@ class AppearanceResolutionTests(unittest.TestCase):
             "cad_appearance_render_material_count_mismatch",
         )
 
+    def test_same_reference_alias_cannot_expand_to_two_face_targets(self):
+        raw = _resolved_raw([None, None])
+        raw["document"] = _layer(
+            owner_configuration=CONFIGURATION,
+            values=[0.0, 1.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+            has_values=True,
+        )
+        owner = _empty_state_owner(
+            scope="component_document",
+            document_path=DOCUMENT,
+            configuration=CONFIGURATION,
+            display_state="Display State 1",
+        )
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        owner["native_reference_index"] = [
+            {
+                "persistent_reference": [1, 2, 3],
+                "target": {
+                    "kind": "face",
+                    "component": COMPONENT,
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": face_index,
+                },
+            }
+            for face_index in (0, 1)
+        ]
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Display State 1"],
+                "entities": ["ambiguous"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "_CDispatch",
+                        "persistent_reference": [1, 2, 3],
+                        "matched_identity": {},
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x000000FF,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        raw["state_render_materials"] = [owner]
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                raw,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=[
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": face_index,
+                        "triangle_start": face_index,
+                        "triangle_count": 1,
+                        "face_reference_sha256": str(face_index + 1) * 64,
+                    }
+                    for face_index in (0, 1)
+                ],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_entity_ambiguous",
+        )
+
     def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
         for failure in (
             "persistent_reference",

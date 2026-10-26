@@ -318,6 +318,69 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 where="capture",
             )
 
+    def test_independent_appearance_rejects_ambiguous_face_aliases(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        raw = hermetic._fixture_appearance_raw(
+            "arm-1",
+            {
+                "source_document_path": "C:/cad/arm.SLDPRT",
+                "referenced_configuration": "Painted",
+            },
+            [
+                {"body_type": 0, "body_index": 0, "face_index": 0},
+                {"body_type": 0, "body_index": 0, "face_index": 1},
+            ],
+        )
+        owner = raw["state_render_materials"][-1]
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        owner["native_reference_index"] = [
+            {
+                "persistent_reference": [1, 2, 3],
+                "target": {
+                    "kind": "face",
+                    "component": "arm-1",
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": face_index,
+                },
+            }
+            for face_index in (0, 1)
+        ]
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Default_Display_State"],
+                "entities": ["ambiguous"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "_CDispatch",
+                        "persistent_reference": [1, 2, 3],
+                        "matched_identity": {},
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x000000FF,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        with self.assertRaisesRegex(
+            PipelineError,
+            "native reference aliases multiple targets",
+        ):
+            _resolved_faces(
+                raw,
+                configuration="Painted",
+                where="capture",
+            )
+
     def test_independent_appearance_accepts_null_with_zero_native_count(self):
         from description_pipeline.verification.native_appearance import _resolved_faces
 
