@@ -48,6 +48,7 @@ from description_pipeline.sources.solidworks.native import (
 SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
 PLANE_XY = {"normal": [0.0, 0.0, 1.0], "point": [0.0, 0.0, 0.0]}
 CYLINDER_Z = {"point": [0.0, 0.0, 0.0], "direction": [0.0, 0.0, 1.0], "radius": 0.02}
+_PRODUCTION_APPEARANCE_INTERFACE = native_module._appearance_interface
 
 
 def _sw_translation(x, y, z):
@@ -61,6 +62,26 @@ def _raiser(error: BaseException):
         raise error
 
     return call
+
+
+def _fixture_appearance_interface(value, _iid, name):
+    interfaces = getattr(value, "_fixture_interfaces", ())
+    return (value if name in interfaces else None), None
+
+
+class _FixtureAppearanceInterfaceMixin:
+    @classmethod
+    def setUpClass(cls):
+        cls._appearance_interface_patcher = patch.object(
+            native_module,
+            "_appearance_interface",
+            side_effect=_fixture_appearance_interface,
+        )
+        cls._appearance_interface_patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._appearance_interface_patcher.stop()
 
 
 class _Plane:
@@ -2330,7 +2351,7 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertEqual(error.detail["datum"], "CS_tip")
 
 
-class AppearanceRawTests(unittest.TestCase):
+class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
     def test_capture_records_document_occurrence_body_and_face_appearance_raw(self) -> None:
         occurrence_calls = []
         body_type_calls = []
@@ -3265,7 +3286,7 @@ class AppearanceRawTests(unittest.TestCase):
             self.assertIn("texture", face_appearance["read_errors"])
 
 
-class AppearanceHelperTests(unittest.TestCase):
+class AppearanceHelperTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
     def test_underlying_part_conversion_uses_domain_specific_apis(
         self,
     ) -> None:
@@ -4004,10 +4025,17 @@ class AppearanceHelperTests(unittest.TestCase):
             TextureFilename="",
             SurfaceFinishFile="",
         )
-        with patch.object(
-            native_module,
-            "_interface",
-            side_effect=RuntimeError("interface query failed"),
+        with (
+            patch.object(
+                native_module,
+                "_appearance_interface",
+                _PRODUCTION_APPEARANCE_INTERFACE,
+            ),
+            patch.object(
+                native_module,
+                "_interface",
+                side_effect=RuntimeError("interface query failed"),
+            ),
         ):
             record, entities = _appearance_render_material(
                 material,
@@ -4462,7 +4490,10 @@ class AppearanceHelperTests(unittest.TestCase):
         self.assertIn("owner", records[1]["read_errors"])
 
 
-class AppearanceOwnerResolutionTests(unittest.TestCase):
+class AppearanceOwnerResolutionTests(
+    _FixtureAppearanceInterfaceMixin,
+    unittest.TestCase,
+):
     def test_conversion_resolution_is_deferred_to_participating_targets(
         self,
     ) -> None:
@@ -5883,6 +5914,37 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 and row["native_interface_kind"] == "IEntity"
                 for row in second[1]["mapping_errors"]
             )
+        )
+
+
+class AppearanceProductionInterfaceTests(unittest.TestCase):
+    def test_non_com_values_never_use_fixture_interface_labels(self) -> None:
+        value, error = native_module._appearance_interface(
+            types.SimpleNamespace(_fixture_interfaces={"IFace2"}),
+            native_module.IFACE2_IID,
+            "IFace2",
+        )
+        self.assertIsNone(value)
+        self.assertIsNone(error)
+
+    def test_com_values_use_the_public_interface_query(self) -> None:
+        raw = types.SimpleNamespace(_oleobj_=object())
+        bound = object()
+        with patch.object(
+            native_module,
+            "_interface",
+            return_value=bound,
+        ) as interface_query:
+            value, error = native_module._appearance_interface(
+                raw,
+                native_module.IFACE2_IID,
+                "IFace2",
+            )
+        self.assertIs(value, bound)
+        self.assertIsNone(error)
+        interface_query.assert_called_once_with(
+            raw,
+            native_module.IFACE2_IID,
         )
 
 

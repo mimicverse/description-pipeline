@@ -958,15 +958,14 @@ def _appearance_persistent_reference(extension, entity):
 def _appearance_interface(value, iid: str, name: str):
     """Query one published interface and keep a failed QI separate from absence."""
 
-    if hasattr(value, "_oleobj_"):
-        try:
-            return _interface(value, iid), None
-        except Exception as error:  # noqa: BLE001 - QI failure is unresolved
-            if getattr(error, "hresult", None) == _COM_NOINTERFACE_HRESULT:
-                return None, None
-            return None, _native_error_record(error)
-    fixture_interfaces = getattr(value, "_fixture_interfaces", ())
-    return (value if name in fixture_interfaces else None), None
+    if not hasattr(value, "_oleobj_"):
+        return None, None
+    try:
+        return _interface(value, iid), None
+    except Exception as error:  # noqa: BLE001 - QI failure is unresolved
+        if getattr(error, "hresult", None) == _COM_NOINTERFACE_HRESULT:
+            return None, None
+        return None, _native_error_record(error)
 
 
 def _appearance_active_configuration(document):
