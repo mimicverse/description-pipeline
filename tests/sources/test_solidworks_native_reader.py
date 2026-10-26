@@ -755,16 +755,20 @@ def _mesh_face(read_triangles, key: str):
     except Exception:  # noqa: BLE001 - the production read must surface this later
         fixture_values = []
         fixture_readable = False
-    return types.SimpleNamespace(
+    face = types.SimpleNamespace(
         GetTessTriangles=read_triangles,
         GetTessTriangleCount=lambda: len(fixture_values) // 9,
         GetArea=lambda: 1.0,
         GetEdges=list,
         GetBody=lambda: None,
+        GetComponent=None,
         _persist_reference=f"fixture-face-{key}".encode(),
+        _fixture_interfaces={"IEntity"},
         _fixture_values=fixture_values,
         _fixture_readable=fixture_readable,
     )
+    face.GetComponent = lambda: getattr(face, "_fixture_component", None)
+    return face
 
 
 def _mesh_body(faces, key: str):
@@ -781,6 +785,7 @@ def _mesh_body(faces, key: str):
         GetVertexCount=list,
         GetVertices=list,
         _persist_reference=f"fixture-body-{key}".encode(),
+        _fixture_interfaces={"IBody2"},
     )
     for face in faces:
         face.GetBody = lambda body=body: body
@@ -2337,6 +2342,7 @@ class AppearanceRawTests(unittest.TestCase):
         top_render_material_calls = []
         top_render_material_count_calls = []
         texture_calls = []
+        corresponding_calls = []
         document_values = [0.1, 0.2, 0.3, 0.2, 0.4, 0.5, 0.6, 0.0, 0.0]
         occurrence_values = [-1.0] * 9
         face_values = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
@@ -2367,6 +2373,11 @@ class AppearanceRawTests(unittest.TestCase):
                 "appearance",
             )
             face._fixture_interfaces = {"IEntity"}
+            material_face = _mesh_face(
+                lambda _quality: [0.0] * 9,
+                "material-document",
+            )
+            material_face.GetComponent = lambda: None
             face_feature = types.SimpleNamespace(
                 Name="PaintedFace",
                 GetTypeName2=lambda: "Extrusion",
@@ -2396,7 +2407,7 @@ class AppearanceRawTests(unittest.TestCase):
                 TextureFilename="",
                 SurfaceFinishFile="C:\\finish.p2m",
                 GetLinkedDisplayStates=lambda: ["FaceState"],
-                GetEntities=lambda: [face],
+                GetEntities=lambda: [material_face],
             )
             incomplete_render_material = types.SimpleNamespace(
                 GetLinkedDisplayStates=list,
@@ -2447,6 +2458,7 @@ class AppearanceRawTests(unittest.TestCase):
                 doc=part_document,
                 configuration="Painted",
             )
+            face._fixture_component = component
             component.ReferencedDisplayState2 = "FaceState"
 
             def get_bodies(body_type):
@@ -2465,7 +2477,9 @@ class AppearanceRawTests(unittest.TestCase):
                 )
                 or None
             )
-            component.GetCorrespondingEntity = lambda entity: face
+            component.GetCorrespondingEntity = (
+                lambda entity: corresponding_calls.append(entity) or face
+            )
             component.GetCorresponding = lambda entity: entity
             assembly = _write(fixture_root, "robot.SLDASM")
             main = _Doc(
@@ -2568,6 +2582,7 @@ class AppearanceRawTests(unittest.TestCase):
                     "body_type",
                     "body_index",
                     "body_name",
+                    "source_context",
                     "faces",
                 },
             )
@@ -2586,6 +2601,14 @@ class AppearanceRawTests(unittest.TestCase):
                     "body_index": 0,
                     "body_name": body.Name,
                 },
+            )
+            self.assertEqual(
+                body_raw["source_context"]["state"],
+                "assembly",
+            )
+            self.assertEqual(
+                body_raw["source_context"]["component"],
+                "arm-1",
             )
             self.assertEqual(body_appearance_calls, [])
             self.assertEqual(body_type_calls, [0, 1])
@@ -2665,7 +2688,7 @@ class AppearanceRawTests(unittest.TestCase):
             self.assertEqual(entity["native_interface_kind"], "IEntity")
             self.assertEqual(
                 entity["source_persistent_reference"],
-                list(face._persist_reference),
+                list(material_face._persist_reference),
             )
             self.assertEqual(
                 entity["persistent_reference"],
@@ -2673,6 +2696,7 @@ class AppearanceRawTests(unittest.TestCase):
             )
             self.assertEqual(entity["source_read_errors"], {})
             self.assertEqual(entity["read_errors"], {})
+            self.assertEqual(corresponding_calls, [material_face])
             self.assertEqual(
                 entity["native_identity"]["context"]["api"],
                 "IComponent2.GetCorrespondingEntity",
@@ -2705,7 +2729,12 @@ class AppearanceRawTests(unittest.TestCase):
                             "owner_scope": "component_document",
                             "owner_document_path": str(assembly),
                             "component": "arm-1",
-                            "api": "IComponent2.GetCorrespondingEntity",
+                            "api": (
+                                "IModelDocExtension.GetPersistReference3"
+                            ),
+                            "reference_api": (
+                                "IModelDocExtension.GetPersistReference3"
+                            ),
                         }
                     )
                     for row in reference_index
@@ -2772,6 +2801,7 @@ class AppearanceRawTests(unittest.TestCase):
             face.GetTexture = lambda _configuration: None
             body = _mesh_body([face], "null-appearance")
             component = _Component("arm-1", part, doc=part_document)
+            face._fixture_component = component
             component.GetBodies2 = (
                 lambda body_type: [body] if body_type == 0 else []
             )
@@ -2839,6 +2869,7 @@ class AppearanceRawTests(unittest.TestCase):
             )
             body = _mesh_body([face], "triangle-error")
             component = _Component("arm-1", part, doc=part_document)
+            face._fixture_component = component
             component.GetBodies2 = (
                 lambda body_type: [body] if body_type == 0 else []
             )
@@ -2921,6 +2952,7 @@ class AppearanceRawTests(unittest.TestCase):
             face.GetTexture = lambda _configuration: None
             body = _mesh_body([face], "extension-failure")
             component = _Component("arm-1", part, doc=part_document)
+            face._fixture_component = component
             component.GetBodies2 = (
                 lambda body_type: [body] if body_type == 0 else []
             )
@@ -2992,6 +3024,7 @@ class AppearanceRawTests(unittest.TestCase):
             face.GetTexture = fail_texture
             body = _mesh_body([face], "appearance-errors")
             component = _Component("arm-1", part, doc=part_document)
+            face._fixture_component = component
             component.GetBodies2 = lambda body_type: [body] if body_type == 0 else []
             component.GetMaterialPropertyValues2 = (
                 lambda _option, _names: [0.0] * 8
@@ -3337,6 +3370,7 @@ class AppearanceHelperTests(unittest.TestCase):
             "owner_document_path": "C:\\first.SLDASM",
             "component": "left-1",
             "api": "IComponent2.GetCorrespondingEntity",
+            "reference_api": "IModelDocExtension.GetPersistReference3",
         }
         second = {
             **first,
@@ -3353,6 +3387,20 @@ class AppearanceHelperTests(unittest.TestCase):
         self.assertNotEqual(
             native_module._appearance_binding_key(reference, first),
             native_module._appearance_binding_key(reference, third),
+        )
+        direct_acquisition = {
+            **first,
+            "api": "IModelDocExtension.GetPersistReference3",
+        }
+        self.assertEqual(
+            native_module._appearance_binding_key(
+                reference,
+                first,
+            ),
+            native_module._appearance_binding_key(
+                reference,
+                direct_acquisition,
+            ),
         )
         left_target = {
             "kind": "face",
@@ -3395,6 +3443,75 @@ class AppearanceHelperTests(unittest.TestCase):
                     "face_index": 0,
                 }
             ],
+        )
+
+    def test_getcomponent_proves_assembly_but_not_document_context(self) -> None:
+        component = types.SimpleNamespace(Name2="arm-1")
+        assembly_face = _mesh_face(
+            lambda _quality: [0.0] * 9,
+            "assembly-context",
+        )
+        assembly_face.GetComponent = lambda: component
+        assembly = native_module._appearance_getcomponent_context(
+            assembly_face,
+            "arm-1",
+        )
+        self.assertEqual(assembly["state"], "assembly")
+        self.assertEqual(assembly["component"], "arm-1")
+
+        assembly_face.GetComponent = lambda: types.SimpleNamespace(
+            Name2="arm-2"
+        )
+        mismatch = native_module._appearance_getcomponent_context(
+            assembly_face,
+            "arm-1",
+        )
+        self.assertEqual(mismatch["state"], "unresolved")
+        self.assertEqual(
+            mismatch["read_errors"]["component"]["code"],
+            "cad_appearance_component_mismatch",
+        )
+
+        document_face = _mesh_face(
+            lambda _quality: [0.0] * 9,
+            "document-context",
+        )
+        document_face.GetComponent = lambda: None
+        observed = native_module._appearance_material_source_context(
+            document_face,
+            native_interface_kind="IEntity",
+            owner_scope="component_document",
+            owner_document_path="C:\\arm.SLDPRT",
+            source_reference=list(
+                document_face._persist_reference
+            ),
+            source_error=None,
+            expected_component="arm-1",
+        )
+        self.assertEqual(observed["state"], "document")
+        self.assertEqual(
+            observed["owner_document_path"],
+            "C:\\arm.SLDPRT",
+        )
+        self.assertEqual(
+            observed["persistent_reference"],
+            list(document_face._persist_reference),
+        )
+
+        null_without_document_reference = (
+            native_module._appearance_material_source_context(
+                document_face,
+                native_interface_kind="IEntity",
+                owner_scope="component_document",
+                owner_document_path="C:\\arm.SLDPRT",
+                source_reference=None,
+                source_error=None,
+                expected_component="arm-1",
+            )
+        )
+        self.assertEqual(
+            null_without_document_reference["state"],
+            "not_assembly",
         )
 
     def test_interface_query_failure_does_not_fall_back_to_reference_or_api(
@@ -3442,7 +3559,7 @@ class AppearanceHelperTests(unittest.TestCase):
             _persist_reference=b"generic",
         )
         unsupported = RuntimeError("unsupported interface")
-        unsupported.hresult = native_module.E_NOINTERFACE_HRESULT
+        unsupported.hresult = native_module._COM_NOINTERFACE_HRESULT
         material = types.SimpleNamespace(
             GetLinkedDisplayStates=list,
             GetEntities=lambda: [entity],
@@ -3707,6 +3824,13 @@ class AppearanceHelperTests(unittest.TestCase):
                         "IModelDoc2.GetPathName"
                         "+ConfigurationManager.ActiveConfiguration.Name"
                     ),
+                    "reference_api": None,
+                },
+                "source_context": {
+                    "api": "IModelDoc2",
+                    "state": "document",
+                    "component": "arm-1",
+                    "read_errors": {},
                 },
                 "state": "observed",
                 "read_errors": {},
@@ -3717,6 +3841,7 @@ class AppearanceHelperTests(unittest.TestCase):
         part_entity = types.SimpleNamespace(
             _persist_reference=b"part-face",
             _fixture_interfaces={"IEntity"},
+            GetComponent=lambda: None,
         )
         assembly_entity = types.SimpleNamespace(
             _persist_reference=b"assembly-face"
@@ -4036,6 +4161,14 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         feature._persist_reference
                     ),
                 },
+                "source_context": {
+                    "state": "document",
+                    "api": (
+                        "IModelDocExtension.GetRenderMaterials2"
+                        "+IModelDocExtension.GetPersistReference3"
+                    ),
+                    "read_errors": {},
+                },
             }
             for face_index in range(2)
         ]
@@ -4130,6 +4263,14 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         feature._persist_reference
                     ),
                 },
+                "source_context": {
+                    "state": "document",
+                    "api": (
+                        "IModelDocExtension.GetRenderMaterials2"
+                        "+IModelDocExtension.GetPersistReference3"
+                    ),
+                    "read_errors": {},
+                },
             }
             for index, (feature, name) in enumerate(
                 ((first, "First"), (second, "Second"))
@@ -4182,6 +4323,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         source_face = types.SimpleNamespace(
             _persist_reference=b"leaf-face",
             _fixture_interfaces={"IEntity"},
+            GetComponent=lambda: None,
         )
         assembly_face = types.SimpleNamespace(
             _persist_reference=b"parent-face"
@@ -4428,26 +4570,32 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         face_a = types.SimpleNamespace(
             _persist_reference=b"face-a",
             _fixture_interfaces={"IEntity"},
+            GetComponent=lambda: None,
         )
         alias_face_a = types.SimpleNamespace(
             _persist_reference=b"face-a",
             _fixture_interfaces={"IEntity"},
+            GetComponent=lambda: None,
         )
         face_b = types.SimpleNamespace(
             _persist_reference=b"face-b",
             _fixture_interfaces={"IEntity"},
+            GetComponent=lambda: None,
         )
         failing_face = types.SimpleNamespace(
             _persist_reference=b"face-fail",
             _fixture_interfaces={"IEntity"},
+            GetComponent=lambda: None,
         )
         null_reference_face = types.SimpleNamespace(
             _persist_reference=b"face-null",
             _fixture_interfaces={"IEntity"},
+            GetComponent=lambda: None,
         )
         invalid_reference_face = types.SimpleNamespace(
             _persist_reference=b"face-invalid",
             _fixture_interfaces={"IEntity"},
+            GetComponent=lambda: None,
         )
         assembly_face_a = types.SimpleNamespace(
             _persist_reference=b"assembly-face-a"
@@ -4455,6 +4603,15 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         assembly_face_b = types.SimpleNamespace(
             _persist_reference=b"assembly-face-b"
         )
+        document_source_context = {
+            "api": (
+                "IModelDocExtension.GetRenderMaterials2"
+                "+IModelDocExtension.GetPersistReference3"
+            ),
+            "state": "document",
+            "component": "component-a",
+            "read_errors": {},
+        }
         material = types.SimpleNamespace(
             GetLinkedDisplayStates=lambda: ["SharedState"],
             GetEntities=lambda: [face_a],
@@ -4556,6 +4713,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_type": 0,
                         "body_index": 0,
                         "face_index": 0,
+                        "source_context": document_source_context,
                         "face": face_a,
                     },
                     {
@@ -4563,6 +4721,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_type": 0,
                         "body_index": 0,
                         "face_index": 1,
+                        "source_context": document_source_context,
                         "face": alias_face_a,
                     },
                 ],
@@ -4584,6 +4743,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_type": 0,
                         "body_index": 0,
                         "face_index": 0,
+                        "source_context": document_source_context,
                         "face": face_b,
                     },
                     {
@@ -4591,6 +4751,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_type": 0,
                         "body_index": 0,
                         "face_index": 1,
+                        "source_context": document_source_context,
                         "face": failing_face,
                     },
                     {
@@ -4598,6 +4759,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_type": 0,
                         "body_index": 0,
                         "face_index": 2,
+                        "source_context": document_source_context,
                         "face": null_reference_face,
                     },
                     {
@@ -4605,6 +4767,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_type": 0,
                         "body_index": 0,
                         "face_index": 3,
+                        "source_context": document_source_context,
                         "face": invalid_reference_face,
                     },
                 ],

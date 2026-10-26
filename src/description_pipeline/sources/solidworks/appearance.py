@@ -227,18 +227,20 @@ def _binding_context_key(value: object):
         value.get("owner_document_path")
     )
     component = value.get("component")
-    api = value.get("api")
+    reference_api = value.get("reference_api")
     if (
         not isinstance(owner_scope, str)
         or not owner_scope
         or owner_document_path is None
         or not isinstance(component, str)
         or not component
-        or not isinstance(api, str)
-        or not api
+        or (
+            reference_api is not None
+            and not isinstance(reference_api, str)
+        )
     ):
         return None
-    return owner_scope, owner_document_path, component, api
+    return owner_scope, owner_document_path, component, reference_api
 
 
 def _valid_values(value: object) -> bool:
@@ -1051,7 +1053,7 @@ def resolve_deliverable_appearance(
                 ),
             )
         reference_index: dict[
-            tuple[tuple[int, ...], tuple[str, str, str, str]],
+            tuple[tuple[int, ...], tuple[str, str, str, object]],
             list[Mapping[str, Any]],
         ] = {}
         for index_position, indexed in enumerate(
@@ -1078,6 +1080,7 @@ def resolve_deliverable_appearance(
             if (
                 indexed_key is None
                 or indexed_context is None
+                or indexed_context[3] != OWNER_CONTEXT_BINDING_API
                 or not isinstance(target, Mapping)
                 or target.get("kind")
                 not in {"occurrence", "body", "face", "feature"}
@@ -1182,7 +1185,9 @@ def resolve_deliverable_appearance(
                     if (
                         entity["read_errors"]
                         or context_key[0] != "component_document"
-                        or context_key[3] != DOCUMENT_BINDING_API
+                        or context_key[3] is not None
+                        or entity["binding_context"].get("api")
+                        != DOCUMENT_BINDING_API
                         or document_identity.get("qi_iid")
                         != IMODELDOC2_IID
                         or document_identity.get("state") != "observed"
@@ -1218,7 +1223,17 @@ def resolve_deliverable_appearance(
                         if isinstance(native_identity, Mapping)
                         else None
                     )
-                    if context_key[0] == "component_document":
+                    source_context = (
+                        native_identity.get("source_context")
+                        if isinstance(native_identity, Mapping)
+                        else None
+                    )
+                    source_state = (
+                        source_context.get("state")
+                        if isinstance(source_context, Mapping)
+                        else None
+                    )
+                    if source_state == "document":
                         expected_api = (
                             COMPONENT_ENTITY_BINDING_API
                             if identity_kind == "entity"
@@ -1226,15 +1241,26 @@ def resolve_deliverable_appearance(
                             if identity_kind == "object"
                             else None
                         )
-                    else:
+                    elif source_state == "assembly":
                         expected_api = OWNER_CONTEXT_BINDING_API
-                    if expected_api is None or context_key[3] != expected_api:
+                    else:
+                        expected_api = None
+                    if (
+                        expected_api is None
+                        or context_key[3] != OWNER_CONTEXT_BINDING_API
+                        or entity["binding_context"].get("api")
+                        != expected_api
+                    ):
                         raise _appearance_resolution_error(
                             component,
                             "cad_appearance_render_entity_binding_unproven",
                             entity_path + ".binding_context.api",
                             "the native binding API does not match the entity context",
-                            observed=context_key[3],
+                            observed={
+                                "api": entity["binding_context"].get("api"),
+                                "reference_api": context_key[3],
+                                "source_context": source_context,
+                            },
                             expected=expected_api,
                         )
                     entity_key = _persistent_reference_key(

@@ -144,19 +144,27 @@ def _binding_context(
     owner_scope: str,
     owner_document_path: str,
     api: str = "IComponent2.GetCorrespondingEntity",
+    reference_api: str | None = "IModelDocExtension.GetPersistReference3",
 ):
     return {
         "owner_scope": owner_scope,
         "owner_document_path": owner_document_path,
         "component": COMPONENT,
         "api": api,
+        "reference_api": reference_api,
     }
 
 
-def _native_identity(kind: str):
+def _native_identity(kind: str, state: str = "document"):
     return {
         "kind": kind,
         "state": "observed",
+        "source_context": {
+            "api": "test_native_context",
+            "state": state,
+            "component": COMPONENT,
+            "read_errors": {},
+        },
         "read_errors": {},
     }
 
@@ -405,7 +413,10 @@ class AppearanceResolutionTests(unittest.TestCase):
                             owner_document_path=r"C:\capture\robot.SLDASM",
                             api="IModelDocExtension.GetPersistReference3",
                         ),
-                        "native_identity": _native_identity("object"),
+                        "native_identity": _native_identity(
+                            "object",
+                            state="assembly",
+                        ),
                         "matched_identity": {
                             "occurrences": [],
                             "bodies": [],
@@ -905,6 +916,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "IModelDoc2.GetPathName"
                 "+ConfigurationManager.ActiveConfiguration.Name"
             ),
+            reference_api=None,
         )
         owner["materials"] = [
             {
@@ -927,6 +939,12 @@ class AppearanceResolutionTests(unittest.TestCase):
                             "owner_configuration": CONFIGURATION,
                             "owner_display_state": "Display State 1",
                             "state": "observed",
+                            "source_context": {
+                                "api": "IModelDoc2",
+                                "state": "document",
+                                "component": COMPONENT,
+                                "read_errors": {},
+                            },
                             "read_errors": {},
                         },
                         "matched_identity": {},

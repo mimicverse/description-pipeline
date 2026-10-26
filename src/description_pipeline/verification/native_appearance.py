@@ -70,18 +70,23 @@ def _binding_context_key(value: object):
     owner_scope = value.get("owner_scope")
     document_path = _document_path_key(value.get("owner_document_path"))
     component = value.get("component")
-    api = value.get("api")
+    reference_api = value.get("reference_api")
     _require(
         isinstance(owner_scope, str)
         and bool(owner_scope)
         and document_path is not None
         and isinstance(component, str)
         and bool(component)
-        and isinstance(api, str)
-        and bool(api),
+        and (
+            reference_api is None
+            or (
+                isinstance(reference_api, str)
+                and bool(reference_api)
+            )
+        ),
         "A native binding context is incomplete",
     )
-    return owner_scope, document_path, component, api
+    return owner_scope, document_path, component, reference_api
 
 
 def _unique_current_targets(targets: Sequence[Mapping], *, component: str):
@@ -498,6 +503,7 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             _require(
                 indexed_key is not None
                 and indexed_context is not None
+                and indexed_context[3] == OWNER_CONTEXT_BINDING_API
                 and isinstance(target, Mapping)
                 and target.get("kind")
                 in {"occurrence", "body", "face", "feature"},
@@ -568,7 +574,9 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     _require(
                         not entity["read_errors"]
                         and context_key[0] == "component_document"
-                        and context_key[3] == DOCUMENT_BINDING_API
+                        and context_key[3] is None
+                        and entity["binding_context"].get("api")
+                        == DOCUMENT_BINDING_API
                         and document_identity.get("qi_iid")
                         == IMODELDOC2_IID
                         and document_identity.get("state") == "observed"
@@ -598,7 +606,17 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         if isinstance(native_identity, Mapping)
                         else None
                     )
-                    if context_key[0] == "component_document":
+                    source_context = (
+                        native_identity.get("source_context")
+                        if isinstance(native_identity, Mapping)
+                        else None
+                    )
+                    source_state = (
+                        source_context.get("state")
+                        if isinstance(source_context, Mapping)
+                        else None
+                    )
+                    if source_state == "document":
                         expected_api = (
                             COMPONENT_ENTITY_BINDING_API
                             if identity_kind == "entity"
@@ -606,11 +624,15 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                             if identity_kind == "object"
                             else None
                         )
-                    else:
+                    elif source_state == "assembly":
                         expected_api = OWNER_CONTEXT_BINDING_API
+                    else:
+                        expected_api = None
                     _require(
                         expected_api is not None
-                        and context_key[3] == expected_api,
+                        and context_key[3] == OWNER_CONTEXT_BINDING_API
+                        and entity["binding_context"].get("api")
+                        == expected_api,
                         f"{entity_path} native binding API is inconsistent",
                     )
                     entity_key = _persistent_reference_key(

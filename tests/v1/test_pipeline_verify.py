@@ -289,10 +289,19 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_document_path": "C:/cad/arm.SLDPRT",
                             "component": "arm-1",
                             "api": "IComponent2.GetCorresponding",
+                            "reference_api": (
+                                "IModelDocExtension.GetPersistReference3"
+                            ),
                         },
                         "native_identity": {
                             "kind": "object",
                             "state": "observed",
+                            "source_context": {
+                                "api": "IComponent2.GetCorresponding",
+                                "state": "document",
+                                "component": "arm-1",
+                                "read_errors": {},
+                            },
                             "read_errors": {},
                         },
                         "matched_identity": {
@@ -354,6 +363,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     "owner_document_path": "C:/cad/arm.SLDPRT",
                     "component": "arm-1",
                     "api": "IComponent2.GetCorrespondingEntity",
+                    "reference_api": (
+                        "IModelDocExtension.GetPersistReference3"
+                    ),
                 },
                 "target": {
                     "kind": "face",
@@ -381,10 +393,19 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_document_path": "C:/cad/arm.SLDPRT",
                             "component": "arm-1",
                             "api": "IComponent2.GetCorrespondingEntity",
+                            "reference_api": (
+                                "IModelDocExtension.GetPersistReference3"
+                            ),
                         },
                         "native_identity": {
                             "kind": "entity",
                             "state": "observed",
+                            "source_context": {
+                                "api": "IComponent2.GetCorrespondingEntity",
+                                "state": "document",
+                                "component": "arm-1",
+                                "read_errors": {},
+                            },
                             "read_errors": {},
                         },
                         "matched_identity": {},
@@ -436,6 +457,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     "owner_document_path": "C:/cad/arm.SLDPRT",
                     "component": "arm-1",
                     "api": "IComponent2.GetCorresponding",
+                    "reference_api": (
+                        "IModelDocExtension.GetPersistReference3"
+                    ),
                 }
                 feature_identities = (
                     [(feature_names[0], [0, 1])]
@@ -481,6 +505,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                 "native_identity": {
                                     "kind": "object",
                                     "state": "observed",
+                                    "source_context": {
+                                        "api": "IComponent2.GetCorresponding",
+                                        "state": "document",
+                                        "component": "arm-1",
+                                        "read_errors": {},
+                                    },
                                     "read_errors": {},
                                 },
                                 "matched_identity": {},
@@ -567,6 +597,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                 "IModelDoc2.GetPathName"
                                 "+ConfigurationManager.ActiveConfiguration.Name"
                             ),
+                            "reference_api": None,
                         },
                         "native_identity": {
                             "kind": "document",
@@ -577,6 +608,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_configuration": "Painted",
                             "owner_display_state": "Default_Display_State",
                             "state": "observed",
+                            "source_context": {
+                                "api": "IModelDoc2",
+                                "state": "document",
+                                "component": "arm-1",
+                                "read_errors": {},
+                            },
                             "read_errors": {},
                         },
                         "matched_identity": {},
@@ -682,6 +719,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     "owner_document_path": "fixture-top.SLDASM",
                     "component": "arm-1",
                     "api": "IModelDocExtension.GetPersistReference3",
+                    "reference_api": (
+                        "IModelDocExtension.GetPersistReference3"
+                    ),
                 },
                 "target": {
                     "kind": "occurrence",
@@ -705,10 +745,19 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_document_path": "fixture-top.SLDASM",
                             "component": "arm-1",
                             "api": "IModelDocExtension.GetPersistReference3",
+                            "reference_api": (
+                                "IModelDocExtension.GetPersistReference3"
+                            ),
                         },
                         "native_identity": {
                             "kind": "object",
                             "state": "observed",
+                            "source_context": {
+                                "api": "IComponent2",
+                                "state": "assembly",
+                                "component": "arm-1",
+                                "read_errors": {},
+                            },
                             "read_errors": {},
                         },
                         "matched_identity": {

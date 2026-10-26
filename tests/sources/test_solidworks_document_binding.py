@@ -792,16 +792,8 @@ class ReturnViewRegistryTests(unittest.TestCase):
             and node.args[1].value == "GetModelDoc2"
         ]
         # Three raw calls remain: one inside _component_document and two
-        # presence-only checks. The single post-acquisition read uses the helper.
+        # presence-only checks. Post-acquisition reads use the helper.
         self.assertEqual(len(raw_sites), 3, raw_sites)
-        acquisition_sites = [
-            node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_component_document"
-        ]
-        self.assertEqual(len(acquisition_sites), 1, acquisition_sites)
 
 
 if __name__ == "__main__":
