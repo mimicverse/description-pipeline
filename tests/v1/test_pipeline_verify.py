@@ -287,7 +287,14 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         "matched_identity": {
                             "occurrences": [],
                             "bodies": [],
-                            "faces": [],
+                            "faces": [
+                                {
+                                    "component": "arm-1",
+                                    "body_type": 0,
+                                    "body_index": 0,
+                                    "face_index": 0,
+                                }
+                            ],
                             "features": [],
                         },
                         "read_errors": {},

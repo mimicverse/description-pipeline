@@ -530,6 +530,7 @@ class AppearanceResolutionTests(unittest.TestCase):
             "persistent_reference",
             "identity_map",
             "unmapped_target",
+            "source_claim_without_index",
         ):
             with self.subTest(failure=failure):
                 raw = _resolved_raw([None])
@@ -594,6 +595,15 @@ class AppearanceResolutionTests(unittest.TestCase):
                             "error": {
                                 "code": "cad_appearance_persistent_reference_invalid"
                             },
+                        }
+                    ]
+                elif failure == "source_claim_without_index":
+                    entity["matched_identity"]["faces"] = [
+                        {
+                            "component": COMPONENT,
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": 0,
                         }
                     ]
                 owner["materials"] = [
