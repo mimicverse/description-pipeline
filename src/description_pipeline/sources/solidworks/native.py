@@ -5037,6 +5037,7 @@ class SolidWorksBackend(CadBackend):
         source_reference,
         source_error,
         native_interface_kind,
+        native_interface_error,
         owner_scope,
         primary_component,
         extension,
@@ -5082,6 +5083,11 @@ class SolidWorksBackend(CadBackend):
                     "message": "the owner-context reference is unavailable",
                     "detail": {},
                 }
+            )
+            return record, None
+        if native_interface_error is not None:
+            record["read_errors"]["interface_query"] = copy.deepcopy(
+                native_interface_error
             )
             return record, None
         if source_reference is None or source_error is not None:
@@ -5179,20 +5185,11 @@ class SolidWorksBackend(CadBackend):
             return maps, mapping_errors, native_reference_index
 
         def add(kind, entity, identity):
-            document, interface_error = _appearance_interface(
+            document, document_interface_error = _appearance_interface(
                 entity,
                 IMODELDOC2_IID,
                 "IModelDoc2",
             )
-            if interface_error is not None:
-                mapping_errors.append(
-                    {
-                        "entity_kind": kind,
-                        "identity": copy.deepcopy(identity),
-                        "error": copy.deepcopy(interface_error),
-                    }
-                )
-                return
             if document is not None:
                 mapping_errors.append(
                     {
@@ -5209,22 +5206,14 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
                 return
-            entity_interface, interface_error = _appearance_interface(
+            entity_interface, entity_interface_error = _appearance_interface(
                 entity,
                 IENTITY_IID,
                 "IEntity",
             )
-            if interface_error is not None:
-                mapping_errors.append(
-                    {
-                        "entity_kind": kind,
-                        "identity": copy.deepcopy(identity),
-                        "error": copy.deepcopy(interface_error),
-                    }
-                )
-                return
-            native_interface_kind = (
-                "IEntity" if entity_interface is not None else None
+            native_interface_kind = "IEntity" if entity_interface is not None else None
+            native_interface_error = (
+                entity_interface_error or document_interface_error
             )
             source_reference, source_error = (
                 _appearance_persistent_reference(
@@ -5237,6 +5226,7 @@ class SolidWorksBackend(CadBackend):
                 source_reference=source_reference,
                 source_error=source_error,
                 native_interface_kind=native_interface_kind,
+                native_interface_error=native_interface_error,
                 owner_scope=owner_scope,
                 primary_component=component,
                 extension=corresponding_extension,
@@ -5728,52 +5718,14 @@ class SolidWorksBackend(CadBackend):
             "source_persistent_reference"
         )
         source_error = source_errors.get("persistent_reference")
-        if source_errors.get("interface_query") is not None:
-            context = {
-                "owner_scope": owner_scope,
-                "input_kind": "unresolved",
-                "api": None,
-                "state": "error",
-                "persistent_reference": None,
-                "read_errors": {
-                    "interface_query": copy.deepcopy(
-                        source_errors["interface_query"]
-                    )
-                },
-            }
-            binding_context = {
-                "owner_scope": owner_scope,
-                "owner_document_path": binding_document_path,
-                "component": component_name,
-                "api": None,
-            }
-            identity = {
-                "kind": "unresolved",
-                "owner_document_path": owner_document_path,
-                "owner_configuration": _json_raw_value(
-                    owner_configuration
-                ),
-                "owner_display_state": display_state,
-                "binding_context": binding_context,
-                "context": context,
-            }
-            return {
-                "record": {
-                    "persistent_reference": None,
-                    "read_errors": copy.deepcopy(
-                        context["read_errors"]
-                    ),
-                    "binding_context": binding_context,
-                    "native_identity": identity,
-                },
-                "persistent_reference": None,
-            }
+        native_interface_error = source_errors.get("interface_query")
         context, reference = (
             SolidWorksBackend._appearance_corresponding_reference(
                 entity,
                 source_reference=source_reference,
                 source_error=source_error,
                 native_interface_kind=native_interface_kind,
+                native_interface_error=native_interface_error,
                 owner_scope=owner_scope,
                 primary_component=primary_component,
                 extension=corresponding_extension,

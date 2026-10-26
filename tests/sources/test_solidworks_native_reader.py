@@ -3516,6 +3516,107 @@ class AppearanceHelperTests(unittest.TestCase):
         )
         self.assertEqual(face_reads, [])
 
+    def test_target_reference_survives_source_interface_failure(
+        self,
+    ) -> None:
+        entity = types.SimpleNamespace(_persist_reference=b"target-body")
+        conversion = _raiser(
+            AssertionError(
+                "an unknown source interface cannot select a conversion"
+            )
+        )
+        context = native_module.SolidWorksBackend._appearance_entity_context(
+            entity,
+            {
+                "native_interface_kind": None,
+                "source_persistent_reference": None,
+                "source_read_errors": {
+                    "interface_query": {
+                        "code": "interface_query_failed",
+                        "message": "source QI failed",
+                        "detail": None,
+                    }
+                },
+            },
+            owner_scope="component_document",
+            primary_component=types.SimpleNamespace(
+                GetCorresponding=conversion,
+                GetCorrespondingEntity=conversion,
+            ),
+            component_name="arm-1",
+            binding_document_path="C:\\robot.SLDASM",
+            corresponding_extension=types.SimpleNamespace(
+                GetPersistReference3=lambda value: list(
+                    value._persist_reference
+                )
+            ),
+            owner_document_path="C:\\arm.SLDPRT",
+            owner_configuration="Default",
+            display_state="State",
+        )
+        self.assertEqual(context["record"]["read_errors"], {})
+        self.assertEqual(
+            context["record"]["persistent_reference"],
+            list(b"target-body"),
+        )
+        self.assertEqual(
+            context["record"]["native_identity"]["context"]["api"],
+            "IModelDocExtension.GetPersistReference3",
+        )
+
+    def test_identity_maps_attempt_target_reference_after_source_qi_failure(
+        self,
+    ) -> None:
+        face = types.SimpleNamespace(
+            _persist_reference=b"assembly-face"
+        )
+        extension = types.SimpleNamespace(
+            GetPersistReference3=lambda value: list(
+                value._persist_reference
+            )
+        )
+        interface_error = RuntimeError("source IEntity QI failed")
+
+        def interface(value, iid, name):
+            if name == "IEntity":
+                return None, interface_error
+            return None, None
+
+        with patch.object(
+            native_module,
+            "_appearance_interface",
+            side_effect=interface,
+        ):
+            maps, errors, reference_index = (
+                _CaptureBackend._appearance_identity_maps(
+                    extension,
+                    owner_scope="component_document",
+                    component=types.SimpleNamespace(),
+                    component_name="arm-1",
+                    binding_document_path="C:\\robot.SLDASM",
+                    corresponding_extension=extension,
+                    holders=[],
+                    bodies=[],
+                    faces=[
+                        {
+                            "component": "arm-1",
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": 0,
+                            "face": face,
+                        }
+                    ],
+                    features=[],
+                )
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(maps), 1)
+        self.assertEqual(len(reference_index), 1)
+        self.assertEqual(
+            reference_index[0]["persistent_reference"],
+            list(b"assembly-face"),
+        )
+
     def test_unsupported_interface_is_absence_not_a_qi_failure(self) -> None:
         entity = types.SimpleNamespace(
             _oleobj_=object(),
