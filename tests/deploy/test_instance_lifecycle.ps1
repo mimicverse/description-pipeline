@@ -253,7 +253,7 @@ Remove-Item -LiteralPath $startupRoot -Recurse -Force -ErrorAction SilentlyConti
 
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
-  'Get-TaskGeneration', 'Get-ListenerEvidence', 'Get-EndpointIdentity',
+  'Get-TaskGeneration', 'Get-ListenerEvidence', 'Get-ProcessOwnerSid', 'Get-EndpointIdentity',
   'Read-EndpointRuntimeProbe',
   'New-EndpointSourceState', 'Assert-EndpointSourceMatch', 'Assert-HealthSourceMatch',
   'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
@@ -1192,13 +1192,9 @@ function Get-CimInstance {
   }
   return @($script:ListenerProcesses)
 }
-function Invoke-CimMethod {
-  [CmdletBinding()]
-  param($InputObject, [string]$MethodName)
-  return [pscustomobject]@{
-    ReturnValue=0
-    Sid=$InputObject.OwnerSid
-  }
+function Get-ProcessOwnerSid {
+  param($Process)
+  return [string]$Process.OwnerSid
 }
 Reset-ListenerProcesses
 $evidence = Get-ListenerEvidence @{port=8765} $listenerProjection

@@ -686,6 +686,17 @@ function Get-ProcessLineageEvidence($Process) {
   } catch {
     throw 'the process lineage node carries no creation time'
   }
+  $ownerSid = Get-ProcessOwnerSid $Process
+  return [ordered]@{
+    pid=[int]$Process.ProcessId
+    parent_pid=[int]$Process.ParentProcessId
+    image=(Normalize-PathIdentity $image)
+    start_utc=$started
+    user_sid=$ownerSid
+    session_id=[int]$Process.SessionId
+  }
+}
+function Get-ProcessOwnerSid($Process) {
   try {
     $ownerSid = Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop
   } catch {
@@ -695,14 +706,7 @@ function Get-ProcessLineageEvidence($Process) {
       [string]::IsNullOrWhiteSpace([string]$ownerSid.Sid)) {
     throw 'the process lineage node owner SID is unavailable'
   }
-  return [ordered]@{
-    pid=[int]$Process.ProcessId
-    parent_pid=[int]$Process.ParentProcessId
-    image=(Normalize-PathIdentity $image)
-    start_utc=$started
-    user_sid=[string]$ownerSid.Sid
-    session_id=[int]$Process.SessionId
-  }
+  return [string]$ownerSid.Sid
 }
 function Get-ListenerEvidence([object]$binding, $TaskProjection) {
   try {
