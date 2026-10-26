@@ -501,7 +501,7 @@ def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
     def axis_sign(joint: dict, properties: dict) -> int | None:
         name = str(joint.get("name") or "")
         direct_key = f"dp.joint.{name}.axis_sign"
-        legacy_key = "dp.joint.axis_sign"
+        mate_key = "dp.joint.axis_sign"
         candidates: list[object] = []
 
         def add(scope: object, key: str) -> None:
@@ -515,9 +515,9 @@ def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
             else:
                 raise PipelineError(f"{name} carries an invalid {key}: {value!r}")
 
-        # The declaration form is a main-assembly property scoped by the joint
-        # name.  Never scan unrelated components: a generic key on another part
-        # does not describe this joint.
+        # Native discovery supports two owner scopes: a joint-scoped declaration
+        # on the main assembly document, and a generic declaration on a bound
+        # mate. A joint-scoped key inside a mate is not a third owner.
         add(properties.get("document") or {}, direct_key)
         mate_names: list[str] = []
         if isinstance(joint.get("mate"), str):
@@ -528,8 +528,7 @@ def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
         for mate_name in sorted(set(mate_names)):
             scope = mate_properties.get(mate_name) or {}
             if isinstance(scope, dict):
-                add(scope, legacy_key)
-                add(scope, direct_key)
+                add(scope, mate_key)
         signs = set(candidates)
         if len(signs) > 1:
             raise PipelineError(f"{name} carries conflicting axis signs: {sorted(signs)}")
