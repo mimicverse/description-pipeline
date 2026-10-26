@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from ...appearance_contract import index_conversion_mismatch
 from ...io import PipelineError
 
 UNRECORDED_APPEARANCE = object()
@@ -607,6 +608,29 @@ def _feature_target_identity(target: Mapping[str, Any]):
     ) not in (int, str):
         return None
     return name, type_name, persistent_identity
+
+
+def _validate_index_conversion(
+    component: str,
+    indexed: Mapping[str, Any],
+    *,
+    owner_document_path: str,
+    path: str,
+) -> None:
+    mismatch = index_conversion_mismatch(
+        indexed,
+        component=component,
+        owner_document_path=owner_document_path,
+    )
+    if mismatch is None:
+        return
+    raise _appearance_resolution_error(
+        component,
+        "cad_appearance_render_conversion_unproven",
+        path + ".conversion",
+        "the participating target lacks exact Part conversion evidence",
+        mismatch=copy.deepcopy(mismatch),
+    )
 
 
 def _rgba_from_material_values(
@@ -1326,8 +1350,17 @@ def resolve_deliverable_appearance(
                 [],
             ).append(
                 {
+                    "persistent_reference": copy.deepcopy(
+                        indexed.get("persistent_reference")
+                    ),
+                    "native_interface_kind": indexed.get(
+                        "native_interface_kind"
+                    ),
                     "target": target,
                     "read_errors": indexed_errors,
+                    "conversion": copy.deepcopy(
+                        indexed.get("conversion")
+                    ),
                 }
             )
         for material_position, material in enumerate(owner["materials"]):
@@ -1520,6 +1553,17 @@ def resolve_deliverable_appearance(
                         component=component,
                         path=entity_path + ".persistent_reference",
                     )
+                    for item in targets:
+                        if item["target"] in current_targets.values():
+                            _validate_index_conversion(
+                                component,
+                                item,
+                                owner_document_path=owner[
+                                    "owner_document_path"
+                                ],
+                                path=entity_path
+                                + ".persistent_reference",
+                            )
                     applicable_errors = _mapping_errors_for_targets(
                         owner["mapping_errors"],
                         current_targets,

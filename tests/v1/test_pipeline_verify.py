@@ -100,6 +100,10 @@ def _appearance_index_record(
     owner_scope="component_document",
     owner_document_path="C:/cad/arm.SLDPRT",
 ):
+    target_kind = target.get("kind")
+    is_assembly_occurrence = target_kind == "occurrence"
+    is_body = target_kind == "body"
+    is_feature = target_kind == "feature"
     return {
         "persistent_reference": list(reference),
         "native_interface_kind": (
@@ -110,6 +114,63 @@ def _appearance_index_record(
             else None
         ),
         "read_errors": {},
+        "conversion": (
+            None
+            if is_assembly_occurrence
+            else {
+                "component": target.get("component", "arm-1"),
+                "input_context": {
+                    "owner_scope": "assembly_occurrence",
+                    "object_kind": "assembly_occurrence",
+                    "source_api": (
+                        "IComponent2.GetBodies2"
+                        if is_body
+                        else "IComponent2.GetBodies2/IBody2.GetFaces"
+                    ),
+                    "traversal_api": (
+                        "IConfiguration.GetRootComponent3/"
+                        "IComponent2.GetChildren"
+                    ),
+                },
+                "receiver": {
+                    "owner_scope": "component_document",
+                    "owner_document_path": owner_document_path,
+                    "interface": "IModelDocExtension",
+                    "object_source": "captured_component_source_document",
+                },
+                "api": (
+                    "IModelDocExtension.GetCorresponding2"
+                    if is_body
+                    else "IFace2.GetFeature+"
+                    "IModelDocExtension.GetPersistReference3"
+                    if is_feature
+                    else "IModelDocExtension.GetCorrespondingEntity2"
+                ),
+                "output_interface_kind": (
+                    "IBody2"
+                    if is_body
+                    else "IFeature"
+                    if is_feature
+                    else "IFace2"
+                ),
+                "output_domain": {
+                    "proof_api": (
+                        "IModelDocExtension.GetObjectByPersistReference3"
+                    ),
+                    "status": 0,
+                    "interface_kind": (
+                        "IBody2"
+                        if is_body
+                        else "IFeature"
+                        if is_feature
+                        else "IFace2"
+                    ),
+                    "expected_owner_document_path": owner_document_path,
+                },
+                "state": "observed",
+                "read_errors": {},
+            }
+        ),
         "binding_context": {
             "owner_scope": owner_scope,
             "owner_document_path": owner_document_path,
@@ -661,6 +722,35 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             configuration="Painted",
             where="capture",
         )
+        for mutation in (
+            lambda conversion: conversion["receiver"].update(
+                owner_scope="top_assembly"
+            ),
+            lambda conversion: conversion.update(
+                api="IComponent2.GetCorrespondingEntity"
+            ),
+            lambda conversion: conversion["output_domain"].update(
+                proof_api="ISldWorks.IsSame",
+                status=1,
+            ),
+            lambda conversion: conversion["output_domain"].update(
+                status=False
+            ),
+        ):
+            malformed = copy.deepcopy(raw)
+            conversion = malformed["state_render_materials"][-1][
+                "native_reference_index"
+            ][0]["conversion"]
+            mutation(conversion)
+            with self.assertRaisesRegex(
+                PipelineError,
+                "cad_appearance_render_conversion_unproven",
+            ):
+                _resolved_faces(
+                    malformed,
+                    configuration="Painted",
+                    where="capture",
+                )
 
         for failure, expected_message in (
             ("wrong_owner", "binding context is not its actual owner"),
@@ -695,6 +785,100 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         configuration="Painted",
                         where="capture",
                     )
+
+    def test_independent_appearance_conversion_is_target_specific(self):
+        from description_pipeline.verification.native_appearance import (
+            _validate_index_conversion,
+        )
+
+        base = _appearance_index_record(
+            reference=(1, 2, 3),
+            target={
+                "kind": "face",
+                "component": "arm-1",
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": 0,
+            },
+        )
+        for target_kind, api, interface, source_api in (
+            (
+                "body",
+                "IModelDocExtension.GetCorresponding2",
+                "IBody2",
+                "IComponent2.GetBodies2",
+            ),
+            (
+                "face",
+                "IModelDocExtension.GetCorrespondingEntity2",
+                "IFace2",
+                "IComponent2.GetBodies2/IBody2.GetFaces",
+            ),
+            (
+                "feature",
+                "IFace2.GetFeature+"
+                "IModelDocExtension.GetPersistReference3",
+                "IFeature",
+                "IComponent2.GetBodies2/IBody2.GetFaces",
+            ),
+        ):
+            indexed = copy.deepcopy(base)
+            target = indexed["target"]
+            target["kind"] = target_kind
+            if target_kind == "body":
+                target.pop("face_index", None)
+            elif target_kind == "feature":
+                target.update(
+                    {
+                        "name": "Boss-Extrude1",
+                        "type_name": "Extrusion",
+                        "persistent_reference": [4, 5, 6],
+                        "faces": [
+                            {
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                            }
+                        ],
+                    }
+                )
+                target.pop("face_index", None)
+            indexed["conversion"].update(
+                {
+                    "api": api,
+                    "output_interface_kind": interface,
+                }
+            )
+            indexed["native_interface_kind"] = (
+                "IBody2"
+                if target_kind == "body"
+                else "IEntity"
+                if target_kind == "face"
+                else None
+            )
+            indexed["conversion"]["output_domain"]["interface_kind"] = (
+                interface
+            )
+            indexed["conversion"]["input_context"]["source_api"] = source_api
+            _validate_index_conversion(
+                indexed,
+                owner_document_path="C:/cad/arm.SLDPRT",
+                component="arm-1",
+                path="capture",
+            )
+            indexed["conversion"]["api"] = (
+                "IComponent2.GetCorrespondingEntity"
+            )
+            with self.assertRaisesRegex(
+                PipelineError,
+                "cad_appearance_render_conversion_unproven",
+            ):
+                _validate_index_conversion(
+                    indexed,
+                    owner_document_path="C:/cad/arm.SLDPRT",
+                    component="arm-1",
+                    path="capture",
+                )
 
     def test_independent_appearance_merges_only_one_feature_footprint(self):
         from description_pipeline.verification.native_appearance import _resolved_faces

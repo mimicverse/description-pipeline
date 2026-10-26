@@ -171,7 +171,10 @@ material 实际 owner document 的 persistent reference、exact occurrence、配
 对象；对 Part 内 face、body 和 feature assignment，须由几何遍历保留 assembly input
 context，再复用 current captured component source document 的 Part extension 对
 occurrence face/body 调用 `GetCorrespondingEntity2`/`GetCorresponding2`，feature 从转换后的
-Part face 取得，最后由同一 Part extension 读取唯一 reference。父装配 extension 不是该转换的 receiver；
+Part face 取得，最后由同一 Part extension 读取唯一 reference，并以
+`GetObjectByPersistReference3` 返回的 exact status `0` 和预期 `IFace2`/`IBody2`/`IFeature`
+QI 证明该 reference 仍属于同一 Part namespace。同一 reference 只解析一次并复用结果。
+父装配 extension 不是该转换或解析的 receiver；
 不得把 assembly alias、双 namespace 或兜底匹配当成 Part 身份。按官方外观层级，
 assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
 part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不

@@ -894,6 +894,29 @@ def _appearance_value(owner, name: str, *, method: bool = False, args=()):
     return _json_raw_value(value), None
 
 
+def _get_object_by_persist_reference(extension, reference):
+    """Resolve one persistent-reference byte array through its owner document."""
+
+    import pythoncom
+
+    win32 = _win32()
+    errors = win32.VARIANT(
+        pythoncom.VT_BYREF | pythoncom.VT_I4,
+        0,
+    )
+    variant = win32.VARIANT(
+        pythoncom.VT_ARRAY | pythoncom.VT_UI1,
+        bytes(reference),
+    )
+    resolved = _method(
+        extension,
+        "GetObjectByPersistReference3",
+        variant,
+        errors,
+    )
+    return resolved, errors.value
+
+
 def _appearance_persistent_reference(extension, entity):
     if extension is None:
         return None, {
@@ -973,7 +996,136 @@ def _appearance_reference_key(value):
     return tuple(item & 0xFF for item in value)
 
 
-def _appearance_feature_identity(face, extension):
+def _appearance_resolve_persistent_reference(
+    extension,
+    reference,
+    *,
+    interface_iid,
+    interface_kind,
+    owner_document_path,
+    cache,
+):
+    """Resolve one Part reference through the receiver that created it."""
+
+    reference_key = _appearance_reference_key(reference)
+    if reference_key is None:
+        return None, None, {
+            "code": "cad_appearance_persist_reference_array_invalid",
+            "message": "the Part persistent reference is not a byte array",
+            "detail": {"value": copy.deepcopy(reference)},
+        }
+    cache_key = (
+        normalize_document_path(str(owner_document_path or "")).casefold(),
+        interface_kind,
+        reference_key,
+    )
+    if cache is not None and cache_key in cache:
+        resolved, output_domain, error = cache[cache_key]
+        return resolved, copy.deepcopy(output_domain), copy.deepcopy(error)
+    if extension is None:
+        result = (
+            None,
+            None,
+            {
+                "code": "cad_appearance_part_receiver_unavailable",
+                "message": "the target Part extension is unavailable",
+                "detail": {},
+            },
+        )
+        if cache is not None:
+            cache[cache_key] = result
+        return result
+    try:
+        resolved, status = _get_object_by_persist_reference(
+            extension,
+            reference_key,
+        )
+    except Exception as error:  # noqa: BLE001 - resolution is field-local
+        result = (None, None, _native_error_record(error))
+        if cache is not None:
+            cache[cache_key] = result
+        return result
+    if type(status) is not int:
+        result = (
+            None,
+            None,
+            {
+                "code": "cad_appearance_persist_reference_status_invalid",
+                "message": (
+                    "GetObjectByPersistReference3 returned an invalid status"
+                ),
+                "detail": {"status": _json_raw_value(status)},
+            },
+        )
+    elif status != 0:
+        result = (
+            None,
+            None,
+            {
+                "code": "cad_appearance_persist_reference_resolve_failed",
+                "message": (
+                    "GetObjectByPersistReference3 did not resolve the "
+                    "reference"
+                ),
+                "detail": {"status": status},
+            },
+        )
+    elif resolved is None:
+        result = (
+            None,
+            None,
+            {
+                "code": "cad_appearance_persist_reference_resolve_missing",
+                "message": (
+                    "GetObjectByPersistReference3 returned no object"
+                ),
+                "detail": {"status": status},
+            },
+        )
+    else:
+        interface_value, interface_error = _appearance_interface(
+            resolved,
+            interface_iid,
+            interface_kind,
+        )
+        if interface_value is None:
+            result = (
+                None,
+                None,
+                interface_error
+                or {
+                    "code": (
+                        "cad_appearance_persist_reference_type_mismatch"
+                    ),
+                    "message": (
+                        "the resolved Part object has the wrong interface"
+                    ),
+                    "detail": {"expected": interface_kind},
+                },
+            )
+        else:
+            output_domain = {
+                "proof_api": (
+                    "IModelDocExtension.GetObjectByPersistReference3"
+                ),
+                "status": status,
+                "interface_kind": interface_kind,
+                "expected_owner_document_path": owner_document_path,
+            }
+            result = (interface_value, output_domain, None)
+    if cache is not None:
+        cache[cache_key] = result
+    return (
+        result[0],
+        copy.deepcopy(result[1]),
+        copy.deepcopy(result[2]),
+    )
+
+
+def _appearance_feature_identity(
+    face,
+    extension,
+):
     errors = {}
     try:
         feature = _member(face, "GetFeature")
@@ -2363,8 +2515,6 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_
     import base64
     import xml.etree.ElementTree as ElementTree
 
-    import pythoncom
-
     root = ElementTree.fromstring(xml_text)
     bindings = []
     seen = set()
@@ -2391,10 +2541,9 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_
                 "error_code": None,
             }
             try:
-                errors = _win32().VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-                variant = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_UI1, data)
-                resolved = _method(extension, "GetObjectByPersistReference3", variant, errors)
-                row["error_code"] = errors.value
+                resolved, row["error_code"] = (
+                    _get_object_by_persist_reference(extension, data)
+                )
                 if resolved is None:
                     raise ValueError("GetObjectByPersistReference3 returned no object")
                 component = _component(_dynamic(resolved))
@@ -5083,7 +5232,6 @@ class SolidWorksBackend(CadBackend):
                     "detail": {"expected": output_interface_kind},
                 }
             else:
-                converted_object = interface_value
                 converted_reference, reference_error = (
                     _appearance_persistent_reference(
                         part_extension,
@@ -5094,6 +5242,8 @@ class SolidWorksBackend(CadBackend):
                     errors["persistent_reference"] = copy.deepcopy(
                         reference_error
                     )
+                else:
+                    converted_object = interface_value
         record = {
             "component": component,
             "input_context": {
@@ -5117,9 +5267,9 @@ class SolidWorksBackend(CadBackend):
             },
             "api": api,
             "output_interface_kind": output_interface_kind,
-            "persistent_reference": copy.deepcopy(converted_reference),
+            "output_domain": None,
             "state": (
-                "observed"
+                "pending"
                 if converted_reference is not None
                 and not errors
                 else "error"
@@ -5139,6 +5289,8 @@ class SolidWorksBackend(CadBackend):
         bodies,
         faces,
         features,
+        material_reference_keys=(),
+        resolution_cache=None,
     ):
         """Project raw reference observations from the enumerated native objects."""
 
@@ -5150,6 +5302,52 @@ class SolidWorksBackend(CadBackend):
             "faces": "face",
             "features": "feature",
         }
+        referenced_keys = {
+            key
+            for value in material_reference_keys
+            if (key := _appearance_reference_key(value)) is not None
+        }
+
+        def resolve_conversion(
+            reference,
+            conversion,
+            interface_iid,
+            interface_kind,
+        ):
+            resolved = (
+                copy.deepcopy(conversion)
+                if isinstance(conversion, Mapping)
+                else {}
+            )
+            if owner_scope != "component_document":
+                return resolved, None
+            reference_key = _appearance_reference_key(reference)
+            if reference_key is None or reference_key not in referenced_keys:
+                resolved["state"] = "unresolved"
+                return resolved, None
+            (
+                _resolved,
+                output_domain,
+                resolution_error,
+            ) = _appearance_resolve_persistent_reference(
+                extension,
+                reference,
+                interface_iid=interface_iid,
+                interface_kind=interface_kind,
+                owner_document_path=owner_document_path,
+                cache=resolution_cache,
+            )
+            resolved["output_domain"] = copy.deepcopy(output_domain)
+            if resolution_error is not None:
+                resolved["state"] = "error"
+                resolved.setdefault("read_errors", {})[
+                    "output_domain"
+                ] = copy.deepcopy(resolution_error)
+                return resolved, copy.deepcopy(resolution_error)
+            resolved["state"] = (
+                "observed" if not resolved.get("read_errors") else "error"
+            )
+            return resolved, None
 
         def record_mapping_error(
             kind,
@@ -5291,6 +5489,17 @@ class SolidWorksBackend(CadBackend):
                 add("occurrences", holder, {"component": name})
         else:
             for row in bodies:
+                conversion, output_error = resolve_conversion(
+                    row["persistent_reference"],
+                    row.get("conversion"),
+                    IBODY2_IID,
+                    "IBody2",
+                )
+                read_errors = copy.deepcopy(row["read_errors"])
+                if output_error is not None:
+                    read_errors["output_domain"] = copy.deepcopy(
+                        output_error
+                    )
                 add(
                     "bodies",
                     row["body"],
@@ -5305,13 +5514,26 @@ class SolidWorksBackend(CadBackend):
                         ],
                         "reference_error": row["read_errors"].get(
                             "persistent_reference"
-                        ),
+                        )
+                        or row["read_errors"].get("output_domain")
+                        or output_error,
                         "native_interface_kind": "IBody2",
-                        "read_errors": row["read_errors"],
-                        "conversion": row.get("conversion"),
+                        "read_errors": read_errors,
+                        "conversion": conversion,
                     },
                 )
             for row in faces:
+                conversion, output_error = resolve_conversion(
+                    row["persistent_reference"],
+                    row.get("conversion"),
+                    IFACE2_IID,
+                    "IFace2",
+                )
+                read_errors = copy.deepcopy(row["read_errors"])
+                if output_error is not None:
+                    read_errors["output_domain"] = copy.deepcopy(
+                        output_error
+                    )
                 add(
                     "faces",
                     row["face"],
@@ -5327,10 +5549,12 @@ class SolidWorksBackend(CadBackend):
                         ],
                         "reference_error": row["read_errors"].get(
                             "persistent_reference"
-                        ),
+                        )
+                        or row["read_errors"].get("output_domain")
+                        or output_error,
                         "native_interface_kind": "IEntity",
-                        "read_errors": row["read_errors"],
-                        "conversion": row.get("conversion"),
+                        "read_errors": read_errors,
+                        "conversion": conversion,
                     },
                 )
             feature_groups = []
@@ -5449,6 +5673,18 @@ class SolidWorksBackend(CadBackend):
                 identity_read_errors = {
                     "faces": feature_errors
                 } if feature_errors else {}
+                feature_conversion, feature_output_error = (
+                    resolve_conversion(
+                        first["identity"].get("persistent_reference"),
+                        first.get("conversion"),
+                        IFEATURE_IID,
+                        "IFeature",
+                    )
+                )
+                if feature_output_error is not None:
+                    identity_read_errors["output_domain"] = copy.deepcopy(
+                        feature_output_error
+                    )
                 add(
                     "features",
                     group["feature"],
@@ -5477,12 +5713,23 @@ class SolidWorksBackend(CadBackend):
                                 .get("persistent_reference")
                             ),
                             None,
-                        ),
+                        )
+                        or next(
+                            (
+                                row["identity"]["read_errors"].get(
+                                    "persistent_reference_resolution"
+                                )
+                                for row in rows
+                                if row["identity"]
+                                .get("read_errors", {})
+                                .get("persistent_reference_resolution")
+                            ),
+                            None,
+                        )
+                        or feature_output_error,
                         "native_interface_kind": None,
                         "read_errors": identity_read_errors,
-                        "conversion": copy.deepcopy(
-                            first.get("conversion")
-                        ),
+                        "conversion": feature_conversion,
                     },
                 )
         return mapping_errors, native_reference_index
@@ -5501,6 +5748,7 @@ class SolidWorksBackend(CadBackend):
         faces,
         features,
         cache,
+        resolution_cache=None,
     ):
         owner_rows, ancestors = self._appearance_owner_rows(
             component,
@@ -5578,6 +5826,13 @@ class SolidWorksBackend(CadBackend):
                     )
                 raw_record, extension, material_entities = cache[key]
                 record.update(copy.deepcopy(raw_record))
+                material_reference_keys = [
+                    entity.get("persistent_reference")
+                    for material in (record.get("materials") or [])
+                    if material.get("entities_state") == "observed"
+                    for entity in material.get("entity_records", [])
+                    if not entity.get("read_errors")
+                ]
                 if (
                     record["call_state"] == "observed"
                     and extension is not None
@@ -5610,6 +5865,8 @@ class SolidWorksBackend(CadBackend):
                             if owner["owner_scope"] == "component_document"
                             else ()
                         ),
+                        material_reference_keys=material_reference_keys,
+                        resolution_cache=resolution_cache,
                     )
                     record["mapping_errors"] = mapping_errors
                     record["native_reference_index"] = (
@@ -5801,6 +6058,7 @@ class SolidWorksBackend(CadBackend):
         with self._current_components("geometry") as current:
             entries = {}
             render_material_cache = {}
+            resolution_cache = {}
             total = len(self._components)
             for index, component in enumerate(sorted(self._components), start=1):
                 note(
@@ -5816,6 +6074,7 @@ class SolidWorksBackend(CadBackend):
                         source_scopes[component],
                         current=current,
                         render_material_cache=render_material_cache,
+                        resolution_cache=resolution_cache,
                     )
                 except Exception as error:  # noqa: BLE001 - continue the remaining objects
                     detail = getattr(error, "detail", None)
@@ -5864,6 +6123,7 @@ class SolidWorksBackend(CadBackend):
         *,
         current,
         render_material_cache,
+        resolution_cache,
     ):
         """Read direct face display triangles without writing or deriving."""
 
@@ -5904,7 +6164,30 @@ class SolidWorksBackend(CadBackend):
                 component,
                 "appearance",
             )
+            document_type = _member(document, "GetType")
+            document_path = _member(document, "GetPathName")
+            if (
+                document_type != 1
+                or not _is_text_name(document_path)
+                or not document_paths_match(
+                    document_path,
+                    source_scope.get("source_document_path"),
+                )
+            ):
+                raise CadError(
+                    "cad_appearance_part_document_mismatch",
+                    "the appearance receiver is not the exact Part document",
+                    {
+                        "component": component,
+                        "document_type": document_type,
+                        "document_path": _json_raw_value(document_path),
+                        "expected_document_path": source_scope.get(
+                            "source_document_path"
+                        ),
+                    },
+                )
         except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
+            document = None
             document_error = _native_error_record(error)
         native_active_configuration = None
         native_active_configuration_error = None
@@ -6246,6 +6529,33 @@ class SolidWorksBackend(CadBackend):
                         }
                     )
                     if feature is not None:
+                        feature_conversion = copy.deepcopy(
+                            face_conversion
+                        )
+                        feature_conversion.update(
+                            {
+                                "api": (
+                                    "IFace2.GetFeature+"
+                                    "IModelDocExtension.GetPersistReference3"
+                                ),
+                                "output_interface_kind": "IFeature",
+                                "output_domain": None,
+                                "state": (
+                                    "pending"
+                                    if feature_identity.get(
+                                        "persistent_reference"
+                                    )
+                                    is not None
+                                    and not feature_identity.get(
+                                        "read_errors"
+                                    )
+                                    else "error"
+                                ),
+                                "read_errors": copy.deepcopy(
+                                    feature_identity.get("read_errors", {})
+                                ),
+                            }
+                        )
                         feature_entities.append(
                             {
                                 "component": component,
@@ -6254,7 +6564,7 @@ class SolidWorksBackend(CadBackend):
                                 "face_index": face_index,
                                 "feature": feature,
                                 "identity": feature_identity,
-                                "conversion": face_conversion,
+                                "conversion": feature_conversion,
                             }
                         )
                     body_appearance_record["faces"].append(
@@ -6326,6 +6636,7 @@ class SolidWorksBackend(CadBackend):
                     faces=face_entities,
                     features=feature_entities,
                     cache=render_material_cache,
+                    resolution_cache=resolution_cache,
                 )
             )
         except Exception as error:  # noqa: BLE001 - appearance is auxiliary

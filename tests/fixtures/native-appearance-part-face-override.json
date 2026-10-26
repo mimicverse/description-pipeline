@@ -246,6 +246,31 @@
             ],
             "native_interface_kind": "IEntity",
             "read_errors": {},
+        "conversion": {
+          "component": "arm-1",
+          "input_context": {
+            "owner_scope": "assembly_occurrence",
+            "object_kind": "assembly_occurrence",
+            "source_api": "IComponent2.GetBodies2/IBody2.GetFaces",
+            "traversal_api": "IConfiguration.GetRootComponent3/IComponent2.GetChildren"
+          },
+          "receiver": {
+            "owner_scope": "component_document",
+            "owner_document_path": "C:\\capture\\arm.SLDPRT",
+            "interface": "IModelDocExtension",
+            "object_source": "captured_component_source_document"
+          },
+          "api": "IModelDocExtension.GetCorrespondingEntity2",
+          "output_interface_kind": "IFace2",
+          "output_domain": {
+            "proof_api": "IModelDocExtension.GetObjectByPersistReference3",
+            "status": 0,
+            "interface_kind": "IFace2",
+            "expected_owner_document_path": "C:\\capture\\arm.SLDPRT"
+          },
+          "state": "observed",
+          "read_errors": {}
+        },
             "binding_context": {
               "owner_scope": "component_document",
               "owner_document_path": "C:\\capture\\arm.SLDPRT",

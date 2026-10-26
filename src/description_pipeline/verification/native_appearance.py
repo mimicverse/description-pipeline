@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -9,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ..appearance_contract import index_conversion_mismatch
 from ..geometry.native_tessellation import native_stl_subset
 from ..io import PipelineError, confined, file_digest
 from ..sources.solidworks.naming import (
@@ -362,6 +364,26 @@ def _feature_target_identity(target: Mapping):
     ) not in (int, str):
         raise PipelineError("A feature target identity is not canonical")
     return name, type_name, persistent_identity
+
+
+def _validate_index_conversion(
+    indexed: Mapping,
+    *,
+    owner_document_path: str,
+    component: str,
+    path: str,
+) -> None:
+    mismatch = index_conversion_mismatch(
+        indexed,
+        component=component,
+        owner_document_path=owner_document_path,
+    )
+    _require(
+        mismatch is None,
+        "cad_appearance_render_conversion_unproven: "
+        f"{path} lacks exact Part conversion evidence; "
+        f"mismatch={json.dumps(mismatch, sort_keys=True)}",
+    )
 
 
 def _valid_values(value: object) -> bool:
@@ -745,8 +767,17 @@ def _resolved_faces(
                 [],
             ).append(
                 {
+                    "persistent_reference": copy.deepcopy(
+                        indexed.get("persistent_reference")
+                    ),
+                    "native_interface_kind": indexed.get(
+                        "native_interface_kind"
+                    ),
                     "target": target,
                     "read_errors": indexed_errors,
+                    "conversion": copy.deepcopy(
+                        indexed.get("conversion")
+                    ),
                 }
             )
         for index, material in enumerate(owner["materials"]):
@@ -883,6 +914,17 @@ def _resolved_faces(
                         [item["target"] for item in targets],
                         component=component,
                     )
+                    for item in targets:
+                        if item["target"] in current_targets.values():
+                            _validate_index_conversion(
+                                item,
+                                owner_document_path=owner[
+                                    "owner_document_path"
+                                ],
+                                component=component,
+                                path=entity_path
+                                + ".persistent_reference",
+                            )
                     applicable_errors = _mapping_errors_for_targets(
                         owner["mapping_errors"],
                         current_targets,

@@ -48,7 +48,10 @@ owner document 的 persistent reference、exact occurrence、配置与显示状�
 实际交付网格保持 occurrence 对象；Part 内 face、body 和 feature identity 须由 traversal
 证明 assembly input context，再复用 current captured component source document 的 Part
 extension 调用 `GetCorrespondingEntity2`/`GetCorresponding2`，feature 从转换后的 Part
-face 取得，最后由同一 Part extension 读取 reference。父装配 extension 不是 receiver；
+face 取得，最后由同一 Part extension 读取 reference，并用
+`GetObjectByPersistReference3` 的 exact status `0` 与预期 `IFace2`/`IBody2`/`IFeature`
+QI 验证解析结果仍在该 Part namespace；同一 reference 只解析一次并复用。父装配
+extension 不是 receiver 或 resolver；
 不得把 assembly alias、双 namespace 或兜底匹配当成 Part 身份。按官方外观层级，
 assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
 part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不

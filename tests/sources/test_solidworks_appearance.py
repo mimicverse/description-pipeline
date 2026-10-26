@@ -10,6 +10,7 @@ from pathlib import Path
 from description_pipeline.sources.solidworks.appearance import (
     AppearanceError,
     _rgba_from_colorref,
+    _validate_index_conversion,
     appearance_groups,
     bind_capture_appearance,
     resolve_deliverable_appearance,
@@ -189,6 +190,10 @@ def _reference_row(
     owner_scope: str = "component_document",
     owner_document_path: str = DOCUMENT,
 ):
+    target_kind = target.get("kind")
+    is_assembly_occurrence = target_kind == "occurrence"
+    is_body = target_kind == "body"
+    is_feature = target_kind == "feature"
     return {
         "persistent_reference": list(reference),
         "native_interface_kind": (
@@ -199,6 +204,63 @@ def _reference_row(
             else None
         ),
         "read_errors": {},
+        "conversion": (
+            None
+            if is_assembly_occurrence
+            else {
+                "component": target.get("component", COMPONENT),
+                "input_context": {
+                    "owner_scope": "assembly_occurrence",
+                    "object_kind": "assembly_occurrence",
+                    "source_api": (
+                        "IComponent2.GetBodies2"
+                        if is_body
+                        else "IComponent2.GetBodies2/IBody2.GetFaces"
+                    ),
+                    "traversal_api": (
+                        "IConfiguration.GetRootComponent3/"
+                        "IComponent2.GetChildren"
+                    ),
+                },
+                "receiver": {
+                    "owner_scope": "component_document",
+                    "owner_document_path": owner_document_path,
+                    "interface": "IModelDocExtension",
+                    "object_source": "captured_component_source_document",
+                },
+                "api": (
+                    "IModelDocExtension.GetCorresponding2"
+                    if is_body
+                    else "IFace2.GetFeature+"
+                    "IModelDocExtension.GetPersistReference3"
+                    if is_feature
+                    else "IModelDocExtension.GetCorrespondingEntity2"
+                ),
+                "output_interface_kind": (
+                    "IBody2"
+                    if is_body
+                    else "IFeature"
+                    if is_feature
+                    else "IFace2"
+                ),
+                "output_domain": {
+                    "proof_api": (
+                        "IModelDocExtension.GetObjectByPersistReference3"
+                    ),
+                    "status": 0,
+                    "interface_kind": (
+                        "IBody2"
+                        if is_body
+                        else "IFeature"
+                        if is_feature
+                        else "IFace2"
+                    ),
+                    "expected_owner_document_path": owner_document_path,
+                },
+                "state": "observed",
+                "read_errors": {},
+            }
+        ),
         "binding_context": _binding_context(
             owner_scope=owner_scope,
             owner_document_path=owner_document_path,
@@ -283,6 +345,148 @@ class CaptureAppearanceBindingTests(unittest.TestCase):
 
 
 class AppearanceResolutionTests(unittest.TestCase):
+    def test_part_conversion_evidence_is_required_and_target_specific(self):
+        case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))
+        raw = copy.deepcopy(case["raw"])
+        owner = raw["state_render_materials"][0]
+        indexed = owner["native_reference_index"][0]
+        _validate_index_conversion(
+            COMPONENT,
+            {
+                **indexed,
+                "target": owner["native_reference_index"][0]["target"],
+            },
+            owner_document_path=DOCUMENT,
+            path="capture",
+        )
+        for target_kind, api, interface, source_api in (
+            (
+                "body",
+                "IModelDocExtension.GetCorresponding2",
+                "IBody2",
+                "IComponent2.GetBodies2",
+            ),
+            (
+                "face",
+                "IModelDocExtension.GetCorrespondingEntity2",
+                "IFace2",
+                "IComponent2.GetBodies2/IBody2.GetFaces",
+            ),
+            (
+                "feature",
+                "IFace2.GetFeature+"
+                "IModelDocExtension.GetPersistReference3",
+                "IFeature",
+                "IComponent2.GetBodies2/IBody2.GetFaces",
+            ),
+        ):
+            target = copy.deepcopy(indexed["target"])
+            target["kind"] = target_kind
+            if target_kind == "body":
+                target.pop("face_index", None)
+            elif target_kind == "feature":
+                target.update(
+                    {
+                        "name": "Boss-Extrude1",
+                        "type_name": "Extrusion",
+                        "persistent_reference": list(
+                            indexed["persistent_reference"]
+                        ),
+                        "faces": [
+                            {
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                            }
+                        ],
+                    }
+                )
+                target.pop("face_index", None)
+            conversion = copy.deepcopy(indexed["conversion"])
+            indexed["native_interface_kind"] = (
+                "IBody2"
+                if target_kind == "body"
+                else "IEntity"
+                if target_kind == "face"
+                else None
+            )
+            conversion.update(
+                {
+                    "api": api,
+                    "output_interface_kind": interface,
+                }
+            )
+            conversion["output_domain"]["interface_kind"] = interface
+            conversion["input_context"]["source_api"] = source_api
+            valid = {**indexed, "target": target, "conversion": conversion}
+            _validate_index_conversion(
+                COMPONENT,
+                valid,
+                owner_document_path=DOCUMENT,
+                path="capture",
+            )
+            for mutation in (
+                lambda value: value.pop("conversion"),
+                lambda value: value["conversion"].update(
+                    receiver={
+                        **value["conversion"]["receiver"],
+                        "owner_scope": "top_assembly",
+                    }
+                ),
+                lambda value: value["conversion"]["receiver"].update(
+                    owner_document_path=r"C:\capture\other.SLDPRT"
+                ),
+                lambda value: value["conversion"].update(
+                    api="IComponent2.GetCorrespondingEntity"
+                ),
+                lambda value, kind=target_kind: value["conversion"].update(
+                    output_interface_kind=(
+                        "IFace2"
+                        if kind == "body"
+                        else "IBody2"
+                    )
+                ),
+                lambda value: value["conversion"]["output_domain"].update(
+                    proof_api="ISldWorks.IsSame",
+                    status=1,
+                ),
+                lambda value: value["conversion"]["output_domain"].update(
+                    status=False
+                ),
+            ):
+                malformed = copy.deepcopy(valid)
+                mutation(malformed)
+                with (
+                    self.subTest(target_kind=target_kind),
+                    self.assertRaises(AppearanceError) as caught,
+                ):
+                    _validate_index_conversion(
+                        COMPONENT,
+                        malformed,
+                        owner_document_path=DOCUMENT,
+                        path="capture",
+                    )
+                self.assertEqual(
+                    caught.exception.appearance["issues"][0]["code"],
+                    "cad_appearance_render_conversion_unproven",
+                )
+        malformed = copy.deepcopy(raw)
+        malformed["state_render_materials"][0]["native_reference_index"][0][
+            "conversion"
+        ]["receiver"]["owner_scope"] = "top_assembly"
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                malformed,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=case["face_spans"],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_conversion_unproven",
+        )
+
     def test_part_material_precedes_only_lower_scopes(self):
         case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))
         resolved = resolve_deliverable_appearance(
