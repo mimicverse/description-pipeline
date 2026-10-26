@@ -103,7 +103,11 @@ def _appearance_index_record(
     return {
         "persistent_reference": list(reference),
         "native_interface_kind": (
-            "IEntity" if target.get("kind") == "face" else None
+            "IEntity"
+            if target.get("kind") == "face"
+            else "IBody2"
+            if target.get("kind") == "body"
+            else None
         ),
         "read_errors": {},
         "binding_context": {

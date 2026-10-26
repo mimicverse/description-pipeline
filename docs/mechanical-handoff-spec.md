@@ -167,8 +167,12 @@ parent 和 component-document owner 分别保留自己的 configuration/display-
 纹理事实分别封存。只有成功读取的 exact-state 总数确证为 0 时，NULL 才可证明没有
 state render assignment；present rows 的基数必须与总数一致。Generate 与 Verify 必须从
 material 实际 owner document 的 persistent reference、exact occurrence、配置与显示状态，
-与同一 owner 的索引独立 join，不信任 Source 预填匹配。`component_document` 的 material
-与 index 都直接读取真实 Part owner extension，不转换到父装配别名。按官方外观层级，
+与同一 owner 的索引独立 join，不信任 Source 预填匹配。实际交付网格保持 occurrence
+对象；对 Part 内 face、body 和 feature assignment，须由几何遍历保留 assembly input
+context，再复用 current captured component source document 的 Part extension 对
+occurrence face/body 调用 `GetCorrespondingEntity2`/`GetCorresponding2`，feature 从转换后的
+Part face 取得，最后由同一 Part extension 读取唯一 reference。父装配 extension 不是该转换的 receiver；
+不得把 assembly alias、双 namespace 或兜底匹配当成 Part 身份。按官方外观层级，
 assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
 part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不
 转换、提升或猜测其作用域。document target 必须核验 `IModelDoc2` QI、path 与 active

@@ -45,14 +45,17 @@ NULL 仍是未解析事实，present rows 的基数必须与总数一致。
 
 state material 的 entity 与同次几何遍历的 `native_reference_index` 以 material 实际
 owner document 的 persistent reference、exact occurrence、配置与显示状态独立 join。
-`component_document` 的 material 与 index 都直接读取真实 Part owner extension；不得把
-同一对象转换到父装配后形成的 component alias 当成 Part 身份，也不保留第二套引用作备用
-匹配。按官方外观层级，assembly-owned material 使用实际 assembly owner 中的组件实例；
-face、feature、body 和 part assignment 使用 Part owner。assembly 材质指向非 occurrence
-target 时明确拒绝，不转换、提升或猜测其作用域。document target 必须核验 `IModelDoc2`
-QI、path、active configuration 与 leaf owner。Generate 与 Verify 分别从原始事实执行该
-join，不信任 Source 预填匹配。参与对象绑定的 owner key 无法命中，或命中 target 仍带有
-该对象/feature footprint 的 mapping 或 identity 错误时失败；只有已证明不同的 target、
+实际交付网格保持 occurrence 对象；Part 内 face、body 和 feature identity 须由 traversal
+证明 assembly input context，再复用 current captured component source document 的 Part
+extension 调用 `GetCorrespondingEntity2`/`GetCorresponding2`，feature 从转换后的 Part
+face 取得，最后由同一 Part extension 读取 reference。父装配 extension 不是 receiver；
+不得把 assembly alias、双 namespace 或兜底匹配当成 Part 身份。按官方外观层级，
+assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
+part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不
+转换、提升或猜测其作用域。document target 必须核验 `IModelDoc2` QI、path、active
+configuration 与 leaf owner。Generate 与 Verify 分别从原始事实执行该 join，不信任
+Source 预填匹配。参与对象绑定的 owner key 无法命中，或命中 target 仍带有该
+对象/feature footprint 的 mapping 或 identity 错误时失败；只有已证明不同的 target、
 exact Count=0 owner 或 exact document proof 可忽略辅助诊断。同一 occurrence 内的 material
 优先级固定为 `face > feature > body > part document`；document target 表示 part 材质，
 不能无条件提升为 assembly occurrence override。真实 assembly occurrence override 仍优先

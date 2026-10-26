@@ -729,7 +729,7 @@ def _resolved_faces(
                 and indexed_binding.get("api")
                 == OWNER_CONTEXT_BINDING_API
                 and indexed.get("native_interface_kind")
-                in {"IEntity", None}
+                in {"IEntity", "IBody2", None}
                 and isinstance(indexed_errors, Mapping)
                 and isinstance(target, Mapping)
                 and target.get("kind")

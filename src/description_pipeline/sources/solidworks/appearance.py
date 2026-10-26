@@ -1305,7 +1305,7 @@ def resolve_deliverable_appearance(
                 or indexed_api
                 != OWNER_CONTEXT_BINDING_API
                 or indexed.get("native_interface_kind")
-                not in {"IEntity", None}
+                not in {"IEntity", "IBody2", None}
                 or not isinstance(indexed_errors, Mapping)
                 or not isinstance(target, Mapping)
                 or target.get("kind")

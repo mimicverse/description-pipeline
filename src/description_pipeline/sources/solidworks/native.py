@@ -5003,6 +5003,132 @@ class SolidWorksBackend(CadBackend):
         return rows, ancestors
 
     @staticmethod
+    def _appearance_underlying_part_entity(
+        entity,
+        *,
+        target_kind,
+        component,
+        part_document_path,
+        part_extension,
+    ):
+        """Convert occurrence geometry into the exact underlying Part object."""
+
+        if target_kind not in {"face", "body"}:
+            raise ValueError(
+                f"unsupported appearance target kind: {target_kind}"
+            )
+        api_name = (
+            "GetCorrespondingEntity2"
+            if target_kind == "face"
+            else "GetCorresponding2"
+        )
+        api = f"IModelDocExtension.{api_name}"
+        corresponding = None
+        converted_object = None
+        converted_reference = None
+        errors = {}
+        output_interface_kind = (
+            "IFace2" if target_kind == "face" else "IBody2"
+        )
+        if part_extension is None:
+            errors["receiver"] = {
+                "code": "cad_appearance_part_receiver_unavailable",
+                "message": (
+                    "the exact target Part document extension is "
+                    "unavailable"
+                ),
+                "detail": {},
+            }
+        else:
+            try:
+                corresponding = _member(
+                    part_extension,
+                    api_name,
+                    entity,
+                )
+            except Exception as error:  # noqa: BLE001 - conversion is field-local
+                errors["conversion"] = _native_error_record(error)
+            else:
+                if corresponding is None:
+                    errors["conversion"] = {
+                        "code": "cad_appearance_underlying_part_missing",
+                        "message": (
+                            "the target Part conversion returned no "
+                            "underlying Part object"
+                        ),
+                        "detail": {},
+                    }
+        if corresponding is not None:
+            if target_kind == "face":
+                interface_value, interface_error = _appearance_interface(
+                    corresponding,
+                    IFACE2_IID,
+                    "IFace2",
+                )
+            else:
+                interface_value, interface_error = (
+                    _appearance_interface(
+                        corresponding,
+                        IBODY2_IID,
+                        "IBody2",
+                    )
+                )
+            if interface_value is None:
+                errors["output_interface"] = interface_error or {
+                    "code": "cad_appearance_part_interface_missing",
+                    "message": (
+                        "the converted Part object does not expose the "
+                        "expected interface"
+                    ),
+                    "detail": {"expected": output_interface_kind},
+                }
+            else:
+                converted_object = interface_value
+                converted_reference, reference_error = (
+                    _appearance_persistent_reference(
+                        part_extension,
+                        interface_value,
+                    )
+                )
+                if reference_error is not None:
+                    errors["persistent_reference"] = copy.deepcopy(
+                        reference_error
+                    )
+        record = {
+            "component": component,
+            "input_context": {
+                "owner_scope": "assembly_occurrence",
+                "object_kind": "assembly_occurrence",
+                "source_api": (
+                    "IComponent2.GetBodies2/IBody2.GetFaces"
+                    if target_kind == "face"
+                    else "IComponent2.GetBodies2"
+                ),
+                "traversal_api": (
+                    "IConfiguration.GetRootComponent3/"
+                    "IComponent2.GetChildren"
+                ),
+            },
+            "receiver": {
+                "owner_scope": "component_document",
+                "owner_document_path": part_document_path,
+                "interface": "IModelDocExtension",
+                "object_source": "captured_component_source_document",
+            },
+            "api": api,
+            "output_interface_kind": output_interface_kind,
+            "persistent_reference": copy.deepcopy(converted_reference),
+            "state": (
+                "observed"
+                if converted_reference is not None
+                and not errors
+                else "error"
+            ),
+            "read_errors": copy.deepcopy(errors),
+        }
+        return converted_object, converted_reference, record
+
+    @staticmethod
     def _appearance_reference_index(
         extension,
         *,
@@ -5108,10 +5234,15 @@ class SolidWorksBackend(CadBackend):
                     observation.get("read_errors", {})
                 )
             if reference is None or reference_error is not None:
+                first_read_error = next(
+                    iter(row_read_errors.values()),
+                    None,
+                )
                 record_mapping_error(
                     kind,
                     identity,
                     reference_error
+                    or first_read_error
                     or {
                         "code": "cad_appearance_owner_reference_missing",
                         "message": (
@@ -5146,6 +5277,11 @@ class SolidWorksBackend(CadBackend):
                     "binding_context": copy.deepcopy(
                         owner_binding_context
                     ),
+                    "conversion": copy.deepcopy(
+                        observation.get("conversion")
+                        if observation is not None
+                        else None
+                    ),
                     "target": copy.deepcopy(target),
                 }
             )
@@ -5162,6 +5298,17 @@ class SolidWorksBackend(CadBackend):
                         "component": row["component"],
                         "body_type": row["body_type"],
                         "body_index": row["body_index"],
+                    },
+                    {
+                        "persistent_reference": row[
+                            "persistent_reference"
+                        ],
+                        "reference_error": row["read_errors"].get(
+                            "persistent_reference"
+                        ),
+                        "native_interface_kind": "IBody2",
+                        "read_errors": row["read_errors"],
+                        "conversion": row.get("conversion"),
                     },
                 )
             for row in faces:
@@ -5183,6 +5330,7 @@ class SolidWorksBackend(CadBackend):
                         ),
                         "native_interface_kind": "IEntity",
                         "read_errors": row["read_errors"],
+                        "conversion": row.get("conversion"),
                     },
                 )
             feature_groups = []
@@ -5332,6 +5480,9 @@ class SolidWorksBackend(CadBackend):
                         ),
                         "native_interface_kind": None,
                         "read_errors": identity_read_errors,
+                        "conversion": copy.deepcopy(
+                            first.get("conversion")
+                        ),
                     },
                 )
         return mapping_errors, native_reference_index
@@ -5909,6 +6060,22 @@ class SolidWorksBackend(CadBackend):
                     self.notes[
                         f"body_name_read_error:{component}:{body_type}/{body_index}"
                     ] = copy.deepcopy(body_name_error)
+                (
+                    underlying_body,
+                    body_reference,
+                    body_conversion,
+                ) = SolidWorksBackend._appearance_underlying_part_entity(
+                    body,
+                    target_kind="body",
+                    component=component,
+                    part_document_path=source_scope.get(
+                        "source_document_path"
+                    ),
+                    part_extension=document_extension,
+                )
+                body_identity_errors = copy.deepcopy(
+                    body_conversion["read_errors"]
+                )
                 # IBody2.MaterialPropertyValues2 is the related-body owner path
                 # through IPartDoc.EnumRelatedBodies2; GetBodies2 here remains
                 # the geometry traversal and cannot be relabeled as that owner.
@@ -5919,6 +6086,17 @@ class SolidWorksBackend(CadBackend):
                     "body_index": body_index,
                     "body_name": body_name,
                     "faces": [],
+                    "native_identity": {
+                        "owner_scope": "component_document",
+                        "owner_document_path": source_scope.get(
+                            "source_document_path"
+                        ),
+                        "persistent_reference": copy.deepcopy(
+                            body_reference
+                        ),
+                        "conversion": body_conversion,
+                        "read_errors": body_identity_errors,
+                    },
                 }
                 appearance_raw["bodies"].append(body_appearance_record)
                 body_entities.append(
@@ -5927,6 +6105,12 @@ class SolidWorksBackend(CadBackend):
                         "body_type": body_type,
                         "body_index": body_index,
                         "body": body,
+                        "underlying_body": underlying_body,
+                        "persistent_reference": copy.deepcopy(
+                            body_reference
+                        ),
+                        "read_errors": body_identity_errors,
+                        "conversion": body_conversion,
                     }
                 )
                 try:
@@ -6005,27 +6189,46 @@ class SolidWorksBackend(CadBackend):
                             used_api=face_api,
                             error=_native_error_record(error),
                         )
-                    feature_identity, feature = _appearance_feature_identity(
+                    (
+                        underlying_face,
+                        face_reference,
+                        face_conversion,
+                    ) = SolidWorksBackend._appearance_underlying_part_entity(
                         face,
-                        document_extension,
+                        target_kind="face",
+                        component=component,
+                        part_document_path=source_scope.get(
+                            "source_document_path"
+                        ),
+                        part_extension=document_extension,
                     )
-                    face_reference, face_reference_error = (
-                        _appearance_persistent_reference(
-                            document_extension,
-                            face,
+                    if underlying_face is None:
+                        feature_identity = {
+                            "name": None,
+                            "type_name": None,
+                            "persistent_reference": None,
+                            "read_errors": copy.deepcopy(
+                                face_conversion["read_errors"]
+                            ),
+                        }
+                        feature = None
+                    else:
+                        feature_identity, feature = (
+                            _appearance_feature_identity(
+                                underlying_face,
+                                document_extension,
+                            )
                         )
+                    native_identity_errors = copy.deepcopy(
+                        face_conversion["read_errors"]
                     )
-                    native_identity_errors = {}
-                    if face_reference_error is not None:
-                        native_identity_errors[
-                            "persistent_reference"
-                        ] = face_reference_error
                     face_appearance["native_identity"] = {
                         "owner_document_path": source_scope.get(
                             "source_document_path"
                         ),
                         "owner_scope": "component_document",
                         "persistent_reference": face_reference,
+                        "conversion": face_conversion,
                         "feature": feature_identity,
                         "read_errors": native_identity_errors,
                     }
@@ -6036,8 +6239,10 @@ class SolidWorksBackend(CadBackend):
                             "body_index": body_index,
                             "face_index": face_index,
                             "face": face,
+                            "underlying_face": underlying_face,
                             "persistent_reference": face_reference,
                             "read_errors": native_identity_errors,
+                            "conversion": face_conversion,
                         }
                     )
                     if feature is not None:
@@ -6049,6 +6254,7 @@ class SolidWorksBackend(CadBackend):
                                 "face_index": face_index,
                                 "feature": feature,
                                 "identity": feature_identity,
+                                "conversion": face_conversion,
                             }
                         )
                     body_appearance_record["faces"].append(
