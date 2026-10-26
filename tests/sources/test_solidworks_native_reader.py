@@ -2340,7 +2340,6 @@ class AppearanceRawTests(unittest.TestCase):
         top_render_material_calls = []
         top_render_material_count_calls = []
         texture_calls = []
-        corresponding_calls = []
         document_values = [0.1, 0.2, 0.3, 0.2, 0.4, 0.5, 0.6, 0.0, 0.0]
         occurrence_values = [-1.0] * 9
         face_values = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
@@ -2375,6 +2374,7 @@ class AppearanceRawTests(unittest.TestCase):
                 lambda _quality: [0.0] * 9,
                 "material-document",
             )
+            material_face._persist_reference = face._persist_reference
             face_feature = types.SimpleNamespace(
                 Name="PaintedFace",
                 GetTypeName2=lambda: "Extrusion",
@@ -2474,8 +2474,10 @@ class AppearanceRawTests(unittest.TestCase):
                 )
                 or None
             )
-            component.GetCorrespondingEntity = (
-                lambda entity: corresponding_calls.append(entity) or face
+            component.GetCorrespondingEntity = _raiser(
+                AssertionError(
+                    "component-document appearance must stay in its owner namespace"
+                )
             )
             component.GetCorresponding = lambda entity: entity
             assembly = _write(fixture_root, "robot.SLDASM")
@@ -2685,23 +2687,14 @@ class AppearanceRawTests(unittest.TestCase):
             entity = material["entity_records"][0]
             self.assertEqual(entity["native_interface_kind"], "IEntity")
             self.assertEqual(
-                entity["source_persistent_reference"],
+                entity["persistent_reference"],
                 list(material_face._persist_reference),
             )
-            self.assertEqual(
-                entity["persistent_reference"],
-                list(face._persist_reference),
-            )
-            self.assertEqual(entity["source_read_errors"], {})
             self.assertEqual(entity["read_errors"], {})
+            self.assertIsNone(entity.get("native_identity"))
             self.assertNotIn("binding_state", entity)
             self.assertNotIn("binding_candidates", entity)
             self.assertNotIn("matched_identity", entity)
-            self.assertEqual(corresponding_calls, [material_face])
-            self.assertEqual(
-                entity["native_identity"]["context"]["api"],
-                "IComponent2.GetCorrespondingEntity",
-            )
             reference_index = component_materials["native_reference_index"]
             self.assertTrue(
                 any(
@@ -2717,12 +2710,14 @@ class AppearanceRawTests(unittest.TestCase):
                         and row["binding_context"]
                         == {
                             "owner_scope": "component_document",
-                            "owner_document_path": str(assembly),
+                            "owner_document_path": str(part),
                             "component": "arm-1",
                             "api": (
                                 "IModelDocExtension.GetPersistReference3"
                             ),
                         }
+                        and row["persistent_reference"]
+                        == list(material_face._persist_reference)
                     )
                     for row in reference_index
                 )
@@ -3253,7 +3248,7 @@ class AppearanceHelperTests(unittest.TestCase):
         )
         self.assertEqual(material_entities, [entity])
         self.assertEqual(
-            material_record["entity_records"][0]["source_read_errors"][
+            material_record["entity_records"][0]["read_errors"][
                 "persistent_reference"
             ]["code"],
             "cad_appearance_persistent_reference_missing",
@@ -3302,8 +3297,8 @@ class AppearanceHelperTests(unittest.TestCase):
         entity = record["entity_records"][0]
         self.assertEqual(entities, [document])
         self.assertEqual(entity["native_interface_kind"], "IModelDoc2")
-        self.assertIsNone(entity["source_persistent_reference"])
-        self.assertEqual(entity["source_read_errors"], {})
+        self.assertIsNone(entity["persistent_reference"])
+        self.assertEqual(entity["read_errors"], {})
         self.assertEqual(persistent_calls, [])
 
         backend = _CaptureBackend(session_factory=lambda: None)
@@ -3316,13 +3311,8 @@ class AppearanceHelperTests(unittest.TestCase):
                 document,
                 entity,
                 owner_scope="component_document",
-                primary_component=types.SimpleNamespace(),
                 component_name="arm-1",
-                binding_document_path="C:\\root.SLDASM",
-                corresponding_extension=extension,
-                owner_document_path="C:\\owner.SLDASM",
-                owner_configuration="OwnerConfig",
-                display_state="State",
+                owner_document_path="C:\\part.SLDPRT",
             )
         self.assertEqual(
             context["record"]["native_identity"]["document_path"],
@@ -3367,168 +3357,58 @@ class AppearanceHelperTests(unittest.TestCase):
         rendered = record["entity_records"][0]
         self.assertEqual(entities, [entity])
         self.assertEqual(rendered["native_interface_kind"], None)
-        self.assertIsNone(rendered["source_persistent_reference"])
+        self.assertIsNone(rendered["persistent_reference"])
         self.assertEqual(
-            rendered["source_read_errors"]["interface_query"]["code"],
+            rendered["read_errors"]["interface_query"]["code"],
             "RuntimeError",
         )
         self.assertEqual(persistent_calls, [])
 
-    def test_material_body_converts_without_face_probe(
-        self,
-    ) -> None:
-        face_reads = []
-        source_body = types.SimpleNamespace(
-            _persist_reference=b"source-body-reference",
-            GetFaces=lambda: face_reads.append(True) or [],
-        )
-        target_body = types.SimpleNamespace(
-            _persist_reference=b"target-body-reference",
-            GetFaces=lambda: face_reads.append(True) or [],
-        )
-        context = native_module.SolidWorksBackend._appearance_entity_context(
-            source_body,
-            {
-                "native_interface_kind": None,
-                "source_persistent_reference": list(
-                    source_body._persist_reference
-                ),
-                "source_read_errors": {},
-            },
-            owner_scope="component_document",
-            primary_component=types.SimpleNamespace(
-                GetCorresponding=lambda entity: target_body,
-            ),
-            component_name="arm-1",
-            binding_document_path="C:\\robot.SLDASM",
-            corresponding_extension=types.SimpleNamespace(
-                GetPersistReference3=lambda entity: list(
-                    entity._persist_reference
-                )
-            ),
-            owner_document_path="C:\\arm.SLDPRT",
-            owner_configuration="Default",
-            display_state="State",
-        )
-        self.assertEqual(
-            context["record"]["persistent_reference"],
-            list(b"target-body-reference"),
-        )
-        self.assertEqual(
-            context["record"]["native_identity"]["context"]["api"],
-            "IComponent2.GetCorresponding",
-        )
-        self.assertEqual(
-            context["record"]["native_identity"]["context"][
-                "target_reference_attempt"
-            ]["error"]["code"],
-            "cad_appearance_cross_document_reference_not_attempted",
-        )
-        self.assertEqual(face_reads, [])
-
-    def test_unknown_source_interface_does_not_use_target_reference(
-        self,
-    ) -> None:
-        entity = types.SimpleNamespace(_persist_reference=b"target-body")
-        target_reference_calls = []
-
-        def target_reference(value):
-            target_reference_calls.append(value)
-            return list(value._persist_reference)
-
-        conversion = _raiser(
-            AssertionError(
-                "an unknown source interface cannot select a conversion"
-            )
-        )
-        context = native_module.SolidWorksBackend._appearance_entity_context(
-            entity,
-            {
-                "native_interface_kind": None,
-                "source_persistent_reference": None,
-                "source_read_errors": {
-                    "interface_query": {
-                        "code": "interface_query_failed",
-                        "message": "source QI failed",
-                        "detail": None,
-                    }
-                },
-            },
-            owner_scope="component_document",
-            primary_component=types.SimpleNamespace(
-                GetCorresponding=conversion,
-                GetCorrespondingEntity=conversion,
-            ),
-            component_name="arm-1",
-            binding_document_path="C:\\robot.SLDASM",
-            corresponding_extension=types.SimpleNamespace(
-                GetPersistReference3=target_reference
-            ),
-            owner_document_path="C:\\arm.SLDPRT",
-            owner_configuration="Default",
-            display_state="State",
-        )
-        self.assertIn(
-            "interface_query",
-            context["record"]["read_errors"],
-        )
-        self.assertIsNone(context["record"]["persistent_reference"])
-        self.assertEqual(
-            context["record"]["native_identity"]["context"]["api"],
-            None,
-        )
-        self.assertEqual(target_reference_calls, [])
-
-    def test_reference_index_keeps_target_reference_after_source_qi_failure(
+    def test_reference_index_reuses_the_observed_face_reference(
         self,
     ) -> None:
         face = types.SimpleNamespace(
-            _persist_reference=b"assembly-face"
+            _persist_reference=b"part-face"
         )
         extension = types.SimpleNamespace(
-            GetPersistReference3=lambda value: list(
-                value._persist_reference
-            )
-        )
-        interface_error = RuntimeError("source IEntity QI failed")
-
-        def interface(value, iid, name):
-            if name == "IEntity":
-                return None, interface_error
-            return None, None
-
-        with patch.object(
-            native_module,
-            "_appearance_interface",
-            side_effect=interface,
-        ):
-            errors, reference_index = (
-                _CaptureBackend._appearance_reference_index(
-                    extension,
-                    owner_scope="component_document",
-                    component=types.SimpleNamespace(),
-                    component_name="arm-1",
-                    binding_document_path="C:\\robot.SLDASM",
-                    corresponding_extension=extension,
-                    holders=[],
-                    bodies=[],
-                    faces=[
-                        {
-                            "component": "arm-1",
-                            "body_type": 0,
-                            "body_index": 0,
-                            "face_index": 0,
-                            "face": face,
-                        }
-                    ],
-                    features=[],
+            GetPersistReference3=_raiser(
+                AssertionError(
+                    "the face owner reference was already observed"
                 )
             )
+        )
+        errors, reference_index = (
+            _CaptureBackend._appearance_reference_index(
+                extension,
+                owner_scope="component_document",
+                component_name="arm-1",
+                owner_document_path="C:\\arm.SLDPRT",
+                holders=[],
+                bodies=[],
+                faces=[
+                    {
+                        "component": "arm-1",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "face": face,
+                        "persistent_reference": list(b"part-face"),
+                        "read_errors": {},
+                    }
+                ],
+                features=[],
+            )
+        )
         self.assertEqual(errors, [])
         self.assertEqual(
             reference_index[0]["persistent_reference"],
-            list(b"assembly-face"),
+            list(b"part-face"),
         )
+        self.assertEqual(
+            reference_index[0]["binding_context"]["owner_document_path"],
+            "C:\\arm.SLDPRT",
+        )
+        self.assertEqual(reference_index[0]["read_errors"], {})
 
     def test_unsupported_interface_is_absence_not_a_qi_failure(self) -> None:
         entity = types.SimpleNamespace(
@@ -3563,10 +3443,10 @@ class AppearanceHelperTests(unittest.TestCase):
         rendered = record["entity_records"][0]
         self.assertIsNone(rendered["native_interface_kind"])
         self.assertEqual(
-            rendered["source_persistent_reference"],
+            rendered["persistent_reference"],
             list(entity._persist_reference),
         )
-        self.assertEqual(rendered["source_read_errors"], {})
+        self.assertEqual(rendered["read_errors"], {})
 
     def test_document_entity_identity_never_falls_back_to_owner_values(
         self,
@@ -3592,26 +3472,12 @@ class AppearanceHelperTests(unittest.TestCase):
                 document,
                 {"native_interface_kind": "IModelDoc2"},
                 owner_scope="top_assembly",
-                primary_component=None,
                 component_name="arm-1",
-                binding_document_path="C:\\owner.SLDASM",
-                corresponding_extension=None,
-                owner_document_path="C:\\owner.SLDASM",
-                owner_configuration="OwnerConfig",
-                display_state="OwnerState",
+                owner_document_path="C:\\part.SLDPRT",
             )
         identity = context["record"]["native_identity"]
         self.assertIsNone(identity["document_path"])
         self.assertIsNone(identity["active_configuration"])
-        self.assertEqual(
-            identity["owner_document_path"],
-            "C:\\owner.SLDASM",
-        )
-        self.assertEqual(
-            identity["owner_configuration"],
-            "OwnerConfig",
-        )
-        self.assertEqual(identity["owner_display_state"], "OwnerState")
         self.assertEqual(identity["state"], "error")
         self.assertEqual(
             identity["read_errors"]["document_path"]["code"],
@@ -3646,13 +3512,8 @@ class AppearanceHelperTests(unittest.TestCase):
                 document,
                 {"native_interface_kind": "IModelDoc2"},
                 owner_scope="component_document",
-                primary_component=types.SimpleNamespace(),
                 component_name="arm-1",
-                binding_document_path="C:\\robot.SLDASM",
-                corresponding_extension=types.SimpleNamespace(),
                 owner_document_path="C:\\part.SLDPRT",
-                owner_configuration="Configured",
-                display_state="State",
             )
         self.assertEqual(
             context["record"]["native_identity"]["state"],
@@ -3742,7 +3603,7 @@ class AppearanceHelperTests(unittest.TestCase):
                 "RuntimeError",
             )
 
-    def test_render_entity_context_uses_one_documented_conversion_per_kind(
+    def test_owner_entity_context_records_document_identity_without_conversion(
         self,
     ) -> None:
         backend = _CaptureBackend(session_factory=lambda: None)
@@ -3759,17 +3620,12 @@ class AppearanceHelperTests(unittest.TestCase):
                 owner_document,
                 {
                     "native_interface_kind": "IModelDoc2",
-                    "source_persistent_reference": None,
-                    "source_read_errors": {},
+                    "persistent_reference": None,
+                    "read_errors": {},
                 },
                 owner_scope="component_document",
-                primary_component=types.SimpleNamespace(),
                 component_name="arm-1",
-                binding_document_path="C:\\root.SLDASM",
-                corresponding_extension=types.SimpleNamespace(),
-                owner_document_path="C:\\owner.SLDASM",
-                owner_configuration="OwnerConfig",
-                display_state="Display State1",
+                owner_document_path="C:\\part.SLDPRT",
             )
         self.assertEqual(
             document_result["record"]["native_identity"],
@@ -3778,228 +3634,67 @@ class AppearanceHelperTests(unittest.TestCase):
                 "qi_iid": native_module.IMODELDOC2_IID,
                 "document_path": "C:\\part.SLDPRT",
                 "active_configuration": "Configured",
-                "owner_document_path": "C:\\owner.SLDASM",
-                "owner_configuration": "OwnerConfig",
-                "owner_display_state": "Display State1",
-                "binding_context": {
-                    "owner_scope": "component_document",
-                    "owner_document_path": "C:\\root.SLDASM",
-                    "component": "arm-1",
-                    "api": (
-                        "IModelDoc2.GetPathName"
-                        "+ConfigurationManager.ActiveConfiguration.Name"
-                    ),
-                },
                 "state": "observed",
                 "read_errors": {},
             },
         )
         self.assertIsNone(document_result["persistent_reference"])
 
-        part_entity = types.SimpleNamespace(
-            _persist_reference=b"part-face",
-            _fixture_interfaces={"IEntity"},
-        )
-        assembly_entity = types.SimpleNamespace(
-            _persist_reference=b"assembly-face"
-        )
-        component_calls = []
-        primary_component = types.SimpleNamespace(
-            GetCorrespondingEntity=lambda entity: component_calls.append(
-                ("entity", entity)
-            )
-            or assembly_entity,
-            GetCorresponding=_raiser(
-                AssertionError("IEntity must use GetCorrespondingEntity")
-            ),
-        )
-        direct_reference_calls = []
-
-        def corresponding_reference(entity):
-            direct_reference_calls.append(
-                entity._persist_reference
-            )
-            if entity._persist_reference in {
-                b"part-face",
-                b"part-feature",
-            }:
-                raise AssertionError(
-                    "source objects must not be queried in the target namespace"
-                )
-            return list(entity._persist_reference)
-
-        corresponding_extension = types.SimpleNamespace(
-            GetPersistReference3=corresponding_reference
-        )
-        converted = backend._appearance_entity_context(
-            part_entity,
-            {
-                "native_interface_kind": "IEntity",
-                "source_persistent_reference": list(
-                    part_entity._persist_reference
-                ),
-                "source_read_errors": {},
-            },
-            owner_scope="component_document",
-            primary_component=primary_component,
-            component_name="arm-1",
-            binding_document_path="C:\\root.SLDASM",
-            corresponding_extension=corresponding_extension,
-            owner_document_path="C:\\part.SLDPRT",
-            owner_configuration="Configured",
-            display_state="Display State1",
-        )
-        self.assertEqual(component_calls, [("entity", part_entity)])
-        self.assertEqual(
-            converted["record"]["native_identity"]["context"]["state"],
-            "observed",
-        )
-        self.assertEqual(
-            converted["record"]["native_identity"]["context"]["api"],
-            "IComponent2.GetCorrespondingEntity",
-        )
-        self.assertEqual(
-            converted["record"]["native_identity"]["context"][
-                "target_reference_attempt"
-            ]["error"]["code"],
-            "cad_appearance_cross_document_reference_not_attempted",
-        )
-        self.assertEqual(
-            converted["record"]["persistent_reference"],
-            list(assembly_entity._persist_reference),
-        )
-
         part_feature = types.SimpleNamespace(
             _persist_reference=b"part-feature"
         )
-        assembly_feature = types.SimpleNamespace(
-            _persist_reference=b"assembly-feature"
-        )
-        primary_component = types.SimpleNamespace(
-            GetCorresponding=lambda entity: (
-                assembly_feature if entity is part_feature else None
-            ),
-            GetCorrespondingEntity=_raiser(
-                AssertionError("generic object must use GetCorresponding")
-            ),
-        )
-        converted_feature = backend._appearance_entity_context(
+        owner_context = backend._appearance_entity_context(
             part_feature,
             {
                 "native_interface_kind": None,
-                "source_persistent_reference": list(
+                "persistent_reference": list(
                     part_feature._persist_reference
                 ),
-                "source_read_errors": {},
+                "read_errors": {},
             },
             owner_scope="component_document",
-            primary_component=primary_component,
             component_name="arm-1",
-            binding_document_path="C:\\root.SLDASM",
-            corresponding_extension=corresponding_extension,
             owner_document_path="C:\\part.SLDPRT",
-            owner_configuration="Configured",
-            display_state="Display State1",
         )
         self.assertEqual(
-            converted_feature["record"]["native_identity"]["context"][
-                "api"
-            ],
-            "IComponent2.GetCorresponding",
-        )
-        self.assertEqual(
-            converted_feature["record"]["persistent_reference"],
-            list(assembly_feature._persist_reference),
-        )
-        self.assertEqual(
-            direct_reference_calls,
-            [b"assembly-face", b"assembly-feature"],
+            owner_context["record"],
+            {
+                "persistent_reference": list(
+                    part_feature._persist_reference
+                ),
+                "read_errors": {},
+                "binding_context": {
+                    "owner_scope": "component_document",
+                    "owner_document_path": "C:\\part.SLDPRT",
+                    "component": "arm-1",
+                    "api": "IModelDocExtension.GetPersistReference3",
+                },
+            },
         )
 
-        primary_component = types.SimpleNamespace(
-            GetCorresponding=_raiser(
-                AssertionError(
-                    "GetCorresponding cannot run without a source reference"
-                )
-            )
-        )
-        missing_source = backend._appearance_entity_context(
+        missing_reference = backend._appearance_entity_context(
             part_feature,
             {
                 "native_interface_kind": None,
-                "source_persistent_reference": None,
-                "source_read_errors": {
+                "persistent_reference": None,
+                "read_errors": {
                     "persistent_reference": {
-                        "code": "source_reference_missing",
+                        "code": "cad_appearance_persistent_reference_missing",
                         "message": "missing",
                         "detail": None,
                     }
                 },
             },
             owner_scope="component_document",
-            primary_component=primary_component,
             component_name="arm-1",
-            binding_document_path="C:\\root.SLDASM",
-            corresponding_extension=corresponding_extension,
             owner_document_path="C:\\part.SLDPRT",
-            owner_configuration="Configured",
-            display_state="Display State1",
         )
+        self.assertIsNone(missing_reference["persistent_reference"])
         self.assertEqual(
-            missing_source["record"]["native_identity"]["context"][
-                "state"
-            ],
-            "error",
-        )
-        self.assertIsNone(
-            missing_source["record"]["persistent_reference"]
-        )
-
-        primary_component = types.SimpleNamespace(
-            GetCorresponding=_raiser(
-                AssertionError("QI failure must not call GetCorresponding")
-            ),
-            GetCorrespondingEntity=_raiser(
-                AssertionError(
-                    "QI failure must not call GetCorrespondingEntity"
-                )
-            ),
-        )
-        interface_failure = backend._appearance_entity_context(
-            part_feature,
-            {
-                "native_interface_kind": None,
-                "source_persistent_reference": list(
-                    part_feature._persist_reference
-                ),
-                "source_read_errors": {
-                    "interface_query": {
-                        "code": "interface_query_failed",
-                        "message": "QI failed",
-                        "detail": None,
-                    }
-                },
-            },
-            owner_scope="component_document",
-            primary_component=primary_component,
-            component_name="arm-1",
-            binding_document_path="C:\\root.SLDASM",
-            corresponding_extension=corresponding_extension,
-            owner_document_path="C:\\part.SLDPRT",
-            owner_configuration="Configured",
-            display_state="Display State 1",
-        )
-        self.assertEqual(
-            interface_failure["record"]["native_identity"]["context"][
-                "state"
-            ],
-            "error",
-        )
-        self.assertEqual(
-            interface_failure["record"]["read_errors"][
-                "interface_query"
+            missing_reference["record"]["read_errors"][
+                "persistent_reference"
             ]["code"],
-            "interface_query_failed",
+            "cad_appearance_persistent_reference_missing",
         )
 
     def test_state_unavailable_owner_record_is_explicit(self) -> None:
@@ -4108,6 +3803,347 @@ class AppearanceHelperTests(unittest.TestCase):
 
 
 class AppearanceOwnerResolutionTests(unittest.TestCase):
+    def test_component_materials_join_the_part_owner_reference_namespace(
+        self,
+    ) -> None:
+        face_zero = types.SimpleNamespace(
+            _persist_reference=b"part-face-zero",
+            _fixture_interfaces={"IEntity"},
+        )
+        face_one = types.SimpleNamespace(
+            _persist_reference=b"part-face-one",
+            _fixture_interfaces={"IEntity"},
+        )
+        material = types.SimpleNamespace(
+            GetLinkedDisplayStates=lambda: ["LeafState"],
+            GetEntities=lambda: [face_zero, face_one],
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        feature = types.SimpleNamespace(
+            _persist_reference=b"part-feature"
+        )
+        owner_reference_reads = []
+
+        def read_owner_reference(entity):
+            owner_reference_reads.append(entity)
+            return list(entity._persist_reference)
+
+        leaf_extension = types.SimpleNamespace(
+            GetRenderMaterialsCount2=lambda _option, _names: 1,
+            GetRenderMaterials2=lambda _option, _names: [material],
+            GetPersistReference3=read_owner_reference,
+        )
+        parent_reference_calls = []
+
+        def constant_parent_reference(entity):
+            parent_reference_calls.append(entity)
+            return list(b"constant-component-reference")
+
+        parent_extension = types.SimpleNamespace(
+            GetRenderMaterialsCount2=lambda _option, _names: 0,
+            GetRenderMaterials2=lambda _option, _names: [],
+            GetPersistReference3=constant_parent_reference,
+        )
+        top_extension = types.SimpleNamespace(
+            GetRenderMaterialsCount2=lambda _option, _names: 0,
+            GetRenderMaterials2=lambda _option, _names: [],
+            GetPersistReference3=constant_parent_reference,
+        )
+        leaf_document = types.SimpleNamespace(
+            Extension=leaf_extension,
+            GetPathName=lambda: "C:\\leaf.SLDPRT",
+        )
+        parent_document = types.SimpleNamespace(
+            Extension=parent_extension,
+            GetPathName=lambda: "C:\\parent.SLDASM",
+        )
+        top_document = types.SimpleNamespace(
+            Extension=top_extension,
+            GetPathName=lambda: "C:\\root.SLDASM",
+        )
+
+        def owner(document, path, scope, state):
+            return {
+                "document_path": path,
+                "owner_scope": scope,
+                "document": document,
+                "configuration": "Default",
+                "display_state": state,
+                "display_state_error": None,
+                "display_states": (
+                    [state] if scope == "top_assembly" else None
+                ),
+                "display_states_state": (
+                    "observed"
+                    if scope == "top_assembly"
+                    else "not_applicable"
+                ),
+                "owner_error": None,
+            }
+
+        owner_rows = [
+            owner(top_document, "C:\\root.SLDASM", "top_assembly", "Top"),
+            owner(
+                parent_document,
+                "C:\\parent.SLDASM",
+                "parent_assembly",
+                "Parent",
+            ),
+            owner(
+                leaf_document,
+                "C:\\leaf.SLDPRT",
+                "component_document",
+                "LeafState",
+            ),
+        ]
+        holder = types.SimpleNamespace(
+            GetCorrespondingEntity=_raiser(
+                AssertionError("component-document objects must not be converted")
+            ),
+            GetCorresponding=_raiser(
+                AssertionError("component-document objects must not be converted")
+            ),
+        )
+        backend = _CaptureBackend(session_factory=lambda: None)
+        with _com_stubs(), patch.object(
+            backend,
+            "_appearance_owner_rows",
+            return_value=(owner_rows, ["sub-1"]),
+        ):
+            records = backend._capture_state_render_materials(
+                component="sub-1/leaf-1",
+                holder=holder,
+                current={"sub-1": holder},
+                leaf_document=leaf_document,
+                source_configuration="Default",
+                leaf_display_state="LeafState",
+                leaf_display_state_error=None,
+                bodies=[],
+                faces=[
+                    {
+                        "component": "sub-1/leaf-1",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "face": face_zero,
+                        "persistent_reference": list(
+                            face_zero._persist_reference
+                        ),
+                        "read_errors": {},
+                    },
+                    {
+                        "component": "sub-1/leaf-1",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 1,
+                        "face": face_one,
+                        "persistent_reference": list(
+                            face_one._persist_reference
+                        ),
+                        "read_errors": {},
+                    },
+                ],
+                features=[
+                    {
+                        "component": "sub-1/leaf-1",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": face_index,
+                        "feature": feature,
+                        "identity": {
+                            "name": "Board-Extrude1",
+                            "type_name": "Extrusion",
+                            "persistent_reference": list(
+                                feature._persist_reference
+                            ),
+                            "read_errors": {},
+                        },
+                    }
+                    for face_index in (0, 1)
+                ],
+                cache={},
+            )
+
+        leaf_record = records[-1]
+        entities = leaf_record["materials"][0]["entity_records"]
+        self.assertEqual(
+            [row["persistent_reference"] for row in entities],
+            [list(b"part-face-zero"), list(b"part-face-one")],
+        )
+        indexed = {
+            row["target"]["face_index"]: row
+            for row in leaf_record["native_reference_index"]
+            if row["target"]["kind"] == "face"
+        }
+        self.assertEqual(
+            {
+                index: row["persistent_reference"]
+                for index, row in indexed.items()
+            },
+            {0: list(b"part-face-zero"), 1: list(b"part-face-one")},
+        )
+        self.assertTrue(
+            all(
+                row["binding_context"]["owner_document_path"]
+                == "C:\\leaf.SLDPRT"
+                for row in (*entities, *indexed.values())
+            )
+        )
+        self.assertEqual(parent_reference_calls, [])
+        self.assertEqual(owner_reference_reads, [face_zero, face_one])
+        self.assertEqual(leaf_record["mapping_errors"], [])
+
+    def test_assembly_owned_material_uses_the_assembly_owner_reference(
+        self,
+    ) -> None:
+        unexpected_face = types.SimpleNamespace(
+            _persist_reference=b"part-face",
+            _fixture_interfaces={"IEntity"},
+        )
+        holder = types.SimpleNamespace(
+            _persist_reference=b"top-occurrence",
+            GetCorrespondingEntity=_raiser(
+                AssertionError("assembly-owned objects must not be converted")
+            ),
+            GetCorresponding=_raiser(
+                AssertionError("assembly-owned objects must not be converted")
+            ),
+        )
+        material = types.SimpleNamespace(
+            GetLinkedDisplayStates=lambda: ["TopState"],
+            GetEntities=lambda: [holder],
+            PrimaryColor=0x000000FF,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        top_extension = types.SimpleNamespace(
+            GetRenderMaterialsCount2=lambda _option, _names: 1,
+            GetRenderMaterials2=lambda _option, _names: [material],
+            GetPersistReference3=lambda entity: list(
+                entity._persist_reference
+            ),
+        )
+        empty_extension = types.SimpleNamespace(
+            GetRenderMaterialsCount2=lambda _option, _names: 0,
+            GetRenderMaterials2=lambda _option, _names: [],
+            GetPersistReference3=_raiser(
+                AssertionError("empty assembly owners must not read references")
+            ),
+        )
+        top_document = types.SimpleNamespace(
+            Extension=top_extension,
+            GetPathName=lambda: "C:\\root.SLDASM",
+        )
+        parent_document = types.SimpleNamespace(
+            Extension=empty_extension,
+            GetPathName=lambda: "C:\\parent.SLDASM",
+        )
+        leaf_document = types.SimpleNamespace(
+            Extension=empty_extension,
+            GetPathName=lambda: "C:\\leaf.SLDPRT",
+        )
+
+        def owner(document, path, scope, state):
+            return {
+                "document_path": path,
+                "owner_scope": scope,
+                "document": document,
+                "configuration": "Default",
+                "display_state": state,
+                "display_state_error": None,
+                "display_states": (
+                    [state] if scope == "top_assembly" else None
+                ),
+                "display_states_state": (
+                    "observed"
+                    if scope == "top_assembly"
+                    else "not_applicable"
+                ),
+                "owner_error": None,
+            }
+
+        owner_rows = [
+            owner(top_document, "C:\\root.SLDASM", "top_assembly", "TopState"),
+            owner(
+                parent_document,
+                "C:\\parent.SLDASM",
+                "parent_assembly",
+                "ParentState",
+            ),
+            owner(
+                leaf_document,
+                "C:\\leaf.SLDPRT",
+                "component_document",
+                "LeafState",
+            ),
+        ]
+        backend = _CaptureBackend(session_factory=lambda: None)
+        with _com_stubs(), patch.object(
+            backend,
+            "_appearance_owner_rows",
+            return_value=(owner_rows, []),
+        ):
+            records = backend._capture_state_render_materials(
+                component="component-1",
+                holder=holder,
+                current={"component-1": holder},
+                leaf_document=leaf_document,
+                source_configuration="Default",
+                leaf_display_state="LeafState",
+                leaf_display_state_error=None,
+                bodies=[],
+                faces=[
+                    {
+                        "component": "component-1",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "face": unexpected_face,
+                        "persistent_reference": list(
+                            unexpected_face._persist_reference
+                        ),
+                        "read_errors": {},
+                    }
+                ],
+                features=[],
+                cache={},
+            )
+
+        top_record = records[0]
+        entity = top_record["materials"][0]["entity_records"][0]
+        occurrence = top_record["native_reference_index"][0]
+        self.assertEqual(
+            entity["persistent_reference"],
+            list(b"top-occurrence"),
+        )
+        self.assertEqual(
+            occurrence["persistent_reference"],
+            entity["persistent_reference"],
+        )
+        self.assertEqual(
+            entity["binding_context"],
+            occurrence["binding_context"],
+        )
+        self.assertEqual(
+            entity["binding_context"]["owner_scope"],
+            "top_assembly",
+        )
+        self.assertEqual(occurrence["target"]["kind"], "occurrence")
+        self.assertEqual(
+            {
+                row["target"]["kind"]
+                for row in top_record["native_reference_index"]
+            },
+            {"occurrence"},
+        )
+        self.assertEqual(top_record["mapping_errors"], [])
+
     def test_one_feature_identity_keeps_all_of_its_face_associations(
         self,
     ) -> None:
@@ -4118,12 +4154,11 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             _persist_reference=b"feature"
         )
         extension = types.SimpleNamespace(
-            GetPersistReference3=lambda entity: list(
-                entity._persist_reference
+            GetPersistReference3=_raiser(
+                AssertionError(
+                    "the feature owner reference was already observed"
+                )
             )
-        )
-        component = types.SimpleNamespace(
-            GetCorresponding=lambda entity: feature
         )
         feature_rows = [
             {
@@ -4140,6 +4175,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                     "persistent_reference": list(
                         feature._persist_reference
                     ),
+                    "read_errors": {},
                 },
             }
             for face_index in range(2)
@@ -4148,10 +4184,8 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             _CaptureBackend._appearance_reference_index(
                 extension,
                 owner_scope="component_document",
-                component=component,
                 component_name="arm-1",
-                binding_document_path="C:\\robot.SLDASM",
-                corresponding_extension=extension,
+                owner_document_path="C:\\arm.SLDPRT",
                 holders=[],
                 bodies=[],
                 faces=[],
@@ -4160,6 +4194,14 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         )
         self.assertEqual(errors, [])
         self.assertEqual(len(reference_index), 1)
+        self.assertEqual(
+            reference_index[0]["persistent_reference"],
+            list(b"feature"),
+        )
+        self.assertEqual(
+            reference_index[0]["binding_context"]["owner_document_path"],
+            "C:\\arm.SLDPRT",
+        )
         self.assertEqual(
             reference_index[0]["target"]["faces"],
             [
@@ -4177,20 +4219,11 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         second = types.SimpleNamespace(
             _persist_reference=b"shared-feature-reference"
         )
-        assembly_first = types.SimpleNamespace(
-            _persist_reference=b"shared-assembly-reference"
-        )
-        assembly_second = types.SimpleNamespace(
-            _persist_reference=b"shared-assembly-reference"
-        )
         extension = types.SimpleNamespace(
-            GetPersistReference3=lambda entity: list(
-                entity._persist_reference
-            )
-        )
-        component = types.SimpleNamespace(
-            GetCorresponding=lambda entity: (
-                assembly_first if entity is first else assembly_second
+            GetPersistReference3=_raiser(
+                AssertionError(
+                    "the feature owner reference was already observed"
+                )
             )
         )
         feature_rows = [
@@ -4206,6 +4239,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                     "persistent_reference": list(
                         feature._persist_reference
                     ),
+                    "read_errors": {},
                 },
             }
             for index, (feature, name) in enumerate(
@@ -4216,10 +4250,8 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             _CaptureBackend._appearance_reference_index(
                 extension,
                 owner_scope="component_document",
-                component=component,
                 component_name="arm-1",
-                binding_document_path="C:\\robot.SLDASM",
-                corresponding_extension=extension,
+                owner_document_path="C:\\arm.SLDPRT",
                 holders=[],
                 bodies=[],
                 faces=[],
@@ -4228,6 +4260,13 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         )
         self.assertEqual(len(reference_index), 2)
         self.assertEqual(
+            {
+                tuple(row["persistent_reference"])
+                for row in reference_index
+            },
+            {tuple(b"shared-feature-reference")},
+        )
+        self.assertEqual(
             [
                 row["target"]["name"]
                 for row in reference_index
@@ -4235,15 +4274,88 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             ["First", "Second"],
         )
 
-    def test_component_entity_conversion_uses_immediate_parent_extension(
+    def test_feature_group_preserves_footprint_when_one_identity_read_fails(
+        self,
+    ) -> None:
+        first = types.SimpleNamespace(
+            _persist_reference=b"shared-feature-reference"
+        )
+        second = types.SimpleNamespace(
+            _persist_reference=b"shared-feature-reference"
+        )
+        feature_rows = [
+            {
+                "component": "arm-1",
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": 0,
+                "feature": first,
+                "identity": {
+                    "name": None,
+                    "type_name": "Extrusion",
+                    "persistent_reference": list(
+                        first._persist_reference
+                    ),
+                    "read_errors": {
+                        "name": {
+                            "code": "cad_member_missing",
+                            "message": "missing",
+                            "detail": {},
+                        }
+                    },
+                },
+            },
+            {
+                "component": "arm-1",
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": 1,
+                "feature": second,
+                "identity": {
+                    "name": "Extrude",
+                    "type_name": "Extrusion",
+                    "persistent_reference": list(
+                        second._persist_reference
+                    ),
+                    "read_errors": {},
+                },
+            },
+        ]
+        errors, reference_index = (
+            _CaptureBackend._appearance_reference_index(
+                types.SimpleNamespace(
+                    GetPersistReference3=_raiser(
+                        AssertionError(
+                            "feature references must be reused"
+                        )
+                    )
+                ),
+                owner_scope="component_document",
+                component_name="arm-1",
+                owner_document_path="C:\\arm.SLDPRT",
+                holders=[],
+                bodies=[],
+                faces=[],
+                features=feature_rows,
+            )
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(reference_index), 1)
+        self.assertEqual(
+            reference_index[0]["target"]["faces"],
+            [
+                {"body_type": 0, "body_index": 0, "face_index": 0},
+                {"body_type": 0, "body_index": 0, "face_index": 1},
+            ],
+        )
+        self.assertIn("faces", reference_index[0]["read_errors"])
+
+    def test_component_document_materials_and_index_use_one_owner_extension(
         self,
     ) -> None:
         source_face = types.SimpleNamespace(
             _persist_reference=b"leaf-face",
             _fixture_interfaces={"IEntity"},
-        )
-        assembly_face = types.SimpleNamespace(
-            _persist_reference=b"parent-face"
         )
         material = types.SimpleNamespace(
             GetLinkedDisplayStates=lambda: ["LeafState"],
@@ -4261,17 +4373,12 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 entity._persist_reference
             ),
         )
-        parent_reference_calls = []
-        def parent_reference(entity):
-            parent_reference_calls.append(entity)
-            if entity is source_face:
-                raise RuntimeError(
-                    "document entity has no parent-context reference"
-                )
-            return list(entity._persist_reference)
-
         parent_extension = types.SimpleNamespace(
-            GetPersistReference3=parent_reference
+            GetPersistReference3=_raiser(
+                AssertionError(
+                    "component-document objects must not use the parent namespace"
+                )
+            )
         )
         top_extension = types.SimpleNamespace(
             GetPersistReference3=_raiser(
@@ -4321,7 +4428,11 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         ]
         parent_component = types.SimpleNamespace()
         holder = types.SimpleNamespace(
-            GetCorrespondingEntity=lambda entity: assembly_face
+            GetCorrespondingEntity=_raiser(
+                AssertionError(
+                    "component-document objects must not be converted"
+                )
+            )
         )
         backend = _CaptureBackend(session_factory=lambda: None)
         with _com_stubs(), patch.object(
@@ -4338,30 +4449,43 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 leaf_display_state="LeafState",
                 leaf_display_state_error=None,
                 bodies=[],
-                faces=[],
+                faces=[
+                    {
+                        "component": "sub-1/leaf-1",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "face": source_face,
+                        "persistent_reference": list(
+                            source_face._persist_reference
+                        ),
+                        "read_errors": {},
+                    }
+                ],
                 features=[],
                 cache={},
             )
 
         leaf_record = records[-1]
         entity = leaf_record["materials"][0]["entity_records"][0]
-        self.assertEqual(
-            leaf_record["corresponding_owner_document_path"],
-            "C:\\parent.SLDASM",
-        )
-        self.assertEqual(entity["source_persistent_reference"], list(b"leaf-face"))
-        self.assertEqual(entity["persistent_reference"], list(b"parent-face"))
-        self.assertEqual(
-            entity["native_identity"]["context"]["api"],
-            "IComponent2.GetCorrespondingEntity",
-        )
+        self.assertEqual(entity["persistent_reference"], list(b"leaf-face"))
         self.assertEqual(
             entity["binding_context"]["owner_document_path"],
-            "C:\\parent.SLDASM",
+            "C:\\leaf.SLDPRT",
+        )
+        self.assertIsNone(entity.get("native_identity"))
+        face_index = next(
+            row
+            for row in leaf_record["native_reference_index"]
+            if row["target"]["kind"] == "face"
         )
         self.assertEqual(
-            parent_reference_calls,
-            [assembly_face],
+            face_index["persistent_reference"],
+            entity["persistent_reference"],
+        )
+        self.assertEqual(
+            face_index["binding_context"],
+            entity["binding_context"],
         )
 
     def test_top_parent_and_leaf_use_their_own_configuration_and_state(self) -> None:
@@ -4501,7 +4625,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             _fixture_interfaces={"IEntity"},
         )
         face_b = types.SimpleNamespace(
-            _persist_reference=b"face-b",
+            _persist_reference=b"face-a",
             _fixture_interfaces={"IEntity"},
         )
         failing_face = types.SimpleNamespace(
@@ -4515,12 +4639,6 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         invalid_reference_face = types.SimpleNamespace(
             _persist_reference=b"face-invalid",
             _fixture_interfaces={"IEntity"},
-        )
-        assembly_face_a = types.SimpleNamespace(
-            _persist_reference=b"assembly-face-a"
-        )
-        assembly_face_b = types.SimpleNamespace(
-            _persist_reference=b"assembly-face-b"
         )
         material = types.SimpleNamespace(
             GetLinkedDisplayStates=lambda: ["SharedState"],
@@ -4551,24 +4669,12 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         )
         extension.GetRenderMaterialsCount2 = lambda _option, _names: 1
         owner_document = types.SimpleNamespace(Extension=extension)
-        source_faces = (
-            face_a,
-            alias_face_a,
-            face_b,
-            failing_face,
-            null_reference_face,
-            invalid_reference_face,
-        )
-
-        def context_reference(entity):
-            if any(entity is source for source in source_faces):
-                raise RuntimeError(
-                    "document entity has no assembly-context reference"
-                )
-            return list(entity._persist_reference)
-
         context_extension = types.SimpleNamespace(
-            GetPersistReference3=context_reference
+            GetPersistReference3=_raiser(
+                AssertionError(
+                    "component-document objects must not use assembly references"
+                )
+            )
         )
         top_document = types.SimpleNamespace(
             Extension=context_extension
@@ -4596,21 +4702,15 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             "owner_error": None,
         }
 
-        def corresponding_a(entity):
-            if entity is face_a or entity is alias_face_a:
-                return assembly_face_a
-            raise RuntimeError("unexpected component-a entity")
-
-        def corresponding_b(entity):
-            if entity is face_a or entity is face_b:
-                return assembly_face_b
-            raise RuntimeError("unexpected component-b entity")
-
         holder_a = types.SimpleNamespace(
-            GetCorrespondingEntity=corresponding_a
+            GetCorrespondingEntity=_raiser(
+                AssertionError("component-document objects must not be converted")
+            )
         )
         holder_b = types.SimpleNamespace(
-            GetCorrespondingEntity=corresponding_b
+            GetCorrespondingEntity=_raiser(
+                AssertionError("component-document objects must not be converted")
+            )
         )
         backend = _CaptureBackend(session_factory=lambda: None)
         cache = {}
@@ -4638,6 +4738,10 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_index": 0,
                         "face_index": 0,
                         "face": face_a,
+                        "persistent_reference": list(
+                            face_a._persist_reference
+                        ),
+                        "read_errors": {},
                     },
                     {
                         "component": "component-a",
@@ -4645,6 +4749,10 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_index": 0,
                         "face_index": 1,
                         "face": alias_face_a,
+                        "persistent_reference": list(
+                            alias_face_a._persist_reference
+                        ),
+                        "read_errors": {},
                     },
                 ],
                 features=[],
@@ -4666,6 +4774,10 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_index": 0,
                         "face_index": 0,
                         "face": face_b,
+                        "persistent_reference": list(
+                            face_b._persist_reference
+                        ),
+                        "read_errors": {},
                     },
                     {
                         "component": "component-b",
@@ -4673,6 +4785,14 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_index": 0,
                         "face_index": 1,
                         "face": failing_face,
+                        "persistent_reference": None,
+                        "read_errors": {
+                            "persistent_reference": {
+                                "code": "RuntimeError",
+                                "message": "persistent reference failed",
+                                "detail": None,
+                            }
+                        },
                     },
                     {
                         "component": "component-b",
@@ -4680,6 +4800,16 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_index": 0,
                         "face_index": 2,
                         "face": null_reference_face,
+                        "persistent_reference": None,
+                        "read_errors": {
+                            "persistent_reference": {
+                                "code": (
+                                    "cad_appearance_persistent_reference_missing"
+                                ),
+                                "message": "missing",
+                                "detail": None,
+                            }
+                        },
                     },
                     {
                         "component": "component-b",
@@ -4687,6 +4817,16 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_index": 0,
                         "face_index": 3,
                         "face": invalid_reference_face,
+                        "persistent_reference": [1, 300],
+                        "read_errors": {
+                            "persistent_reference": {
+                                "code": (
+                                    "cad_appearance_persistent_reference_invalid"
+                                ),
+                                "message": "invalid",
+                                "detail": None,
+                            }
+                        },
                     },
                 ],
                 features=[],
@@ -4749,6 +4889,16 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 "cad_appearance_persistent_reference_missing",
                 "cad_appearance_persistent_reference_invalid",
             ],
+        )
+        self.assertTrue(
+            all(
+                row["owner_scope"] == "component_document"
+                and row["owner_document_path"] == "C:\\shared.SLDPRT"
+                and row["component"] == "component-b"
+                and row["target_kind"] == "face"
+                and row["native_interface_kind"] == "IEntity"
+                for row in second[1]["mapping_errors"]
+            )
         )
 
 

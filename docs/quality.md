@@ -43,16 +43,21 @@ typed display-state 参数下的 `GetRenderMaterialsCount2` 分开保存。只�
 exact-state 总数确证为 0 时才可证明没有 state render assignment；非零或未知总数下的
 NULL 仍是未解析事实，present rows 的基数必须与总数一致。
 
-state material 的原生对象绑定由 entity persistent reference、同一 owner/context 的
-`native_reference_index` 独立 join，不能信任 Source 预填的 `matched_identity`。document
-target 必须保留并核验 `IModelDoc2` QI、path、active configuration 与 leaf owner；assembly
-context 只接受已证明方向的 `IComponent2.GetCorresponding` / `GetCorrespondingEntity`。
-同一 occurrence 内的 material 优先级固定为 `face > feature > body > part document`；
-document target 表示 part 材质，不能无条件提升为 assembly occurrence override。真实
-assembly occurrence override 仍优先于上述 part 内层级。
-同一 feature identity 可拥有多个 `faces[]`，不同 identity 共享 reference 仍为未知。
-没有索引或索引失败的 entity 视为未知；只有成功的原生 context 明确指向当前交付 scope
-外对象时才能忽略。
+state material 的 entity 与同次几何遍历的 `native_reference_index` 以 material 实际
+owner document 的 persistent reference、exact occurrence、配置与显示状态独立 join。
+`component_document` 的 material 与 index 都直接读取真实 Part owner extension；不得把
+同一对象转换到父装配后形成的 component alias 当成 Part 身份，也不保留第二套引用作备用
+匹配。按官方外观层级，assembly-owned material 使用实际 assembly owner 中的组件实例；
+face、feature、body 和 part assignment 使用 Part owner。assembly 材质指向非 occurrence
+target 时明确拒绝，不转换、提升或猜测其作用域。document target 必须核验 `IModelDoc2`
+QI、path、active configuration 与 leaf owner。Generate 与 Verify 分别从原始事实执行该
+join，不信任 Source 预填匹配。参与对象绑定的 owner key 无法命中，或命中 target 仍带有
+该对象/feature footprint 的 mapping 或 identity 错误时失败；只有已证明不同的 target、
+exact Count=0 owner 或 exact document proof 可忽略辅助诊断。同一 occurrence 内的 material
+优先级固定为 `face > feature > body > part document`；document target 表示 part 材质，
+不能无条件提升为 assembly occurrence override。真实 assembly occurrence override 仍优先
+于上述 part 内层级。同一 feature identity 可拥有多个面的完整 `faces[]`；重复记录的
+footprint 不一致、不同 identity 共享 reference 或对象/覆盖被并集扩张均为未知并失败。
 Generate 与 Verify 分别执行该 join，并按交付 face 的 triangle span 无损分组为多个
 visual/material；alpha 从原生 index 7 的透明度派生并显示来源 warning。当前没有资产、
 UV 和绑定消费能力的 present texture、对象/配置错绑或冲突必须失败，不输出默认色，

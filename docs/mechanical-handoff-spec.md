@@ -166,11 +166,16 @@ parent 和 component-document owner 分别保留自己的 configuration/display-
 `native_reference_index`、实体 binding context、document QI、feature face footprint 和
 纹理事实分别封存。只有成功读取的 exact-state 总数确证为 0 时，NULL 才可证明没有
 state render assignment；present rows 的基数必须与总数一致。Generate 与 Verify 必须从
-entity reference 与同一 owner/context 索引独立 join，不信任 Source 预填匹配；document
-target 必须核验 `IModelDoc2` QI、path 与 active configuration，feature 的多 face 只在
-同一 native feature identity 下合法。part 内材质优先级为 `face > feature > body >
-part document`；document target 只表示 part 材质，不能提升为 assembly occurrence
-override。真实 assembly occurrence override 仍高于该 part 内层级。
+material 实际 owner document 的 persistent reference、exact occurrence、配置与显示状态，
+与同一 owner 的索引独立 join，不信任 Source 预填匹配。`component_document` 的 material
+与 index 都直接读取真实 Part owner extension，不转换到父装配别名。按官方外观层级，
+assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
+part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不
+转换、提升或猜测其作用域。document target 必须核验 `IModelDoc2` QI、path 与 active
+configuration。part 内材质优先级为 `face > feature > body > part document`；document
+target 只表示 part 材质，不能提升为 assembly occurrence override。真实 assembly
+occurrence override 仍高于该 part 内层级。同一 native feature identity 可有多个面的完整
+footprint；重复 footprint 冲突或不同 identity 共享 reference 时不得并集扩张。
 
 最终表示按实际交付 face 的 triangle spans 生成一个或多个 visual/material；alpha 从原生
 透明度派生并保留来源 warning。`PrimaryColor` 按版本化 COLORREF 规则从低到高解码 RGB，
@@ -178,9 +183,9 @@ alpha 为 `1-transparency`。present texture 缺少资产、UV 或绑定消费�
 以及未证明冲突必须失败。只有已证明的 leaf model document target、exact linked
 display-state ColorForm-one 单色 material、空 `TextureFilename`/`SurfaceFinishFile` 和
 完整 face coverage 同时成立时，旧 config-wide `GetTexture` pointer 才可作为非参与诊断
-保留；`MaterialName=""` 本身不表示 absence。与交付无关且由成功原生 context 证明在
-scope 外的辅助事实可以保留，不为所有辅助错误另设全阻断门；不以默认色、伪造 empty、
-预填 effective 值或 warning 代替颜色与纹理资格。
+保留；`MaterialName=""` 本身不表示 absence。与交付无关的辅助事实和 mapping 诊断可以
+保留，不为所有辅助错误另设全阻断门；实际参与对象的 owner key 不能唯一命中时仍须拒绝。
+不以默认色、伪造 empty、预填 effective 值或 warning 代替颜色与纹理资格。
 
 覆盖质量、COM 或惯量必须有可信来源、范围、配置、参考点、轴和单位；不向运动链接分摊父级覆盖。完整张量保留非对角项，不混用原点与质心惯量。平台按[质量规范](quality.md#physics)读取、转换与独立核验，工程师不抄写张量。
 

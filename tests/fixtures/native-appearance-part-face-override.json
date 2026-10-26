@@ -174,10 +174,11 @@
               {
                 "entity_index": 0,
                 "native_object_type": "IModelDoc2",
+                "native_interface_kind": "IModelDoc2",
                 "persistent_reference": null,
                 "binding_context": {
                   "owner_scope": "component_document",
-                  "owner_document_path": "C:\\capture\\parent.SLDASM",
+                  "owner_document_path": "C:\\capture\\arm.SLDPRT",
                   "component": "arm-1",
                   "api": "IModelDoc2.GetPathName+ConfigurationManager.ActiveConfiguration.Name"
                 },
@@ -186,9 +187,6 @@
                   "qi_iid": "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}",
                   "document_path": "C:\\capture\\arm.SLDPRT",
                   "active_configuration": "Painted",
-                  "owner_document_path": "C:\\capture\\arm.SLDPRT",
-                  "owner_configuration": "Painted",
-                  "owner_display_state": "Display State 1",
                   "state": "observed",
                   "read_errors": {}
                 },
@@ -215,57 +213,17 @@
               {
                 "entity_index": 0,
                 "native_object_type": "IFace2",
+                "native_interface_kind": "IEntity",
                 "persistent_reference": [
-                  11,
-                  12,
-                  13
-                ],
-                "source_persistent_reference": [
                   1,
                   2,
                   3
                 ],
-                "source_read_errors": {},
                 "binding_context": {
                   "owner_scope": "component_document",
-                  "owner_document_path": "C:\\capture\\parent.SLDASM",
-                  "component": "arm-1",
-                  "api": "IComponent2.GetCorrespondingEntity"
-                },
-                "native_identity": {
-                  "kind": "entity",
                   "owner_document_path": "C:\\capture\\arm.SLDPRT",
-                  "owner_configuration": "Painted",
-                  "owner_display_state": "Display State 1",
-                  "binding_context": {
-                    "owner_scope": "component_document",
-                    "owner_document_path": "C:\\capture\\parent.SLDASM",
-                    "component": "arm-1",
-                    "api": "IComponent2.GetCorrespondingEntity"
-                  },
-                  "context": {
-                    "owner_scope": "component_document",
-                    "input_kind": "IEntity",
-                    "api": "IComponent2.GetCorrespondingEntity",
-                    "persistent_reference": [
-                      11,
-                      12,
-                      13
-                    ],
-                    "target_reference_attempt": {
-                      "api": "IModelDocExtension.GetPersistReference3",
-                      "persistent_reference": null,
-                      "error": {
-                        "code": "cad_appearance_persistent_reference_missing",
-                        "message": "the apparent owner reference is unavailable",
-                        "detail": {}
-                      }
-                    },
-                    "state": "observed",
-                    "read_errors": {}
-                  },
-                  "state": "observed",
-                  "read_errors": {}
+                  "component": "arm-1",
+                  "api": "IModelDocExtension.GetPersistReference3"
                 },
                 "read_errors": {}
               }
@@ -282,15 +240,17 @@
         "native_reference_index": [
           {
             "persistent_reference": [
-              11,
-              12,
-              13
+              1,
+              2,
+              3
             ],
+            "native_interface_kind": "IEntity",
+            "read_errors": {},
             "binding_context": {
               "owner_scope": "component_document",
-              "owner_document_path": "C:\\capture\\parent.SLDASM",
+              "owner_document_path": "C:\\capture\\arm.SLDPRT",
               "component": "arm-1",
-              "api": "IComponent2.GetCorrespondingEntity"
+              "api": "IModelDocExtension.GetPersistReference3"
             },
             "target": {
               "kind": "face",

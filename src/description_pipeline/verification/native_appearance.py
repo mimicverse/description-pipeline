@@ -23,8 +23,6 @@ DOCUMENT_BINDING_API = (
     "IModelDoc2.GetPathName"
     "+ConfigurationManager.ActiveConfiguration.Name"
 )
-COMPONENT_ENTITY_BINDING_API = "IComponent2.GetCorrespondingEntity"
-COMPONENT_OBJECT_BINDING_API = "IComponent2.GetCorresponding"
 OWNER_CONTEXT_BINDING_API = "IModelDocExtension.GetPersistReference3"
 APPEARANCE_SCOPE_ORDER = (
     "occurrence",
@@ -99,6 +97,7 @@ def _unique_current_targets(targets: Sequence[Mapping], *, component: str):
         if target_component != component:
             continue
         kind = target["kind"]
+        footprint = None
         if kind == "occurrence":
             identity = ("occurrence", component, 0, 0, 0)
         elif kind == "feature":
@@ -126,6 +125,16 @@ def _unique_current_targets(targets: Sequence[Mapping], *, component: str):
                 0,
                 feature_identity,
             )
+            footprint = tuple(
+                sorted(
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        face["face_index"],
+                    )
+                    for face in target["faces"]
+                )
+            )
         else:
             face_key = _face_key(
                 target.get("body_type"),
@@ -139,8 +148,191 @@ def _unique_current_targets(targets: Sequence[Mapping], *, component: str):
                 face_key[1],
                 face_key[2],
             )
-        current.setdefault(identity, target)
+        if identity in current:
+            if footprint is not None:
+                previous = current[identity]
+                previous_footprint = tuple(
+                    sorted(
+                        (
+                            face["body_type"],
+                            face["body_index"],
+                            face["face_index"],
+                        )
+                        for face in previous["faces"]
+                    )
+                )
+                _require(
+                    previous_footprint == footprint,
+                    "One native feature identity carries conflicting face footprints",
+                )
+            continue
+        current[identity] = target
     return current
+
+
+def _mapping_errors_for_targets(
+    mapping_errors: Sequence[object],
+    targets: Mapping[tuple[Any, ...], Mapping],
+    *,
+    owner_scope: str,
+    owner_document_path: str,
+    component: str,
+) -> list[object]:
+    def complete_face(value: object) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and type(value.get("body_type")) is int
+            and value["body_type"] in (0, 1)
+            and type(value.get("body_index")) is int
+            and value["body_index"] >= 0
+            and type(value.get("face_index")) is int
+            and value["face_index"] >= 0
+        )
+
+    applicable = []
+    for error in mapping_errors:
+        if not isinstance(error, Mapping) or not isinstance(
+            error.get("identity"), Mapping
+        ):
+            applicable.append(error)
+            continue
+        error_document_path = _document_path_key(
+            error.get("owner_document_path")
+        )
+        if (
+            not isinstance(error.get("owner_scope"), str)
+            or not error["owner_scope"]
+            or not isinstance(error.get("component"), str)
+            or not error["component"]
+            or error_document_path is None
+        ):
+            applicable.append(error)
+            continue
+        if (
+            error["owner_scope"] != owner_scope
+            or error["component"] != component
+            or error_document_path
+            != _document_path_key(owner_document_path)
+        ):
+            continue
+        identity = error["identity"]
+        if (
+            identity.get("component") != component
+            or error.get("target_kind")
+            not in {"occurrence", "body", "face", "feature"}
+        ):
+            applicable.append(error)
+            continue
+        target_kind = error["target_kind"]
+        expected_entity_kind = {
+            "occurrence": "occurrences",
+            "body": "bodies",
+            "face": "faces",
+            "feature": "features",
+        }[target_kind]
+        kind = error.get("entity_kind")
+        if kind != expected_entity_kind:
+            applicable.append(error)
+            continue
+        if kind == "faces" and not complete_face(identity):
+            applicable.append(error)
+            continue
+        if kind == "bodies" and not all(
+            type(identity.get(field)) is int
+            and (
+                identity[field] in (0, 1)
+                if field == "body_type"
+                else identity[field] >= 0
+            )
+            for field in ("body_type", "body_index")
+        ):
+            applicable.append(error)
+            continue
+        error_faces = identity.get("faces")
+        if kind == "features" and (
+            not isinstance(identity.get("name"), str)
+            or not identity["name"]
+            or not isinstance(identity.get("type_name"), str)
+            or not identity["type_name"]
+            or not isinstance(error_faces, list)
+            or not error_faces
+            or any(not complete_face(face) for face in error_faces)
+        ):
+            applicable.append(error)
+            continue
+        matches = False
+        for target in targets.values():
+            target_kind = target.get("kind")
+            if identity.get("component") != target.get("component"):
+                continue
+            if kind == "faces" and target_kind == "face":
+                matches = all(
+                    identity.get(field) == target.get(field)
+                    for field in ("body_type", "body_index", "face_index")
+                )
+            elif kind == "bodies" and target_kind == "body":
+                matches = all(
+                    identity.get(field) == target.get(field)
+                    for field in ("body_type", "body_index")
+                )
+            elif kind == "features" and target_kind == "feature":
+                feature_identity = _feature_target_identity(target)
+                same_name_type = (
+                    identity.get("name") == target.get("name")
+                    and identity.get("type_name") == target.get("type_name")
+                )
+                error_reference = _persistent_reference_key(
+                    identity.get("persistent_reference")
+                )
+                target_reference = feature_identity[-1]
+                error_footprint = {
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        face["face_index"],
+                    )
+                    for face in error_faces
+                }
+                target_footprint = {
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        face["face_index"],
+                    )
+                    for face in target.get("faces", ())
+                    if complete_face(face)
+                }
+                matches = (
+                    (
+                        same_name_type
+                        and error_reference is not None
+                        and error_reference == target_reference
+                    )
+                    or bool(error_footprint & target_footprint)
+                    or (
+                        same_name_type
+                        and (
+                            error_reference is None
+                            or target_reference is None
+                        )
+                    )
+                )
+            elif kind == "occurrences" and target_kind == "occurrence":
+                matches = True
+            elif kind == "faces" and target_kind == "feature":
+                matches = any(
+                    all(
+                        identity.get(field) == face.get(field)
+                        for field in ("body_type", "body_index", "face_index")
+                    )
+                    for face in target.get("faces", ())
+                    if isinstance(face, Mapping)
+                )
+            if matches:
+                break
+        if matches:
+            applicable.append(error)
+    return applicable
 
 
 def _feature_target_identity(target: Mapping):
@@ -366,16 +558,41 @@ def _colorref(value: object, transparency: object):
     )
 
 
-def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
+def _resolved_faces(
+    raw: object,
+    *,
+    configuration: str,
+    where: str,
+    expected_component: str | None = None,
+    expected_document_path: str | None = None,
+) -> dict:
     _require(
         isinstance(raw, Mapping)
-        and raw.get("component")
+        and isinstance(raw.get("component"), str)
+        and bool(raw.get("component"))
         and raw.get("referenced_configuration") == configuration
         and raw.get("native_active_configuration") == configuration
         and raw.get("native_active_configuration_error") is None,
         f"{where} is not bound to the referenced occurrence and configuration",
     )
     component = str(raw["component"])
+    _require(
+        expected_component is None or component == expected_component,
+        f"{where} names another component",
+    )
+    _require(
+        expected_document_path is None
+        or _document_path_key(raw.get("source_document_path"))
+        == _document_path_key(expected_document_path),
+        f"{where} names another source document",
+    )
+    source_document_path = expected_document_path or raw.get(
+        "source_document_path"
+    )
+    _require(
+        _document_path_key(source_document_path) is not None,
+        f"{where} has no source document identity",
+    )
     display_state = raw.get("native_referenced_display_state")
     _require(
         isinstance(display_state, str)
@@ -449,6 +666,12 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             ),
             f"{owner_path} has no successful exact display-state enumeration",
         )
+        _require(
+            owner.get("owner_scope") != "component_document"
+            or _document_path_key(owner.get("owner_document_path"))
+            == _document_path_key(source_document_path),
+            f"{owner_path} names another component-document owner",
+        )
         owner_display_state = _state_owner_display_state(
             owner,
             expected_configuration=configuration,
@@ -497,17 +720,17 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             )
             indexed_binding = indexed.get("binding_context")
             indexed_context = _binding_context_key(indexed_binding)
+            indexed_errors = indexed.get("read_errors")
             target = indexed.get("target")
             _require(
                 indexed_key is not None
                 and indexed_context is not None
                 and isinstance(indexed_binding, Mapping)
                 and indexed_binding.get("api")
-                in {
-                    OWNER_CONTEXT_BINDING_API,
-                    COMPONENT_ENTITY_BINDING_API,
-                    COMPONENT_OBJECT_BINDING_API,
-                }
+                == OWNER_CONTEXT_BINDING_API
+                and indexed.get("native_interface_kind")
+                in {"IEntity", None}
+                and isinstance(indexed_errors, Mapping)
                 and isinstance(target, Mapping)
                 and target.get("kind")
                 in {"occurrence", "body", "face", "feature"},
@@ -516,7 +739,12 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             reference_index.setdefault(
                 (indexed_key, indexed_context),
                 [],
-            ).append(target)
+            ).append(
+                {
+                    "target": target,
+                    "read_errors": indexed_errors,
+                }
+            )
         for index, material in enumerate(owner["materials"]):
             material_path = f"{owner_path}.materials[{index}]"
             _require(
@@ -557,16 +785,20 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     isinstance(entity, Mapping)
                     and entity.get("entity_index") == entity_index
                     and isinstance(entity.get("native_object_type"), str)
-                    and isinstance(entity.get("read_errors"), Mapping)
-                    ,
+                    and entity.get("native_interface_kind")
+                    in {"IModelDoc2", "IEntity", None}
+                    and isinstance(entity.get("read_errors"), Mapping),
                     f"{entity_path} is malformed",
                 )
                 context_key = _binding_context_key(
                     entity.get("binding_context")
                 )
                 _require(
-                    context_key[2] == component,
-                    f"{entity_path} binding context names another component",
+                    context_key[0] == owner.get("owner_scope")
+                    and context_key[1]
+                    == _document_path_key(owner.get("owner_document_path"))
+                    and context_key[2] == component,
+                    f"{entity_path} binding context is not its actual owner",
                 )
                 native_identity = entity.get("native_identity")
                 document_identity = (
@@ -579,6 +811,12 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     _require(
                         not entity["read_errors"]
                         and context_key[0] == "component_document"
+                        and _document_path_key(
+                            entity["binding_context"].get(
+                                "owner_document_path"
+                            )
+                        )
+                        == _document_path_key(owner.get("owner_document_path"))
                         and entity["binding_context"].get("api")
                         == DOCUMENT_BINDING_API
                         and document_identity.get("qi_iid")
@@ -590,128 +828,69 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         )
                         == _document_path_key(raw.get("source_document_path"))
                         and document_identity.get("active_configuration")
-                        == configuration
-                        and _document_path_key(
-                            document_identity.get("owner_document_path")
-                        )
-                        == _document_path_key(raw.get("source_document_path"))
-                        and document_identity.get("owner_configuration")
-                        == configuration
-                        and document_identity.get("owner_display_state")
-                        == display_state,
+                        == configuration,
                         f"{entity_path} document identity is not the current leaf",
                     )
                     current_targets = {
                         ("document", component, 0, 0, 0): {}
                     }
                 else:
-                    identity_kind = (
-                        native_identity.get("kind")
-                        if isinstance(native_identity, Mapping)
-                        else None
-                    )
                     entity_key = _persistent_reference_key(
                         entity.get("persistent_reference")
                     )
-                    context_details = (
-                        native_identity.get("context")
-                        if isinstance(native_identity, Mapping)
-                        else None
-                    )
-                    context_api = (
-                        context_details.get("api")
-                        if isinstance(context_details, Mapping)
-                        else None
-                    )
-                    context_reference = (
-                        _persistent_reference_key(
-                            context_details.get("persistent_reference")
-                        )
-                        if isinstance(context_details, Mapping)
-                        else None
-                    )
-                    target_attempt = (
-                        context_details.get("target_reference_attempt")
-                        if isinstance(context_details, Mapping)
-                        else None
-                    )
-                    target_attempt_reference = (
-                        _persistent_reference_key(
-                            target_attempt.get("persistent_reference")
-                        )
-                        if isinstance(target_attempt, Mapping)
-                        else None
-                    )
-                    direct_reference_proven = (
+                    owner_context = {
+                        "owner_scope": owner["owner_scope"],
+                        "owner_document_path": owner["owner_document_path"],
+                        "component": component,
+                        "api": OWNER_CONTEXT_BINDING_API,
+                    }
+                    source_context_proven = (
                         entity_key is not None
-                        and isinstance(context_details, Mapping)
-                        and context_api == OWNER_CONTEXT_BINDING_API
-                        and context_details.get("state") == "observed"
-                        and context_details.get("owner_scope")
-                        == context_key[0]
-                        and context_reference == entity_key
-                        and isinstance(target_attempt, Mapping)
-                        and target_attempt.get("api")
-                        == OWNER_CONTEXT_BINDING_API
-                        and target_attempt.get("error") is None
-                        and target_attempt_reference == entity_key
-                    )
-                    source_reference = _persistent_reference_key(
-                        entity.get("source_persistent_reference")
-                    )
-                    source_errors = entity.get("source_read_errors")
-                    conversion_base = (
-                        isinstance(context_details, Mapping)
-                        and entity_key is not None
-                        and context_details.get("state") == "observed"
-                        and context_details.get("owner_scope")
-                        == context_key[0]
-                        and context_reference == entity_key
-                        and source_reference is not None
-                        and isinstance(source_errors, Mapping)
-                        and not source_errors
-                        and isinstance(target_attempt, Mapping)
-                        and target_attempt.get("api")
-                        == OWNER_CONTEXT_BINDING_API
-                        and isinstance(target_attempt.get("error"), Mapping)
-                    )
-                    converted_entity_proven = (
-                        conversion_base
-                        and identity_kind == "entity"
-                        and context_api == COMPONENT_ENTITY_BINDING_API
-                        and context_details.get("input_kind") == "IEntity"
-                    )
-                    converted_object_proven = (
-                        conversion_base
-                        and identity_kind == "object"
-                        and context_api == COMPONENT_OBJECT_BINDING_API
-                        and context_details.get("input_kind")
-                        == "persistent_object"
-                    )
-                    _require(
-                        (
-                            direct_reference_proven
-                            or converted_entity_proven
-                            or converted_object_proven
-                        )
+                        and not entity["read_errors"]
+                        and _binding_context_key(entity["binding_context"])
+                        == _binding_context_key(owner_context)
                         and entity["binding_context"].get("api")
-                        == context_api,
-                        f"{entity_path} native context evidence is inconsistent",
+                        == OWNER_CONTEXT_BINDING_API
+                        and native_identity is None
                     )
                     _require(
-                        entity_key is not None and not entity["read_errors"],
-                        f"{entity_path} has no usable native identity",
+                        source_context_proven,
+                        f"{entity_path} is not bound to its actual owner document",
                     )
                     targets = reference_index.get(
                         (entity_key, context_key)
                     )
                     _require(
                         bool(targets),
-                        f"{entity_path} has no native reference-index binding",
+                        f"{entity_path} has no native reference-index binding; "
+                        f"mapping_errors={json.dumps(owner['mapping_errors'], sort_keys=True)}",
+                    )
+                    _require(
+                        not any(
+                            item["read_errors"]
+                            and set(item["read_errors"])
+                            != {"interface_query"}
+                            for item in targets
+                        ),
+                        f"{entity_path} matched native target has unresolved "
+                        "identity evidence",
                     )
                     current_targets = _unique_current_targets(
-                        targets,
+                        [item["target"] for item in targets],
                         component=component,
+                    )
+                    applicable_errors = _mapping_errors_for_targets(
+                        owner["mapping_errors"],
+                        current_targets,
+                        owner_scope=owner["owner_scope"],
+                        owner_document_path=owner["owner_document_path"],
+                        component=component,
+                    )
+                    _require(
+                        not applicable_errors,
+                        f"{owner_path} has unresolved identities for "
+                        f"participating targets: "
+                        f"{json.dumps(applicable_errors, sort_keys=True)}",
                     )
                 if not current_targets:
                     continue
@@ -1048,6 +1227,8 @@ def verify_native_appearance(
             appearance,
             configuration=configuration,
             where=f"geometry[{row_index}].appearance_raw",
+            expected_component=component,
+            expected_document_path=source_scope.get("source_document_path"),
         )
         groups = _expected_groups(root, row, resolved)
         expected_faces = sum(len(span_group["face_references"]) for span_group in groups)

@@ -19,8 +19,6 @@ DOCUMENT_BINDING_API = (
     "IModelDoc2.GetPathName"
     "+ConfigurationManager.ActiveConfiguration.Name"
 )
-COMPONENT_ENTITY_BINDING_API = "IComponent2.GetCorrespondingEntity"
-COMPONENT_OBJECT_BINDING_API = "IComponent2.GetCorresponding"
 OWNER_CONTEXT_BINDING_API = "IModelDocExtension.GetPersistReference3"
 APPEARANCE_SCOPE_ORDER = (
     "occurrence",
@@ -318,6 +316,7 @@ def _unique_current_targets(
         if target_component != component:
             continue
         kind = target["kind"]
+        footprint = None
         if kind == "occurrence":
             identity = ("occurrence", component, 0, 0, 0)
         elif kind == "feature":
@@ -356,6 +355,16 @@ def _unique_current_targets(
                 0,
                 feature_identity,
             )
+            footprint = tuple(
+                sorted(
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        face["face_index"],
+                    )
+                    for face in target["faces"]
+                )
+            )
         else:
             face_key = _face_key(
                 target.get("body_type"),
@@ -376,8 +385,199 @@ def _unique_current_targets(
                 face_key[1],
                 face_key[2],
             )
-        current.setdefault(identity, target)
+        if identity in current:
+            if footprint is not None:
+                previous = current[identity]
+                previous_footprint = tuple(
+                    sorted(
+                        (
+                            face["body_type"],
+                            face["body_index"],
+                            face["face_index"],
+                        )
+                        for face in previous["faces"]
+                    )
+                )
+                if previous_footprint != footprint:
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_ambiguous",
+                        path,
+                        "one native feature identity carries conflicting face footprints",
+                    )
+            continue
+        current[identity] = target
     return current
+
+
+def _mapping_errors_for_targets(
+    mapping_errors: Sequence[object],
+    targets: Mapping[tuple[Any, ...], Mapping[str, Any]],
+    *,
+    owner_scope: str,
+    owner_document_path: str,
+    component: str,
+) -> list[object]:
+    def complete_face(value: object) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and type(value.get("body_type")) is int
+            and value["body_type"] in (0, 1)
+            and type(value.get("body_index")) is int
+            and value["body_index"] >= 0
+            and type(value.get("face_index")) is int
+            and value["face_index"] >= 0
+        )
+
+    applicable = []
+    for error in mapping_errors:
+        if not isinstance(error, Mapping) or not isinstance(
+            error.get("identity"), Mapping
+        ):
+            applicable.append(error)
+            continue
+        error_document_path = _document_path_key(
+            error.get("owner_document_path")
+        )
+        if (
+            not isinstance(error.get("owner_scope"), str)
+            or not error["owner_scope"]
+            or not isinstance(error.get("component"), str)
+            or not error["component"]
+            or error_document_path is None
+        ):
+            applicable.append(error)
+            continue
+        if (
+            error["owner_scope"] != owner_scope
+            or error["component"] != component
+            or error_document_path
+            != _document_path_key(owner_document_path)
+        ):
+            continue
+        identity = error["identity"]
+        if (
+            identity.get("component") != component
+            or error.get("target_kind")
+            not in {"occurrence", "body", "face", "feature"}
+        ):
+            applicable.append(error)
+            continue
+        target_kind = error["target_kind"]
+        expected_entity_kind = {
+            "occurrence": "occurrences",
+            "body": "bodies",
+            "face": "faces",
+            "feature": "features",
+        }[target_kind]
+        kind = error.get("entity_kind")
+        if kind != expected_entity_kind:
+            applicable.append(error)
+            continue
+        if kind == "faces" and not complete_face(identity):
+            applicable.append(error)
+            continue
+        if kind == "bodies" and not all(
+            type(identity.get(field)) is int
+            and (
+                identity[field] in (0, 1)
+                if field == "body_type"
+                else identity[field] >= 0
+            )
+            for field in ("body_type", "body_index")
+        ):
+            applicable.append(error)
+            continue
+        error_faces = identity.get("faces")
+        if kind == "features" and (
+            not isinstance(identity.get("name"), str)
+            or not identity["name"]
+            or not isinstance(identity.get("type_name"), str)
+            or not identity["type_name"]
+            or not isinstance(error_faces, list)
+            or not error_faces
+            or any(not complete_face(face) for face in error_faces)
+        ):
+            applicable.append(error)
+            continue
+        matches = False
+        for target in targets.values():
+            target_kind = target.get("kind")
+            if identity.get("component") != target.get("component"):
+                continue
+            if kind == "faces" and target_kind == "face":
+                matches = all(
+                    identity.get(field) == target.get(field)
+                    for field in ("body_type", "body_index", "face_index")
+                )
+            elif kind == "bodies" and target_kind == "body":
+                matches = all(
+                    identity.get(field) == target.get(field)
+                    for field in ("body_type", "body_index")
+                )
+            elif kind == "features" and target_kind == "feature":
+                feature_identity = _feature_target_identity(target)
+                same_name_type = (
+                    feature_identity is not None
+                    and identity.get("name") == target.get("name")
+                    and identity.get("type_name") == target.get("type_name")
+                )
+                error_reference = _persistent_reference_key(
+                    identity.get("persistent_reference")
+                )
+                target_reference = (
+                    feature_identity[-1]
+                    if feature_identity is not None
+                    else None
+                )
+                error_footprint = {
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        face["face_index"],
+                    )
+                    for face in error_faces
+                }
+                target_footprint = {
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        face["face_index"],
+                    )
+                    for face in target.get("faces", ())
+                    if complete_face(face)
+                }
+                matches = (
+                    (
+                        same_name_type
+                        and error_reference is not None
+                        and error_reference == target_reference
+                    )
+                    or bool(error_footprint & target_footprint)
+                    or (
+                        same_name_type
+                        and (
+                            error_reference is None
+                            or target_reference is None
+                        )
+                    )
+                )
+            elif kind == "occurrences" and target_kind == "occurrence":
+                matches = True
+            elif kind == "faces" and target_kind == "feature":
+                matches = any(
+                    all(
+                        identity.get(field) == face.get(field)
+                        for field in ("body_type", "body_index", "face_index")
+                    )
+                    for face in target.get("faces", ())
+                    if isinstance(face, Mapping)
+                )
+            if matches:
+                break
+        if matches:
+            applicable.append(error)
+    return applicable
 
 
 def _feature_target_identity(target: Mapping[str, Any]):
@@ -987,6 +1187,21 @@ def resolve_deliverable_appearance(
                 owner_path,
                 "a display-state render-material owner record is malformed",
             )
+        if (
+            owner.get("owner_scope") == "component_document"
+            and not _same_document_path(
+                owner.get("owner_document_path"),
+                expected_document_path,
+            )
+        ):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_render_entity_binding_unproven",
+                owner_path + ".owner_document_path",
+                "a component-document owner does not name the exact source document",
+                expected=expected_document_path,
+                observed=owner.get("owner_document_path"),
+            )
         owner_display_state = _state_owner_display_state(
             owner,
             component=component,
@@ -1056,7 +1271,7 @@ def resolve_deliverable_appearance(
             )
         reference_index: dict[
             tuple[tuple[int, ...], tuple[str, str, str]],
-            list[Mapping[str, Any]],
+            list[dict[str, Any]],
         ] = {}
         for index_position, indexed in enumerate(
             owner["native_reference_index"]
@@ -1082,16 +1297,16 @@ def resolve_deliverable_appearance(
                 if isinstance(indexed_binding, Mapping)
                 else None
             )
+            indexed_errors = indexed.get("read_errors")
             target = indexed.get("target")
             if (
                 indexed_key is None
                 or indexed_context is None
                 or indexed_api
-                not in {
-                    OWNER_CONTEXT_BINDING_API,
-                    COMPONENT_ENTITY_BINDING_API,
-                    COMPONENT_OBJECT_BINDING_API,
-                }
+                != OWNER_CONTEXT_BINDING_API
+                or indexed.get("native_interface_kind")
+                not in {"IEntity", None}
+                or not isinstance(indexed_errors, Mapping)
                 or not isinstance(target, Mapping)
                 or target.get("kind")
                 not in {"occurrence", "body", "face", "feature"}
@@ -1105,7 +1320,12 @@ def resolve_deliverable_appearance(
             reference_index.setdefault(
                 (indexed_key, indexed_context),
                 [],
-            ).append(target)
+            ).append(
+                {
+                    "target": target,
+                    "read_errors": indexed_errors,
+                }
+            )
         for material_position, material in enumerate(owner["materials"]):
             path = f"{owner_path}.materials[{material_position}]"
             if not isinstance(material, Mapping):
@@ -1166,6 +1386,8 @@ def resolve_deliverable_appearance(
                     not isinstance(entity, Mapping)
                     or entity.get("entity_index") != entity_index
                     or not isinstance(entity.get("native_object_type"), str)
+                    or entity.get("native_interface_kind")
+                    not in {"IModelDoc2", "IEntity", None}
                     or not isinstance(entity.get("read_errors"), Mapping)
                 ):
                     raise _appearance_resolution_error(
@@ -1178,7 +1400,10 @@ def resolve_deliverable_appearance(
                     entity.get("binding_context")
                 )
                 if context_key is None or (
-                    context_key[2] != component
+                    context_key[0] != owner.get("owner_scope")
+                    or context_key[1]
+                    != _document_path_key(owner.get("owner_document_path"))
+                    or context_key[2] != component
                 ):
                     raise _appearance_resolution_error(
                         component,
@@ -1197,6 +1422,12 @@ def resolve_deliverable_appearance(
                     if (
                         entity["read_errors"]
                         or context_key[0] != "component_document"
+                        or not _same_document_path(
+                            entity["binding_context"].get(
+                                "owner_document_path"
+                            ),
+                            owner["owner_document_path"],
+                        )
                         or entity["binding_context"].get("api")
                         != DOCUMENT_BINDING_API
                         or document_identity.get("qi_iid")
@@ -1209,14 +1440,6 @@ def resolve_deliverable_appearance(
                         != _document_path_key(expected_document_path)
                         or document_identity.get("active_configuration")
                         != configuration
-                        or _document_path_key(
-                            document_identity.get("owner_document_path")
-                        )
-                        != _document_path_key(expected_document_path)
-                        or document_identity.get("owner_configuration")
-                        != configuration
-                        or document_identity.get("owner_display_state")
-                        != display_state
                     ):
                         raise _appearance_resolution_error(
                             component,
@@ -1229,128 +1452,37 @@ def resolve_deliverable_appearance(
                         ("document", component, 0, 0, 0): {}
                     }
                 else:
-                    identity_kind = (
-                        native_identity.get("kind")
-                        if isinstance(native_identity, Mapping)
-                        else None
-                    )
                     entity_key = _persistent_reference_key(
                         entity.get("persistent_reference")
                     )
-                    context_details = (
-                        native_identity.get("context")
-                        if isinstance(native_identity, Mapping)
-                        else None
-                    )
-                    context_api = (
-                        context_details.get("api")
-                        if isinstance(context_details, Mapping)
-                        else None
-                    )
-                    context_reference = (
-                        _persistent_reference_key(
-                            context_details.get("persistent_reference")
-                        )
-                        if isinstance(context_details, Mapping)
-                        else None
-                    )
-                    target_attempt = (
-                        context_details.get("target_reference_attempt")
-                        if isinstance(context_details, Mapping)
-                        else None
-                    )
-                    target_attempt_reference = (
-                        _persistent_reference_key(
-                            target_attempt.get("persistent_reference")
-                        )
-                        if isinstance(target_attempt, Mapping)
-                        else None
-                    )
-                    direct_reference_proven = (
+                    owner_context = {
+                        "owner_scope": owner["owner_scope"],
+                        "owner_document_path": owner["owner_document_path"],
+                        "component": component,
+                        "api": OWNER_CONTEXT_BINDING_API,
+                    }
+                    source_context_proven = (
                         entity_key is not None
-                        and isinstance(context_details, Mapping)
-                        and context_api == OWNER_CONTEXT_BINDING_API
-                        and context_details.get("state") == "observed"
-                        and context_details.get("owner_scope")
-                        == context_key[0]
-                        and context_reference == entity_key
-                        and isinstance(target_attempt, Mapping)
-                        and target_attempt.get("api")
+                        and not entity["read_errors"]
+                        and _binding_context_key(entity["binding_context"])
+                        == _binding_context_key(owner_context)
+                        and entity["binding_context"].get("api")
                         == OWNER_CONTEXT_BINDING_API
-                        and target_attempt.get("error") is None
-                        and target_attempt_reference == entity_key
+                        and native_identity is None
                     )
-                    source_reference = _persistent_reference_key(
-                        entity.get("source_persistent_reference")
-                    )
-                    source_errors = entity.get("source_read_errors")
-                    conversion_base = (
-                        isinstance(context_details, Mapping)
-                        and entity_key is not None
-                        and context_details.get("state") == "observed"
-                        and context_details.get("owner_scope")
-                        == context_key[0]
-                        and context_reference == entity_key
-                        and source_reference is not None
-                        and isinstance(source_errors, Mapping)
-                        and not source_errors
-                        and isinstance(target_attempt, Mapping)
-                        and target_attempt.get("api")
-                        == OWNER_CONTEXT_BINDING_API
-                        and isinstance(target_attempt.get("error"), Mapping)
-                    )
-                    converted_entity_proven = (
-                        conversion_base
-                        and identity_kind == "entity"
-                        and context_api == COMPONENT_ENTITY_BINDING_API
-                        and context_details.get("input_kind") == "IEntity"
-                    )
-                    converted_object_proven = (
-                        conversion_base
-                        and identity_kind == "object"
-                        and context_api == COMPONENT_OBJECT_BINDING_API
-                        and context_details.get("input_kind")
-                        == "persistent_object"
-                    )
-                    if (
-                        not (
-                            direct_reference_proven
-                            or converted_entity_proven
-                            or converted_object_proven
-                        )
-                        or entity["binding_context"].get("api")
-                        != context_api
-                    ):
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_binding_unproven",
-                            entity_path + ".binding_context.api",
-                            "the native binding API does not match the entity context",
-                            observed={
-                                "api": entity["binding_context"].get("api"),
-                                "context_api": context_api,
-                                "context": context_details,
-                                "source_reference": source_reference,
-                                "target_reference_attempt": target_attempt,
-                            },
-                            expected={
-                                "direct": OWNER_CONTEXT_BINDING_API,
-                                "entity_conversion": (
-                                    COMPONENT_ENTITY_BINDING_API
-                                ),
-                                "object_conversion": (
-                                    COMPONENT_OBJECT_BINDING_API
-                                ),
-                            },
-                        )
-                    if entity_key is None or entity["read_errors"]:
+                    if not source_context_proven:
                         raise _appearance_resolution_error(
                             component,
                             "cad_appearance_render_entity_binding_unproven",
                             entity_path + ".persistent_reference",
-                            "a display-state render-material entity has no usable native identity",
-                            observed=entity.get("persistent_reference"),
-                            errors=dict(entity["read_errors"]),
+                            "the material entity is not bound to its actual owner document",
+                            observed={
+                                "binding_context": entity["binding_context"],
+                                "identity": native_identity,
+                                "persistent_reference": entity_key,
+                                "read_errors": entity["read_errors"],
+                            },
+                            expected=owner_context,
                         )
                     targets = reference_index.get(
                         (entity_key, context_key)
@@ -1361,12 +1493,44 @@ def resolve_deliverable_appearance(
                             "cad_appearance_render_entity_binding_unproven",
                             entity_path + ".persistent_reference",
                             "the native reference index does not bind this entity",
+                            mapping_errors=copy.deepcopy(
+                                owner["mapping_errors"]
+                            ),
+                        )
+                    blocking_index_errors = [
+                        item["read_errors"]
+                        for item in targets
+                        if item["read_errors"]
+                        and set(item["read_errors"]) != {"interface_query"}
+                    ]
+                    if blocking_index_errors:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_identity_unresolved",
+                            entity_path + ".persistent_reference",
+                            "the matched native target has unresolved identity evidence",
+                            errors=copy.deepcopy(blocking_index_errors),
                         )
                     current_targets = _unique_current_targets(
-                        targets,
+                        [item["target"] for item in targets],
                         component=component,
                         path=entity_path + ".persistent_reference",
                     )
+                    applicable_errors = _mapping_errors_for_targets(
+                        owner["mapping_errors"],
+                        current_targets,
+                        owner_scope=owner["owner_scope"],
+                        owner_document_path=owner["owner_document_path"],
+                        component=component,
+                    )
+                    if applicable_errors:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_identity_unresolved",
+                            owner_path + ".mapping_errors",
+                            "a participating native target has unresolved identities",
+                            errors=copy.deepcopy(applicable_errors),
+                        )
                 if not current_targets:
                     continue
                 if all(

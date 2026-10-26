@@ -676,10 +676,11 @@ Capture artifact 绑定其字节；`evidence/capture.json` 保留必要投影与
 复算；原始事实缺失、被改写或与投影冲突时，按既有工程和完整性规则拒绝。
 
 独立 consumer 从 raw 字节、face spans、原始 placement、物性和基准读数复算实际
-输出，核验源绑定、单位、坐标、对象归属及派生 warning，不能只比较生产者的投影。
-三角网格拓扑和 raw/STL 一致性不自动建立原生 BRep、光滑曲面距离或最终工程资格；
-最终 50 µm 双向曲面上界、覆盖、朝向及其他质量要求仍按 `docs/quality.md` 验收，
-未建立项如实保持未通过，不借用历史几何证明或未验证预览豁免。
+输出，核验源绑定、单位、坐标、对象归属、覆盖、朝向及派生 warning，不能只比较生产者的投影。
+raw/STL 一致性证明本次原始三角事实到交付的派生一致性，不自动建立原生 BRep 或
+光滑曲面误差界；几何资格按实际证据陈述，不借用历史证明或未验证预览。
+`docs/quality.md#geometry-equivalence` 的 50 µm 双向距离标准仅用于声明适用 CAD 的
+独立参考回归，不是生产或正式发布前置；当前 CAD 的独立工程检查继续执行。
 
 ### 原生外观读数与交付
 
@@ -687,7 +688,7 @@ Capture artifact 绑定其字节；`evidence/capture.json` 保留必要投影与
 
 `GetRenderMaterials2(3, names)` 与 `GetRenderMaterialsCount2(3, names)` 使用同一个表示 exact owner display state 的 typed `SAFEARRAY(BSTR)`。NULL 与计数分开保留；只有成功计数为零才证明该状态无 assignment，正数或未知计数不能解释为 absent。成功枚举的行数必须等于同状态计数，不使用旧无参 Count 或 fallback。
 
-文档实体通过真实 `IModelDoc2` QI、实际 `GetPathName` 与 active configuration 建立身份，不要求文档具有实体 persistent reference。其他实体与同次几何遍历的 `native_reference_index` 在已证明的相同 owner document、occurrence 和转换上下文中 join；先确定输入对象上下文，再使用方向正确的原生对应 API，不能按 material owner scope 猜测几何对象上下文。保留原生引用和读取、转换事实；Generate 与 Verify 分别重新 join，不信任 `matched_identity`。未绑定或真实歧义仍拒绝。一个 feature identity 可以拥有多个面的 `faces[]` footprint；不同 feature identity 共用引用不授权取并集染色。
+文档实体通过真实 `IModelDoc2` QI、实际 `GetPathName` 与 active configuration 建立身份，不要求文档具有实体 persistent reference。其他材质实体与同次几何遍历的 `native_reference_index` 使用实际材质所属文档的原生持久引用，并绑定 exact occurrence、配置和显示状态；Generate 与 Verify 各自从原始事实独立 join。`component_document` 的材质与索引均直接使用真实 Part owner extension，不转换到父装配引用，也不保留第二套引用作为备用匹配。按官方外观层级，assembly-owned 材质使用实际 assembly owner 上下文中的组件实例；face、feature、body 和 part assignment 使用 Part owner。装配材质指向非 occurrence target 时明确拒绝，不转换、提升或猜测其作用域。不能以非空引用、颜色相同或索引覆盖全组件证明身份，不保留无消费者的转换及重复引用副本。参与对象绑定的原生读取或 mapping 错误、错误 component／source document、未绑定或真实歧义均拒绝；没有参与该绑定的辅助诊断不另设零错误资格。同一 native feature identity 可有多个面的完整 `faces[]` footprint，重复记录的完整 footprint 不一致须拒绝，不对不同对象或不同覆盖取并集染色。
 
 有效外观按有文档依据的对象层级解释，不任意规定继承。已证明参与的单色现代 material 必须绑定 exact owner/state 与实际交付面，`ColorForm=1`，无参与纹理或 surface finish。通用规则 `appearance.primary_color_colorref` 版本 `v1` 对非布尔、范围为 `0..0xffffff` 的 `PrimaryColor` 整数计算 `R=(v&255)/255`、`G=((v>>8)&255)/255`、`B=((v>>16)&255)/255`，`alpha=1-Transparency`，不取最高字节作为 alpha。九值属性的 alpha 同样由其原生透明度派生。保留原值、规则版本、结果和字段级 derived warning；独立验证自行计算。位顺序依据固定成熟导出器的同 API 实现交叉证据，不能冒称官方文档明确给出了 byte packing，也不从手工参考回填。
 

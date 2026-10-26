@@ -150,7 +150,7 @@ def _binding_context(
     *,
     owner_scope: str,
     owner_document_path: str,
-    api: str = "IComponent2.GetCorrespondingEntity",
+    api: str = "IModelDocExtension.GetPersistReference3",
 ):
     return {
         "owner_scope": owner_scope,
@@ -160,58 +160,46 @@ def _binding_context(
     }
 
 
-def _native_identity(
-    kind: str,
+def _state_entity_record(
     *,
+    kind: str = "entity",
+    reference=(1, 2, 3),
     owner_scope: str = "component_document",
-    api: str | None = None,
-    persistent_reference=(1, 2, 3),
-    target_reference=None,
+    owner_document_path: str = DOCUMENT,
 ):
-    api = api or (
-        "IComponent2.GetCorrespondingEntity"
-        if kind == "entity"
-        else "IComponent2.GetCorresponding"
-    )
-    input_kind = "IEntity" if kind == "entity" else "persistent_object"
-    target_attempt = {
-        "api": "IModelDocExtension.GetPersistReference3",
-        "persistent_reference": (
-            list(target_reference)
-            if target_reference is not None
-            else None
-        ),
-        "error": (
-            None
-            if target_reference is not None
-            else {
-                "code": "cad_appearance_persistent_reference_missing",
-                "message": "the apparent owner reference is unavailable",
-                "detail": {},
-            }
-        ),
-    }
     return {
-        "kind": kind,
-        "owner_document_path": f"C:\\cad\\{COMPONENT}.SLDPRT",
-        "owner_configuration": CONFIGURATION,
-        "owner_display_state": "Display State 1",
+        "entity_index": 0,
+        "native_object_type": "_CDispatch",
+        "native_interface_kind": (
+            "IEntity" if kind == "entity" else None
+        ),
+        "persistent_reference": list(reference),
         "binding_context": _binding_context(
             owner_scope=owner_scope,
-            owner_document_path=DOCUMENT,
-            api=api,
+            owner_document_path=owner_document_path,
         ),
-        "context": {
-            "owner_scope": owner_scope,
-            "input_kind": input_kind,
-            "api": api,
-            "persistent_reference": list(persistent_reference),
-            "target_reference_attempt": target_attempt,
-            "state": "observed",
-            "read_errors": {},
-        },
-        "state": "observed",
         "read_errors": {},
+    }
+
+
+def _reference_row(
+    *,
+    reference,
+    target,
+    owner_scope: str = "component_document",
+    owner_document_path: str = DOCUMENT,
+):
+    return {
+        "persistent_reference": list(reference),
+        "native_interface_kind": (
+            "IEntity" if target.get("kind") == "face" else None
+        ),
+        "read_errors": {},
+        "binding_context": _binding_context(
+            owner_scope=owner_scope,
+            owner_document_path=owner_document_path,
+        ),
+        "target": target,
     }
 
 
@@ -329,15 +317,12 @@ class AppearanceResolutionTests(unittest.TestCase):
         top["call_state"] = "observed"
         top["native_render_material_count"] = 1
         top["native_reference_index"] = [
-            {
-                "persistent_reference": [4, 5, 6],
-                "binding_context": _binding_context(
-                    owner_scope="top_assembly",
-                    owner_document_path=r"C:\capture\robot.SLDASM",
-                    api="IModelDocExtension.GetPersistReference3",
-                ),
-                "target": {"kind": "occurrence", "component": COMPONENT},
-            }
+            _reference_row(
+                reference=(4, 5, 6),
+                target={"kind": "occurrence", "component": COMPONENT},
+                owner_scope="top_assembly",
+                owner_document_path=r"C:\capture\robot.SLDASM",
+            )
         ]
         top["materials"] = [
             {
@@ -346,26 +331,12 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "entities": ["top-occurrence"],
                 "entities_state": "observed",
                 "entity_records": [
-                    {
-                        "entity_index": 0,
-                        "native_object_type": "IComponent2",
-                        "persistent_reference": [4, 5, 6],
-                        "binding_context": _binding_context(
-                            owner_scope="top_assembly",
-                            owner_document_path=r"C:\capture\robot.SLDASM",
-                            api="IModelDocExtension.GetPersistReference3",
-                        ),
-                        "source_persistent_reference": None,
-                        "source_read_errors": {},
-                        "native_identity": _native_identity(
-                            "object",
-                            owner_scope="top_assembly",
-                            api="IModelDocExtension.GetPersistReference3",
-                            persistent_reference=[4, 5, 6],
-                            target_reference=[4, 5, 6],
-                        ),
-                        "read_errors": {},
-                    }
+                    _state_entity_record(
+                        kind="object",
+                        reference=(4, 5, 6),
+                        owner_scope="top_assembly",
+                        owner_document_path=r"C:\capture\robot.SLDASM",
+                    )
                 ],
                 "primary_color": 0x0000FF00,
                 "transparency": 0.0,
@@ -390,6 +361,24 @@ class AppearanceResolutionTests(unittest.TestCase):
         self.assertEqual(
             {tuple(face.source["scopes"]) for face in resolved.faces},
             {("occurrence",)},
+        )
+        non_occurrence = copy.deepcopy(raw)
+        entity = non_occurrence["state_render_materials"][0]["materials"][
+            0
+        ]["entity_records"][0]
+        entity["persistent_reference"] = [7, 8, 9]
+        entity["native_interface_kind"] = "IEntity"
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                non_occurrence,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=case["face_spans"],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_entity_binding_unproven",
         )
 
     def test_face_owners_partition_one_occurrence_into_multiple_materials(self):
@@ -531,18 +520,12 @@ class AppearanceResolutionTests(unittest.TestCase):
         top["call_state"] = "observed"
         top["native_render_material_count"] = 1
         top["native_reference_index"] = [
-            {
-                "persistent_reference": [4, 5, 6],
-                "binding_context": _binding_context(
-                    owner_scope="top_assembly",
-                    owner_document_path=r"C:\capture\robot.SLDASM",
-                    api="IModelDocExtension.GetPersistReference3",
-                ),
-                "target": {
-                    "kind": "occurrence",
-                    "component": COMPONENT,
-                },
-            }
+            _reference_row(
+                reference=(4, 5, 6),
+                target={"kind": "occurrence", "component": COMPONENT},
+                owner_scope="top_assembly",
+                owner_document_path=r"C:\capture\robot.SLDASM",
+            )
         ]
         top["materials"] = [
             {
@@ -551,32 +534,12 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "entities": ["top-face"],
                 "entities_state": "observed",
                 "entity_records": [
-                    {
-                        "entity_index": 0,
-                        "native_object_type": "IFace2",
-                        "persistent_reference": [4, 5, 6],
-                        "binding_context": _binding_context(
-                            owner_scope="top_assembly",
-                            owner_document_path=r"C:\capture\robot.SLDASM",
-                            api="IModelDocExtension.GetPersistReference3",
-                        ),
-                        "source_persistent_reference": None,
-                        "source_read_errors": {
-                            "interface_query": {
-                                "code": "interface_query_failed",
-                                "message": "source QI failed",
-                                "detail": None,
-                            }
-                        },
-                        "native_identity": _native_identity(
-                            "object",
-                            owner_scope="top_assembly",
-                            api="IModelDocExtension.GetPersistReference3",
-                            persistent_reference=[4, 5, 6],
-                            target_reference=[4, 5, 6],
-                        ),
-                        "read_errors": {},
-                    }
+                    _state_entity_record(
+                        kind="object",
+                        reference=(4, 5, 6),
+                        owner_scope="top_assembly",
+                        owner_document_path=r"C:\capture\robot.SLDASM",
+                    )
                 ],
                 "primary_color": 0x00AABBCC,
                 "transparency": 0.0,
@@ -700,6 +663,262 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         self.assertEqual(resolved.faces[0].source["scopes"], ["face"])
 
+    def test_mapping_errors_only_block_participating_object_bindings(self):
+        mapping_error = {
+            "owner_scope": "component_document",
+            "owner_document_path": DOCUMENT,
+            "component": COMPONENT,
+            "entity_kind": "faces",
+            "target_kind": "face",
+            "identity": {
+                "component": COMPONENT,
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": 0,
+            },
+            "persistent_reference": None,
+            "native_interface_kind": "IEntity",
+            "error": {"code": "cad_appearance_persistent_reference_invalid"},
+        }
+        unrelated_error = copy.deepcopy(mapping_error)
+        unrelated_error["identity"]["face_index"] = 1
+        empty = _resolved_raw(
+            [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
+        )
+        empty["state_render_materials"][0]["mapping_errors"] = [
+            unrelated_error
+        ]
+        resolved_empty = resolve_deliverable_appearance(
+            empty,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }
+            ],
+        )
+        self.assertEqual(resolved_empty.faces[0].source["scopes"], ["face"])
+
+        object_raw = _resolved_raw(
+            [
+                None,
+                [0.0, 1.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+            ]
+        )
+        owner = _empty_state_owner(
+            scope="component_document",
+            document_path=DOCUMENT,
+            configuration=CONFIGURATION,
+            display_state="Display State 1",
+        )
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        owner["mapping_errors"] = [unrelated_error]
+        owner["native_reference_index"] = [
+            _reference_row(
+                reference=(1, 2, 3),
+                target={
+                    "kind": "face",
+                    "component": COMPONENT,
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                },
+            )
+        ]
+        owner["native_reference_index"][0]["read_errors"] = {
+            "interface_query": {
+                "code": "cad_appearance_interface_unavailable",
+                "message": "optional QI failed",
+                "detail": {},
+            }
+        }
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Display State 1"],
+                "entities": ["face"],
+                "entities_state": "observed",
+                "entity_records": [
+                    _state_entity_record(
+                        kind="entity",
+                        reference=(1, 2, 3),
+                    )
+                ],
+                "primary_color": 0x000000FF,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        object_raw["state_render_materials"] = [owner]
+        resolved_object = resolve_deliverable_appearance(
+            object_raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                },
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 1,
+                    "triangle_start": 1,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "b" * 64,
+                },
+            ],
+        )
+        self.assertEqual(resolved_object.faces[0].source["scopes"], ["face"])
+
+        same_target = copy.deepcopy(object_raw)
+        same_target["state_render_materials"][0]["mapping_errors"] = [
+            mapping_error
+        ]
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                same_target,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=[
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": face_index,
+                        "triangle_start": face_index,
+                        "triangle_count": 1,
+                        "face_reference_sha256": str(face_index + 1) * 64,
+                    }
+                    for face_index in (0, 1)
+                ],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_identity_unresolved",
+        )
+
+        incomplete_target_error = copy.deepcopy(object_raw)
+        incomplete_identity = copy.deepcopy(mapping_error)
+        incomplete_identity["identity"].pop("face_index")
+        incomplete_target_error["state_render_materials"][0][
+            "mapping_errors"
+        ] = [incomplete_identity]
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                incomplete_target_error,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=[
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": face_index,
+                        "triangle_start": face_index,
+                        "triangle_count": 1,
+                        "face_reference_sha256": str(face_index + 1) * 64,
+                    }
+                    for face_index in (0, 1)
+                ],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_identity_unresolved",
+        )
+
+        document = _resolved_raw([None])
+        document["document"] = _layer(
+            owner_configuration=CONFIGURATION,
+            values=[0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+            has_values=True,
+        )
+        owner = _empty_state_owner(
+            scope="component_document",
+            document_path=DOCUMENT,
+            configuration=CONFIGURATION,
+            display_state="Display State 1",
+        )
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        owner["mapping_errors"] = [unrelated_error]
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Display State 1"],
+                "entities": ["document"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "IModelDoc2",
+                        "native_interface_kind": "IModelDoc2",
+                        "persistent_reference": None,
+                        "binding_context": _binding_context(
+                            owner_scope="component_document",
+                            owner_document_path=DOCUMENT,
+                            api=(
+                                "IModelDoc2.GetPathName"
+                                "+ConfigurationManager.ActiveConfiguration.Name"
+                            ),
+                        ),
+                        "native_identity": {
+                            "kind": "document",
+                            "qi_iid": "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}",
+                            "document_path": DOCUMENT,
+                            "active_configuration": CONFIGURATION,
+                            "state": "observed",
+                            "read_errors": {},
+                        },
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x00AABBCC,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        document["state_render_materials"] = [owner]
+        resolved_document = resolve_deliverable_appearance(
+            document,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }
+            ],
+        )
+        self.assertEqual(
+            resolved_document.faces[0].source["scopes"],
+            ["document"],
+        )
+
     def test_nonzero_or_unknown_count_keeps_null_state_materials_unresolved(self):
         for count, count_error in (
             (1, None),
@@ -759,15 +978,10 @@ class AppearanceResolutionTests(unittest.TestCase):
         owner["call_state"] = "observed"
         owner["native_render_material_count"] = 2
         owner["native_reference_index"] = [
-            {
-                "persistent_reference": [1, 2, 3],
-                "binding_context": _binding_context(
-                    owner_scope="component_document",
-                    owner_document_path=DOCUMENT,
-                    api="IComponent2.GetCorresponding",
-                ),
-                "target": {"kind": "occurrence", "component": COMPONENT},
-            }
+            _reference_row(
+                reference=(1, 2, 3),
+                target={"kind": "occurrence", "component": COMPONENT},
+            )
         ]
         owner["materials"] = [
             {
@@ -776,20 +990,10 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "entities": ["entity"],
                 "entities_state": "observed",
                 "entity_records": [
-                    {
-                        "entity_index": 0,
-                        "native_object_type": "_CDispatch",
-                        "persistent_reference": [1, 2, 3],
-                        "binding_context": _binding_context(
-                            owner_scope="component_document",
-                            owner_document_path=DOCUMENT,
-                            api="IComponent2.GetCorresponding",
-                        ),
-                        "source_persistent_reference": [7, 8, 9],
-                        "source_read_errors": {},
-                        "native_identity": _native_identity("object"),
-                        "read_errors": {},
-                    }
+                    _state_entity_record(
+                        kind="object",
+                        reference=(1, 2, 3),
+                    )
                 ],
                 "primary_color": 0x000000FF,
                 "transparency": 0.0,
@@ -838,21 +1042,16 @@ class AppearanceResolutionTests(unittest.TestCase):
         owner["call_state"] = "observed"
         owner["native_render_material_count"] = 1
         owner["native_reference_index"] = [
-            {
-                "persistent_reference": [1, 2, 3],
-                "binding_context": _binding_context(
-                    owner_scope="component_document",
-                    owner_document_path=DOCUMENT,
-                    api="IComponent2.GetCorrespondingEntity",
-                ),
-                "target": {
+            _reference_row(
+                reference=(1, 2, 3),
+                target={
                     "kind": "face",
                     "component": COMPONENT,
                     "body_type": 0,
                     "body_index": 0,
                     "face_index": face_index,
                 },
-            }
+            )
             for face_index in (0, 1)
         ]
         owner["materials"] = [
@@ -862,20 +1061,10 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "entities": ["ambiguous"],
                 "entities_state": "observed",
                 "entity_records": [
-                    {
-                        "entity_index": 0,
-                        "native_object_type": "_CDispatch",
-                        "persistent_reference": [1, 2, 3],
-                        "binding_context": _binding_context(
-                            owner_scope="component_document",
-                            owner_document_path=DOCUMENT,
-                            api="IComponent2.GetCorrespondingEntity",
-                        ),
-                        "source_persistent_reference": [7, 8, 9],
-                        "source_read_errors": {},
-                        "native_identity": _native_identity("entity"),
-                        "read_errors": {},
-                    }
+                    _state_entity_record(
+                        kind="entity",
+                        reference=(1, 2, 3),
+                    )
                 ],
                 "primary_color": 0x000000FF,
                 "transparency": 0.0,
@@ -939,21 +1128,15 @@ class AppearanceResolutionTests(unittest.TestCase):
                 )
                 owner["call_state"] = "observed"
                 owner["native_render_material_count"] = 1
-                binding_context = _binding_context(
-                    owner_scope="component_document",
-                    owner_document_path=DOCUMENT,
-                    api="IComponent2.GetCorresponding",
-                )
                 feature_identities = (
                     [(feature_names[0], [0, 1])]
                     if should_pass
                     else [("Boss-Extrude1", [0]), ("Cut-Extrude1", [1])]
                 )
                 owner["native_reference_index"] = [
-                    {
-                        "persistent_reference": [1, 2, 3],
-                        "binding_context": binding_context,
-                        "target": {
+                    _reference_row(
+                        reference=(1, 2, 3),
+                        target={
                             "kind": "feature",
                             "component": COMPONENT,
                             "name": feature_name,
@@ -968,7 +1151,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                                 for face_index in face_indices
                             ],
                         },
-                    }
+                    )
                     for index, (feature_name, face_indices) in enumerate(
                         feature_identities
                     )
@@ -980,16 +1163,10 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "entities": ["feature"],
                         "entities_state": "observed",
                         "entity_records": [
-                            {
-                                "entity_index": 0,
-                                "native_object_type": "_CDispatch",
-                                "persistent_reference": [1, 2, 3],
-                                "binding_context": binding_context,
-                                "source_persistent_reference": [7, 8, 9],
-                                "source_read_errors": {},
-                                "native_identity": _native_identity("object"),
-                                "read_errors": {},
-                            }
+                            _state_entity_record(
+                                kind="object",
+                                reference=(1, 2, 3),
+                            )
                         ],
                         "primary_color": 0x000000FF,
                         "transparency": 0.0,
@@ -1023,6 +1200,120 @@ class AppearanceResolutionTests(unittest.TestCase):
                         {face.rgba for face in resolved.faces},
                         {(1.0, 0.0, 0.0, 1.0)},
                     )
+                    incomplete = copy.deepcopy(raw)
+                    incomplete["state_render_materials"][0][
+                        "native_reference_index"
+                    ][0]["read_errors"] = {
+                        "faces": [
+                            {
+                                "face": {
+                                    "body_type": 0,
+                                    "body_index": 0,
+                                    "face_index": 0,
+                                },
+                                "read_errors": {
+                                    "name": {
+                                        "code": "cad_member_missing",
+                                        "message": "missing",
+                                        "detail": {},
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                    with self.assertRaises(AppearanceError) as caught:
+                        resolve_deliverable_appearance(
+                            incomplete,
+                            component=COMPONENT,
+                            expected_document_path=DOCUMENT,
+                            expected_configuration=CONFIGURATION,
+                            face_spans=spans,
+                        )
+                    self.assertEqual(
+                        caught.exception.appearance["issues"][0]["code"],
+                        "cad_appearance_render_identity_unresolved",
+                    )
+                    footprint_error = copy.deepcopy(raw)
+                    footprint_error["state_render_materials"][0][
+                        "mapping_errors"
+                    ] = [
+                        {
+                            "owner_scope": "component_document",
+                            "owner_document_path": DOCUMENT,
+                            "component": COMPONENT,
+                            "entity_kind": "faces",
+                            "target_kind": "face",
+                            "identity": {
+                                "component": COMPONENT,
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                            },
+                            "persistent_reference": None,
+                            "native_interface_kind": "IEntity",
+                            "error": {
+                                "code": (
+                                    "cad_appearance_persistent_reference_invalid"
+                                )
+                            },
+                        }
+                    ]
+                    with self.assertRaises(AppearanceError) as caught:
+                        resolve_deliverable_appearance(
+                            footprint_error,
+                            component=COMPONENT,
+                            expected_document_path=DOCUMENT,
+                            expected_configuration=CONFIGURATION,
+                            face_spans=spans,
+                        )
+                    self.assertEqual(
+                        caught.exception.appearance["issues"][0]["code"],
+                        "cad_appearance_render_identity_unresolved",
+                    )
+                    missing_feature_reference = copy.deepcopy(raw)
+                    missing_feature_reference["state_render_materials"][0][
+                        "mapping_errors"
+                    ] = [
+                        {
+                            "owner_scope": "component_document",
+                            "owner_document_path": DOCUMENT,
+                            "component": COMPONENT,
+                            "entity_kind": "features",
+                            "target_kind": "feature",
+                            "identity": {
+                                "component": COMPONENT,
+                                "name": feature_names[0],
+                                "type_name": "Extrusion",
+                                "persistent_reference": None,
+                                "faces": [
+                                    {
+                                        "body_type": 0,
+                                        "body_index": 0,
+                                        "face_index": 0,
+                                    }
+                                ],
+                            },
+                            "persistent_reference": None,
+                            "native_interface_kind": None,
+                            "error": {
+                                "code": (
+                                    "cad_appearance_persistent_reference_missing"
+                                )
+                            },
+                        }
+                    ]
+                    with self.assertRaises(AppearanceError) as caught:
+                        resolve_deliverable_appearance(
+                            missing_feature_reference,
+                            component=COMPONENT,
+                            expected_document_path=DOCUMENT,
+                            expected_configuration=CONFIGURATION,
+                            face_spans=spans,
+                        )
+                    self.assertEqual(
+                        caught.exception.appearance["issues"][0]["code"],
+                        "cad_appearance_render_identity_unresolved",
+                    )
                 else:
                     with self.assertRaises(AppearanceError) as caught:
                         resolve_deliverable_appearance(
@@ -1036,6 +1327,80 @@ class AppearanceResolutionTests(unittest.TestCase):
                         caught.exception.appearance["issues"][0]["code"],
                         "cad_appearance_render_entity_ambiguous",
                     )
+
+    def test_same_feature_identity_cannot_have_conflicting_footprints(self):
+        raw = _resolved_raw([None, None])
+        raw["document"] = _layer(
+            owner_configuration=CONFIGURATION,
+            values=[0.0, 1.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+            has_values=True,
+        )
+        owner = _empty_state_owner(
+            scope="component_document",
+            document_path=DOCUMENT,
+            configuration=CONFIGURATION,
+            display_state="Display State 1",
+        )
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        owner["native_reference_index"] = [
+            _reference_row(
+                reference=(1, 2, 3),
+                target={
+                    "kind": "feature",
+                    "component": COMPONENT,
+                    "name": "Boss-Extrude1",
+                    "type_name": "Extrusion",
+                    "persistent_reference": [4, 5, 6],
+                    "faces": [
+                        {
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": face_index,
+                        }
+                    ],
+                },
+            )
+            for face_index in (0, 1)
+        ]
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Display State 1"],
+                "entities": ["feature"],
+                "entities_state": "observed",
+                "entity_records": [_state_entity_record()],
+                "primary_color": 0x000000FF,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        raw["state_render_materials"] = [owner]
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                raw,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=[
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": face_index,
+                        "triangle_start": face_index,
+                        "triangle_count": 1,
+                        "face_reference_sha256": str(face_index + 1) * 64,
+                    }
+                    for face_index in (0, 1)
+                ],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_entity_ambiguous",
+        )
 
     def test_exact_document_material_is_not_overridden_by_legacy_texture(self):
         raw = _resolved_raw([None, None])
@@ -1066,7 +1431,7 @@ class AppearanceResolutionTests(unittest.TestCase):
         owner["native_render_material_count"] = 1
         binding_context = _binding_context(
             owner_scope="component_document",
-            owner_document_path=r"C:\capture\parent.SLDASM",
+            owner_document_path=DOCUMENT,
             api=(
                 "IModelDoc2.GetPathName"
                 "+ConfigurationManager.ActiveConfiguration.Name"
@@ -1170,12 +1535,11 @@ class AppearanceResolutionTests(unittest.TestCase):
     def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
         for failure in (
             "persistent_reference",
-            "identity_map",
-            "unmapped_target",
+            "unmapped_target_with_mapping_error",
             "source_claim_without_index",
             "wrong_owner",
-            "reverse_conversion",
-            "missing_source_reference",
+            "conversion_in_owner",
+            "missing_owner_reference",
             "binding_api_mismatch",
         ):
             with self.subTest(failure=failure):
@@ -1209,20 +1573,10 @@ class AppearanceResolutionTests(unittest.TestCase):
                 )
                 owner["call_state"] = "observed"
                 owner["native_render_material_count"] = 1
-                entity = {
-                    "entity_index": 0,
-                    "native_object_type": "_CDispatch",
-                    "persistent_reference": [1, 2, 3],
-                    "binding_context": _binding_context(
-                        owner_scope="component_document",
-                        owner_document_path=DOCUMENT,
-                        api="IComponent2.GetCorresponding",
-                    ),
-                    "source_persistent_reference": [7, 8, 9],
-                    "source_read_errors": {},
-                    "native_identity": _native_identity("object"),
-                    "read_errors": {},
-                }
+                entity = _state_entity_record(
+                    kind="object",
+                    reference=(1, 2, 3),
+                )
                 if failure == "persistent_reference":
                     entity["persistent_reference"] = None
                     entity["read_errors"] = {
@@ -1230,7 +1584,19 @@ class AppearanceResolutionTests(unittest.TestCase):
                             "code": "cad_appearance_persistent_reference_missing"
                         }
                     }
-                elif failure == "identity_map":
+                elif failure == "unmapped_target_with_mapping_error":
+                    owner["native_reference_index"] = [
+                        _reference_row(
+                            reference=(9, 9, 9),
+                            target={
+                                "kind": "face",
+                                "component": COMPONENT,
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                            },
+                        )
+                    ]
                     owner["mapping_errors"] = [
                         {
                             "entity_kind": "faces",
@@ -1261,21 +1627,15 @@ class AppearanceResolutionTests(unittest.TestCase):
                     }
                 elif failure == "wrong_owner":
                     entity["binding_context"]["component"] = "other-1"
-                elif failure == "reverse_conversion":
+                elif failure == "conversion_in_owner":
                     entity["binding_context"]["api"] = (
                         "IComponent2.GetCorresponding"
                     )
-                    entity["native_identity"]["binding_context"]["api"] = (
-                        "IComponent2.GetCorresponding"
-                    )
-                    entity["native_identity"]["context"]["api"] = (
-                        "IComponent2.GetCorresponding"
-                    )
-                elif failure == "missing_source_reference":
-                    entity["source_persistent_reference"] = None
+                elif failure == "missing_owner_reference":
+                    entity["persistent_reference"] = None
                 elif failure == "binding_api_mismatch":
                     entity["binding_context"]["api"] = (
-                        "IModelDocExtension.GetPersistReference3"
+                        "IModelDoc2.GetPathName"
                     )
                 owner["materials"] = [
                     {
@@ -1314,6 +1674,13 @@ class AppearanceResolutionTests(unittest.TestCase):
                     caught.exception.appearance["issues"][0]["code"],
                     "cad_appearance_render_entity_binding_unproven",
                 )
+                if failure == "unmapped_target_with_mapping_error":
+                    self.assertEqual(
+                        caught.exception.appearance["issues"][0][
+                            "mapping_errors"
+                        ],
+                        owner["mapping_errors"],
+                    )
 
     def test_source_render_material_uses_colorref_decode(self):
         raw = _resolved_raw(
@@ -1342,20 +1709,10 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "entities": ["native-face"],
                         "entities_state": "observed",
                         "entity_records": [
-                            {
-                                "entity_index": 0,
-                                "native_object_type": "IFace2",
-                                "persistent_reference": [1, 2, 3],
-                                "binding_context": _binding_context(
-                                    owner_scope="component_document",
-                                    owner_document_path=DOCUMENT,
-                                    api="IComponent2.GetCorrespondingEntity",
-                                ),
-                                "source_persistent_reference": [7, 8, 9],
-                                "source_read_errors": {},
-                                "native_identity": _native_identity("entity"),
-                                "read_errors": {},
-                            }
+                            _state_entity_record(
+                                kind="entity",
+                                reference=(1, 2, 3),
+                            )
                         ],
                         "primary_color": 0x00AABBCC,
                         "transparency": 0.25,
@@ -1367,18 +1724,13 @@ class AppearanceResolutionTests(unittest.TestCase):
                 ],
                 "mapping_errors": [],
                 "native_reference_index": [
-                    {
-                        "persistent_reference": [1, 2, 3],
-                        "binding_context": _binding_context(
-                            owner_scope="component_document",
-                            owner_document_path=DOCUMENT,
-                            api="IComponent2.GetCorrespondingEntity",
-                        ),
-                        "target": {
+                    _reference_row(
+                        reference=(1, 2, 3),
+                        target={
                             "kind": "occurrence",
                             "component": COMPONENT,
                         },
-                    }
+                    )
                 ],
                 "read_errors": {},
             }
