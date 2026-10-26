@@ -546,6 +546,70 @@ class AppearanceResolutionTests(unittest.TestCase):
                     "cad_appearance_render_enumeration_failed",
                 )
 
+    def test_observed_material_row_count_must_match_native_count(self):
+        raw = _resolved_raw(
+            [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
+        )
+        owner = _empty_state_owner(
+            scope="component_document",
+            document_path=DOCUMENT,
+            configuration=CONFIGURATION,
+            display_state="Display State 1",
+        )
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 2
+        owner["native_reference_index"] = [
+            {
+                "persistent_reference": [1, 2, 3],
+                "target": {"kind": "occurrence", "component": COMPONENT},
+            }
+        ]
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Display State 1"],
+                "entities": ["entity"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "_CDispatch",
+                        "persistent_reference": [1, 2, 3],
+                        "matched_identity": {},
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x000000FF,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        raw["state_render_materials"] = [owner]
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                raw,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=[
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "triangle_start": 0,
+                        "triangle_count": 1,
+                        "face_reference_sha256": "a" * 64,
+                    }
+                ],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_material_count_mismatch",
+        )
+
     def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
         for failure in (
             "persistent_reference",

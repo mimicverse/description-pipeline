@@ -885,6 +885,28 @@ def resolve_deliverable_appearance(
                 owner_path,
                 "an observed render-material call carries no material rows",
             )
+        if (
+            owner.get("call_state") == "observed"
+            and owner.get("native_render_material_count")
+            != len(owner["materials"])
+        ) or (
+            owner.get("call_state") == "empty"
+            and owner.get("native_render_material_count") != 0
+        ):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_render_material_count_mismatch",
+                owner_path + ".native_render_material_count",
+                "the native render-material count disagrees with the material rows",
+                native_render_material_count=owner.get(
+                    "native_render_material_count"
+                ),
+                material_rows=(
+                    len(owner["materials"])
+                    if isinstance(owner.get("materials"), list)
+                    else None
+                ),
+            )
         reference_index: dict[tuple[int, ...], list[Mapping[str, Any]]] = {}
         for index_position, indexed in enumerate(
             owner["native_reference_index"]

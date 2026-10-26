@@ -344,6 +344,18 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             or (owner["call_state"] == "observed" and bool(owner["materials"])),
             f"{owner_path} call state and material rows disagree",
         )
+        _require(
+            (
+                owner["call_state"] == "observed"
+                and owner["native_render_material_count"]
+                == len(owner["materials"])
+            )
+            or (
+                owner["call_state"] == "empty"
+                and owner["native_render_material_count"] == 0
+            ),
+            f"{owner_path} native material count disagrees with material rows",
+        )
         reference_index = {}
         for index_position, indexed in enumerate(
             owner["native_reference_index"]
