@@ -708,9 +708,18 @@ function Get-ProcessOwnerSid($Process) {
   }
   return [string]$ownerSid.Sid
 }
+function Get-ListenerConnections([int]$Port) {
+  return @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
+}
+function Get-ListenerProcesses {
+  return @(Get-CimInstance Win32_Process -ErrorAction Stop)
+}
+function Get-ScheduleService {
+  return @(Get-CimInstance Win32_Service -Filter "Name='Schedule'" -ErrorAction Stop)
+}
 function Get-ListenerEvidence([object]$binding, $TaskProjection) {
   try {
-    $listeners = @(Get-NetTCPConnection -LocalPort ([int]$binding.port) -State Listen -ErrorAction Stop)
+    $listeners = @(Get-ListenerConnections ([int]$binding.port))
   } catch {
     if (Test-NetTcpNoMatchError $_) { $listeners = @() } else { throw }
   }
@@ -734,7 +743,11 @@ function Get-ListenerEvidence([object]$binding, $TaskProjection) {
   if (-not (Test-ActionConfigArgument $actionArguments $configPath)) {
     Die 'windows_listener_identity_mismatch' 'the projected task action names another configuration'
   }
-  $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+  try {
+    $processes = @(Get-ListenerProcesses)
+  } catch {
+    Die 'windows_listener_identity_mismatch' 'the process inventory is unavailable'
+  }
   $listenerMatches = @($processes | Where-Object {
     [int]$_.ProcessId -eq $listenerPid
   })
@@ -807,7 +820,7 @@ function Get-ListenerEvidence([object]$binding, $TaskProjection) {
     Die 'windows_listener_identity_mismatch' 'the task-action launcher parent is not the Task Scheduler host'
   }
   try {
-    $schedulerServices = @(Get-CimInstance Win32_Service -Filter "Name='Schedule'" -ErrorAction Stop)
+    $schedulerServices = @(Get-ScheduleService)
   } catch {
     Die 'windows_listener_identity_mismatch' 'the Task Scheduler service is unavailable'
   }

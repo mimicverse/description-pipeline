@@ -253,7 +253,9 @@ Remove-Item -LiteralPath $startupRoot -Recurse -Force -ErrorAction SilentlyConti
 
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
-  'Get-TaskGeneration', 'Get-ListenerEvidence', 'Get-ProcessOwnerSid', 'Get-EndpointIdentity',
+  'Get-TaskGeneration', 'Get-ListenerEvidence', 'Get-ListenerConnections',
+  'Get-ListenerProcesses', 'Get-ScheduleService', 'Get-ProcessOwnerSid',
+  'Get-EndpointIdentity',
   'Read-EndpointRuntimeProbe',
   'New-EndpointSourceState', 'Assert-EndpointSourceMatch', 'Assert-HealthSourceMatch',
   'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
@@ -1181,16 +1183,15 @@ function Reset-ListenerProcesses([string]$Scenario = 'valid') {
   $script:ListenerProcesses = @($scheduler, $launcher, $listener) +
     @(if ($extraLauncher) { $extraLauncher })
 }
-function Get-NetTCPConnection {
-  [CmdletBinding()] param([int]$LocalPort, [string]$State)
+function Get-ListenerConnections {
+  param([int]$Port)
   return @($script:ListenerPorts)
 }
-function Get-CimInstance {
-  [CmdletBinding()] param([string]$ClassName, [string]$Filter)
-  if ($ClassName -eq 'Win32_Service') {
-    return @($script:SchedulerService)
-  }
+function Get-ListenerProcesses {
   return @($script:ListenerProcesses)
+}
+function Get-ScheduleService {
+  return @($script:SchedulerService)
 }
 function Get-ProcessOwnerSid {
   param($Process)
