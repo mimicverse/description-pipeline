@@ -294,7 +294,7 @@ start、stop、health 和 recovery。triggerer 缺失、版本不符、未运行
     三角形、错误 occurrence/configuration/source scope、face span 遗漏或重叠、
     错误 placement 和 STL 派生字节。独立 consumer 必须从 raw 复算并拒绝，保留
     primary 错误及 partial facts；正例覆盖合法原生读取、释放后的离线转换和原值复核。
-    raw/STL 一致性不替代最终工程验证及 50 µm 参考几何资格。
+    raw/STL 一致性不替代当前 CAD 的独立工程验证。
 
 保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
