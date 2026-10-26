@@ -132,7 +132,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             airflow_effect_trigger,
             "_native_probe_from_environment",
-            return_value=(client, expected),
+            return_value=(client, expected, Mock()),
         ):
             hint = await probe_effect_wait(wait)
 
@@ -142,6 +142,49 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
         client.create_operation.assert_not_called()
         client.upload_input.assert_not_called()
         client.cancel_operation.assert_not_called()
+
+    async def test_native_probe_records_activity_without_making_it_state_authority(
+        self,
+    ) -> None:
+        wait = _wait()
+        activity = {
+            "seq": 1,
+            "at": "2026-10-26T02:00:00Z",
+            "phase": "capture",
+            "action": "readings",
+            "current_object": "cad/robot.SLDASM",
+            "completed": 1,
+            "total": 3,
+            "unit": "documents",
+        }
+        view = SimpleNamespace(
+            operation_id="operation-capture",
+            state="running",
+            resource_terminated=False,
+            activity=activity,
+        )
+        expected = SimpleNamespace(
+            operation_id="operation-capture",
+            require=Mock(return_value=view),
+        )
+        client = Mock()
+        client.get_operation.return_value = view
+        facts = Mock()
+
+        with patch.object(
+            airflow_effect_trigger,
+            "_native_probe_from_environment",
+            return_value=(client, expected, facts),
+        ):
+            hint = await probe_effect_wait(wait)
+
+        self.assertFalse(hint.changed)
+        facts.record_run_activity.assert_called_once_with(
+            wait.run_id,
+            "operation-capture",
+            activity,
+            terminal=False,
+        )
 
     async def test_poll_reuses_one_exact_identity_loader(self) -> None:
         wait = _wait()
@@ -155,7 +198,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
         )
         client = Mock()
         client.get_operation.side_effect = [None, terminal]
-        loader = Mock(return_value=(client, expected))
+        loader = Mock(return_value=(client, expected, Mock()))
 
         with (
             patch.object(
@@ -214,7 +257,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 airflow_effect_trigger,
                 "_native_probe_from_environment",
-                return_value=(client, expected),
+                return_value=(client, expected, Mock()),
             ),
             patch.object(
                 airflow_effect_trigger.asyncio,
@@ -251,7 +294,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(
                         airflow_effect_trigger,
                         "_native_probe_from_environment",
-                        return_value=(client, expected),
+                        return_value=(client, expected, Mock()),
                     ),
                     self.assertRaises(NativeOperationClientError),
                 ):
@@ -276,7 +319,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 airflow_effect_trigger,
                 "_native_probe_from_environment",
-                return_value=(client, expected),
+                return_value=(client, expected, Mock()),
             ),
             self.assertRaises(NativeOperationIdentityConflict),
         ):
@@ -300,7 +343,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 airflow_effect_trigger,
                 "_native_probe_from_environment",
-                return_value=(client, expected),
+                return_value=(client, expected, Mock()),
             ),
             self.assertRaises(NativeOperationClientConflict),
         ):
@@ -333,7 +376,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 airflow_effect_trigger,
                 "_native_probe_from_environment",
-                return_value=(client, expected),
+                return_value=(client, expected, Mock()),
             ),
             self.assertRaises(NativeOperationClientConflict),
         ):
@@ -369,7 +412,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(
                     airflow_effect_trigger,
                     "_native_probe_from_environment",
-                    return_value=(client, expected),
+                    return_value=(client, expected, Mock()),
                 ):
                     hint = await probe_effect_wait(wait)
                 self.assertFalse(hint.changed)

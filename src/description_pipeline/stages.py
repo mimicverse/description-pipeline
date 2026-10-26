@@ -401,6 +401,8 @@ def activity_view(job) -> dict:
             view["counts"] = counts
 
     final = job.get("activity_final") if isinstance(job.get("activity_final"), dict) else None
+    if final is None and isinstance(job.get("activity"), dict):
+        final = job["activity"]
     if status in {"passed", "failed", "native_complete"}:
         view["state"] = "finished"
         if final is not None or view["recent"]:

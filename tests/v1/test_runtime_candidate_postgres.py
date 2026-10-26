@@ -73,9 +73,31 @@ from description_pipeline.platform.facts import (
     FactStore,
     FactStoreError,
 )
+from description_pipeline.orchestration.native_operation_client import (
+    NativeOperationClient,
+    NativeOperationEndpoint,
+)
+from description_pipeline.orchestration.native_operation_runtime import (
+    CAPTURE_KIND,
+    CaptureOperationExecutor,
+    NativeOperationRuntime,
+)
+from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
+from description_pipeline.orchestration.windows import handler as windows_handler
+from description_pipeline.platform.queries import read_run_projection
+from description_pipeline.sources.solidworks.revision import package_inventory
+from description_pipeline.orchestration.discover_protocol import seal_source_archive
+from description_pipeline.orchestration.portal import PortalApp
+from description_pipeline.stages import activity_view
+from tests.v1.test_native_operations import (
+    NATIVE_TOOL,
+    TOKEN,
+    _operation,
+)
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     DISCOVER_RESULT_SCHEMA,
+    RUN_ACTIVITY_SCHEMA,
     STAGE_RESULT_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
     VERIFY_REQUEST_SCHEMA,
@@ -2261,6 +2283,260 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "decision commit response lost",
             (workspaces[0] / "engine-unhandled-failure.json").read_text(encoding="utf-8"),
         )
+
+    def test_runtime_activity_reaches_portal_without_becoming_stage_authority(self) -> None:
+        package = Path(self.directory.name) / "activity-package"
+        package_files = {
+            "cad/robot.SLDASM": b"prepared assembly",
+            "source.json": b"prepared source",
+        }
+        for relative, payload in package_files.items():
+            path = package / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        prepared_files = package_inventory(package)
+        archive = seal_source_archive(
+            package,
+            prepared_files,
+            Path(self.directory.name) / "activity-input.zip",
+        )
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def transaction(_package, output, **kwargs):
+            kwargs["on_activity"](
+                {
+                    "phase": "capture",
+                    "action": "readings",
+                    "current_object": "cad/robot.SLDASM",
+                    "completed": 1,
+                    "total": 3,
+                    "unit": "documents",
+                }
+            )
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("activity executor was not released")
+            output = Path(output)
+            output.mkdir(parents=True)
+            (output / CAPTURE_ARCHIVE).write_bytes(b"activity artifact")
+            return {
+                "native_complete": True,
+                "capture_archive": {"name": CAPTURE_ARCHIVE},
+                "resource_settlement": {"settled": True},
+            }
+
+        runtime = NativeOperationRuntime(
+            state_root=Path(self.directory.name) / "activity-runtime",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={
+                CAPTURE_KIND: CaptureOperationExecutor(
+                    transaction=transaction,
+                )
+            },
+            install_id="win-" + "e" * 32,
+        )
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            windows_handler(runtime, TOKEN),
+        )
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        server_thread.start()
+        self.addCleanup(runtime.close)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server_thread.join, 5)
+        host, port = server.server_address[:2]
+        client = NativeOperationClient(
+            NativeOperationEndpoint(f"http://{host}:{port}", TOKEN),
+            target_id=runtime.target_identity.target_id,
+            sleeper=lambda _seconds: time.sleep(0.01),
+        )
+        operation_id = "operation-activity"
+        envelope = _operation(
+            operation_id,
+            archive,
+            target_id=runtime.target_identity.target_id,
+            package_files=prepared_files,
+        )
+        decisions_before = self._query(
+            "SELECT count(*) FROM stage_decision"
+        )[0][0]
+        effects_before = self._query("SELECT count(*) FROM effect_fact")[0][0]
+        display_before = self.facts.rename_run(
+            self.admission.run_id,
+            "activity display",
+        )
+
+        client.create_operation(envelope)
+        client.upload_input(operation_id, archive)
+        self.assertTrue(entered.wait(5))
+
+        terminal = {}
+
+        def poll() -> None:
+            try:
+                terminal["view"] = client.wait_for_terminal(
+                    operation_id,
+                    timeout=5,
+                    poll_interval=0.01,
+                    on_observation=lambda view: self.facts.record_run_activity(
+                        self.admission.run_id,
+                        view.operation_id,
+                        view.activity,
+                        terminal=view.state
+                        in {"satisfied", "failed", "cancelled", "unknown"},
+                    ),
+                )
+            except BaseException as error:
+                terminal["error"] = error
+
+        poll_thread = threading.Thread(target=poll, daemon=True)
+        poll_thread.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            row = self._query(
+                "SELECT activity FROM run_display_metadata WHERE run_id = %s",
+                (self.admission.run_id,),
+            )
+            if row and row[0][0] is not None:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail(
+                "native activity was not projected into run_display_metadata: "
+                f"events={runtime._events(operation_id)!r} terminal={terminal!r}"
+            )
+
+        projection = read_run_projection(
+            self._connect(),
+            self.admission.run_id,
+            artifacts=self.artifacts,
+        )
+        self.assertEqual(projection["activity"]["current"]["action"], "readings")
+        display = self._query(
+            "SELECT display_name, updated_at, activity "
+            "FROM run_display_metadata WHERE run_id = %s",
+            (self.admission.run_id,),
+        )[0]
+        self.assertEqual(display[0], "activity display")
+        self.assertEqual(display[1], display_before.updated_at)
+        self.assertEqual(display[2]["schema_version"], RUN_ACTIVITY_SCHEMA)
+        self.assertEqual(display[2]["operation_id"], operation_id)
+        self.assertIsInstance(display[2]["source_seq"], int)
+        self.assertGreater(display[2]["source_seq"], 0)
+        self.assertEqual(display[2]["current"]["action"], "readings")
+        self.assertIsNone(display[2]["final"])
+        projection["state"] = "running"
+        job = PortalApp._fact_display_job(
+            object.__new__(PortalApp),
+            projection,
+        )
+        self.assertIsNotNone(job)
+        view = activity_view(job)
+        self.assertTrue(view["available"])
+        self.assertEqual(view["state"], "busy")
+        self.assertEqual(view["action"]["code"], "capture.readings")
+        self.assertEqual(view["object"], "cad/robot.SLDASM")
+        self.assertEqual(
+            view["counts"],
+            {"done": 1, "total": 3, "unit": "documents"},
+        )
+        stored = display[2]
+        same_source = {
+            "seq": stored["source_seq"],
+            "at": stored["current"]["updated_at"],
+            "phase": "capture",
+            "action": "mesh",
+        }
+        self.facts.record_run_activity(
+            self.admission.run_id,
+            operation_id,
+            same_source,
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT activity->'current'->>'action' "
+                "FROM run_display_metadata WHERE run_id = %s",
+                (self.admission.run_id,),
+            )[0][0],
+            "readings",
+        )
+        self.facts.record_run_activity(
+            self.admission.run_id,
+            "operation-after",
+            {
+                "seq": 1,
+                "at": "2026-10-26T04:00:00Z",
+                "phase": "capture",
+                "action": "mesh",
+            },
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT activity->>'operation_id' "
+                "FROM run_display_metadata WHERE run_id = %s",
+                (self.admission.run_id,),
+            )[0][0],
+            "operation-after",
+        )
+        self.facts.record_run_activity(
+            self.admission.run_id,
+            operation_id,
+            {
+                "seq": stored["source_seq"],
+                "at": stored["current"]["updated_at"],
+                "phase": "capture",
+                "action": "readings",
+            },
+            terminal=True,
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT activity->>'operation_id' "
+                "FROM run_display_metadata WHERE run_id = %s",
+                (self.admission.run_id,),
+            )[0][0],
+            "operation-after",
+        )
+        self.facts.record_run_activity(
+            self.admission.run_id,
+            operation_id,
+            {
+                "seq": stored["source_seq"] + 1,
+                "at": "2026-10-26T04:00:01Z",
+                "phase": "capture",
+                "action": "readings",
+                "current_object": "cad/robot.SLDASM",
+                "completed": 1,
+                "total": 3,
+                "unit": "documents",
+            },
+        )
+        self.assertEqual(
+            self._query("SELECT count(*) FROM stage_decision")[0][0],
+            decisions_before,
+        )
+        self.assertEqual(
+            self._query("SELECT count(*) FROM effect_fact")[0][0],
+            effects_before,
+        )
+
+        release.set()
+        poll_thread.join(5)
+        self.assertFalse(poll_thread.is_alive())
+        self.assertNotIn("error", terminal)
+        self.assertEqual(terminal["view"].state, "satisfied")
+        final_projection = read_run_projection(
+            self._connect(),
+            self.admission.run_id,
+            artifacts=self.artifacts,
+        )
+        self.assertEqual(final_projection["activity"]["final"]["action"], "readings")
 
     def test_expected_executor_drift_stops_before_handler_execution(self) -> None:
         wrong_tool = digest({"tool": "other-release"})

@@ -288,6 +288,17 @@ def read_run_projection(
         if admission is None:
             raise PipelineError(f"Run {run_id!r} is not admitted")
         cursor.execute(
+            "SELECT activity FROM run_display_metadata WHERE run_id = %s",
+            (run_id,),
+        )
+        activity_row = cursor.fetchone()
+        activity = (
+            activity_row[0]
+            if activity_row is not None
+            and isinstance(activity_row[0], Mapping)
+            else None
+        )
+        cursor.execute(
             """
             SELECT command_id, run_id, kind, stage, request, request_digest,
                    idempotency_key, config_snapshot_sha256, contract_sha256,
@@ -698,6 +709,7 @@ def read_run_projection(
         "stages": stage_rows,
         "by_stage": by_stage,
         "members": members,
+        "activity": activity,
         "technical": {
             "commands": list(commands.values()),
             "claims": technical_claims,

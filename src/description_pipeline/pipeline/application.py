@@ -8,7 +8,7 @@ import stat
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1532,6 +1532,18 @@ def application_from_environment(
         transfer_resume_gate=_transfer_resume_gate_from_environment(source),
     )
     client = native_operation_client
+
+    def record_native_activity(run_id: str, view) -> None:
+        if getattr(view, "activity", None) is not None:
+            with suppress(Exception):
+                facts.record_run_activity(
+                    run_id,
+                    view.operation_id,
+                    view.activity,
+                    terminal=view.state
+                    in {"satisfied", "failed", "cancelled", "unknown"},
+                )
+
     if discover_adapter is None or capture_handler is None:
         client = (
             native_operation_client
@@ -1548,6 +1560,7 @@ def application_from_environment(
                     client,
                     native_tool=None,
                     tool_provider=tool_provider,
+                    on_observation=record_native_activity,
                 ),
                 artifacts=artifacts,
             )
@@ -1556,6 +1569,7 @@ def application_from_environment(
                 client,
                 artifact_store=artifacts,
                 tool_provider=tool_provider,
+                on_observation=record_native_activity,
             )
     adapters = dict(reconciliation_adapters or {})
     if client is not None:
