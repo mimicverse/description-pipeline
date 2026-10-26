@@ -1238,6 +1238,34 @@ def resolve_deliverable_appearance(
                         if isinstance(native_identity, Mapping)
                         else None
                     )
+                    entity_key = _persistent_reference_key(
+                        entity.get("persistent_reference")
+                    )
+                    context_details = (
+                        native_identity.get("context")
+                        if isinstance(native_identity, Mapping)
+                        else None
+                    )
+                    target_attempt = (
+                        context_details.get("target_reference_attempt")
+                        if isinstance(context_details, Mapping)
+                        else None
+                    )
+                    target_attempt_reference = (
+                        _persistent_reference_key(
+                            target_attempt.get("persistent_reference")
+                        )
+                        if isinstance(target_attempt, Mapping)
+                        else None
+                    )
+                    target_reference_proven = (
+                        entity_key is not None
+                        and isinstance(target_attempt, Mapping)
+                        and target_attempt.get("api")
+                        == OWNER_CONTEXT_BINDING_API
+                        and target_attempt.get("error") is None
+                        and target_attempt_reference == entity_key
+                    )
                     source_context = (
                         native_identity.get("source_context")
                         if isinstance(native_identity, Mapping)
@@ -1248,25 +1276,20 @@ def resolve_deliverable_appearance(
                         if isinstance(source_context, Mapping)
                         else None
                     )
-                    if (
-                        not isinstance(source_context, Mapping)
-                        or not isinstance(source_context.get("api"), str)
-                        or not source_context.get("api")
-                        or source_context.get("component") != component
-                        or not isinstance(
+                    if target_reference_proven:
+                        expected_api = OWNER_CONTEXT_BINDING_API
+                    elif (
+                        isinstance(source_context, Mapping)
+                        and source_state == "document"
+                        and isinstance(source_context.get("api"), str)
+                        and source_context.get("api")
+                        and source_context.get("component") == component
+                        and isinstance(
                             source_context.get("read_errors"),
                             Mapping,
                         )
-                        or source_context.get("read_errors")
+                        and not source_context.get("read_errors")
                     ):
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_binding_unproven",
-                            entity_path + ".native_identity.source_context",
-                            "the material source context is incomplete",
-                            observed=source_context,
-                        )
-                    if source_state == "document":
                         expected_api = (
                             COMPONENT_ENTITY_BINDING_API
                             if identity_kind == "entity"
@@ -1274,8 +1297,6 @@ def resolve_deliverable_appearance(
                             if identity_kind == "object"
                             else None
                         )
-                    elif source_state == "assembly":
-                        expected_api = OWNER_CONTEXT_BINDING_API
                     else:
                         expected_api = None
                     if (
@@ -1293,12 +1314,10 @@ def resolve_deliverable_appearance(
                                 "api": entity["binding_context"].get("api"),
                                 "reference_api": context_key[3],
                                 "source_context": source_context,
+                            "target_reference_attempt": target_attempt,
                             },
                             expected=expected_api,
                         )
-                    entity_key = _persistent_reference_key(
-                        entity.get("persistent_reference")
-                    )
                     if entity_key is None or entity["read_errors"]:
                         raise _appearance_resolution_error(
                             component,

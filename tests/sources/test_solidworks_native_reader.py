@@ -2488,6 +2488,16 @@ class AppearanceRawTests(unittest.TestCase):
                 children=[component],
                 display_states=["TopState"],
             )
+            main_reference = main.Extension.GetPersistReference3
+
+            def main_persistent_reference(entity):
+                if entity is material_face:
+                    raise RuntimeError(
+                        "document entity has no assembly-context reference"
+                    )
+                return main_reference(entity)
+
+            main.Extension.GetPersistReference3 = main_persistent_reference
             main.Extension.GetRenderMaterials2 = (
                 lambda option, names: top_render_material_calls.append(
                     (option, names)
@@ -3497,6 +3507,43 @@ class AppearanceHelperTests(unittest.TestCase):
             observed["persistent_reference"],
             list(document_face._persist_reference),
         )
+        direct_context, direct_reference = (
+            native_module.SolidWorksBackend._appearance_corresponding_reference(
+                document_face,
+                source_reference=list(
+                    document_face._persist_reference
+                ),
+                source_error=None,
+                source_context={
+                    "api": "IEntity.GetComponent",
+                    "state": "not_assembly",
+                    "read_errors": {},
+                },
+                native_interface_kind="IEntity",
+                owner_scope="component_document",
+                primary_component=types.SimpleNamespace(
+                    GetCorrespondingEntity=_raiser(
+                        AssertionError(
+                            "a successful target-owner reference is direct proof"
+                        )
+                    )
+                ),
+                extension=types.SimpleNamespace(
+                    GetPersistReference3=lambda entity: list(
+                        entity._persist_reference
+                    )
+                ),
+            )
+        )
+        self.assertEqual(direct_context["state"], "observed")
+        self.assertEqual(
+            direct_context["api"],
+            "IModelDocExtension.GetPersistReference3",
+        )
+        self.assertEqual(
+            direct_reference,
+            list(document_face._persist_reference),
+        )
 
         null_without_document_reference = (
             native_module._appearance_material_source_context(
@@ -3856,10 +3903,18 @@ class AppearanceHelperTests(unittest.TestCase):
                 AssertionError("IEntity must use GetCorrespondingEntity")
             ),
         )
+        def corresponding_reference(entity):
+            if entity._persist_reference in {
+                b"part-face",
+                b"part-feature",
+            }:
+                raise RuntimeError(
+                    "part entity has no assembly-context reference"
+                )
+            return list(entity._persist_reference)
+
         corresponding_extension = types.SimpleNamespace(
-            GetPersistReference3=lambda entity: list(
-                entity._persist_reference
-            )
+            GetPersistReference3=corresponding_reference
         )
         converted = backend._appearance_entity_context(
             part_entity,
@@ -4345,11 +4400,16 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             ),
         )
         parent_reference_calls = []
+        def parent_reference(entity):
+            parent_reference_calls.append(entity)
+            if entity is source_face:
+                raise RuntimeError(
+                    "document entity has no parent-context reference"
+                )
+            return list(entity._persist_reference)
+
         parent_extension = types.SimpleNamespace(
-            GetPersistReference3=lambda entity: parent_reference_calls.append(
-                entity
-            )
-            or list(entity._persist_reference)
+            GetPersistReference3=parent_reference
         )
         top_extension = types.SimpleNamespace(
             GetPersistReference3=_raiser(
@@ -4437,7 +4497,10 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             entity["binding_context"]["owner_document_path"],
             "C:\\parent.SLDASM",
         )
-        self.assertEqual(parent_reference_calls, [assembly_face])
+        self.assertEqual(
+            parent_reference_calls,
+            [source_face, assembly_face],
+        )
 
     def test_top_parent_and_leaf_use_their_own_configuration_and_state(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -4641,10 +4704,24 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         )
         extension.GetRenderMaterialsCount2 = lambda _option, _names: 1
         owner_document = types.SimpleNamespace(Extension=extension)
+        source_faces = (
+            face_a,
+            alias_face_a,
+            face_b,
+            failing_face,
+            null_reference_face,
+            invalid_reference_face,
+        )
+
+        def context_reference(entity):
+            if any(entity is source for source in source_faces):
+                raise RuntimeError(
+                    "document entity has no assembly-context reference"
+                )
+            return list(entity._persist_reference)
+
         context_extension = types.SimpleNamespace(
-            GetPersistReference3=lambda entity: list(
-                entity._persist_reference
-            )
+            GetPersistReference3=context_reference
         )
         top_document = types.SimpleNamespace(
             Extension=context_extension
@@ -6569,7 +6646,11 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
 class _LinkMassProperty:
     """Fake IMassProperty2 for the direct link group reader."""
 
+    _next_sequence = 0
+
     def __init__(self, state, reads, getter_calls=None):
+        type(self)._next_sequence += 1
+        self._sequence = type(self)._next_sequence
         self.UseSystemUnits = None
         self.IncludeHiddenBodiesOrComponents = None
         self.SelectedItems = None
@@ -6602,7 +6683,7 @@ class _LinkMassProperty:
 
     def GetMomentOfInertia(self, kind):
         if self._getter_calls is not None:
-            self._getter_calls.append((id(self), kind))
+            self._getter_calls.append((self._sequence, kind))
         if kind == 0:
             return [value for row in self._tensor for value in row]
         if self._origin_error is not None:

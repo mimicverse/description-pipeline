@@ -621,6 +621,34 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         if isinstance(native_identity, Mapping)
                         else None
                     )
+                    entity_key = _persistent_reference_key(
+                        entity.get("persistent_reference")
+                    )
+                    context_details = (
+                        native_identity.get("context")
+                        if isinstance(native_identity, Mapping)
+                        else None
+                    )
+                    target_attempt = (
+                        context_details.get("target_reference_attempt")
+                        if isinstance(context_details, Mapping)
+                        else None
+                    )
+                    target_attempt_reference = (
+                        _persistent_reference_key(
+                            target_attempt.get("persistent_reference")
+                        )
+                        if isinstance(target_attempt, Mapping)
+                        else None
+                    )
+                    target_reference_proven = (
+                        entity_key is not None
+                        and isinstance(target_attempt, Mapping)
+                        and target_attempt.get("api")
+                        == OWNER_CONTEXT_BINDING_API
+                        and target_attempt.get("error") is None
+                        and target_attempt_reference == entity_key
+                    )
                     source_context = (
                         native_identity.get("source_context")
                         if isinstance(native_identity, Mapping)
@@ -631,8 +659,11 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         if isinstance(source_context, Mapping)
                         else None
                     )
-                    _require(
+                    if target_reference_proven:
+                        expected_api = OWNER_CONTEXT_BINDING_API
+                    elif (
                         isinstance(source_context, Mapping)
+                        and source_state == "document"
                         and isinstance(source_context.get("api"), str)
                         and bool(source_context.get("api"))
                         and source_context.get("component") == component
@@ -640,10 +671,8 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                             source_context.get("read_errors"),
                             Mapping,
                         )
-                        and not source_context.get("read_errors"),
-                        f"{entity_path} source context is incomplete",
-                    )
-                    if source_state == "document":
+                        and not source_context.get("read_errors")
+                    ):
                         expected_api = (
                             COMPONENT_ENTITY_BINDING_API
                             if identity_kind == "entity"
@@ -651,8 +680,6 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                             if identity_kind == "object"
                             else None
                         )
-                    elif source_state == "assembly":
-                        expected_api = OWNER_CONTEXT_BINDING_API
                     else:
                         expected_api = None
                     _require(
@@ -661,9 +688,6 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         and entity["binding_context"].get("api")
                         == expected_api,
                         f"{entity_path} native binding API is inconsistent",
-                    )
-                    entity_key = _persistent_reference_key(
-                        entity.get("persistent_reference")
                     )
                     _require(
                         entity_key is not None and not entity["read_errors"],

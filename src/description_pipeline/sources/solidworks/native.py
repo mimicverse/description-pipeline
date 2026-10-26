@@ -5201,38 +5201,39 @@ class SolidWorksBackend(CadBackend):
             if isinstance(source_context, Mapping)
             else None
         )
-        if context_state not in {"assembly", "document"}:
-            record["read_errors"]["source_context"] = {
-                "code": "cad_appearance_source_context_unproven",
-                "message": (
-                    "the native source object context is not positively proven"
-                ),
-                "detail": copy.deepcopy(source_context),
-            }
-            return record, None
-        if context_state == "assembly":
-            if extension is None:
-                record["read_errors"]["corresponding_owner"] = {
-                    "code": "cad_appearance_owner_unavailable",
-                    "message": (
-                        "the assembly document extension is unavailable"
-                    ),
-                    "detail": {},
-                }
-                return record, None
-            reference, error = _appearance_persistent_reference(
-                extension,
-                entity,
-            )
-            record["api"] = "IModelDocExtension.GetPersistReference3"
-            record["persistent_reference"] = reference
-            if error is not None:
-                record["read_errors"]["persistent_reference"] = copy.deepcopy(
-                    error
+        target_reference = None
+        target_error = None
+        if extension is not None:
+            target_reference, target_error = (
+                _appearance_persistent_reference(
+                    extension,
+                    entity,
                 )
-                return record, None
+            )
+        record["target_reference_attempt"] = {
+            "api": "IModelDocExtension.GetPersistReference3",
+            "persistent_reference": copy.deepcopy(target_reference),
+            "error": copy.deepcopy(target_error),
+        }
+        if target_reference is not None and target_error is None:
+            record["api"] = "IModelDocExtension.GetPersistReference3"
+            record["persistent_reference"] = target_reference
             record["state"] = "observed"
-            return record, reference
+            return record, target_reference
+        if context_state != "document":
+            if target_error is not None:
+                record["read_errors"]["persistent_reference"] = copy.deepcopy(
+                    target_error
+                )
+            else:
+                record["read_errors"]["source_context"] = {
+                    "code": "cad_appearance_source_context_unproven",
+                    "message": (
+                        "the native source object context is not positively proven"
+                    ),
+                    "detail": copy.deepcopy(source_context),
+                }
+            return record, None
         if primary_component is None:
             error = {
                 "code": "cad_appearance_component_unavailable",
@@ -5382,19 +5383,6 @@ class SolidWorksBackend(CadBackend):
                     entity,
                 )
             )
-            if (
-                source_error is not None
-                and native_interface_kind != "IEntity"
-                and source_context.get("state") != "assembly"
-            ):
-                mapping_errors.append(
-                    {
-                        "entity_kind": kind,
-                        "identity": copy.deepcopy(identity),
-                        "error": copy.deepcopy(source_error),
-                    }
-                )
-                return
             context, reference = SolidWorksBackend._appearance_corresponding_reference(
                 entity,
                 source_reference=source_reference,

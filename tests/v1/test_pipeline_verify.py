@@ -758,6 +758,15 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                 "component": "arm-1",
                                 "read_errors": {},
                             },
+                            "context": {
+                                "target_reference_attempt": {
+                                    "api": (
+                                        "IModelDocExtension.GetPersistReference3"
+                                    ),
+                                    "persistent_reference": [4, 5, 6],
+                                    "error": None,
+                                }
+                            },
                             "read_errors": {},
                         },
                         "matched_identity": {

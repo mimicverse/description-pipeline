@@ -155,8 +155,12 @@ def _binding_context(
     }
 
 
-def _native_identity(kind: str, state: str = "document"):
-    return {
+def _native_identity(
+    kind: str,
+    state: str = "document",
+    target_reference=None,
+):
+    identity = {
         "kind": kind,
         "state": "observed",
         "source_context": {
@@ -167,6 +171,15 @@ def _native_identity(kind: str, state: str = "document"):
         },
         "read_errors": {},
     }
+    if target_reference is not None:
+        identity["context"] = {
+            "target_reference_attempt": {
+                "api": "IModelDocExtension.GetPersistReference3",
+                "persistent_reference": list(target_reference),
+                "error": None,
+            }
+        }
+    return identity
 
 
 def _resolved_raw(values):
@@ -416,6 +429,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "native_identity": _native_identity(
                             "object",
                             state="assembly",
+                            target_reference=[4, 5, 6],
                         ),
                         "matched_identity": {
                             "occurrences": [],
