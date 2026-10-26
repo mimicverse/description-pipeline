@@ -2274,27 +2274,99 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(carrier["joints"][0]["axis_sign"], -1)
 
+    def test_carrier_axis_sign_owner_scopes_match_producer_and_independent_verifier(self):
+        joint_name = "hinge_joint"
+        mate_name = "hinge_joint__coaxial"
+        direct_key = f"dp.joint.{joint_name}.axis_sign"
+        mate_key = "dp.joint.axis_sign"
+
+        def root_shape(payload):
+            source_mate = "shoulder_pitch_joint__coaxial"
+            payload["mates"][0]["name"] = mate_name
+            payload["mates"][1]["name"] = f"{joint_name}__locate"
+            payload["properties"]["mates"][mate_name] = payload["properties"]["mates"].pop(
+                source_mate
+            )
+
+        def prepare(mutate):
+            def mutate_root(payload):
+                root_shape(payload)
+                mutate(payload)
+
+            result, _source, output = self._prepare(mutate=mutate_root)
+            self.assertTrue(result.passed, result.findings)
+            report = self._verify(output)
+            self.assertTrue(report["passed"], report["errors"])
+            payload = json.loads(
+                (output / "discovery/native-discovery.json").read_text(encoding="utf-8")
+            )
+            raw = payload.get("raw", payload)
+            joints = rebuild_joint_facts(payload, output, purpose="engineering")
+            carrier = _carrier_snapshot(
+                None,
+                rebuild_rigid_bodies(payload),
+                joints,
+                raw,
+            )
+            return joints[0], carrier["joints"][0]
+
+        def unsupported_mate_direct(payload):
+            payload["properties"]["document"][direct_key] = "+1"
+            payload["properties"]["mates"][mate_name][direct_key] = "-1"
+
+        joint, carrier_joint = prepare(unsupported_mate_direct)
+        self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
+        self.assertEqual(carrier_joint["axis_sign"], 1)
+
+        for owner in ("document", "mate"):
+
+            def supported_owner(payload, owner=owner):
+                payload["properties"]["document"].pop(direct_key, None)
+                payload["properties"]["mates"][mate_name][mate_key] = "+1"
+                if owner == "document":
+                    payload["properties"]["mates"][mate_name].pop(mate_key)
+                    payload["properties"]["document"][direct_key] = "-1"
+                else:
+                    payload["properties"]["mates"][mate_name][mate_key] = "-1"
+
+            with self.subTest(owner=owner):
+                joint, carrier_joint = prepare(supported_owner)
+                self.assertEqual(joint["axis"], [0.0, 0.0, -1.0])
+                self.assertEqual(carrier_joint["axis_sign"], -1)
+
+        def owner_conflict(payload):
+            payload["properties"]["document"][direct_key] = "-1"
+            payload["properties"]["mates"][mate_name][mate_key] = "+1"
+
+        def root_owner_conflict(payload):
+            root_shape(payload)
+            owner_conflict(payload)
+
+        result, _source, _output = self._prepare(mutate=root_owner_conflict)
+        self.assertIn("discovery.joint_property_conflict", self._codes(result))
+
+        baseline, _source, baseline_output = self._prepare(mutate=root_shape)
+        self.assertTrue(baseline.passed, baseline.findings)
+        report = self._verify_mutated_record(
+            baseline_output,
+            lambda payload: owner_conflict(payload["raw"]),
+        )
+        self.assertFalse(report["passed"])
+        raw = record()
+        root_shape(raw)
+        owner_conflict(raw)
         with self.assertRaises(PipelineError):
             _carrier_snapshot(
                 None,
                 [],
                 [
                     {
-                        "name": "shoulder_pitch_joint",
-                        "mate": "shoulder_pitch_joint__coaxial",
-                        "mates": ["shoulder_pitch_joint__coaxial"],
+                        "name": joint_name,
+                        "mate": mate_name,
+                        "mates": [mate_name],
                     }
                 ],
-                {
-                    "properties": {
-                        "document": {"dp.joint.shoulder_pitch_joint.axis_sign": "-1"},
-                        "mates": {
-                            "shoulder_pitch_joint__coaxial": {
-                                "dp.joint.shoulder_pitch_joint.axis_sign": "+1"
-                            }
-                        },
-                    }
-                },
+                raw,
             )
 
     def test_carrier_snapshot_scope_and_type_boundaries(self):
