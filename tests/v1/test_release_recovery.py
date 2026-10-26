@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
@@ -19,6 +20,7 @@ sys.path.insert(0, str(REPOSITORY / "deploy" / "operator"))
 import release_recovery  # noqa: E402
 import promotion  # noqa: E402
 from tests.v1 import test_disaster_recovery as recovery_tests  # noqa: E402
+from tests.v1.windows_fixtures import operator_status_sample  # noqa: E402
 
 
 def digest(payload: bytes) -> str:
@@ -69,6 +71,34 @@ class ReleaseRecoveryTests(unittest.TestCase):
         for index, row in enumerate(receipt["steps"], 1):
             row["seq"] = index
         return self.freeze_steps(receipt)
+
+    def test_status_identity_rejects_crosswired_source_context(self):
+        install_id = "win-" + "a" * 32
+        config_digest = "a" * 64
+        release = {
+            "version": "1.5.0",
+            "source_commit": "b" * 40,
+            "source_sha256": "c" * 64,
+            "role": "native",
+        }
+        sample = operator_status_sample(install_id, config_digest, release)
+        self.assertTrue(
+            release_recovery._status_identity_matches(
+                sample, install_id, config_digest
+            )
+        )
+        for field, value in (
+            ("install_id", "win-" + "d" * 32),
+            ("config_digest", "e" * 64),
+        ):
+            with self.subTest(field=field):
+                crosswired = copy.deepcopy(sample)
+                crosswired["source"][field] = value
+                self.assertFalse(
+                    release_recovery._status_identity_matches(
+                        crosswired, install_id, config_digest
+                    )
+                )
 
     def make_inputs(self, root: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
         release = {
@@ -296,6 +326,16 @@ class ReleaseRecoveryTests(unittest.TestCase):
             before = len(calls)
             self.assertEqual(release_recovery.restore(args), 0)
             self.assertEqual(len(calls), before)
+            with mock.patch.object(
+                release_recovery.windows_identity,
+                "__file__",
+                args.recovery_py,
+            ), self.assertRaisesRegex(
+                release_recovery.GateError,
+                "differs from the fixed release path",
+            ):
+                release_recovery.restore(args)
+            self.assertEqual(len(calls), before)
             receipt = json.loads((status / release_recovery.RECEIPT).read_text(encoding="utf-8"))
             self.assertEqual(receipt["database_rollback"], True)
             self.assertEqual(receipt["database_restore_executed"], True)
@@ -305,6 +345,30 @@ class ReleaseRecoveryTests(unittest.TestCase):
             self.assertEqual(receipt["admission"], "closed")
             self.assertEqual(receipt["health"], "NOT_RUN")
             self.assertFalse(any("start" in row for row in calls))
+
+    def test_parser_refuses_windows_identity_override(self):
+        with self.assertRaises(SystemExit):
+            release_recovery.parser().parse_args(
+                [
+                    "--windows-identity-py",
+                    "/fixed/windows_identity.py",
+                    "verify",
+                    "--manifest",
+                    "manifest.json",
+                    "--key",
+                    "key",
+                    "--target-plan",
+                    "target.json",
+                    "--status-dir",
+                    "status",
+                    "--config",
+                    "platform.json",
+                    "--operatorctl",
+                    "operatorctl.sh",
+                    "--expected-release",
+                    "release.json",
+                ]
+            )
 
     def test_restore_release_mismatch_refuses_before_runner(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -633,6 +697,9 @@ class ReleaseRecoveryTests(unittest.TestCase):
             )
             (operator_root / "recovery.py").write_text("# fixed recovery\n", encoding="utf-8")
             (operator_root / "operatorctl.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (operator_root / "windows_identity.py").write_text(
+                "# fixed identity\n", encoding="utf-8"
+            )
             config = root / "platform.json"
             config.write_text("{}\n", encoding="utf-8")
             plan = root / "plan.json"
@@ -680,14 +747,11 @@ class ReleaseRecoveryTests(unittest.TestCase):
                         stdout=(
                             "description-portal.service active\n"
                             + json.dumps(
-                                {
-                                    "task_name": "Description",
-                                    "task_state": "Running",
-                                    "listener_pid": 42,
-                                    "process_start_utc": "2026-10-21T00:00:00Z",
-                                    "install_id": "win-" + "a" * 32,
-                                    "config_digest": "a" * 64,
-                                }
+                                operator_status_sample(
+                                    "win-" + "a" * 32,
+                                    "a" * 64,
+                                    args_release(args),
+                                )
                             )
                             + "\n"
                         )
@@ -800,13 +864,13 @@ class ReleaseRecoveryTests(unittest.TestCase):
                     if action == "status":
                         return Result(
                             stdout=json.dumps(
-                                {
-                                    "task_state": "Running",
-                                    "listener_pid": 42,
-                                    "process_start_utc": "2026-10-22T00:00:00Z",
-                                    "install_id": args.install_id if use_generation_id else "win-" + "a" * 32,
-                                    "config_digest": "a" * 64 if use_generation_id else "b" * 64,
-                                }
+                                operator_status_sample(
+                                    args.install_id
+                                    if use_generation_id
+                                    else "win-" + "a" * 32,
+                                    "a" * 64 if use_generation_id else "b" * 64,
+                                    args_release(args),
+                                )
                             )
                         )
                     return Result(stdout="admission open\n")
@@ -923,13 +987,11 @@ class ReleaseRecoveryTests(unittest.TestCase):
                 if argv[1] == "status":
                     return Result(
                         stdout=json.dumps(
-                            {
-                                "task_state": "Running",
-                                "install_id": "another-generation",
-                                "config_digest": "b" * 64,
-                                "listener_pid": 9,
-                                "process_start_utc": "2026-10-21T00:00:00Z",
-                            }
+                            operator_status_sample(
+                                "another-generation",
+                                "b" * 64,
+                                args_release(args),
+                            )
                         )
                         + "\n"
                     )

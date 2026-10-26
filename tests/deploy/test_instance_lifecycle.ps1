@@ -224,15 +224,24 @@ function Get-ListenerProcess { param([int]$port) return 4242 }
 function Invoke-RestMethod {
   param([string]$Uri, [hashtable]$Headers, [int]$TimeoutSec)
   return [pscustomobject]@{
-    ready=$true; native_platform=$true;
-    schema_version='solidworks-to-urdf.health/v1'}
+    schema_version='solidworks-to-urdf.health/v1'
+    pipeline_id='solidworks-to-urdf'
+    ready=$true
+    native_platform=$true
+    release=[pscustomobject]@{
+      version='1.0.0'; source_commit=('a' * 40);
+      source_sha256=('b' * 64); role='native'}
+    endpoint=[pscustomobject]@{port=8765}}
 }
 function Get-Date { return $script:startupNow }
 function Start-Sleep {
   param([int]$Milliseconds)
   $script:startupNow = $script:startupNow.AddMilliseconds($Milliseconds)
 }
-$startupResult = Wait-StartupHealthy $startupConfig @{task_name='test-endpoint'}
+$startupBinding = @{
+  task_name='test-endpoint'; port=8765; version='1.0.0';
+  source_commit=('a' * 40); source_sha256=('b' * 64)}
+$startupResult = Wait-StartupHealthy $startupConfig $startupBinding
 Check 'settle.startup_ready_then_running' ($startupResult.listener_pid -eq 4242)
 function Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
@@ -240,20 +249,59 @@ function Get-ScheduledTask {
 }
 $script:startupNow = [datetime]'2026-10-22T00:00:00Z'
 try {
-  $null = Wait-StartupHealthy $startupConfig @{task_name='test-endpoint'}
+  $null = Wait-StartupHealthy $startupConfig $startupBinding
   $startupTimeout = ''
 } catch {
   $startupTimeout = $_.Exception.Message
 }
 Check 'settle.startup_ready_timeout_refused' (
   $startupTimeout -match 'did not answer /health within the startup window')
+$commonHealth = [pscustomobject]@{
+  schema_version='solidworks-to-urdf.health/v1'
+  pipeline_id='solidworks-to-urdf'
+  ready=$true
+  native_platform=$true
+  release=[pscustomobject]@{
+    version='1.0.0'; source_commit=('a' * 40);
+    source_sha256=('b' * 64); role='native'}
+  endpoint=[pscustomobject]@{port=8765}
+  install=[pscustomobject]@{
+    install_id='source-install'; config_digest=('c' * 64)}
+}
+Check 'health.common_legacy_extras_ignored' (
+  Test-MaintenanceHealthShape $commonHealth 8765)
+foreach ($mutation in @(
+    @('schema', 'schema_version', 'solidworks-to-urdf.health/v2'),
+    @('pipeline', 'pipeline_id', 'foreign-pipeline'),
+    @('ready', 'ready', $false),
+    @('native', 'native_platform', $false),
+    @('port', 'port', 8766),
+    @('release', 'source_commit', ('d' * 40)))) {
+  $changedHealth = ($commonHealth | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+  if ($mutation[0] -eq 'port') {
+    $changedHealth.endpoint.port = $mutation[2]
+  } elseif ($mutation[0] -eq 'release') {
+    $changedHealth.release.source_commit = $mutation[2]
+  } else {
+    $changedHealth.($mutation[1]) = $mutation[2]
+  }
+  $healthAccepted = $true
+  try {
+    Assert-MaintenanceHealth $changedHealth '1.0.0' ('a' * 40) ('b' * 64) 8765
+  } catch {
+    $healthAccepted = $false
+  }
+  Check ('health.common_' + $mutation[0] + '_refused') (-not $healthAccepted)
+}
 Remove-Item Function:\Get-ScheduledTask, Function:\Get-ListenerProcess, Function:\Invoke-RestMethod,
   Function:\Get-Date, Function:\Start-Sleep -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $startupRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
-  'Get-TaskGeneration', 'Get-ListenerEvidence', 'Get-EndpointIdentity',
+  'Get-TaskGeneration', 'Get-ListenerEvidence', 'Get-ListenerConnections',
+  'Get-ListenerProcesses', 'Get-ScheduleService', 'Get-ProcessOwnerSid',
+  'Get-EndpointIdentity',
   'Read-EndpointRuntimeProbe',
   'New-EndpointSourceState', 'Assert-EndpointSourceMatch', 'Assert-HealthSourceMatch',
   'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
@@ -1019,72 +1067,315 @@ $message = ''
 try { Assert-Single-TaskAction $multiActionTask } catch { $message = $_.Exception.Message }
 Check 'task.multi_action_refused' ($message -match 'task_ambiguous')
 function Resolve-Sid { param([string]$Identity) return $Identity }
+$listenerFixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+  'il-listener-' + [guid]::NewGuid().ToString('N'))
+$listenerGeneration = Join-Path $listenerFixtureRoot 'managed/generation'
+$listenerRuntime = Join-Path $listenerGeneration 'runtime'
+$listenerScripts = Join-Path $listenerRuntime 'Scripts'
+$listenerBaseHome = Join-Path $listenerFixtureRoot 'Python312'
+$script:OriginalListenerSystemRoot = $env:SystemRoot
+$script:ListenerUsesSyntheticSystemRoot = (
+  [System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT)
+$listenerSystemRoot = if ($script:ListenerUsesSyntheticSystemRoot) {
+  Join-Path $listenerFixtureRoot 'Windows'
+} else {
+  [string]$env:SystemRoot
+}
+$listenerSchedulerRoot = Join-Path $listenerSystemRoot 'System32'
+$listenerDirectories = @($listenerGeneration, $listenerScripts, $listenerBaseHome)
+if ($script:ListenerUsesSyntheticSystemRoot) {
+  $listenerDirectories += $listenerSchedulerRoot
+}
+foreach ($directory in $listenerDirectories) {
+  $null = New-Item -ItemType Directory -Path $directory -Force
+}
+$listenerLauncher = Join-Path $listenerScripts 'python.exe'
+$listenerBase = Join-Path $listenerBaseHome 'python.exe'
+$listenerScheduler = Join-Path $listenerSchedulerRoot 'svchost.exe'
+foreach ($path in @($listenerLauncher, $listenerBase)) {
+  Write-Utf8NoBom $path ('fixture:' + $path)
+}
+if ($script:ListenerUsesSyntheticSystemRoot) {
+  Write-Utf8NoBom $listenerScheduler ('fixture:' + $listenerScheduler)
+  $env:SystemRoot = $listenerSystemRoot
+}
+$listenerConfig = Join-Path $listenerGeneration 'endpoint.json'
+Write-Utf8NoBom $listenerConfig '{"schema_version":"solidworks-to-urdf.endpoint/v1"}'
+$listenerArguments = '-I -B -m description_pipeline serve --config "' +
+  $listenerConfig + '"'
+$listenerTaskSid = 'S-1-5-21-1-2-3-500'
 $listenerProjection = [pscustomobject]@{
-  principal=[pscustomobject]@{sid='S-1-5-21-1-2-3-500'}
+  principal=[pscustomobject]@{sid=$listenerTaskSid}
   action=[pscustomobject]@{
-    execute='C:/managed/generation/runtime/Scripts/python.exe'
-    arguments='-I -B -m description_pipeline serve --config "C:/managed/generation/endpoint.json"'
+    execute=$listenerLauncher
+    arguments=$listenerArguments
   }
 }
-function Set-ListenerScenario([string]$Name) {
-  $script:ListenerScenario = $Name
+function Get-ListenerPyvenvText([string]$CommandRoot = '') {
+  if (-not $CommandRoot) { $CommandRoot = $listenerRuntime }
+  return @(
+    ('home = ' + $listenerBaseHome)
+    'include-system-site-packages = false'
+    'version = 3.12.10'
+    ('executable = ' + $listenerBase)
+    ('command = "' + $listenerBase + '" -m venv "' + $CommandRoot + '"')
+  ) -join "`n"
 }
-function Get-NetTCPConnection {
-  [CmdletBinding()] param([int]$LocalPort, [string]$State)
-  if ($script:ListenerScenario -eq 'multi') {
-    return @([pscustomobject]@{OwningProcess=4242}, [pscustomobject]@{OwningProcess=4243})
-  }
-  return [pscustomobject]@{OwningProcess=4242}
+function Write-ListenerPyvenv([string]$CommandRoot = '') {
+  $text = Get-ListenerPyvenvText $CommandRoot
+  Write-Utf8NoBom (Join-Path $listenerRuntime 'pyvenv.cfg') $text
 }
-function Get-CimInstance {
-  [CmdletBinding()] param([string]$ClassName, [string]$Filter)
-  $image = if ($script:ListenerScenario -eq 'image') {
-    'C:/foreign/python.exe'
-  } else {
-    $listenerProjection.action.execute
-  }
-  $command = if ($script:ListenerScenario -eq 'command') {
-    'python.exe foreign-action'
-  } else {
-    '"C:/managed/generation/runtime/Scripts/python.exe" ' +
-      $listenerProjection.action.arguments
-  }
-  return [pscustomobject]@{ExecutablePath=$image; CommandLine=$command}
-}
-function Get-Process {
-  [CmdletBinding()] param([int]$Id, [switch]$IncludeUserName)
-  $user = if ($script:ListenerScenario -eq 'user') {
-    'S-1-5-21-1-2-3-501'
-  } else {
-    'S-1-5-21-1-2-3-500'
-  }
+function New-ListenerProcess(
+    [int]$ProcessId,
+    [int]$ParentProcessId,
+    [string]$Image,
+    [string]$Arguments,
+    [datetime]$Created,
+    [string]$Sid,
+    [int]$SessionId) {
   return [pscustomobject]@{
-    UserName=$user
-    StartTime=[datetime]'2026-10-27T00:00:00Z'
+    ProcessId=$ProcessId
+    ParentProcessId=$ParentProcessId
+    ExecutablePath=$Image
+    CommandLine=('"' + $Image + '" ' + $Arguments).Trim()
+    CreationDate=$Created
+    OwnerSid=$Sid
+    SessionId=$SessionId
   }
 }
-Set-ListenerScenario 'valid'
+function Reset-ListenerProcesses([string]$Scenario = 'valid') {
+  $script:ListenerScenario = $Scenario
+  foreach ($path in @($listenerLauncher, $listenerBase)) {
+    Write-Utf8NoBom $path ('fixture:' + $path)
+  }
+  if ($script:ListenerUsesSyntheticSystemRoot) {
+    Write-Utf8NoBom $listenerScheduler ('fixture:' + $listenerScheduler)
+  }
+  Write-ListenerPyvenv
+  $scheduler = New-ListenerProcess 2512 900 $listenerScheduler `
+    '-k netsvcs -p -s Schedule' ([datetime]'2026-10-27T00:00:00Z') `
+    'S-1-5-18' 0
+  $launcher = New-ListenerProcess 19344 2512 $listenerLauncher `
+    $listenerArguments ([datetime]'2026-10-27T00:00:01Z') `
+    $listenerTaskSid 1
+  $listener = New-ListenerProcess 15124 19344 $listenerBase `
+    $listenerArguments ([datetime]'2026-10-27T00:00:02Z') `
+    $listenerTaskSid 1
+  $script:SchedulerService = [pscustomobject]@{
+    Name='Schedule'
+    State='Running'
+    ProcessId=2512
+  }
+  $script:ListenerPorts = @([pscustomobject]@{OwningProcess=15124})
+  switch ($Scenario) {
+    'multiple_listeners' {
+      $script:ListenerPorts += [pscustomobject]@{OwningProcess=15125}
+    }
+    'multiple_rows_same_listener' {
+      $script:ListenerPorts += [pscustomobject]@{OwningProcess=15124}
+    }
+    'missing_listener' {
+      $script:ListenerPorts = @([pscustomobject]@{OwningProcess=15125})
+    }
+    'non_direct_listener' {
+      $listener.ParentProcessId = 999
+    }
+    'foreign_launcher_parent' {
+      $launcher.ParentProcessId = 999
+    }
+    'same_process' {
+      $script:ListenerPorts[0].OwningProcess = 19344
+    }
+    'multiple_launchers' {
+      $extraLauncher = New-ListenerProcess 19345 2512 $listenerLauncher `
+        $listenerArguments ([datetime]'2026-10-27T00:00:01.500Z') `
+        $listenerTaskSid 1
+    }
+    'launcher_arguments' {
+      $launcher.CommandLine = '"' + $listenerLauncher + '" foreign-action'
+    }
+    'listener_arguments' {
+      $listener.CommandLine = '"' + $listenerBase + '" foreign-action'
+    }
+    'launcher_sid' {
+      $launcher.OwnerSid = 'S-1-5-21-1-2-3-501'
+    }
+    'listener_sid' {
+      $listener.OwnerSid = 'S-1-5-21-1-2-3-501'
+    }
+    'launcher_session' {
+      $launcher.SessionId = 2
+    }
+    'listener_session' {
+      $listener.SessionId = 2
+    }
+    'scheduler_image' {
+      $scheduler.ExecutablePath = $listenerLauncher
+      $scheduler.CommandLine = '"' + $listenerLauncher + '" -k netsvcs -p -s Schedule'
+    }
+    'scheduler_service_missing' {
+      $script:SchedulerService = $null
+    }
+    'scheduler_service_name' {
+      $script:SchedulerService.Name = 'Foreign'
+    }
+    'scheduler_service_state' {
+      $script:SchedulerService.State = 'Stopped'
+    }
+    'scheduler_service_pid' {
+      $script:SchedulerService.ProcessId = 2513
+    }
+    'scheduler_sid' {
+      $scheduler.OwnerSid = $listenerTaskSid
+    }
+    'scheduler_session' {
+      $scheduler.SessionId = 1
+    }
+    'creation_order' {
+      $listener.CreationDate = [datetime]'2026-10-27T00:00:00.500Z'
+    }
+    'foreign_pyvenv_command' {
+      Write-ListenerPyvenv (Join-Path $listenerFixtureRoot 'foreign-runtime')
+    }
+    'missing_base' {
+      Remove-Item -LiteralPath $listenerBase -Force
+    }
+  }
+  $script:ListenerProcesses = @($scheduler, $launcher, $listener) +
+    @(if ($extraLauncher) { $extraLauncher })
+}
+function Get-ListenerConnections {
+  param([int]$Port)
+  return @($script:ListenerPorts)
+}
+function Get-ListenerProcesses {
+  if ($script:ListenerScenario -eq 'process_inventory_failure') {
+    throw 'injected process inventory failure'
+  }
+  return @($script:ListenerProcesses)
+}
+function Get-ScheduleService {
+  return @($script:SchedulerService)
+}
+function Get-ProcessOwnerSid {
+  param($Process)
+  return [string]$Process.OwnerSid
+}
+Reset-ListenerProcesses
 $evidence = Get-ListenerEvidence @{port=8765} $listenerProjection
-Check 'listener.exact_process_bound' (
-  ($evidence.listener_pid -eq 4242) -and
-  ($evidence.process_user_sid -eq 'S-1-5-21-1-2-3-500'))
+Check 'listener.direct_venv_child_bound' (
+  ($evidence.schema_version -eq 'solidworks-to-urdf.windows-listener/v2') -and
+  ($evidence.relation -eq 'direct_venv_child') -and
+  ($evidence.scheduler_pid -eq 2512) -and
+  ($evidence.launcher_pid -eq 19344) -and
+  ($evidence.launcher_parent_pid -eq 2512) -and
+  ($evidence.listener_pid -eq 15124) -and
+  ($evidence.listener_parent_pid -eq 19344) -and
+  ($evidence.process_arguments_sha256 -eq (Get-TextSha256 $listenerArguments)) -and
+  ($evidence.base_interpreter_path -eq (Normalize-PathIdentity $listenerBase)))
+$listenerSourceContext = [ordered]@{
+  schema_version='solidworks-to-urdf.windows-source-state/v2'
+  endpoint_root=(Normalize-PathIdentity $listenerGeneration)
+  config_path=(Normalize-PathIdentity $listenerConfig)
+  execute=(Normalize-PathIdentity $listenerLauncher)
+  arguments=$listenerArguments
+  principal_sid=$listenerTaskSid
+  principal=[pscustomobject]@{sid=$listenerTaskSid}
+  listener=$evidence
+}
+$staticBindingPassed = $true
+try { Assert-ListenerSourceMatch $evidence $listenerSourceContext } catch {
+  $staticBindingPassed = $false
+}
+Check 'listener.static_source_binding_passes' $staticBindingPassed
+Reset-ListenerProcesses 'multiple_rows_same_listener'
+$dualStackEvidence = Get-ListenerEvidence @{port=8765} $listenerProjection
+Check 'listener.dual_stack_rows_same_pid_pass' (
+  $dualStackEvidence.listener_pid -eq 15124)
+foreach ($replacement in @(
+    @('launcher', $listenerLauncher, 'replaced-launcher'),
+    @('base', $listenerBase, 'replaced-base'),
+    @('pyvenv', (Join-Path $listenerRuntime 'pyvenv.cfg'), 'replaced-pyvenv'))) {
+  $originalBytes = [System.IO.File]::ReadAllBytes([string]$replacement[1])
+  Write-Utf8NoBom ([string]$replacement[1]) ([string]$replacement[2])
+  $message = ''
+  try {
+    Assert-ListenerSourceMatch $evidence $listenerSourceContext
+  } catch { $message = $_.Exception.Message }
+  Check ('listener.' + [string]$replacement[0] + '_replacement_refused') (
+    $message -match 'differs|unreadable')
+  [System.IO.File]::WriteAllBytes([string]$replacement[1], $originalBytes)
+}
 $changedListener = ($evidence | ConvertTo-Json -Compress | ConvertFrom-Json)
-$changedListener.process_start_utc = '2026-10-27T00:00:01Z'
+$changedListener.listener_start_utc = '2026-10-27T00:00:03Z'
 $message = ''
 try { Assert-ListenerMatch $evidence $changedListener } catch { $message = $_.Exception.Message }
 Check 'listener.mid_switch_change_refused' ($message -match 'windows_listener_changed')
+$sameProcessEvidence = ($evidence | ConvertTo-Json -Compress | ConvertFrom-Json)
+$sameProcessEvidence.relation = 'same_process'
+$message = ''
+try { Assert-ListenerDocument $sameProcessEvidence } catch { $message = $_.Exception.Message }
+Check 'listener.same_process_refused' ($message -match 'direct venv child lineage')
 foreach ($case in @(
-    @('multi', 'windows_listener_ambiguous'),
-    @('image', 'windows_listener_identity_mismatch'),
-    @('command', 'windows_listener_identity_mismatch'),
-    @('user', 'windows_listener_identity_mismatch'))) {
-  Set-ListenerScenario $case[0]
+    @('multiple_listeners', 'windows_listener_ambiguous'),
+    @('missing_listener', 'endpoint listener process is missing'),
+    @('non_direct_listener', 'launcher child'),
+    @('foreign_launcher_parent', 'exact scheduler parent'),
+    @('same_process', 'not the task-action launcher child|ambiguous'),
+    @('multiple_launchers', 'windows_listener_ambiguous'),
+    @('launcher_arguments', 'ambiguous'),
+    @('listener_arguments', 'projected task arguments'),
+    @('launcher_sid', 'account differs'),
+    @('listener_sid', 'account differs'),
+    @('launcher_session', 'different sessions'),
+    @('listener_session', 'different sessions'),
+    @('scheduler_image', 'Task Scheduler host'),
+    @('scheduler_service_missing', 'service process'),
+    @('scheduler_service_name', 'service process'),
+    @('scheduler_service_state', 'service process'),
+    @('scheduler_service_pid', 'service process'),
+    @('scheduler_sid', 'Task Scheduler host'),
+    @('scheduler_session', 'Task Scheduler host'),
+    @('creation_order', 'creation order'),
+    @('foreign_pyvenv_command', 'another virtual environment'),
+    @('missing_base', 'base interpreter is missing'))) {
+  Reset-ListenerProcesses $case[0]
   $message = ''
-  try { $null = Get-ListenerEvidence @{port=8765} $listenerProjection } catch {
+  try {
+    $null = Get-ListenerEvidence @{port=8765} $listenerProjection
+  } catch {
     $message = $_.Exception.Message
   }
-  Check ('listener.' + $case[0] + '_refused') ($message -match $case[1])
+  Check ('listener.' + $case[0] + '_refused') ($message -match $case[1]) $message
 }
+Reset-ListenerProcesses
+$foreignConfigArguments = '-I -B -m description_pipeline serve --config "' +
+  (Join-Path $listenerGeneration 'foreign.json') + '"'
+$message = ''
+try {
+  $null = Get-ListenerEvidence @{port=8765} ([pscustomobject]@{
+      principal=$listenerProjection.principal
+      action=[pscustomobject]@{
+        execute=$listenerLauncher
+        arguments=$foreignConfigArguments
+      }
+    })
+} catch { $message = $_.Exception.Message }
+Check 'listener.task_action_config_refused' ($message -match 'another configuration') $message
+Reset-ListenerProcesses 'process_inventory_failure'
+$message = ''
+try {
+  $null = Get-ListenerEvidence @{port=8765} $listenerProjection
+} catch {
+  $message = $_.Exception.Message
+}
+Check 'listener.process_inventory_failure_is_not_identity_mismatch' (
+  ($message -match 'injected process inventory failure') -and
+  ($message -notmatch 'windows_listener_identity_mismatch')) $message
+if ($script:ListenerUsesSyntheticSystemRoot) {
+  $env:SystemRoot = $script:OriginalListenerSystemRoot
+}
+Remove-Item -LiteralPath $listenerFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
 function Get-NetTCPConnection {
   [CmdletBinding()] param([int]$LocalPort, [string]$State)
   return $null
@@ -1355,11 +1646,46 @@ $sourceLauncher = Runtime-Python $sourceGeneration
 $sourceArguments = '-I -B -m description_pipeline serve --config "' +
   (Join-Path $sourceGeneration 'endpoint.json') + '"'
 $sourceWorkingDirectory = $root
+$sourceRuntime = Join-Path $sourceGeneration 'runtime'
+$sourceScripts = Join-Path $sourceRuntime 'Scripts'
+$sourceBaseHome = Join-Path $root 'source-python'
+$script:SourceUsesSyntheticSystemRoot = (
+  [System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT)
+$sourceSystemRoot = if ($script:SourceUsesSyntheticSystemRoot) {
+  Join-Path $root 'windows'
+} else {
+  [string]$env:SystemRoot
+}
+$sourceScheduler = Join-Path $sourceSystemRoot 'System32/svchost.exe'
+$sourceBase = Join-Path $sourceBaseHome 'python.exe'
+$sourceDirectories = @($sourceScripts, $sourceBaseHome)
+if ($script:SourceUsesSyntheticSystemRoot) {
+  $sourceDirectories += Split-Path -Parent $sourceScheduler
+}
+foreach ($directory in $sourceDirectories) {
+  $null = New-Item -ItemType Directory -Path $directory -Force
+}
+foreach ($path in @($sourceLauncher, $sourceBase)) {
+  Write-Utf8NoBom $path ('source-fixture:' + $path)
+}
+if ($script:SourceUsesSyntheticSystemRoot) {
+  Write-Utf8NoBom $sourceScheduler ('source-fixture:' + $sourceScheduler)
+}
+$sourcePyvenvPath = Join-Path $sourceRuntime 'pyvenv.cfg'
+Write-Utf8NoBom $sourcePyvenvPath (@(
+    ('home = ' + $sourceBaseHome)
+    'include-system-site-packages = false'
+    'version = 3.12.10'
+    ('executable = ' + $sourceBase)
+    ('command = "' + $sourceBase + '" -m venv "' + $sourceRuntime + '"')
+  ) -join "`n")
+$sourceConfigPath = Join-Path $sourceGeneration 'endpoint.json'
+$sourceConfigText = ('{{"state_root":"{0}","port":8765}}' -f ($root -replace '\\', '/'))
+Write-Utf8NoBom $sourceConfigPath $sourceConfigText
 $sourceTaskText = '<Task><Actions><Exec><Command>' + $sourceLauncher +
   '</Command><Arguments>' + $sourceArguments +
   '</Arguments><WorkingDirectory>' + $sourceWorkingDirectory +
   '</WorkingDirectory></Exec></Actions></Task>'
-$sourceConfigText = ('{{"state_root":"{0}","port":8765}}' -f ($root -replace '\\', '/'))
 [System.IO.File]::WriteAllText((Join-Path $previous 'task.xml'), $sourceTaskText)
 [System.IO.File]::WriteAllText((Join-Path $previous 'endpoint-before.json'), $sourceConfigText)
 $sourceProjection = [pscustomobject]@{
@@ -1386,7 +1712,43 @@ $sourceIdentity = [pscustomobject]@{
   release=[pscustomobject]@{version='1.5.0'; source_commit='4ed0f03d'; source_sha256='f' * 64; role='native'}}
 $sourceIdentity.release_identity_sha256 = Get-ReleaseIdentitySha256 $sourceIdentity.release
 [System.IO.File]::WriteAllText($sourceIdentity.install_id_path, $sourceIdentity.install_id)
-$sourceState = New-EndpointSourceState ([pscustomobject]@{}) $sourceProjection $sourceIdentity
+$script:SourceListenerSystemRoot = $env:SystemRoot
+if ($script:SourceUsesSyntheticSystemRoot) {
+  $env:SystemRoot = $sourceSystemRoot
+}
+$sourceListener = [ordered]@{
+  schema_version='solidworks-to-urdf.windows-listener/v2'
+  relation='direct_venv_child'
+  process_arguments_sha256=(Get-TextSha256 $sourceArguments)
+  scheduler_service_name='Schedule'
+  scheduler_service_state='Running'
+  scheduler_service_process_id=2512
+  scheduler_pid=2512
+  scheduler_image=(Normalize-PathIdentity $sourceScheduler)
+  scheduler_start_utc='2026-10-27T00:00:00.0000000Z'
+  scheduler_user_sid='S-1-5-18'
+  scheduler_session_id=0
+  launcher_pid=19344
+  launcher_parent_pid=2512
+  launcher_image=(Normalize-PathIdentity $sourceLauncher)
+  launcher_image_sha256=(Sha256 $sourceLauncher)
+  launcher_start_utc='2026-10-27T00:00:01.0000000Z'
+  launcher_user_sid=$sourceProjection.principal.sid
+  launcher_session_id=1
+  listener_pid=15124
+  listener_parent_pid=19344
+  listener_start_utc='2026-10-27T00:00:02.0000000Z'
+  listener_user_sid=$sourceProjection.principal.sid
+  listener_session_id=1
+  venv_config_path=(Normalize-PathIdentity $sourcePyvenvPath)
+  venv_config_sha256=(Sha256 $sourcePyvenvPath)
+  venv_home=(Normalize-PathIdentity $sourceBaseHome)
+  venv_version='3.12.10'
+  base_interpreter_path=(Normalize-PathIdentity $sourceBase)
+  base_interpreter_sha256=(Sha256 $sourceBase)
+}
+$sourceState = New-EndpointSourceState ([pscustomobject]@{}) $sourceProjection `
+  $sourceIdentity $sourceListener
 Write-Receipt (Join-Path $previous 'source-state.json') $sourceState
 $sourceStateSha256 = Get-SourceStateAuthorityHash (Join-Path $previous 'source-state.json')
 function Get-TaskProjection {
@@ -1417,14 +1779,26 @@ function Read-EndpointRuntimeProbe {
 }
 function Get-ListenerEvidence {
   param([object]$binding, $TaskProjection)
-  return @{listener_pid=4242}
+  $restoredListener = (
+    $sourceListener | ConvertTo-Json -Compress | ConvertFrom-Json)
+  $restoredListener.listener_pid = 15125
+  $restoredListener.listener_start_utc = '2026-10-27T00:00:03.0000000Z'
+  if ($script:RestoreListenerScenario -eq 'bad_sid') {
+    $restoredListener.listener_user_sid = 'S-1-5-21-1-2-3-501'
+  }
+  return $restoredListener
 }
 function Read-EndpointHealth {
   param([string]$configPath)
   if (-not $script:OldHealthOk) { throw 'the previous endpoint did not answer /health' }
   return [pscustomobject]@{
-    install_id=$sourceIdentity.install_id; config_digest=$sourceIdentity.config_digest;
-    release=$sourceIdentity.release}
+    schema_version='solidworks-to-urdf.health/v1'
+    pipeline_id='solidworks-to-urdf'; ready=$true; native_platform=$true;
+    release=$sourceIdentity.release;
+    endpoint=[pscustomobject]@{port=8765};
+    install=[pscustomobject]@{
+      install_id=$sourceIdentity.install_id
+      config_digest=$sourceIdentity.config_digest}}
 }
 function Register-ScheduledTask {
   [CmdletBinding()]
@@ -1444,6 +1818,8 @@ $restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
   -ExpectedSourceStateSha256 $sourceStateSha256
 Check 'restore.success_exact_source_identity' ($restore.stopped -and $restore.restored -and $restore.startable -and $restore.started -and
   ($restore.healthy -eq $true) -and ($restore.previous_generation -eq (Normalize-PathIdentity $sourceGeneration)) -and
+  ($restore.listener.listener_pid -eq 15125) -and
+  ($sourceState.listener.listener_pid -eq 15124) -and
   (($script:CallLog -join ',') -eq 'stop,register,start')) `
   ($restore | ConvertTo-Json -Depth 8 -Compress)
 
@@ -1470,6 +1846,19 @@ Check 'restore.health_failure_is_not_success' ($restore.stopped -and $restore.re
 
 Reset-State
 $script:RestoreActionArguments = $sourceArguments
+$script:RestoreListenerScenario = 'bad_sid'
+$restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
+  -stageDir $generation -expectedTaskPath $sourceProjection.task_path `
+  -ExpectedSourceStateSha256 $sourceStateSha256
+Check 'restore.static_listener_mismatch_fails_closed' (
+  $restore.stopped -and $restore.restored -and $restore.started -and
+  (-not $restore.healthy) -and
+  ($restore.error -match 'differs from the task')) `
+  ($restore | ConvertTo-Json -Depth 8 -Compress)
+$script:RestoreListenerScenario = $null
+
+Reset-State
+$script:RestoreActionArguments = $sourceArguments
 Remove-Item -LiteralPath (Join-Path $previous 'source-state.json') -Force
 $restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
   -stageDir $generation -expectedTaskPath $sourceProjection.task_path `
@@ -1487,6 +1876,9 @@ $restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
 Check 'restore.changed_opaque_action_fails_closed' ((-not $restore.started) -and ($null -eq $restore.healthy) -and
   ($restore.error -match 'arguments') -and (($script:CallLog -join ',') -eq 'stop,register'))
 $script:RestoreActionArguments = $sourceArguments
+if ($script:SourceUsesSyntheticSystemRoot) {
+  $env:SystemRoot = $script:SourceListenerSystemRoot
+}
 
 # ---- real outer promote flow (child pwsh; real Invoke-Main) -----------------
 $harness = Join-Path $PSScriptRoot 'invoke-main-harness.ps1'

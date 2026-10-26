@@ -365,9 +365,8 @@ function Test-ActionConfigArgument([string]$Arguments, [string]$ConfigPath) {
       (Normalize-PathIdentity $ConfigPath)
   )
 }
-function Get-TaskGeneration([object]$task) {
-  Assert-Single-TaskAction $task
-  $execute = [string]$task.Actions[0].Execute
+function Get-ActionGeneration([object]$Action) {
+  $execute = [string]$Action.Execute
   if (-not $execute) {
     Die 'windows_task_projection_mismatch' 'the instance task action has no executable'
   }
@@ -385,9 +384,286 @@ function Get-TaskGeneration([object]$task) {
   }
   return $generation
 }
+function Get-CommandArgumentsForExecutable([string]$CommandLine, [string]$ExecutablePath) {
+  $quoted = '"' + $ExecutablePath + '"'
+  $offset = -1
+  if ($CommandLine.StartsWith($quoted, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $offset = $quoted.Length
+  } elseif ($CommandLine.StartsWith($ExecutablePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $offset = $ExecutablePath.Length
+  }
+  if ($offset -lt 0 -or
+      ($offset -lt $CommandLine.Length -and -not [char]::IsWhiteSpace($CommandLine[$offset]))) {
+    throw 'the process command line does not start with its executable path'
+  }
+  return $CommandLine.Substring($offset).Trim()
+}
+function Get-ListenerFieldNames($Listener) {
+  if ($Listener -is [System.Collections.IDictionary]) {
+    return @($Listener.Keys)
+  }
+  return @($Listener.PSObject.Properties.Name)
+}
+function Get-ListenerUtcTicks($Value) {
+  if ($Value -is [datetime]) {
+    return ([datetime]$Value).ToUniversalTime().Ticks
+  }
+  return ([datetime]::Parse(
+    [string]$Value,
+    [System.Globalization.CultureInfo]::InvariantCulture,
+    [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime().Ticks
+}
+function Assert-ListenerDocument($Listener) {
+  if ($null -eq $Listener) {
+    throw 'the listener evidence is missing'
+  }
+  $fields = @(
+    'schema_version',
+    'relation',
+    'process_arguments_sha256',
+    'scheduler_service_name',
+    'scheduler_service_state',
+    'scheduler_service_process_id',
+    'scheduler_pid',
+    'scheduler_image',
+    'scheduler_start_utc',
+    'scheduler_user_sid',
+    'scheduler_session_id',
+    'launcher_pid',
+    'launcher_parent_pid',
+    'launcher_image',
+    'launcher_image_sha256',
+    'launcher_start_utc',
+    'launcher_user_sid',
+    'launcher_session_id',
+    'listener_pid',
+    'listener_parent_pid',
+    'listener_start_utc',
+    'listener_user_sid',
+    'listener_session_id',
+    'venv_config_path',
+    'venv_config_sha256',
+    'venv_home',
+    'venv_version',
+    'base_interpreter_path',
+    'base_interpreter_sha256')
+  $actualFields = @(Get-ListenerFieldNames $Listener)
+  if ($actualFields.Count -ne $fields.Count -or
+      @($fields | Where-Object { $_ -notin $actualFields }).Count -ne 0) {
+    throw 'the listener evidence fields are unsupported'
+  }
+  foreach ($field in @(
+      'schema_version',
+      'relation',
+      'process_arguments_sha256',
+      'scheduler_service_name',
+      'scheduler_service_state',
+      'scheduler_image',
+      'scheduler_start_utc',
+      'scheduler_user_sid',
+      'launcher_image',
+      'launcher_image_sha256',
+      'launcher_start_utc',
+      'launcher_user_sid',
+      'listener_start_utc',
+      'listener_user_sid',
+      'venv_config_path',
+      'venv_config_sha256',
+      'venv_home',
+      'venv_version',
+      'base_interpreter_path',
+      'base_interpreter_sha256')) {
+    if ([string]::IsNullOrWhiteSpace([string]$Listener.$field)) {
+      throw ('the listener evidence misses ' + $field)
+    }
+  }
+  foreach ($field in @(
+      'process_arguments_sha256',
+      'launcher_image_sha256',
+      'venv_config_sha256',
+      'base_interpreter_sha256')) {
+    if ([string]$Listener.$field -cnotmatch '^[0-9a-f]{64}$') {
+      throw ('the listener evidence carries an invalid digest at ' + $field)
+    }
+  }
+  foreach ($field in @(
+      'scheduler_pid',
+      'scheduler_service_process_id',
+      'launcher_pid',
+      'launcher_parent_pid',
+      'listener_pid',
+      'listener_parent_pid')) {
+    $value = $Listener.$field
+    if (($value -isnot [int] -and $value -isnot [long]) -or [long]$value -le 0) {
+      throw ('the listener evidence carries an invalid process number at ' + $field)
+    }
+  }
+  foreach ($field in @(
+      'scheduler_session_id',
+      'launcher_session_id',
+      'listener_session_id')) {
+    $value = $Listener.$field
+    if (($value -isnot [int] -and $value -isnot [long]) -or [long]$value -lt 0) {
+      throw ('the listener evidence carries an invalid session at ' + $field)
+    }
+  }
+  if ([string]$Listener.schema_version -cne 'solidworks-to-urdf.windows-listener/v2' -or
+      [string]$Listener.relation -cne 'direct_venv_child' -or
+      [string]$Listener.scheduler_service_name -cne 'Schedule' -or
+      [string]$Listener.scheduler_service_state -cne 'Running' -or
+      [int]$Listener.scheduler_service_process_id -ne [int]$Listener.scheduler_pid -or
+      [string]$Listener.scheduler_user_sid -cne 'S-1-5-18' -or
+      [int]$Listener.scheduler_session_id -ne 0 -or
+      [int]$Listener.launcher_parent_pid -ne [int]$Listener.scheduler_pid -or
+      [int]$Listener.listener_parent_pid -ne [int]$Listener.launcher_pid -or
+      [int]$Listener.launcher_pid -eq [int]$Listener.listener_pid -or
+      [int]$Listener.launcher_session_id -ne [int]$Listener.listener_session_id) {
+    throw 'the listener evidence does not describe the direct venv child lineage'
+  }
+  $normalizedHome = Normalize-PathIdentity ([string]$Listener.venv_home)
+  $normalizedBase = Normalize-PathIdentity ([string]$Listener.base_interpreter_path)
+  if (-not $normalizedBase.StartsWith(
+        $normalizedHome + '/',
+        [System.StringComparison]::OrdinalIgnoreCase) -or
+      $normalizedBase -notmatch '(?i)/python\.exe$' -or
+      (Normalize-PathIdentity ([string]$Listener.scheduler_image)) -notmatch
+        '(?i)/System32/svchost\.exe$') {
+    throw 'the listener evidence carries inconsistent venv or scheduler identities'
+  }
+  try {
+    $schedulerStarted = [datetime]::Parse(
+      [string]$Listener.scheduler_start_utc,
+      [System.Globalization.CultureInfo]::InvariantCulture,
+      [System.Globalization.DateTimeStyles]::RoundtripKind)
+    $launcherStarted = [datetime]::Parse(
+      [string]$Listener.launcher_start_utc,
+      [System.Globalization.CultureInfo]::InvariantCulture,
+      [System.Globalization.DateTimeStyles]::RoundtripKind)
+    $listenerStarted = [datetime]::Parse(
+      [string]$Listener.listener_start_utc,
+      [System.Globalization.CultureInfo]::InvariantCulture,
+      [System.Globalization.DateTimeStyles]::RoundtripKind)
+  } catch {
+    throw 'the listener lineage creation times are unreadable'
+  }
+  if ($schedulerStarted -gt $launcherStarted -or $launcherStarted -gt $listenerStarted) {
+    throw 'the listener lineage creation order is inconsistent'
+  }
+}
+function Read-PyvenvRuntime([string]$VenvRoot) {
+  $path = Join-Path $VenvRoot 'pyvenv.cfg'
+  Assert-NoReparseAncestor $path
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    throw 'the generation runtime carries no pyvenv.cfg'
+  }
+  $fields = @{}
+  $text = (Read-Utf8Text $path).TrimStart([char]0xFEFF)
+  foreach ($line in ($text -split '\r?\n')) {
+    $trimmed = $line.Trim()
+    if (-not $trimmed -or $trimmed.StartsWith('#', [System.StringComparison]::Ordinal)) {
+      continue
+    }
+    $separator = $trimmed.IndexOf('=')
+    if ($separator -lt 1) {
+      throw 'the generation pyvenv.cfg carries an invalid line'
+    }
+    $key = $trimmed.Substring(0, $separator).Trim().ToLowerInvariant()
+    if ($fields.ContainsKey($key)) {
+      throw ('the generation pyvenv.cfg repeats ' + $key)
+    }
+    $fields[$key] = $trimmed.Substring($separator + 1).Trim()
+  }
+  foreach ($key in @(
+      'home',
+      'include-system-site-packages',
+      'version',
+      'executable',
+      'command')) {
+    if ([string]::IsNullOrWhiteSpace([string]$fields[$key])) {
+      throw ('the generation pyvenv.cfg misses ' + $key)
+    }
+  }
+  if ([string]$fields['include-system-site-packages'] -cne 'false') {
+    throw 'the generation pyvenv.cfg includes system site packages'
+  }
+  $venvHome = [string]$fields['home']
+  $baseExecutable = [string]$fields['executable']
+  foreach ($value in @($venvHome, $baseExecutable)) {
+    if (-not [System.IO.Path]::IsPathRooted($value) -and
+        $value -cnotmatch '^(?:[A-Za-z]:[\\/]|\\\\)') {
+      throw 'the generation pyvenv.cfg carries a non-absolute interpreter path'
+    }
+  }
+  $normalizedHome = Normalize-PathIdentity $venvHome
+  $normalizedExecutable = Normalize-PathIdentity $baseExecutable
+  if (-not $normalizedExecutable.StartsWith(
+        $normalizedHome + '/',
+        [System.StringComparison]::OrdinalIgnoreCase) -or
+      $normalizedExecutable -notmatch '(?i)/python\.exe$') {
+    throw 'the generation pyvenv.cfg base executable differs from home'
+  }
+  try {
+    $createArguments = Get-CommandArgumentsForExecutable `
+      ([string]$fields['command']) $baseExecutable
+  } catch {
+    throw 'the generation pyvenv.cfg command does not name its base executable'
+  }
+  if ($createArguments -cnotmatch '^(?is)^-m\s+venv\s+(?:"([^"]+)"|(\S+))\s*$') {
+    throw 'the generation pyvenv.cfg command names another virtual environment'
+  }
+  $createdRoot = if ($Matches[1]) { [string]$Matches[1] } else { [string]$Matches[2] }
+  if ((Normalize-PathIdentity $createdRoot) -ne
+      (Normalize-PathIdentity $VenvRoot)) {
+    throw 'the generation pyvenv.cfg command names another virtual environment'
+  }
+  if (-not (Test-Path -LiteralPath $baseExecutable -PathType Leaf)) {
+    throw 'the generation pyvenv.cfg base interpreter is missing'
+  }
+  Assert-NoReparseAncestor $baseExecutable
+  return @{
+    path=(Normalize-PathIdentity $path)
+    sha256=(Sha256 $path)
+    home=(Normalize-PathIdentity $venvHome)
+    version=[string]$fields['version']
+    base_interpreter=(Normalize-PathIdentity $baseExecutable)
+    base_interpreter_sha256=(Sha256 $baseExecutable)
+  }
+}
+function Get-TaskGeneration([object]$task) {
+  Assert-Single-TaskAction $task
+  return Get-ActionGeneration $task.Actions[0]
+}
 function Assert-RunningTask([object]$task) {
   if ([string]$task.State -cne 'Running') {
     Die 'task_not_running' ('the instance task state is not Running: ' + $task.State)
+  }
+}
+function Test-MaintenanceHealthShape($Health, [int]$Port) {
+  return (
+    $null -ne $Health -and
+    [string]$Health.schema_version -ceq 'solidworks-to-urdf.health/v1' -and
+    [string]$Health.pipeline_id -ceq 'solidworks-to-urdf' -and
+    $Health.ready -is [bool] -and $Health.ready -eq $true -and
+    $Health.native_platform -is [bool] -and $Health.native_platform -eq $true -and
+    -not [string]::IsNullOrWhiteSpace([string]$Health.release.version) -and
+    -not [string]::IsNullOrWhiteSpace([string]$Health.release.source_commit) -and
+    -not [string]::IsNullOrWhiteSpace([string]$Health.release.source_sha256) -and
+    [string]$Health.release.role -ceq 'native' -and
+    ($Health.endpoint.port -is [int] -or $Health.endpoint.port -is [long]) -and
+    [int]$Health.endpoint.port -eq $Port
+  )
+}
+function Assert-MaintenanceHealth(
+    $Health,
+    [string]$Version,
+    [string]$SourceCommit,
+    [string]$SourceSha256,
+    [int]$Port) {
+  if (-not (Test-MaintenanceHealthShape $Health $Port) -or
+      [string]$Health.release.version -cne $Version -or
+      [string]$Health.release.source_commit -cne $SourceCommit -or
+      [string]$Health.release.source_sha256 -cne $SourceSha256) {
+    throw 'the maintenance endpoint /health differs from the bound release or port'
   }
 }
 function Read-EndpointHealth([string]$configPath) {
@@ -402,21 +678,16 @@ function Read-EndpointHealth([string]$configPath) {
     } catch { Start-Sleep -Milliseconds 500 }
   } while (-not $health -and (Get-Date) -lt $deadline)
   if (-not $health) { throw 'the instance endpoint did not answer /health within 30s' }
-  if ($health.schema_version -ne 'solidworks-to-urdf.health/v1' -or -not $health.ready -or -not $health.native_platform) {
-    throw 'the instance endpoint /health is not a ready IF-09 identity'
-  }
-  if (-not $health.install_id -or -not $health.config_digest -or -not $health.target_identity.target_id) {
-    throw 'the instance endpoint /health does not carry its install identity'
+  if (-not (Test-MaintenanceHealthShape $health ([int]$config.port))) {
+    throw 'the instance endpoint /health does not satisfy the maintenance readiness contract'
   }
   return $health
 }
 function Health-Probe([string]$configPath, [object]$binding) {
   $health = Read-EndpointHealth $configPath
-  if ($health.release.version -ne $binding.version -or
-      $health.release.source_commit -ne $binding.source_commit -or
-      $health.release.source_sha256 -ne $binding.source_sha256) {
-    throw 'the instance endpoint /health release identity differs from the bound release'
-  }
+  Assert-MaintenanceHealth $health ([string]$binding.version) `
+    ([string]$binding.source_commit) ([string]$binding.source_sha256) `
+    ([int]$binding.port)
   return $health
 }
 function Get-ListenerProcess([int]$port) {
@@ -425,51 +696,233 @@ function Get-ListenerProcess([int]$port) {
   if ($connection) { return [int]$connection.OwningProcess }
   return $null
 }
+function Get-ProcessLineageEvidence($Process) {
+  if ($null -eq $Process -or [int]$Process.ProcessId -le 0) {
+    throw 'the process lineage node is missing'
+  }
+  $image = [string]$Process.ExecutablePath
+  if ([string]::IsNullOrWhiteSpace($image)) {
+    throw 'the process lineage node carries no executable'
+  }
+  try {
+    $started = ([datetime]$Process.CreationDate).ToUniversalTime().ToString('o')
+  } catch {
+    throw 'the process lineage node carries no creation time'
+  }
+  $ownerSid = Get-ProcessOwnerSid $Process
+  return [ordered]@{
+    pid=[int]$Process.ProcessId
+    parent_pid=[int]$Process.ParentProcessId
+    image=(Normalize-PathIdentity $image)
+    start_utc=$started
+    user_sid=$ownerSid
+    session_id=[int]$Process.SessionId
+  }
+}
+function Get-ProcessOwnerSid($Process) {
+  try {
+    $ownerSid = Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop
+  } catch {
+    throw 'the process lineage node owner is unavailable'
+  }
+  if ([int]$ownerSid.ReturnValue -ne 0 -or
+      [string]::IsNullOrWhiteSpace([string]$ownerSid.Sid)) {
+    throw 'the process lineage node owner SID is unavailable'
+  }
+  return [string]$ownerSid.Sid
+}
+function Get-ListenerConnections([int]$Port) {
+  return @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
+}
+function Get-ListenerProcesses {
+  return @(Get-CimInstance Win32_Process -ErrorAction Stop)
+}
+function Get-ScheduleService {
+  return @(Get-CimInstance Win32_Service -Filter "Name='Schedule'" -ErrorAction Stop)
+}
 function Get-ListenerEvidence([object]$binding, $TaskProjection) {
   try {
-    $listeners = @(Get-NetTCPConnection -LocalPort ([int]$binding.port) -State Listen -ErrorAction Stop)
+    $listeners = @(Get-ListenerConnections ([int]$binding.port))
   } catch {
     if (Test-NetTcpNoMatchError $_) { $listeners = @() } else { throw }
   }
-  if ($listeners.Count -ne 1) {
-    Die 'windows_listener_ambiguous' ('expected exactly one endpoint listener, found ' + $listeners.Count)
+  $processes = @(Get-ListenerProcesses)
+  $schedulerServices = @(Get-ScheduleService)
+  $listenerPids = @($listeners | ForEach-Object {
+    [int]$_.OwningProcess
+  } | Sort-Object -Unique)
+  if ($listenerPids.Count -ne 1 -or [int]$listenerPids[0] -le 0) {
+    Die 'windows_listener_ambiguous' (
+      'expected exactly one endpoint listener process, found ' + $listenerPids.Count)
   }
-  $listenerPid = [int]$listeners[0].OwningProcess
-  $process = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $listenerPid) -ErrorAction Stop
-  if ($null -eq $process) {
+  $listenerPid = [int]$listenerPids[0]
+  $action = $TaskProjection.action
+  $actionExecute = Normalize-PathIdentity ([string]$action.execute)
+  $actionArguments = [string]$action.arguments
+  if ([string]::IsNullOrWhiteSpace($actionExecute) -or
+      [string]::IsNullOrWhiteSpace($actionArguments)) {
+    Die 'windows_listener_identity_mismatch' 'the projected task action is incomplete'
+  }
+  $generation = Get-ActionGeneration $action
+  $configPath = Config-Path $generation
+  if (-not (Test-ActionConfigArgument $actionArguments $configPath)) {
+    Die 'windows_listener_identity_mismatch' 'the projected task action names another configuration'
+  }
+  $listenerMatches = @($processes | Where-Object {
+    [int]$_.ProcessId -eq $listenerPid
+  })
+  if ($listenerMatches.Count -ne 1) {
     Die 'windows_listener_identity_mismatch' 'the endpoint listener process is missing'
   }
-  $processImage = [string]$process.ExecutablePath
-  $processCommand = [string]$process.CommandLine
-  $action = $TaskProjection.action
-  $actionArguments = [string]$action.arguments
-  if ((Normalize-PathIdentity $processImage) -ne (Normalize-PathIdentity ([string]$action.execute)) -or
-      [string]::IsNullOrWhiteSpace($processCommand) -or
-      [string]::IsNullOrWhiteSpace($actionArguments) -or
-      $processCommand.IndexOf(
-        $actionArguments,
-        [System.StringComparison]::Ordinal) -lt 0) {
-    Die 'windows_listener_identity_mismatch' 'the endpoint listener does not execute the projected task action'
+  try { $listener = Get-ProcessLineageEvidence $listenerMatches[0] } catch {
+    Die 'windows_listener_identity_mismatch' $_.Exception.Message
   }
-  $information = Get-Process -Id $listenerPid -IncludeUserName -ErrorAction Stop
-  $processSid = Resolve-Sid ([string]$information.UserName)
-  if ($processSid -ne [string]$TaskProjection.principal.sid) {
-    Die 'windows_listener_identity_mismatch' 'the endpoint listener account differs from the task principal'
+  $launchers = @()
+  foreach ($candidate in $processes) {
+    if ((Normalize-PathIdentity ([string]$candidate.ExecutablePath)) -ne $actionExecute) {
+      continue
+    }
+    try {
+      $candidateArguments = Get-CommandArgumentsForExecutable `
+        ([string]$candidate.CommandLine) ([string]$action.execute)
+    } catch {
+      continue
+    }
+    if ($candidateArguments -ceq $actionArguments) {
+      $launchers += $candidate
+    }
   }
-  return [ordered]@{
-    listener_pid = $listenerPid
-    process_start_utc = $information.StartTime.ToUniversalTime().ToString('o')
-    process_command_sha256 = Get-TextSha256 $processCommand
-    process_user_sid = $processSid
+  if ($launchers.Count -ne 1) {
+    Die 'windows_listener_ambiguous' (
+      'expected exactly one task-action launcher, found ' + $launchers.Count)
   }
+  try { $launcher = Get-ProcessLineageEvidence $launchers[0] } catch {
+    Die 'windows_listener_identity_mismatch' $_.Exception.Message
+  }
+  if ($listener.pid -eq $launcher.pid -or
+      $listener.parent_pid -ne $launcher.pid) {
+    Die 'windows_listener_identity_mismatch' 'the endpoint listener is not the task-action launcher child'
+  }
+  try {
+    $listenerArguments = Get-CommandArgumentsForExecutable `
+      ([string]$listenerMatches[0].CommandLine) `
+      ([string]$listenerMatches[0].ExecutablePath)
+  } catch {
+    Die 'windows_listener_identity_mismatch' $_.Exception.Message
+  }
+  if ($listenerArguments -cne $actionArguments) {
+    Die 'windows_listener_identity_mismatch' 'the endpoint listener does not carry the projected task arguments'
+  }
+  $scripts = Split-Path -Parent ([string]$action.execute)
+  $runtimeRoot = Split-Path -Parent $scripts
+  try { $pyvenv = Read-PyvenvRuntime $runtimeRoot } catch {
+    Die 'windows_listener_identity_mismatch' $_.Exception.Message
+  }
+  if ($listener.image -ne [string]$pyvenv.base_interpreter) {
+    Die 'windows_listener_identity_mismatch' 'the endpoint listener is not the configured base interpreter'
+  }
+  $schedulerMatches = @($processes | Where-Object {
+    [int]$_.ProcessId -eq [int]$launcher.parent_pid
+  })
+  if ($schedulerMatches.Count -ne 1) {
+    Die 'windows_listener_identity_mismatch' 'the task-action launcher has no exact scheduler parent'
+  }
+  try { $scheduler = Get-ProcessLineageEvidence $schedulerMatches[0] } catch {
+    Die 'windows_listener_identity_mismatch' $_.Exception.Message
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$env:SystemRoot)) {
+    Die 'windows_listener_identity_mismatch' 'the Windows system root is unavailable'
+  }
+  $expectedScheduler = Normalize-PathIdentity (Join-Path ([string]$env:SystemRoot) 'System32\svchost.exe')
+  if ($scheduler.image -ne $expectedScheduler -or
+      $scheduler.user_sid -cne 'S-1-5-18' -or
+      $scheduler.session_id -ne 0) {
+    Die 'windows_listener_identity_mismatch' 'the task-action launcher parent is not the Task Scheduler host'
+  }
+  if ($schedulerServices.Count -ne 1 -or
+      [string]$schedulerServices[0].Name -cne 'Schedule' -or
+      [string]$schedulerServices[0].State -cne 'Running' -or
+      [int]$schedulerServices[0].ProcessId -ne [int]$scheduler.pid) {
+    Die 'windows_listener_identity_mismatch' 'the launcher parent is not the running Task Scheduler service process'
+  }
+  try {
+    $schedulerStarted = [datetime]::Parse(
+      [string]$scheduler.start_utc,
+      [System.Globalization.CultureInfo]::InvariantCulture,
+      [System.Globalization.DateTimeStyles]::RoundtripKind)
+    $launcherStarted = [datetime]::Parse(
+      [string]$launcher.start_utc,
+      [System.Globalization.CultureInfo]::InvariantCulture,
+      [System.Globalization.DateTimeStyles]::RoundtripKind)
+    $listenerStarted = [datetime]::Parse(
+      [string]$listener.start_utc,
+      [System.Globalization.CultureInfo]::InvariantCulture,
+      [System.Globalization.DateTimeStyles]::RoundtripKind)
+  } catch {
+    Die 'windows_listener_identity_mismatch' 'the process lineage creation order is unreadable'
+  }
+  if ($schedulerStarted -gt $launcherStarted -or $launcherStarted -gt $listenerStarted) {
+    Die 'windows_listener_identity_mismatch' 'the process lineage creation order is inconsistent'
+  }
+  $principalSid = [string]$TaskProjection.principal.sid
+  if ($launcher.user_sid -ne $principalSid -or $listener.user_sid -ne $principalSid) {
+    Die 'windows_listener_identity_mismatch' 'an endpoint process account differs from the task principal'
+  }
+  if ($launcher.session_id -ne $listener.session_id) {
+    Die 'windows_listener_identity_mismatch' 'the endpoint launcher and listener use different sessions'
+  }
+  $evidence = [ordered]@{
+    schema_version='solidworks-to-urdf.windows-listener/v2'
+    relation='direct_venv_child'
+    process_arguments_sha256=(Get-TextSha256 $actionArguments)
+    scheduler_service_name=[string]$schedulerServices[0].Name
+    scheduler_service_state=[string]$schedulerServices[0].State
+    scheduler_service_process_id=[int]$schedulerServices[0].ProcessId
+    scheduler_pid=[int]$scheduler.pid
+    scheduler_image=[string]$scheduler.image
+    scheduler_start_utc=[string]$scheduler.start_utc
+    scheduler_user_sid=[string]$scheduler.user_sid
+    scheduler_session_id=[int]$scheduler.session_id
+    launcher_pid=[int]$launcher.pid
+    launcher_parent_pid=[int]$launcher.parent_pid
+    launcher_image=[string]$launcher.image
+    launcher_image_sha256=(Sha256 ([string]$launchers[0].ExecutablePath))
+    launcher_start_utc=[string]$launcher.start_utc
+    launcher_user_sid=[string]$launcher.user_sid
+    launcher_session_id=[int]$launcher.session_id
+    listener_pid=[int]$listener.pid
+    listener_parent_pid=[int]$listener.parent_pid
+    listener_start_utc=[string]$listener.start_utc
+    listener_user_sid=[string]$listener.user_sid
+    listener_session_id=[int]$listener.session_id
+    venv_config_path=[string]$pyvenv.path
+    venv_config_sha256=[string]$pyvenv.sha256
+    venv_home=[string]$pyvenv.home
+    venv_version=[string]$pyvenv.version
+    base_interpreter_path=[string]$pyvenv.base_interpreter
+    base_interpreter_sha256=[string]$pyvenv.base_interpreter_sha256
+  }
+  try {
+    Assert-ListenerDocument $evidence
+  } catch {
+    Die 'windows_listener_identity_mismatch' $_.Exception.Message
+  }
+  return $evidence
 }
 function Assert-ListenerMatch($Expected, $Current) {
-  foreach ($field in @(
-      'listener_pid',
-      'process_start_utc',
-      'process_command_sha256',
-      'process_user_sid')) {
-    if ([string]$Expected.$field -cne [string]$Current.$field) {
+  Assert-ListenerDocument $Expected
+  Assert-ListenerDocument $Current
+  foreach ($field in @(Get-ListenerFieldNames $Expected)) {
+    $changed = if ($field -in @(
+        'scheduler_start_utc',
+        'launcher_start_utc',
+        'listener_start_utc')) {
+      (Get-ListenerUtcTicks $Expected.$field) -ne
+        (Get-ListenerUtcTicks $Current.$field)
+    } else {
+      [string]$Expected.$field -cne [string]$Current.$field
+    }
+    if ($changed) {
       Die 'windows_listener_changed' ('the endpoint listener changed during maintenance at ' + $field)
     }
   }
@@ -496,8 +949,12 @@ function Wait-StartupHealthy([string]$configPath, [object]$binding) {
       try {
         $probe = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
           -Headers @{Authorization=('Bearer ' + $token)} -TimeoutSec 3
-        $ready = ($probe.ready -eq $true) -and ($probe.native_platform -eq $true) -and `
-          $probe.schema_version -eq 'solidworks-to-urdf.health/v1'
+        $ready = (
+          (Test-MaintenanceHealthShape $probe ([int]$config.port)) -and
+          [string]$probe.release.version -ceq [string]$binding.version -and
+          [string]$probe.release.source_commit -ceq [string]$binding.source_commit -and
+          [string]$probe.release.source_sha256 -ceq [string]$binding.source_sha256
+        )
       } catch { $ready = $false }
     }
     if ($ready) { $listenerPid = $pidNow; break }
@@ -530,8 +987,11 @@ function Wait-Settled([string]$configPath, [object]$binding) {
       $probe = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
         -Headers @{Authorization=('Bearer ' + $token)} -TimeoutSec 3
     } catch { throw ('the settle window observed /health not ready: ' + $_.Exception.Message) }
-    if (-not $probe.ready -or -not $probe.native_platform -or $probe.schema_version -ne 'solidworks-to-urdf.health/v1') {
-      throw 'the settle window observed /health without the ready IF-09 identity'
+    if (-not (Test-MaintenanceHealthShape $probe ([int]$config.port)) -or
+        [string]$probe.release.version -cne [string]$binding.version -or
+        [string]$probe.release.source_commit -cne [string]$binding.source_commit -or
+        [string]$probe.release.source_sha256 -cne [string]$binding.source_sha256) {
+      throw 'the settle window observed /health outside the bound maintenance readiness contract'
     }
     Start-Sleep -Seconds 10
   }
@@ -911,7 +1371,7 @@ function Read-ValidatedSnapshot(
     throw 'the sealed source-state authority differs from the bound promotion'
   }
   $source = Read-Json $sourcePath
-  if ([string]$source.schema_version -cne 'solidworks-to-urdf.windows-source-state/v1') {
+  if ([string]$source.schema_version -cne 'solidworks-to-urdf.windows-source-state/v2') {
     throw 'the source snapshot schema is unsupported'
   }
   if ([string]::IsNullOrWhiteSpace([string]$source.task_name) -or
@@ -960,6 +1420,10 @@ function Read-ValidatedSnapshot(
       (Normalize-PathIdentity (Config-Path ([string]$source.endpoint_root)))) {
     throw 'the sealed source configuration is outside its generation'
   }
+  if ($null -eq $source.listener) {
+    throw 'the sealed source has no listener evidence'
+  }
+  Assert-ListenerSourceMatch $source.listener $source
   $installIdPath = Join-Path ([string]$source.state_root) 'install-id'
   if ((Normalize-PathIdentity ([string]$source.execute)) -ne
         (Normalize-PathIdentity (Runtime-Python ([string]$source.endpoint_root))) -or
@@ -1139,10 +1603,14 @@ function Restore-PreviousEndpoint(
         Start-BoundTask $binding
         $restore.started = $true
         $health = Read-EndpointHealth ([string]$source.config_path)
-        Assert-HealthSourceMatch $health $source
         $runningTask = Get-BoundTask $binding 'Stop'
         $runningProjection = Get-TaskProjection $runningTask
-        $restore.listener = Get-ListenerEvidence $binding $runningProjection
+        $runningListener = Get-ListenerEvidence $binding $runningProjection
+        Assert-ListenerSourceMatch $runningListener $current
+        $current.listener = $runningListener
+        $restore.source = $current
+        Assert-HealthSourceMatch $health $current
+        $restore.listener = $runningListener
         $restore.healthy = $true
       } catch { if (-not $restore.error) { $restore.error = 'start/health: ' + $_.Exception.Message } }
     } elseif (-not $restore.error) {
@@ -2169,9 +2637,9 @@ function Get-EndpointIdentity($Task, $TaskProjection, [string]$SshHost) {
     }
   }
 }
-function New-EndpointSourceState($Task, $TaskProjection, $Identity) {
-  return [ordered]@{
-    schema_version = 'solidworks-to-urdf.windows-source-state/v1'
+function New-EndpointSourceState($Task, $TaskProjection, $Identity, $Listener = $null) {
+  $source = [ordered]@{
+    schema_version = 'solidworks-to-urdf.windows-source-state/v2'
     task_path = [string]$TaskProjection.task_path
     task_name = [string]$TaskProjection.task_name
     task_xml_sha256 = [string]$TaskProjection.xml_sha256
@@ -2196,6 +2664,67 @@ function New-EndpointSourceState($Task, $TaskProjection, $Identity) {
     install_id = [string]$Identity.install_id
     release_identity_sha256 = [string]$Identity.release_identity_sha256
     release = $Identity.release
+    listener = $Listener
+  }
+  if ($null -ne $Listener) {
+    Assert-ListenerSourceMatch $Listener $source
+  }
+  return $source
+}
+function Assert-ListenerSourceMatch($Listener, $Source) {
+  Assert-ListenerDocument $Listener
+  if ($null -eq $Source -or
+      [string]$Source.schema_version -cne 'solidworks-to-urdf.windows-source-state/v2' -or
+      [string]$Source.principal.sid -cne [string]$Source.principal_sid) {
+    throw 'the source context is missing or unsupported'
+  }
+  $endpointRoot = Normalize-PathIdentity ([string]$Source.endpoint_root)
+  $expectedExecute = $endpointRoot + '/runtime/Scripts/python.exe'
+  $expectedConfig = $endpointRoot + '/endpoint.json'
+  $expectedVenvConfig = $endpointRoot + '/runtime/pyvenv.cfg'
+  if ((Normalize-PathIdentity ([string]$Source.execute)) -ne $expectedExecute -or
+      (Normalize-PathIdentity ([string]$Source.config_path)) -ne $expectedConfig -or
+      [string]$Listener.process_arguments_sha256 -cne
+        (Get-TextSha256 ([string]$Source.arguments)) -or
+      (Normalize-PathIdentity ([string]$Listener.launcher_image)) -ne
+        (Normalize-PathIdentity ([string]$Source.execute)) -or
+      (Normalize-PathIdentity ([string]$Listener.venv_config_path)) -ne
+        $expectedVenvConfig -or
+      [string]$Listener.launcher_user_sid -cne [string]$Source.principal_sid -or
+      [string]$Listener.listener_user_sid -cne [string]$Source.principal_sid) {
+    throw 'the source listener differs from the task or configuration identity'
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$env:SystemRoot)) {
+    throw 'the Windows system root is unavailable'
+  }
+  if ((Normalize-PathIdentity ([string]$Listener.scheduler_image)) -ne
+      (Normalize-PathIdentity (Join-Path ([string]$env:SystemRoot) 'System32\svchost.exe'))) {
+    throw 'the source listener names another Task Scheduler host'
+  }
+  try {
+    $runtime = Read-PyvenvRuntime (Join-Path ([string]$Source.endpoint_root) 'runtime')
+  } catch {
+    throw ('the source virtual environment is unreadable: ' + $_.Exception.Message)
+  }
+  if ((Normalize-PathIdentity ([string]$Listener.venv_config_path)) -ne
+        (Normalize-PathIdentity ([string]$runtime.path)) -or
+      [string]$Listener.venv_config_sha256 -cne [string]$runtime.sha256 -or
+      (Normalize-PathIdentity ([string]$Listener.venv_home)) -ne
+        (Normalize-PathIdentity ([string]$runtime.home)) -or
+      [string]$Listener.venv_version -cne [string]$runtime.version -or
+      (Normalize-PathIdentity ([string]$Listener.base_interpreter_path)) -ne
+        (Normalize-PathIdentity ([string]$runtime.base_interpreter)) -or
+      [string]$Listener.base_interpreter_sha256 -cne
+        [string]$runtime.base_interpreter_sha256) {
+    throw 'the source virtual environment differs from the listener evidence'
+  }
+  $launcherPath = [string]$Source.execute
+  if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
+    throw ('the source task-action image is missing: ' + $launcherPath)
+  }
+  Assert-NoReparseAncestor $launcherPath
+  if ([string]$Listener.launcher_image_sha256 -cne (Sha256 $launcherPath)) {
+    throw 'the source task-action image digest differs from the listener evidence'
   }
 }
 function Assert-EndpointSourceMatch($Expected, $Current) {
@@ -2236,14 +2765,18 @@ function Assert-EndpointSourceMatch($Expected, $Current) {
       (Get-JsonSha256 $Expected.settings) -ne (Get-JsonSha256 $Current.settings)) {
     Die 'windows_source_identity_mismatch' 'the restored source release, port, or settings differs'
   }
+  if ($null -ne $Expected.listener -and $null -ne $Current.listener) {
+    Assert-ListenerMatch $Expected.listener $Current.listener
+  }
 }
 function Assert-HealthSourceMatch($Health, $Source) {
-  if ([string]$Health.install_id -cne [string]$Source.install_id -or
-      [string]$Health.config_digest -cne [string]$Source.config_digest -or
-      [string]$Health.release.version -cne [string]$Source.release.version -or
-      [string]$Health.release.source_commit -cne [string]$Source.release.source_commit -or
-      [string]$Health.release.source_sha256 -cne [string]$Source.release.source_sha256) {
-    Die 'windows_source_health_mismatch' 'the restored endpoint health differs from the sealed source identity'
+  try {
+    Assert-MaintenanceHealth $Health ([string]$Source.release.version) `
+      ([string]$Source.release.source_commit) `
+      ([string]$Source.release.source_sha256) ([int]$Source.port)
+  } catch {
+    Die 'windows_source_health_mismatch' (
+      'the endpoint health differs from the sealed release or port')
   }
 }
 function Get-RecoveryComparableState($State) {
@@ -2874,16 +3407,22 @@ function Invoke-RecoveryResume($Binding) {
     Die 'windows_resume_not_disabled' ('the Windows task is neither Disabled nor Running: ' + $projection.state)
   }
   $health = $settled.health
-  if ($health.install_id -ne [string]$Binding.install_id -or
-      $health.config_digest -ne [string]$Binding.config_digest -or
-      $health.release.version -ne [string]$Binding.version -or
-      $health.release.source_commit -ne [string]$Binding.source_commit -or
-      $health.release.source_sha256 -ne [string]$Binding.source_sha256) {
+  try {
+    Assert-MaintenanceHealth $health ([string]$Binding.version) `
+      ([string]$Binding.source_commit) ([string]$Binding.source_sha256) `
+      ([int]$Binding.port)
+  } catch {
     try { Disable-ManagedTask ([string]$task.TaskName) ([string]$task.TaskPath) } catch { }
-    Die 'windows_health_mismatch' 'the resumed endpoint did not report the bound identity'
+    Die 'windows_health_mismatch' 'the resumed endpoint did not report the bound release or port'
+  }
+  $runningTask = Get-RecoveryTask ([string]$Binding.task_name) ([string]$Binding.task_path)
+  $runningProjection = Get-TaskProjection $runningTask
+  $listener = Get-ListenerEvidence $Binding $runningProjection
+  if ([int]$listener.listener_pid -ne [int]$settled.listener_pid) {
+    Die 'windows_listener_changed' 'the resumed endpoint listener changed after the settle window'
   }
   Emit @{passed=$true; verb='resume'; task_state='Running'; settled_seconds=$settled.settled_seconds;
-    listener_pid=$settled.listener_pid; health=$health}
+    listener=$listener; health=$health}
 }
 
 function Invoke-Main {
@@ -2919,7 +3458,7 @@ if ($Verb -eq 'health') {
   $listener = Get-ListenerEvidence $binding $projection
   try { $probe = Read-EndpointHealth ([string]$identity.config_path) }
   catch { Die 'endpoint_unhealthy' $_.Exception.Message }
-  $source = New-EndpointSourceState $task $projection $identity
+  $source = New-EndpointSourceState $task $projection $identity $listener
   Assert-HealthSourceMatch $probe $source
   Emit @{passed=$true; verb='health'; health=$probe; listener=$listener}
   exit 0
@@ -2953,9 +3492,11 @@ if ($Verb -eq 'status') {
           [string]::IsNullOrWhiteSpace([string]$rollbackIntent.rollback_generation) -or
           [string]::IsNullOrWhiteSpace([string]$rollbackIntent.restore_to) -or
           [string]::IsNullOrWhiteSpace([string]$rollbackIntent.current_snapshot) -or
-          [string]$rollbackIntent.source_state_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+          [string]$rollbackIntent.source_state_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+          $null -eq $rollbackIntent.source) {
         throw 'the pending rollback intent is incomplete or malformed'
       }
+      Assert-ListenerSourceMatch $rollbackIntent.source.listener $rollbackIntent.source
       $pendingRollback = @{
         state='present'
         previous=[string]$rollbackIntent.previous
@@ -3003,7 +3544,6 @@ if ($Verb -eq 'status') {
       $projection = Get-TaskProjection $task
       Set-BindingTaskPath $binding ([string]$projection.task_path)
       $identity = Get-EndpointIdentity $task $projection ([string]$binding.ssh_host)
-      $source = New-EndpointSourceState $task $projection $identity
       $listener = $null
       $health = $null
       if ([string]$task.State -eq 'Running') {
@@ -3011,6 +3551,9 @@ if ($Verb -eq 'status') {
           throw 'the running endpoint port differs from the binding'
         }
         $listener = Get-ListenerEvidence $binding $projection
+      }
+      $source = New-EndpointSourceState $task $projection $identity $listener
+      if ([string]$task.State -eq 'Running') {
         $health = Read-EndpointHealth ([string]$identity.config_path)
         Assert-HealthSourceMatch $health $source
       }
@@ -3042,6 +3585,8 @@ if ($Verb -eq 'status') {
         } elseif ($record.source) {
           try {
             Assert-EndpointSourceMatch $record.source $source
+            Assert-ListenerSourceMatch $record.source.listener $source
+            Assert-ListenerMatch $record.source.listener $listener
             $relation = 'source'
           } catch {
             $relation = 'unknown'
@@ -3236,7 +3781,7 @@ if ($Verb -eq 'promote') {
   $sourceListener = Get-ListenerEvidence $binding $sourceProjection
   $sourceHealth = Read-EndpointHealth $previousConfig
   Assert-HealthSourceMatch $sourceHealth $sourceIdentity
-  $sourceState = New-EndpointSourceState $task $sourceProjection $sourceIdentity
+  $sourceState = New-EndpointSourceState $task $sourceProjection $sourceIdentity $sourceListener
   if ((Get-GenerationLaunchContract $StageDir) -cne (Python-Module-LaunchContract)) {
     Die 'stage_launch_contract_unsupported' 'the staged candidate does not declare the Python module launcher contract'
   }
@@ -3278,16 +3823,17 @@ if ($Verb -eq 'promote') {
   Write-Receipt (Join-Path $promotions 'pending-promotion.json') @{
     intent=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
     previous=$previous; task_before=(Join-Path $previous 'task.xml');
-    source=$sourceState; source_state_sha256=$sourceStateSha256; source_listener=$sourceListener;
+    source=$sourceState; source_state_sha256=$sourceStateSha256;
     target=$pendingTarget}
   $mutationStarted = $false
   try {
     $preStopTask = Get-BoundTask $binding 'Stop'
     $preStopProjection = Get-TaskProjection $preStopTask
     $preStopIdentity = Get-EndpointIdentity $preStopTask $preStopProjection ([string]$binding.ssh_host)
-    $preStopSource = New-EndpointSourceState $preStopTask $preStopProjection $preStopIdentity
-    Assert-EndpointSourceMatch $sourceState $preStopSource
     $preStopListener = Get-ListenerEvidence $binding $preStopProjection
+    $preStopSource = New-EndpointSourceState $preStopTask $preStopProjection $preStopIdentity `
+      $preStopListener
+    Assert-EndpointSourceMatch $sourceState $preStopSource
     Assert-ListenerMatch $sourceListener $preStopListener
     $preStopHealth = Read-EndpointHealth ([string]$preStopIdentity.config_path)
     Assert-HealthSourceMatch $preStopHealth $sourceState
@@ -3346,14 +3892,11 @@ if ($Verb -eq 'promote') {
     $lockRefusal = $started.lock_refusal
     $retriedAfter = $started.retried_after_s
     $health = $settled.health
-    if ($health.config_digest -ne $candidate.config_digest) {
-      throw 'the running endpoint config digest differs from the staged generation configuration'
-    }
     $targetListener = Get-ListenerEvidence $binding $targetProjection
     $receipt = @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
       previous=$previous; source=$sourceState;
-      source_state_sha256=$sourceStateSha256; source_listener=$sourceListener;
+      source_state_sha256=$sourceStateSha256;
       target=$targetState; health=$health; listener=$targetListener;
       settled_seconds=$settled.settled_seconds; listener_pid=$settled.listener_pid}
     if ($lockRefusal) { $receipt['lock_refusal']=$lockRefusal; $receipt['retried']=@{after_s=$retriedAfter} }
@@ -3422,7 +3965,7 @@ if ($Verb -eq 'rollback') {
   $currentHealth = Read-EndpointHealth ([string]$currentIdentity.config_path)
   Assert-HealthSourceMatch $currentHealth $currentIdentity
   $currentListener = Get-ListenerEvidence $binding $currentProjection
-  $currentSource = New-EndpointSourceState $task $currentProjection $currentIdentity
+  $currentSource = New-EndpointSourceState $task $currentProjection $currentIdentity $currentListener
   $targetSource = $validatedPrevious.source
   $pins = Assert-DomainPins $binding.state_root ([string]$currentIdentity.endpoint_root)
   New-Item -ItemType Directory -Path $promotions -ErrorAction SilentlyContinue | Out-Null
@@ -3451,9 +3994,11 @@ if ($Verb -eq 'rollback') {
   $preStopTask = Get-BoundTask $binding 'Stop'
   $preStopProjection = Get-TaskProjection $preStopTask
   $preStopIdentity = Get-EndpointIdentity $preStopTask $preStopProjection ([string]$binding.ssh_host)
-  $preStopSource = New-EndpointSourceState $preStopTask $preStopProjection $preStopIdentity
+  $preStopListener = Get-ListenerEvidence $binding $preStopProjection
+  $preStopSource = New-EndpointSourceState $preStopTask $preStopProjection $preStopIdentity `
+    $preStopListener
   Assert-EndpointSourceMatch $currentSource $preStopSource
-  Assert-ListenerMatch $currentListener (Get-ListenerEvidence $binding $preStopProjection)
+  Assert-ListenerMatch $currentListener $preStopListener
   $preStopHealth = Read-EndpointHealth ([string]$preStopIdentity.config_path)
   Assert-HealthSourceMatch $preStopHealth $currentSource
   Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' ([string]$targetSource.endpoint_root)
@@ -3505,7 +4050,8 @@ if ($Verb -eq 'rollback') {
   Write-Receipt (Join-Path $promotions ('rollback-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') + '.json')) @{
     passed=$true; verb='rollback'; at=(Get-Date).ToUniversalTime().ToString('o');
     restored_from=$Previous; rollback_source=$rollbackSnapshot; source=$targetSource;
-    source_state_sha256=$expectedSourceStateSha256; restore=$restore; health=$health}
+    source_state_sha256=$expectedSourceStateSha256;
+    listener=$restore.listener; restore=$restore; health=$health}
   Emit @{passed=$true; verb='rollback'; restored_from=$Previous}
   exit 0
 }
