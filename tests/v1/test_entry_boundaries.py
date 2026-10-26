@@ -170,7 +170,8 @@ print(json.dumps(sorted(
     def test_windows_lifecycle_uses_the_existing_native_module_route(self) -> None:
         source = (ROOT / "deploy/windows/instance-lifecycle.ps1").read_text(encoding="utf-8")
         self.assertIn("-I -B -m description_pipeline.orchestration.windows serve --config", source)
-        self.assertIn("'^(-I -m description_pipeline serve --config )\"([^\"]+)\"$'", source)
+        self.assertNotIn("'^(-I -m description_pipeline serve --config )\"([^\"]+)\"$'", source)
+        self.assertNotIn("140d39e51be5f0c39c32d7cfea9ca25fe642c273", source)
 
 
 if __name__ == "__main__":

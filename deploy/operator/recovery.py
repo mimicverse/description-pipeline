@@ -98,11 +98,7 @@ MAINTENANCE_RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-maintenance/v1"
 SNAPSHOT_WORKER_SCHEMA = "solidworks-to-urdf.recovery-snapshot-worker/v5"
 SELECTION_SCHEMA = "solidworks-to-urdf.recovery-selection/v2"
 SNAPSHOT_READY_SCHEMA = "solidworks-to-urdf.recovery-snapshot-ready/v1"
-WINDOWS_RECOVERY_SCHEMA = "solidworks-to-urdf.windows-recovery/v1"
-WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
-WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
-WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256 = "62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200"
-WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256 = "15d94bef1ad0475bc30ba4b3cc9fd19a707d9893e6318d9529b787cca0dfcf3a"
+WINDOWS_RECOVERY_SCHEMA = "solidworks-to-urdf.windows-recovery/v2"
 WINDOWS_BUNDLE_MEMBER = "windows/recovery.zip"
 WINDOWS_STATE_MEMBER = "windows-state.json"
 WINDOWS_BUNDLE = "recovery.zip"
@@ -6788,14 +6784,6 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "Windows task does not enforce singleton instances",
     )
     raw_identity = state["identity"]
-    missing_launch_contract = object()
-    declared_launch_contract = missing_launch_contract
-    if isinstance(raw_identity, dict):
-        raw_identity = dict(raw_identity)
-        declared_launch_contract = raw_identity.pop(
-            "runtime_launch_contract",
-            missing_launch_contract,
-        )
     identity = _exact_keys(
         raw_identity,
         {
@@ -6821,36 +6809,6 @@ def _validate_windows_recovery_state(document: object) -> dict:
         },
         "windows state identity",
     )
-    launch_contract = declared_launch_contract
-    if launch_contract is missing_launch_contract:
-        launch_contract = (
-            WINDOWS_LEGACY_LAUNCH_CONTRACT
-            if identity["release_identity_sha256"] == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256
-            else None
-        )
-    require(
-        isinstance(launch_contract, str)
-        and launch_contract
-        in {
-            WINDOWS_PYTHON_LAUNCH_CONTRACT,
-            WINDOWS_LEGACY_LAUNCH_CONTRACT,
-        },
-        "windows_recovery_state_invalid",
-        "Windows runtime launch contract is unsupported",
-    )
-    require(
-        launch_contract != WINDOWS_LEGACY_LAUNCH_CONTRACT
-        or identity["release_identity_sha256"] == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
-        "windows_recovery_state_invalid",
-        "the legacy launch contract is not bound to the approved release",
-    )
-    require(
-        launch_contract != WINDOWS_PYTHON_LAUNCH_CONTRACT
-        or identity["release_identity_sha256"] != WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
-        "windows_recovery_state_invalid",
-        "the approved legacy release cannot use the Python module launch contract",
-    )
-    identity["runtime_launch_contract"] = launch_contract
     require(
         identity["operator_administrator"] is True,
         "windows_operator_not_administrator",
@@ -6890,26 +6848,14 @@ def _validate_windows_recovery_state(document: object) -> dict:
         )
     }
     normalized_action = {key: str(value).replace("\\", "/") for key, value in action.items()}
-    transition_python_action = (
-        identity["release_identity_sha256"] == WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
-        and normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
-        and normalized_action["arguments"]
-        == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
-    )
-    python_module_action = (
-        normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
-        and normalized_action["arguments"]
-        == f'-I -B -m description_pipeline.orchestration.windows serve --config "{normalized["config_path"]}"'
-    ) or transition_python_action
-    legacy_launcher_action = (
-        normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/description.exe"
-        and normalized_action["arguments"] == f'serve --config "{normalized["config_path"]}"'
+    managed_runtime_action = (
+        normalized_action["execute"]
+        == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
     )
     require(
-        (
-            (launch_contract == WINDOWS_PYTHON_LAUNCH_CONTRACT and python_module_action)
-            or (launch_contract == WINDOWS_LEGACY_LAUNCH_CONTRACT and legacy_launcher_action)
-        )
+        managed_runtime_action
+        and normalized["config_path"].casefold()
+        in normalized_action["arguments"].casefold()
         and normalized_action["working_directory"] == normalized["state_root"]
         and normalized["config_path"] == normalized["endpoint_root"] + "/endpoint.json"
         and normalized["install_id_path"].startswith(normalized["state_root"] + "/")

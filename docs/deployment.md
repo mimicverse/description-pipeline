@@ -109,17 +109,22 @@ spec target；已存在 request 的重试先复用封存 Spec，不读取 later 
 
 Windows 端点的新 generation 只使用解释器入口 `runtime\Scripts\python.exe`，参数固定为
 `-I -B -m description_pipeline.orchestration.windows serve --config "<generation>\endpoint.json"`；
-其中 `-B` 禁止解释器向受管 generation 写入字节码缓存。stage receipt 必须声明
-`launch_contract=python_module_v1`，promote 必须拒绝缺失或不同契约的候选。为完成从
-已部署 `140d39e5` generation 的一次性安全迁移，验证只可接受该固定 source commit
-与 version 1.5.0 的精确旧形式
-`-I -m description_pipeline serve --config "<generation>\endpoint.json"`；该兼容
-不得扩展到新 generation、其他来源或其他 action。不得依赖 pip 生成的
-`description.exe` launcher；该 launcher 的代码完整性身份可能被主机 Device
-Guard/WDAC 策略拒绝，不能通过关闭策略、添加例外或复制旧可执行文件绕过。为完成从
-更早 generation 的一次性安全回滚，恢复只可接受无该契约历史 generation 的精确
-`description.exe + serve --config "<generation>\endpoint.json"` 形式，并须记录
-`legacy_pip_launcher_v0`；该过渡形式不得用于新 stage 或 promote。
+其中 `-B` 禁止解释器向受管 generation 写入字节码缓存。新目标的配置、发行身份和任务定义
+必须与当前 stage 记录一致，不接受替代启动方式。不得依赖 pip 生成的 `description.exe`
+launcher，也不得通过关闭 Device Guard/WDAC、添加例外或复制旧可执行文件绕过策略。
+
+当前受管实例的所有权与新目标的启动断言分开核验。既有任务须绑定精确 task name/path、
+唯一 action、受管服务账户和 ACL、同一 generation 的解释器与 `endpoint.json`、工作目录、
+安装与发行身份，以及即时进程和监听端点。不能仅因当前实例的启动串不同于新目标而拒绝
+既有受管对象，也不能接管外来任务、忽略身份冲突或把 UNKNOWN 当作已完成。
+
+在 Stop 或任何替换之前，先持久封存当前原始 task XML、配置、身份、必要权限与 pin、
+摘要和操作意图，再统一安装唯一目标状态。失败恢复只使用本次绑定的封存源状态；恢复任务
+按原始 XML 的安全语义和实际旧端点身份核验，不套用新目标的启动串，也不按历史版本
+枚举兼容形式。XML 原件摘要保持精确；任务系统导出格式差异不能放宽 action、账户、
+权限或设置。Windows 统一解释任务和运行状态，Linux operator 只消费源／目标身份明确的
+结构化事实；status、health、reconcile、rollback、backup 和 restore 共用此边界。
+排空、维护锁、租约、不可变发行归档与 UNKNOWN 对账能力继续有效。
 
 Windows 的 canonical release archive 是不可变 lifecycle 输入，不进入可变 recovery snapshot/state。恢复只重建 runtime、配置和任务身份；archive 缺失、摘要漂移或 ReadOnly/protected ACL 不成立时必须从同一固定 release 重建并重新 stage，promote/rollback 复用前重新核验 ReadOnly、受保护 ACL 与摘要，不能静默恢复成可写归档。
 

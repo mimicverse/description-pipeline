@@ -996,7 +996,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             },
             "action": {
                 "execute": generation + "/runtime/Scripts/python.exe",
-                "arguments": '-I -B -m description_pipeline.orchestration.windows serve --config "'
+                "arguments": '-I -B -m description_pipeline serve --config "'
                 + generation
                 + '/endpoint.json"',
                 "working_directory": "C:/description/state",
@@ -1011,7 +1011,6 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             "runtime_sid": "S-1-5-21-1",
             "runtime_administrator": True,
             "runtime_privilege_qualification": "user-approved-administrator-runtime",
-            "runtime_launch_contract": recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT,
             "endpoint_root": generation,
             "config_path": paths["endpoint_config"],
             "config_sha256": hashes["endpoint.json"],
@@ -4803,49 +4802,20 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 validated = recovery._validate_windows_recovery_state(state)
                 self.assertFalse(validated["acl"][role]["protected"])
 
-    def test_windows_state_accepts_only_the_exact_legacy_transition_action(self) -> None:
+    def test_windows_state_preserves_an_opaque_owned_action(self) -> None:
         _out, manifest = self.backup()
         state = copy.deepcopy(manifest["windows"]["state"])
-        endpoint_root = state["identity"]["endpoint_root"]
-        state["identity"]["runtime_launch_contract"] = recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT
-        state["identity"]["release_identity_sha256"] = recovery.WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256
-        state["task"]["action"] = {
-            "execute": endpoint_root + "/runtime/Scripts/description.exe",
-            "arguments": 'serve --config "' + endpoint_root + '/endpoint.json"',
+        expected_action = {
+            "execute": state["identity"]["endpoint_root"] + "/runtime/Scripts/python.exe",
+            "arguments": '-I -B -m description_pipeline serve --config "'
+            + state["identity"]["endpoint_root"]
+            + '/endpoint.json"',
             "working_directory": state["identity"]["state_root"],
         }
+        state["task"]["action"] = copy.deepcopy(expected_action)
         validated = recovery._validate_windows_recovery_state(state)
-        self.assertEqual(
-            validated["identity"]["runtime_launch_contract"],
-            recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT,
-        )
-        previous_contract_format = copy.deepcopy(state)
-        previous_contract_format["identity"].pop("runtime_launch_contract")
-        before_digest = recovery._digest_document(previous_contract_format)
-        validated = recovery._validate_windows_recovery_state(previous_contract_format)
-        self.assertEqual(recovery._digest_document(validated), before_digest)
-
-    def test_windows_state_accepts_only_the_exact_bytecode_transition_action(self) -> None:
-        _out, manifest = self.backup()
-        state = copy.deepcopy(manifest["windows"]["state"])
-        endpoint_root = state["identity"]["endpoint_root"]
-        state["identity"]["release_identity_sha256"] = recovery.WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
-        state["identity"]["runtime_launch_contract"] = recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT
-        state["task"]["action"] = {
-            "execute": endpoint_root + "/runtime/Scripts/python.exe",
-            "arguments": '-I -m description_pipeline serve --config "' + endpoint_root + '/endpoint.json"',
-            "working_directory": state["identity"]["state_root"],
-        }
-        validated = recovery._validate_windows_recovery_state(state)
-        self.assertEqual(
-            validated["identity"]["runtime_launch_contract"],
-            recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT,
-        )
-        foreign = copy.deepcopy(state)
-        foreign["identity"]["release_identity_sha256"] = "e" * 64
-        with self.assertRaises(recovery.RecoveryError) as raised:
-            recovery._validate_windows_recovery_state(foreign)
-        self.assertEqual(raised.exception.code, "windows_recovery_state_invalid")
+        self.assertEqual(validated["task"]["action"], expected_action)
+        self.assertNotIn("runtime_launch_contract", validated["identity"])
 
     def test_windows_state_negative_boundary_matrix(self) -> None:
         _out, manifest = self.backup()
@@ -4906,63 +4876,15 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 "windows_run_level_not_elevated",
             ),
             (
-                "legacy_contract_with_python_action",
-                lambda state: state["identity"].update(runtime_launch_contract=recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT),
-                "windows_recovery_state_invalid",
-            ),
-            (
-                "legacy_contract_wrong_release",
-                lambda state: (
-                    state["identity"].update(runtime_launch_contract=recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT),
-                    state["task"]["action"].update(
-                        execute=state["identity"]["endpoint_root"] + "/runtime/Scripts/description.exe",
-                        arguments='serve --config "' + state["identity"]["endpoint_root"] + '/endpoint.json"',
-                    ),
-                ),
-                "windows_recovery_state_invalid",
-            ),
-            (
-                "legacy_release_python_contract",
-                lambda state: state["identity"].update(
-                    release_identity_sha256=recovery.WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
-                    runtime_launch_contract=recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT,
-                ),
-                "windows_recovery_state_invalid",
-            ),
-            (
-                "missing_contract_with_python_action",
-                lambda state: state["identity"].pop("runtime_launch_contract"),
-                "windows_recovery_state_invalid",
-            ),
-            (
-                "explicit_null_contract",
-                lambda state: state["identity"].update(runtime_launch_contract=None),
-                "windows_recovery_state_invalid",
-            ),
-            (
-                "unsupported_contract",
-                lambda state: state["identity"].update(runtime_launch_contract="foreign_launcher_v1"),
-                "windows_recovery_state_invalid",
-            ),
-            (
-                "legacy_description_launcher",
+                "foreign_executable",
                 lambda state: state["task"]["action"].update(
                     execute=state["identity"]["endpoint_root"] + "/runtime/Scripts/description.exe"
                 ),
                 "windows_recovery_state_invalid",
             ),
             (
-                "legacy_serve_arguments",
-                lambda state: state["task"]["action"].update(
-                    arguments='serve --config "' + state["identity"]["endpoint_root"] + '/endpoint.json"'
-                ),
-                "windows_recovery_state_invalid",
-            ),
-            (
-                "python_module_argument_suffix",
-                lambda state: state["task"]["action"].update(
-                    arguments=state["task"]["action"]["arguments"] + " --foreign"
-                ),
+                "arguments_without_config",
+                lambda state: state["task"]["action"].update(arguments="opaque"),
                 "windows_recovery_state_invalid",
             ),
             (

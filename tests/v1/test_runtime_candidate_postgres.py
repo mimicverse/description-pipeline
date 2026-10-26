@@ -2377,26 +2377,45 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertTrue(entered.wait(5))
 
         terminal = {}
+        manual_ordering = threading.Event()
 
         def poll() -> None:
+            def observe(view) -> None:
+                terminal_state = view.state in {
+                    "satisfied",
+                    "failed",
+                    "cancelled",
+                    "unknown",
+                }
+                if manual_ordering.is_set() and not terminal_state:
+                    return
+                self.facts.record_run_activity(
+                    self.admission.run_id,
+                    view.operation_id,
+                    view.activity,
+                    terminal=terminal_state,
+                )
+
             try:
                 terminal["view"] = client.wait_for_terminal(
                     operation_id,
                     timeout=5,
                     poll_interval=0.01,
-                    on_observation=lambda view: self.facts.record_run_activity(
-                        self.admission.run_id,
-                        view.operation_id,
-                        view.activity,
-                        terminal=view.state
-                        in {"satisfied", "failed", "cancelled", "unknown"},
-                    ),
+                    on_observation=observe,
                 )
             except BaseException as error:
                 terminal["error"] = error
 
         poll_thread = threading.Thread(target=poll, daemon=True)
         poll_thread.start()
+
+        def release_poll() -> None:
+            release.set()
+            poll_thread.join(5)
+
+        # unittest cleanups run on assertion failure as well as success, so a failed ordering
+        # assertion cannot leave the callback polling while the test is being torn down.
+        self.addCleanup(release_poll)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             row = self._query(
@@ -2411,6 +2430,10 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 "native activity was not projected into run_display_metadata: "
                 f"events={runtime._events(operation_id)!r} terminal={terminal!r}"
             )
+        # The first observation above proves the asynchronous callback path. Thereafter the test
+        # owns nonterminal ordering until it explicitly releases the terminal transition; retain
+        # terminal callbacks so the poller still verifies eventual completion.
+        manual_ordering.set()
 
         projection = read_run_projection(
             self._connect(),
