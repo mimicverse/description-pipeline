@@ -373,7 +373,7 @@ def _run(workspace: Path) -> dict:
     request_evidence = build_request_evidence(
         purpose=PURPOSE_ENGINEERING,
         request_id="minimal-native-closure",
-        target_hardware="nd_fixture",
+        target_hardware="m3.0",
         change_summary="Minimal native closure probe",
         main_assembly=main_assembly,
         handoff_digest=handoff_sha256,
