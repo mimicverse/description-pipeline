@@ -355,7 +355,7 @@ function Test-ActionConfigArgument([string]$Arguments, [string]$ConfigPath) {
   if ($optionIndexes.Count -ne 1) { return $false }
   $optionIndex = [int]$optionIndexes[0]
   if ([string]$tokens[$optionIndex].text -cne '--config' -or
-      $optionIndex + 1 -ge $tokens.Count) {
+      $optionIndex + 2 -ne $tokens.Count) {
     return $false
   }
   $value = $tokens[$optionIndex + 1]
