@@ -27,6 +27,31 @@ $newGeneration = Join-Path $Root 'lifecycle/new/generation'
 $oldGeneration = Join-Path $Root 'lifecycle/old/generation'
 $null = New-Item -ItemType Directory -Path $newGeneration -Force
 $null = New-Item -ItemType Directory -Path $oldGeneration -Force
+$harnessSystemRoot = Join-Path $Root 'windows'
+$harnessScheduler = Join-Path $harnessSystemRoot 'System32/svchost.exe'
+$null = New-Item -ItemType Directory -Path (Split-Path -Parent $harnessScheduler) -Force
+Write-Utf8NoBom $harnessScheduler 'harness-svchost'
+$env:SystemRoot = $harnessSystemRoot
+function Initialize-HarnessRuntime([string]$Generation, [string]$Name) {
+  $runtime = Join-Path $Generation 'runtime'
+  $scripts = Join-Path $runtime 'Scripts'
+  $baseHome = Join-Path $Root ($Name + '-python')
+  $base = Join-Path $baseHome 'python.exe'
+  foreach ($directory in @($scripts, $baseHome)) {
+    $null = New-Item -ItemType Directory -Path $directory -Force
+  }
+  Write-Utf8NoBom (Join-Path $scripts 'python.exe') ('launcher:' + $Generation)
+  Write-Utf8NoBom $base ('base:' + $Name)
+  Write-Utf8NoBom (Join-Path $runtime 'pyvenv.cfg') (@(
+      ('home = ' + $baseHome)
+      'include-system-site-packages = false'
+      'version = 3.12.10'
+      ('executable = ' + $base)
+      ('command = "' + $base + '" -m venv "' + $runtime + '"')
+    ) -join "`n")
+}
+Initialize-HarnessRuntime $oldGeneration 'old'
+Initialize-HarnessRuntime $newGeneration 'new'
 $oldConfig = Join-Path $oldGeneration 'endpoint.json'
 $newConfig = Join-Path $newGeneration 'endpoint.json'
 $token = Join-Path $Root 'local-test-token'
@@ -330,15 +355,49 @@ function Read-EndpointRuntimeProbe {
 function Get-ListenerEvidence {
   param([object]$binding, $TaskProjection)
   $script:ListenerCallCount++
+  $generation = Get-ActionGeneration $TaskProjection.action
+  $runtime = Read-PyvenvRuntime (Join-Path $generation 'runtime')
   $listenerPid = if (
     $Scenario -eq 'promote_prestop_identity_mismatch' -and
     $script:ListenerCallCount -ge 2
   ) { 4243 } else { 4242 }
-  return [pscustomobject]@{
+  $evidence = [ordered]@{
+    schema_version='solidworks-to-urdf.windows-listener/v2'
+    relation='direct_venv_child'
+    process_arguments_sha256=(Get-TextSha256 ([string]$TaskProjection.action.arguments))
+    scheduler_service_name='Schedule'
+    scheduler_service_state='Running'
+    scheduler_service_process_id=2512
+    scheduler_pid=2512
+    scheduler_image=(Normalize-PathIdentity $harnessScheduler)
+    scheduler_start_utc='2026-10-27T00:00:00.0000000Z'
+    scheduler_user_sid='S-1-5-18'
+    scheduler_session_id=0
+    launcher_pid=19344
+    launcher_parent_pid=2512
+    launcher_image=(Normalize-PathIdentity ([string]$TaskProjection.action.execute))
+    launcher_image_sha256=(Sha256 ([string]$TaskProjection.action.execute))
+    launcher_start_utc='2026-10-27T00:00:01.0000000Z'
+    launcher_user_sid=$TaskProjection.principal.sid
+    launcher_session_id=1
     listener_pid=$listenerPid
-    process_start_utc='2026-10-27T00:00:00Z'
-    process_command_sha256=('c' * 64)
-    process_user_sid=$TaskProjection.principal.sid}
+    listener_parent_pid=19344
+    listener_start_utc=if ($listenerPid -eq 4243) {
+      '2026-10-27T00:00:02.5000000Z'
+    } else {
+      '2026-10-27T00:00:02.0000000Z'
+    }
+    listener_user_sid=$TaskProjection.principal.sid
+    listener_session_id=1
+    venv_config_path=[string]$runtime.path
+    venv_config_sha256=[string]$runtime.sha256
+    venv_home=[string]$runtime.home
+    venv_version=[string]$runtime.version
+    base_interpreter_path=[string]$runtime.base_interpreter
+    base_interpreter_sha256=[string]$runtime.base_interpreter_sha256
+  }
+  Assert-ListenerDocument $evidence
+  return $evidence
 }
 function Read-EndpointHealth {
   param([string]$configPath)
@@ -369,7 +428,9 @@ $rollbackTask = [pscustomobject]@{
 }
 $rollbackProjection = Get-TaskProjection $rollbackTask
 $rollbackIdentity = Get-EndpointIdentity $rollbackTask $rollbackProjection ''
-$rollbackState = New-EndpointSourceState $rollbackTask $rollbackProjection $rollbackIdentity
+$rollbackListener = Get-ListenerEvidence $binding $rollbackProjection
+$rollbackState = New-EndpointSourceState $rollbackTask $rollbackProjection `
+  $rollbackIdentity $rollbackListener
 Write-Utf8NoBom (Join-Path $script:RollbackPrevious 'task.xml') ([string]$rollbackProjection.xml)
 Copy-Item -LiteralPath $oldConfig `
   -Destination (Join-Path $script:RollbackPrevious 'endpoint-before.json')
@@ -428,7 +489,7 @@ if ($Scenario -in @(
       rollback_generation=(Normalize-PathIdentity $newGeneration);
       restore_to=(Normalize-PathIdentity $oldGeneration);
       current_snapshot=(Join-Path $promotionRecords 'rollback-before-fixture');
-      source_state_sha256=('a' * 64)
+      source_state_sha256=('a' * 64); source=$rollbackState
     }
   }
 }
@@ -515,6 +576,7 @@ if ($Scenario -like 'stage_*') {
   $Script:Binding = $bindingPath
   $Script:StageDir = $newGeneration
 }
+$script:ListenerCallCount = 0
 $message = ''
 $stack = ''
 try { Invoke-Main } catch { $message = $_.Exception.Message; $stack = $_.ScriptStackTrace }

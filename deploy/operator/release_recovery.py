@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from windows_identity import sealed_source_listener_matches
+
 SCHEMA = "solidworks-to-urdf.release-recovery-gate/v1"
 RECEIPT = "release-recovery-gate.json"
 FINALIZE_RECEIPT = "release-finalize-gate.json"
@@ -291,15 +293,18 @@ def validate_code_rollback(receipt_path: Path, install_id: str, identity: dict) 
 
 
 def _status_identity_matches(value: object, install_id: str, config_digest: str) -> bool:
+    source = value.get("source") if isinstance(value, dict) else None
     return (
         isinstance(value, dict)
         and value.get("task_state") == "Running"
         and value.get("install_id") == install_id
         and value.get("config_digest") == config_digest
-        and type(value.get("listener_pid")) is int
-        and value["listener_pid"] > 0
-        and isinstance(value.get("process_start_utc"), str)
-        and bool(value["process_start_utc"])
+        and value.get("listener")
+        == (source.get("listener") if isinstance(source, dict) else None)
+        and isinstance(source, dict)
+        and source.get("install_id") == install_id
+        and source.get("config_digest") == config_digest
+        and sealed_source_listener_matches(source)
     )
 
 
@@ -320,14 +325,18 @@ def status_identity(stdout: str, install_id: str, config_digest: str) -> dict:
     )
 
 
-def fixed_release_paths() -> tuple[Path, Path, Path]:
+def fixed_release_paths() -> tuple[Path, Path, Path, Path]:
     release_manifest = require_file(RELEASE_ROOT / "release.json", "release manifest")
     recovery_py = require_file(RELEASE_ROOT / "deploy" / "operator" / "recovery.py", "recovery.py")
     operatorctl = require_file(
         RELEASE_ROOT / "deploy" / "operator" / "operatorctl.sh",
         "operatorctl.sh",
     )
-    return release_manifest, recovery_py, operatorctl
+    windows_identity_py = require_file(
+        RELEASE_ROOT / "deploy" / "operator" / "windows_identity.py",
+        "windows_identity.py",
+    )
+    return release_manifest, recovery_py, operatorctl, windows_identity_py
 
 
 def canonical_code_rollback_receipt(config: Path, install_id: str) -> Path:
@@ -351,6 +360,7 @@ def authority_inputs(
     release_manifest: Path,
     recovery_py: Path,
     operatorctl: Path,
+    windows_identity_py: Path,
     manifest: Path,
     key: Path,
     target_plan: Path,
@@ -364,6 +374,8 @@ def authority_inputs(
         "recovery_py_sha256": sha256_file(recovery_py),
         "operatorctl": str(operatorctl.resolve()),
         "operatorctl_sha256": sha256_file(operatorctl),
+        "windows_identity_py": str(windows_identity_py.resolve()),
+        "windows_identity_py_sha256": sha256_file(windows_identity_py),
         "manifest": str(manifest.resolve()),
         "manifest_sha256": sha256_file(manifest),
         "key_sha256": sha256_file(key),
@@ -462,6 +474,9 @@ def restore(args, *, verify_only: bool = False) -> int:
     config = require_file(Path(args.config), "platform config")
     recovery_py = require_file(Path(args.recovery_py), "recovery.py")
     operatorctl = require_file(Path(args.operatorctl), "operatorctl")
+    windows_identity_py = require_file(
+        Path(args.windows_identity_py), "windows_identity.py"
+    )
     expected_release = require_file(Path(args.expected_release), "release manifest")
     status_dir = Path(args.status_dir)
     receipt = status_dir / RECEIPT
@@ -478,6 +493,7 @@ def restore(args, *, verify_only: bool = False) -> int:
         release_manifest=expected_release,
         recovery_py=recovery_py,
         operatorctl=operatorctl,
+        windows_identity_py=windows_identity_py,
         manifest=manifest,
         key=key,
         target_plan=plan,
@@ -600,6 +616,9 @@ def finalize(args) -> int:
     status_dir = require_directory(Path(args.restore_status_dir), "restore status directory")
     operatorctl = require_file(Path(args.operatorctl), "operatorctl")
     recovery_py = require_file(Path(args.recovery_py), "recovery.py")
+    windows_identity_py = require_file(
+        Path(args.windows_identity_py), "windows_identity.py"
+    )
     config = require_file(Path(args.config), "platform config")
     expected_release = require_file(Path(args.expected_release), "release manifest")
     identity = expected_identity(expected_release)
@@ -617,6 +636,7 @@ def finalize(args) -> int:
         ("expected_release", expected_release),
         ("recovery_py", recovery_py),
         ("operatorctl", operatorctl),
+        ("windows_identity_py", windows_identity_py),
     ):
         require_success(
             restore_inputs.get(key),
@@ -663,6 +683,7 @@ def finalize(args) -> int:
         "release_manifest_sha256": sha256_file(expected_release),
         "recovery_py_sha256": sha256_file(recovery_py),
         "operatorctl_sha256": sha256_file(operatorctl),
+        "windows_identity_py_sha256": sha256_file(windows_identity_py),
         "release": identity,
         "install_id": args.install_id,
     }
@@ -826,6 +847,10 @@ def _replace_gate_receipt(receipt: Path, document: dict) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="release_recovery.py")
     root.add_argument("--recovery-py", default=str(Path(__file__).with_name("recovery.py")))
+    root.add_argument(
+        "--windows-identity-py",
+        default=str(Path(__file__).with_name("windows_identity.py")),
+    )
     root.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     sub = root.add_subparsers(dest="action", required=True)
     snapshot_parser = sub.add_parser("snapshot")
@@ -860,6 +885,7 @@ def restore_from_plan(args):
         "expected_release",
         "operatorctl",
         "recovery_py",
+        "windows_identity_py",
         "release_file",
         "release_root",
     }
@@ -870,7 +896,7 @@ def restore_from_plan(args):
             "release recovery plan cannot replace fixed release authorities",
             {"forbidden": present},
         )
-    release_manifest, recovery_py, operatorctl = fixed_release_paths()
+    release_manifest, recovery_py, operatorctl, windows_identity_py = fixed_release_paths()
     required = {"config", "manifest", "key_file", "target_plan"}
     if not required.issubset(plan):
         raise GateError(
@@ -892,6 +918,7 @@ def restore_from_plan(args):
         status_dir=status_dir,
         config=plan["config"],
         operatorctl=str(operatorctl),
+        windows_identity_py=str(windows_identity_py),
         expected_release=str(release_manifest),
         runner=args.runner,
         timeout=args.timeout,
@@ -904,6 +931,7 @@ def finalize_from_plan(args):
         "expected_release",
         "operatorctl",
         "recovery_py",
+        "windows_identity_py",
         "release_file",
         "release_root",
     }
@@ -914,7 +942,7 @@ def finalize_from_plan(args):
             "release finalize plan cannot replace fixed release authorities",
             {"forbidden": present},
         )
-    release_manifest, recovery_py, operatorctl = fixed_release_paths()
+    release_manifest, recovery_py, operatorctl, windows_identity_py = fixed_release_paths()
     required = {"config"}
     if not required.issubset(plan):
         raise GateError(
@@ -944,6 +972,7 @@ def finalize_from_plan(args):
         config=plan["config"],
         operatorctl=str(operatorctl),
         recovery_py=str(recovery_py),
+        windows_identity_py=str(windows_identity_py),
         expected_release=str(release_manifest),
         restore_status_dir=status_dir,
         code_rollback_receipt=code_rollback_receipt,

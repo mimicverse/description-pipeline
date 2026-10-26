@@ -31,6 +31,7 @@ flowchart LR
 | 共同 stage engine | claim、执行、候选校验、唯一 decision 及失败保全 | 各阶段领域算法 |
 | Linux handlers | 冻结、原生协调、模型生成、独立验证与发布 | Windows 会话所有权 |
 | Windows native runtime | 已保存 CAD 原生事实读取、几何观察、会话管理，以及释放后的原值投影、raw/STL 编码与证据封包 | 完整模型、URDF、独立质量结论、Git 和 PR |
+| deploy/operator/windows_identity.py | operator 与恢复共用的 Windows 进程证据结构及 sealed source 上下文绑定校验；不解释 Windows Task、CIM 或 pyvenv，不持久化第二份模型 |
 | PostgreSQL `FactStore` | 接纳、命令、执行权、effect 与阶段决定 | artifact 文件内容和 Airflow 调度状态 |
 | `ArtifactStore` | 不可变文件集合、manifest、摘要及物化 | 运行成功、阶段决定和业务显示状态 |
 

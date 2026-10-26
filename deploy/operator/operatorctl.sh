@@ -1462,6 +1462,7 @@ from windows_transport import (
     run_powershell,
     write_metadata,
 )
+from windows_identity import sealed_source_listener_matches
 
 config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
@@ -1578,10 +1579,7 @@ function Get-Sample {{
     task_acl_sha256 = [string]$live.task_acl_sha256
     endpoint_root = [string]$live.endpoint_root
     config_path = [string]$live.config_path
-    listener_pid = [int]$listener.listener_pid
-    process_start_utc = [string]$listener.process_start_utc
-    process_command_sha256 = [string]$listener.process_command_sha256
-    process_user_sid = [string]$listener.process_user_sid
+    listener = $listener
     install_id = [string]$live.install_id
     release_identity_sha256 = [string]$live.release_identity_sha256
     config_digest = [string]$live.config_digest
@@ -1744,7 +1742,11 @@ if not isinstance(result, dict) or result.get("passed") is not True:
     )
 sample = result.get("sample")
 source = sample.get("source") if isinstance(sample, dict) else None
+listener = sample.get("listener") if isinstance(sample, dict) else None
 pending_rollback = sample.get("pending_rollback") if isinstance(sample, dict) else None
+pending_source = pending_rollback.get("source") if isinstance(pending_rollback, dict) else None
+
+
 if (
     not isinstance(sample, dict)
     or sample.get("task_name") != task_name
@@ -1773,23 +1775,23 @@ if (
     or not re.fullmatch(r"[0-9a-f]{64}", sample.get("task_semantic_sha256", ""))
     or not isinstance(sample.get("task_acl_sha256"), str)
     or not re.fullmatch(r"[0-9a-f]{64}", sample.get("task_acl_sha256", ""))
-    or not isinstance(sample.get("process_command_sha256"), str)
-    or not re.fullmatch(r"[0-9a-f]{64}", sample.get("process_command_sha256", ""))
-    or not isinstance(sample.get("process_user_sid"), str)
-    or not sample.get("process_user_sid")
     or sample.get("maintenance_relation") not in {"source", "target", "unknown"}
     or not isinstance(source, dict)
+    or source.get("task_name") != sample.get("task_name")
+    or source.get("task_path") != sample.get("task_path")
+    or source.get("task_xml_sha256") != sample.get("task_xml_sha256")
     or source.get("task_semantic_sha256") != sample.get("task_semantic_sha256")
     or source.get("task_acl_sha256") != sample.get("task_acl_sha256")
     or source.get("endpoint_root") != sample.get("endpoint_root")
     or source.get("config_path") != sample.get("config_path")
+    or source.get("port") != port
     or source.get("config_digest") != sample.get("config_digest")
     or source.get("install_id") != sample.get("install_id")
+    or source.get("release") != sample.get("release")
     or source.get("release_identity_sha256")
     != sample.get("release_identity_sha256")
-    or type(sample.get("listener_pid")) is not int
-    or not isinstance(sample.get("process_start_utc"), str)
-    or not sample["process_start_utc"]
+    or listener != (source.get("listener") if isinstance(source, dict) else None)
+    or not sealed_source_listener_matches(source)
     or (
         pending_rollback is not None
         and (
@@ -1813,6 +1815,8 @@ if (
                         r"[0-9a-f]{64}",
                         pending_rollback.get("source_state_sha256", ""),
                     )
+                    or not isinstance(pending_source, dict)
+                    or not sealed_source_listener_matches(pending_source)
                 )
             )
             or (
@@ -1846,8 +1850,7 @@ print(
             "task_path": sample["task_path"],
             "task_state": "Running",
             "action_count": sample["action_count"],
-            "listener_pid": sample["listener_pid"],
-            "process_start_utc": sample["process_start_utc"],
+            "listener": listener,
             "task_xml_sha256": sample["task_xml_sha256"],
             "task_xml": sample["task_xml"],
             "task_semantic_sha256": sample["task_semantic_sha256"],
@@ -1857,8 +1860,6 @@ print(
             "install_id": sample["install_id"],
             "config_digest": sample["config_digest"],
             "release_identity_sha256": sample["release_identity_sha256"],
-            "process_command_sha256": sample["process_command_sha256"],
-            "process_user_sid": sample["process_user_sid"],
             "maintenance_relation": sample["maintenance_relation"],
             "source": source,
             "pending_rollback": pending_rollback,

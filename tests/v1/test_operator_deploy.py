@@ -38,6 +38,95 @@ def native_target_identity(install_id: str) -> dict:
     ).to_record()
 
 
+def windows_status_fixture(install_id: str, config_digest: str, release: dict) -> dict:
+    endpoint_root = "C:/description-e2e/state/lifecycle/gen-2/generation"
+    arguments = (
+        '-I -B -m description_pipeline serve --config "'
+        f'{endpoint_root}/endpoint.json"'
+    )
+    listener = {
+        "schema_version": "solidworks-to-urdf.windows-listener/v2",
+        "relation": "direct_venv_child",
+        "process_arguments_sha256": hashlib.sha256(arguments.encode()).hexdigest(),
+        "scheduler_service_name": "Schedule",
+        "scheduler_service_state": "Running",
+        "scheduler_service_process_id": 2512,
+        "scheduler_pid": 2512,
+        "scheduler_image": "C:/Windows/System32/svchost.exe",
+        "scheduler_start_utc": "2026-10-21T00:00:00Z",
+        "scheduler_user_sid": "S-1-5-18",
+        "scheduler_session_id": 0,
+        "launcher_pid": 19344,
+        "launcher_parent_pid": 2512,
+        "launcher_image": f"{endpoint_root}/runtime/Scripts/python.exe",
+        "launcher_image_sha256": "2" * 64,
+        "launcher_start_utc": "2026-10-21T00:00:01Z",
+        "launcher_user_sid": "S-1-5-21-1",
+        "launcher_session_id": 1,
+        "listener_pid": 4242,
+        "listener_parent_pid": 19344,
+        "listener_start_utc": "2026-10-21T00:00:02Z",
+        "listener_user_sid": "S-1-5-21-1",
+        "listener_session_id": 1,
+        "venv_config_path": f"{endpoint_root}/runtime/pyvenv.cfg",
+        "venv_config_sha256": "3" * 64,
+        "venv_home": "C:/Python312",
+        "venv_version": "3.12.10",
+        "base_interpreter_path": "C:/Python312/python.exe",
+        "base_interpreter_sha256": "4" * 64,
+    }
+    source = {
+        "schema_version": "solidworks-to-urdf.windows-source-state/v2",
+        "task_path": "\\",
+        "task_name": "description-e2e-endpoint",
+        "task_xml_sha256": "a" * 64,
+        "task_semantic_sha256": "c" * 64,
+        "task_acl_sha256": "d" * 64,
+        "principal_sid": "S-1-5-21-1",
+        "principal": {"sid": "S-1-5-21-1"},
+        "execute": f"{endpoint_root}/runtime/Scripts/python.exe",
+        "arguments": arguments,
+        "working_directory": "C:/description-e2e/state",
+        "settings": {"multiple_instances": "IgnoreNew"},
+        "triggers_sha256": "5" * 64,
+        "endpoint_root": endpoint_root,
+        "config_path": f"{endpoint_root}/endpoint.json",
+        "config_sha256": "6" * 64,
+        "config_digest": config_digest,
+        "package_root": "C:/description-e2e/packages",
+        "output_root": "C:/description-e2e/results",
+        "state_root": "C:/description-e2e/state",
+        "port": 9765,
+        "install_id_path": "C:/description-e2e/state/install-id",
+        "install_id": install_id,
+        "release_identity_sha256": "e" * 64,
+        "release": release,
+        "listener": listener,
+    }
+    return {
+        "task_name": source["task_name"],
+        "task_path": source["task_path"],
+        "task_state": "Running",
+        "action_count": 1,
+        "task_xml": "<Task/>",
+        "task_xml_sha256": source["task_xml_sha256"],
+        "task_semantic_sha256": source["task_semantic_sha256"],
+        "task_acl_sha256": source["task_acl_sha256"],
+        "endpoint_root": endpoint_root,
+        "config_path": source["config_path"],
+        "listener": listener,
+        "maintenance_relation": "target",
+        "install_id": install_id,
+        "config_digest": config_digest,
+        "release_identity_sha256": source["release_identity_sha256"],
+        "source": source,
+        "release": release,
+        "health_install_id": install_id,
+        "health_config_digest": config_digest,
+        "health_release": release,
+    }
+
+
 _RENDER_MODULE: object | None = None
 
 
@@ -287,6 +376,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from tests.v1.test_operator_deploy import windows_status_fixture
 
 root = Path(sys.argv[1])
 stdin_script = sys.argv[2]
@@ -319,40 +409,9 @@ match = re.search(r"FromBase64String\('([^']+)'\)", script)
 if match is None:
     raise SystemExit(2)
 expected = json.loads(base64.b64decode(match.group(1)).decode())
-sample = {
-    "task_name": expected["task_name"],
-    "task_path": "\\",
-    "task_state": "Running",
-    "action_count": 1,
-    "task_xml": "<Task/>",
-    "task_xml_sha256": "a" * 64,
-    "task_semantic_sha256": "c" * 64,
-    "task_acl_sha256": "d" * 64,
-    "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
-    "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
-    "last_task_result": 267009,
-    "listener_pid": 4242,
-    "process_start_utc": "2026-10-21T00:00:00Z",
-    "process_command_sha256": "b" * 64,
-    "process_user_sid": "S-1-5-21-1",
-    "maintenance_relation": "target",
-    "source": {
-        "task_semantic_sha256": "c" * 64,
-        "task_acl_sha256": "d" * 64,
-        "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
-        "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
-        "config_digest": expected["config_digest"],
-        "install_id": expected["install_id"],
-        "release_identity_sha256": "e" * 64,
-    },
-    "install_id": expected["install_id"],
-    "config_digest": expected["config_digest"],
-    "release_identity_sha256": "e" * 64,
-    "release": expected["release"],
-    "health_install_id": expected["install_id"],
-    "health_config_digest": expected["config_digest"],
-    "health_release": expected["release"],
-}
+sample = windows_status_fixture(
+    expected["install_id"], expected["config_digest"], expected["release"]
+)
 print(json.dumps({"passed": True, "sample": sample}, sort_keys=True))
 PY
 ''',
@@ -927,40 +986,91 @@ class LifecycleTests(unittest.TestCase):
             'case "$* $decoded_script" in\n'
             '  *"two status probes returned different"*)\n'
             '    python3 - "$FIXTURE_OPERATOR_STATE/install-record.json" <<\'PY\'\n'
+            "import hashlib\n"
             "import json\n"
             "import os\n"
             "import sys\n"
             "record = json.load(open(sys.argv[1], encoding='utf-8'))\n"
             "identity = record['ends']['windows']\n"
             "release = identity['release']\n"
-            "sample = {\n"
-            "    'task_name': 'description-e2e-endpoint',\n"
+            "endpoint_root = 'C:/description-e2e/state/lifecycle/gen-2/generation'\n"
+            "arguments = '-I -B -m description_pipeline serve --config \"' + endpoint_root + '/endpoint.json\"'\n"
+            "listener = {\n"
+            "    'schema_version': 'solidworks-to-urdf.windows-listener/v2',\n"
+            "    'relation': 'direct_venv_child',\n"
+            "    'process_arguments_sha256': hashlib.sha256(arguments.encode()).hexdigest(),\n"
+            "    'scheduler_service_name': 'Schedule',\n"
+            "    'scheduler_service_state': 'Running',\n"
+            "    'scheduler_service_process_id': 2512,\n"
+            "    'scheduler_pid': 2512,\n"
+            "    'scheduler_image': 'C:/Windows/System32/svchost.exe',\n"
+            "    'scheduler_start_utc': '2026-10-21T00:00:00Z',\n"
+            "    'scheduler_user_sid': 'S-1-5-18',\n"
+            "    'scheduler_session_id': 0,\n"
+            "    'launcher_pid': 19344,\n"
+            "    'launcher_parent_pid': 2512,\n"
+            "    'launcher_image': endpoint_root + '/runtime/Scripts/python.exe',\n"
+            "    'launcher_image_sha256': '2' * 64,\n"
+            "    'launcher_start_utc': '2026-10-21T00:00:01Z',\n"
+            "    'launcher_user_sid': 'S-1-5-21-1',\n"
+            "    'launcher_session_id': 1,\n"
+            "    'listener_pid': 4242,\n"
+            "    'listener_parent_pid': 19344,\n"
+            "    'listener_start_utc': '2026-10-21T00:00:02Z',\n"
+            "    'listener_user_sid': 'S-1-5-21-1',\n"
+            "    'listener_session_id': 1,\n"
+            "    'venv_config_path': endpoint_root + '/runtime/pyvenv.cfg',\n"
+            "    'venv_config_sha256': '3' * 64,\n"
+            "    'venv_home': 'C:/Python312',\n"
+            "    'venv_version': '3.12.10',\n"
+            "    'base_interpreter_path': 'C:/Python312/python.exe',\n"
+            "    'base_interpreter_sha256': '4' * 64,\n"
+            "}\n"
+            "source = {\n"
+            "    'schema_version': 'solidworks-to-urdf.windows-source-state/v2',\n"
             "    'task_path': '\\\\',\n"
-            "    'task_state': 'Running',\n"
-            "    'action_count': 1,\n"
-            "    'task_xml': '<Task/>',\n"
+            "    'task_name': 'description-e2e-endpoint',\n"
             "    'task_xml_sha256': 'a' * 64,\n"
             "    'task_semantic_sha256': 'c' * 64,\n"
             "    'task_acl_sha256': 'd' * 64,\n"
-            "    'endpoint_root': 'C:/description-e2e/state/lifecycle/gen-2/generation',\n"
-            "    'config_path': 'C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json',\n"
-            "    'listener_pid': 4242,\n"
-            "    'process_start_utc': '2026-10-21T00:00:00Z',\n"
-            "    'process_command_sha256': 'b' * 64,\n"
-            "    'process_user_sid': 'S-1-5-21-1',\n"
+            "    'principal_sid': 'S-1-5-21-1',\n"
+            "    'principal': {'sid': 'S-1-5-21-1'},\n"
+            "    'execute': endpoint_root + '/runtime/Scripts/python.exe',\n"
+            "    'arguments': arguments,\n"
+            "    'working_directory': 'C:/description-e2e/state',\n"
+            "    'settings': {'multiple_instances': 'IgnoreNew'},\n"
+            "    'triggers_sha256': '5' * 64,\n"
+            "    'endpoint_root': endpoint_root,\n"
+            "    'config_path': endpoint_root + '/endpoint.json',\n"
+            "    'config_sha256': '6' * 64,\n"
+            "    'config_digest': identity['config_digest'],\n"
+            "    'package_root': 'C:/description-e2e/packages',\n"
+            "    'output_root': 'C:/description-e2e/results',\n"
+            "    'state_root': 'C:/description-e2e/state',\n"
+            "    'port': expected['port'],\n"
+            "    'install_id_path': 'C:/description-e2e/state/install-id',\n"
+            "    'install_id': identity['install_id'],\n"
+            "    'release_identity_sha256': 'e' * 64,\n"
+            "    'release': release,\n"
+            "    'listener': listener,\n"
+            "}\n"
+            "sample = {\n"
+            "    'task_name': source['task_name'],\n"
+            "    'task_path': source['task_path'],\n"
+            "    'task_state': 'Running',\n"
+            "    'action_count': 1,\n"
+            "    'task_xml': '<Task/>',\n"
+            "    'task_xml_sha256': source['task_xml_sha256'],\n"
+            "    'task_semantic_sha256': source['task_semantic_sha256'],\n"
+            "    'task_acl_sha256': source['task_acl_sha256'],\n"
+            "    'endpoint_root': endpoint_root,\n"
+            "    'config_path': source['config_path'],\n"
+            "    'listener': listener,\n"
             "    'maintenance_relation': 'target',\n"
             "    'install_id': identity['install_id'],\n"
             "    'config_digest': identity['config_digest'],\n"
-            "    'release_identity_sha256': 'e' * 64,\n"
-            "    'source': {\n"
-            "        'task_semantic_sha256': 'c' * 64,\n"
-            "        'task_acl_sha256': 'd' * 64,\n"
-            "        'endpoint_root': 'C:/description-e2e/state/lifecycle/gen-2/generation',\n"
-            "        'config_path': 'C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json',\n"
-            "        'config_digest': identity['config_digest'],\n"
-            "        'install_id': identity['install_id'],\n"
-            "        'release_identity_sha256': 'e' * 64,\n"
-            "    },\n"
+            "    'release_identity_sha256': source['release_identity_sha256'],\n"
+            "    'source': source,\n"
             "    'release': release,\n"
             "    'health_install_id': identity['install_id'],\n"
             "    'health_config_digest': identity['config_digest'],\n"
@@ -2767,7 +2877,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn("legacy_pip_launcher_v0", control)
         self.assertNotIn("parse_arguments", control)
         self.assertIn("task_xml_sha256", control)
-        self.assertIn("process_command_sha256", control)
+        self.assertIn("from windows_identity import", control)
+        self.assertIn("sealed_source_listener_matches", control)
         self.assertNotIn("Get-CimInstance Win32_Process", control)
         self.assertNotIn("gzip.compress(script", control)
         self.assertNotIn('ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST"', control)
@@ -2834,10 +2945,7 @@ class LifecycleTests(unittest.TestCase):
                 "task_acl_sha256": baseline_sample["task_acl_sha256"],
                 "endpoint_root": baseline_sample["endpoint_root"],
                 "config_path": baseline_sample["config_path"],
-                "listener_pid": baseline_sample["listener_pid"],
-                "process_start_utc": baseline_sample["process_start_utc"],
-                "process_command_sha256": baseline_sample["process_command_sha256"],
-                "process_user_sid": baseline_sample["process_user_sid"],
+                "listener": baseline_sample["listener"],
                 "maintenance_relation": baseline_sample["maintenance_relation"],
                 "source": baseline_sample["source"],
                 "install_id": baseline_sample["install_id"],
@@ -2869,6 +2977,7 @@ class LifecycleTests(unittest.TestCase):
                     "C:/description-e2e/state/instance-promotions/rollback-before-0001"
                 ),
                 "source_state_sha256": "f" * 64,
+                "source": baseline_sample["source"],
             }
             raw_sample["pending_rollback"] = rollback_intent
             status_path.write_text(
@@ -2884,7 +2993,7 @@ class LifecycleTests(unittest.TestCase):
             intent_sample = json.loads(intent_status.stdout.strip().splitlines()[-1])
             self.assertEqual(intent_sample["pending_rollback"], rollback_intent)
             self.assertEqual(intent_sample["task_state"], "Running")
-            self.assertGreater(intent_sample["listener_pid"], 0)
+            self.assertGreater(intent_sample["listener"]["listener_pid"], 0)
             self.assertEqual(
                 intent_sample["source"]["install_id"],
                 intent_sample["install_id"],
@@ -2912,7 +3021,7 @@ class LifecycleTests(unittest.TestCase):
             )
             self.assertEqual(unknown_sample["pending_rollback"], unknown_intent)
             self.assertEqual(unknown_sample["task_state"], "Running")
-            self.assertGreater(unknown_sample["listener_pid"], 0)
+            self.assertGreater(unknown_sample["listener"]["listener_pid"], 0)
 
             raw_sample["pending_rollback"] = {
                 **rollback_intent,
@@ -3142,43 +3251,11 @@ class LifecycleTests(unittest.TestCase):
             )
             identity = record["ends"]["windows"]
             for task_state in ("Ready", "Disabled", "Failed"):
-                sample = {
-                    "passed": True,
-                    "sample": {
-                        "task_name": "description-e2e-endpoint",
-                        "task_path": "\\",
-                        "task_state": task_state,
-                        "action_count": 1,
-                        "task_xml": "<Task/>",
-                        "task_xml_sha256": "a" * 64,
-                        "task_semantic_sha256": "c" * 64,
-                        "task_acl_sha256": "d" * 64,
-                        "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
-                        "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
-                        "last_task_result": 267009,
-                        "listener_pid": 4242,
-                        "process_start_utc": "2026-10-21T00:00:00Z",
-                        "process_command_sha256": "b" * 64,
-                        "process_user_sid": "S-1-5-21-1",
-                        "maintenance_relation": "target",
-                        "source": {
-                            "task_semantic_sha256": "c" * 64,
-                            "task_acl_sha256": "d" * 64,
-                            "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
-                            "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
-                            "config_digest": identity["config_digest"],
-                            "install_id": identity["install_id"],
-                            "release_identity_sha256": "e" * 64,
-                        },
-                        "install_id": identity["install_id"],
-                        "config_digest": identity["config_digest"],
-                        "release_identity_sha256": "e" * 64,
-                        "release": identity["release"],
-                        "health_install_id": identity["install_id"],
-                        "health_config_digest": identity["config_digest"],
-                        "health_release": identity["release"],
-                    },
-                }
+                sample = windows_status_fixture(
+                    identity["install_id"], identity["config_digest"], identity["release"]
+                )
+                sample["task_state"] = task_state
+                sample = {"passed": True, "sample": sample}
                 (root / "windows-status.json").write_text(
                     json.dumps(sample),
                     encoding="utf-8",
@@ -3199,57 +3276,43 @@ class LifecycleTests(unittest.TestCase):
                     result.stdout + result.stderr,
                 )
 
-            for label, changes in (
-                ("task-path", {"task_path": ""}),
-                ("endpoint-root", {"endpoint_root": ""}),
-                ("config-path", {"config_path": ""}),
-                ("task-xml-body", {"task_xml": ""}),
-                ("task-xml", {"task_xml_sha256": "bad"}),
-                ("release-identity", {"release_identity_sha256": "bad"}),
-                ("process-command", {"process_command_sha256": "bad"}),
-                ("process-user", {"process_user_sid": ""}),
-                ("multi-action", {"action_count": 2}),
-                ("boolean-action-count", {"action_count": True}),
-                ("float-action-count", {"action_count": 1.0}),
+            for label, changes, value in (
+                ("task-path", ("task_path",), ""),
+                ("endpoint-root", ("endpoint_root",), ""),
+                ("config-path", ("config_path",), ""),
+                ("task-xml-body", ("task_xml",), ""),
+                ("task-xml", ("task_xml_sha256",), "bad"),
+                ("release-identity", ("release_identity_sha256",), "bad"),
+                ("same-process", ("listener", "relation"), "same_process"),
+                (
+                    "service-state",
+                    ("listener", "scheduler_service_state"),
+                    "Stopped",
+                ),
+                ("listener-parent", ("listener", "listener_parent_pid"), 999),
+                ("process-user", ("listener", "listener_user_sid"), ""),
+                ("process-digest", ("listener", "process_arguments_sha256"), "bad"),
+                ("source-task-xml", ("source", "task_xml_sha256"), "f" * 64),
+                ("source-port", ("source", "port"), 8766),
+                ("source-release", ("source", "release"), {"version": "foreign"}),
+                ("source-listener", ("source", "listener"), {}),
+                ("multi-action", ("action_count",), 2),
+                ("boolean-action-count", ("action_count",), True),
+                ("float-action-count", ("action_count",), 1.0),
             ):
                 with self.subTest(label=label):
                     sample = {
                         "passed": True,
-                        "sample": {
-                            "task_name": "description-e2e-endpoint",
-                            "task_path": "\\",
-                            "task_state": "Running",
-                            "action_count": 1,
-                            "task_xml": "<Task/>",
-                            "task_xml_sha256": "a" * 64,
-                            "task_semantic_sha256": "c" * 64,
-                            "task_acl_sha256": "d" * 64,
-                            "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
-                            "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
-                            "listener_pid": 4242,
-                            "process_start_utc": "2026-10-21T00:00:00Z",
-                            "process_command_sha256": "b" * 64,
-                            "process_user_sid": "S-1-5-21-1",
-                            "maintenance_relation": "target",
-                            "source": {
-                                "task_semantic_sha256": "c" * 64,
-                                "task_acl_sha256": "d" * 64,
-                                "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
-                                "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
-                                "config_digest": identity["config_digest"],
-                                "install_id": identity["install_id"],
-                                "release_identity_sha256": "e" * 64,
-                            },
-                            "install_id": identity["install_id"],
-                            "config_digest": identity["config_digest"],
-                            "release_identity_sha256": "e" * 64,
-                            "release": identity["release"],
-                            "health_install_id": identity["install_id"],
-                            "health_config_digest": identity["config_digest"],
-                            "health_release": identity["release"],
-                        },
+                        "sample": windows_status_fixture(
+                            identity["install_id"],
+                            identity["config_digest"],
+                            identity["release"],
+                        ),
                     }
-                    sample["sample"].update(changes)
+                    current = sample["sample"]
+                    for key in changes[:-1]:
+                        current = current[key]
+                    current[changes[-1]] = value
                     (root / "windows-status.json").write_text(
                         json.dumps(sample),
                         encoding="utf-8",
@@ -3455,6 +3518,11 @@ class LifecycleTests(unittest.TestCase):
             result = run(["bash", "-n", str(script)], {})
             self.assertEqual(result.returncode, 0, f"{script}: {result.stderr}")
         compile(RENDER.read_text(encoding="utf-8"), str(RENDER), "exec")
+        compile(
+            (OPERATOR / "windows_identity.py").read_text(encoding="utf-8"),
+            str(OPERATOR / "windows_identity.py"),
+            "exec",
+        )
 
 
 class InstallOrderingTests(unittest.TestCase):
@@ -4023,42 +4091,13 @@ class InstallOrderingTests(unittest.TestCase):
             "import json\n"
             "import os\n"
             "import sys\n"
+            "from tests.v1.test_operator_deploy import windows_status_fixture\n"
             "record = json.load(open(sys.argv[1], encoding='utf-8'))\n"
             "identity = record['ends']['windows']\n"
             "release = identity['release']\n"
-            "sample = {\n"
-            "    'task_name': 'description-e2e-endpoint',\n"
-            "    'task_path': '\\\\',\n"
-            "    'task_state': 'Running',\n"
-            "    'action_count': 1,\n"
-            "    'task_xml': '<Task/>',\n"
-            "    'task_xml_sha256': 'a' * 64,\n"
-            "    'task_semantic_sha256': 'c' * 64,\n"
-            "    'task_acl_sha256': 'd' * 64,\n"
-            "    'endpoint_root': 'C:/description-e2e/state/lifecycle/gen-2/generation',\n"
-            "    'config_path': 'C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json',\n"
-            "    'listener_pid': 4242,\n"
-            "    'process_start_utc': '2026-10-21T00:00:00Z',\n"
-            "    'process_command_sha256': 'b' * 64,\n"
-            "    'process_user_sid': 'S-1-5-21-1',\n"
-            "    'maintenance_relation': 'target',\n"
-            "    'install_id': identity['install_id'],\n"
-            "    'config_digest': identity['config_digest'],\n"
-            "    'release_identity_sha256': 'e' * 64,\n"
-            "    'source': {\n"
-            "        'task_semantic_sha256': 'c' * 64,\n"
-            "        'task_acl_sha256': 'd' * 64,\n"
-            "        'endpoint_root': 'C:/description-e2e/state/lifecycle/gen-2/generation',\n"
-            "        'config_path': 'C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json',\n"
-            "        'config_digest': identity['config_digest'],\n"
-            "        'install_id': identity['install_id'],\n"
-            "        'release_identity_sha256': 'e' * 64,\n"
-            "    },\n"
-            "    'release': release,\n"
-            "    'health_install_id': identity['install_id'],\n"
-            "    'health_config_digest': identity['config_digest'],\n"
-            "    'health_release': release,\n"
-            "}\n"
+            "sample = windows_status_fixture(\n"
+            "    identity['install_id'], identity['config_digest'], release\n"
+            ")\n"
             "if os.environ.get('FIXTURE_STATUS') == 'foreign':\n"
             "    sample['install_id'] = 'win-' + 'f' * 32\n"
             "    sample['health_install_id'] = sample['install_id']\n"
