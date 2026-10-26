@@ -1310,12 +1310,16 @@ def resolve_deliverable_appearance(
                 or not isinstance(target, Mapping)
                 or target.get("kind")
                 not in {"occurrence", "body", "face", "feature"}
+                or (
+                    owner.get("owner_scope") != "component_document"
+                    and target.get("kind") != "occurrence"
+                )
             ):
                 raise _appearance_resolution_error(
                     component,
                     "cad_appearance_render_entity_invalid",
                     index_path,
-                    "a native reference index entry cannot be bound exactly",
+                    "an assembly-owned material index target is not an occurrence",
                 )
             reference_index.setdefault(
                 (indexed_key, indexed_context),

@@ -368,6 +368,22 @@ class AppearanceResolutionTests(unittest.TestCase):
         ]["entity_records"][0]
         entity["persistent_reference"] = [7, 8, 9]
         entity["native_interface_kind"] = "IEntity"
+        non_occurrence["state_render_materials"][0][
+            "native_reference_index"
+        ] = [
+            _reference_row(
+                reference=(7, 8, 9),
+                target={
+                    "kind": "face",
+                    "component": COMPONENT,
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                },
+                owner_scope="top_assembly",
+                owner_document_path=r"C:\capture\robot.SLDASM",
+            )
+        ]
         with self.assertRaises(AppearanceError) as caught:
             resolve_deliverable_appearance(
                 non_occurrence,
@@ -378,7 +394,7 @@ class AppearanceResolutionTests(unittest.TestCase):
             )
         self.assertEqual(
             caught.exception.appearance["issues"][0]["code"],
-            "cad_appearance_render_entity_binding_unproven",
+            "cad_appearance_render_entity_invalid",
         )
 
     def test_face_owners_partition_one_occurrence_into_multiple_materials(self):

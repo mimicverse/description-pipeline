@@ -1203,9 +1203,25 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         ]["entity_records"][0]
         entity["persistent_reference"] = [7, 8, 9]
         entity["native_interface_kind"] = "IEntity"
+        non_occurrence["state_render_materials"][0][
+            "native_reference_index"
+        ] = [
+            _appearance_index_record(
+                reference=(7, 8, 9),
+                target={
+                    "kind": "face",
+                    "component": "arm-1",
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                },
+                owner_scope="top_assembly",
+                owner_document_path="C:/cad/robot.SLDASM",
+            )
+        ]
         with self.assertRaisesRegex(
             PipelineError,
-            "has no native reference-index binding",
+            "assembly-owned material target is not an occurrence",
         ):
             _resolved_faces(
                 non_occurrence,

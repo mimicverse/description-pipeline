@@ -733,8 +733,12 @@ def _resolved_faces(
                 and isinstance(indexed_errors, Mapping)
                 and isinstance(target, Mapping)
                 and target.get("kind")
-                in {"occurrence", "body", "face", "feature"},
-                f"{index_path} cannot be bound exactly",
+                in {"occurrence", "body", "face", "feature"}
+                and (
+                    owner.get("owner_scope") == "component_document"
+                    or target.get("kind") == "occurrence"
+                ),
+                f"{index_path} assembly-owned material target is not an occurrence",
             )
             reference_index.setdefault(
                 (indexed_key, indexed_context),
