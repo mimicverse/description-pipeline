@@ -709,11 +709,7 @@ function Get-ProcessLineageEvidence($Process) {
   } catch {
     throw 'the process lineage node carries no creation time'
   }
-  $ownerSid = if ($null -ne $Process.OwnerSid) {
-    [string]$Process.OwnerSid
-  } else {
-    Get-ProcessOwnerSid $Process
-  }
+  $ownerSid = Get-ProcessOwnerSid $Process
   return [ordered]@{
     pid=[int]$Process.ProcessId
     parent_pid=[int]$Process.ParentProcessId
@@ -744,23 +740,14 @@ function Get-ListenerProcesses {
 function Get-ScheduleService {
   return @(Get-CimInstance Win32_Service -Filter "Name='Schedule'" -ErrorAction Stop)
 }
-function Get-ListenerEvidence([object]$binding, $TaskProjection, $ListenerFacts = $null) {
-  if ($ListenerFacts -is [scriptblock]) {
-    $ListenerFacts = & $ListenerFacts
+function Get-ListenerEvidence([object]$binding, $TaskProjection) {
+  try {
+    $listeners = @(Get-ListenerConnections ([int]$binding.port))
+  } catch {
+    if (Test-NetTcpNoMatchError $_) { $listeners = @() } else { throw }
   }
-  if ($null -ne $ListenerFacts) {
-    $listeners = @($ListenerFacts.listeners)
-    $processes = @($ListenerFacts.processes)
-    $schedulerServices = @($ListenerFacts.scheduler_services)
-  } else {
-    try {
-      $listeners = @(Get-ListenerConnections ([int]$binding.port))
-    } catch {
-      if (Test-NetTcpNoMatchError $_) { $listeners = @() } else { throw }
-    }
-    $processes = @(Get-ListenerProcesses)
-    $schedulerServices = @(Get-ScheduleService)
-  }
+  $processes = @(Get-ListenerProcesses)
+  $schedulerServices = @(Get-ScheduleService)
   $listenerPids = @($listeners | ForEach-Object {
     [int]$_.OwningProcess
   } | Sort-Object -Unique)
