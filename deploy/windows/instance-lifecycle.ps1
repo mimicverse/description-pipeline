@@ -904,13 +904,14 @@ function Read-ValidatedSnapshot(
     throw 'the sealed source configuration is outside its generation'
   }
   $installIdPath = Join-Path ([string]$source.state_root) 'install-id'
+  $normalizedArguments = Normalize-PathIdentity ([string]$source.arguments)
+  $normalizedConfigPath = Normalize-PathIdentity ([string]$source.config_path)
   if ((Normalize-PathIdentity ([string]$source.execute)) -ne
         (Normalize-PathIdentity (Runtime-Python ([string]$source.endpoint_root))) -or
       (Normalize-PathIdentity ([string]$source.working_directory)) -ne
         (Normalize-PathIdentity ([string]$source.state_root)) -or
-      ([string]$source.arguments).IndexOf(
-        [string]$source.config_path,
-        [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+      $normalizedArguments.IndexOf(
+        $normalizedConfigPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
       (Normalize-PathIdentity ([string]$source.install_id_path)) -ne
         (Normalize-PathIdentity $installIdPath)) {
     throw 'the sealed source action or install identity is outside its generation'

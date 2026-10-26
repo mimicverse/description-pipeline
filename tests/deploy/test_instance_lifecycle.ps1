@@ -1455,7 +1455,12 @@ Check 'outer.path_predicates_are_host_neutral' (
     '*/new/runtime/Scripts/python.exe') -and
   ((Normalize-PathIdentity 'C:\root\bound-previous') -like '*/bound-previous') -and
   ((Normalize-PathIdentity 'start:C:\root\old\runtime\Scripts\python.exe') -like
-    'start:*/old/*'))
+    'start:*/old/*') -and
+  ((Normalize-PathIdentity (
+      '-I -B -m description_pipeline serve --config "C:\root\old\generation\endpoint.json"'
+    )).IndexOf(
+      (Normalize-PathIdentity 'C:/root/old/generation/endpoint.json'),
+      [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
 function Invoke-Outer([string]$scenario) {
   $outerRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('il-outer-' + [guid]::NewGuid().ToString('N'))
   $null = New-Item -ItemType Directory -Path $outerRoot -Force
