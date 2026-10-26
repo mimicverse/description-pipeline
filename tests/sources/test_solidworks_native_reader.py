@@ -3378,14 +3378,33 @@ class AppearanceHelperTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase)
             _persist_reference=b"part-body",
             _fixture_interfaces={"IBody2"},
         )
+        underlying_feature = types.SimpleNamespace(
+            Name="PaintedFace",
+            GetTypeName2=lambda: "Extrusion",
+            _persist_reference=b"part-feature",
+            _fixture_interfaces={"IFeature"},
+        )
         method_hints = []
 
         class PartFace:
             _persist_reference = b"part-face"
             _fixture_interfaces = ("IFace2",)
 
+            def __init__(self):
+                self.hinted = set()
+
             def _FlagAsMethod(self, name):
                 method_hints.append(name)
+                self.hinted.add(name)
+
+            def __getattr__(self, name):
+                if name == "GetFeature":
+                    if "GetFeature" not in self.hinted:
+                        raise AssertionError(
+                            "GetFeature must be flagged before getattr"
+                        )
+                    return lambda: underlying_feature
+                raise AttributeError(name)
 
             def GetBody(self):
                 return underlying_body
@@ -3417,6 +3436,7 @@ class AppearanceHelperTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase)
         resolved_objects = {
             b"part-face": underlying_face,
             b"part-body": underlying_body,
+            b"part-feature": underlying_feature,
         }
         with patch.object(
             native_module,
@@ -3513,6 +3533,31 @@ class AppearanceHelperTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase)
         self.assertEqual(
             reference_calls,
             [underlying_face, underlying_body],
+        )
+
+        with patch.object(
+            native_module,
+            "_get_object_by_persist_reference",
+            side_effect=lambda extension, reference: (
+                resolved_objects[bytes(reference)],
+                0,
+            ),
+        ):
+            converted_feature, feature_identity, feature_conversion = (
+                _CaptureBackend._appearance_underlying_part_feature(
+                    underlying_face,
+                    component="parent-1/arm-1",
+                    part_document_path="C:\\part.SLDPRT",
+                    part_extension=part_extension,
+                    resolution_cache={},
+                )
+            )
+        self.assertIs(converted_feature, underlying_feature)
+        self.assertIn("GetFeature", method_hints)
+        self.assertEqual(feature_identity["name"], "PaintedFace")
+        self.assertEqual(
+            feature_conversion["output_domain"]["interface_kind"],
+            "IFeature",
         )
 
     def test_face_derived_body_requires_exact_interface_and_resolution(

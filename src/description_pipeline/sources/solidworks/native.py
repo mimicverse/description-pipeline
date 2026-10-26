@@ -1223,7 +1223,7 @@ def _appearance_feature_identity(
 ):
     errors = {}
     try:
-        feature = _member(face, "GetFeature")
+        feature = _method(face, "GetFeature")
     except Exception as error:  # noqa: BLE001 - identity remains field-local
         return {
             "name": None,
