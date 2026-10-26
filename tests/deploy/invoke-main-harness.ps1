@@ -27,11 +27,20 @@ $newGeneration = Join-Path $Root 'lifecycle/new/generation'
 $oldGeneration = Join-Path $Root 'lifecycle/old/generation'
 $null = New-Item -ItemType Directory -Path $newGeneration -Force
 $null = New-Item -ItemType Directory -Path $oldGeneration -Force
-$harnessSystemRoot = Join-Path $Root 'windows'
+$script:OriginalHarnessSystemRoot = $env:SystemRoot
+$script:HarnessUsesSyntheticSystemRoot = (
+  [System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT)
+$harnessSystemRoot = if ($script:HarnessUsesSyntheticSystemRoot) {
+  Join-Path $Root 'windows'
+} else {
+  [string]$env:SystemRoot
+}
 $harnessScheduler = Join-Path $harnessSystemRoot 'System32/svchost.exe'
-$null = New-Item -ItemType Directory -Path (Split-Path -Parent $harnessScheduler) -Force
-Write-Utf8NoBom $harnessScheduler 'harness-svchost'
-$env:SystemRoot = $harnessSystemRoot
+if ($script:HarnessUsesSyntheticSystemRoot) {
+  $null = New-Item -ItemType Directory -Path (Split-Path -Parent $harnessScheduler) -Force
+  Write-Utf8NoBom $harnessScheduler 'harness-svchost'
+  $env:SystemRoot = $harnessSystemRoot
+}
 function Initialize-HarnessRuntime([string]$Generation, [string]$Name) {
   $runtime = Join-Path $Generation 'runtime'
   $scripts = Join-Path $runtime 'Scripts'

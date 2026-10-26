@@ -1073,22 +1073,32 @@ $listenerGeneration = Join-Path $listenerFixtureRoot 'managed/generation'
 $listenerRuntime = Join-Path $listenerGeneration 'runtime'
 $listenerScripts = Join-Path $listenerRuntime 'Scripts'
 $listenerBaseHome = Join-Path $listenerFixtureRoot 'Python312'
-$listenerSystemRoot = Join-Path $listenerFixtureRoot 'Windows'
+$script:OriginalListenerSystemRoot = $env:SystemRoot
+$script:ListenerUsesSyntheticSystemRoot = (
+  [System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT)
+$listenerSystemRoot = if ($script:ListenerUsesSyntheticSystemRoot) {
+  Join-Path $listenerFixtureRoot 'Windows'
+} else {
+  [string]$env:SystemRoot
+}
 $listenerSchedulerRoot = Join-Path $listenerSystemRoot 'System32'
-foreach ($directory in @(
-    $listenerGeneration, $listenerScripts, $listenerBaseHome, $listenerSchedulerRoot)) {
+$listenerDirectories = @($listenerGeneration, $listenerScripts, $listenerBaseHome)
+if ($script:ListenerUsesSyntheticSystemRoot) {
+  $listenerDirectories += $listenerSchedulerRoot
+}
+foreach ($directory in $listenerDirectories) {
   $null = New-Item -ItemType Directory -Path $directory -Force
 }
 $listenerLauncher = Join-Path $listenerScripts 'python.exe'
 $listenerBase = Join-Path $listenerBaseHome 'python.exe'
 $listenerScheduler = Join-Path $listenerSchedulerRoot 'svchost.exe'
-$listenerForeignSchedulerRoot = Join-Path $listenerSystemRoot 'Foreign/System32'
-$null = New-Item -ItemType Directory -Path $listenerForeignSchedulerRoot -Force
-$listenerForeignScheduler = Join-Path $listenerForeignSchedulerRoot 'svchost.exe'
-foreach ($path in @($listenerLauncher, $listenerBase, $listenerScheduler)) {
+foreach ($path in @($listenerLauncher, $listenerBase)) {
   Write-Utf8NoBom $path ('fixture:' + $path)
 }
-Write-Utf8NoBom $listenerForeignScheduler ('fixture:' + $listenerForeignScheduler)
+if ($script:ListenerUsesSyntheticSystemRoot) {
+  Write-Utf8NoBom $listenerScheduler ('fixture:' + $listenerScheduler)
+  $env:SystemRoot = $listenerSystemRoot
+}
 $listenerConfig = Join-Path $listenerGeneration 'endpoint.json'
 Write-Utf8NoBom $listenerConfig '{"schema_version":"solidworks-to-urdf.endpoint/v1"}'
 $listenerArguments = '-I -B -m description_pipeline serve --config "' +
@@ -1101,8 +1111,6 @@ $listenerProjection = [pscustomobject]@{
     arguments=$listenerArguments
   }
 }
-$script:OriginalListenerSystemRoot = $env:SystemRoot
-$env:SystemRoot = $listenerSystemRoot
 function Get-ListenerPyvenvText([string]$CommandRoot = '') {
   if (-not $CommandRoot) { $CommandRoot = $listenerRuntime }
   return @(
@@ -1136,9 +1144,12 @@ function New-ListenerProcess(
   }
 }
 function Reset-ListenerProcesses([string]$Scenario = 'valid') {
-  $script:ListenerRuntimeFailure = $null
-  foreach ($path in @($listenerLauncher, $listenerBase, $listenerScheduler)) {
+  $script:ListenerScenario = $Scenario
+  foreach ($path in @($listenerLauncher, $listenerBase)) {
     Write-Utf8NoBom $path ('fixture:' + $path)
+  }
+  if ($script:ListenerUsesSyntheticSystemRoot) {
+    Write-Utf8NoBom $listenerScheduler ('fixture:' + $listenerScheduler)
   }
   Write-ListenerPyvenv
   $scheduler = New-ListenerProcess 2512 900 $listenerScheduler `
@@ -1199,8 +1210,8 @@ function Reset-ListenerProcesses([string]$Scenario = 'valid') {
       $listener.SessionId = 2
     }
     'scheduler_image' {
-      $scheduler.ExecutablePath = $listenerForeignScheduler
-      $scheduler.CommandLine = '"' + $listenerForeignScheduler + '" -k netsvcs -p -s Schedule'
+      $scheduler.ExecutablePath = $listenerLauncher
+      $scheduler.CommandLine = '"' + $listenerLauncher + '" -k netsvcs -p -s Schedule'
     }
     'scheduler_service_missing' {
       $script:SchedulerService = $null
@@ -1225,11 +1236,9 @@ function Reset-ListenerProcesses([string]$Scenario = 'valid') {
     }
     'foreign_pyvenv_command' {
       Write-ListenerPyvenv (Join-Path $listenerFixtureRoot 'foreign-runtime')
-      $script:ListenerRuntimeFailure = 'the generation pyvenv.cfg command names another virtual environment'
     }
     'missing_base' {
       Remove-Item -LiteralPath $listenerBase -Force
-      $script:ListenerRuntimeFailure = 'the generation pyvenv.cfg base interpreter is missing'
     }
   }
   $script:ListenerProcesses = @($scheduler, $launcher, $listener) +
@@ -1240,6 +1249,9 @@ function Get-ListenerConnections {
   return @($script:ListenerPorts)
 }
 function Get-ListenerProcesses {
+  if ($script:ListenerScenario -eq 'process_inventory_failure') {
+    throw 'injected process inventory failure'
+  }
   return @($script:ListenerProcesses)
 }
 function Get-ScheduleService {
@@ -1249,28 +1261,8 @@ function Get-ProcessOwnerSid {
   param($Process)
   return [string]$Process.OwnerSid
 }
-function Get-CurrentListenerFacts {
-  $facts = @{
-    listeners=@($script:ListenerPorts)
-    processes=@($script:ListenerProcesses)
-    scheduler_services=@($script:SchedulerService)
-    launcher_image_sha256=(Get-TextSha256 ('fixture:' + $listenerLauncher))
-    runtime=@{
-      path=(Normalize-PathIdentity (Join-Path $listenerRuntime 'pyvenv.cfg'))
-      sha256=(Get-TextSha256 (Get-ListenerPyvenvText))
-      home=(Normalize-PathIdentity $listenerBaseHome)
-      version='3.12.10'
-      base_interpreter=(Normalize-PathIdentity $listenerBase)
-      base_interpreter_sha256=(Get-TextSha256 ('fixture:' + $listenerBase))
-    }
-  }
-  if ($script:ListenerRuntimeFailure) {
-    $facts.runtime = { throw $script:ListenerRuntimeFailure }
-  }
-  return $facts
-}
 Reset-ListenerProcesses
-$evidence = Get-ListenerEvidence @{port=8765} $listenerProjection (Get-CurrentListenerFacts)
+$evidence = Get-ListenerEvidence @{port=8765} $listenerProjection
 Check 'listener.direct_venv_child_bound' (
   ($evidence.schema_version -eq 'solidworks-to-urdf.windows-listener/v2') -and
   ($evidence.relation -eq 'direct_venv_child') -and
@@ -1297,8 +1289,7 @@ try { Assert-ListenerSourceMatch $evidence $listenerSourceContext } catch {
 }
 Check 'listener.static_source_binding_passes' $staticBindingPassed
 Reset-ListenerProcesses 'multiple_rows_same_listener'
-$dualStackEvidence = Get-ListenerEvidence @{port=8765} $listenerProjection `
-  (Get-CurrentListenerFacts)
+$dualStackEvidence = Get-ListenerEvidence @{port=8765} $listenerProjection
 Check 'listener.dual_stack_rows_same_pid_pass' (
   $dualStackEvidence.listener_pid -eq 15124)
 foreach ($replacement in @(
@@ -1351,8 +1342,7 @@ foreach ($case in @(
   Reset-ListenerProcesses $case[0]
   $message = ''
   try {
-    $null = Get-ListenerEvidence @{port=8765} $listenerProjection `
-      (Get-CurrentListenerFacts)
+    $null = Get-ListenerEvidence @{port=8765} $listenerProjection
   } catch {
     $message = $_.Exception.Message
   }
@@ -1369,21 +1359,22 @@ try {
         execute=$listenerLauncher
         arguments=$foreignConfigArguments
       }
-    }) (Get-CurrentListenerFacts)
+    })
 } catch { $message = $_.Exception.Message }
 Check 'listener.task_action_config_refused' ($message -match 'another configuration') $message
+Reset-ListenerProcesses 'process_inventory_failure'
 $message = ''
 try {
-  $null = Get-ListenerEvidence @{port=8765} $listenerProjection {
-    throw 'injected process inventory failure'
-  }
+  $null = Get-ListenerEvidence @{port=8765} $listenerProjection
 } catch {
   $message = $_.Exception.Message
 }
 Check 'listener.process_inventory_failure_is_not_identity_mismatch' (
   ($message -match 'injected process inventory failure') -and
   ($message -notmatch 'windows_listener_identity_mismatch')) $message
-$env:SystemRoot = $script:OriginalListenerSystemRoot
+if ($script:ListenerUsesSyntheticSystemRoot) {
+  $env:SystemRoot = $script:OriginalListenerSystemRoot
+}
 Remove-Item -LiteralPath $listenerFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
 function Get-NetTCPConnection {
   [CmdletBinding()] param([int]$LocalPort, [string]$State)
@@ -1658,15 +1649,27 @@ $sourceWorkingDirectory = $root
 $sourceRuntime = Join-Path $sourceGeneration 'runtime'
 $sourceScripts = Join-Path $sourceRuntime 'Scripts'
 $sourceBaseHome = Join-Path $root 'source-python'
-$sourceSystemRoot = Join-Path $root 'windows'
+$script:SourceUsesSyntheticSystemRoot = (
+  [System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT)
+$sourceSystemRoot = if ($script:SourceUsesSyntheticSystemRoot) {
+  Join-Path $root 'windows'
+} else {
+  [string]$env:SystemRoot
+}
 $sourceScheduler = Join-Path $sourceSystemRoot 'System32/svchost.exe'
 $sourceBase = Join-Path $sourceBaseHome 'python.exe'
-foreach ($directory in @(
-    $sourceScripts, $sourceBaseHome, (Split-Path -Parent $sourceScheduler))) {
+$sourceDirectories = @($sourceScripts, $sourceBaseHome)
+if ($script:SourceUsesSyntheticSystemRoot) {
+  $sourceDirectories += Split-Path -Parent $sourceScheduler
+}
+foreach ($directory in $sourceDirectories) {
   $null = New-Item -ItemType Directory -Path $directory -Force
 }
-foreach ($path in @($sourceLauncher, $sourceBase, $sourceScheduler)) {
+foreach ($path in @($sourceLauncher, $sourceBase)) {
   Write-Utf8NoBom $path ('source-fixture:' + $path)
+}
+if ($script:SourceUsesSyntheticSystemRoot) {
+  Write-Utf8NoBom $sourceScheduler ('source-fixture:' + $sourceScheduler)
 }
 $sourcePyvenvPath = Join-Path $sourceRuntime 'pyvenv.cfg'
 Write-Utf8NoBom $sourcePyvenvPath (@(
@@ -1710,7 +1713,9 @@ $sourceIdentity = [pscustomobject]@{
 $sourceIdentity.release_identity_sha256 = Get-ReleaseIdentitySha256 $sourceIdentity.release
 [System.IO.File]::WriteAllText($sourceIdentity.install_id_path, $sourceIdentity.install_id)
 $script:SourceListenerSystemRoot = $env:SystemRoot
-$env:SystemRoot = $sourceSystemRoot
+if ($script:SourceUsesSyntheticSystemRoot) {
+  $env:SystemRoot = $sourceSystemRoot
+}
 $sourceListener = [ordered]@{
   schema_version='solidworks-to-urdf.windows-listener/v2'
   relation='direct_venv_child'
@@ -1871,7 +1876,9 @@ $restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
 Check 'restore.changed_opaque_action_fails_closed' ((-not $restore.started) -and ($null -eq $restore.healthy) -and
   ($restore.error -match 'arguments') -and (($script:CallLog -join ',') -eq 'stop,register'))
 $script:RestoreActionArguments = $sourceArguments
-$env:SystemRoot = $script:SourceListenerSystemRoot
+if ($script:SourceUsesSyntheticSystemRoot) {
+  $env:SystemRoot = $script:SourceListenerSystemRoot
+}
 
 # ---- real outer promote flow (child pwsh; real Invoke-Main) -----------------
 $harness = Join-Path $PSScriptRoot 'invoke-main-harness.ps1'
