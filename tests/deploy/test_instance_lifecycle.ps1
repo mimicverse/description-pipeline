@@ -917,6 +917,18 @@ Check 'task.action_config_path_duplicate_refused' (
   -not (Test-ActionConfigArgument (
     $windowsArguments + ' --config "C:\root\old\generation\endpoint.json"'
   ) $windowsConfigPath))
+Check 'task.action_config_path_unquoted_duplicate_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --config C:\foreign\generation\endpoint.json'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_equals_duplicate_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --config=C:\foreign\generation\endpoint.json'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_equals_form_refused' (
+  -not (Test-ActionConfigArgument (
+    '-I -B -m description_pipeline serve --config=C:\root\old\generation\endpoint.json'
+  ) $windowsConfigPath))
 $sourceGeneration = Join-Path $root 'lifecycle/source-generation'
 $null = New-Item -ItemType Directory -Path $sourceGeneration
 $opaqueTask = [pscustomobject]@{

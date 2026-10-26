@@ -308,16 +308,17 @@ function Start-BoundTask([object]$binding) {
   $parameters = Get-TaskSelectionParameters $binding
   Start-ScheduledTask @parameters
 }
-function Get-ActionConfigArguments([string]$Arguments) {
-  return @([regex]::Matches(
+function Test-ActionConfigArgument([string]$Arguments, [string]$ConfigPath) {
+  $options = @([regex]::Matches(
+    $Arguments,
+    '(?:^|\s)--config(?=\s|=)'))
+  $canonical = @([regex]::Matches(
     $Arguments,
     '(?:^|\s)--config\s+"([^"]+)"(?=\s|$)'))
-}
-function Test-ActionConfigArgument([string]$Arguments, [string]$ConfigPath) {
-  $matches = @(Get-ActionConfigArguments $Arguments)
   return (
-    $matches.Count -eq 1 -and
-    (Normalize-PathIdentity $matches[0].Groups[1].Value) -eq
+    $options.Count -eq 1 -and
+    $canonical.Count -eq 1 -and
+    (Normalize-PathIdentity $canonical[0].Groups[1].Value) -eq
       (Normalize-PathIdentity $ConfigPath)
   )
 }
