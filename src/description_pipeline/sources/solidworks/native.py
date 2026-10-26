@@ -946,138 +946,6 @@ def _appearance_interface(value, iid: str, name: str):
     return (value if name in fixture_interfaces else None), None
 
 
-def _appearance_getcomponent_context(entity, expected_component):
-    """Prove assembly ownership from GetComponent without inferring document."""
-
-    context = {
-        "api": "IEntity.GetComponent",
-        "qi_iid": IENTITY_IID,
-        "expected_component": expected_component,
-        "component": None,
-        "state": "unresolved",
-        "read_errors": {},
-    }
-    interface, error = _appearance_interface(
-        entity,
-        IENTITY_IID,
-        "IEntity",
-    )
-    if error is not None:
-        context["read_errors"]["interface_query"] = error
-        return context
-    if interface is None:
-        context["state"] = "interface_absent"
-        return context
-    try:
-        component = _member(interface, "GetComponent")
-    except Exception as error:  # noqa: BLE001 - context stays field-local
-        context["read_errors"]["get_component"] = _native_error_record(error)
-        return context
-    if component is None:
-        context["state"] = "not_assembly"
-        return context
-    name, error = _appearance_value(component, "Name2")
-    context["component"] = name
-    if error is not None:
-        context["read_errors"]["component_name"] = error
-        return context
-    if not isinstance(name, str) or name != expected_component:
-        context["read_errors"]["component"] = {
-            "code": "cad_appearance_component_mismatch",
-            "message": "GetComponent did not return the captured occurrence",
-            "detail": {
-                "expected": expected_component,
-                "actual": name,
-            },
-        }
-        return context
-    context["state"] = "assembly"
-    return context
-
-
-def _appearance_body_getcomponent_context(body, expected_component):
-    """Use a body's already returned face to prove assembly ownership."""
-
-    body_interface, error = _appearance_interface(
-        body,
-        IBODY2_IID,
-        "IBody2",
-    )
-    context = {
-        "api": "IBody2.GetFaces[0].IEntity.GetComponent",
-        "expected_component": expected_component,
-        "component": None,
-        "state": "unresolved",
-        "read_errors": {},
-    }
-    if error is not None:
-        context["read_errors"]["interface_query"] = error
-        return context
-    if body_interface is None:
-        context["state"] = "interface_absent"
-        return context
-    try:
-        faces = _as_list(_member(body_interface, "GetFaces"))
-    except Exception as error:  # noqa: BLE001 - context stays field-local
-        context["read_errors"]["faces"] = _native_error_record(error)
-        return context
-    if not faces:
-        context["read_errors"]["faces"] = {
-            "code": "cad_appearance_body_faces_missing",
-            "message": "GetFaces returned no representative face",
-            "detail": {},
-        }
-        return context
-    return _appearance_getcomponent_context(
-        faces[0],
-        expected_component,
-    )
-
-
-def _appearance_material_source_context(
-    entity,
-    *,
-    native_interface_kind,
-    owner_scope,
-    owner_document_path,
-    source_reference,
-    source_error,
-    expected_component,
-):
-    """Classify material entities from native evidence, never NULL alone."""
-
-    if native_interface_kind == "IEntity":
-        observed = _appearance_getcomponent_context(
-            entity,
-            expected_component,
-        )
-    else:
-        observed = _appearance_body_getcomponent_context(
-            entity,
-            expected_component,
-        )
-    if observed["state"] == "assembly":
-        return observed
-    if (
-        owner_scope == "component_document"
-        and observed["state"] in {"not_assembly", "interface_absent"}
-        and source_reference is not None
-        and source_error is None
-    ):
-        return {
-            "api": (
-                "IModelDocExtension.GetRenderMaterials2"
-                "+IModelDocExtension.GetPersistReference3"
-            ),
-            "state": "document",
-            "owner_document_path": owner_document_path,
-            "persistent_reference": copy.deepcopy(source_reference),
-            "read_errors": {},
-            "getcomponent_observation": copy.deepcopy(observed),
-        }
-    return observed
-
-
 def _appearance_active_configuration(document):
     """Read the active configuration from the document already under observation."""
 
@@ -1112,22 +980,15 @@ def _appearance_binding_key(reference, context):
     owner_scope = context.get("owner_scope")
     document_path = context.get("owner_document_path")
     component = context.get("component")
-    reference_api = context.get("reference_api")
     if not all(
         isinstance(value, str) and value
-        for value in (
-            owner_scope,
-            document_path,
-            component,
-            reference_api,
-        )
+        for value in (owner_scope, document_path, component)
     ):
         return None
     return (
         owner_scope,
         normalize_document_path(document_path),
         component,
-        reference_api,
         reference_key,
     )
 
@@ -5175,7 +5036,6 @@ class SolidWorksBackend(CadBackend):
         *,
         source_reference,
         source_error,
-        source_context,
         native_interface_kind,
         owner_scope,
         primary_component,
@@ -5193,14 +5053,8 @@ class SolidWorksBackend(CadBackend):
             "api": None,
             "state": "error",
             "persistent_reference": None,
-            "source_context": copy.deepcopy(source_context),
             "read_errors": {},
         }
-        context_state = (
-            source_context.get("state")
-            if isinstance(source_context, Mapping)
-            else None
-        )
         target_reference = None
         target_error = None
         if extension is not None:
@@ -5220,19 +5074,37 @@ class SolidWorksBackend(CadBackend):
             record["persistent_reference"] = target_reference
             record["state"] = "observed"
             return record, target_reference
-        if context_state != "document":
-            if target_error is not None:
-                record["read_errors"]["persistent_reference"] = copy.deepcopy(
-                    target_error
-                )
-            else:
-                record["read_errors"]["source_context"] = {
-                    "code": "cad_appearance_source_context_unproven",
-                    "message": (
-                        "the native source object context is not positively proven"
-                    ),
-                    "detail": copy.deepcopy(source_context),
+        if owner_scope != "component_document":
+            record["read_errors"]["persistent_reference"] = copy.deepcopy(
+                target_error
+                or {
+                    "code": "cad_appearance_reference_unresolved",
+                    "message": "the owner-context reference is unavailable",
+                    "detail": {},
                 }
+            )
+            return record, None
+        if source_reference is None or source_error is not None:
+            record["read_errors"]["source_reference"] = copy.deepcopy(
+                source_error
+                or {
+                    "code": "cad_appearance_persistent_reference_missing",
+                    "message": (
+                        "the component-document reference is unavailable"
+                    ),
+                    "detail": {},
+                }
+            )
+            return record, None
+        if extension is None:
+            record["read_errors"]["corresponding_owner"] = {
+                "code": "cad_appearance_owner_unavailable",
+                "message": (
+                    "the corresponding assembly document extension is "
+                    "unavailable"
+                ),
+                "detail": {},
+            }
             return record, None
         if primary_component is None:
             error = {
@@ -5242,34 +5114,11 @@ class SolidWorksBackend(CadBackend):
             }
             record["read_errors"]["component"] = error
             return record, None
-        if extension is None:
-            error = {
-                "code": "cad_appearance_owner_unavailable",
-                "message": (
-                    "the corresponding assembly document extension is "
-                    "unavailable"
-                ),
-                "detail": {},
-            }
-            record["read_errors"]["corresponding_owner"] = error
-            return record, None
-        if native_interface_kind == "IEntity":
-            api = "GetCorrespondingEntity"
-        else:
-            if source_reference is None or source_error is not None:
-                error = {
-                    "code": "cad_appearance_persistent_reference_missing",
-                    "message": (
-                        "GetCorresponding requires a source persistent reference"
-                    ),
-                    "detail": {
-                        "native_interface_kind": native_interface_kind,
-                        "reference_error": copy.deepcopy(source_error),
-                    },
-                }
-                record["read_errors"]["source"] = error
-                return record, None
-            api = "GetCorresponding"
+        api = (
+            "GetCorrespondingEntity"
+            if native_interface_kind == "IEntity"
+            else "GetCorresponding"
+        )
         record["api"] = f"IComponent2.{api}"
         try:
             corresponding = _member(primary_component, api, entity)
@@ -5329,7 +5178,7 @@ class SolidWorksBackend(CadBackend):
             )
             return maps, mapping_errors, native_reference_index
 
-        def add(kind, entity, identity, source_context):
+        def add(kind, entity, identity):
             document, interface_error = _appearance_interface(
                 entity,
                 IMODELDOC2_IID,
@@ -5387,7 +5236,6 @@ class SolidWorksBackend(CadBackend):
                 entity,
                 source_reference=source_reference,
                 source_error=source_error,
-                source_context=source_context,
                 native_interface_kind=native_interface_kind,
                 owner_scope=owner_scope,
                 primary_component=component,
@@ -5417,7 +5265,6 @@ class SolidWorksBackend(CadBackend):
                 "owner_document_path": binding_document_path,
                 "component": component_name,
                 "api": context["api"],
-                "reference_api": "IModelDocExtension.GetPersistReference3",
             }
             key = _appearance_binding_key(
                 reference,
@@ -5445,17 +5292,7 @@ class SolidWorksBackend(CadBackend):
 
         if owner_scope != "component_document":
             for name, holder in holders:
-                add(
-                    "occurrences",
-                    holder,
-                    {"component": name},
-                    {
-                        "api": "IComponent2",
-                        "state": "assembly",
-                        "component": name,
-                        "read_errors": {},
-                    },
-                )
+                add("occurrences", holder, {"component": name})
         for row in bodies:
             add(
                 "bodies",
@@ -5465,7 +5302,6 @@ class SolidWorksBackend(CadBackend):
                     "body_type": row["body_type"],
                     "body_index": row["body_index"],
                 },
-                row["source_context"],
             )
         for row in faces:
             add(
@@ -5477,7 +5313,6 @@ class SolidWorksBackend(CadBackend):
                     "body_index": row["body_index"],
                     "face_index": row["face_index"],
                 },
-                row["source_context"],
             )
         feature_groups = {}
         for position, row in enumerate(features):
@@ -5532,7 +5367,6 @@ class SolidWorksBackend(CadBackend):
                     ),
                     "faces": faces,
                 },
-                first["source_context"],
             )
         return maps, mapping_errors, native_reference_index
 
@@ -5820,7 +5654,6 @@ class SolidWorksBackend(CadBackend):
                     "IModelDoc2.GetPathName"
                     "+ConfigurationManager.ActiveConfiguration.Name"
                 ),
-                "reference_api": None,
             }
             if interface_error is not None:
                 identity = {
@@ -5871,12 +5704,6 @@ class SolidWorksBackend(CadBackend):
                 ),
                 "owner_display_state": display_state,
                 "binding_context": binding_context,
-                "source_context": {
-                    "api": "IModelDoc2",
-                    "state": "document",
-                    "component": component_name,
-                    "read_errors": {},
-                },
                 "state": (
                     "observed"
                     if not errors
@@ -5919,7 +5746,6 @@ class SolidWorksBackend(CadBackend):
                 "owner_document_path": binding_document_path,
                 "component": component_name,
                 "api": None,
-                "reference_api": None,
             }
             identity = {
                 "kind": "unresolved",
@@ -5942,21 +5768,11 @@ class SolidWorksBackend(CadBackend):
                 },
                 "persistent_reference": None,
             }
-        source_context = _appearance_material_source_context(
-            entity,
-            native_interface_kind=native_interface_kind,
-            owner_scope=owner_scope,
-            owner_document_path=owner_document_path,
-            source_reference=source_reference,
-            source_error=source_error,
-            expected_component=component_name,
-        )
         context, reference = (
             SolidWorksBackend._appearance_corresponding_reference(
                 entity,
                 source_reference=source_reference,
                 source_error=source_error,
-                source_context=source_context,
                 native_interface_kind=native_interface_kind,
                 owner_scope=owner_scope,
                 primary_component=primary_component,
@@ -5968,7 +5784,6 @@ class SolidWorksBackend(CadBackend):
             "owner_document_path": binding_document_path,
             "component": component_name,
             "api": context["api"],
-            "reference_api": "IModelDocExtension.GetPersistReference3",
         }
         identity = {
             "kind": (
@@ -5980,7 +5795,6 @@ class SolidWorksBackend(CadBackend):
             "owner_configuration": _json_raw_value(owner_configuration),
             "owner_display_state": display_state,
             "binding_context": binding_context,
-            "source_context": copy.deepcopy(source_context),
             "context": context,
         }
         return {
@@ -6365,12 +6179,14 @@ class SolidWorksBackend(CadBackend):
                     "faces": [],
                 }
                 appearance_raw["bodies"].append(body_appearance_record)
-                body_entity_record = {
-                    "component": component,
-                    "body_type": body_type,
-                    "body_index": body_index,
-                    "body": body,
-                }
+                body_entities.append(
+                    {
+                        "component": component,
+                        "body_type": body_type,
+                        "body_index": body_index,
+                        "body": body,
+                    }
+                )
                 try:
                     faces = _as_list(_member(body, "GetFaces"))
                 except Exception as error:  # noqa: BLE001
@@ -6392,61 +6208,11 @@ class SolidWorksBackend(CadBackend):
                         "face_count": len(faces),
                     }
                 )
-                first_face = None
-                if faces:
-                    try:
-                        first_face = _interface(
-                            _dynamic(faces[0]),
-                            IFACE2_IID,
-                        )
-                        body_source_context = (
-                            _appearance_getcomponent_context(
-                                first_face,
-                                component,
-                            )
-                        )
-                    except Exception as error:  # noqa: BLE001
-                        body_source_context = {
-                            "api": "IEntity.GetComponent",
-                            "expected_component": component,
-                            "component": None,
-                            "state": "unresolved",
-                            "read_errors": {
-                                "binding": _native_error_record(error)
-                            },
-                        }
-                else:
-                    body_source_context = {
-                        "api": "IEntity.GetComponent",
-                        "expected_component": component,
-                        "component": None,
-                        "state": "unresolved",
-                        "read_errors": {
-                            "faces": {
-                                "code": (
-                                    "cad_appearance_body_faces_missing"
-                                ),
-                                "message": (
-                                    "the body has no representative face"
-                                ),
-                                "detail": {},
-                            }
-                        },
-                    }
-                body_appearance_record["source_context"] = (
-                    copy.deepcopy(body_source_context)
-                )
-                body_entity_record["source_context"] = body_source_context
-                body_entities.append(body_entity_record)
                 for face_index, raw_face in enumerate(faces):
                     face_count += 1
                     triangle_start = len(values) // 9
                     try:
-                        face = (
-                            first_face
-                            if face_index == 0 and first_face is not None
-                            else _interface(_dynamic(raw_face), IFACE2_IID)
-                        )
+                        face = _interface(_dynamic(raw_face), IFACE2_IID)
                     except Exception as error:  # noqa: BLE001
                         errors.append(
                             {
@@ -6519,9 +6285,6 @@ class SolidWorksBackend(CadBackend):
                         "owner_scope": "component_document",
                         "persistent_reference": face_reference,
                         "feature": feature_identity,
-                        "source_context": copy.deepcopy(
-                            body_source_context
-                        ),
                         "read_errors": native_identity_errors,
                     }
                     face_entities.append(
@@ -6530,7 +6293,6 @@ class SolidWorksBackend(CadBackend):
                             "body_type": body_type,
                             "body_index": body_index,
                             "face_index": face_index,
-                            "source_context": body_source_context,
                             "face": face,
                         }
                     )
@@ -6543,7 +6305,6 @@ class SolidWorksBackend(CadBackend):
                                 "face_index": face_index,
                                 "feature": feature,
                                 "identity": feature_identity,
-                                "source_context": body_source_context,
                             }
                         )
                     body_appearance_record["faces"].append(
