@@ -709,7 +709,11 @@ function Get-ProcessLineageEvidence($Process) {
   } catch {
     throw 'the process lineage node carries no creation time'
   }
-  $ownerSid = Get-ProcessOwnerSid $Process
+  $ownerSid = if ($null -ne $Process.OwnerSid) {
+    [string]$Process.OwnerSid
+  } else {
+    Get-ProcessOwnerSid $Process
+  }
   return [ordered]@{
     pid=[int]$Process.ProcessId
     parent_pid=[int]$Process.ParentProcessId
@@ -822,26 +826,10 @@ function Get-ListenerEvidence([object]$binding, $TaskProjection, $ListenerFacts 
   if ($listenerArguments -cne $actionArguments) {
     Die 'windows_listener_identity_mismatch' 'the endpoint listener does not carry the projected task arguments'
   }
-  if ($null -ne $ListenerFacts) {
-    if ($ListenerFacts.runtime -is [scriptblock]) {
-      try { $pyvenv = & $ListenerFacts.runtime } catch {
-        Die 'windows_listener_identity_mismatch' $_.Exception.Message
-      }
-    } else {
-      $pyvenv = $ListenerFacts.runtime
-    }
-    $launcherImageSha256 = [string]$ListenerFacts.launcher_image_sha256
-    if ($null -eq $pyvenv -or
-        [string]::IsNullOrWhiteSpace($launcherImageSha256)) {
-      Die 'windows_listener_identity_mismatch' 'the listener runtime facts are incomplete'
-    }
-  } else {
-    $scripts = Split-Path -Parent ([string]$action.execute)
-    $runtimeRoot = Split-Path -Parent $scripts
-    try { $pyvenv = Read-PyvenvRuntime $runtimeRoot } catch {
-      Die 'windows_listener_identity_mismatch' $_.Exception.Message
-    }
-    $launcherImageSha256 = Sha256 ([string]$launchers[0].ExecutablePath)
+  $scripts = Split-Path -Parent ([string]$action.execute)
+  $runtimeRoot = Split-Path -Parent $scripts
+  try { $pyvenv = Read-PyvenvRuntime $runtimeRoot } catch {
+    Die 'windows_listener_identity_mismatch' $_.Exception.Message
   }
   if ($listener.image -ne [string]$pyvenv.base_interpreter) {
     Die 'windows_listener_identity_mismatch' 'the endpoint listener is not the configured base interpreter'
@@ -911,7 +899,7 @@ function Get-ListenerEvidence([object]$binding, $TaskProjection, $ListenerFacts 
     launcher_pid=[int]$launcher.pid
     launcher_parent_pid=[int]$launcher.parent_pid
     launcher_image=[string]$launcher.image
-    launcher_image_sha256=$launcherImageSha256
+    launcher_image_sha256=(Sha256 ([string]$launchers[0].ExecutablePath))
     launcher_start_utc=[string]$launcher.start_utc
     launcher_user_sid=[string]$launcher.user_sid
     launcher_session_id=[int]$launcher.session_id
