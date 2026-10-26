@@ -311,7 +311,7 @@ function Start-BoundTask([object]$binding) {
 function Test-ActionConfigArgument([string]$Arguments, [string]$ConfigPath) {
   $options = @([regex]::Matches(
     $Arguments,
-    '(?:^|\s)--config(?=\s|=)'))
+    '(?:^|\s)--config(?=\s|=|$)'))
   $canonical = @([regex]::Matches(
     $Arguments,
     '(?:^|\s)--config\s+"([^"]+)"(?=\s|$)'))

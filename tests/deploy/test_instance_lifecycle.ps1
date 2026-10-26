@@ -925,6 +925,10 @@ Check 'task.action_config_path_equals_duplicate_refused' (
   -not (Test-ActionConfigArgument (
     $windowsArguments + ' --config=C:\foreign\generation\endpoint.json'
   ) $windowsConfigPath))
+Check 'task.action_config_path_missing_value_duplicate_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --config'
+  ) $windowsConfigPath))
 Check 'task.action_config_path_equals_form_refused' (
   -not (Test-ActionConfigArgument (
     '-I -B -m description_pipeline serve --config=C:\root\old\generation\endpoint.json'
