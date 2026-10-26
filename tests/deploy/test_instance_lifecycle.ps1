@@ -1103,15 +1103,18 @@ $listenerProjection = [pscustomobject]@{
 }
 $script:OriginalListenerSystemRoot = $env:SystemRoot
 $env:SystemRoot = $listenerSystemRoot
-function Write-ListenerPyvenv([string]$CommandRoot = '') {
+function Get-ListenerPyvenvText([string]$CommandRoot = '') {
   if (-not $CommandRoot) { $CommandRoot = $listenerRuntime }
-  $text = @(
+  return @(
     ('home = ' + $listenerBaseHome)
     'include-system-site-packages = false'
     'version = 3.12.10'
     ('executable = ' + $listenerBase)
     ('command = "' + $listenerBase + '" -m venv "' + $CommandRoot + '"')
   ) -join "`n"
+}
+function Write-ListenerPyvenv([string]$CommandRoot = '') {
+  $text = Get-ListenerPyvenvText $CommandRoot
   Write-Utf8NoBom (Join-Path $listenerRuntime 'pyvenv.cfg') $text
 }
 function New-ListenerProcess(
@@ -1133,6 +1136,7 @@ function New-ListenerProcess(
   }
 }
 function Reset-ListenerProcesses([string]$Scenario = 'valid') {
+  $script:ListenerRuntimeFailure = $null
   foreach ($path in @($listenerLauncher, $listenerBase, $listenerScheduler)) {
     Write-Utf8NoBom $path ('fixture:' + $path)
   }
@@ -1221,9 +1225,11 @@ function Reset-ListenerProcesses([string]$Scenario = 'valid') {
     }
     'foreign_pyvenv_command' {
       Write-ListenerPyvenv (Join-Path $listenerFixtureRoot 'foreign-runtime')
+      $script:ListenerRuntimeFailure = 'the generation pyvenv.cfg command names another virtual environment'
     }
     'missing_base' {
       Remove-Item -LiteralPath $listenerBase -Force
+      $script:ListenerRuntimeFailure = 'the generation pyvenv.cfg base interpreter is missing'
     }
   }
   $script:ListenerProcesses = @($scheduler, $launcher, $listener) +
@@ -1244,11 +1250,24 @@ function Get-ProcessOwnerSid {
   return [string]$Process.OwnerSid
 }
 function Get-CurrentListenerFacts {
-  return @{
+  $facts = @{
     listeners=@($script:ListenerPorts)
     processes=@($script:ListenerProcesses)
     scheduler_services=@($script:SchedulerService)
+    launcher_image_sha256=(Get-TextSha256 ('fixture:' + $listenerLauncher))
+    runtime=@{
+      path=(Normalize-PathIdentity (Join-Path $listenerRuntime 'pyvenv.cfg'))
+      sha256=(Get-TextSha256 (Get-ListenerPyvenvText))
+      home=(Normalize-PathIdentity $listenerBaseHome)
+      version='3.12.10'
+      base_interpreter=(Normalize-PathIdentity $listenerBase)
+      base_interpreter_sha256=(Get-TextSha256 ('fixture:' + $listenerBase))
+    }
   }
+  if ($script:ListenerRuntimeFailure) {
+    $facts.runtime = { throw $script:ListenerRuntimeFailure }
+  }
+  return $facts
 }
 Reset-ListenerProcesses
 $evidence = Get-ListenerEvidence @{port=8765} $listenerProjection (Get-CurrentListenerFacts)
