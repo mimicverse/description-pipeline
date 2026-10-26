@@ -289,17 +289,33 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_document_path": "C:/cad/arm.SLDPRT",
                             "component": "arm-1",
                             "api": "IComponent2.GetCorresponding",
-                            "reference_api": (
-                                "IModelDocExtension.GetPersistReference3"
-                            ),
                         },
+                        "source_persistent_reference": [7, 8, 9],
+                        "source_read_errors": {},
                         "native_identity": {
                             "kind": "object",
                             "state": "observed",
-                            "source_context": {
+                            "context": {
+                                "owner_scope": "component_document",
+                                "input_kind": "persistent_object",
                                 "api": "IComponent2.GetCorresponding",
-                                "state": "document",
-                                "component": "arm-1",
+                                "persistent_reference": [1, 2, 3],
+                                "target_reference_attempt": {
+                                    "api": (
+                                        "IModelDocExtension.GetPersistReference3"
+                                    ),
+                                    "persistent_reference": None,
+                                    "error": {
+                                        "code": (
+                                            "cad_appearance_persistent_reference_missing"
+                                        ),
+                                        "message": (
+                                            "the apparent owner reference is unavailable"
+                                        ),
+                                        "detail": {},
+                                    },
+                                },
+                                "state": "observed",
                                 "read_errors": {},
                             },
                             "read_errors": {},
@@ -363,9 +379,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     "owner_document_path": "C:/cad/arm.SLDPRT",
                     "component": "arm-1",
                     "api": "IComponent2.GetCorrespondingEntity",
-                    "reference_api": (
-                        "IModelDocExtension.GetPersistReference3"
-                    ),
                 },
                 "target": {
                     "kind": "face",
@@ -393,17 +406,33 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_document_path": "C:/cad/arm.SLDPRT",
                             "component": "arm-1",
                             "api": "IComponent2.GetCorrespondingEntity",
-                            "reference_api": (
-                                "IModelDocExtension.GetPersistReference3"
-                            ),
                         },
+                        "source_persistent_reference": [7, 8, 9],
+                        "source_read_errors": {},
                         "native_identity": {
                             "kind": "entity",
                             "state": "observed",
-                            "source_context": {
+                            "context": {
+                                "owner_scope": "component_document",
+                                "input_kind": "IEntity",
                                 "api": "IComponent2.GetCorrespondingEntity",
-                                "state": "document",
-                                "component": "arm-1",
+                                "persistent_reference": [1, 2, 3],
+                                "target_reference_attempt": {
+                                    "api": (
+                                        "IModelDocExtension.GetPersistReference3"
+                                    ),
+                                    "persistent_reference": None,
+                                    "error": {
+                                        "code": (
+                                            "cad_appearance_persistent_reference_missing"
+                                        ),
+                                        "message": (
+                                            "the apparent owner reference is unavailable"
+                                        ),
+                                        "detail": {},
+                                    },
+                                },
+                                "state": "observed",
                                 "read_errors": {},
                             },
                             "read_errors": {},
@@ -429,6 +458,139 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 configuration="Painted",
                 where="capture",
             )
+
+    def test_independent_appearance_verifies_reference_evidence(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        raw = hermetic._fixture_appearance_raw(
+            "arm-1",
+            {
+                "source_document_path": "C:/cad/arm.SLDPRT",
+                "referenced_configuration": "Painted",
+            },
+            [{"body_type": 0, "body_index": 0, "face_index": 0}],
+        )
+        owner = raw["state_render_materials"][-1]
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        binding_context = {
+            "owner_scope": "component_document",
+            "owner_document_path": "C:/cad/parent.SLDASM",
+            "component": "arm-1",
+            "api": "IComponent2.GetCorresponding",
+        }
+        owner["native_reference_index"] = [
+            {
+                "persistent_reference": [1, 2, 3],
+                "binding_context": binding_context,
+                "target": {
+                    "kind": "face",
+                    "component": "arm-1",
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                },
+            }
+        ]
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Default_Display_State"],
+                "entities": ["feature"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "_CDispatch",
+                        "persistent_reference": [1, 2, 3],
+                        "binding_context": binding_context,
+                        "source_persistent_reference": [7, 8, 9],
+                        "source_read_errors": {},
+                        "native_identity": {
+                            "kind": "object",
+                            "state": "observed",
+                            "context": {
+                                "owner_scope": "component_document",
+                                "input_kind": "persistent_object",
+                                "api": "IComponent2.GetCorresponding",
+                                "persistent_reference": [1, 2, 3],
+                                "target_reference_attempt": {
+                                    "api": (
+                                        "IModelDocExtension.GetPersistReference3"
+                                    ),
+                                    "persistent_reference": None,
+                                    "error": {
+                                        "code": (
+                                            "cad_appearance_persistent_reference_missing"
+                                        ),
+                                        "message": (
+                                            "the apparent owner reference is unavailable"
+                                        ),
+                                        "detail": {},
+                                    },
+                                },
+                                "state": "observed",
+                                "read_errors": {},
+                            },
+                            "read_errors": {},
+                        },
+                        "matched_identity": {},
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x000000FF,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        for base_owner in (raw["document"], raw["occurrence"]):
+            base_owner["material_property_values"] = None
+            base_owner["has_material_property_values"] = False
+        for body in raw["bodies"]:
+            body["appearance"]["material_property_values"] = None
+            body["appearance"]["has_material_property_values"] = False
+            for face in body["faces"]:
+                face["appearance"]["material_property_values"] = None
+                face["appearance"]["has_material_property_values"] = False
+        _resolved_faces(
+            raw,
+            configuration="Painted",
+            where="capture",
+        )
+
+        for failure, expected_message in (
+            ("wrong_owner", "binding context names another component"),
+            ("reverse_conversion", "native context evidence is inconsistent"),
+            ("missing_source_reference", "native context evidence is inconsistent"),
+        ):
+            with self.subTest(failure=failure):
+                malformed = copy.deepcopy(raw)
+                entity = malformed["state_render_materials"][-1]["materials"][
+                    0
+                ]["entity_records"][0]
+                if failure == "wrong_owner":
+                    entity["binding_context"]["component"] = "other-1"
+                elif failure == "reverse_conversion":
+                    entity["binding_context"]["api"] = (
+                        "IComponent2.GetCorrespondingEntity"
+                    )
+                    entity["native_identity"]["context"]["api"] = (
+                        "IComponent2.GetCorrespondingEntity"
+                    )
+                else:
+                    entity["source_persistent_reference"] = None
+                with self.assertRaisesRegex(
+                    PipelineError,
+                    expected_message,
+                ):
+                    _resolved_faces(
+                        malformed,
+                        configuration="Painted",
+                        where="capture",
+                    )
 
     def test_independent_appearance_merges_only_one_feature_footprint(self):
         from description_pipeline.verification.native_appearance import _resolved_faces
@@ -457,9 +619,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     "owner_document_path": "C:/cad/arm.SLDPRT",
                     "component": "arm-1",
                     "api": "IComponent2.GetCorresponding",
-                    "reference_api": (
-                        "IModelDocExtension.GetPersistReference3"
-                    ),
                 }
                 feature_identities = (
                     [(feature_names[0], [0, 1])]
@@ -502,13 +661,32 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                 "native_object_type": "_CDispatch",
                                 "persistent_reference": [1, 2, 3],
                                 "binding_context": binding_context,
+                                "source_persistent_reference": [7, 8, 9],
+                                "source_read_errors": {},
                                 "native_identity": {
                                     "kind": "object",
                                     "state": "observed",
-                                    "source_context": {
+                                    "context": {
+                                        "owner_scope": "component_document",
+                                        "input_kind": "persistent_object",
                                         "api": "IComponent2.GetCorresponding",
-                                        "state": "document",
-                                        "component": "arm-1",
+                                        "persistent_reference": [1, 2, 3],
+                                        "target_reference_attempt": {
+                                            "api": (
+                                                "IModelDocExtension.GetPersistReference3"
+                                            ),
+                                            "persistent_reference": None,
+                                            "error": {
+                                                "code": (
+                                                    "cad_appearance_persistent_reference_missing"
+                                                ),
+                                                "message": (
+                                                    "the apparent owner reference is unavailable"
+                                                ),
+                                                "detail": {},
+                                            },
+                                        },
+                                        "state": "observed",
                                         "read_errors": {},
                                     },
                                     "read_errors": {},
@@ -597,7 +775,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                 "IModelDoc2.GetPathName"
                                 "+ConfigurationManager.ActiveConfiguration.Name"
                             ),
-                            "reference_api": None,
                         },
                         "native_identity": {
                             "kind": "document",
@@ -608,12 +785,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_configuration": "Painted",
                             "owner_display_state": "Default_Display_State",
                             "state": "observed",
-                            "source_context": {
-                                "api": "IModelDoc2",
-                                "state": "document",
-                                "component": "arm-1",
-                                "read_errors": {},
-                            },
                             "read_errors": {},
                         },
                         "matched_identity": {},
@@ -719,9 +890,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     "owner_document_path": "fixture-top.SLDASM",
                     "component": "arm-1",
                     "api": "IModelDocExtension.GetPersistReference3",
-                    "reference_api": (
-                        "IModelDocExtension.GetPersistReference3"
-                    ),
                 },
                 "target": {
                     "kind": "occurrence",
@@ -745,27 +913,26 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_document_path": "fixture-top.SLDASM",
                             "component": "arm-1",
                             "api": "IModelDocExtension.GetPersistReference3",
-                            "reference_api": (
-                                "IModelDocExtension.GetPersistReference3"
-                            ),
                         },
                         "native_identity": {
                             "kind": "object",
                             "state": "observed",
-                            "source_context": {
-                                "api": "IComponent2",
-                                "state": "assembly",
-                                "component": "arm-1",
-                                "read_errors": {},
-                            },
                             "context": {
+                                "owner_scope": "top_assembly",
+                                "input_kind": "persistent_object",
+                                "api": (
+                                    "IModelDocExtension.GetPersistReference3"
+                                ),
+                                "persistent_reference": [4, 5, 6],
                                 "target_reference_attempt": {
                                     "api": (
                                         "IModelDocExtension.GetPersistReference3"
                                     ),
                                     "persistent_reference": [4, 5, 6],
                                     "error": None,
-                                }
+                                },
+                                "state": "observed",
+                                "read_errors": {},
                             },
                             "read_errors": {},
                         },

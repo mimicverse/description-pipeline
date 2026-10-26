@@ -227,20 +227,15 @@ def _binding_context_key(value: object):
         value.get("owner_document_path")
     )
     component = value.get("component")
-    reference_api = value.get("reference_api")
     if (
         not isinstance(owner_scope, str)
         or not owner_scope
         or owner_document_path is None
         or not isinstance(component, str)
         or not component
-        or (
-            reference_api is not None
-            and not isinstance(reference_api, str)
-        )
     ):
         return None
-    return owner_scope, owner_document_path, component, reference_api
+    return owner_scope, owner_document_path, component
 
 
 def _valid_values(value: object) -> bool:
@@ -1053,7 +1048,7 @@ def resolve_deliverable_appearance(
                 ),
             )
         reference_index: dict[
-            tuple[tuple[int, ...], tuple[str, str, str, object]],
+            tuple[tuple[int, ...], tuple[str, str, str]],
             list[Mapping[str, Any]],
         ] = {}
         for index_position, indexed in enumerate(
@@ -1073,14 +1068,23 @@ def resolve_deliverable_appearance(
             indexed_key = _persistent_reference_key(
                 indexed.get("persistent_reference")
             )
-            indexed_context = _binding_context_key(
-                indexed.get("binding_context")
+            indexed_binding = indexed.get("binding_context")
+            indexed_context = _binding_context_key(indexed_binding)
+            indexed_api = (
+                indexed_binding.get("api")
+                if isinstance(indexed_binding, Mapping)
+                else None
             )
             target = indexed.get("target")
             if (
                 indexed_key is None
                 or indexed_context is None
-                or indexed_context[3] != OWNER_CONTEXT_BINDING_API
+                or indexed_api
+                not in {
+                    OWNER_CONTEXT_BINDING_API,
+                    COMPONENT_ENTITY_BINDING_API,
+                    COMPONENT_OBJECT_BINDING_API,
+                }
                 or not isinstance(target, Mapping)
                 or target.get("kind")
                 not in {"occurrence", "body", "face", "feature"}
@@ -1182,27 +1186,11 @@ def resolve_deliverable_appearance(
                     else None
                 )
                 if document_identity is not None:
-                    document_source_context = document_identity.get(
-                        "source_context"
-                    )
                     if (
                         entity["read_errors"]
                         or context_key[0] != "component_document"
-                        or context_key[3] is not None
                         or entity["binding_context"].get("api")
                         != DOCUMENT_BINDING_API
-                        or not isinstance(document_source_context, Mapping)
-                        or document_source_context.get("api")
-                        != "IModelDoc2"
-                        or document_source_context.get("state")
-                        != "document"
-                        or document_source_context.get("component")
-                        != component
-                        or not isinstance(
-                            document_source_context.get("read_errors"),
-                            Mapping,
-                        )
-                        or document_source_context.get("read_errors")
                         or document_identity.get("qi_iid")
                         != IMODELDOC2_IID
                         or document_identity.get("state") != "observed"
@@ -1246,6 +1234,18 @@ def resolve_deliverable_appearance(
                         if isinstance(native_identity, Mapping)
                         else None
                     )
+                    context_api = (
+                        context_details.get("api")
+                        if isinstance(context_details, Mapping)
+                        else None
+                    )
+                    context_reference = (
+                        _persistent_reference_key(
+                            context_details.get("persistent_reference")
+                        )
+                        if isinstance(context_details, Mapping)
+                        else None
+                    )
                     target_attempt = (
                         context_details.get("target_reference_attempt")
                         if isinstance(context_details, Mapping)
@@ -1258,52 +1258,60 @@ def resolve_deliverable_appearance(
                         if isinstance(target_attempt, Mapping)
                         else None
                     )
-                    target_reference_proven = (
+                    direct_reference_proven = (
                         entity_key is not None
+                        and isinstance(context_details, Mapping)
+                        and context_api == OWNER_CONTEXT_BINDING_API
+                        and context_details.get("state") == "observed"
+                        and context_details.get("owner_scope")
+                        == context_key[0]
+                        and context_reference == entity_key
                         and isinstance(target_attempt, Mapping)
                         and target_attempt.get("api")
                         == OWNER_CONTEXT_BINDING_API
                         and target_attempt.get("error") is None
                         and target_attempt_reference == entity_key
                     )
-                    source_context = (
-                        native_identity.get("source_context")
-                        if isinstance(native_identity, Mapping)
-                        else None
+                    source_reference = _persistent_reference_key(
+                        entity.get("source_persistent_reference")
                     )
-                    source_state = (
-                        source_context.get("state")
-                        if isinstance(source_context, Mapping)
-                        else None
+                    source_errors = entity.get("source_read_errors")
+                    conversion_base = (
+                        isinstance(context_details, Mapping)
+                        and entity_key is not None
+                        and context_details.get("state") == "observed"
+                        and context_details.get("owner_scope")
+                        == context_key[0]
+                        and context_reference == entity_key
+                        and source_reference is not None
+                        and isinstance(source_errors, Mapping)
+                        and not source_errors
+                        and isinstance(target_attempt, Mapping)
+                        and target_attempt.get("api")
+                        == OWNER_CONTEXT_BINDING_API
+                        and isinstance(target_attempt.get("error"), Mapping)
                     )
-                    if target_reference_proven:
-                        expected_api = OWNER_CONTEXT_BINDING_API
-                    elif (
-                        isinstance(source_context, Mapping)
-                        and source_state == "document"
-                        and isinstance(source_context.get("api"), str)
-                        and source_context.get("api")
-                        and source_context.get("component") == component
-                        and isinstance(
-                            source_context.get("read_errors"),
-                            Mapping,
-                        )
-                        and not source_context.get("read_errors")
-                    ):
-                        expected_api = (
-                            COMPONENT_ENTITY_BINDING_API
-                            if identity_kind == "entity"
-                            else COMPONENT_OBJECT_BINDING_API
-                            if identity_kind == "object"
-                            else None
-                        )
-                    else:
-                        expected_api = None
+                    converted_entity_proven = (
+                        conversion_base
+                        and identity_kind == "entity"
+                        and context_api == COMPONENT_ENTITY_BINDING_API
+                        and context_details.get("input_kind") == "IEntity"
+                    )
+                    converted_object_proven = (
+                        conversion_base
+                        and identity_kind == "object"
+                        and context_api == COMPONENT_OBJECT_BINDING_API
+                        and context_details.get("input_kind")
+                        == "persistent_object"
+                    )
                     if (
-                        expected_api is None
-                        or context_key[3] != OWNER_CONTEXT_BINDING_API
+                        not (
+                            direct_reference_proven
+                            or converted_entity_proven
+                            or converted_object_proven
+                        )
                         or entity["binding_context"].get("api")
-                        != expected_api
+                        != context_api
                     ):
                         raise _appearance_resolution_error(
                             component,
@@ -1312,11 +1320,20 @@ def resolve_deliverable_appearance(
                             "the native binding API does not match the entity context",
                             observed={
                                 "api": entity["binding_context"].get("api"),
-                                "reference_api": context_key[3],
-                                "source_context": source_context,
-                            "target_reference_attempt": target_attempt,
+                                "context_api": context_api,
+                                "context": context_details,
+                                "source_reference": source_reference,
+                                "target_reference_attempt": target_attempt,
                             },
-                            expected=expected_api,
+                            expected={
+                                "direct": OWNER_CONTEXT_BINDING_API,
+                                "entity_conversion": (
+                                    COMPONENT_ENTITY_BINDING_API
+                                ),
+                                "object_conversion": (
+                                    COMPONENT_OBJECT_BINDING_API
+                                ),
+                            },
                         )
                     if entity_key is None or entity["read_errors"]:
                         raise _appearance_resolution_error(

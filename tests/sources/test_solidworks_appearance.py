@@ -144,42 +144,68 @@ def _binding_context(
     owner_scope: str,
     owner_document_path: str,
     api: str = "IComponent2.GetCorrespondingEntity",
-    reference_api: str | None = "IModelDocExtension.GetPersistReference3",
 ):
     return {
         "owner_scope": owner_scope,
         "owner_document_path": owner_document_path,
         "component": COMPONENT,
         "api": api,
-        "reference_api": reference_api,
     }
 
 
 def _native_identity(
     kind: str,
-    state: str = "document",
+    *,
+    owner_scope: str = "component_document",
+    api: str | None = None,
+    persistent_reference=(1, 2, 3),
     target_reference=None,
 ):
-    identity = {
+    api = api or (
+        "IComponent2.GetCorrespondingEntity"
+        if kind == "entity"
+        else "IComponent2.GetCorresponding"
+    )
+    input_kind = "IEntity" if kind == "entity" else "persistent_object"
+    target_attempt = {
+        "api": "IModelDocExtension.GetPersistReference3",
+        "persistent_reference": (
+            list(target_reference)
+            if target_reference is not None
+            else None
+        ),
+        "error": (
+            None
+            if target_reference is not None
+            else {
+                "code": "cad_appearance_persistent_reference_missing",
+                "message": "the apparent owner reference is unavailable",
+                "detail": {},
+            }
+        ),
+    }
+    return {
         "kind": kind,
-        "state": "observed",
-        "source_context": {
-            "api": "test_native_context",
-            "state": state,
-            "component": COMPONENT,
+        "owner_document_path": f"C:\\cad\\{COMPONENT}.SLDPRT",
+        "owner_configuration": CONFIGURATION,
+        "owner_display_state": "Display State 1",
+        "binding_context": _binding_context(
+            owner_scope=owner_scope,
+            owner_document_path=DOCUMENT,
+            api=api,
+        ),
+        "context": {
+            "owner_scope": owner_scope,
+            "input_kind": input_kind,
+            "api": api,
+            "persistent_reference": list(persistent_reference),
+            "target_reference_attempt": target_attempt,
+            "state": "observed",
             "read_errors": {},
         },
+        "state": "observed",
         "read_errors": {},
     }
-    if target_reference is not None:
-        identity["context"] = {
-            "target_reference_attempt": {
-                "api": "IModelDocExtension.GetPersistReference3",
-                "persistent_reference": list(target_reference),
-                "error": None,
-            }
-        }
-    return identity
 
 
 def _resolved_raw(values):
@@ -428,7 +454,9 @@ class AppearanceResolutionTests(unittest.TestCase):
                         ),
                         "native_identity": _native_identity(
                             "object",
-                            state="assembly",
+                            owner_scope="top_assembly",
+                            api="IModelDocExtension.GetPersistReference3",
+                            persistent_reference=[4, 5, 6],
                             target_reference=[4, 5, 6],
                         ),
                         "matched_identity": {
@@ -647,6 +675,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                             owner_document_path=DOCUMENT,
                             api="IComponent2.GetCorresponding",
                         ),
+                        "source_persistent_reference": [7, 8, 9],
+                        "source_read_errors": {},
                         "native_identity": _native_identity("object"),
                         "matched_identity": {},
                         "read_errors": {},
@@ -732,6 +762,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                             owner_document_path=DOCUMENT,
                             api="IComponent2.GetCorrespondingEntity",
                         ),
+                        "source_persistent_reference": [7, 8, 9],
+                        "source_read_errors": {},
                         "native_identity": _native_identity("entity"),
                         "matched_identity": {},
                         "read_errors": {},
@@ -845,6 +877,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                                 "native_object_type": "_CDispatch",
                                 "persistent_reference": [1, 2, 3],
                                 "binding_context": binding_context,
+                                "source_persistent_reference": [7, 8, 9],
+                                "source_read_errors": {},
                                 "native_identity": _native_identity("object"),
                                 "matched_identity": {},
                                 "read_errors": {},
@@ -930,7 +964,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "IModelDoc2.GetPathName"
                 "+ConfigurationManager.ActiveConfiguration.Name"
             ),
-            reference_api=None,
         )
         owner["materials"] = [
             {
@@ -953,12 +986,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                             "owner_configuration": CONFIGURATION,
                             "owner_display_state": "Display State 1",
                             "state": "observed",
-                            "source_context": {
-                                "api": "IModelDoc2",
-                                "state": "document",
-                                "component": COMPONENT,
-                                "read_errors": {},
-                            },
                             "read_errors": {},
                         },
                         "matched_identity": {},
@@ -1040,6 +1067,10 @@ class AppearanceResolutionTests(unittest.TestCase):
             "identity_map",
             "unmapped_target",
             "source_claim_without_index",
+            "wrong_owner",
+            "reverse_conversion",
+            "missing_source_reference",
+            "binding_api_mismatch",
         ):
             with self.subTest(failure=failure):
                 raw = _resolved_raw([None])
@@ -1081,6 +1112,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                         owner_document_path=DOCUMENT,
                         api="IComponent2.GetCorresponding",
                     ),
+                    "source_persistent_reference": [7, 8, 9],
+                    "source_read_errors": {},
                     "native_identity": _native_identity("object"),
                     "matched_identity": {
                         "occurrences": [],
@@ -1121,6 +1154,24 @@ class AppearanceResolutionTests(unittest.TestCase):
                             "face_index": 0,
                         }
                     ]
+                elif failure == "wrong_owner":
+                    entity["binding_context"]["component"] = "other-1"
+                elif failure == "reverse_conversion":
+                    entity["binding_context"]["api"] = (
+                        "IComponent2.GetCorresponding"
+                    )
+                    entity["native_identity"]["binding_context"]["api"] = (
+                        "IComponent2.GetCorresponding"
+                    )
+                    entity["native_identity"]["context"]["api"] = (
+                        "IComponent2.GetCorresponding"
+                    )
+                elif failure == "missing_source_reference":
+                    entity["source_persistent_reference"] = None
+                elif failure == "binding_api_mismatch":
+                    entity["binding_context"]["api"] = (
+                        "IModelDocExtension.GetPersistReference3"
+                    )
                 owner["materials"] = [
                     {
                         "material_index": 0,
@@ -1195,6 +1246,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                                     owner_document_path=DOCUMENT,
                                     api="IComponent2.GetCorrespondingEntity",
                                 ),
+                                "source_persistent_reference": [7, 8, 9],
+                                "source_read_errors": {},
                                 "native_identity": _native_identity("entity"),
                                 "read_errors": {},
                                 "matched_identity": {
