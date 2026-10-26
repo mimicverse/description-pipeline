@@ -473,6 +473,52 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         self.assertEqual(resolved.faces[0].source["scopes"], ["face"])
 
+    def test_nonzero_or_unknown_count_keeps_null_state_materials_unresolved(self):
+        for count, count_error in (
+            (1, None),
+            (None, {"code": "cad_appearance_render_material_count_unreadable"}),
+        ):
+            with self.subTest(count=count):
+                raw = _resolved_raw(
+                    [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
+                )
+                owner = _empty_state_owner(
+                    scope="component_document",
+                    document_path=DOCUMENT,
+                    configuration=CONFIGURATION,
+                    display_state="Display State 1",
+                )
+                owner["call_state"] = "null_result"
+                owner["materials"] = None
+                owner["native_render_material_count"] = count
+                owner["native_render_material_count_error"] = count_error
+                if count_error is not None:
+                    owner["read_errors"] = {
+                        "native_render_material_count": count_error
+                    }
+                raw["state_render_materials"] = [owner]
+                with self.assertRaises(AppearanceError) as caught:
+                    resolve_deliverable_appearance(
+                        raw,
+                        component=COMPONENT,
+                        expected_document_path=DOCUMENT,
+                        expected_configuration=CONFIGURATION,
+                        face_spans=[
+                            {
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                                "triangle_start": 0,
+                                "triangle_count": 1,
+                                "face_reference_sha256": "a" * 64,
+                            }
+                        ],
+                    )
+                self.assertEqual(
+                    caught.exception.appearance["issues"][0]["code"],
+                    "cad_appearance_render_enumeration_failed",
+                )
+
     def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
         for failure in (
             "persistent_reference",
