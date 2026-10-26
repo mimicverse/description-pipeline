@@ -882,6 +882,326 @@ def _appearance_read_error(code: str, message: str, value: object) -> dict:
     }
 
 
+def _appearance_value(owner, name: str, *, method: bool = False, args=()):
+    """Read one auxiliary native value without converting an error into null."""
+
+    try:
+        value = _method(owner, name, *args) if method else _member(owner, name)
+    except Exception as error:  # noqa: BLE001 - caller records the field failure
+        return None, _native_error_record(error)
+    return _json_raw_value(value), None
+
+
+def _appearance_persistent_reference(extension, entity):
+    if extension is None:
+        return None, {
+            "code": "cad_appearance_owner_unavailable",
+            "message": "the apparent owner document extension is unavailable",
+            "detail": {},
+        }
+    try:
+        raw = _member(extension, "GetPersistReference3", entity)
+    except Exception as error:  # noqa: BLE001 - identity failure is field-local
+        return None, _native_error_record(error)
+    if raw is None:
+        return None, _appearance_read_error(
+            "cad_appearance_persistent_reference_missing",
+            "GetPersistReference3 returned null",
+            None,
+        )
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    if isinstance(raw, (bytes, bytearray)):
+        value = list(raw)
+    elif isinstance(raw, (list, tuple)):
+        value = [_json_raw_value(item) for item in raw]
+    else:
+        value = _json_raw_value(raw)
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(type(item) is not int or not -128 <= item <= 255 for item in value)
+    ):
+        return value, _appearance_read_error(
+            "cad_appearance_persistent_reference_invalid",
+            "GetPersistReference3 did not return a nonempty byte array",
+            value,
+        )
+    return value, None
+
+
+def _appearance_reference_key(value):
+    if not isinstance(value, list) or not value:
+        return None
+    if any(type(item) is not int for item in value):
+        return None
+    return tuple(item & 0xFF for item in value)
+
+
+def _appearance_feature_identity(face, extension):
+    errors = {}
+    try:
+        feature = _member(face, "GetFeature")
+    except Exception as error:  # noqa: BLE001 - identity remains field-local
+        return {
+            "name": None,
+            "type_name": None,
+            "persistent_reference": None,
+            "read_errors": {"feature": _native_error_record(error)},
+        }, None
+    if feature is None:
+        return {
+            "name": None,
+            "type_name": None,
+            "persistent_reference": None,
+            "read_errors": {},
+        }, None
+    name, name_error = _appearance_value(feature, "Name")
+    type_name, type_error = _appearance_value(feature, "GetTypeName2", method=True)
+    reference, reference_error = _appearance_persistent_reference(
+        extension,
+        feature,
+    )
+    if name_error is not None:
+        errors["name"] = name_error
+    if type_error is not None:
+        errors["type_name"] = type_error
+    if reference_error is not None:
+        errors["persistent_reference"] = reference_error
+    return {
+        "name": name,
+        "type_name": type_name,
+        "persistent_reference": reference,
+        "read_errors": errors,
+    }, feature
+
+
+def _appearance_render_material(material, index: int, extension) -> dict:
+    errors = {}
+    linked_display_states, error = _appearance_value(
+        material,
+        "GetLinkedDisplayStates",
+        method=True,
+    )
+    if error is not None:
+        errors["linked_display_states"] = error
+    try:
+        raw_entities = _method(material, "GetEntities")
+    except Exception as error:  # noqa: BLE001 - retain entity read failure
+        raw_entities = None
+        entities = None
+        entity_objects = []
+        entities_state = "error"
+        errors["entities"] = _native_error_record(error)
+    else:
+        entities = _json_raw_value(raw_entities)
+        entity_objects = _as_list(raw_entities)
+        entities_state = (
+            "null_result"
+            if raw_entities is None
+            else "empty"
+            if not entity_objects
+            else "observed"
+        )
+    entity_records = []
+    for entity_index, entity in enumerate(entity_objects):
+        reference, reference_error = _appearance_persistent_reference(
+            extension,
+            entity,
+        )
+        record_errors = {}
+        if reference_error is not None:
+            record_errors["persistent_reference"] = reference_error
+        entity_records.append(
+            {
+                "entity_index": entity_index,
+                "native_object_type": type(entity).__name__,
+                "persistent_reference": reference,
+                "read_errors": record_errors,
+            }
+        )
+    fields = {}
+    for key, name in (
+        ("primary_color", "PrimaryColor"),
+        ("transparency", "Transparency"),
+        ("color_form", "ColorForm"),
+        ("texture_filename", "TextureFilename"),
+        ("surface_finish_file", "SurfaceFinishFile"),
+    ):
+        value, error = _appearance_value(material, name)
+        fields[key] = value
+        if error is not None:
+            errors[key] = error
+    return {
+        "material_index": index,
+        "linked_display_states": linked_display_states,
+        "entities": entities,
+        "entities_state": entities_state,
+        "entity_records": entity_records,
+        "primary_color": fields["primary_color"],
+        "transparency": fields["transparency"],
+        "color_form": fields["color_form"],
+        "texture_filename": fields["texture_filename"],
+        "surface_finish_file": fields["surface_finish_file"],
+        "read_errors": errors,
+    }
+
+
+def _appearance_display_state(holder):
+    try:
+        raw = _member(holder, "ReferencedDisplayState2")
+    except Exception as error:  # noqa: BLE001 - retain a field-local read failure
+        return None, _native_error_record(error)
+    value = _json_raw_value(raw)
+    if not _is_text_name(raw):
+        return value, _appearance_read_error(
+            "cad_appearance_display_state_invalid",
+            "ReferencedDisplayState2 did not return a nonempty string",
+            value,
+        )
+    return value, None
+
+
+def _appearance_document_display_state(document):
+    try:
+        _manager, active = _active_configuration_view(document)
+        if active is None:
+            raise ValueError("the owner document has no active configuration")
+        configuration = str(_member(active, "Name"))
+    except Exception as error:  # noqa: BLE001 - active owner failure
+        return None, None, _native_error_record(error), None, "error"
+    try:
+        raw_states = _method(active, "GetDisplayStates")
+    except Exception as error:  # noqa: BLE001 - display-state field failure
+        return (
+            configuration,
+            None,
+            _native_error_record(error),
+            None,
+            "error",
+        )
+    states_raw = _json_raw_value(raw_states)
+    state_error = None
+    if raw_states is None:
+        states = []
+        states_state = "null_result"
+    elif isinstance(raw_states, (list, tuple)):
+        states = _as_list(raw_states)
+        states_state = "empty" if not states else "observed"
+    else:
+        states = []
+        states_state = "error"
+        state_error = _appearance_read_error(
+            "cad_appearance_display_states_invalid",
+            "GetDisplayStates did not return null or an array",
+            states_raw,
+        )
+    display_state = states[0] if states else None
+    if not _is_text_name(configuration):
+        state_error = _appearance_read_error(
+            "cad_appearance_active_configuration_invalid",
+            "the owner document active configuration is unreadable",
+            _json_raw_value(configuration),
+        )
+    elif state_error is None and not _is_text_name(display_state):
+        state_error = _appearance_read_error(
+            "cad_appearance_display_state_missing",
+            "GetDisplayStates returned no active display-state name",
+            states_raw,
+        )
+    return (
+        configuration,
+        _json_raw_value(display_state),
+        state_error,
+        states_raw,
+        states_state,
+    )
+
+
+def _state_render_materials_raw(
+    document,
+    *,
+    configuration,
+    display_state,
+) -> tuple[dict, dict | None]:
+    """Read one exact document/configuration/display-state owner result."""
+
+    record = {
+        "api": "IModelDocExtension.GetRenderMaterials2",
+        "display_state_option": 3,
+        "display_state": display_state,
+        "native_render_material_count": None,
+        "native_render_material_count_error": None,
+        "call_state": "error",
+        "materials": [],
+        "read_errors": {},
+    }
+    if configuration is not None:
+        record["configuration"] = _json_raw_value(configuration)
+    if document is None:
+        record["read_errors"]["document"] = {
+            "code": "cad_appearance_owner_unavailable",
+            "message": "the apparent owner document is unavailable",
+            "detail": {},
+        }
+        return record, None
+    if not _is_text_name(display_state):
+        record["call_state"] = "state_unavailable"
+        return record, None
+    try:
+        import pythoncom
+
+        extension = _member(document, "Extension")
+        try:
+            native_count = _method(
+                extension,
+                "GetRenderMaterialsCount",
+            )
+        except Exception as error:  # noqa: BLE001 - count stays field-local
+            count_error = _native_error_record(error)
+        else:
+            if type(native_count) is int and native_count >= 0:
+                record["native_render_material_count"] = native_count
+                count_error = None
+            else:
+                count_error = _appearance_read_error(
+                    "cad_appearance_render_material_count_invalid",
+                    "GetRenderMaterialsCount did not return a nonnegative integer",
+                    _json_raw_value(native_count),
+                )
+        if count_error is not None:
+            record["native_render_material_count_error"] = count_error
+            record["read_errors"]["native_render_material_count"] = copy.deepcopy(
+                count_error
+            )
+        display_state_names = _win32().VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_BSTR,
+            (display_state,),
+        )
+        raw_materials = _member(
+            extension,
+            "GetRenderMaterials2",
+            3,
+            display_state_names,
+        )
+    except Exception as error:  # noqa: BLE001 - appearance remains field-local
+        record["read_errors"]["materials"] = _native_error_record(error)
+        return record, None
+    materials = _as_list(raw_materials)
+    if raw_materials is None:
+        record["call_state"] = "null_result"
+        record["materials"] = None
+    elif not materials:
+        record["call_state"] = "empty"
+    else:
+        record["call_state"] = "observed"
+        record["materials"] = [
+            _appearance_render_material(material, index, extension)
+            for index, material in enumerate(materials)
+        ]
+    return record, extension
+
+
 def _appearance_texture_raw(owner, configuration, read_errors):
     """Read one documented texture pointer without making it a primary gate."""
 
@@ -927,6 +1247,9 @@ def _appearance_texture_raw(owner, configuration, read_errors):
     }
 
 
+_DEFAULT_APPEARANCE_OWNER = object()
+
+
 def _appearance_raw(
     owner,
     *,
@@ -935,26 +1258,47 @@ def _appearance_raw(
     material_args=(),
     material_context: dict,
     used_api: str,
+    presence_owner=_DEFAULT_APPEARANCE_OWNER,
+    presence_api: str | None = None,
+    texture_owner=_DEFAULT_APPEARANCE_OWNER,
 ):
     """Record one exact appearance owner without coercing absence or failure."""
 
+    presence_owner = (
+        owner
+        if presence_owner is _DEFAULT_APPEARANCE_OWNER
+        else presence_owner
+    )
+    texture_owner = (
+        owner
+        if texture_owner is _DEFAULT_APPEARANCE_OWNER
+        else texture_owner
+    )
+    same_owner_presence = presence_owner is owner
     read_errors = {}
+    material_read_failed = False
     try:
         material_values = _json_raw_value(
             _member(owner, material_member, *material_args)
         )
     except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
+        material_read_failed = True
         material_values = None
         read_errors["material_property_values"] = _native_error_record(error)
     else:
-        if not _appearance_values_are_valid(material_values):
+        if material_values is not None and not _appearance_values_are_valid(material_values):
             read_errors["material_property_values"] = _appearance_read_error(
                 "cad_appearance_values_invalid",
                 f"{material_member} did not return nine finite numeric values",
                 material_values,
             )
     try:
-        raw_has_values = _method(owner, "HasMaterialPropertyValues")
+        if presence_owner is None:
+            raise AttributeError("the diagnostic appearance owner is unavailable")
+        raw_has_values = _method(
+            presence_owner,
+            "HasMaterialPropertyValues",
+        )
     except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
         has_values = None
         read_errors["has_material_property_values"] = _native_error_record(error)
@@ -966,14 +1310,30 @@ def _appearance_raw(
                 "HasMaterialPropertyValues did not return bool",
                 _json_raw_value(raw_has_values),
             )
+    if (
+        material_values is None
+        and not material_read_failed
+        and same_owner_presence
+        and has_values is True
+    ):
+        read_errors["material_property_values"] = _appearance_read_error(
+            "cad_appearance_values_unresolved",
+            f"{material_member} returned null while the same owner reports material property values",
+            None,
+        )
     return {
         "used_api": used_api,
         "material_call": material_context,
-        "presence_call": {"arguments": [], "configuration_semantics": "native_owner_context"},
+        "presence_call": {
+            "arguments": [],
+            "configuration_semantics": "native_owner_context",
+            "same_owner": same_owner_presence,
+            **({"owner_api": presence_api} if presence_api else {}),
+        },
         "material_property_values": material_values,
         "has_material_property_values": has_values,
         "texture": _appearance_texture_raw(
-            owner,
+            texture_owner,
             configuration,
             read_errors,
         ),
@@ -4425,6 +4785,362 @@ class SolidWorksBackend(CadBackend):
     def _body_count(self, holder, body_type, component):
         return len(self._body_list(holder, body_type, component))
 
+    def _appearance_owner_rows(
+        self,
+        component,
+        holder,
+        current,
+        leaf_document,
+        leaf_display_state,
+        leaf_display_state_error,
+    ):
+        """Relevant top, ancestor, and leaf document owners for one occurrence."""
+
+        rows = []
+        try:
+            top_document = self._captured_document(
+                self._scene_document_key,
+                component=component,
+                phase="appearance_owner",
+            )
+        except Exception as error:  # noqa: BLE001 - retained owner failure
+            rows.append(
+                {
+                    "owner_scope": "top_assembly",
+                    "document": None,
+                    "document_path": None,
+                    "configuration": None,
+                    "display_state": None,
+                    "display_state_error": _native_error_record(error),
+                    "display_states": None,
+                    "display_states_state": "error",
+                    "owner_error": None,
+                }
+            )
+        else:
+            (
+                top_configuration,
+                top_state,
+                top_state_error,
+                top_display_states,
+                top_display_states_state,
+            ) = (
+                _appearance_document_display_state(top_document)
+            )
+            top_path_error = None
+            try:
+                top_path = _member(top_document, "GetPathName")
+            except Exception as error:  # noqa: BLE001 - path stays field-local
+                top_path = None
+                top_path_error = _native_error_record(error)
+            rows.append(
+                {
+                    "owner_scope": "top_assembly",
+                    "document": top_document,
+                    "document_path": top_path,
+                    "configuration": top_configuration,
+                    "display_state": top_state,
+                    "display_state_error": top_state_error,
+                    "display_states": top_display_states,
+                    "display_states_state": top_display_states_state,
+                    "owner_error": top_path_error,
+                }
+            )
+
+        ancestors = []
+        parts = component.split("/")
+        for end in range(1, len(parts)):
+            name = "/".join(parts[:end])
+            ancestor = current.get(name)
+            if ancestor is None:
+                continue
+            ancestors.append(name)
+            try:
+                ancestor_document = _component_document(ancestor)
+                configuration = _member(
+                    ancestor,
+                    "ReferencedConfiguration",
+                )
+                display_state, state_error = _appearance_display_state(
+                    ancestor
+                )
+            except Exception as error:  # noqa: BLE001 - owner stays field-local
+                rows.append(
+                    {
+                        "owner_scope": "parent_assembly",
+                        "document": None,
+                        "document_path": None,
+                        "configuration": None,
+                        "display_state": None,
+                        "display_state_error": _native_error_record(error),
+                        "display_states": None,
+                        "display_states_state": "not_applicable",
+                        "owner_error": None,
+                    }
+                )
+                continue
+            path_error = None
+            try:
+                document_path = _member(
+                    ancestor_document,
+                    "GetPathName",
+                )
+            except Exception as error:  # noqa: BLE001 - path stays field-local
+                document_path = None
+                path_error = _native_error_record(error)
+            rows.append(
+                {
+                    "owner_scope": "parent_assembly",
+                    "document": ancestor_document,
+                    "document_path": document_path,
+                    "configuration": configuration,
+                    "display_state": display_state,
+                    "display_state_error": state_error,
+                    "display_states": None,
+                    "display_states_state": "not_applicable",
+                    "owner_error": path_error,
+                }
+            )
+
+        try:
+            leaf_path = _member(leaf_document, "GetPathName")
+            leaf_path_error = None
+        except Exception as error:  # noqa: BLE001 - path stays field-local
+            leaf_path = None
+            leaf_path_error = _native_error_record(error)
+        rows.append(
+            {
+                "owner_scope": "component_document",
+                "document": leaf_document,
+                "document_path": leaf_path,
+                "configuration": None,
+                "display_state": leaf_display_state,
+                "display_state_error": leaf_display_state_error,
+                "display_states": None,
+                "display_states_state": "not_applicable",
+                "owner_error": leaf_path_error,
+            }
+        )
+        return rows, ancestors
+
+    @staticmethod
+    def _appearance_identity_maps(
+        extension,
+        holders,
+        bodies,
+        faces,
+        features,
+    ):
+        """Build exact persistent-reference maps for one occurrence context."""
+
+        maps = {
+            "occurrences": {},
+            "bodies": {},
+            "faces": {},
+            "features": {},
+        }
+        mapping_errors = []
+
+        def add(kind, entity, identity):
+            reference, error = _appearance_persistent_reference(
+                extension,
+                entity,
+            )
+            if error is not None:
+                mapping_errors.append(
+                    {
+                        "entity_kind": kind,
+                        "identity": copy.deepcopy(identity),
+                        "error": copy.deepcopy(error),
+                    }
+                )
+                return
+            key = _appearance_reference_key(reference)
+            if key is not None:
+                maps[kind].setdefault(key, []).append(identity)
+
+        for name, component in holders:
+            add("occurrences", component, {"component": name})
+        for row in bodies:
+            add(
+                "bodies",
+                row["body"],
+                {
+                    "component": row["component"],
+                    "body_type": row["body_type"],
+                    "body_index": row["body_index"],
+                },
+            )
+        for row in faces:
+            add(
+                "faces",
+                row["face"],
+                {
+                    "component": row["component"],
+                    "body_type": row["body_type"],
+                    "body_index": row["body_index"],
+                    "face_index": row["face_index"],
+                },
+            )
+        for row in features:
+            add(
+                "features",
+                row["feature"],
+                {
+                    "component": row["component"],
+                    "body_type": row["body_type"],
+                    "body_index": row["body_index"],
+                    "face_index": row["face_index"],
+                    "name": row["identity"]["name"],
+                    "type_name": row["identity"]["type_name"],
+                    "persistent_reference": row["identity"][
+                        "persistent_reference"
+                    ],
+                },
+            )
+        return maps, mapping_errors
+
+    def _capture_state_render_materials(
+        self,
+        *,
+        component,
+        holder,
+        current,
+        leaf_document,
+        source_configuration,
+        leaf_display_state,
+        leaf_display_state_error,
+        bodies,
+        faces,
+        features,
+        cache,
+    ):
+        owner_rows, ancestors = self._appearance_owner_rows(
+            component,
+            holder,
+            current,
+            leaf_document,
+            leaf_display_state,
+            leaf_display_state_error,
+        )
+        holder_rows = [(component, holder)]
+        holder_rows.extend(
+            (name, current[name])
+            for name in ancestors
+            if name in current
+        )
+        records = []
+        for owner in owner_rows:
+            try:
+                document = owner["document"]
+                configuration = owner["configuration"]
+                display_state = owner["display_state"]
+                state_error = owner["display_state_error"]
+                owner_error = owner["owner_error"]
+                owner_configuration = (
+                    configuration
+                    if owner["owner_scope"] != "component_document"
+                    else source_configuration
+                )
+                record = {
+                    "owner_document_path": owner["document_path"],
+                    "owner_scope": owner["owner_scope"],
+                    "api": "IModelDocExtension.GetRenderMaterials2",
+                    "display_state_option": 3,
+                    "native_render_material_count": None,
+                    "native_render_material_count_error": None,
+                    "configuration": _json_raw_value(owner_configuration),
+                    "display_state": display_state,
+                    "display_states": copy.deepcopy(
+                        owner["display_states"]
+                    ),
+                    "display_states_state": owner["display_states_state"],
+                    "call_state": "error",
+                    "materials": [],
+                    "mapping_errors": [],
+                    "read_errors": {},
+                }
+                if owner_error is not None:
+                    record["call_state"] = "error"
+                    record["read_errors"]["owner"] = copy.deepcopy(
+                        owner_error
+                    )
+                    records.append(record)
+                    continue
+                if state_error is not None:
+                    record["call_state"] = "state_unavailable"
+                    record["read_errors"]["display_state"] = copy.deepcopy(
+                        state_error
+                    )
+                    records.append(record)
+                    continue
+                key = (
+                    normalize_document_path(owner["document_path"]),
+                    str(owner_configuration),
+                    str(display_state),
+                )
+                if key not in cache:
+                    cache[key] = _state_render_materials_raw(
+                        document,
+                        configuration=owner_configuration,
+                        display_state=display_state,
+                    )
+                raw_record, extension = cache[key]
+                record.update(copy.deepcopy(raw_record))
+                if (
+                    record["call_state"] == "observed"
+                    and extension is not None
+                ):
+                    maps, mapping_errors = self._appearance_identity_maps(
+                        extension,
+                        holder_rows,
+                        bodies,
+                        faces,
+                        features,
+                    )
+                    record["mapping_errors"] = mapping_errors
+                    for material in record["materials"]:
+                        for entity in material["entity_records"]:
+                            entity["matched_identity"] = {
+                                kind: copy.deepcopy(
+                                    values.get(
+                                        _appearance_reference_key(
+                                            entity["persistent_reference"]
+                                        ),
+                                        [],
+                                    )
+                                )
+                                for kind, values in maps.items()
+                            }
+                records.append(record)
+            except Exception as error:  # noqa: BLE001 - owner-local failure
+                records.append(
+                    {
+                        "owner_document_path": owner.get("document_path"),
+                        "owner_scope": owner.get("owner_scope", "unresolved"),
+                        "api": "IModelDocExtension.GetRenderMaterials2",
+                        "display_state_option": 3,
+                        "native_render_material_count": None,
+                        "native_render_material_count_error": None,
+                        "configuration": _json_raw_value(
+                            owner.get("configuration")
+                        ),
+                        "display_state": owner.get("display_state"),
+                        "display_states": copy.deepcopy(
+                            owner.get("display_states")
+                        ),
+                        "display_states_state": owner.get(
+                            "display_states_state"
+                        ),
+                        "call_state": "error",
+                        "materials": [],
+                        "mapping_errors": [],
+                        "read_errors": {
+                            "owner": _native_error_record(error),
+                        },
+                    }
+                )
+        return records
 
     def capture_prepared_geometry(self, source_scopes, on_activity=None):
         """Capture direct raw triangles for every occurrence in memory.
@@ -4455,6 +5171,7 @@ class SolidWorksBackend(CadBackend):
             )
         with self._current_components("geometry") as current:
             entries = {}
+            render_material_cache = {}
             total = len(self._components)
             for index, component in enumerate(sorted(self._components), start=1):
                 note(
@@ -4468,6 +5185,8 @@ class SolidWorksBackend(CadBackend):
                         component,
                         current[component],
                         source_scopes[component],
+                        current=current,
+                        render_material_cache=render_material_cache,
                     )
                 except Exception as error:  # noqa: BLE001 - continue the remaining objects
                     detail = getattr(error, "detail", None)
@@ -4508,7 +5227,15 @@ class SolidWorksBackend(CadBackend):
             note("geometry_facts", completed=total, total=total, force=True)
             return entries
 
-    def _capture_component_geometry(self, component, holder, source_scope):
+    def _capture_component_geometry(
+        self,
+        component,
+        holder,
+        source_scope,
+        *,
+        current,
+        render_material_cache,
+    ):
         """Read direct face display triangles without writing or deriving."""
 
         if not isinstance(source_scope, dict):
@@ -4520,6 +5247,9 @@ class SolidWorksBackend(CadBackend):
         values: list[float] = []
         spans: list[dict[str, object]] = []
         body_inventory: list[dict[str, object]] = []
+        body_entities: list[dict[str, object]] = []
+        face_entities: list[dict[str, object]] = []
+        feature_entities: list[dict[str, object]] = []
         empty_faces: list[dict[str, object]] = []
         errors: list[dict[str, object]] = []
         body_counts = {"solid": 0, "sheet": 0}
@@ -4536,6 +5266,7 @@ class SolidWorksBackend(CadBackend):
             "configuration_names": [configuration],
         }
         document = None
+        document_extension = None
         document_error = None
         try:
             document_key = self._source_components[component][0]
@@ -4561,35 +5292,58 @@ class SolidWorksBackend(CadBackend):
                         _json_raw_value(native_active_configuration),
                     )
         document_api = (
-            "IModelDocExtension.GetMaterialPropertyValues(swSpecifyConfiguration)"
+            "IModelDoc2.MaterialPropertyValues"
             "/IModelDocExtension.HasMaterialPropertyValues"
             "/IModelDocExtension.GetTexture/ITexture.MaterialName"
         )
         if document is None:
             document_appearance = _unavailable_appearance_raw(
-                configuration=configuration,
-                material_context=requested_context,
+                configuration=native_active_configuration,
+                material_context={
+                    "configuration_semantics": "active_configuration",
+                    "active_configuration": native_active_configuration,
+                },
                 used_api=document_api,
                 error=document_error,
             )
         else:
+            extension_error = None
             try:
                 document_extension = _member(document, "Extension")
+            except Exception as error:  # noqa: BLE001 - diagnostic owner only
+                extension_error = _native_error_record(error)
+            try:
                 document_appearance = _appearance_raw(
-                    document_extension,
-                    configuration=configuration,
-                    material_member="GetMaterialPropertyValues",
-                    material_args=(3, (configuration,)),
-                    material_context=requested_context,
+                    document,
+                    configuration=native_active_configuration,
+                    material_member="MaterialPropertyValues",
+                    material_context={
+                        "configuration_semantics": "active_configuration",
+                        "active_configuration": native_active_configuration,
+                    },
                     used_api=document_api,
+                    presence_owner=document_extension,
+                    presence_api="IModelDocExtension.HasMaterialPropertyValues",
+                    texture_owner=document_extension,
                 )
             except Exception as error:  # noqa: BLE001 - appearance is auxiliary
                 document_appearance = _unavailable_appearance_raw(
-                    configuration=configuration,
-                    material_context=requested_context,
+                    configuration=native_active_configuration,
+                    material_context={
+                        "configuration_semantics": "active_configuration",
+                        "active_configuration": native_active_configuration,
+                    },
                     used_api=document_api,
                     error=_native_error_record(error),
                 )
+            else:
+                if extension_error is not None:
+                    document_appearance["read_errors"][
+                        "has_material_property_values"
+                    ] = copy.deepcopy(extension_error)
+                    document_appearance["read_errors"]["texture"] = (
+                        copy.deepcopy(extension_error)
+                    )
         occurrence_api = (
             "IComponent2.GetMaterialPropertyValues2(swSpecifyConfiguration)"
             "/IComponent2.HasMaterialPropertyValues"
@@ -4611,15 +5365,21 @@ class SolidWorksBackend(CadBackend):
                 used_api=occurrence_api,
                 error=_native_error_record(error),
             )
+        native_referenced_display_state, display_state_error = (
+            _appearance_display_state(holder)
+        )
         appearance_raw = {
             "component": component,
             "source_document_path": source_scope.get("source_document_path"),
             "referenced_configuration": configuration,
             "native_active_configuration": native_active_configuration,
             "native_active_configuration_error": native_active_configuration_error,
+            "native_referenced_display_state": native_referenced_display_state,
+            "native_referenced_display_state_error": display_state_error,
             "document": document_appearance,
             "occurrence": occurrence_appearance,
             "bodies": [],
+            "state_render_materials": [],
         }
         for body_type, kind in ((0, "solid"), (1, "sheet")):
             try:
@@ -4671,38 +5431,24 @@ class SolidWorksBackend(CadBackend):
                     self.notes[
                         f"body_name_read_error:{component}:{body_type}/{body_index}"
                     ] = copy.deepcopy(body_name_error)
-                body_context = {
-                    "configuration_semantics": "active_configuration",
-                    "active_configuration": native_active_configuration,
+                # IBody2.MaterialPropertyValues2 is the related-body owner path
+                # through IPartDoc.EnumRelatedBodies2; GetBodies2 here remains
+                # the geometry traversal and cannot be relabeled as that owner.
+                body_appearance_record = {
+                    "component": component,
+                    "enumeration_api": "IComponent2.GetBodies2",
+                    "body_type": body_type,
+                    "body_index": body_index,
+                    "body_name": body_name,
+                    "faces": [],
                 }
-                body_api = (
-                    "IBody2.MaterialPropertyValues2"
-                    "/IBody2.HasMaterialPropertyValues"
-                    "/IBody2.GetTexture/ITexture.MaterialName"
-                )
-                try:
-                    body_appearance = _appearance_raw(
-                        body,
-                        configuration=configuration,
-                        material_member="MaterialPropertyValues2",
-                        material_context=body_context,
-                        used_api=body_api,
-                    )
-                except Exception as error:  # noqa: BLE001 - appearance is auxiliary
-                    body_appearance = _unavailable_appearance_raw(
-                        configuration=configuration,
-                        material_context=body_context,
-                        used_api=body_api,
-                        error=_native_error_record(error),
-                    )
-                appearance_raw["bodies"].append(
+                appearance_raw["bodies"].append(body_appearance_record)
+                body_entities.append(
                     {
                         "component": component,
-                        "enumeration_api": "IComponent2.GetBodies2",
                         "body_type": body_type,
                         "body_index": body_index,
-                        "body_name": body_name,
-                        "appearance": body_appearance,
+                        "body": body,
                     }
                 )
                 try:
@@ -4731,6 +5477,107 @@ class SolidWorksBackend(CadBackend):
                     triangle_start = len(values) // 9
                     try:
                         face = _interface(_dynamic(raw_face), IFACE2_IID)
+                    except Exception as error:  # noqa: BLE001
+                        errors.append(
+                            {
+                                "body_type": body_type,
+                                "body_index": body_index,
+                                "body_name": body_name,
+                                "face_index": face_index,
+                                "api": "IFace2 binding",
+                                "error": (
+                                    f"{type(error).__name__}: {error}"
+                                )[:300],
+                            }
+                        )
+                        continue
+                    face_api = (
+                        "IFace2.MaterialPropertyValues"
+                        "/IFace2.HasMaterialPropertyValues"
+                        "/IFace2.GetTexture/ITexture.MaterialName"
+                    )
+                    try:
+                        if native_active_configuration != configuration:
+                            raise CadError(
+                                "cad_appearance_active_configuration_mismatch",
+                                "the face active configuration differs from the occurrence referenced configuration",
+                                {
+                                    "component": component,
+                                    "referenced_configuration": configuration,
+                                    "native_active_configuration": native_active_configuration,
+                                },
+                            )
+                        face_appearance = _appearance_raw(
+                            face,
+                            configuration=native_active_configuration,
+                            material_member="MaterialPropertyValues",
+                            material_context={
+                                "configuration_semantics": "active_configuration",
+                                "active_configuration": native_active_configuration,
+                            },
+                            used_api=face_api,
+                        )
+                    except Exception as error:  # noqa: BLE001 - appearance is auxiliary
+                        face_appearance = _unavailable_appearance_raw(
+                            configuration=native_active_configuration,
+                            material_context={
+                                "configuration_semantics": "active_configuration",
+                                "active_configuration": native_active_configuration,
+                            },
+                            used_api=face_api,
+                            error=_native_error_record(error),
+                        )
+                    feature_identity, feature = _appearance_feature_identity(
+                        face,
+                        document_extension,
+                    )
+                    face_reference, face_reference_error = (
+                        _appearance_persistent_reference(
+                            document_extension,
+                            face,
+                        )
+                    )
+                    native_identity_errors = {}
+                    if face_reference_error is not None:
+                        native_identity_errors[
+                            "persistent_reference"
+                        ] = face_reference_error
+                    face_appearance["native_identity"] = {
+                        "owner_document_path": source_scope.get(
+                            "source_document_path"
+                        ),
+                        "owner_scope": "component_document",
+                        "persistent_reference": face_reference,
+                        "feature": feature_identity,
+                        "read_errors": native_identity_errors,
+                    }
+                    face_entities.append(
+                        {
+                            "component": component,
+                            "body_type": body_type,
+                            "body_index": body_index,
+                            "face_index": face_index,
+                            "face": face,
+                        }
+                    )
+                    if feature is not None:
+                        feature_entities.append(
+                            {
+                                "component": component,
+                                "body_type": body_type,
+                                "body_index": body_index,
+                                "face_index": face_index,
+                                "feature": feature,
+                                "identity": feature_identity,
+                            }
+                        )
+                    body_appearance_record["faces"].append(
+                        {
+                            "face_index": face_index,
+                            "appearance": face_appearance,
+                        }
+                    )
+                    try:
                         raw_values = _member(
                             face,
                             "GetTessTriangles",
@@ -4779,6 +5626,41 @@ class SolidWorksBackend(CadBackend):
                         }
                     )
 
+        try:
+            appearance_raw["state_render_materials"] = (
+                self._capture_state_render_materials(
+                    component=component,
+                    holder=holder,
+                    current=current,
+                    leaf_document=document,
+                    source_configuration=configuration,
+                    leaf_display_state=native_referenced_display_state,
+                    leaf_display_state_error=display_state_error,
+                    bodies=body_entities,
+                    faces=face_entities,
+                    features=feature_entities,
+                    cache=render_material_cache,
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - appearance is auxiliary
+            appearance_raw["state_render_materials"].append(
+                {
+                    "owner_document_path": None,
+                    "owner_scope": "unresolved",
+                    "api": "IModelDocExtension.GetRenderMaterials2",
+                    "display_state_option": 3,
+                    "native_render_material_count": None,
+                    "native_render_material_count_error": None,
+                    "configuration": None,
+                    "display_state": native_referenced_display_state,
+                    "call_state": "error",
+                    "materials": [],
+                    "mapping_errors": [],
+                    "read_errors": {
+                        "owner_resolution": _native_error_record(error),
+                    },
+                }
+            )
         state = (
             "observed"
             if not errors and not empty_faces and values

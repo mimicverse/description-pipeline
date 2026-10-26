@@ -367,7 +367,27 @@ class FreezeTests(unittest.TestCase):
                 "has_material_property_values": False,
                 "read_errors": {},
             },
-            "bodies": [],
+            "bodies": [
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "faces": [
+                        {
+                            "face_index": 0,
+                            "appearance": {
+                                "material_property_values": None,
+                                "has_material_property_values": False,
+                                "texture": {
+                                    "configuration": "Default",
+                                    "state": "absent",
+                                    "material_name": None,
+                                },
+                                "read_errors": {},
+                            },
+                        }
+                    ],
+                }
+            ],
         }
         capture_geometry = self.backend.capture_prepared_geometry
 

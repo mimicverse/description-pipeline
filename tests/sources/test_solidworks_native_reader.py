@@ -26,20 +26,23 @@ from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import description_pipeline.sources.solidworks.native as native_module
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError
 from description_pipeline.sources.solidworks.isolation import CadSession
 from description_pipeline.sources.solidworks.jsonio import read_json, write_json
 from description_pipeline.sources.solidworks.native import (
     SolidWorksBackend,
+    _appearance_display_state,
+    _appearance_document_display_state,
+    _appearance_persistent_reference,
+    _appearance_render_material,
     _project_mass_reading,
     _project_link_group_mass,
     _raw_mass_fact,
     _temporary_configuration,
 )
-import description_pipeline.sources.solidworks.native as native_module
-
 #: SolidWorks ``MathTransform.ArrayData`` order for an identity occurrence.
 SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
 PLANE_XY = {"normal": [0.0, 0.0, 1.0], "point": [0.0, 0.0, 0.0]}
@@ -402,12 +405,17 @@ class _ConfigurationManager:
             GetPathName=lambda: self._doc._path,
             GetChildren=lambda: list(self._doc.children_for(name)),
         )
-        return types.SimpleNamespace(
+        configuration = types.SimpleNamespace(
             Name=name,
             NeedsRebuild=False,
             AddRebuildSaveMark=False,
             GetRootComponent3=lambda _visible: root,
         )
+        if self._doc._display_states is not None:
+            configuration.GetDisplayStates = lambda: list(
+                self._doc._display_states
+            )
+        return configuration
 
     @property
     def ActiveConfiguration(self):
@@ -436,6 +444,7 @@ class _Doc:
         show_effect=True,
         custom_property_manager=_AUTO,
         scope_managers=None,
+        display_states=None,
     ):
         self._path = str(path)
         self._children = list(children)
@@ -445,6 +454,9 @@ class _Doc:
         self.active_configuration = configuration
         self._show_success = show_success
         self._show_effect = show_effect
+        self._display_states = (
+            list(display_states) if display_states is not None else None
+        )
         scopes = {"": dict(properties or {})}
         for name, values in (configuration_properties or {}).items():
             scopes[name] = dict(values)
@@ -2314,27 +2326,30 @@ class CaptureSceneTests(unittest.TestCase):
 
 
 class AppearanceRawTests(unittest.TestCase):
-    def test_capture_records_document_occurrence_and_body_appearance_raw(self) -> None:
-        document_calls = []
+    def test_capture_records_document_occurrence_body_and_face_appearance_raw(self) -> None:
         occurrence_calls = []
+        body_type_calls = []
+        face_enumeration_calls = []
+        body_appearance_calls = []
+        part_render_material_calls = []
+        top_render_material_calls = []
         texture_calls = []
         document_values = [0.1, 0.2, 0.3, 0.2, 0.4, 0.5, 0.6, 0.0, 0.0]
         occurrence_values = [-1.0] * 9
-        body_values = [0.7, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0, 0.0]
+        face_values = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 
         with TemporaryDirectory() as tmp, _com_stubs():
             fixture_root = Path(tmp)
             part = _write(fixture_root, "arm.SLDPRT")
             part_document = _Doc(
                 part,
-                configuration="Parked",
-                configuration_children={"Painted": [], "Parked": []},
+                configuration="Painted",
+                configuration_children={"Painted": []},
             )
             document_texture = types.SimpleNamespace(MaterialName="C:\\textures\\paint.jpg")
-            body_texture = types.SimpleNamespace(MaterialName="C:\\textures\\brushed.jpg")
-            part_document.Extension.GetMaterialPropertyValues = (
-                lambda option, names: document_calls.append((option, names))
-                or list(document_values)
+            part_document.MaterialPropertyValues = list(document_values)
+            part_document.Extension.GetMaterialPropertyValues = _raiser(
+                AssertionError("document material must use IModelDoc2 property")
             )
             part_document.Extension.HasMaterialPropertyValues = lambda: True
             part_document.Extension.GetTexture = (
@@ -2348,22 +2363,88 @@ class AppearanceRawTests(unittest.TestCase):
                 lambda _quality: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
                 "appearance",
             )
-            body = _mesh_body([face], "appearance")
-            body.MaterialPropertyValues2 = list(body_values)
-            body.HasMaterialPropertyValues = lambda: True
-            body.GetTexture = (
-                lambda configuration: texture_calls.append(
-                    ("body", configuration)
-                )
-                or body_texture
+            face_feature = types.SimpleNamespace(
+                Name="PaintedFace",
+                GetTypeName2=lambda: "Extrusion",
+                _persist_reference=b"feature",
             )
+            face.GetFeature = lambda: face_feature
+            face_texture = types.SimpleNamespace(
+                MaterialName="C:\\textures\\face.jpg"
+            )
+            face.MaterialPropertyValues = list(face_values)
+            face.GetMaterialPropertyValues2 = _raiser(
+                AssertionError(
+                    "face material must use IFace2.MaterialPropertyValues"
+                )
+            )
+            face.HasMaterialPropertyValues = lambda: True
+            face.GetTexture = (
+                lambda configuration: texture_calls.append(
+                    ("face", configuration)
+                )
+                or face_texture
+            )
+            render_material = types.SimpleNamespace(
+                PrimaryColor=0x00AABBCC,
+                Transparency=0.25,
+                ColorForm=1,
+                TextureFilename="",
+                SurfaceFinishFile="C:\\finish.p2m",
+                GetLinkedDisplayStates=lambda: ["FaceState"],
+                GetEntities=lambda: [face],
+            )
+            incomplete_render_material = types.SimpleNamespace(
+                GetLinkedDisplayStates=list,
+                GetEntities=list,
+            )
+            part_document.Extension.GetRenderMaterials2 = (
+                lambda option, names: part_render_material_calls.append(
+                    (option, tuple(names.value), names.varianttype)
+                )
+                or [render_material, incomplete_render_material]
+            )
+            part_document.Extension.GetRenderMaterialsCount = lambda: 2
+            body = _mesh_body([face], "appearance")
+            body_faces = body.GetFaces
+
+            def get_faces():
+                face_enumeration_calls.append(True)
+                return body_faces()
+
+            body.GetFaces = get_faces
+
+            class BodyView:
+                def __init__(self, value):
+                    self._value = value
+
+                def __getattr__(self, name):
+                    if name in {
+                        "MaterialPropertyValues2",
+                        "HasMaterialPropertyValues",
+                        "GetTexture",
+                    }:
+                        body_appearance_calls.append(name)
+                        raise AssertionError(
+                            "IComponent2.GetBodies2 bodies are not the documented "
+                            "IBody2.MaterialPropertyValues2 owner path"
+                        )
+                    return getattr(self._value, name)
+
+            body_view = BodyView(body)
             component = _Component(
                 "arm-1",
                 part,
                 doc=part_document,
                 configuration="Painted",
             )
-            component.GetBodies2 = lambda body_type: [body] if body_type == 0 else []
+            component.ReferencedDisplayState2 = "FaceState"
+
+            def get_bodies(body_type):
+                body_type_calls.append(body_type)
+                return [body_view] if body_type == 0 else []
+
+            component.GetBodies2 = get_bodies
             component.GetMaterialPropertyValues2 = (
                 lambda option, names: occurrence_calls.append((option, names))
                 or list(occurrence_values)
@@ -2376,7 +2457,19 @@ class AppearanceRawTests(unittest.TestCase):
                 or None
             )
             assembly = _write(fixture_root, "robot.SLDASM")
-            main = _Doc(assembly, doc_type=2, children=[component])
+            main = _Doc(
+                assembly,
+                doc_type=2,
+                children=[component],
+                display_states=["TopState"],
+            )
+            main.Extension.GetRenderMaterials2 = (
+                lambda option, names: top_render_material_calls.append(
+                    (option, tuple(names.value))
+                )
+                or []
+            )
+            main.Extension.GetRenderMaterialsCount = lambda: 0
             backend = _CaptureBackend(
                 session_factory=lambda: _Session(_App({assembly: main}))
             )
@@ -2386,15 +2479,14 @@ class AppearanceRawTests(unittest.TestCase):
 
             self.assertEqual(geometry["arm-1"]["state"], "observed")
             self.assertEqual(geometry["arm-1"]["triangles"], 1)
-            self.assertEqual(part_document.active_configuration, "Parked")
-            self.assertEqual(document_calls, [(3, ("Painted",))])
+            self.assertEqual(part_document.active_configuration, "Painted")
             self.assertEqual(occurrence_calls, [(3, ("Painted",))])
             self.assertEqual(
                 texture_calls,
                 [
                     ("document", "Painted"),
                     ("occurrence", "Painted"),
-                    ("body", "Painted"),
+                    ("face", "Painted"),
                 ],
             )
             self.assertEqual(raw["component"], "arm-1")
@@ -2403,13 +2495,35 @@ class AppearanceRawTests(unittest.TestCase):
                 str(part).replace("\\", "/").casefold(),
             )
             self.assertEqual(raw["referenced_configuration"], "Painted")
-            self.assertEqual(raw["native_active_configuration"], "Parked")
+            self.assertEqual(raw["native_active_configuration"], "Painted")
             self.assertIsNone(raw["native_active_configuration_error"])
+            self.assertEqual(
+                raw["document"]["used_api"],
+                "IModelDoc2.MaterialPropertyValues"
+                "/IModelDocExtension.HasMaterialPropertyValues"
+                "/IModelDocExtension.GetTexture/ITexture.MaterialName",
+            )
             self.assertEqual(
                 raw["document"]["material_property_values"],
                 document_values,
             )
+            self.assertEqual(
+                raw["document"]["material_call"],
+                {
+                    "configuration_semantics": "active_configuration",
+                    "active_configuration": "Painted",
+                },
+            )
             self.assertTrue(raw["document"]["has_material_property_values"])
+            self.assertEqual(
+                raw["document"]["presence_call"],
+                {
+                    "arguments": [],
+                    "configuration_semantics": "native_owner_context",
+                    "same_owner": False,
+                    "owner_api": "IModelDocExtension.HasMaterialPropertyValues",
+                },
+            )
             self.assertEqual(
                 raw["document"]["texture"],
                 {
@@ -2423,10 +2537,24 @@ class AppearanceRawTests(unittest.TestCase):
                 occurrence_values,
             )
             self.assertFalse(raw["occurrence"]["has_material_property_values"])
+            self.assertTrue(
+                raw["occurrence"]["presence_call"]["same_owner"]
+            )
             self.assertEqual(raw["occurrence"]["texture"]["state"], "absent")
             self.assertIsNone(raw["occurrence"]["texture"]["material_name"])
             self.assertEqual(len(raw["bodies"]), 1)
             body_raw = raw["bodies"][0]
+            self.assertEqual(
+                set(body_raw),
+                {
+                    "component",
+                    "enumeration_api",
+                    "body_type",
+                    "body_index",
+                    "body_name",
+                    "faces",
+                },
+            )
             self.assertEqual(
                 {
                     "component": body_raw["component"],
@@ -2443,32 +2571,323 @@ class AppearanceRawTests(unittest.TestCase):
                     "body_name": body.Name,
                 },
             )
+            self.assertEqual(body_appearance_calls, [])
+            self.assertEqual(body_type_calls, [0, 1])
+            self.assertEqual(face_enumeration_calls, [True])
             self.assertEqual(
-                body_raw["appearance"]["material_call"],
+                part_render_material_calls,
+                [(3, ("FaceState",), 0x2000 | 8)],
+            )
+            state_materials = {
+                row["owner_scope"]: row
+                for row in raw["state_render_materials"]
+            }
+            self.assertEqual(
+                top_render_material_calls,
+                [(3, ("TopState",))],
+                state_materials,
+            )
+            self.assertEqual(
+                state_materials["top_assembly"]["call_state"],
+                "empty",
+            )
+            self.assertEqual(
+                state_materials["top_assembly"][
+                    "native_render_material_count"
+                ],
+                0,
+            )
+            component_materials = state_materials["component_document"]
+            self.assertEqual(
+                component_materials["call_state"],
+                "observed",
+            )
+            self.assertEqual(
+                component_materials["display_state"],
+                "FaceState",
+            )
+            self.assertEqual(
+                component_materials["native_render_material_count"],
+                2,
+            )
+            material = component_materials["materials"][0]
+            self.assertEqual(material["linked_display_states"], ["FaceState"])
+            self.assertEqual(material["primary_color"], 0x00AABBCC)
+            self.assertEqual(material["transparency"], 0.25)
+            self.assertEqual(material["color_form"], 1)
+            self.assertEqual(material["texture_filename"], "")
+            self.assertEqual(
+                material["surface_finish_file"],
+                "C:\\finish.p2m",
+            )
+            incomplete = component_materials["materials"][1]
+            self.assertEqual(incomplete["entities_state"], "empty")
+            self.assertEqual(
+                incomplete["read_errors"]["primary_color"]["code"],
+                "cad_member_missing",
+            )
+            self.assertEqual(
+                material["entity_records"][0]["matched_identity"]["faces"],
+                [
+                    {
+                        "component": "arm-1",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                    }
+                ],
+            )
+            face_raw = body_raw["faces"]
+            feature_identity = face_raw[0]["appearance"]["native_identity"][
+                "feature"
+            ]
+            self.assertEqual(feature_identity["name"], "PaintedFace")
+            self.assertEqual(feature_identity["type_name"], "Extrusion")
+            self.assertEqual(
+                feature_identity["persistent_reference"],
+                list(b"feature"),
+            )
+            self.assertEqual(len(face_raw), 1)
+            self.assertEqual(set(face_raw[0]), {"face_index", "appearance"})
+            self.assertEqual(face_raw[0]["face_index"], 0)
+            self.assertEqual(
+                face_raw[0]["appearance"]["material_property_values"],
+                face_values,
+            )
+            self.assertEqual(
+                face_raw[0]["appearance"]["material_call"],
                 {
                     "configuration_semantics": "active_configuration",
-                    "active_configuration": "Parked",
+                    "active_configuration": "Painted",
                 },
             )
-            self.assertEqual(
-                body_raw["appearance"]["material_property_values"],
-                body_values,
-            )
-            self.assertTrue(body_raw["appearance"]["has_material_property_values"])
-            self.assertEqual(
-                body_raw["appearance"]["texture"]["material_name"],
-                "C:\\textures\\brushed.jpg",
+            self.assertTrue(
+                face_raw[0]["appearance"]["has_material_property_values"]
             )
             self.assertEqual(
-                body_raw["appearance"]["read_errors"],
-                {},
+                face_raw[0]["appearance"]["texture"]["material_name"],
+                "C:\\textures\\face.jpg",
             )
+            self.assertEqual(face_raw[0]["appearance"]["read_errors"], {})
+
+    def test_null_material_values_follow_same_owner_presence(self) -> None:
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "arm.SLDPRT")
+            part_document = _Doc(part)
+            part_document.MaterialPropertyValues = None
+            part_document.Extension.HasMaterialPropertyValues = lambda: True
+            part_document.Extension.GetTexture = lambda _configuration: None
+
+            face = _mesh_face(
+                lambda _quality: [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                ],
+                "null-appearance",
+            )
+            face.MaterialPropertyValues = None
+            face.HasMaterialPropertyValues = lambda: False
+            face.GetTexture = lambda _configuration: None
+            body = _mesh_body([face], "null-appearance")
+            component = _Component("arm-1", part, doc=part_document)
+            component.GetBodies2 = (
+                lambda body_type: [body] if body_type == 0 else []
+            )
+            component.GetMaterialPropertyValues2 = (
+                lambda _option, _names: None
+            )
+            component.HasMaterialPropertyValues = lambda: True
+            component.GetTexture = lambda _configuration: None
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = _CaptureBackend(
+                session_factory=lambda: _Session(_App({assembly: main}))
+            )
+            backend.capture_scene_for_test(str(assembly), [])
+            raw = backend.capture_geometry_for_test()["arm-1"][
+                "appearance_raw"
+            ]
+
+            self.assertNotIn(
+                "material_property_values",
+                raw["document"]["read_errors"],
+            )
+            self.assertTrue(
+                raw["document"]["has_material_property_values"]
+            )
+            self.assertFalse(
+                raw["document"]["presence_call"]["same_owner"]
+            )
+            self.assertEqual(
+                raw["occurrence"]["read_errors"]["material_property_values"]["code"],
+                "cad_appearance_values_unresolved",
+            )
+            for owner in (
+                raw["bodies"][0]["faces"][0]["appearance"],
+            ):
+                self.assertIsNone(owner["material_property_values"])
+                self.assertFalse(owner["has_material_property_values"])
+                self.assertNotIn(
+                    "material_property_values",
+                    owner["read_errors"],
+                )
+
+    def test_face_appearance_survives_triangle_failure_and_has_error(self) -> None:
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "arm.SLDPRT")
+            part_document = _Doc(part)
+
+            def fail_has():
+                raise RuntimeError("presence read failed")
+
+            part_document.MaterialPropertyValues = None
+            part_document.Extension.HasMaterialPropertyValues = fail_has
+            part_document.Extension.GetTexture = lambda _configuration: None
+
+            face_values = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+            face = _mesh_face(
+                _raiser(RuntimeError("triangle read failed")),
+                "triangle-error",
+            )
+            face.MaterialPropertyValues = list(face_values)
+            face.HasMaterialPropertyValues = lambda: True
+            face.GetTexture = lambda _configuration: types.SimpleNamespace(
+                MaterialName="C:\\textures\\face.jpg"
+            )
+            body = _mesh_body([face], "triangle-error")
+            component = _Component("arm-1", part, doc=part_document)
+            component.GetBodies2 = (
+                lambda body_type: [body] if body_type == 0 else []
+            )
+            component.GetMaterialPropertyValues2 = (
+                lambda _option, _names: None
+            )
+            component.HasMaterialPropertyValues = lambda: False
+            component.GetTexture = lambda _configuration: None
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = _CaptureBackend(
+                session_factory=lambda: _Session(_App({assembly: main}))
+            )
+            backend.capture_scene_for_test(str(assembly), [])
+            geometry = backend.capture_geometry_for_test()["arm-1"]
+            raw = geometry["appearance_raw"]
+
+            self.assertEqual(geometry["state"], "failed")
+            self.assertEqual(geometry["triangles"], 0)
+            self.assertTrue(
+                any(
+                    row["api"] == "IFace2.GetTessTriangles(True)"
+                    for row in geometry["errors"]
+                )
+            )
+            self.assertTrue(
+                all(
+                    "appearance" not in row["api"].casefold()
+                    for row in geometry["errors"]
+                )
+            )
+            document = raw["document"]
+            self.assertIsNone(document["material_property_values"])
+            self.assertIsNone(document["has_material_property_values"])
+            self.assertIn(
+                "has_material_property_values",
+                document["read_errors"],
+            )
+            self.assertNotIn(
+                "material_property_values",
+                document["read_errors"],
+            )
+            face_appearance = raw["bodies"][0]["faces"][0]["appearance"]
+            self.assertEqual(
+                face_appearance["material_property_values"],
+                face_values,
+            )
+            self.assertTrue(
+                face_appearance["has_material_property_values"]
+            )
+            self.assertEqual(
+                face_appearance["texture"]["material_name"],
+                "C:\\textures\\face.jpg",
+            )
+            self.assertEqual(face_appearance["read_errors"], {})
+
+    def test_document_material_survives_extension_owner_failure(self) -> None:
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part = _write(root, "arm.SLDPRT")
+            document_values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.0, 0.0]
+            part_document = _Doc(part)
+            part_document.MaterialPropertyValues = list(document_values)
+            face = _mesh_face(
+                lambda _quality: [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                ],
+                "extension-failure",
+            )
+            face.MaterialPropertyValues = None
+            face.HasMaterialPropertyValues = lambda: False
+            face.GetTexture = lambda _configuration: None
+            body = _mesh_body([face], "extension-failure")
+            component = _Component("arm-1", part, doc=part_document)
+            component.GetBodies2 = (
+                lambda body_type: [body] if body_type == 0 else []
+            )
+            component.GetMaterialPropertyValues2 = (
+                lambda _option, _names: None
+            )
+            component.HasMaterialPropertyValues = lambda: False
+            component.GetTexture = lambda _configuration: None
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = _CaptureBackend(
+                session_factory=lambda: _Session(_App({assembly: main}))
+            )
+            backend.capture_scene_for_test(str(assembly), [])
+            part_document.Extension = None
+            geometry = backend.capture_geometry_for_test()["arm-1"]
+            document = geometry["appearance_raw"]["document"]
+
+            self.assertEqual(geometry["state"], "observed")
+            self.assertEqual(
+                document["material_property_values"],
+                document_values,
+            )
+            self.assertFalse(document["presence_call"]["same_owner"])
+            self.assertIn(
+                "has_material_property_values",
+                document["read_errors"],
+            )
+            self.assertIn("texture", document["read_errors"])
 
     def test_appearance_failures_do_not_block_native_triangle_capture(self) -> None:
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
             part = _write(root, "arm.SLDPRT")
-            part_document = _Doc(part)
+
+            class FailingAppearanceDoc(_Doc):
+                @property
+                def MaterialPropertyValues(self):
+                    raise RuntimeError("material property read failed")
+
+            part_document = FailingAppearanceDoc(part)
 
             def fail_values(*_args):
                 raise RuntimeError("material property read failed")
@@ -2476,24 +2895,47 @@ class AppearanceRawTests(unittest.TestCase):
             def fail_texture(_configuration):
                 raise RuntimeError("texture read failed")
 
-            part_document.Extension.GetMaterialPropertyValues = fail_values
             part_document.Extension.HasMaterialPropertyValues = lambda: "true"
             part_document.Extension.GetTexture = fail_texture
-            face = _mesh_face(
+            part_document.Extension.GetRenderMaterials2 = _raiser(
+                RuntimeError("render material read failed")
+            )
+            part_document.Extension.GetRenderMaterialsCount = _raiser(
+                RuntimeError("render material count failed")
+            )
+            face_base = _mesh_face(
                 lambda _quality: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
                 "appearance-errors",
             )
+
+            class FailingFace(types.SimpleNamespace):
+                @property
+                def MaterialPropertyValues(self):
+                    return fail_values()
+
+            face = FailingFace(**vars(face_base))
+            face.HasMaterialPropertyValues = lambda: False
+            face.GetTexture = fail_texture
             body = _mesh_body([face], "appearance-errors")
-            body.MaterialPropertyValues2 = [0.0] * 8
-            body.HasMaterialPropertyValues = lambda: 1
-            body.GetTexture = fail_texture
             component = _Component("arm-1", part, doc=part_document)
             component.GetBodies2 = lambda body_type: [body] if body_type == 0 else []
-            component.GetMaterialPropertyValues2 = fail_values
-            component.HasMaterialPropertyValues = lambda: None
+            component.GetMaterialPropertyValues2 = (
+                lambda _option, _names: [0.0] * 8
+            )
+            component.HasMaterialPropertyValues = lambda: False
             component.GetTexture = fail_texture
+            component.ReferencedDisplayState2 = "ErrorState"
             assembly = _write(root, "robot.SLDASM")
-            main = _Doc(assembly, doc_type=2, children=[component])
+            main = _Doc(
+                assembly,
+                doc_type=2,
+                children=[component],
+                display_states=["TopNullState"],
+            )
+            main.Extension.GetRenderMaterials2 = (
+                lambda _option, _names: None
+            )
+            main.Extension.GetRenderMaterialsCount = lambda: 0
             backend = _CaptureBackend(
                 session_factory=lambda: _Session(_App({assembly: main}))
             )
@@ -2504,32 +2946,644 @@ class AppearanceRawTests(unittest.TestCase):
             self.assertEqual(scene.components[0].name, "arm-1")
             self.assertEqual(geometry["arm-1"]["state"], "observed")
             self.assertEqual(geometry["arm-1"]["triangles"], 1)
-            for layer in (raw["document"], raw["occurrence"]):
-                self.assertIsNone(layer["material_property_values"])
-                self.assertIsNone(layer["has_material_property_values"])
-                self.assertEqual(layer["texture"]["state"], "unreadable")
-                self.assertIn(
-                    "material_property_values",
-                    layer["read_errors"],
-                )
-                self.assertIn(
-                    "has_material_property_values",
-                    layer["read_errors"],
-                )
-                self.assertIn("texture", layer["read_errors"])
-            body_appearance = raw["bodies"][0]["appearance"]
-            self.assertEqual(body_appearance["material_property_values"], [0.0] * 8)
-            self.assertIsNone(body_appearance["has_material_property_values"])
-            self.assertEqual(body_appearance["texture"]["state"], "unreadable")
+            document = raw["document"]
+            self.assertIsNone(document["material_property_values"])
+            self.assertIsNone(document["has_material_property_values"])
+            self.assertEqual(document["texture"]["state"], "unreadable")
+            self.assertIn(
+                "material_property_values",
+                document["read_errors"],
+            )
             self.assertIn(
                 "has_material_property_values",
-                body_appearance["read_errors"],
+                document["read_errors"],
             )
-            self.assertIn("texture", body_appearance["read_errors"])
+            self.assertIn("texture", document["read_errors"])
+            occurrence = raw["occurrence"]
             self.assertEqual(
-                body_appearance["read_errors"]["material_property_values"]["code"],
+                occurrence["material_property_values"],
+                [0.0] * 8,
+            )
+            self.assertFalse(
+                occurrence["has_material_property_values"]
+            )
+            self.assertEqual(
+                occurrence["texture"]["state"],
+                "unreadable",
+            )
+            self.assertIn(
+                "material_property_values",
+                occurrence["read_errors"],
+            )
+            self.assertIn("texture", occurrence["read_errors"])
+            state_materials = {
+                row["owner_scope"]: row
+                for row in raw["state_render_materials"]
+            }
+            self.assertEqual(
+                state_materials["top_assembly"]["call_state"],
+                "null_result",
+            )
+            self.assertIsNone(
+                state_materials["top_assembly"]["materials"]
+            )
+            self.assertEqual(
+                state_materials["component_document"]["call_state"],
+                "error",
+            )
+            self.assertIn(
+                "materials",
+                state_materials["component_document"]["read_errors"],
+            )
+            self.assertIn(
+                "native_render_material_count",
+                state_materials["component_document"]["read_errors"],
+            )
+            self.assertEqual(
+                raw["occurrence"]["read_errors"]["material_property_values"]["code"],
                 "cad_appearance_values_invalid",
             )
+            face_appearance = raw["bodies"][0]["faces"][0]["appearance"]
+            self.assertIsNone(face_appearance["material_property_values"])
+            self.assertFalse(
+                face_appearance["has_material_property_values"]
+            )
+            self.assertEqual(
+                face_appearance["texture"]["state"],
+                "unreadable",
+            )
+            self.assertIn(
+                "material_property_values",
+                face_appearance["read_errors"],
+            )
+            self.assertIn("texture", face_appearance["read_errors"])
+
+
+class AppearanceHelperTests(unittest.TestCase):
+    def test_display_state_preserves_null_and_empty_results(self) -> None:
+        for raw_states, expected_state, expected_raw in (
+            (None, "null_result", None),
+            ([], "empty", []),
+        ):
+            active = types.SimpleNamespace(
+                Name="Default",
+                GetDisplayStates=lambda value=raw_states: value,
+            )
+            with (
+                self.subTest(states=raw_states),
+                patch.object(
+                    native_module,
+                    "_active_configuration_view",
+                    return_value=(None, active),
+                ),
+            ):
+                (
+                    configuration,
+                    display_state,
+                    error,
+                    states,
+                    states_state,
+                ) = _appearance_document_display_state(object())
+                self.assertEqual(configuration, "Default")
+                self.assertIsNone(display_state)
+                self.assertEqual(
+                    error["code"],
+                    "cad_appearance_display_state_missing",
+                )
+                self.assertEqual(states, expected_raw)
+                self.assertEqual(states_state, expected_state)
+
+    def test_referenced_display_state_distinguishes_failure_and_null(self) -> None:
+        missing, missing_error = _appearance_display_state(object())
+        self.assertIsNone(missing)
+        self.assertEqual(missing_error["code"], "cad_member_missing")
+
+        holder = types.SimpleNamespace(ReferencedDisplayState2=None)
+        invalid, invalid_error = _appearance_display_state(holder)
+        self.assertIsNone(invalid)
+        self.assertEqual(
+            invalid_error["code"],
+            "cad_appearance_display_state_invalid",
+        )
+
+    def test_display_states_invalid_and_exception_are_field_local(self) -> None:
+        invalid_active = types.SimpleNamespace(
+            Name="Default",
+            GetDisplayStates=lambda: "not-an-array",
+        )
+        with patch.object(
+            native_module,
+            "_active_configuration_view",
+            return_value=(None, invalid_active),
+        ):
+            *_, error, states, states_state = (
+                _appearance_document_display_state(object())
+            )
+            self.assertEqual(
+                error["code"],
+                "cad_appearance_display_states_invalid",
+            )
+            self.assertEqual(states, "not-an-array")
+            self.assertEqual(states_state, "error")
+
+        failing_active = types.SimpleNamespace(
+            Name="Default",
+            GetDisplayStates=_raiser(RuntimeError("display state read failed")),
+        )
+        with patch.object(
+            native_module,
+            "_active_configuration_view",
+            return_value=(None, failing_active),
+        ):
+            configuration, state, error, states, states_state = (
+                _appearance_document_display_state(object())
+            )
+            self.assertEqual(configuration, "Default")
+            self.assertIsNone(state)
+            self.assertIsNone(states)
+            self.assertEqual(states_state, "error")
+            self.assertEqual(error["code"], "RuntimeError")
+
+    def test_persistent_reference_missing_and_invalid_are_errors(self) -> None:
+        missing_extension = types.SimpleNamespace(
+            GetPersistReference3=lambda _entity: None
+        )
+        value, error = _appearance_persistent_reference(
+            missing_extension,
+            object(),
+        )
+        self.assertIsNone(value)
+        self.assertEqual(
+            error["code"],
+            "cad_appearance_persistent_reference_missing",
+        )
+        signed_extension = types.SimpleNamespace(
+            GetPersistReference3=lambda _entity: [-1, 0]
+        )
+        value, error = _appearance_persistent_reference(
+            signed_extension,
+            object(),
+        )
+        self.assertEqual(value, [-1, 0])
+        self.assertIsNone(error)
+        for raw, expected in (
+            (b"\x00\xff", [0, 255]),
+            (bytearray(b"\x00\xff"), [0, 255]),
+            (memoryview(b"\x00\xff"), [0, 255]),
+        ):
+            bytes_extension = types.SimpleNamespace(
+                GetPersistReference3=lambda _entity, value=raw: value
+            )
+            value, error = _appearance_persistent_reference(
+                bytes_extension,
+                object(),
+            )
+            self.assertEqual(value, expected)
+            self.assertIsNone(error)
+        entity = object()
+        material = types.SimpleNamespace(
+            GetLinkedDisplayStates=list,
+            GetEntities=lambda: [entity],
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        material_record = _appearance_render_material(
+            material,
+            0,
+            missing_extension,
+        )
+        self.assertEqual(
+            material_record["entity_records"][0]["read_errors"][
+                "persistent_reference"
+            ]["code"],
+            "cad_appearance_persistent_reference_missing",
+        )
+
+        invalid_extension = types.SimpleNamespace(
+            GetPersistReference3=lambda _entity: [1, 300]
+        )
+        value, error = _appearance_persistent_reference(
+            invalid_extension,
+            object(),
+        )
+        self.assertEqual(value, [1, 300])
+        self.assertEqual(
+            error["code"],
+            "cad_appearance_persistent_reference_invalid",
+        )
+
+    def test_render_material_entities_preserve_null_and_error(self) -> None:
+        null_material = types.SimpleNamespace(
+            GetLinkedDisplayStates=list,
+            GetEntities=lambda: None,
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        null_record = _appearance_render_material(
+            null_material,
+            0,
+            object(),
+        )
+        self.assertEqual(null_record["entities_state"], "null_result")
+        self.assertIsNone(null_record["entities"])
+        self.assertNotIn("entities", null_record["read_errors"])
+
+        failing_material = types.SimpleNamespace(
+            GetLinkedDisplayStates=list,
+            GetEntities=_raiser(RuntimeError("entity read failed")),
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        failing_record = _appearance_render_material(
+            failing_material,
+            0,
+            object(),
+        )
+        self.assertEqual(failing_record["entities_state"], "error")
+        self.assertIn("entities", failing_record["read_errors"])
+
+    def test_state_unavailable_owner_record_is_explicit(self) -> None:
+        backend = _CaptureBackend(session_factory=lambda: None)
+        owner = {
+            "document_path": "C:\\model.SLDPRT",
+            "owner_scope": "component_document",
+            "document": types.SimpleNamespace(),
+            "configuration": None,
+            "display_state": None,
+            "display_state_error": {
+                "code": "cad_appearance_display_state_missing",
+                "message": "missing",
+                "detail": {"value": None},
+            },
+            "display_states": None,
+            "display_states_state": "not_applicable",
+            "owner_error": None,
+        }
+        with patch.object(
+            backend,
+            "_appearance_owner_rows",
+            return_value=([owner], []),
+        ):
+            records = backend._capture_state_render_materials(
+                component="arm-1",
+                holder=types.SimpleNamespace(),
+                current={"arm-1": types.SimpleNamespace()},
+                leaf_document=owner["document"],
+                source_configuration="Default",
+                leaf_display_state=None,
+                leaf_display_state_error=owner["display_state_error"],
+                bodies=[],
+                faces=[],
+                features=[],
+                cache={},
+            )
+
+        self.assertEqual(records[0]["call_state"], "state_unavailable")
+        self.assertEqual(
+            records[0]["read_errors"]["display_state"]["code"],
+            "cad_appearance_display_state_missing",
+        )
+
+    def test_later_owner_failure_does_not_discard_successful_records(self) -> None:
+        def owner(path, scope):
+            return {
+                "document_path": path,
+                "owner_scope": scope,
+                "document": types.SimpleNamespace(),
+                "configuration": "Default",
+                "display_state": f"{scope}-state",
+                "display_state_error": None,
+                "display_states": None,
+                "display_states_state": "not_applicable",
+                "owner_error": None,
+            }
+
+        backend = _CaptureBackend(session_factory=lambda: None)
+        rows = [
+            owner("C:\\first.SLDASM", "top_assembly"),
+            owner("C:\\second.SLDASM", "parent_assembly"),
+        ]
+        successful = (
+            {
+                "api": "IModelDocExtension.GetRenderMaterials2",
+                "display_state_option": 3,
+                "display_state": "top_assembly-state",
+                "call_state": "observed",
+                "materials": [],
+                "read_errors": {},
+            },
+            object(),
+        )
+        with (
+            patch.object(
+                backend,
+                "_appearance_owner_rows",
+                return_value=(rows, []),
+            ),
+            patch.object(
+                native_module,
+                "_state_render_materials_raw",
+                side_effect=[successful, RuntimeError("second owner failed")],
+            ),
+        ):
+            records = backend._capture_state_render_materials(
+                component="arm-1",
+                holder=types.SimpleNamespace(),
+                current={"arm-1": types.SimpleNamespace()},
+                leaf_document=rows[0]["document"],
+                source_configuration="Default",
+                leaf_display_state="ArmState",
+                leaf_display_state_error=None,
+                bodies=[],
+                faces=[],
+                features=[],
+                cache={},
+            )
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["call_state"], "observed")
+        self.assertEqual(records[1]["call_state"], "error")
+        self.assertIn("owner", records[1]["read_errors"])
+
+
+class AppearanceOwnerResolutionTests(unittest.TestCase):
+    def test_top_parent_and_leaf_use_their_own_configuration_and_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            parent_path = _write(root, "sub.SLDASM")
+            leaf_path = _write(root, "arm.SLDPRT")
+            top_document = _Doc(
+                assembly,
+                doc_type=2,
+                display_states=["TopState"],
+            )
+            parent_document = _Doc(parent_path, doc_type=2)
+            leaf_document = _Doc(leaf_path)
+            top_calls = []
+            parent_calls = []
+            leaf_calls = []
+            top_document.Extension.GetRenderMaterials2 = (
+                lambda option, names: top_calls.append(
+                    (option, tuple(names.value))
+                )
+                or []
+            )
+            top_document.Extension.GetRenderMaterialsCount = lambda: 0
+            parent_document.Extension.GetRenderMaterials2 = (
+                lambda option, names: parent_calls.append(
+                    (option, tuple(names.value))
+                )
+                or []
+            )
+            parent_document.Extension.GetRenderMaterialsCount = lambda: 0
+            leaf_document.Extension.GetRenderMaterials2 = (
+                lambda option, names: leaf_calls.append(
+                    (option, tuple(names.value))
+                )
+                or []
+            )
+            leaf_document.Extension.GetRenderMaterialsCount = lambda: 0
+            parent = _Component(
+                "sub-1",
+                parent_path,
+                doc=parent_document,
+                configuration="ParentConfig",
+            )
+            parent.ReferencedDisplayState2 = "ParentState"
+            leaf = _Component(
+                "sub-1/arm-1",
+                leaf_path,
+                doc=leaf_document,
+                configuration="LeafConfig",
+            )
+            leaf.ReferencedDisplayState2 = "LeafState"
+            backend = _CaptureBackend(session_factory=lambda: None)
+            with _com_stubs(), patch.object(
+                backend,
+                "_captured_document",
+                return_value=top_document,
+            ):
+                rows, ancestors = backend._appearance_owner_rows(
+                    "sub-1/arm-1",
+                    leaf,
+                    {"sub-1": parent, "sub-1/arm-1": leaf},
+                    leaf_document,
+                    "LeafState",
+                    None,
+                )
+
+            by_scope = {row["owner_scope"]: row for row in rows}
+            self.assertEqual(ancestors, ["sub-1"])
+            self.assertEqual(by_scope["top_assembly"]["configuration"], "Default")
+            self.assertEqual(by_scope["top_assembly"]["display_state"], "TopState")
+            self.assertEqual(
+                by_scope["parent_assembly"]["configuration"],
+                "ParentConfig",
+            )
+            self.assertEqual(
+                by_scope["parent_assembly"]["display_state"],
+                "ParentState",
+            )
+            self.assertEqual(
+                by_scope["component_document"]["display_state"],
+                "LeafState",
+            )
+
+            cache = {}
+            with _com_stubs(), patch.object(
+                backend,
+                "_captured_document",
+                return_value=top_document,
+            ):
+                first = backend._capture_state_render_materials(
+                    component="sub-1/arm-1",
+                    holder=leaf,
+                    current={"sub-1": parent, "sub-1/arm-1": leaf},
+                    leaf_document=leaf_document,
+                    source_configuration="LeafConfig",
+                    leaf_display_state="LeafState",
+                    leaf_display_state_error=None,
+                    bodies=[],
+                    faces=[],
+                    features=[],
+                    cache=cache,
+                )
+                second = backend._capture_state_render_materials(
+                    component="sub-1/arm-1",
+                    holder=leaf,
+                    current={"sub-1": parent, "sub-1/arm-1": leaf},
+                    leaf_document=leaf_document,
+                    source_configuration="LeafConfig",
+                    leaf_display_state="LeafState",
+                    leaf_display_state_error=None,
+                    bodies=[],
+                    faces=[],
+                    features=[],
+                    cache=cache,
+                )
+            self.assertEqual(first, second)
+            self.assertEqual(top_calls, [(3, ("TopState",))])
+            self.assertEqual(parent_calls, [(3, ("ParentState",))])
+            self.assertEqual(leaf_calls, [(3, ("LeafState",))])
+
+    def test_cached_owner_facts_are_remapped_per_occurrence(self) -> None:
+        render_calls = []
+        face_a = types.SimpleNamespace(_persist_reference=b"face-a")
+        face_b = types.SimpleNamespace(_persist_reference=b"face-b")
+        failing_face = types.SimpleNamespace(_persist_reference=b"face-fail")
+        null_reference_face = types.SimpleNamespace(
+            _persist_reference=b"face-null"
+        )
+        invalid_reference_face = types.SimpleNamespace(
+            _persist_reference=b"face-invalid"
+        )
+        material = types.SimpleNamespace(
+            GetLinkedDisplayStates=lambda: ["SharedState"],
+            GetEntities=lambda: [face_a],
+            PrimaryColor=1,
+            Transparency=0.0,
+            ColorForm=1,
+            TextureFilename="",
+            SurfaceFinishFile="",
+        )
+        extension = types.SimpleNamespace()
+
+        def persistent_reference(entity):
+            if entity is failing_face:
+                raise RuntimeError("persistent reference failed")
+            if entity is null_reference_face:
+                return None
+            if entity is invalid_reference_face:
+                return [1, 300]
+            return list(entity._persist_reference)
+
+        extension.GetPersistReference3 = persistent_reference
+        extension.GetRenderMaterials2 = (
+            lambda option, names: render_calls.append(
+                (option, tuple(names.value))
+            )
+            or [material]
+        )
+        extension.GetRenderMaterialsCount = lambda: 1
+        owner_document = types.SimpleNamespace(Extension=extension)
+        owner = {
+            "document_path": "C:\\shared.SLDPRT",
+            "owner_scope": "component_document",
+            "document": owner_document,
+            "configuration": None,
+            "display_state": "SharedState",
+            "display_state_error": None,
+            "display_states": None,
+            "display_states_state": "not_applicable",
+            "owner_error": None,
+        }
+        holder_a = types.SimpleNamespace(_persist_reference=b"component-a")
+        holder_b = types.SimpleNamespace(_persist_reference=b"component-b")
+        backend = _CaptureBackend(session_factory=lambda: None)
+        cache = {}
+        with _com_stubs(), patch.object(
+            backend,
+            "_appearance_owner_rows",
+            return_value=([owner], []),
+        ):
+            first = backend._capture_state_render_materials(
+                component="component-a",
+                holder=holder_a,
+                current={"component-a": holder_a},
+                leaf_document=owner_document,
+                source_configuration="Default",
+                leaf_display_state="SharedState",
+                leaf_display_state_error=None,
+                bodies=[],
+                faces=[
+                    {
+                        "component": "component-a",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "face": face_a,
+                    }
+                ],
+                features=[],
+                cache=cache,
+            )
+            second = backend._capture_state_render_materials(
+                component="component-b",
+                holder=holder_b,
+                current={"component-b": holder_b},
+                leaf_document=owner_document,
+                source_configuration="Default",
+                leaf_display_state="SharedState",
+                leaf_display_state_error=None,
+                bodies=[],
+                faces=[
+                    {
+                        "component": "component-b",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "face": face_b,
+                    },
+                    {
+                        "component": "component-b",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 1,
+                        "face": failing_face,
+                    },
+                    {
+                        "component": "component-b",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 2,
+                        "face": null_reference_face,
+                    },
+                    {
+                        "component": "component-b",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 3,
+                        "face": invalid_reference_face,
+                    },
+                ],
+                features=[],
+                cache=cache,
+            )
+
+        self.assertEqual(render_calls, [(3, ("SharedState",))])
+        first_entity = first[0]["materials"][0]["entity_records"][0]
+        second_entity = second[0]["materials"][0]["entity_records"][0]
+        self.assertEqual(
+            first_entity["matched_identity"]["faces"][0]["component"],
+            "component-a",
+        )
+        self.assertEqual(second_entity["matched_identity"]["faces"], [])
+        self.assertEqual(second[0]["mapping_errors"][0]["entity_kind"], "faces")
+        self.assertEqual(
+            second[0]["mapping_errors"][0]["identity"]["component"],
+            "component-b",
+        )
+        error_codes = {
+            row["error"]["code"] for row in second[0]["mapping_errors"]
+        }
+        self.assertIn(
+            "cad_appearance_persistent_reference_missing",
+            error_codes,
+        )
+        self.assertIn(
+            "cad_appearance_persistent_reference_invalid",
+            error_codes,
+        )
 
 
 class PropertyContractTests(unittest.TestCase):
