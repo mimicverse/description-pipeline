@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import suppress
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -36,6 +37,7 @@ class _EffectEvidence:
     command: StageCommand
     intent: EffectIntent
     settlement: EffectSettlement
+    facts: FactStore | None = None
 
 
 def _minimum_poll_interval(value: float) -> float:
@@ -81,6 +83,7 @@ def _load_effect_evidence(wait: StageEffectWait) -> _EffectEvidence:
     ):
         raise ValueError("The pending effect facts differ from their wait")
     return _EffectEvidence(
+        facts=facts,
         artifacts=artifacts,
         command=command,
         intent=intent,
@@ -271,7 +274,7 @@ def _native_expectation(
 
 def _native_probe_from_environment(
     wait: StageEffectWait,
-) -> tuple[Any, NativeOperationStatusExpectation]:
+) -> tuple[Any, NativeOperationStatusExpectation, FactStore | None]:
     """Load one small immutable native identity without materializing its archive."""
 
     from ..pipeline.application import _native_client_from_environment
@@ -280,10 +283,14 @@ def _native_probe_from_environment(
     if evidence.intent.effect_kind != "native_operation":
         raise ValueError("The pending effect is not a native operation")
     _kind, expected = _native_expectation(evidence)
-    return _native_client_from_environment(
-        os.environ,
-        target_id=expected.target_id,
-    ), expected
+    return (
+        _native_client_from_environment(
+            os.environ,
+            target_id=expected.target_id,
+        ),
+        expected,
+        evidence.facts,
+    )
 
 
 def _native_wakeable(view: object | None) -> bool:
@@ -338,7 +345,7 @@ async def _prepare_native_effect_probe(
 ) -> EffectWaitProbe:
     from .native_operation_client import NativeOperationClientError
 
-    client, expected = await asyncio.to_thread(
+    client, expected, facts = await asyncio.to_thread(
         _native_probe_from_environment,
         wait,
     )
@@ -357,6 +364,15 @@ async def _prepare_native_effect_probe(
             raise
         if view is not None:
             expected.require(view)
+            if facts is not None and getattr(view, "activity", None) is not None:
+                with suppress(Exception):
+                    facts.record_run_activity(
+                        wait.run_id,
+                        view.operation_id,
+                        view.activity,
+                        terminal=view.state
+                        in {"satisfied", "failed", "cancelled", "unknown"},
+                    )
         return _wakeup(wait, _native_wakeable(view))
 
     return probe

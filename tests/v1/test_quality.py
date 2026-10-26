@@ -18,7 +18,7 @@ from description_pipeline.interface_records import CHECK_POLICY_V1, validate_qua
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks import verify as oracle
 from description_pipeline.sources.snapshot import write_manifest
-from description_pipeline.verification import solidworks_urdf as quality
+from description_pipeline.verification import native_discovery, solidworks_urdf as quality
 from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
 from tests.sources import support
 
@@ -512,12 +512,12 @@ class PhysicsTests(unittest.TestCase):
                 },
             ),
             mock.patch.object(
-                quality.evidence,
+                native_discovery,
                 "rebuild_rigid_bodies",
                 return_value=copy.deepcopy(self.source["bodies"]),
             ),
-            mock.patch.object(quality.evidence, "rebuild_joint_facts", return_value=[]),
-            mock.patch.object(quality.evidence, "rebuild_interface_frames", return_value=[]),
+            mock.patch.object(native_discovery, "rebuild_joint_facts", return_value=[]),
+            mock.patch.object(native_discovery, "rebuild_interface_frames", return_value=[]),
         ):
             return quality.rebuilt_definition(self.bundle)["source"]
 
@@ -1498,6 +1498,28 @@ class StructuralQualityTests(unittest.TestCase):
             )
             self.assertEqual("1.0.0", quality._tool(root)["version"])
 
+    def test_structural_quality_uses_exact_python_runtime_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tool = {
+                "schema_version": "solidworks-to-urdf.tool/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "source_sha256": "a" * 64,
+                "version": "1.0.0",
+                "runtime": {
+                    "python": "3.12",
+                    "packages": {"numpy": "2.5.3", "pywin32": "311"},
+                },
+            }
+            write_json(root / "tool.json", tool)
+            self.assertEqual("1.0.0", quality._tool(root)["version"])
+            for value in ("3.120", "3.12garbage", "3.12.0rc1", 3.12):
+                with self.subTest(value=repr(value)):
+                    wrong = {**tool, "runtime": {**tool["runtime"], "python": value}}
+                    write_json(root / "tool.json", wrong)
+                    with self.assertRaisesRegex(PipelineError, "Missing pinned build runtime"):
+                        quality._tool(root)
+
     def test_captured_matrices_are_rowmajor_and_reflections_fail(self):
         transform = np.array([[0, -1, 0, 0.1], [1, 0, 0, 0.2], [0, 0, 1, 0.3], [0, 0, 0, 1]], dtype=float)
         np.testing.assert_array_equal(transform, quality._cad_pose(transform.ravel()))
@@ -1515,6 +1537,16 @@ class StructuralQualityTests(unittest.TestCase):
             "surface": "cylinder",
             "radius_m": 0.01,
             "coordinate_frame": "component_local",
+            "is_cylinder_raw": True,
+            "cylinder_params_raw": [
+                0.01,
+                0,
+                0.1,
+                0,
+                0,
+                -1,
+                0.01,
+            ],
             "axis_point_m": [0.01, 0, 0.1],
             "axis_direction": [0, 0, -1],
         }
@@ -1621,6 +1653,13 @@ class UrdfMassEqualityTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        raw_fact_gate = mock.patch(
+            "description_pipeline.verification.native_capture_facts."
+            "verify_native_capture_facts",
+            return_value={"native_capture_facts": True},
+        )
+        raw_fact_gate.start()
+        self.addCleanup(raw_fact_gate.stop)
         support.write_target_delivery(self.root, capture={})
         self.masses = [1.0, 2.0]
         self.write()
@@ -1905,89 +1944,40 @@ class MeshChunkContractTests(unittest.TestCase):
             ((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),
             ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
         ]
-        face_triangles = {0: (0, 1), 1: (2, 3)}
-        edge_occurrences = {}
-        for face_index, triangle_indices in face_triangles.items():
-            for triangle_index in triangle_indices:
-                triangle = triangles[triangle_index]
-                for offset in range(3):
-                    start = triangle[offset]
-                    end = triangle[(offset + 1) % 3]
-                    key = frozenset(
-                        (
-                            tuple(struct.pack("<3f", *start)),
-                            tuple(struct.pack("<3f", *end)),
-                        )
-                    )
-                    edge_occurrences.setdefault(key, []).append(
-                        (face_index, triangle_index, start, end)
-                    )
-        face_edges = {0: [], 1: []}
-        native_edges = []
-        for index, occurrences in enumerate(
-            sorted(edge_occurrences.values(), key=lambda rows: rows[0][1:]),
-            start=1,
-        ):
-            face_indices = sorted({row[0] for row in occurrences})
-            if len(face_indices) != 2:
-                continue
-            reference = hashlib.sha256(f"fixture-edge-{index}".encode()).hexdigest()
-            for face_index in face_indices:
-                face_edges[face_index].append(reference)
-            start = occurrences[0][2]
-            end = occurrences[0][3]
-            native_edges.append(
+        from description_pipeline.geometry.native_tessellation import (
+            build_native_tessellation,
+        )
+
+        source_scope = support.fixture_source_scope("pcb-1")
+        tessellation = build_native_tessellation(
+            "pcb-1",
+            [
                 {
                     "body_type": body_type,
                     "body_index": 0,
-                    "edge_reference_sha256": reference,
-                    "start_vertex_reference_sha256": hashlib.sha256(
-                        struct.pack("<3f", *start)
-                    ).hexdigest(),
-                    "end_vertex_reference_sha256": hashlib.sha256(
-                        struct.pack("<3f", *end)
-                    ).hexdigest(),
-                    "start_point_m": list(start),
-                    "end_point_m": list(end),
-                    "face_indices": face_indices,
+                    "body_name": "fixture-body",
+                    "face_count": 2,
                 }
-            )
-        for references in face_edges.values():
-            references.sort()
-        face_spans = [
-            {
-                "body_type": body_type,
-                "body_index": 0,
-                "body_name": "fixture-body",
-                "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
-                "face_index": 0,
-                "face_reference_sha256": hashlib.sha256(b"fixture-face-0").hexdigest(),
-                "face_owner_id": 1,
-                "edge_references": face_edges[0],
-                "triangle_start": 0,
-                "triangle_count": 2,
-                "triangle_records_sha256": "0" * 64,
-            },
-            {
-                "body_type": body_type,
-                "body_index": 0,
-                "body_name": "fixture-body",
-                "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
-                "face_index": 1,
-                "face_reference_sha256": hashlib.sha256(b"fixture-face-1").hexdigest(),
-                "face_owner_id": 2,
-                "edge_references": face_edges[1],
-                "triangle_start": 2,
-                "triangle_count": 2,
-                "triangle_records_sha256": "0" * 64,
-            },
-        ]
-        tessellation = support.native_tessellation_fixture(
-            face_spans,
-            native_edges,
-            triangle_vertices=triangles,
+            ],
+            [
+                {
+                    "body_type": body_type,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 2,
+                },
+                {
+                    "body_type": body_type,
+                    "body_index": 0,
+                    "face_index": 1,
+                    "triangle_start": 2,
+                    "triangle_count": 2,
+                },
+            ],
+            source_scope=source_scope,
         )
-        payload = tessellation.stl_bytes
+        payload = support.binary_stl_bytes(triangles)
         parts = self._parts(payload, limit)
         if mutate is not None:
             mutate(payload, parts)
@@ -2013,18 +2003,27 @@ class MeshChunkContractTests(unittest.TestCase):
                 "mass": 1.0,
             },
             "visuals": [
-                {"filename": "geometry/0001_mesh.stl", "scale": [1, 1, 1], "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
+                {
+                    "filename": "geometry/0001_mesh.stl",
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "mesh_name": "meshes/visual/board_0.stl",
+                    "scale": [1, 1, 1],
+                    "xyz": [0, 0, 0],
+                    "rpy": [0, 0, 0],
+                    "provenance": {"native_component": "pcb-1"},
+                }
             ],
             "collisions": [],
         }
         geometry = {
             "pcb-1": {
                 "path": "geometry/0001_mesh.stl",
-                "sha256": hashlib.sha256(payload).hexdigest(),
+                "sha": hashlib.sha256(payload).hexdigest(),
                 "triangles": 4,
-                "scale": [1, 1, 1],
-                "xyz": [0, 0, 0],
-                "rpy": [0, 0, 0],
+                "bodies": {
+                    "solid": 1 if body_type == 0 else 0,
+                    "sheet": 1 if body_type == 1 else 0,
+                },
                 "tessellation": tessellation,
             }
         }
@@ -2091,7 +2090,8 @@ class MeshChunkContractTests(unittest.TestCase):
                 third = struct.unpack_from("<3f", flipped, offset + 36)
                 struct.pack_into("<12f", flipped, offset, *[-value for value in normal], *first, *third, *second)
             source.write_bytes(flipped)
-            geometry["pcb-1"]["sha256"] = hashlib.sha256(flipped).hexdigest()
+            geometry["pcb-1"]["sha"] = hashlib.sha256(flipped).hexdigest()
+            model_link["visuals"][0]["sha256"] = geometry["pcb-1"]["sha"]
             for index, part in enumerate(self._parts(flipped, 2)):
                 (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
             with (
@@ -2138,7 +2138,8 @@ class MeshChunkContractTests(unittest.TestCase):
                     *second,
                 )
             source.write_bytes(flipped)
-            geometry["pcb-1"]["sha256"] = hashlib.sha256(flipped).hexdigest()
+            geometry["pcb-1"]["sha"] = hashlib.sha256(flipped).hexdigest()
+            model_link["visuals"][0]["sha256"] = geometry["pcb-1"]["sha"]
             for index, part in enumerate(self._parts(flipped, 2)):
                 (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
             with mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 2):
@@ -2191,14 +2192,13 @@ class MeshChunkContractTests(unittest.TestCase):
             payload = self._mesh(triangles)
             source = root / "evidence/geometry/0001_mesh.stl"
             source.write_bytes(payload)
-            geometry["pcb-1"]["sha256"] = hashlib.sha256(payload).hexdigest()
+            geometry["pcb-1"]["sha"] = hashlib.sha256(payload).hexdigest()
+            model_link["visuals"][0]["sha256"] = geometry["pcb-1"]["sha"]
             geometry["pcb-1"]["triangles"] = 8
             spans = geometry["pcb-1"]["tessellation"]["face_spans"]
             spans[0]["triangle_count"] = 4
-            spans[0]["triangle_records_sha256"] = hashlib.sha256(payload[84:284]).hexdigest()
             spans[1]["triangle_start"] = 4
             spans[1]["triangle_count"] = 4
-            spans[1]["triangle_records_sha256"] = hashlib.sha256(payload[284:484]).hexdigest()
             for index, part in enumerate(self._parts(payload, 4)):
                 (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
             with mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 4):
@@ -2575,6 +2575,10 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
         return header + struct.pack("<I", len(triangles)) + payload
 
     def _geometry_fixture(self, root, *, qualified, collinear, raw_payload=None):
+        from description_pipeline.geometry.native_tessellation import (
+            build_native_tessellation,
+        )
+
         payload = raw_payload or self._stl_bytes(collinear=collinear)
         (root / "evidence/geometry").mkdir(parents=True, exist_ok=True)
         (root / "meshes/visual").mkdir(parents=True, exist_ok=True)
@@ -2582,6 +2586,29 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
         (root / "meshes/visual/board_0.stl").write_bytes(payload)
         digest = hashlib.sha256(payload).hexdigest()
         occurrence = "pcb-1"
+        triangle_count = struct.unpack("<I", payload[80:84])[0]
+        source_scope = support.fixture_source_scope(occurrence)
+        tessellation = build_native_tessellation(
+            occurrence,
+            [
+                {
+                    "body_type": 1,
+                    "body_index": 0,
+                    "body_name": "sheet-fixture",
+                    "face_count": 1,
+                }
+            ],
+            [
+                {
+                    "body_type": 1,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": triangle_count,
+                }
+            ],
+            source_scope=source_scope,
+        )
         if qualified:
             self._delivery(root)
         node = ET.fromstring(
@@ -2594,9 +2621,12 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
             "visuals": [
                 {
                     "filename": "geometry/0001_mesh.stl",
+                    "sha256": digest,
+                    "mesh_name": "meshes/visual/board_0.stl",
                     "scale": [1, 1, 1],
                     "xyz": [0, 0, 0],
                     "rpy": [0, 0, 0],
+                    "provenance": {"native_component": occurrence},
                 }
             ],
             "collisions": [],
@@ -2604,11 +2634,10 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
         geometry = {
             occurrence: {
                 "path": "geometry/0001_mesh.stl",
-                "sha256": digest,
-                "triangles": struct.unpack("<I", payload[80:84])[0],
-                "scale": [1, 1, 1],
-                "xyz": [0, 0, 0],
-                "rpy": [0, 0, 0],
+                "sha": digest,
+                "triangles": triangle_count,
+                "bodies": {"solid": 0, "sheet": 1},
+                "tessellation": tessellation,
             }
         }
         components = {occurrence: np.identity(4)}

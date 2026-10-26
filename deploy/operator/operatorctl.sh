@@ -1059,7 +1059,7 @@ triple = "\n".join(
     str(release.get(key) or "") for key in ("version", "source_commit", "source_sha256", "role")
 )
 document = {
-    "schema_version": "solidworks-to-urdf.windows-recovery/v1",
+    "schema_version": "solidworks-to-urdf.windows-recovery/v2",
     "ssh_host": windows["ssh_host"],
     "task_name": instance["task_name"],
     "state_root": instance["state_root"],
@@ -1444,13 +1444,12 @@ windows_status_check() {
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
-WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[3])
 from windows_transport import (
@@ -1500,198 +1499,97 @@ script = rf"""
 $ErrorActionPreference = 'Stop'
 $expected = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
   [Convert]::FromBase64String('{encoded}')))
-function Read-Json([string]$path) {{
-  (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json
-}}
-function Normalize-PathIdentity([string]$path) {{
-  return (([string]$path).Replace('\', '/').TrimEnd('/'))
-}}
-function Get-LaunchContract([string]$generation) {{
-  $receipt = Join-Path $generation 'stage-receipt.json'
-  if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) {{
-    throw 'the task generation has no stage receipt'
-  }}
-  $record = Read-Json $receipt
-  if ($record.passed -isnot [bool] -or $record.passed -ne $true) {{
-    throw 'the task generation stage receipt passed field is not JSON boolean true'
-  }}
-  if ($record.verb -isnot [string] -or $record.verb -cne 'stage') {{
-    throw 'the task generation stage receipt verb is not the exact JSON string stage'
-  }}
-  if ($record.generation -isnot [string] -or
-      (Normalize-PathIdentity $record.generation) -ne
-      (Normalize-PathIdentity $generation)) {{
-    throw 'the stage receipt generation is not an exact string for this generation'
-  }}
-  if ($record.version -isnot [string] -or
-      $record.source_commit -isnot [string] -or
-      $record.source_sha256 -isnot [string]) {{
-    throw 'the task generation launch contract carries no strict release identity strings'
-  }}
-  if ($record.PSObject.Properties.Name -contains 'launch_contract') {{
-    if ($record.launch_contract -isnot [string]) {{
-      throw 'the task generation launch_contract is not a JSON string'
-    }}
-    $contract = $record.launch_contract
-    if ($contract -cne 'python_module_v1') {{
-      throw "the task generation names an unsupported launch contract: $contract"
-    }}
-    if ($record.source_commit -ceq '55cdf8da178e37239d3ac199cd27fc50cf56540d') {{
-      throw 'the approved legacy release cannot declare the Python module launcher'
-    }}
-    return $contract
-  }}
-  if ($record.source_commit -cne '55cdf8da178e37239d3ac199cd27fc50cf56540d') {{
-    throw 'the contract-less task generation is not the approved legacy release'
-  }}
-  if ($record.version -cne '1.5.0' -or
-      $record.source_sha256 -cne '66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec') {{
-    throw 'the contract-less task generation does not carry the approved legacy release identity'
-  }}
-  return 'legacy_pip_launcher_v0'
-}}
-function Test-Bytecode-TransitionGeneration([string]$generation) {{
-  $receiptPath = Join-Path $generation 'stage-receipt.json'
-  if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {{ return $false }}
-  try {{ $record = Read-Json $receiptPath }} catch {{ return $false }}
-  return (
-    $record.passed -eq $true -and
-    $record.verb -ceq 'stage' -and
-    $record.PSObject.Properties.Name -contains 'launch_contract' -and
-    $record.launch_contract -ceq 'python_module_v1' -and
-    (Normalize-PathIdentity $record.generation) -eq
-      (Normalize-PathIdentity $generation) -and
-    $record.version -ceq '1.5.0' -and
-    $record.source_commit -ceq '140d39e51be5f0c39c32d7cfea9ca25fe642c273' -and
-    $record.source_sha256 -ceq '351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec'
-  )
-}}
-function Test-Transition-LaunchArguments([string]$arguments, [string]$generation, [object]$release) {{
-  if (-not (Test-Bytecode-TransitionGeneration $generation) -or
-      $release.source_commit -cne '140d39e51be5f0c39c32d7cfea9ca25fe642c273' -or
-      $release.source_sha256 -cne '351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec' -or
-      $release.version -cne '1.5.0' -or $release.role -cne 'native') {{
-    return $false
-  }}
-  # The fixed bytecode-transition generation predates the native module split.
-  $match = [regex]::Match(
-    $arguments,
-    '^(-I -m description_pipeline serve --config )"([^"]+)"$')
-  return (
-    $match.Success -and
-    $match.Groups[1].Value -ceq '-I -m description_pipeline serve --config ' -and
-    (Normalize-PathIdentity $match.Groups[2].Value) -eq
-      (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))
-  )
-}}
-function Test-LaunchArguments([string]$arguments, [string]$generation, [string]$contract, [object]$release) {{
-  if ($contract -ceq 'python_module_v1') {{
-    $match = [regex]::Match(
-      $arguments,
-      '^(-I -B -m description_pipeline\.orchestration\.windows serve --config )"([^"]+)"$')
-    if (
-      $match.Success -and
-      $match.Groups[1].Value -ceq '-I -B -m description_pipeline.orchestration.windows serve --config ' -and
-      (Normalize-PathIdentity $match.Groups[2].Value) -eq
-      (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))
-    ) {{ return $true }}
-    return (Test-Transition-LaunchArguments $arguments $generation $release)
-  }}
-  if ($contract -ceq 'legacy_pip_launcher_v0') {{
-    $match = [regex]::Match($arguments, '^(serve --config )"([^"]+)"$')
-    return (
-      $match.Success -and
-      $match.Groups[1].Value -ceq 'serve --config ' -and
-      (Normalize-PathIdentity $match.Groups[2].Value) -eq
-      (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))
-    )
-  }}
-  return $false
-}}
-function Test-LaunchAction([string]$execute, [string]$arguments, [string]$generation, [string]$contract, [object]$release) {{
-  if ($contract -ceq 'python_module_v1') {{
-    return (
-      (Normalize-PathIdentity $execute) -eq
-        (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\python.exe')) -and
-      (Test-LaunchArguments $arguments $generation $contract $release)
-    )
-  }}
-  return (
-    $contract -ceq 'legacy_pip_launcher_v0' -and
-    (Normalize-PathIdentity $execute) -eq
-      (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\description.exe')) -and
-      (Test-LaunchArguments $arguments $generation $contract $release)
-  )
-}}
 function Get-Sample {{
   $task = Get-ScheduledTask -TaskName $expected.task_name -ErrorAction Stop
   if ($task.State -ne 'Running') {{ throw "task state is $($task.State)" }}
   if (@($task.Actions).Count -ne 1) {{ throw 'task action count differs from exactly one' }}
-  $arguments = [string]$task.Actions[0].Arguments
-  $match = [regex]::Match($arguments, 'serve --config\s+"?([^"]+)"?')
-  if (-not $match.Success) {{ throw 'task action does not bind serve --config' }}
-  $configPath = $match.Groups[1].Value
-  $generation = Split-Path -Parent $configPath
-  $launchContract = Get-LaunchContract $generation
-  if (-not (Test-LaunchAction ([string]$task.Actions[0].Execute) `
-      ([string]$task.Actions[0].Arguments) $generation $launchContract ([object]$expected.release))) {{
-    throw 'task action does not match its generation launch contract'
+  $action = $task.Actions[0]
+  $execute = [string]$action.Execute
+  $scripts = [IO.Path]::GetDirectoryName($execute)
+  $runtime = [IO.Path]::GetDirectoryName($scripts)
+  $generation = [IO.Path]::GetDirectoryName($runtime)
+  if (-not $generation -or
+      $execute -ne (Join-Path $generation 'runtime\Scripts\python.exe')) {{
+    throw 'task executable is not the managed generation runtime'
   }}
-  $python = Join-Path $generation 'runtime\Scripts\python.exe'
-  if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {{
-    throw 'task generation runtime Python is missing'
+  $generationRoot = Split-Path -Parent $generation
+  $lifecycle = Join-Path $generationRoot 'instance-lifecycle.ps1'
+  $binding = Join-Path $generationRoot 'windows-binding.json'
+  if (-not (Test-Path -LiteralPath $lifecycle -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $binding -PathType Leaf)) {{
+    throw 'task generation has no lifecycle identity'
   }}
-  $program = "import json,sys;" +
-    "from description_pipeline.orchestration import windows;" +
-    "from description_pipeline.runtime import tool_record;" +
-    "c=windows.read_config(sys.argv[1]);" +
-    "print(json.dumps({{'config_digest':c['config_digest']," +
-    "'state_root':str(c['state_root']),'port':c['port']," +
-    "'release':tool_record(role='native')}},sort_keys=True))"
-  $probe = ((& $python -I -B -c $program $configPath) | Select-Object -Last 1) |
-    ConvertFrom-Json
-  $config = Read-Json $configPath
-  if ((Normalize-PathIdentity ([string]$task.Actions[0].WorkingDirectory)) -ne
-      (Normalize-PathIdentity ([string]$config.state_root))) {{
-    throw 'task working directory differs from the endpoint state root'
+  $hostExecutable = if (Test-Path -LiteralPath (Join-Path $PSHOME 'powershell.exe')) {{
+    Join-Path $PSHOME 'powershell.exe'
+  }} elseif (Test-Path -LiteralPath (Join-Path $PSHOME 'pwsh')) {{
+    Join-Path $PSHOME 'pwsh'
+  }} else {{
+    throw 'the PowerShell host executable is unavailable'
   }}
-  $installId = (
-    Get-Content -LiteralPath (Join-Path ([string]$probe.state_root) 'install-id') -Raw
-  ).Trim()
-  $listeners = @(Get-NetTCPConnection -LocalPort ([int]$expected.port) -State Listen `
-    -ErrorAction Stop)
-  if ($listeners.Count -ne 1) {{
-    throw "expected one listener on port $($expected.port), got $($listeners.Count)"
+  $output = @(& $hostExecutable -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    -File $lifecycle -Verb status -Binding $binding 2>&1)
+  if ($LASTEXITCODE -ne 0) {{
+    throw 'the managed lifecycle status command failed'
   }}
-  $process = Get-Process -Id ([int]$listeners[0].OwningProcess) -ErrorAction Stop
-  $token = (Get-Content -LiteralPath ([string]$config.token_file) -Raw).Trim()
-  $health = $null
-  for ($attempt = 0; $attempt -lt 10 -and -not $health; $attempt++) {{
-    try {{
-      $health = Invoke-RestMethod -Uri (
-        'http://127.0.0.1:' + [string]$expected.port + '/health'
-      ) -Headers @{{Authorization=('Bearer ' + $token)}} -TimeoutSec 3
-    }} catch {{
-      Start-Sleep -Milliseconds 500
+  try {{
+    $document = (($output | Select-Object -Last 1) | ConvertFrom-Json)
+  }} catch {{
+    throw 'the managed lifecycle status returned no JSON'
+  }}
+  if ($document.passed -ne $true -or $document.verb -ne 'status' -or
+      $null -eq $document.live_task) {{
+    throw 'the managed lifecycle status did not return a live task'
+  }}
+  $live = $document.live_task
+  if ($live.state -ne 'Running' -or $live.action_count -ne 1 -or
+      $live.maintenance_relation -notin @('source','target','unknown') -or
+      -not $live.endpoint_root -or -not $live.config_path -or
+      -not $live.config_digest -or -not $live.install_id -or
+      -not $live.task_xml -or -not $live.task_xml_sha256 -or
+      -not $live.task_semantic_sha256 -or
+      -not $live.task_acl_sha256 -or $null -eq $live.listener -or
+      $null -eq $live.health -or $null -eq $live.release) {{
+    throw 'the managed lifecycle status did not prove the running task identity'
+  }}
+  $health = $live.health
+  $listener = $live.listener
+  $pendingRollback = $document.pending_rollback
+  if ($null -ne $pendingRollback) {{
+    if ($pendingRollback.state -eq 'present') {{
+      if (-not $pendingRollback.previous -or
+          -not $pendingRollback.target_generation -or
+          -not $pendingRollback.restore_to -or
+          -not $pendingRollback.current_snapshot -or
+          [string]$pendingRollback.source_state_sha256 -cnotmatch '^[0-9a-f]{{64}}$') {{
+        throw 'the managed lifecycle returned an incomplete rollback intent'
+      }}
+    }} elseif ($pendingRollback.state -ne 'unknown') {{
+      throw 'the managed lifecycle returned an invalid rollback intent state'
     }}
   }}
-  if (-not $health) {{ throw 'endpoint health is unavailable' }}
-  $embedded = $probe.release.release
   [ordered]@{{
     task_name = [string]$task.TaskName
+    task_path = [string]$task.TaskPath
     task_state = [string]$task.State
     action_count = @($task.Actions).Count
-    listener_pid = [int]$process.Id
-    process_start_utc = $process.StartTime.ToUniversalTime().ToString('o')
-    install_id = [string]$installId
-    config_digest = [string]$probe.config_digest
-    launch_contract = [string]$launchContract
-    action_matches_generation = $true
+    task_xml = [string]$live.task_xml
+    task_xml_sha256 = [string]$live.task_xml_sha256
+    task_semantic_sha256 = [string]$live.task_semantic_sha256
+    task_acl_sha256 = [string]$live.task_acl_sha256
+    endpoint_root = [string]$live.endpoint_root
+    config_path = [string]$live.config_path
+    listener_pid = [int]$listener.listener_pid
+    process_start_utc = [string]$listener.process_start_utc
+    process_command_sha256 = [string]$listener.process_command_sha256
+    process_user_sid = [string]$listener.process_user_sid
+    install_id = [string]$live.install_id
+    release_identity_sha256 = [string]$live.release_identity_sha256
+    config_digest = [string]$live.config_digest
     release = [ordered]@{{
-      version = [string]$probe.release.version
-      source_commit = [string]$embedded.source_commit
-      source_sha256 = [string]$probe.release.source_sha256
-      role = 'native'
+      version = [string]$live.release.version
+      source_commit = [string]$live.release.source_commit
+      source_sha256 = [string]$live.release.source_sha256
+      role = [string]$live.release.role
     }}
     health_install_id = [string]$health.install_id
     health_config_digest = [string]$health.config_digest
@@ -1701,6 +1599,9 @@ function Get-Sample {{
       source_sha256 = [string]$health.release.source_sha256
       role = [string]$health.release.role
     }}
+    maintenance_relation = [string]$live.maintenance_relation
+    source = $live.source
+    pending_rollback = $pendingRollback
   }}
 }}
 try {{
@@ -1842,6 +1743,8 @@ if not isinstance(result, dict) or result.get("passed") is not True:
         + str(result.get("error") if isinstance(result, dict) else "invalid result")
     )
 sample = result.get("sample")
+source = sample.get("source") if isinstance(sample, dict) else None
+pending_rollback = sample.get("pending_rollback") if isinstance(sample, dict) else None
 if (
     not isinstance(sample, dict)
     or sample.get("task_name") != task_name
@@ -1854,12 +1757,70 @@ if (
     or sample.get("health_config_digest") != identity["config_digest"]
     or sample.get("release") != identity["release"]
     or sample.get("health_release") != identity["release"]
-    or sample.get("action_matches_generation") is not True
-    or sample.get("launch_contract")
-    not in {WINDOWS_PYTHON_LAUNCH_CONTRACT, WINDOWS_LEGACY_LAUNCH_CONTRACT}
+    or not isinstance(sample.get("release_identity_sha256"), str)
+    or not re.fullmatch(r"[0-9a-f]{64}", sample.get("release_identity_sha256", ""))
+    or not isinstance(sample.get("task_path"), str)
+    or not sample.get("task_path")
+    or not isinstance(sample.get("endpoint_root"), str)
+    or not sample.get("endpoint_root")
+    or not isinstance(sample.get("config_path"), str)
+    or not sample.get("config_path")
+    or not isinstance(sample.get("task_xml_sha256"), str)
+    or not re.fullmatch(r"[0-9a-f]{64}", sample.get("task_xml_sha256", ""))
+    or not isinstance(sample.get("task_xml"), str)
+    or not sample.get("task_xml")
+    or not isinstance(sample.get("task_semantic_sha256"), str)
+    or not re.fullmatch(r"[0-9a-f]{64}", sample.get("task_semantic_sha256", ""))
+    or not isinstance(sample.get("task_acl_sha256"), str)
+    or not re.fullmatch(r"[0-9a-f]{64}", sample.get("task_acl_sha256", ""))
+    or not isinstance(sample.get("process_command_sha256"), str)
+    or not re.fullmatch(r"[0-9a-f]{64}", sample.get("process_command_sha256", ""))
+    or not isinstance(sample.get("process_user_sid"), str)
+    or not sample.get("process_user_sid")
+    or sample.get("maintenance_relation") not in {"source", "target", "unknown"}
+    or not isinstance(source, dict)
+    or source.get("task_semantic_sha256") != sample.get("task_semantic_sha256")
+    or source.get("task_acl_sha256") != sample.get("task_acl_sha256")
+    or source.get("endpoint_root") != sample.get("endpoint_root")
+    or source.get("config_path") != sample.get("config_path")
+    or source.get("config_digest") != sample.get("config_digest")
+    or source.get("install_id") != sample.get("install_id")
+    or source.get("release_identity_sha256")
+    != sample.get("release_identity_sha256")
     or type(sample.get("listener_pid")) is not int
     or not isinstance(sample.get("process_start_utc"), str)
     or not sample["process_start_utc"]
+    or (
+        pending_rollback is not None
+        and (
+            not isinstance(pending_rollback, dict)
+            or pending_rollback.get("state") not in {"present", "unknown"}
+            or (
+                pending_rollback.get("state") == "present"
+                and (
+                    not isinstance(pending_rollback.get("previous"), str)
+                    or not pending_rollback["previous"]
+                    or not isinstance(pending_rollback.get("target_generation"), str)
+                    or not pending_rollback["target_generation"]
+                    or not isinstance(pending_rollback.get("restore_to"), str)
+                    or not pending_rollback["restore_to"]
+                    or not isinstance(pending_rollback.get("current_snapshot"), str)
+                    or not pending_rollback["current_snapshot"]
+                    or not isinstance(
+                        pending_rollback.get("source_state_sha256"), str
+                    )
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        pending_rollback.get("source_state_sha256", ""),
+                    )
+                )
+            )
+            or (
+                pending_rollback.get("state") == "unknown"
+                and pending_rollback.get("code") != "rollback_intent_unreadable"
+            )
+        )
+    )
 ):
     persist_status_evidence(
         completed.stdout,
@@ -1882,14 +1843,25 @@ print(
     json.dumps(
         {
             "task_name": task_name,
+            "task_path": sample["task_path"],
             "task_state": "Running",
             "action_count": sample["action_count"],
             "listener_pid": sample["listener_pid"],
             "process_start_utc": sample["process_start_utc"],
+            "task_xml_sha256": sample["task_xml_sha256"],
+            "task_xml": sample["task_xml"],
+            "task_semantic_sha256": sample["task_semantic_sha256"],
+            "task_acl_sha256": sample["task_acl_sha256"],
+            "endpoint_root": sample["endpoint_root"],
+            "config_path": sample["config_path"],
             "install_id": sample["install_id"],
             "config_digest": sample["config_digest"],
-            "launch_contract": sample["launch_contract"],
-            "action_matches_generation": sample["action_matches_generation"],
+            "release_identity_sha256": sample["release_identity_sha256"],
+            "process_command_sha256": sample["process_command_sha256"],
+            "process_user_sid": sample["process_user_sid"],
+            "maintenance_relation": sample["maintenance_relation"],
+            "source": source,
+            "pending_rollback": pending_rollback,
             "transport": getattr(completed, "transport", {}),
             "evidence": {
                 "stdout": str(stdout_path),
@@ -3031,20 +3003,6 @@ def normalize(value):
     return str(value or "").replace("\\", "/").rstrip("/")
 
 
-def parse_arguments(value):
-    text = str(value or "").strip()
-    for pattern in (
-        r'^(-I -B -m description_pipeline\.orchestration\.windows serve --config )"([^"]+)"$',
-        # The fixed bytecode-transition generation predates the native module split.
-        r'^(-I -m description_pipeline serve --config )"([^"]+)"$',
-        r'^(serve --config )"([^"]+)"$',
-    ):
-        match = re.fullmatch(pattern, text)
-        if match:
-            return match.group(1), normalize(match.group(2)).lower()
-    return None
-
-
 binding = json.load(open(sys.argv[1], encoding="utf-8"))
 status = json.load(open(sys.argv[2], encoding="utf-8"))
 target = normalize(binding.get("dir")) + "/generation"
@@ -3052,106 +3010,57 @@ live = status.get("live_task") if isinstance(status, dict) else None
 if not isinstance(live, dict):
     print("unknown")
     raise SystemExit(0)
-# The endpoint script owns task-config parsing; this side compares structured facts only.
-execute = normalize(live.get("execute")).lower()
-config = normalize(live.get("config")).lower()
-arguments = parse_arguments(live.get("arguments"))
-working_directory = normalize(live.get("working_directory")).lower()
-launch_contract = live.get("launch_contract")
-action_matches_generation = live.get("action_matches_generation") is True
-task_running = live.get("state") == "Running"
-exact_one_action = (
-    type(live.get("action_count")) is int and live.get("action_count") == 1
-)
-if not execute or not config:
-    print("unknown")
-    raise SystemExit(0)
 records = [row for row in (status.get("pending"), status.get("last_promotion")) if isinstance(row, dict)]
 record = next((row for row in records if normalize(row.get("generation")) == target), None)
-source = normalize(record.get("previous")) if record else ""
-source_launcher = normalize(record.get("source_launcher")).lower() if record else ""
-source_config = normalize(record.get("source_config")).lower() if record else ""
-has_source_arguments = isinstance(record, dict) and "source_arguments" in record
-has_source_working_directory = (
-    isinstance(record, dict) and "source_working_directory" in record
-)
-source_arguments = parse_arguments(record.get("source_arguments")) if record else None
-source_working_directory = normalize(record.get("source_working_directory")).lower() if record else ""
-source_generation = (
-    source_config[: -len("/endpoint.json")]
-    if source_config.endswith("/endpoint.json")
-    else ""
-)
+if not isinstance(record, dict) or live.get("state") != "Running":
+    print("unknown")
+    raise SystemExit(0)
+
+relation = live.get("maintenance_relation")
+previous = normalize(record.get("previous"))
+source = record.get("source") if isinstance(record.get("source"), dict) else {}
+target_identity = record.get("target") if isinstance(record.get("target"), dict) else {}
 
 
-def runs(generation):
-    # The single launch convention the endpoint script uses (Runtime-Launcher + Config-Path).
+def source_matches() -> bool:
     return (
-        task_running
-        and exact_one_action
-        and action_matches_generation
-        and launch_contract == "python_module_v1"
-        and execute == (generation + "/runtime/scripts/python.exe").lower()
-        and config == (generation + "/endpoint.json").lower()
-        and arguments
-        == (
-            '-I -B -m description_pipeline.orchestration.windows serve --config ',
-            normalize(generation + "/endpoint.json").lower(),
-        )
-        and working_directory == normalize(binding.get("state_root")).lower()
+        relation == "source"
+        and bool(previous)
+        and type(live.get("action_count")) is int
+        and live.get("action_count") == 1
+        and live.get("task_semantic_sha256") == source.get("task_semantic_sha256")
+        and live.get("task_acl_sha256") == source.get("task_acl_sha256")
+        and normalize(live.get("endpoint_root")) == normalize(source.get("endpoint_root"))
+        and normalize(live.get("config_path")) == normalize(source.get("config_path"))
+        and live.get("config_digest") == source.get("config_digest")
+        and live.get("install_id") == source.get("install_id")
+        and live.get("release_identity_sha256") == source.get("release_identity_sha256")
     )
 
 
-if runs(target):
-    print(source if source else "unknown")
-elif (
-    task_running
-    and exact_one_action
-    and launch_contract == "legacy_pip_launcher_v0"
-    and action_matches_generation
-    and source
-    and source_launcher
-    and source_config
-    and source_generation
-    and source_launcher == source_generation + "/runtime/scripts/description.exe"
-    and execute == source_launcher
-    and config == source_config
-    and arguments == ("serve --config ", normalize(source_config).lower())
-    and working_directory == normalize(binding.get("state_root")).lower()
-    and not has_source_arguments
-    and not has_source_working_directory
-):
-    # Transitional pending receipts predate the full source-action fields. They are accepted
-    # only for the exact approved legacy action proven by the live generation contract.
-    print("before")
-elif (
-    task_running
-    and exact_one_action
-    and action_matches_generation
-    and source
-    and source_launcher
-    and source_config
-    and source_arguments
-    and source_working_directory
-    and execute == source_launcher
-    and config == source_config
-    and arguments == source_arguments
-    and working_directory == source_working_directory
-    and (
-        (
-            source_launcher.endswith("/runtime/scripts/description.exe")
-            and launch_contract == "legacy_pip_launcher_v0"
-        )
-        or (
-            source_launcher.endswith("/runtime/scripts/python.exe")
-            and launch_contract == "python_module_v1"
-        )
+def target_matches() -> bool:
+    return (
+        relation == "target"
+        and bool(previous)
+        and type(live.get("action_count")) is int
+        and live.get("action_count") == 1
+        and normalize(live.get("endpoint_root")) == target
+        and normalize(live.get("config_path"))
+        == normalize(target_identity.get("config_path"))
+        and live.get("config_digest") == target_identity.get("config_digest")
+        and live.get("task_xml_sha256") == target_identity.get("task_xml_sha256")
+        and isinstance(target_identity.get("config_sha256"), str)
+        and bool(re.fullmatch(r"[0-9a-f]{64}", target_identity["config_sha256"]))
+        and isinstance(live.get("task_xml_sha256"), str)
+        and bool(re.fullmatch(r"[0-9a-f]{64}", live["task_xml_sha256"]))
     )
-):
-    # Positively the ACTUAL launcher and configuration this maintenance bound as its source.
+
+
+if target_matches():
+    print(previous)
+elif source_matches():
     print("before")
 else:
-    # A foreign, unparseable or unbound launcher is never claimed as an unswitched source.
     print("unknown")
 PY
       then

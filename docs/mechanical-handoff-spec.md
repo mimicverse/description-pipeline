@@ -2,7 +2,7 @@
 
 结构组交付完整、已保存、可重新打开的 SolidWorks 原生工程。流水线生成采集计划、模型、证据、URDF、网格、报告与 PR；工程师不编写流水线 YAML，不手工导出模型，不修改生成物。
 
-“必须”和“须”表示必需项。CAD 提供工程事实，允许采用明确规则进行规范化、计算和有依据的修正。规则须绑定本次原生对象与读数，保留原值、结果和依据，并由独立验证复算。不得从手工导出取得名称、轴向、限位或网格，也不得为匹配手工结果加入特例。所有非原生直接读取的值按[来源警告契约](contracts.md#value-provenance)显示 warning。
+“必须”和“须”表示必需项。CAD 提供工程事实，允许采用明确规则进行规范化、计算和有依据的修正。规则须绑定本次原生对象与读数，保留原值、结果和依据，并由独立验证复算。不得从手工导出取得名称、轴向、限位或网格，也不得为匹配手工结果加入特例。历史手工 URDF 只作为独立参考单元测试和回归测试 fixture，不进入生产或发布必经链。所有非原生直接读取的值按[来源警告契约](contracts.md#value-provenance)显示 warning。
 
 ## 交付范围与身份
 
@@ -86,15 +86,15 @@
 - 使用 Pack and Go 或等效方法收集，从收集目录重开并完全解析交付配置，不依赖原目录、个人路径或共享盘。
 - 内嵌虚拟组件可由已封存的所属装配提供几何，须以直接原生读取证明 `IsVirtual=True`、所属装配字节、实例、引用配置及当前受控会话中的 `VC~~` 文档归属；临时路径或虚拟标记单独出现不足以准入。不把临时文档当作上传来源，也不将其混同为 `IC~~` 导入缓存。不能建立完整绑定时拒绝采集。重复实例的全部引用配置保持有效。
 - 外部设计表、方程及上下文依赖须内嵌、收集或固化为可重新读取的受控原生结果。
-- 3D Interconnect 导入件绑定包内来源。引擎物化文档还须能通过原生所有者、实例身份和来源字节建立绑定；临时路径或可见缓存不足以证明来源。
+- 当前采集仅接纳已保存的普通文档及已证明的内嵌虚拟组件。原生 API 识别为 `IC~~` 缓存物化的组件在计划输入边界明确拒绝；普通文档的导入工具历史或名称不构成拒绝依据。
 - 不包含符号链接、junction、`.git`、大小写冲突、Windows 保留名称、非法字符、以空格/句点结尾的名称或 `~$` 锁文件。
 - 不将流水线生成的定义、交付清单、URDF 和网格作为工程输入。
 
-主装配及依赖以已保存原件交付，在发行物列明的受支持 SolidWorks 版本中从受控只读工作副本打开并完成重建。读取前后实际交付配置一致，配置本身不需重建，最终文档重建状态为完全重建；原件摘要始终不变。`GetSaveFlag` 只记录内存文档的保存提示，读取过程置位不等同于原件未保存；不得据此忽略配置不一致或未完成重建。所有参与对象完全解析，实体、基准、配合及质量可读；不能靠缓存图形、轻量状态或交互查找补救缺项。
+主装配及依赖以已保存原件交付，在发行物列明的受支持 SolidWorks 版本中只读打开，一次读取原生几何、轴线、配合、物性及对应对象、配置和位姿。实际参与读取的对象和原件必须可绑定，原件摘要始终不变；真实缺失、冲突和读取失败原样保留。辅助状态不触发 CAD 修改，也不替代所需原生读数的验证；坐标转换、模型生成和工程复算在释放 CAD 后离线完成。
 
 配置明确附件、负载、抑制与引用配置。隐藏只改变显示，不能定义物理排除。展示、运输或临时装配姿态不能自动当作机械零位。发生工程变化须形成新的原件版本，原交付保持可取且不被覆盖。
 
-封存原件在原生操作前后核对完整字节身份，不在原件上重建、保存或修复。原生工作副本与原件分别记录身份；引擎物化或改写的副本须保留原件到副本的完整绑定，不能冒充未变的原件。满足前述内嵌来源绑定要求的虚拟组件无需另存；若为解决无法绑定的来源而另存虚拟件、固化依赖或修正配置，这些工程准备须在冻结前完成并交付新版本。
+封存原件在原生读取前后核对完整字节身份，不执行 CAD 重建、保存或修复。原生读取位置与封存原件保留完整绑定，不能冒充未变的原件。满足前述内嵌来源绑定要求的虚拟组件无需另存；若为解决无法绑定的来源而另存虚拟件、固化依赖或修正配置，这些工程准备须在冻结前完成并交付新版本。
 
 导入来源证明同时保留引擎报告的来源/依赖路径、原生所有者与实例身份及包内来源摘要；验收须在原目录不可用且未借用缓存时重新解析。
 
@@ -107,7 +107,7 @@
 
 先建立当前配置的“实例 → 有据的刚体 → 原生关节两端”映射，再选择根和父子连接。依据包含完整配合端点、抑制与错误状态、约束剩余自由度，以及刚性/柔性子装配和跨装配配合的求解语义。约束状态按实际 API 版本解释；`IsFixed` 只说明装配固定锚点，`false` 不等于未连接，局部欠约束也须结合预期运动判定。多个同轴对象由原生引用消歧，轴线重合本身不确定连接两端。
 
-历史模型与手工导出可用于最终结果的只读比较和历史调查，不用于确定当前接口名、方向、归属、连接或数值真值，也不参与放行。局部约束秩或保存姿态下的刚性证明只适用于其对象、配置和姿态，不能外推为完整机构自由度资格。
+参考会话的模型专用资料只用于隔离测试与历史调查。参考测试须成对固定原生 CAD 输入与手工期望输出；切换时同时切换两者。配套 CAD 通过正常 Freeze 作为本次测试请求的原生输入，不能把 fixture 作为生产实现或固定配置。手工导出不进入任何生产阶段，不提供当前接口名、方向、归属、连接或数值真值，也不参与放行。参考测试只在 fixture 声明兼容的 CAD 原件、配置和修订上运行，按工程语义和有依据容差比较，不锁 XML／STL 字节、元素或三角形顺序或合法三角化；版本不同不得硬匹配旧 URDF。局部约束秩或保存姿态下的刚性证明只适用于其对象、配置和姿态，不能外推为完整机构自由度资格。
 
 模型以唯一 `base_link` 为根，支持固定、有限转动、连续转动和直线运动的树状连接。真实闭环、并联、齿轮、螺旋、耦合及其他多自由度关系不属于该模型表达范围，须保留真实设计，由平台明确报告不支持，不能通过删杆、解耦或固定被动件伪装。
 
@@ -158,6 +158,48 @@ CAD 方向表达偏离规范时给出明确 warning，按 CAD 运动关系和统
 参与实体非空且可读取，真实安装面、运动轴、关键尺寸与原生工程图一致。薄片、柔性、商业设备简模和可变负载必须明确边界与依据，不能用默认包络密度代表真实质量分布。
 
 材料核对实体级、零件级与配置级生效状态，来源库和密度固定可追溯。颜色、外观或材料名称文本不能代替赋值。缺少显式材料时保留原生质量、COM 和惯量并警告，但不建立材料真实性。
+
+外观在同一只读原生会话中记录 document 与 face 的无参 active-configuration 属性，并
+要求实际 active configuration 与 occurrence referenced configuration 相同。top、
+parent 和 component-document owner 分别保留自己的 configuration/display-state 与读取
+错误；`GetRenderMaterials2` 的 NULL 原值、同 state `GetRenderMaterialsCount2`、
+逐 face 的唯一原生实体／parent-body／feature 关系观察及成功或失败、实体 binding
+context、document QI 和纹理事实分别封存。Source 不另存可从同批观察推导的 body、
+feature、face 索引或 footprint；assembly occurrence 直接原生引用只保留一次。只有成功读取的 exact-state 总数确证为 0 时，NULL 才可证明没有
+state render assignment；present rows 的基数必须与总数一致。Generate 与 Verify 必须从
+material 实际 owner document 的 persistent reference、exact occurrence、配置与显示状态，
+与同一 owner 的原生观察独立 join。Generate 与 Verify 各自临时构造索引，不信任
+Source 预填匹配，也不增加两份封存派生结果的互比门。实际交付网格保持 occurrence
+对象；对 Part 内 face、body 和 feature assignment，须由几何遍历保留 assembly input
+context，再复用 current captured component source document 的 Part extension 对
+occurrence face 调用 `GetCorrespondingEntity2`；body 与 feature 从验证后的 Part face
+分别通过 `GetBody()`、`GetFeature()` 取得，最后由同一 Part extension 读取唯一 reference，并以
+`GetObjectByPersistReference3` 返回的 exact status `0` 和预期 `IFace2`/`IBody2`/`IFeature`
+QI 证明该 reference 仍属于同一 Part namespace。同一 reference 只解析一次并复用结果。
+父装配 extension 不是该转换或解析的 receiver；body 不调用 `GetCorresponding2`。
+材质实体记录完整 public QI 集合，并按实际 target kind 核验支持接口；文档目标不用补造
+实体 reference。body 的交付 face footprint 须由同次实际 Part-face parent-body 观察证明，
+不 first-face 代全体；合法同一 identity 对应多个 occurrence fragments 时保留其实际关系，
+不同 Part body 或缺失、分歧的见证不能按顺序、名称或 coverage 合并。
+
+不得把 assembly alias、双 namespace 或兜底匹配当成 Part 身份。按官方外观层级，
+assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
+part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不
+转换、提升或猜测其作用域。document target 必须核验 `IModelDoc2` QI、path 与 active
+configuration。part 内材质优先级为 `face > feature > body > part document`；document
+target 只表示 part 材质，不能提升为 assembly occurrence override。真实 assembly
+occurrence override 仍高于该 part 内层级。同一 native feature identity 可关联多个实际
+交付 face；原生关系观察冲突或不同 identity 被错误合并时不得扩大覆盖。
+
+最终表示按实际交付 face 的 triangle spans 生成一个或多个 visual/material；alpha 从原生
+透明度派生并保留来源 warning。`PrimaryColor` 按版本化 COLORREF 规则从低到高解码 RGB，
+alpha 为 `1-transparency`。present texture 缺少资产、UV 或绑定消费能力、对象或配置错绑
+以及未证明冲突必须失败。只有已证明的 leaf model document target、exact linked
+display-state ColorForm-one 单色 material、空 `TextureFilename`/`SurfaceFinishFile` 和
+完整 face coverage 同时成立时，旧 config-wide `GetTexture` pointer 才可作为非参与诊断
+保留；`MaterialName=""` 本身不表示 absence。与交付无关的辅助事实和 mapping 诊断可以
+保留，不为所有辅助错误另设全阻断门；实际参与对象的 owner key 不能唯一命中时仍须拒绝。
+不以默认色、伪造 empty、预填 effective 值或 warning 代替颜色与纹理资格。
 
 覆盖质量、COM 或惯量必须有可信来源、范围、配置、参考点、轴和单位；不向运动链接分摊父级覆盖。完整张量保留非对角项，不混用原点与质心惯量。平台按[质量规范](quality.md#physics)读取、转换与独立核验，工程师不抄写张量。
 

@@ -173,7 +173,7 @@ class StageTests(unittest.TestCase):
                 ("discovery.definition", "discovery.binding"),
             ),
             "capture": (
-                ("input.valid", "runtime.ready"),
+                ("input.valid",),
                 ("capture.integrity", "capture.input_stability"),
             ),
             "generate": (("generation.inputs",), ("generation.artifacts",)),

@@ -9,14 +9,15 @@ from pathlib import Path
 
 from . import _paths  # noqa: F401
 from . import support
+from description_pipeline.sources.solidworks.appearance import AppearanceError
 from description_pipeline.sources.solidworks.errors import ConfigError
-from description_pipeline.sources.solidworks.freeze import freeze as _freeze
 from description_pipeline.sources.solidworks.freeze import validate_source_config as _validate_source_config
 from description_pipeline.sources.solidworks.scene import load_scene
+from description_pipeline.sources.snapshot import write_manifest
 
 
 def freeze(config, *args, **kwargs):
-    return _freeze(support.capture_requests(config), *args, **kwargs)
+    return support.capture_prepared_fixture(config, *args, **kwargs)
 
 
 def validate_source_config(config):
@@ -71,6 +72,81 @@ def _compose_scene_inputs(destination: Path, cad_root: Path) -> None:
     )
 
 
+def _appearance_owner(
+    *,
+    configuration: str,
+    member: str,
+    active: bool = False,
+    values=None,
+    has_values: bool = False,
+    read_errors=None,
+):
+    material_call = (
+        {
+            "configuration_semantics": "active_configuration",
+            "active_configuration": configuration,
+        }
+        if active
+        else {
+            "configuration_semantics": "requested_configuration",
+            "configuration_option": 3,
+            "configuration_names": [configuration],
+        }
+    )
+    return {
+        "used_api": member,
+        "material_call": material_call,
+        "presence_call": {
+            "arguments": [],
+            "configuration_semantics": "native_owner_context",
+        },
+        "material_property_values": values,
+        "has_material_property_values": has_values,
+        "texture": {
+            "configuration": configuration,
+            "state": "absent",
+            "material_name": None,
+        },
+        "read_errors": dict(read_errors or {}),
+    }
+
+
+def _appearance_raw(component: str, scope: dict, *, claimed: bool = False):
+    configuration = str(scope["referenced_configuration"])
+    values = [0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4, 0.0, 0.0]
+    return {
+        "component": component,
+        "source_document_path": scope["source_document_path"],
+        "referenced_configuration": configuration,
+        "native_active_configuration": configuration,
+        "native_active_configuration_error": None,
+        "document": _appearance_owner(
+            configuration=configuration,
+            member="IModelDocExtension.GetMaterialPropertyValues",
+            values=values if claimed else None,
+            has_values=claimed,
+        ),
+        "occurrence": _appearance_owner(
+            configuration=configuration,
+            member="IComponent2.GetMaterialPropertyValues2",
+        ),
+        "bodies": [
+            {
+                "component": component,
+                "enumeration_api": "IComponent2.GetBodies3",
+                "body_type": 0,
+                "body_index": 0,
+                "body_name": component,
+                "appearance": _appearance_owner(
+                    configuration=configuration,
+                    member="IBody2.MaterialPropertyValues2",
+                    active=True,
+                ),
+            }
+        ],
+    }
+
+
 class CadMassAuthorityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-cad-mass-"))
@@ -96,7 +172,7 @@ class CadMassAuthorityTests(unittest.TestCase):
             "assembly": str(self.assembly),
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
-            "geometry": {"enabled": False},
+            "geometry": {"enabled": True},
             "coordinate_systems": ["CS_base_link", "CS_arm_link"],
             "bodies": [
                 {
@@ -122,6 +198,31 @@ class CadMassAuthorityTests(unittest.TestCase):
         snapshot = self.tmp / name
         freeze(dict(self.config), snapshot, backend=self.backend)
         return snapshot
+
+    def _install_appearance(self, *, claimed: bool) -> None:
+        capture_geometry = self.backend.capture_prepared_geometry
+
+        def capture_with_appearance(source_scopes, on_activity=None):
+            rows = capture_geometry(source_scopes, on_activity=on_activity)
+            for component, row in rows.items():
+                row["appearance_raw"] = _appearance_raw(
+                    component,
+                    row["source_scope"],
+                    claimed=claimed and component == "arm-1",
+                )
+            return rows
+
+        self.backend.capture_prepared_geometry = capture_with_appearance
+
+    @staticmethod
+    def _mark_as_native(snapshot: Path) -> None:
+        manifest = json.loads((snapshot / "manifest.json").read_text())
+        write_manifest(
+            snapshot,
+            kind=manifest["kind"],
+            identity=manifest["identity"],
+            evidence_class="cad",
+        )
 
     def test_manual_mass_configuration_is_rejected(self) -> None:
         for key, value in (
@@ -172,6 +273,42 @@ class CadMassAuthorityTests(unittest.TestCase):
         self.assertFalse((snapshot / "raw/declared_masses.json").exists())
         scene = load_scene(snapshot)
         self.assertNotIn("warnings", scene["provenance"])
+
+    def test_native_unrecorded_or_default_appearance_fails_generation(self) -> None:
+        for label, explicit in (("unrecorded", False), ("all_false_all_minus_one", True)):
+            with self.subTest(case=label):
+                if explicit:
+                    self._install_appearance(claimed=False)
+                snapshot = self._freeze("appearance-" + label)
+                _compose_scene_inputs(snapshot, self.tmp / "cad")
+                self._mark_as_native(snapshot)
+                with self.assertRaises(AppearanceError) as caught:
+                    load_scene(snapshot)
+                self.assertIn(
+                    (
+                        "cad_appearance_record_missing"
+                        if not explicit
+                        else "cad_appearance_display_state_invalid"
+                    ),
+                    {
+                        issue["code"]
+                        for issue in caught.exception.details["appearance"]["issues"]
+                    },
+                )
+
+    def test_generate_rejects_claimed_appearance_without_effective_scope(self) -> None:
+        self._install_appearance(claimed=True)
+        snapshot = self._freeze("appearance-claimed")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
+        self._mark_as_native(snapshot)
+        with self.assertRaises(AppearanceError) as caught:
+            load_scene(snapshot)
+        appearance = caught.exception.details["appearance"]
+        self.assertEqual(appearance["component"], "arm-1")
+        self.assertIn(
+            "cad_appearance_display_state_invalid",
+            {issue["code"] for issue in appearance["issues"]},
+        )
 
 
 if __name__ == "__main__":

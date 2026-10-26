@@ -6,10 +6,7 @@ qualification or a claim about a licensed SolidWorks installation.
 
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
-import os
 import shutil
 import subprocess
 import tempfile
@@ -18,19 +15,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-import numpy as np
-
 from description_pipeline import solidworks
 from description_pipeline.delivery import read_delivery_manifest
 from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.io import digest
 from description_pipeline.pipeline.contracts import ArtifactRef
-from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
+from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.runtime import tool_record
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
-from description_pipeline.sources.solidworks.native import normalize_document_path
 from description_pipeline.sources.solidworks.revision import package_inventory
-from description_pipeline.sources.solidworks.scene import combine_mass_properties
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend
@@ -103,432 +96,279 @@ def _mass_reading(mass: float, com: tuple[float, float, float], part_document: P
     }
 
 
+def _fixture_appearance_owner(configuration: str, values=None) -> dict:
+    return {
+        "used_api": "fixture-native-appearance-owner",
+        "material_call": {
+            "configuration_semantics": "active_configuration",
+            "active_configuration": configuration,
+        },
+        "presence_call": {
+            "arguments": [],
+            "configuration_semantics": "native_owner_context",
+        },
+        "material_property_values": values,
+        "has_material_property_values": values is not None,
+        "texture": {
+            "configuration": configuration,
+            "state": "absent",
+            "material_name": None,
+        },
+        "read_errors": {},
+    }
+
+
+def _fixture_appearance_raw(
+    component: str,
+    source_scope: dict,
+    face_inventory: list[dict],
+) -> dict:
+    configuration = str(source_scope["referenced_configuration"])
+    face_values = (
+        [0.7, 0.7, 0.7, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+        [0.15, 0.35, 0.75, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+    )
+    bodies = {}
+    for face in face_inventory:
+        body_key = (face["body_type"], face["body_index"])
+        body = bodies.setdefault(
+            body_key,
+            {
+                "component": component,
+                "enumeration_api": "IComponent2.GetBodies3",
+                "body_type": body_key[0],
+                "body_index": body_key[1],
+                "body_name": "fixture-solid",
+                "appearance": _fixture_appearance_owner(configuration),
+                "faces": [],
+            },
+        )
+        body["faces"].append(
+            {
+                "face_index": face["face_index"],
+                "appearance": {
+                    **_fixture_appearance_owner(
+                        configuration,
+                        face_values[face["face_index"] % 2],
+                    ),
+                    "native_identity": {
+                        "persistent_reference": [
+                            1,
+                            2,
+                            face["face_index"] + 3,
+                        ],
+                        "conversion": {
+                            "component": component,
+                            "input_context": {
+                                "owner_scope": "assembly_occurrence",
+                                "object_kind": "assembly_occurrence",
+                                "source_api": (
+                                    "IComponent2.GetBodies3/"
+                                    "IBody2.GetFaces"
+                                ),
+                                "traversal_api": (
+                                    "IConfiguration.GetRootComponent3/"
+                                    "IComponent2.GetChildren"
+                                ),
+                            },
+                            "receiver": {
+                                "owner_scope": "component_document",
+                                "owner_document_path": source_scope[
+                                    "source_document_path"
+                                ],
+                                "interface": "IModelDocExtension",
+                                "object_source": (
+                                    "captured_component_source_document"
+                                ),
+                            },
+                            "api": (
+                                "IModelDocExtension."
+                                "GetCorrespondingEntity2"
+                            ),
+                            "output_interface_kind": "IFace2",
+                            "output_domain": {
+                                "proof_api": (
+                                    "IModelDocExtension."
+                                    "GetObjectByPersistReference3"
+                                ),
+                                "status": 0,
+                                "interface_kind": "IFace2",
+                                "expected_owner_document_path": (
+                                    source_scope["source_document_path"]
+                                ),
+                            },
+                            "state": "observed",
+                            "read_errors": {},
+                        },
+                        "read_errors": {},
+                        "feature": {
+                            "name": "fixture-solid",
+                            "type_name": "Fixture",
+                            "persistent_reference": [4, 5, 6],
+                            "conversion": {
+                                "component": component,
+                                "input_context": {
+                                    "owner_scope": "assembly_occurrence",
+                                    "object_kind": "assembly_occurrence",
+                                    "source_api": (
+                                        "IComponent2.GetBodies3/"
+                                        "IBody2.GetFaces"
+                                    ),
+                                    "traversal_api": (
+                                        "IConfiguration."
+                                        "GetRootComponent3/"
+                                        "IComponent2.GetChildren"
+                                    ),
+                                },
+                                "receiver": {
+                                    "owner_scope": "component_document",
+                                    "owner_document_path": source_scope[
+                                        "source_document_path"
+                                    ],
+                                    "interface": "IModelDocExtension",
+                                    "object_source": (
+                                        "captured_component_source_document"
+                                    ),
+                                },
+                                "api": (
+                                    "IFace2.GetFeature+"
+                                    "IModelDocExtension."
+                                    "GetPersistReference3"
+                                ),
+                                "output_interface_kind": "IFeature",
+                                "output_domain": {
+                                    "proof_api": (
+                                        "IModelDocExtension."
+                                        "GetObjectByPersistReference3"
+                                    ),
+                                    "status": 0,
+                                    "interface_kind": "IFeature",
+                                    "expected_owner_document_path": (
+                                        source_scope[
+                                            "source_document_path"
+                                        ]
+                                    ),
+                                },
+                                "state": "observed",
+                                "read_errors": {},
+                            },
+                            "read_errors": {},
+                        },
+                    },
+                },
+            }
+        )
+    return {
+        "component": component,
+        "source_document_path": source_scope["source_document_path"],
+        "referenced_configuration": configuration,
+        "native_active_configuration": configuration,
+        "native_active_configuration_error": None,
+        "native_referenced_display_state": "Default_Display_State",
+        "native_referenced_display_state_error": None,
+        "document": _fixture_appearance_owner(configuration),
+        "occurrence": _fixture_appearance_owner(configuration),
+        "bodies": [bodies[key] for key in sorted(bodies)],
+        "state_render_materials": [
+            {
+                "owner_document_path": "fixture-top.SLDASM",
+                "owner_scope": "top_assembly",
+                "api": "IModelDocExtension.GetRenderMaterials2",
+                "display_state_option": 3,
+                "configuration": "Top Configuration",
+                "display_state": "Top Display State",
+                "display_states": [
+                    "Top Display State",
+                    "Alternate Top Display State",
+                ],
+                "display_states_state": "observed",
+                "native_render_material_count_api": (
+                    "IModelDocExtension.GetRenderMaterialsCount2"
+                ),
+                "native_render_material_count": 0,
+                "native_render_material_count_error": None,
+                "call_state": "empty",
+                "materials": [],
+                "mapping_errors": [],
+                "native_reference_index": [],
+                "read_errors": {},
+            },
+            {
+                "owner_document_path": "fixture-parent.SLDASM",
+                "owner_scope": "parent_assembly",
+                "api": "IModelDocExtension.GetRenderMaterials2",
+                "display_state_option": 3,
+                "configuration": "Parent Configuration",
+                "display_state": "Parent Display State",
+                "display_states": None,
+                "display_states_state": "not_applicable",
+                "native_render_material_count_api": (
+                    "IModelDocExtension.GetRenderMaterialsCount2"
+                ),
+                "native_render_material_count": 0,
+                "native_render_material_count_error": None,
+                "call_state": "empty",
+                "materials": [],
+                "mapping_errors": [],
+                "native_reference_index": [],
+                "read_errors": {},
+            },
+            {
+                "owner_document_path": source_scope["source_document_path"],
+                "owner_scope": "component_document",
+                "api": "IModelDocExtension.GetRenderMaterials2",
+                "display_state_option": 3,
+                "configuration": configuration,
+                "display_state": "Default_Display_State",
+                "display_states": None,
+                "display_states_state": "not_applicable",
+                "native_render_material_count_api": (
+                    "IModelDocExtension.GetRenderMaterialsCount2"
+                ),
+                "native_render_material_count": 0,
+                "native_render_material_count_error": None,
+                "call_state": "empty",
+                "materials": [],
+                "mapping_errors": [],
+                "native_reference_index": [],
+                "read_errors": {},
+            },
+        ],
+    }
+
+
 class QualifiedFixtureBackend(AxisFixtureBackend):
-    """A hermetic native-shaped backend with complete, internally consistent evidence."""
+    """Prepared one-session fixture with hermetic native environment metadata.
+
+    The backend emits the CAD evidence class required by native transfer, but
+    it has no native appearance facts. Tests that run past transfer must isolate
+    appearance qualification and must not claim a native appearance positive.
+    """
 
     name = "solidworks"
     evidence_class = "cad"
 
     def environment(self) -> dict:
-        if not hasattr(self, "_hermetic_source_pid"):
-            self._hermetic_source_pid = max(1, self.session_pid - 1)
         return {
+            **super().environment(),
             "revision": "34.0.0",
-            "input_mode": "saved_documents",
-            "sessions": {
-                "source": {
-                    "pid": self._hermetic_source_pid,
-                    "state": "closed",
-                },
-                "copy": {
-                    "pid": self.session_pid,
-                    "state": "active",
-                },
-            },
             "build": "hermetic-test",
             "license": 1,
             "visible": True,
         }
 
-    def retire_session(self, role: str = "copy") -> dict:
-        order = getattr(self, "order", None)
-        if order is None:
-            order = self.order = []
-        order.append("retire_session")
-        self.assert_role(role)
-        before = {
-            "pid": self.session_pid,
-            "state": "active",
-        }
-        self.retired_session_pids.append(self.session_pid)
-        self.open_documents.clear()
-        self.session_pid += 1
-        return {
-            "role": role,
-            "retired": True,
-            "before": before,
-            "after": {
-                "pid": before["pid"],
-                "state": "closed",
-            },
-        }
-
-    @staticmethod
-    def assert_role(role: str) -> None:
-        if role != "copy":
-            raise AssertionError(f"unexpected retired role: {role}")
-
-    def assembly_mass_properties(self, path: str) -> dict:
-        entries = []
-        for component in self.components:
-            reading = component["mass"]
-            transform = np.asarray(component["transform"], dtype=float).reshape(4, 4)
-            rotation = transform[:3, :3]
-            entries.append(
-                {
-                    "mass": reading["mass"],
-                    "com": rotation @ np.asarray(reading["com"], dtype=float) + transform[:3, 3],
-                    "inertia": rotation @ np.asarray(reading["inertia"], dtype=float) @ rotation.T,
-                }
-            )
-        combined = combine_mass_properties(entries)
-        return {
-            "mass": combined["mass"],
-            "com": combined["com"],
-            "inertia": combined["inertia"],
-            "reference": {
-                "used_api": "IMassProperty2.GetMomentOfInertia(0)",
-                "product_convention": "solidworks_standard",
-                "scope": "assembly_document",
-                "axes": "assembly_document_axes",
-                "reference_point": "center_of_mass",
-                "use_system_units": True,
-                "configuration": "Default",
-                "overrides": dict(OVERRIDES),
-            },
-        }
-
-    def assembly_component_mass_properties(self, path: str) -> dict:
-        return {
-            "assembly": path,
-            "configuration": "Default",
-            "instances": [
-                {
-                    "name": component["name"],
-                    "parent": None,
-                    "depth": 0,
-                    "document": str(component["path"]),
-                    "document_type": "part",
-                    "context_mass_kg": component["mass"]["mass"],
-                    "context_volume_m3": component["mass"]["reference"]["volume_m3"],
-                    "overrides": dict(OVERRIDES),
-                    "effective": None,
-                    "effective_error": None,
-                }
-                for component in self.components
-            ],
-            "errors": [],
-            "reference": {"method": "IMassProperty2 (SelectedItems = component instance)"},
-        }
-
-    def collect_scene(self, doc_path, coordinate_systems, on_activity=None, require_material=True):
-        scene = super().collect_scene(
-            doc_path,
-            coordinate_systems,
+    def capture_prepared_geometry(self, source_scopes, on_activity=None):
+        rows = super().capture_prepared_geometry(
+            source_scopes,
             on_activity=on_activity,
-            require_material=require_material,
         )
-        self._capture_component_paths = [
-            (str(component.name), str(component.path))
-            for component in scene.components
-        ]
-        configuration = "Default"
-        state = {
-            "save_flag": False,
-            "needs_rebuild2_value": 0,
-            "read_only": True,
-            "configuration": configuration,
-            "configuration_needs_rebuild": False,
-            "path": str(doc_path),
-            "configurations": [
-                {
-                    "name": configuration,
-                    "needs_rebuild": False,
-                    "add_rebuild_save_mark": False,
-                }
-            ],
-            "controls": {
-                "enable_assembly_rebuild": False,
-                "lightweight_component_count": 0,
-            },
-        }
-        source_files = {}
-        for path in [doc_path, *(component.path for component in scene.components)]:
-            key = normalize_document_path(os.path.abspath(path))
-            source_files.setdefault(
-                key,
-                {
-                    "path": str(path),
-                    "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
-                },
+        for component, row in rows.items():
+            row["appearance_raw"] = _fixture_appearance_raw(
+                component,
+                source_scopes[component],
+                row["face_inventory"],
             )
-        topology = [
-            {
-                "instance": "top",
-                "depth": 0,
-                "document_path": str(doc_path),
-                "normalized_path": normalize_document_path(os.path.abspath(doc_path)),
-                "document_type": 2,
-                "referenced_configuration": configuration,
-                "suppression_state": None,
-                "storage_scope": "file",
-                "provenance_state": None,
-                "owner_document_path": None,
-                "owner_sha256": None,
-                "native_api_pid": None,
-            },
-            *[
-                {
-                    "instance": component.name,
-                    "depth": 1,
-                    "document_path": component.path,
-                    "normalized_path": normalize_document_path(os.path.abspath(component.path)),
-                    "document_type": 1,
-                    "referenced_configuration": configuration,
-                    "suppression_state": 2,
-                    "storage_scope": "file",
-                    "provenance_state": None,
-                    "owner_document_path": None,
-                    "owner_sha256": None,
-                    "native_api_pid": None,
-                }
-                for component in scene.components
-            ],
-        ]
-        topology.sort(
-            key=lambda row: tuple(
-                "" if row.get(name) is None else str(row.get(name))
-                for name in (
-                    "instance",
-                    "normalized_path",
-                    "document_type",
-                    "referenced_configuration",
-                    "depth",
-                    "suppression_state",
-                    "storage_scope",
-                    "provenance_state",
-                )
-            )
-        )
-        top_sha256 = source_files[normalize_document_path(os.path.abspath(doc_path))]["sha256"]
-        loaded_types = {}
-        for row in topology:
-            if row["storage_scope"] == "suppressed":
-                continue
-            path = normalize_document_path(os.path.abspath(row["document_path"]))
-            prior = loaded_types.setdefault(path, row["document_type"])
-            if prior != row["document_type"]:
-                raise AssertionError("fixture loaded document type changed")
-        loaded_documents = {
-            "file_paths": sorted(loaded_types),
-            "session_paths": [],
-            "document_types": [
-                {"path": path, "document_type": document_type}
-                for path, document_type in sorted(loaded_types.items())
-            ],
-        }
-        scene.notes["capture_preparation"] = {
-            "session": {"role": "copy", "identity": self.environment()["sessions"]["copy"], "temp_root": None},
-            "schema_version": "solidworks-to-urdf.capture-preparation/v3",
-            "used_api": "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
-            "scope": "collected_copy_in_memory",
-            "document": str(doc_path),
-            "configuration": configuration,
-            "read_only": True,
-            "saved_to_disk": False,
-            "rebuild_performed": False,
-            "component_count": len(scene.components),
-            "assembly_document_count": 1,
-            "child_rebuilds": [],
-            "top_rebuild": None,
-            "rebuild_calls": [
-                {
-                    "kind": "initial",
-                    "initial_pending": [],
-                    "rebuild_candidates": [],
-                }
-            ],
-            "needs_rebuild2_before": 0,
-            "needs_rebuild2_after": 0,
-            "configuration_needs_rebuild_before": False,
-            "configuration_needs_rebuild_after": False,
-            "source_sha256_before": top_sha256,
-            "source_sha256_after": top_sha256,
-            "save_flag_before": False,
-            "save_flag_after": False,
-            "state_before": dict(state),
-            "state_after_children": dict(state),
-            "state_after": dict(state),
-            "assembly_states_before": [
-                {
-                    "depth": 0,
-                    "path": str(doc_path),
-                    "instances": ["top"],
-                    "state": dict(state),
-                }
-            ],
-            "assembly_states_after": [
-                {
-                    "depth": 0,
-                    "path": str(doc_path),
-                    "instances": ["top"],
-                    "state": dict(state),
-                }
-            ],
-            "part_states_after": [
-                {
-                    "path": str(component.path),
-                    "instances": [component.name],
-                    "state": {
-                        "save_flag": False,
-                        "needs_rebuild2_value": 0,
-                        "read_only": False,
-                        "configuration": configuration,
-                        "configuration_needs_rebuild": False,
-                        "path": str(component.path),
-                        "configurations": [
-                            {
-                                "name": configuration,
-                                "needs_rebuild": False,
-                                "add_rebuild_save_mark": False,
-                            }
-                        ],
-                    },
-                }
-                for component in scene.components
-            ],
-            "source_files_before": source_files,
-            "source_files_after": dict(source_files),
-            "session_dependency_paths": [],
-            "topology_before": topology,
-            "topology_after": [dict(row) for row in topology],
-            "loaded_documents_before": copy.deepcopy(loaded_documents),
-            "loaded_documents_after": copy.deepcopy(loaded_documents),
-            "session_recovery": None,
-        }
-        return scene
-
-    def verify_capture_documents_ready(self) -> dict:
-        top_path = str(self._capture_document)
-        documents = [
-            {
-                "path": top_path,
-                "document_type": 2,
-                "state": {
-                    "save_flag": False,
-                    "needs_rebuild2_value": 0,
-                    "read_only": True,
-                    "configuration": "Default",
-                    "configuration_needs_rebuild": False,
-                    "path": top_path,
-                    "configurations": [
-                        {
-                            "name": "Default",
-                            "needs_rebuild": False,
-                            "add_rebuild_save_mark": False,
-                        }
-                    ],
-                    "controls": {
-                        "enable_assembly_rebuild": False,
-                        "lightweight_component_count": 0,
-                    },
-                },
-            },
-            *[
-                {
-                    "path": component_path,
-                    "document_type": 1,
-                    "state": {
-                        "save_flag": False,
-                        "needs_rebuild2_value": 0,
-                        "read_only": False,
-                        "configuration": "Default",
-                        "configuration_needs_rebuild": False,
-                        "path": component_path,
-                        "configurations": [
-                            {
-                                "name": "Default",
-                                "needs_rebuild": False,
-                                "add_rebuild_save_mark": False,
-                            }
-                        ],
-                    },
-                }
-                for _component_name, component_path in self._capture_component_paths
-            ],
-        ]
-        return {
-            "document_count": len(documents),
-            "session": {"role": "copy", "identity": self.environment()["sessions"]["copy"], "temp_root": None},
-            "parts": sum(item["document_type"] == 1 for item in documents),
-            "assemblies": sum(item["document_type"] == 2 for item in documents),
-            "documents": documents,
-            "topology": [
-                {
-                    "instance": "top",
-                    "depth": 0,
-                    "document_path": top_path,
-                    "normalized_path": normalize_document_path(os.path.abspath(top_path)),
-                    "document_type": 2,
-                    "referenced_configuration": "Default",
-                    "suppression_state": None,
-                    "storage_scope": "file",
-                    "provenance_state": None,
-                    "owner_document_path": None,
-                    "owner_sha256": None,
-                    "native_api_pid": None,
-                },
-                *[
-                    {
-                        "instance": component_name,
-                        "depth": 1,
-                        "document_path": component_path,
-                        "normalized_path": normalize_document_path(os.path.abspath(component_path)),
-                        "document_type": 1,
-                        "referenced_configuration": "Default",
-                        "suppression_state": 2,
-                        "storage_scope": "file",
-                        "provenance_state": None,
-                        "owner_document_path": None,
-                        "owner_sha256": None,
-                        "native_api_pid": None,
-                    }
-                    for component_name, component_path in self._capture_component_paths
-                ],
-            ],
-        }
-
-    def export_component_meshes(self, destinations: dict[str, str], on_activity=None) -> dict[str, dict]:
-        entries = {}
-        for component, destination in destinations.items():
-            face_edges, native_edges = support.cube_native_edges(half=0.199999)
-            triangles, _attributes = support.cube_triangles(half=0.199999)
-            triangles = [(first, third, second) for first, second, third in triangles]
-            spans = []
-            start = 0
-            for face_index in range(6):
-                spans.append(
-                    {
-                        "body_type": 0,
-                        "body_index": 0,
-                        "body_name": "fixture-solid",
-                        "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
-                        "face_index": face_index,
-                        "face_reference_sha256": hashlib.sha256(f"fixture-face-{face_index}".encode()).hexdigest(),
-                        "face_owner_id": face_index + 1,
-                        "edge_references": face_edges[face_index],
-                        "triangle_start": start,
-                        "triangle_count": 2,
-                        "triangle_records_sha256": "0" * 64,
-                    }
-                )
-                start += 2
-            tessellation = support.native_tessellation_fixture(
-                spans,
-                native_edges,
-                triangle_vertices=triangles,
-            )
-            Path(destination).write_bytes(tessellation.stl_bytes)
-            self.exported.append(str(destination))
-            entries[component] = {
-                "component": component,
-                "written": destination,
-                "used_api": "IBody2.GetTessellation",
-                "triangles": len(triangles),
-                "bodies": {"solid": 1, "sheet": 0},
-                "tessellation": tessellation,
-            }
-        return entries
+        return rows
 
 
 class HermeticNativeFixture:
@@ -669,6 +509,15 @@ class HermeticNativeFixture:
             "owner_sha256": digest({"owner": "hermetic-capture"}),
             "run_id": RUN_ID,
         }
+        request = build_request_evidence(
+            purpose=PURPOSE_ENGINEERING,
+            request_id="hermetic-six-stage",
+            target_hardware="nd_fixture",
+            change_summary="Hermetic six-stage delivery",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=handoff_digest,
+            platform_config_digest="c" * 64,
+        )
         with patch("description_pipeline.runtime.tool_record", return_value=native_identity):
             from description_pipeline.pipeline.capture import (
                 _capture_native_transaction,
@@ -687,20 +536,9 @@ class HermeticNativeFixture:
                 native_tool_factory=lambda: dict(native_identity),
                 upstream_artifacts=upstream_artifacts,
                 execution=execution,
+                request_evidence=request,
             )
         self.assertEqual(capture["state"], "native_complete", capture.get("error"))
-        request = build_request_evidence(
-            purpose=PURPOSE_ENGINEERING,
-            request_id="hermetic-six-stage",
-            target_hardware="nd_fixture",
-            change_summary="Hermetic six-stage delivery",
-            main_assembly=MAIN_ASSEMBLY,
-            handoff_digest=handoff_digest,
-            platform_config_digest="c" * 64,
-        )
-        request_path = self.root / "capture/input/request.json"
-        request_path.parent.mkdir(parents=True, exist_ok=True)
-        request_path.write_bytes(request_evidence_bytes(request))
         return self.root / "capture", {"freeze": frozen, "capture": capture}
 
     def _repository(self) -> Path:

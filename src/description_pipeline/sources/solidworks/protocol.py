@@ -8,8 +8,9 @@ tested, without Windows or SolidWorks.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 Matrix = tuple[
     float,
@@ -56,7 +57,7 @@ def identity() -> Matrix:
 
 @dataclass
 class RawComponent:
-    """One SolidWorks component instance found while walking an assembly."""
+    """One projected component instance used by portable scene consumers."""
 
     name: str
     path: str = ""
@@ -67,17 +68,17 @@ class RawComponent:
 
 @dataclass
 class RawScene:
-    """Everything the contact layer read from one document, unmodified."""
+    """A projected scene consumed after the owned CAD session has closed."""
 
     document: str
     components: list[RawComponent] = field(default_factory=list)
     coordinate_systems: dict[str, Matrix] = field(default_factory=dict)
     mass_properties: dict[str, dict] = field(default_factory=dict)
-    notes: dict[str, str] = field(default_factory=dict)
+    notes: dict[str, Any] = field(default_factory=dict)
 
 
 class CadBackend:
-    """What the freeze path needs from a CAD host.
+    """What the prepared-capture path needs from a CAD host.
 
     Implementations raise the errors in :mod:`.errors`; a missing environment is
     reported as ``EnvironmentError_`` and never as an empty successful read.
@@ -85,51 +86,57 @@ class CadBackend:
 
     name = "abstract"
 
+    def session(self):
+        """Own the capture session and its COM lifetime."""
+
+        raise NotImplementedError
+
+    def release(self) -> None:
+        """Release all native objects before offline projection."""
+
+        raise NotImplementedError
+
     def health(self) -> dict:
         raise NotImplementedError
 
     def list_documents(self) -> list[str]:
         raise NotImplementedError
 
+    def prepare_prepared_capture(
+        self,
+        source_root: str,
+        assembly: str,
+        configuration: str,
+    ) -> dict:
+        """Bind the controlled prepared root, configuration and session role."""
+
+        raise NotImplementedError
+
     def open_document(self, path: str) -> dict:
         raise NotImplementedError
 
-    def retire_session(self, role: str = "copy") -> dict:
-        raise NotImplementedError
 
-    def close_document(self, name: str, confirm: bool = False) -> dict:
-        raise NotImplementedError
-
-    def collect_scene(
+    def collect_prepared_scene(
         self,
         doc_path: str,
         coordinate_systems: Sequence[str],
+        groups: Sequence[dict],
         on_activity=None,
         require_material: bool = True,
-    ) -> RawScene:
-        """Read one captured scene's occurrence tree and per-instance evidence.
-
-        ``on_activity`` optionally receives partial live-activity records
-        (``phase``/``action`` plus optional ``params``, ``current_object``,
-        ``completed``/``total``, ``unit``) while the read is blocking; it is
-        observation only and can never change the scene or the failure
-        behaviour.  Callbacks observed by the pipeline are invoked defensively.
-        """
+    ) -> dict[str, Any]:
+        """Read raw scene, mass, pose, configuration and source facts in COM."""
 
         raise NotImplementedError
 
-    def export_component_meshes(self, destinations: dict[str, str], on_activity=None) -> dict[str, dict]:
-        """Export one geometry batch while its native parent interfaces stay alive.
-
-        ``on_activity`` follows the same record contract as
-        :meth:`collect_scene`; it observes mesh progress (current component
-        name plus ``completed``/``total``) and can never fail the export.
-        """
+    def capture_prepared_geometry(
+        self,
+        source_scopes: Mapping[str, dict],
+        on_activity=None,
+    ) -> dict[str, dict]:
+        """Read direct occurrence triangles into memory without file output."""
 
         raise NotImplementedError
 
-    def verify_sources_unchanged(self) -> dict[str, dict]:
-        raise NotImplementedError
 
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         """Read the raw native primitives used for CAD-only semantic discovery.

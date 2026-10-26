@@ -17,7 +17,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror
@@ -73,9 +73,31 @@ from description_pipeline.platform.facts import (
     FactStore,
     FactStoreError,
 )
+from description_pipeline.orchestration.native_operation_client import (
+    NativeOperationClient,
+    NativeOperationEndpoint,
+)
+from description_pipeline.orchestration.native_operation_runtime import (
+    CAPTURE_KIND,
+    CaptureOperationExecutor,
+    NativeOperationRuntime,
+)
+from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE
+from description_pipeline.orchestration.windows import handler as windows_handler
+from description_pipeline.platform.queries import read_run_projection
+from description_pipeline.sources.solidworks.revision import package_inventory
+from description_pipeline.orchestration.discover_protocol import seal_source_archive
+from description_pipeline.orchestration.portal import PortalApp
+from description_pipeline.stages import activity_view
+from tests.v1.test_native_operations import (
+    NATIVE_TOOL,
+    TOKEN,
+    _operation,
+)
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     DISCOVER_RESULT_SCHEMA,
+    RUN_ACTIVITY_SCHEMA,
     STAGE_RESULT_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
     VERIFY_REQUEST_SCHEMA,
@@ -298,6 +320,15 @@ class _FailureHandler:
             "domain_input_invalid",
             "The domain input is definitely invalid",
             unavailable_reason="diagnostic sealing deliberately unavailable",
+            detail={
+                "appearance": {
+                    "issues": (
+                        {
+                            "code": "cad_appearance_effective_scope_unproven",
+                        },
+                    )
+                }
+            },
         )
 
     def validate_candidate(self, command, claim, candidate, *, effects):
@@ -2148,11 +2179,21 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
     def test_minimal_failure_envelope_does_not_require_diagnostic_seal(self) -> None:
         result = self._execute(_FailureHandler())
         self.assertNotIsInstance(result, StageResult)
+        expected_detail = {
+            "appearance": {
+                "issues": (
+                    {
+                        "code": "cad_appearance_effective_scope_unproven",
+                    },
+                )
+            }
+        }
         decision = self.facts.decision_for(self.command)
         self.assertIsNotNone(decision)
         self.assertIsNone(decision.result_record_artifact)
         self.assertIsNotNone(decision.failure_envelope)
         self.assertEqual(decision.failure_envelope.reason_code, "domain_input_invalid")
+        self.assertEqual(decision.failure_envelope.error_detail, expected_detail)
         self.assertEqual(decision.failure_envelope.unavailable_reason, "diagnostic sealing deliberately unavailable")
         rows = self._query(
             "SELECT result_record_artifact_id, failure_envelope, failure_digest "
@@ -2163,6 +2204,26 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertIsNone(rows[0][0])
         self.assertIsNotNone(rows[0][1])
         self.assertIsNotNone(rows[0][2])
+        self.assertEqual(
+            rows[0][1]["error_detail"],
+            {
+                "appearance": {
+                    "issues": [
+                        {
+                            "code": "cad_appearance_effective_scope_unproven",
+                        },
+                    ]
+                }
+            },
+        )
+        restarted = FactStore(self._connect, self.artifacts).decision_for(
+            self.command
+        )
+        self.assertEqual(restarted.failure_envelope, result)
+        self.assertEqual(
+            restarted.failure_envelope.error_detail,
+            expected_detail,
+        )
         self.assertTrue(result.retained_locations)
         self.assertTrue(Path(result.retained_locations[0]).is_dir())
 
@@ -2222,6 +2283,289 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "decision commit response lost",
             (workspaces[0] / "engine-unhandled-failure.json").read_text(encoding="utf-8"),
         )
+
+    def test_runtime_activity_reaches_portal_without_becoming_stage_authority(self) -> None:
+        package = Path(self.directory.name) / "activity-package"
+        package_files = {
+            "cad/robot.SLDASM": b"prepared assembly",
+            "source.json": b"prepared source",
+        }
+        for relative, payload in package_files.items():
+            path = package / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        prepared_files = package_inventory(package)
+        archive = seal_source_archive(
+            package,
+            prepared_files,
+            Path(self.directory.name) / "activity-input.zip",
+        )
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def transaction(_package, output, **kwargs):
+            kwargs["on_activity"](
+                {
+                    "phase": "capture",
+                    "action": "readings",
+                    "current_object": "cad/robot.SLDASM",
+                    "completed": 1,
+                    "total": 3,
+                    "unit": "documents",
+                }
+            )
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("activity executor was not released")
+            output = Path(output)
+            output.mkdir(parents=True)
+            (output / CAPTURE_ARCHIVE).write_bytes(b"activity artifact")
+            return {
+                "native_complete": True,
+                "capture_archive": {"name": CAPTURE_ARCHIVE},
+                "resource_settlement": {"settled": True},
+            }
+
+        runtime = NativeOperationRuntime(
+            state_root=Path(self.directory.name) / "activity-runtime",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={
+                CAPTURE_KIND: CaptureOperationExecutor(
+                    transaction=transaction,
+                )
+            },
+            install_id="win-" + "e" * 32,
+        )
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            windows_handler(runtime, TOKEN),
+        )
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        server_thread.start()
+        self.addCleanup(runtime.close)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server_thread.join, 5)
+        host, port = server.server_address[:2]
+        client = NativeOperationClient(
+            NativeOperationEndpoint(f"http://{host}:{port}", TOKEN),
+            target_id=runtime.target_identity.target_id,
+            sleeper=lambda _seconds: time.sleep(0.01),
+        )
+        operation_id = "operation-activity"
+        envelope = _operation(
+            operation_id,
+            archive,
+            target_id=runtime.target_identity.target_id,
+            package_files=prepared_files,
+        )
+        decisions_before = self._query(
+            "SELECT count(*) FROM stage_decision"
+        )[0][0]
+        effects_before = self._query("SELECT count(*) FROM effect_fact")[0][0]
+        display_before = self.facts.rename_run(
+            self.admission.run_id,
+            "activity display",
+        )
+
+        client.create_operation(envelope)
+        client.upload_input(operation_id, archive)
+        self.assertTrue(entered.wait(5))
+
+        terminal = {}
+        manual_ordering = threading.Event()
+        manual_ordering_lock = threading.Lock()
+
+        def poll() -> None:
+            def observe(view) -> None:
+                terminal_state = view.state in {
+                    "satisfied",
+                    "failed",
+                    "cancelled",
+                    "unknown",
+                }
+                with manual_ordering_lock:
+                    if manual_ordering.is_set() and not terminal_state:
+                        return
+                    self.facts.record_run_activity(
+                        self.admission.run_id,
+                        view.operation_id,
+                        view.activity,
+                        terminal=terminal_state,
+                    )
+
+            try:
+                terminal["view"] = client.wait_for_terminal(
+                    operation_id,
+                    timeout=5,
+                    poll_interval=0.01,
+                    on_observation=observe,
+                )
+            except BaseException as error:
+                terminal["error"] = error
+
+        poll_thread = threading.Thread(target=poll, daemon=True)
+        poll_thread.start()
+
+        def release_poll() -> None:
+            release.set()
+            poll_thread.join(5)
+
+        # unittest cleanups run on assertion failure as well as success, so a failed ordering
+        # assertion cannot leave the callback polling while the test is being torn down.
+        self.addCleanup(release_poll)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            row = self._query(
+                "SELECT activity FROM run_display_metadata WHERE run_id = %s",
+                (self.admission.run_id,),
+            )
+            if row and row[0][0] is not None:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail(
+                "native activity was not projected into run_display_metadata: "
+                f"events={runtime._events(operation_id)!r} terminal={terminal!r}"
+            )
+        # Acquiring the same lock drains any callback that observed the open gate before it can
+        # be mistaken for a later observation. Once the gate is set, subsequent nonterminal
+        # callbacks are ignored while terminal callbacks remain accepted.
+        with manual_ordering_lock:
+            manual_ordering.set()
+
+        projection = read_run_projection(
+            self._connect(),
+            self.admission.run_id,
+            artifacts=self.artifacts,
+        )
+        self.assertEqual(projection["activity"]["current"]["action"], "readings")
+        display = self._query(
+            "SELECT display_name, updated_at, activity "
+            "FROM run_display_metadata WHERE run_id = %s",
+            (self.admission.run_id,),
+        )[0]
+        self.assertEqual(display[0], "activity display")
+        self.assertEqual(display[1], display_before.updated_at)
+        self.assertEqual(display[2]["schema_version"], RUN_ACTIVITY_SCHEMA)
+        self.assertEqual(display[2]["operation_id"], operation_id)
+        self.assertIsInstance(display[2]["source_seq"], int)
+        self.assertGreater(display[2]["source_seq"], 0)
+        self.assertEqual(display[2]["current"]["action"], "readings")
+        self.assertIsNone(display[2]["final"])
+        projection["state"] = "running"
+        job = PortalApp._fact_display_job(
+            object.__new__(PortalApp),
+            projection,
+        )
+        self.assertIsNotNone(job)
+        view = activity_view(job)
+        self.assertTrue(view["available"])
+        self.assertEqual(view["state"], "busy")
+        self.assertEqual(view["action"]["code"], "capture.readings")
+        self.assertEqual(view["object"], "cad/robot.SLDASM")
+        self.assertEqual(
+            view["counts"],
+            {"done": 1, "total": 3, "unit": "documents"},
+        )
+        stored = display[2]
+        previous_at = datetime.fromisoformat(stored["current"]["updated_at"])
+        stale_at = (previous_at - timedelta(milliseconds=1)).isoformat()
+        newer_at = (previous_at + timedelta(milliseconds=1)).isoformat()
+        same_source = {
+            "seq": stored["source_seq"],
+            "at": stored["current"]["updated_at"],
+            "phase": "capture",
+            "action": "mesh",
+        }
+        self.facts.record_run_activity(
+            self.admission.run_id,
+            operation_id,
+            same_source,
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT activity->'current'->>'action' "
+                "FROM run_display_metadata WHERE run_id = %s",
+                (self.admission.run_id,),
+            )[0][0],
+            "readings",
+        )
+        self.facts.record_run_activity(
+            self.admission.run_id,
+            "operation-after",
+            {
+                "seq": 1,
+                "at": previous_at.isoformat(),
+                "phase": "capture",
+                "action": "mesh",
+            },
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT activity->>'operation_id' "
+                "FROM run_display_metadata WHERE run_id = %s",
+                (self.admission.run_id,),
+            )[0][0],
+            "operation-after",
+        )
+        self.facts.record_run_activity(
+            self.admission.run_id,
+            operation_id,
+            {
+                "seq": stored["source_seq"],
+                "at": stale_at,
+                "phase": "capture",
+                "action": "readings",
+            },
+            terminal=True,
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT activity->>'operation_id' "
+                "FROM run_display_metadata WHERE run_id = %s",
+                (self.admission.run_id,),
+            )[0][0],
+            "operation-after",
+        )
+        self.facts.record_run_activity(
+            self.admission.run_id,
+            operation_id,
+            {
+                "seq": stored["source_seq"] + 1,
+                "at": newer_at,
+                "phase": "capture",
+                "action": "readings",
+                "current_object": "cad/robot.SLDASM",
+                "completed": 1,
+                "total": 3,
+                "unit": "documents",
+            },
+        )
+        self.assertEqual(
+            self._query("SELECT count(*) FROM stage_decision")[0][0],
+            decisions_before,
+        )
+        self.assertEqual(
+            self._query("SELECT count(*) FROM effect_fact")[0][0],
+            effects_before,
+        )
+
+        release.set()
+        poll_thread.join(5)
+        self.assertFalse(poll_thread.is_alive())
+        self.assertNotIn("error", terminal)
+        self.assertEqual(terminal["view"].state, "satisfied")
+        final_projection = read_run_projection(
+            self._connect(),
+            self.admission.run_id,
+            artifacts=self.artifacts,
+        )
+        self.assertEqual(final_projection["activity"]["final"]["action"], "readings")
 
     def test_expected_executor_drift_stops_before_handler_execution(self) -> None:
         wrong_tool = digest({"tool": "other-release"})

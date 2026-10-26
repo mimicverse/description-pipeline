@@ -5,6 +5,7 @@ seals native observations and their source configuration; Linux constructs the
 link-frame scene when generation consumes those observations.
 """
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +15,6 @@ from ...io import PipelineError, confined, digest, inventory, read_data
 def derive_engineering_input(root: Path, manifest: dict) -> dict:
     """Construct Generate input using only a verified SolidWorks snapshot."""
     from .evidence import (
-        REWRITE_ENVIRONMENT_EVIDENCE,
         RUNTIME_EVIDENCE,
         metadata_value_warnings,
     )
@@ -52,14 +52,85 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
             "this workflow requires a capture made by the direct-link-readout pipeline"
         )
     link_groups = read_data(confined(root, "raw/link_group_mass_properties.json"))
-    components = raw.get("components")
-    if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
-        raise PipelineError("Captured component readings must be objects")
     geometry = (
         read_data(confined(root, "raw/geometry.json"))
         if "raw/geometry.json" in manifest["files"]
         else []
     )
+    if "raw/native_capture_facts.json" in manifest["files"]:
+        from .appearance import bind_capture_appearance
+
+        raw, geometry = bind_capture_appearance(
+            raw,
+            geometry,
+            read_data(confined(root, "raw/native_capture_facts.json")),
+        )
+    components = raw.get("components")
+    if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
+        raise PipelineError("Captured component readings must be objects")
+    if manifest.get("evidence_class") != "fixture":
+        from .appearance import (
+            UNRECORDED_APPEARANCE,
+            appearance_groups,
+            resolve_deliverable_appearance,
+        )
+        from ...geometry.native_tessellation import native_stl_subset
+
+        components_by_name = {str(row.get("name") or ""): row for row in components}
+        for entry in geometry:
+            component = str(entry.get("component") or "")
+            source_scope = entry.get("source_scope") or {}
+            raw_component = components_by_name.get(component)
+            tessellation = entry.get("tessellation")
+            face_spans = (
+                tessellation.get("face_spans")
+                if isinstance(tessellation, dict)
+                else None
+            )
+            if not isinstance(face_spans, list) or not face_spans:
+                raise PipelineError(
+                    f"Native appearance has no delivered face spans: {component}"
+                )
+            resolution = resolve_deliverable_appearance(
+                (
+                    raw_component.get("appearance_raw", UNRECORDED_APPEARANCE)
+                    if raw_component is not None
+                    else UNRECORDED_APPEARANCE
+                ),
+                component=component,
+                expected_document_path=source_scope.get("source_document_path"),
+                expected_configuration=source_scope.get(
+                    "referenced_configuration"
+                ),
+                face_spans=face_spans,
+            )
+            source_path = confined(root, str(entry.get("path") or ""))
+            source_bytes = source_path.read_bytes()
+            if hashlib.sha256(source_bytes).hexdigest() != entry.get("sha"):
+                raise PipelineError(
+                    f"Native appearance source STL differs from its geometry record: {component}"
+                )
+            groups = []
+            for group in appearance_groups(resolution.faces):
+                subset, triangles = native_stl_subset(
+                    source_bytes,
+                    group["triangle_ranges"],
+                )
+                expected_triangles = sum(
+                    row["triangle_count"]
+                    for row in group["triangle_ranges"]
+                )
+                if triangles != expected_triangles:
+                    raise PipelineError(
+                        f"Native appearance subset count is inconsistent: {component}"
+                    )
+                groups.append(
+                    {
+                        **group,
+                        "mesh_sha256": hashlib.sha256(subset).hexdigest(),
+                    }
+                )
+            entry["appearance_groups"] = groups
     readings = SimpleNamespace(
         components=[SimpleNamespace(**row) for row in components],
         coordinate_systems=datums,
@@ -95,23 +166,13 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
         return payload, digest
 
     runtime, runtime_sha256 = evidence_source(RUNTIME_EVIDENCE, "native-runtime.json")
-    rewrite, rewrite_sha256 = evidence_source(
-        REWRITE_ENVIRONMENT_EVIDENCE,
-        "evidence/rewrite-environment.json",
-    )
     native_tool_path = confined(delivery, "reports/native-tool.json")
     native_tool = read_data(native_tool_path)
-    closure = read_data(confined(root, "raw/dependency_closure.json"))
-    if not isinstance(closure, dict):
-        raise PipelineError("Captured dependency closure must be an object")
     metadata_warnings = metadata_value_warnings(
         runtime,
-        rewrite,
         expected_tool=native_tool,
         runtime_sha256=runtime_sha256,
-        rewrite_sha256=rewrite_sha256,
         expected_configuration=str(config.get("configuration") or ""),
-        closure_top_level=str(closure.get("top_level") or ""),
     )
     provenance = scene.setdefault("provenance", {})
     # Native producer paths remain in raw evidence. The model retains only a

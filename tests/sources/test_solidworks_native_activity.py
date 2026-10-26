@@ -254,7 +254,11 @@ class ActivityEmissionTests(unittest.TestCase):
             try:
                 native_module._ACTIVITY_MIN_INTERVAL_SECONDS = 0.0
                 records = []
-                scene = backend.collect_scene(str(assembly), [], on_activity=records.append)
+                scene = backend.capture_scene_for_test(
+                    str(assembly),
+                    [],
+                    on_activity=records.append,
+                )
             finally:
                 native_module._ACTIVITY_MIN_INTERVAL_SECONDS = original
 
@@ -286,7 +290,11 @@ class ActivityEmissionTests(unittest.TestCase):
             def exploded(_record):
                 raise RuntimeError("collector exploded")
 
-            scene = backend.collect_scene(str(assembly), [], on_activity=exploded)
+            scene = backend.capture_scene_for_test(
+                str(assembly),
+                [],
+                on_activity=exploded,
+            )
             self.assertEqual([component.name for component in scene.components], ["arm1"])
 
     def test_keepalive_refreshes_the_last_record_until_stopped(self) -> None:

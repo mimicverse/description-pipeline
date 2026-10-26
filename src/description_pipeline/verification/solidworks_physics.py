@@ -16,9 +16,16 @@ import numpy as np
 
 from ..io import PipelineError, confined
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
-from ..sources.solidworks import verify as oracle
 from ..sources.snapshot import verify_snapshot
-from . import native_discovery as evidence
+from ..sources.solidworks import verify as oracle
+from . import capture_evidence as evidence
+from . import native_capture_facts as native_capture_checks
+from .native_capture_facts import (
+    _finite_matrix3,
+    _finite_number,
+    _finite_vector3,
+    _require,
+)
 
 MASS_RTOL = 1e-6
 MASS_CLOSURE_ATOL = 1e-12
@@ -54,25 +61,6 @@ INSTANCE_MEASUREMENT_QUALIFICATION = (
     "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
     "not geometry-derived, not independently physically qualified"
 )
-
-
-def _require(passed, message):
-    if not bool(passed):
-        raise PipelineError(message)
-
-
-def _finite_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
-
-
-def _finite_vector3(value: object) -> bool:
-    return isinstance(value, list) and len(value) == 3 and all(_finite_number(item) for item in value)
-
-
-def _finite_matrix3(value: object) -> bool:
-    return isinstance(value, list) and len(value) == 3 and all(_finite_vector3(row) for row in value)
-
-
 def _require_measured_reading(measured: dict, row: dict, reference: dict, name: str) -> None:
     """The recorded measurement must quote the captured component reading exactly."""
 
@@ -440,6 +428,10 @@ def _direct_link_sum(record: dict, source: dict) -> tuple[float, np.ndarray, np.
 def verify_urdf_mass_equality(bundle_root: Path, source: dict | None = None) -> dict:
     """Mandatory whole-CAD equality for the delivered URDF.
 
+    Before comparing the model, every projected scene/part/assembly/effective/
+    link-group value is bound back to the sealed pre-projection native facts.
+    The projector is not used as an oracle.
+
     The actual delivered URDF XML inertial mass sum, plus the independently
     measured mass of every native occurrence that no selected body claims,
     must equal the bound ``mass_closure`` capture block's whole-assembly
@@ -453,6 +445,7 @@ def verify_urdf_mass_equality(bundle_root: Path, source: dict | None = None) -> 
     """
 
     root = Path(bundle_root)
+    native_capture_checks.verify_native_capture_facts(root)
     try:
         payload = evidence.mass_closure(root)
     except (OSError, PipelineError) as error:
@@ -1109,8 +1102,8 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 )
                 if any(overrides.values()):
                     # A single-occurrence selection surfaces the instance's
-                    # authored override as an object-level flag in the pristine
-                    # reopened window; instance overrides are part of the CAD
+                    # authored override as an object-level flag in the captured
+                    # readout; instance overrides are part of the CAD
                     # value, so the active flags are recorded verbatim instead
                     # of refused (whole-assembly and per-instance readers keep
                     # their own refusals).
@@ -1184,7 +1177,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 details["object_overrides"] = object_override_notes
                 details["object_overrides_note"] = (
                     "single-occurrence selections surface the instance's authored overrides as "
-                    "object-level flags in the pristine window; recorded verbatim, not refused"
+                    "object-level flags in the captured readout; recorded verbatim, not refused"
                 )
             return details
 

@@ -23,7 +23,6 @@ from description_pipeline.sources.solidworks.isolation import (  # noqa: E402
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
     SolidWorksBackend,
     _read_only_document,
-    normalize_document_path,
 )
 
 
@@ -75,167 +74,31 @@ class AbortOwnedProcessesTests(unittest.TestCase):
 
 
 class SessionTests(unittest.TestCase):
-    def test_capture_rebuild_cannot_touch_the_original_assembly(self):
-        backend = SolidWorksBackend()
-        backend._capture_roots = [normalize_document_path("/snapshot/source")]
-        doc = Mock()
-        with self.assertRaises(CadError) as caught:
-            backend._rebuild_capture_copy(doc, "/handoff/robot.SLDASM")
-        self.assertEqual(caught.exception.code, "cad_rebuild_scope")
-        doc.ForceRebuild3.assert_not_called()
-
-    def test_capture_rebuild_is_in_memory_and_failure_blocks_measurement(self):
-        backend = SolidWorksBackend()
-        backend._sessions["copy"] = Mock(
-            closed=False, identity=Mock(return_value={"pid": 100, "state": "active"}),
-        )
-        backend._capture_roots = [normalize_document_path("/snapshot/source")]
-        extension = SimpleNamespace(
-            NeedsRebuild2=1,
-            Rebuild=Mock(spec=["__call__"], return_value=True),
-        )
-        configuration = SimpleNamespace(
-            Name="Default",
-            NeedsRebuild=False,
-            AddRebuildSaveMark=False,
-            GetRootComponent3=lambda _visible: SimpleNamespace(GetChildren=list),
-        )
-        doc = SimpleNamespace(
-            ConfigurationManager=SimpleNamespace(
-                ActiveConfiguration=configuration,
-            ),
-            Extension=extension,
-            GetConfigurationNames=lambda: ["Default"],
-            GetConfigurationByName=lambda _name: configuration,
-            GetLightWeightComponentCount=lambda: 0,
-            GetSaveFlag=False,
-            GetPathName="/snapshot/source/robot.SLDASM",
-            GetType=lambda: 2,
-            IsOpenedReadOnly=True,
-            EnableAssemblyRebuild=False,
-            Save=Mock(),
-            ForceRebuild3=Mock(spec=["__call__"], return_value=True),
-        )
-
-        def rebuild(_options):
-            extension.NeedsRebuild2 = 0
-            return True
-
-        extension.Rebuild.side_effect = rebuild
-        refreshed = []
-
-        def refresh(path):
-            refreshed.append(path)
-            return doc
-
-        backend._document_by_path = refresh
-        backend._capture_loaded_documents = Mock(
-            return_value=[
-                {
-                    "doc": doc,
-                    "identity": id(doc),
-                    "normalized_path": normalize_document_path(
-                        os.path.abspath(doc.GetPathName)
-                    ),
-                    "path": doc.GetPathName,
-                    "document_type": 2,
-                }
-            ]
-        )
-        with patch(
-            "description_pipeline.sources.solidworks.native._hash",
-            return_value="a" * 64,
-        ):
-            rebuilt, result = backend._rebuild_capture_copy(doc, doc.GetPathName)
-        self.assertIs(rebuilt, doc)
-        self.assertEqual(result["scope"], "collected_copy_in_memory")
-        self.assertFalse(result["saved_to_disk"])
-        self.assertTrue(result["read_only"])
-        self.assertTrue(result["rebuild_performed"])
-        extension.Rebuild.assert_called_once_with(2)
-        doc.ForceRebuild3.assert_not_called()
-        doc.Save.assert_not_called()
-        self.assertEqual(refreshed, [doc.GetPathName])
-        extension.NeedsRebuild2 = 1
-        extension.Rebuild.side_effect = None
-        extension.Rebuild.return_value = False
-        with patch(
-            "description_pipeline.sources.solidworks.native._hash",
-            return_value="a" * 64,
-        ), self.assertRaises(CadError) as caught:
-            backend._rebuild_capture_copy(doc, doc.GetPathName)
-        self.assertEqual(caught.exception.code, "cad_rebuild_failed")
-        self.assertEqual(caught.exception.detail["path"], doc.GetPathName)
-        self.assertIs(caught.exception.detail["result"], False)
-        self.assertEqual(refreshed, [doc.GetPathName])
-
-    def test_capture_rebuild_rejects_truthy_non_boolean_result(self):
-        backend = SolidWorksBackend()
-        backend._capture_roots = [normalize_document_path("/snapshot/source")]
-        extension = SimpleNamespace(
-            NeedsRebuild2=1,
-            Rebuild=Mock(spec=["__call__"], return_value=1),
-        )
-        configuration = SimpleNamespace(
-            Name="Default",
-            NeedsRebuild=False,
-            AddRebuildSaveMark=False,
-            GetRootComponent3=lambda _visible: SimpleNamespace(GetChildren=list),
-        )
-        doc = SimpleNamespace(
-            ConfigurationManager=SimpleNamespace(
-                ActiveConfiguration=configuration,
-            ),
-            Extension=extension,
-            GetConfigurationNames=lambda: ["Default"],
-            GetConfigurationByName=lambda _name: configuration,
-            GetLightWeightComponentCount=lambda: 0,
-            GetSaveFlag=False,
-            GetPathName="/snapshot/source/robot.SLDASM",
-            GetType=lambda: 2,
-            IsOpenedReadOnly=True,
-            EnableAssemblyRebuild=False,
-        )
-        backend._document_by_path = Mock(return_value=doc)
-        backend._capture_loaded_documents = Mock(
-            return_value=[
-                {
-                    "doc": doc,
-                    "identity": id(doc),
-                    "normalized_path": normalize_document_path(
-                        os.path.abspath(doc.GetPathName)
-                    ),
-                    "path": doc.GetPathName,
-                    "document_type": 2,
-                }
-            ]
-        )
-        with patch(
-            "description_pipeline.sources.solidworks.native._hash",
-            return_value="a" * 64,
-        ), self.assertRaises(CadError) as caught:
-            backend._rebuild_capture_copy(doc, doc.GetPathName)
-        self.assertEqual(caught.exception.code, "cad_rebuild_failed")
-        self.assertEqual(caught.exception.detail["result"], 1)
-        backend._document_by_path.assert_not_called()
-
     def test_loaded_references_must_also_be_read_only(self):
-        doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT")
+        state = {"read_only": False}
+        doc = SimpleNamespace(
+            IsOpenedReadOnly=lambda: state["read_only"],
+            GetPathName=lambda: "part.SLDPRT",
+        )
         calls = []
 
         def protect(value):
             calls.append(value)
-            doc.IsOpenedReadOnly = value
+            state["read_only"] = value
             return True
 
         doc.SetReadOnlyState = protect
         self.assertIs(_read_only_document(doc), doc)
-        self.assertTrue(doc.IsOpenedReadOnly)
+        self.assertTrue(doc.IsOpenedReadOnly())
         _read_only_document(doc)
         self.assertEqual(calls, [True])
 
     def test_read_only_failure_blocks_capture(self):
-        doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT", SetReadOnlyState=lambda value: True)
+        doc = SimpleNamespace(
+            IsOpenedReadOnly=lambda: False,
+            GetPathName=lambda: "part.SLDPRT",
+            SetReadOnlyState=lambda value: True,
+        )
         with self.assertRaises(CadError) as caught:
             _read_only_document(doc)
         self.assertEqual(caught.exception.code, "cad_read_only_failed")
@@ -558,7 +421,7 @@ class SessionTests(unittest.TestCase):
         session.close()
         process.close.assert_called_once()
 
-    def test_backend_releases_source_and_copy_after_failed_capture(self):
+    def test_backend_releases_the_single_session_after_failed_capture(self):
         sessions = []
 
         def factory():
@@ -572,21 +435,10 @@ class SessionTests(unittest.TestCase):
 
         backend = SolidWorksBackend(session_factory=factory)
         with self.assertRaisesRegex(RuntimeError, "failed"), backend.session():
-            source = backend._app_for_path("/source/robot.SLDASM")
-            from description_pipeline.sources.solidworks.native import normalize_document_path
-
-            copy_root = os.path.abspath("/copy")
-            backend._capture_roots.append(normalize_document_path(copy_root))
-            copied = backend._app_for_path(os.path.join(copy_root, "robot.SLDASM"))
-            self.assertIsNot(source, copied)
-            with backend.session():
-                with self.assertRaises(EnvironmentError_) as retired:
-                    backend._app_for_path("/source/robot.SLDASM")
-                self.assertEqual(retired.exception.code, "cad_session_retired")
+            backend._app_for_path("/prepared/robot.SLDASM")
             raise RuntimeError("failed")
-        self.assertEqual(len(sessions), 2)
+        self.assertEqual(len(sessions), 1)
         sessions[0].close.assert_called_once()
-        sessions[1].close.assert_called_once()
         self.assertEqual(backend._sessions, {})
 
 

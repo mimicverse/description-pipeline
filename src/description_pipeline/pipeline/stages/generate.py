@@ -21,6 +21,7 @@ from ..contracts import (
     StageCandidate,
     StageCommand,
     StageExecution,
+    StageFailure,
     StageResult,
 )
 from ..effects import StageEffectPort
@@ -125,8 +126,18 @@ def _write_output(
     capture: _CaptureInput,
     destination: Path,
 ) -> tuple[str, EngineeringModel]:
+    from ...sources.solidworks.appearance import AppearanceError
+
     tool, actual_executor = _actual_tool(command, claim)
-    model = _compile_capture(capture)
+    try:
+        model = _compile_capture(capture)
+    except AppearanceError as error:
+        raise StageFailure(
+            "generate.appearance_unrepresentable",
+            str(error),
+            error_type=type(error).__name__,
+            detail=error.details,
+        ) from error
     if destination.exists():
         raise PipelineError(f"Generate output already exists: {destination}")
     destination.mkdir(parents=True)

@@ -933,12 +933,6 @@ def _upstream_records(inputs: CaptureInputs) -> tuple[dict[str, Any], ...]:
     )
 
 
-def _native_tool_record() -> dict[str, Any]:
-    from ..runtime import tool_record
-
-    return tool_record(role="native")
-
-
 @contextmanager
 def _capture_output_lock(output: Path):
     """One attempt owns the destination lock for the complete native transaction."""
@@ -1059,25 +1053,23 @@ def _seal_native_capture_artifact(
     *,
     run_id: str,
     handoff_sha256: str,
-    upload_sha256: str | None,
+    upload_sha256: str,
     main_assembly: str,
-    upstream_artifacts=None,
-    execution=None,
-    native_tool: dict[str, Any] | None = None,
+    upstream_artifacts: tuple[dict[str, Any], ...],
+    execution: Mapping[str, Any],
+    native_tool: dict[str, Any],
 ) -> dict[str, Any]:
     """Seal the native artifact and atomically install the completed Capture tree."""
 
     from ..native_transfer import expected_native_check_details
     from ..orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
 
-    upload_sha256 = upload_sha256 or handoff_sha256
-    tool = native_tool or _native_tool_record()
-    write_json(staging / "reports/native-tool.json", tool)
+    write_json(staging / "reports/native-tool.json", native_tool)
     receipt.update(
         state="native_complete",
         passed=False,
         native_complete=True,
-        native_tool=tool,
+        native_tool=native_tool,
         stage="capture",
         resource_settlement={
             "settled": True,
@@ -1111,9 +1103,9 @@ def _seal_native_capture_artifact(
         handoff_sha256=handoff_sha256,
         upload_sha256=upload_sha256,
         main_assembly=main_assembly,
-        native_tool=tool,
+        native_tool=native_tool,
         upstream_artifacts=upstream_artifacts,
-        execution=execution,
+        execution=dict(execution),
     )
     receipt["upload_sha256"] = upload_sha256
     write_json(staging / CAPTURE_MANIFEST, manifest)
@@ -1132,18 +1124,18 @@ def _capture_native_transaction(
     package: Path,
     output: Path,
     *,
-    backend=None,
+    backend: Any,
     run_id: str,
     on_event=None,
     on_activity=None,
-    expected_inputs: Mapping[str, str] | None = None,
+    expected_inputs: Mapping[str, str],
     handoff_sha256: str,
-    upload_sha256: str | None = None,
+    upload_sha256: str,
     main_assembly: str,
-    upstream_artifacts: tuple[dict[str, Any], ...] | None = None,
-    execution: Mapping[str, Any] | None = None,
-    native_tool_factory: Callable[[], dict[str, Any]] | None = None,
-    request_evidence: Mapping[str, Any] | None = None,
+    upstream_artifacts: tuple[dict[str, Any], ...],
+    execution: Mapping[str, Any],
+    native_tool_factory: Callable[[], dict[str, Any]],
+    request_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Run the real native Capture transaction and seal its artifact.
 
@@ -1168,24 +1160,23 @@ def _capture_native_transaction(
         )
         event = _capture_event_sink(receipt, on_event)
         try:
-            if request_evidence is not None:
-                validate_request_record(request_evidence)
-                request_path = staging / "input/request.json"
-                request_path.parent.mkdir(parents=True, exist_ok=True)
-                request_path.write_bytes(
-                    canonical(dict(request_evidence))
-                )
+            validate_request_record(request_evidence)
+            request_path = staging / "input/request.json"
+            request_path.parent.mkdir(parents=True, exist_ok=True)
+            request_path.write_bytes(
+                canonical(dict(request_evidence))
+            )
             _, input_report = capture_native_package(
                 package,
                 staging,
                 backend=backend,
                 on_event=event,
                 on_activity=on_activity,
-                expected_inputs=dict(expected_inputs) if expected_inputs is not None else None,
+                expected_inputs=dict(expected_inputs),
                 handoff_sha256=handoff_sha256,
             )
             receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
-            tool = (native_tool_factory or _native_tool_record)()
+            tool = native_tool_factory()
             return _seal_native_capture_artifact(
                 staging,
                 output,
@@ -1195,7 +1186,7 @@ def _capture_native_transaction(
                 upload_sha256=upload_sha256,
                 main_assembly=main_assembly,
                 upstream_artifacts=upstream_artifacts,
-                execution=dict(execution) if execution is not None else None,
+                execution=execution,
                 native_tool=tool,
             )
         except Exception as error:
@@ -1554,7 +1545,6 @@ class CaptureHandler:
             expected_main_assembly=request.main_assembly,
             expected_native_tool=tool,
             expected_prepared_dir=None,
-            expected_prepared_files=dict(inputs.prepared_files),
             expected_upstream_artifacts=_upstream_records(inputs),
             expected_execution=execution_record,
         )

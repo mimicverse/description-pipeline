@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from description_pipeline.orchestration.report_view import build_report
-from description_pipeline.stages import CONTRACT
+from description_pipeline.stages import CONTRACT, activity_view
 from description_pipeline.verification.solidworks_urdf import evaluate_bundle
 from tests.v1.protocol_support import protocol_events
 
@@ -63,11 +63,6 @@ def passed_job() -> dict:
             "files": {"handoff/a.SLDPRT": "a" * 64, "handoff/b.SLDPRT": "b" * 64, "handoff/c.SLDPRT": "c" * 64}
         },
         "discovery.definition": {"passed": True, "findings": [], "hardware_id": "nd_cfg_gap", "revision": "r1"},
-        "runtime.ready": {
-            "role": "native",
-            "scope": "Native prerequisites; the capture session checks CAD access and document readiness",
-            "solidworks_executable": "D:\\DOWNLO~1\\SOLIDWORKS\\SLDWORKS.exe",
-        },
         "publication.inputs": {
             "repository_slug": "example/repo",
             "base": "feature/nd_cfg_gap",
@@ -94,6 +89,48 @@ def passed_job() -> dict:
 
 
 class ReportViewTests(unittest.TestCase):
+    def test_activity_view_keeps_native_read_release_and_offline_phases(self) -> None:
+        view = activity_view(
+            {
+                "status": "running",
+                "events": [],
+                "activity_history": [
+                    {
+                        "at": "2026-10-25T21:20:01Z",
+                        "code": "capture.readings",
+                        "object": "robot.SLDASM",
+                    },
+                    {
+                        "at": "2026-10-25T21:20:02Z",
+                        "code": "capture.geometry_facts",
+                        "object": "arm-1",
+                    },
+                    {
+                        "at": "2026-10-25T21:20:03Z",
+                        "code": "capture.release",
+                        "object": None,
+                    },
+                ],
+                "activity": {
+                    "phase": "capture",
+                    "action": "scene_projection",
+                    "started_at": "2026-10-25T21:20:03Z",
+                    "updated_at": "2026-10-25T21:20:04Z",
+                    "current_object": "robot.SLDASM",
+                },
+            }
+        )
+        self.assertEqual(view["state"], "busy")
+        self.assertEqual(view["action"]["code"], "capture.scene_projection")
+        self.assertEqual(
+            [item["code"] for item in view["recent"]],
+            [
+                "capture.release",
+                "capture.geometry_facts",
+                "capture.readings",
+            ],
+        )
+
     def test_source_warning_objects_and_rule_fields_survive_the_report_projection(self) -> None:
         from description_pipeline.orchestration.report_view import _warning_row
 
@@ -201,14 +238,6 @@ class ReportViewTests(unittest.TestCase):
         definition = next(row for row in discover["boundary"] if row["id"] == "discovery.definition")
         self.assertIn("Hardware nd_cfg_gap", definition["summary"]["actual"])
         self.assertIn("blocking findings 0", definition["summary"]["actual"])
-        runtime = next(row for row in stages["capture"]["boundary"] if row["id"] == "runtime.ready")
-        # Native readiness reports prerequisites; the CAD session itself is not claimed here, and
-        # the raw host executable path never reaches the operator summary.
-        self.assertEqual(runtime["summary"]["expected"], "Native platform and SolidWorks are ready")
-        self.assertIn("Windows, COM, and SolidWorks prerequisites", runtime["summary"]["actual"])
-        self.assertIn("capture session", runtime["summary"]["actual"])
-        self.assertNotIn("not recorded", runtime["summary"]["actual"])
-        self.assertNotIn("SLDWORKS.exe", runtime["summary"]["actual"])
         consumer = independent["consumer.urdf"]
         self.assertEqual(consumer["label"], "Consumer URDF loadability")
         self.assertIn("4 consumer bodies", consumer["summary"]["actual"])
@@ -358,51 +387,59 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(failure["raw_detail"], {"body": "r_thigh_yaw"})
         self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
 
-    def test_codified_native_failure_projects_its_recorded_context(self) -> None:
+    def test_generate_appearance_failure_preserves_object_phase_and_details(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="generate")
+        job["error"] = "AppearanceError: CAD appearance cannot be represented faithfully"
+        job["error_code"] = "generate.appearance_unrepresentable"
+        job["detail"] = {
+            "appearance": {
+                "component": "arm-1",
+                "state": "unrepresentable",
+                "issues": [
+                    {
+                        "code": "cad_appearance_effective_scope_unproven",
+                        "path": "appearance_raw",
+                        "message": "delivered-face coverage is not proven",
+                    }
+                ],
+                "claims": [],
+            }
+        }
+        job["activity_final"] = {
+            "stage": "generate",
+            "phase": "generate",
+            "action": "validate_appearance",
+            "current_object": "arm-1",
+        }
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["stage"], "generate")
+        self.assertEqual(failure["error_code"], "generate.appearance_unrepresentable")
+        self.assertEqual(failure["object"], "arm-1")
+        self.assertEqual(failure["phase"], "validate_appearance")
+        self.assertEqual(
+            failure["values"]["appearance"],
+            job["detail"]["appearance"],
+        )
+
+    def test_capture_import_failure_keeps_real_error_without_native_identity(self) -> None:
         job = passed_job()
         job["status"] = "failed"
         job["events"] = protocol_events(subject=SHA, failed_stage="capture")
-        job["error"] = "Capture preparation did not end in a fully rebuilt read-only state"
-        job["error_code"] = "cad_rebuild_incomplete"
-        job["detail"] = {
-            "path": (
-                "C:\\description-v1-review\\endpoint-deliveries\\capture\\"
-                "evidence.partial\\source\\M3.0.3_20261016.SLDASM"
-            ),
-            "rebuilt": True,
-            "state": {
-                "configuration": "Default",
-                "configuration_needs_rebuild": False,
-                "needs_rebuild2_value": 1,
-                "read_only": True,
-                "save_flag": True,
-            },
-        }
-        job["activity_final"] = {
-            "action": "prepare_capture",
-            "current_object": "M3.0.3_20261016.SLDASM",
-            "phase": "capture",
-        }
-        job["diagnostic_path"] = (
-            "C:\\description-v1-review\\endpoint-deliveries\\261ea3ec-5eb0-5746-9760-389b1c21c2d4.failed"
-        )
-
+        job["error"] = "ModuleNotFoundError: No module named 'yaml'"
         failure = build_report(job)["failure"]
-
         self.assertEqual(failure["stage"], "capture")
-        self.assertEqual(failure["title"], "Native CAD stage failed")
+        self.assertEqual(failure["title"], "Native runtime import failed")
         self.assertEqual(failure["kind"], "runtime")
-        self.assertEqual(failure["error_code"], "cad_rebuild_incomplete")
-        self.assertEqual(failure["object"], "M3.0.3_20261016.SLDASM")
-        self.assertEqual(failure["phase"], "prepare_capture")
+        self.assertEqual(failure["phase"], "capture")
         self.assertEqual(
             failure["cause"],
-            "Capture preparation did not end in a fully rebuilt read-only state",
+            "ModuleNotFoundError: No module named 'yaml'",
         )
-        self.assertEqual(failure["values"]["rebuilt"], True)
-        self.assertEqual(failure["values"]["state"]["needs_rebuild2_value"], 1)
-        self.assertEqual(failure["evidence_path"], job["diagnostic_path"])
-        self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
+        self.assertEqual(failure["actual_native_activity"], "Not recorded")
+        self.assertEqual(failure["actual_native_identity"], "Not recorded")
+        self.assertNotIn("object", failure)
 
     def test_publish_failure_does_not_use_stale_capture_activity(self) -> None:
         job = passed_job()
@@ -773,7 +810,7 @@ class ReportViewTests(unittest.TestCase):
         metadata_object = {
             "object_type": "metadata",
             "object": "evidence/native-runtime.json",
-            "fields": ["/session_boundary/opened/read_only"],
+            "fields": ["/solidworks/revision"],
             "source": "open_document operation claim",
             "rule_id": "metadata.operation_claim",
             "rule_version": "v1",

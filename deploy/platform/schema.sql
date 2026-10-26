@@ -340,9 +340,13 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".run_display_metadata (
     display_name text,
     hidden_at timestamptz,
     hidden_reason text,
+    activity jsonb,
     updated_at timestamptz NOT NULL DEFAULT now(),
     CHECK ((hidden_at IS NULL) = (hidden_reason IS NULL))
 );
+
+ALTER TABLE :"platform_schema".run_display_metadata
+    ADD COLUMN IF NOT EXISTS activity jsonb;
 
 CREATE OR REPLACE FUNCTION :"platform_schema".reject_immutable_fact_mutation()
 RETURNS trigger

@@ -12,7 +12,8 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -55,6 +56,7 @@ _STATES = frozenset(
 _TERMINAL_STATES = frozenset({"satisfied", "failed", "cancelled", "unknown"})
 _SHA_CHARS = frozenset("0123456789abcdef")
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_ACTIVITY_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
 _WINDOWS_RESERVED_NAMES = frozenset(
     {
         "CON",
@@ -352,6 +354,71 @@ class NativeFailureView:
         return cls(code=value["code"], message=value["message"])
 
 
+def _activity_record(value: object) -> dict[str, object]:
+    """Validate one bounded activity observation without extending operation state."""
+
+    if not isinstance(value, Mapping):
+        raise NativeOperationError("activity must be an object")
+    record = copy.deepcopy(dict(value))
+    if set(record) - {
+        "phase",
+        "action",
+        "current_object",
+        "params",
+        "completed",
+        "total",
+        "unit",
+    }:
+        raise NativeOperationError("activity fields are invalid")
+    phase = record.get("phase")
+    action = record.get("action")
+    if phase not in _KINDS or not isinstance(action, str) or _ACTIVITY_TOKEN.fullmatch(action) is None:
+        raise NativeOperationError("activity phase or action is invalid")
+    current_object = record.get("current_object")
+    if current_object is not None and (
+        not isinstance(current_object, str)
+        or not current_object
+        or len(current_object) > 160
+        or "\x00" in current_object
+    ):
+        raise NativeOperationError("activity current_object is invalid")
+    params = record.get("params")
+    if params is not None:
+        if not isinstance(params, Mapping) or len(params) > 6:
+            raise NativeOperationError("activity params are invalid")
+        for name, item in params.items():
+            if (
+                not isinstance(name, str)
+                or _ACTIVITY_TOKEN.fullmatch(name) is None
+                or (
+                    type(item) not in {bool, int}
+                    and not (
+                        isinstance(item, str)
+                        and len(item) <= 120
+                        and "\x00" not in item
+                    )
+                )
+            ):
+                raise NativeOperationError("activity params are invalid")
+    completed = record.get("completed")
+    total = record.get("total")
+    if (completed is None) != (total is None):
+        raise NativeOperationError("activity counts must be paired")
+    if completed is not None and (
+        type(completed) is not int
+        or type(total) is not int
+        or completed < 0
+        or total < completed
+    ):
+        raise NativeOperationError("activity counts are invalid")
+    unit = record.get("unit")
+    if unit is not None and (
+        not isinstance(unit, str) or _ACTIVITY_TOKEN.fullmatch(unit) is None
+    ):
+        raise NativeOperationError("activity unit is invalid")
+    return record
+
+
 @dataclass(frozen=True, slots=True)
 class NativeOperationView:
     schema_version: str
@@ -372,6 +439,7 @@ class NativeOperationView:
     created_at: str
     started_at: str | None
     finished_at: str | None
+    activity: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != OPERATION_VIEW_SCHEMA:
@@ -401,6 +469,20 @@ class NativeOperationView:
         _timestamp(self.created_at, "created_at")
         _timestamp(self.started_at, "started_at", optional=True)
         _timestamp(self.finished_at, "finished_at", optional=True)
+        if self.activity is not None:
+            if not isinstance(self.activity, Mapping):
+                raise NativeOperationError("activity must be an object")
+            activity = copy.deepcopy(dict(self.activity))
+            if type(activity.get("seq")) is not int or activity["seq"] <= 0:
+                raise NativeOperationError("activity sequence is invalid")
+            _timestamp(activity.get("at"), "activity.at")
+            payload = {
+                key: item
+                for key, item in activity.items()
+                if key not in {"seq", "at"}
+            }
+            _activity_record(payload)
+            object.__setattr__(self, "activity", activity)
         if self.state == "satisfied":
             if self.artifact is None or not self.resource_terminated:
                 raise NativeOperationError(
@@ -414,7 +496,7 @@ class NativeOperationView:
             raise NativeOperationError("A terminal operation requires finished_at")
 
     def to_record(self) -> dict[str, object]:
-        return {
+        record = {
             "schema_version": self.schema_version,
             "operation_id": self.operation_id,
             "kind": self.kind,
@@ -434,6 +516,9 @@ class NativeOperationView:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }
+        if self.activity is not None:
+            record["activity"] = copy.deepcopy(dict(self.activity))
+        return record
 
     @classmethod
     def from_record(cls, record: Mapping[str, object]) -> NativeOperationView:
@@ -459,7 +544,7 @@ class NativeOperationView:
             "started_at",
             "finished_at",
         }
-        if set(record) != expected:
+        if not expected <= set(record) or set(record) - (expected | {"activity"}):
             raise NativeOperationError(
                 "Native operation view fields are incomplete or unknown",
                 detail={
@@ -488,6 +573,7 @@ class NativeOperationView:
             created_at=record["created_at"],
             started_at=record["started_at"],
             finished_at=record["finished_at"],
+            activity=record.get("activity"),
         )
 
 
@@ -1899,6 +1985,20 @@ class NativeOperationRuntime:
         ):
             shutil.rmtree(workspace, ignore_errors=True)
             return
+        if isinstance(executor, (DiscoverOperationExecutor, CaptureOperationExecutor)):
+            previous_observer = executor.on_activity
+
+            def runtime_activity(record: Mapping[str, object]) -> None:
+                with suppress(Exception):
+                    self._append(
+                        operation_id,
+                        "activity",
+                        _activity_record(record),
+                    )
+                if previous_observer is not None:
+                    previous_observer(record)
+
+            executor = replace(executor, on_activity=runtime_activity)
         try:
             result = executor(
                 dict(intent.request),
@@ -2142,6 +2242,7 @@ class NativeOperationRuntime:
         executor_sha256 = None
         started_at = None
         finished_at = None
+        activity = None
         if "input_admitted" in types:
             state = "awaiting_input"
         if "claimed" in types or "execution_started" in types:
@@ -2157,6 +2258,13 @@ class NativeOperationRuntime:
                 owner_sha256 = payload.get("owner_sha256")
             elif event["type"] == "execution_started":
                 started_at = event["at"]
+            elif event["type"] == "activity":
+                payload = _activity_record(event["payload"])
+                activity = {
+                    "seq": event["seq"],
+                    "at": event["at"],
+                    **payload,
+                }
             elif event["type"] == "artifact_sealed":
                 artifact = NativeArtifactView(
                     name=payload["name"],
@@ -2206,6 +2314,7 @@ class NativeOperationRuntime:
             created_at=str(row["created_at"]),
             started_at=started_at,
             finished_at=finished_at,
+            activity=activity,
         )
 
     def view(

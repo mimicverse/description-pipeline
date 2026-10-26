@@ -772,12 +772,16 @@ class NativeOperationClient:
         *,
         timeout: float = 600.0,
         poll_interval: float = 0.2,
+        on_observation: Callable[[NativeOperationView], None] | None = None,
     ) -> NativeOperationView:
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("timeout and poll_interval must be positive")
         deadline = self._clock() + timeout
         while True:
             view = self.get_operation(operation_id)
+            if on_observation is not None and getattr(view, "activity", None) is not None:
+                with suppress(Exception):
+                    on_observation(view)
             if view.state in _TERMINAL_STATES:
                 return view
             remaining = deadline - self._clock()
@@ -1627,7 +1631,6 @@ class NativeOperationEffectObserver:
         upstream = [
             dict(record) for record in native_request.upstream_artifacts
         ]
-        prepared_files = dict(native_request.package_files)
         operation_id = identity.operation_id
         observed = self._operation(
             operation_id,
@@ -1724,7 +1727,6 @@ class NativeOperationEffectObserver:
             expected_main_assembly=request.main_assembly,
             expected_native_tool=native_tool,
             expected_prepared_dir=None,
-            expected_prepared_files=prepared_files,
             expected_upstream_artifacts=upstream,
             expected_execution=execution,
         )
@@ -1899,6 +1901,7 @@ class NativeOperationCapturePort:
     client: NativeOperationClient
     timeout: float = 600.0
     poll_interval: float = 0.2
+    on_observation: Callable[[str, NativeOperationView], None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.client, NativeOperationClient):
@@ -2149,11 +2152,20 @@ class NativeOperationCapturePort:
             view = self.client.upload_input(operation_id, archive)
             expected.require(view)
         if view.state not in _TERMINAL_STATES:
+            def observe(value: NativeOperationView) -> None:
+                if self.on_observation is not None:
+                    with suppress(Exception):
+                        self.on_observation(request.run_id, value)
+
             view = self.client.wait_for_terminal(
                 operation_id,
                 timeout=self.timeout,
                 poll_interval=self.poll_interval,
+                on_observation=observe,
             )
+        elif self.on_observation is not None and getattr(view, "activity", None) is not None:
+            with suppress(Exception):
+                self.on_observation(request.run_id, view)
         expected.require(view)
         receipt = view.to_record()
         if view.state == "satisfied":
@@ -2207,6 +2219,7 @@ def capture_handler_from_native_operation(
     timeout: float = 600.0,
     poll_interval: float = 0.2,
     tool_provider: NativeOperationToolProvider | None = None,
+    on_observation: Callable[[str, NativeOperationView], None] | None = None,
 ):
     """Build CaptureHandler with the Windows port and no local CAD fallback."""
 
@@ -2222,6 +2235,7 @@ def capture_handler_from_native_operation(
             client,
             timeout=timeout,
             poll_interval=poll_interval,
+            on_observation=on_observation,
         ),
         native_tool_factory=tool_provider,
     )
@@ -2236,6 +2250,7 @@ class NativeOperationDiscoverPort:
     timeout: float = 600.0
     poll_interval: float = 0.2
     tool_provider: Callable[[], Mapping[str, object]] | None = None
+    on_observation: Callable[[str, NativeOperationView], None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.client, NativeOperationClient):
@@ -2326,6 +2341,9 @@ class NativeOperationDiscoverPort:
             if error.status is None or error.status >= 500:
                 return None
             raise
+        if self.on_observation is not None and getattr(view, "activity", None) is not None:
+            with suppress(Exception):
+                self.on_observation(request.run_id, view)
         return self._observation_from_view(
             view,
             request,
@@ -2375,6 +2393,9 @@ class NativeOperationDiscoverPort:
             raise
         if view is None:
             return None
+        if self.on_observation is not None and getattr(view, "activity", None) is not None:
+            with suppress(Exception):
+                self.on_observation(request.run_id, view)
         return self._observation_from_view(
             view,
             request,
@@ -2474,6 +2495,7 @@ def discover_adapter_from_native_operation(
     *,
     timeout: float = 600.0,
     poll_interval: float = 0.2,
+    on_observation: Callable[[str, NativeOperationView], None] | None = None,
 ) -> NativeRemoteDiscoverAdapter:
     """Build Discover with one observed full Windows tool record."""
 
@@ -2487,6 +2509,7 @@ def discover_adapter_from_native_operation(
             tool_provider(),
             timeout=timeout,
             poll_interval=poll_interval,
+            on_observation=on_observation,
         ),
         artifacts=artifacts,
     )

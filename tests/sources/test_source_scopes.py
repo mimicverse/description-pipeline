@@ -12,7 +12,7 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.io import PipelineError, digest  # noqa: E402
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA  # noqa: E402
-from description_pipeline.verification.native_discovery import (  # noqa: E402
+from description_pipeline.verification.capture_evidence import (  # noqa: E402
     source_scopes,
 )
 
@@ -71,8 +71,8 @@ class SourceScopeTests(unittest.TestCase):
         source_path = "C:/staged/source/Part.SLDPRT"
         source = self.root / "evidence/source/Part.SLDPRT"
         source.write_bytes(b"frozen-file")
-        source_sha256 = hashlib.sha256(b"original-source").hexdigest()
-        copy_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+        source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+        copy_sha256 = source_sha256
         return {
             "rule_version": "native-open-edge-scope-binding-v1",
             "component": "part-1",
@@ -155,7 +155,6 @@ class SourceScopeTests(unittest.TestCase):
         self.write(
             "evidence/raw/dependency_closure.json",
             {
-                "session_temp_documents": [],
                 "mapping": [
                     {
                         "instance": "part-1",
@@ -247,7 +246,6 @@ class SourceScopeTests(unittest.TestCase):
         self.write(
             "evidence/raw/dependency_closure.json",
             {
-                "session_temp_documents": [],
                 "mapping": [
                     {
                         "instance": "part-1",
@@ -366,11 +364,7 @@ class SourceScopeTests(unittest.TestCase):
         )
         self.write(
             "evidence/raw/dependency_closure.json",
-            {
-                "session_temp_documents": [
-                    scope["virtual_session_document_path"]
-                ]
-            },
+            {},
         )
         self.write(
             "evidence/raw/source_scopes.json",
@@ -820,25 +814,6 @@ class SourceScopeTests(unittest.TestCase):
             "owner_sha256"
         ] = "c" * 64
         self.write("evidence/discovery.json", discovery)
-
-        with self.assertRaises(PipelineError):
-            source_scopes(self.root)
-
-    def test_virtual_scope_rejects_session_root_counterpart_mismatch(self):
-        scope = self.virtual_scope()
-        self.write_virtual_anchors(scope)
-        dependency = json.loads(
-            (
-                self.root / "evidence/raw/dependency_closure.json"
-            ).read_text(encoding="utf-8")
-        )
-        dependency["session_temp_documents"] = [
-            r"c:\users\test\appdata\local\temp\swx999\vc~~\foreign\imported.sldprt"
-        ]
-        self.write(
-            "evidence/raw/dependency_closure.json",
-            dependency,
-        )
 
         with self.assertRaises(PipelineError):
             source_scopes(self.root)

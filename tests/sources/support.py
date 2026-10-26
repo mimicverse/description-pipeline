@@ -4,85 +4,36 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import os
 import struct
-from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from description_pipeline.geometry.native_u import (
-    NATIVE_CURVE_DOMAIN_RULE,
-    NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
-    NATIVE_IDENTITY_POLICY_RULE,
-    NATIVE_PERSISTENT_IDENTITY_RULE,
-    NATIVE_POINT_ROUNDTRIP_RULE,
-    NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
-    NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC,
-    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
-    NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
-    NATIVE_U_IDENTITY_RULE,
-    NATIVE_U_RESOLUTION_RULE,
-    native_curve_domain_transform,
-    native_curve_endpoint_operation_tolerance,
-    native_curve_parameter_endpoints,
-    native_curve_topology_endpoint_set_assignment,
-    native_evaluate2_evidence,
-    native_point_error,
+from description_pipeline.geometry.native_scope import (
+    NATIVE_SOURCE_SCOPE_RULE,
 )
 from description_pipeline.io import file_digest
-from description_pipeline.schemas import (
-    NATIVE_ID_ARRAY_SOURCE_FLAT,
-    NATIVE_TESSELLATION_SCHEMA,
-)
-from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
-NATIVE_TESSELLATION_PROPERTIES = {
-    "improved_quality": True,
-    "match_type": 0,
-    "need_error_list": True,
-    "need_face_facet_map": True,
-    "need_edge_fin_map": True,
-    "need_vertex_params": True,
-}
-
-
-def native_tessellation_request() -> dict[str, Any]:
-    return {
-        "api": "IBody2.GetTessellation",
-        "argument_count": 1,
-        "face_list": {
-            "scope": "whole_body",
-            "variant_type": "VT_EMPTY",
-            "value": None,
-        },
-    }
-
-
-def write_binary_stl(
-    path: Path,
+def binary_stl_bytes(
     triangles: Sequence[Sequence[Sequence[float]]],
     *,
     attributes: Sequence[int] | None = None,
-) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
+) -> bytes:
+    """Return the strict binary STL projection used by offline fixtures."""
+
     attributes = list(attributes or [0] * len(triangles))
     if len(attributes) != len(triangles):
         raise ValueError("binary STL attributes must match the triangle count")
-    header = b"fixture stl".ljust(80, b" ")
-    payload = bytearray()
+    payload = bytearray(b"fixture stl".ljust(80, b" "))
+    payload += struct.pack("<I", len(triangles))
     for triangle, attribute in zip(triangles, attributes, strict=True):
-        first, second, third = triangle
         payload += struct.pack("<3f", 0.0, 0.0, 1.0)
-        for vertex in (first, second, third):
+        for vertex in triangle:
             payload += struct.pack("<3f", float(vertex[0]), float(vertex[1]), float(vertex[2]))
         payload += struct.pack("<H", attribute)
-    with open(path, "wb") as handle:
-        handle.write(header)
-        handle.write(struct.pack("<I", len(triangles)))
-        handle.write(bytes(payload))
-    return len(triangles)
+    return bytes(payload)
 
 
 def cube_triangles(
@@ -104,930 +55,300 @@ def cube_triangles(
         (1, 7, 5),
     ]
     return (
-        [(corners[a], corners[b], corners[c]) for a, b, c in faces],
+        [(corners[a], corners[c], corners[b]) for a, b, c in faces],
         (1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6),
     )
 
 
-def cube_stl(path: Path, half: float = 0.02) -> int:
-    triangles, attributes = cube_triangles(half)
-    return write_binary_stl(path, triangles, attributes=attributes)
+def fixture_source_scope(
+    component: str,
+    *,
+    source_document_path: str | None = None,
+    source_copy_path: str | None = None,
+    source_document_sha256: str | None = None,
+    referenced_configuration: str = "Default",
+) -> dict[str, Any]:
+    """Build one independent file-backed source scope for a test occurrence."""
+
+    if source_document_sha256 is None:
+        source_document_sha256 = hashlib.sha256(
+            b"native-tessellation-fixture-source"
+        ).hexdigest()
+    return {
+        "rule_version": NATIVE_SOURCE_SCOPE_RULE,
+        "component": component,
+        "source_document_path": (
+            source_document_path
+            or f"C:/fixture/source/{component}.SLDPRT"
+        ),
+        "source_copy_path": (
+            source_copy_path or f"source/{component}.SLDPRT"
+        ),
+        "source_document_sha256": source_document_sha256,
+        "source_copy_sha256": source_document_sha256,
+        "source_document_identity_sha256": source_document_sha256,
+        "source_document_identity_kind": "file_sha256",
+        "referenced_configuration": referenced_configuration,
+        "occurrence_scope": component,
+        "virtual_owner": None,
+        "virtual_owner_sha256": None,
+        "virtual_session_document_path": None,
+        "virtual_session_temp_root": None,
+        "virtual_native_api_pid": None,
+    }
 
 
-def cube_native_edges(half: float = 0.02) -> tuple[dict[int, list[str]], list[dict]]:
-    """Return the cube's twelve native edges and the references on each owner face."""
+def fixture_mass_fact(reading: dict[str, Any]) -> dict[str, Any]:
+    """Convert one projected fixture mass reading back to the native raw shape."""
 
-    corners = [(x, y, z) for x in (-half, half) for y in (-half, half) for z in (-half, half)]
-    face_corners = (
-        (0, 1, 2, 3),
-        (4, 5, 6, 7),
-        (0, 1, 4, 5),
-        (2, 3, 6, 7),
-        (0, 2, 4, 6),
-        (1, 3, 5, 7),
-    )
-    face_edges: dict[int, list[str]] = {face_index: [] for face_index in range(len(face_corners))}
-    native_edges = []
-    for start, end in (
-        (0, 1),
-        (0, 2),
-        (0, 4),
-        (1, 3),
-        (1, 5),
-        (2, 3),
-        (2, 6),
-        (3, 7),
-        (4, 5),
-        (4, 6),
-        (5, 7),
-        (6, 7),
-    ):
-        face_indices = [
-            face_index
-            for face_index, owners in enumerate(face_corners)
-            if start in owners and end in owners
-        ]
-        if len(face_indices) != 2:
-            raise AssertionError(f"cube edge {start}-{end} must have two owner faces")
-        reference = hashlib.sha256(f"fixture-cube-edge-{start}-{end}".encode()).hexdigest()
-        for face_index in face_indices:
-            face_edges[face_index].append(reference)
-        native_edges.append(
+    result = copy.deepcopy(reading)
+    reference = result.get("reference") or {}
+    overrides = reference.get("overrides")
+    if overrides is None:
+        overrides = {
+            "OverrideMass": False,
+            "OverrideCenterOfMass": False,
+            "OverrideMomentsOfInertia": False,
+        }
+    inertia = [
+        float(value)
+        for row in result.get("inertia") or []
+        for value in row
+    ]
+    native_raw = {
+        "mass_kg": float(result.get("mass")),
+        "center_of_mass_m": [
+            float(value)
+            for value in result.get("com") or []
+        ],
+        "inertia_values": inertia,
+        "overrides": copy.deepcopy(overrides),
+    }
+    for key in ("volume_m3", "density_kg_m3"):
+        if type(reference.get(key)) in (int, float):
+            native_raw[key] = float(reference[key])
+    part_measurement = result.pop("part_measurement", None)
+    if isinstance(part_measurement, dict):
+        result["part_measurement_raw"] = fixture_mass_fact(
             {
-                "body_type": 0,
-                "body_index": 0,
-                "edge_reference_sha256": reference,
-                "start_vertex_reference_sha256": hashlib.sha256(
-                    f"fixture-cube-vertex-{start}".encode()
-                ).hexdigest(),
-                "end_vertex_reference_sha256": hashlib.sha256(
-                    f"fixture-cube-vertex-{end}".encode()
-                ).hexdigest(),
-                "start_point_m": list(corners[start]),
-                "end_point_m": list(corners[end]),
-                "face_indices": face_indices,
+                "mass": part_measurement["mass_kg"],
+                "com": part_measurement["center_of_mass_m"],
+                "inertia": part_measurement["inertia_kg_m2"],
+                "reference": {
+                    key: value
+                    for key, value in part_measurement.items()
+                    if key
+                    not in {
+                        "mass_kg",
+                        "center_of_mass_m",
+                        "inertia_kg_m2",
+                    }
+                },
             }
         )
-    for references in face_edges.values():
-        references.sort()
-    return face_edges, native_edges
+    result["native_raw"] = native_raw
+    result["reference"] = copy.deepcopy(reference)
+    result.setdefault("read_errors", {})
+    return result
 
 
-ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
-NATIVE_VT_BYREF_R8 = 0x4005
-NATIVE_VT_BYREF_BOOL = 0x400B
+def fixture_component_mass_fact(reading: dict[str, Any]) -> dict[str, Any]:
+    """Convert projected component-context readings to the native raw shape."""
+
+    result = copy.deepcopy(reading)
+    for row in result.get("instances") or []:
+        if isinstance(row, dict) and isinstance(row.get("effective"), dict):
+            row["effective"] = fixture_mass_fact(row["effective"])
+        if isinstance(row, dict):
+            row.setdefault("read_errors", {})
+    return result
 
 
-class NativeTessellationV3Fixture(dict):
-    """A v3 envelope with the exact STL bytes generated from its facet graph."""
+def fixture_link_group_mass_fact(reading: dict[str, Any]) -> dict[str, Any]:
+    """Convert projected link reads back to native getter evidence."""
 
-    def __init__(
-        self,
-        envelope: dict[str, Any],
-        *,
-        stl_bytes: bytes,
-        triangle_vertices: Sequence[Sequence[Sequence[float]]],
-    ):
-        super().__init__(envelope)
-        self.stl_bytes = stl_bytes
-        self.triangle_vertices = [
-            tuple(tuple(float(value) for value in point) for point in triangle)
-            for triangle in triangle_vertices
-        ]
-
-
-def _binary32_point(point: Sequence[float]) -> tuple[float, float, float]:
-    values = tuple(float(value) for value in point)
-    if len(values) != 3:
-        raise ValueError("native tessellation point must have three coordinates")
-    return struct.unpack("<3f", struct.pack("<3f", *values))
+    result = copy.deepcopy(reading)
+    for body in (result.get("links") or {}).values():
+        for row in body.get("reads") or []:
+            row["com_m"] = [float(value) for value in row.pop("com_m", row.get("com") or [])]
+            row["inertia_values_raw"] = [
+                float(value)
+                for values in row.pop("inertia_tensor_about_com", [])
+                for value in values
+            ]
+            row.setdefault("read_errors", {})
+            row.setdefault("overrides", {
+                "OverrideMass": False,
+                "OverrideCenterOfMass": False,
+                "OverrideMomentsOfInertia": False,
+            })
+    return result
 
 
-def _packed_evaluate2_success() -> float:
-    return struct.unpack("<d", struct.pack("<Q", 1))[0]
-
-
-def _evaluate2_evidence(
-    point: tuple[float, float, float],
-) -> tuple[list[float], dict[str, Any]]:
-    raw = [*point, 0.0, 0.0, 0.0, _packed_evaluate2_success()]
-    evidence = native_evaluate2_evidence(raw)
-    if (
-        evidence is None
-        or evidence["packed_status"]["parsed_success"] is not True
-    ):
-        raise ValueError("native Evaluate2 fixture status is not successful")
-    return evidence["payload"], evidence["packed_status"]
-
-
-def _u_evidence(
-    u_parameter: float,
-    point: tuple[float, float, float],
+def fixture_native_geometry(
+    component: str,
+    source_scope: dict[str, Any],
+    transform_raw: Sequence[float],
     *,
-    projected_point_m: Sequence[float] | None = None,
-    evaluated_point_m: Sequence[float] | None = None,
+    half: float = 0.199999,
 ) -> dict[str, Any]:
-    projected_point = (
-        point
-        if projected_point_m is None
-        else tuple(float(value) for value in projected_point_m)
-    )
-    evaluated_source = (
-        point
-        if evaluated_point_m is None
-        else tuple(float(value) for value in evaluated_point_m)
-    )
-    payload, packed_status = _evaluate2_evidence(evaluated_source)
-    evaluated_point = tuple(payload[:3])
-    raw_evaluate2 = [
-        *payload,
-        struct.unpack("<d", struct.pack("<Q", 1))[0],
+    """Build one direct `GetTessTriangles(True)`-shaped occurrence fact."""
+
+    triangles, _attributes = cube_triangles(half=half)
+    values = [coordinate for triangle in triangles for point in triangle for coordinate in point]
+    body_inventory = [
+        {
+            "body_type": 0,
+            "body_index": 0,
+            "body_name": "fixture-solid",
+            "face_count": 6,
+        }
+    ]
+    face_inventory = [
+        {
+            "body_type": 0,
+            "body_index": 0,
+            "face_index": face_index,
+            "triangle_start": face_index * 2,
+            "triangle_count": 2,
+        }
+        for face_index in range(6)
     ]
     return {
-        "u": u_parameter,
-        "u_parameter_rule": NATIVE_U_CLOSEST_POINT_PARAMETER_RULE,
-        "rule_version": NATIVE_U_IDENTITY_RULE,
-        "projection_rule": NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
-        "projection_metric": NATIVE_TESSELLATION_EDGE_PROJECTION_METRIC,
-        "projection_tolerance_m": (
-            NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
-        ),
-        "source_point_m": list(point),
-        "closest_point_on_raw": [*projected_point, u_parameter],
-        "evaluate2_raw": raw_evaluate2,
-        "evaluate_payload": payload,
-        "evaluate_packed_status": packed_status,
-        "projection_errors_m": {
-            "source_to_closest": native_point_error(
-                point,
-                projected_point,
-            ),
-            "closest_to_evaluate": native_point_error(
-                projected_point,
-                evaluated_point,
-            ),
-            "source_to_evaluate": native_point_error(
-                point,
-                evaluated_point,
-            ),
-        },
+        "component": component,
+        "used_api": "IComponent2.GetBodies3/IBody2.GetFaces/IFace2.GetTessTriangles(True)",
+        "triangles": len(triangles),
+        "triangle_values": values,
+        "body_inventory": body_inventory,
+        "face_inventory": face_inventory,
+        "empty_faces": [],
+        "errors": [],
+        "faces": 6,
+        "units": "m",
+        "state": "observed",
+        "representation": "cad_face_display_triangles_raw",
+        "source_scope": copy.deepcopy(source_scope),
+        "transform_raw": [float(value) for value in transform_raw],
+        "bodies": {"solid": 1, "sheet": 0},
     }
 
 
-def _curve_endpoint_evaluation(
-    u_parameter: float,
-    point: Sequence[float],
-    opposite_point: Sequence[float],
-) -> dict[str, Any]:
-    expected = _binary32_point(point)
-    opposite = _binary32_point(opposite_point)
-    payload, packed_status = _evaluate2_evidence(expected)
-    evaluated = tuple(payload[:3])
-    return {
-        "u": u_parameter,
-        "point_roundtrip_rule": NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
-        "payload": payload,
-        "packed_status": packed_status,
-        "error": None,
-        "point_tolerance_m": native_curve_endpoint_operation_tolerance(
-            expected,
-            evaluated,
-            opposite,
-        ),
-        "point_error_m": max(
-            abs(expected[index] - evaluated[index])
-            for index in range(3)
-        ),
-    }
-
-
-def replace_curve_endpoint_evaluation(
-    evaluation: dict[str, Any],
-    point: Sequence[float],
-    opposite_point: Sequence[float],
-) -> None:
-    """Rebind one fixture evaluation to a new expected native endpoint."""
-
-    evaluation.update(
-        _curve_endpoint_evaluation(
-            evaluation["u"],
-            point,
-            opposite_point,
-        )
-    )
-
-
-def replace_u_evidence(
-    evidence: dict[str, Any],
-    point: Sequence[float],
-) -> None:
-    """Rebind one fin endpoint proof to a changed native vertex point."""
-
-    evidence.update(_u_evidence(evidence["u"], _binary32_point(point)))
-
-
-def _curve_end_params(
-    start: float,
-    end: float,
+def write_file_source_scope_authority(
+    root: Path,
     *,
-    is_closed: bool,
-    is_periodic: bool,
-) -> dict[str, Any]:
-    return {
-        "call_form": "pywin32-byref-variant",
-        "success": True,
-        "error": None,
-        "start": start,
-        "end": end,
-        "is_closed": is_closed,
-        "is_periodic": is_periodic,
-        "raw_outputs": [
-            {"value_type": NATIVE_VT_BYREF_R8, "value": start},
-            {"value_type": NATIVE_VT_BYREF_R8, "value": end},
-            {"value_type": NATIVE_VT_BYREF_BOOL, "value": is_closed},
-            {"value_type": NATIVE_VT_BYREF_BOOL, "value": is_periodic},
-        ],
-    }
+    source_scopes: dict[str, dict[str, Any]],
+    source_files: dict[str, dict[str, bytes]],
+) -> None:
+    """Write one real file-backed source-scope authority tree for tests."""
 
+    from description_pipeline.io import read_data, write_json  # noqa: PLC0415
 
-def native_tessellation_fixture(
-    face_spans: Sequence[dict[str, Any]],
-    native_edges: Sequence[dict[str, Any]],
-    no_facets_faces: Sequence[dict[str, Any]] = (),
-    *,
-    triangle_vertices: Sequence[Sequence[Sequence[float]]] | None = None,
-) -> NativeTessellationV3Fixture:
-    """Build one closed v3 graph and its byte-identical binary STL projection."""
-
-    spans = copy.deepcopy(list(face_spans))
-    input_edges = copy.deepcopy(list(native_edges))
-    normalized_no_facets = copy.deepcopy(list(no_facets_faces))
-    for row in normalized_no_facets:
-        row.setdefault("source_rule", NATIVE_ID_ARRAY_SOURCE_FLAT)
-        row.setdefault("warnings", [])
-        row.setdefault("derived_empty_edges", [])
-    for span in spans:
-        span.setdefault(
-            "native_body_reference_sha256",
-            span["body_reference_sha256"],
-        )
-        span.setdefault(
-            "native_face_reference_sha256",
-            span["face_reference_sha256"],
-        )
-        span.setdefault(
-            "face_identity_mode",
-            NATIVE_PERSISTENT_IDENTITY_RULE,
-        )
-        span.setdefault("face_identity", None)
-    for edge in input_edges:
-        edge.setdefault(
-            "native_edge_reference_sha256",
-            edge["edge_reference_sha256"],
-        )
-        edge.setdefault(
-            "edge_identity_mode",
-            NATIVE_PERSISTENT_IDENTITY_RULE,
-        )
-        edge.setdefault("edge_identity", None)
-        edge.setdefault("mapping_source_edge_index", None)
-        edge.setdefault(
-            "mapping_source_edge_persistent_reference_sha256",
-            None,
-        )
-    fixture_triangles = []
-    body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
-    evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
-    body_rows = []
-    vertex_rows = []
-    next_facet_id = 1
-    next_fin_id = 1
-    next_vertex_id = 1
-
-    for body_type, body_index in body_keys:
-        body_key = (body_type, body_index)
-        body_spans = sorted(
-            (
-                span
-                for span in spans
-                if (span["body_type"], span["body_index"]) == body_key
-            ),
-            key=lambda span: span["face_index"],
-        )
-        faces = []
-        facets = []
-        fins = []
-        vertex_ids_by_point = {}
-        points_by_vertex_id = {}
-        vertex_ids_by_face = {}
-        fins_by_face = {}
-        for span in body_spans:
-            facet_ids = []
-            for local_index in range(span["triangle_count"]):
-                triangle_record_index = span["triangle_start"] + local_index
-                if triangle_vertices is None:
-                    points = [
-                        [float(triangle_record_index), float(vertex_index), 0.0]
-                        for vertex_index in range(3)
-                    ]
-                else:
-                    points = triangle_vertices[triangle_record_index]
-                    if len(points) != 3:
-                        raise ValueError("native tessellation triangle must have three vertices")
-                facet_id = next_facet_id
-                next_facet_id += 1
-                vertex_ids = []
-                for point in points:
-                    point_key = _binary32_point(point)
-                    vertex_id = vertex_ids_by_point.get(point_key)
-                    if vertex_id is None:
-                        vertex_id = next_vertex_id
-                        next_vertex_id += 1
-                        vertex_ids_by_point[point_key] = vertex_id
-                        points_by_vertex_id[vertex_id] = point_key
-                        vertex_rows.append(
-                            {
-                                "body_type": body_type,
-                                "body_index": body_index,
-                                "vertex_id": vertex_id,
-                                "point_m": list(point_key),
-                            }
-                        )
-                    vertex_ids.append(vertex_id)
-                if len(set(vertex_ids)) != 3:
-                    raise ValueError("native tessellation facet needs three distinct binary32 vertices")
-                fixture_triangles.append(
-                    tuple(_binary32_point(point) for point in points)
-                )
-                fin_ids = [next_fin_id, next_fin_id + 1, next_fin_id + 2]
-                next_fin_id += 3
-                for fin_id, side in zip(
-                    fin_ids,
-                    (
-                        (vertex_ids[0], vertex_ids[1]),
-                        (vertex_ids[1], vertex_ids[2]),
-                        (vertex_ids[2], vertex_ids[0]),
-                    ),
-                    strict=True,
-                ):
-                    fins.append(
-                        {
-                            "fin_id": fin_id,
-                            "facet_id": facet_id,
-                            "face_index": span["face_index"],
-                            "vertex_ids": list(side),
-                            "edge_reference_sha256": None,
-                            "classification": "internal_only",
-                            "start_u": None,
-                            "end_u": None,
-                            "start_evidence": None,
-                            "end_evidence": None,
-                            "cofin_raw_id": None,
-                            "cofin_id": None,
-                        }
-                    )
-                facets.append(
-                    {
-                        "facet_id": facet_id,
-                        "face_index": span["face_index"],
-                        "fin_ids": fin_ids,
-                        "vertex_ids": sorted(vertex_ids),
-                        "triangle_record_index": triangle_record_index,
-                    }
-                )
-                fins_by_face.setdefault(span["face_index"], []).extend(fin_ids)
-                vertex_ids_by_face.setdefault(span["face_index"], set()).update(
-                    vertex_ids
-                )
-                facet_ids.append(facet_id)
-            faces.append(
-                {
-                    "face_index": span["face_index"],
-                    "facet_ids": facet_ids,
-                    "facet_count": len(facet_ids),
-                    "facet_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
-                    "raw_facet_ids": list(facet_ids),
-                    "warnings": [],
-                    "face_identity_sha256": span[
-                        "face_reference_sha256"
-                    ],
-                }
+    root = Path(root)
+    (root / "evidence/raw").mkdir(parents=True, exist_ok=True)
+    discovery_components = []
+    discovery_files = {}
+    scene_components = []
+    scene_mass_properties = {}
+    dependency_mapping = []
+    original_files = {}
+    copy_files = {}
+    for component in sorted(source_scopes):
+        scope = source_scopes[component]
+        files = source_files[component]
+        source_bytes = files["source"]
+        copy_bytes = files["copy"]
+        if (
+            hashlib.sha256(source_bytes).hexdigest()
+            != scope["source_document_sha256"]
+            or hashlib.sha256(copy_bytes).hexdigest()
+            != scope["source_copy_sha256"]
+        ):
+            raise ValueError(
+                f"source files do not match the scope for {component}"
             )
-        evidence_by_body[body_key] = {
-            "spans": body_spans,
-            "faces": faces,
-            "facets": facets,
-            "fins": fins,
-            "fins_by_face": fins_by_face,
-            "vertex_ids_by_face": vertex_ids_by_face,
-            "vertex_ids_by_point": vertex_ids_by_point,
-            "points_by_vertex_id": points_by_vertex_id,
-            "assigned_fin_ids": set(),
+        frozen = root / "evidence" / scope["source_copy_path"]
+        frozen.parent.mkdir(parents=True, exist_ok=True)
+        frozen.write_bytes(copy_bytes)
+        source_path = scope["source_document_path"]
+        document = Path(source_path.replace("\\", "/")).name
+        source_sha256 = scope["source_document_sha256"]
+        copy_sha256 = scope["source_copy_sha256"]
+        discovery_components.append(
+            {
+                "instance_id": component,
+                "name2": component,
+                "document": document,
+                "configuration": scope["referenced_configuration"],
+                "suppressed": False,
+                "source_provenance": None,
+            }
+        )
+        discovery_files[document] = source_sha256
+        scene_components.append(
+            {
+                "name": component,
+                "path": source_path,
+                "configuration": scope["referenced_configuration"],
+            }
+        )
+        scene_mass_properties[component] = {
+            "reference": {
+                "configuration": scope["referenced_configuration"],
+            }
         }
-
-    span_by_face = {
-        (span["body_type"], span["body_index"], span["face_index"]): span
-        for span in spans
-    }
-
-    def directed_path(
-        body: dict[str, Any],
-        face_index: int,
-        source: int,
-        target: int,
-        allowed_vertices: set[int],
-    ) -> list[dict[str, Any]] | None:
-        fins_by_id = {fin["fin_id"]: fin for fin in body["fins"]}
-        adjacency: dict[int, list[dict[str, Any]]] = {}
-        for fin_id in body["fins_by_face"].get(face_index, []):
-            if fin_id in body["assigned_fin_ids"]:
-                continue
-            fin = fins_by_id[fin_id]
-            if not set(fin["vertex_ids"]) <= allowed_vertices:
-                continue
-            adjacency.setdefault(fin["vertex_ids"][0], []).append(fin)
-        queue = deque([(source, ())])
-        while queue:
-            current, path = queue.popleft()
-            if current == target and path:
-                return list(path)
-            visited = {source, *(fin["vertex_ids"][1] for fin in path)}
-            for fin in adjacency.get(current, []):
-                destination = fin["vertex_ids"][1]
-                if destination not in visited:
-                    queue.append((destination, (*path, fin)))
-        return None
-
-    edge_rows = []
-    for edge in input_edges:
-        body_key = (edge["body_type"], edge["body_index"])
-        body = evidence_by_body[body_key]
-        face_indices = sorted(edge["face_indices"])
-        active_faces = [
-            face_index
-            for face_index in face_indices
-            if span_by_face[(*body_key, face_index)]["triangle_count"] > 0
-        ]
-        paths_by_face = {}
-        if active_faces:
-            if len(active_faces) not in (1, 2):
-                raise ValueError("native edge fixture requires one or two active cofaces")
-            source = body["vertex_ids_by_point"].get(_binary32_point(edge["start_point_m"]))
-            target = body["vertex_ids_by_point"].get(_binary32_point(edge["end_point_m"]))
-            if source is None or target is None or source == target:
-                raise ValueError("native edge endpoints are not shared body vertices")
-            shared_vertices = set.intersection(
-                *(body["vertex_ids_by_face"][face_index] for face_index in active_faces)
-            )
-            fins_by_id = {fin["fin_id"]: fin for fin in body["fins"]}
-            for face_index in active_faces:
-                direct = [
-                    fin
-                    for fin_id in body["fins_by_face"].get(face_index, [])
-                    for fin in (fins_by_id[fin_id],)
-                    if frozenset(fin["vertex_ids"]) == frozenset((source, target))
-                    and fin_id not in body["assigned_fin_ids"]
-                ]
-                if len(direct) == 1:
-                    path = direct
-                else:
-                    path = directed_path(
-                        body,
-                        face_index,
-                        source,
-                        target,
-                        shared_vertices,
-                    )
-                    if path is None:
-                        path = directed_path(
-                            body,
-                            face_index,
-                            target,
-                            source,
-                            shared_vertices,
-                        )
-                if not path:
-                    raise ValueError(f"native edge endpoint path is missing on face {face_index}")
-                paths_by_face[face_index] = path
-
-        u_min = float(edge.get("u_min", 0.0))
-        u_max = float(edge.get("u_max", 1.0))
-        if not u_min < u_max:
-            raise ValueError("native edge fixture U domain must be increasing")
-        edge_fin_ids = []
-        path_senses = {}
-        if active_faces:
-            first_face = active_faces[0]
-            second_face = active_faces[1] if len(active_faces) == 2 else None
-            source = body["vertex_ids_by_point"][_binary32_point(edge["start_point_m"])]
-            first_path = paths_by_face[first_face]
-            if first_path[0]["vertex_ids"][0] != source:
-                first_path = list(reversed(first_path))
-                path_senses[first_face] = False
-            else:
-                path_senses[first_face] = True
-            canonical_segments = []
-            current = source
-            for fin in first_path:
-                if fin["vertex_ids"][0] == current:
-                    segment = tuple(fin["vertex_ids"])
-                elif fin["vertex_ids"][1] == current:
-                    segment = tuple(reversed(fin["vertex_ids"]))
-                else:
-                    raise ValueError("native edge face path is disconnected")
-                canonical_segments.append((segment, fin))
-                current = segment[1]
-            if current != body["vertex_ids_by_point"][_binary32_point(edge["end_point_m"])]:
-                raise ValueError("native edge face path does not reach its endpoint")
-            if len(active_faces) == 1:
-                step = (u_max - u_min) / len(canonical_segments)
-                for index, (segment, first_fin) in enumerate(
-                    canonical_segments
-                ):
-                    low = u_min + step * index
-                    high = u_min + step * (index + 1)
-                    first_reversed = (
-                        first_fin["vertex_ids"][0] != segment[0]
-                    )
-                    first_start_u = high if first_reversed else low
-                    first_end_u = low if first_reversed else high
-                    first_fin.update(
-                        {
-                            "edge_reference_sha256": edge[
-                                "edge_reference_sha256"
-                            ],
-                            "classification": "native_edge",
-                            "start_u": first_start_u,
-                            "end_u": first_end_u,
-                            "start_evidence": _u_evidence(
-                                first_start_u,
-                                body["points_by_vertex_id"][
-                                    first_fin["vertex_ids"][0]
-                                ],
-                            ),
-                            "end_evidence": _u_evidence(
-                                first_end_u,
-                                body["points_by_vertex_id"][
-                                    first_fin["vertex_ids"][1]
-                                ],
-                            ),
-                            "cofin_raw_id": -1,
-                            "cofin_id": None,
-                        }
-                    )
-                    body["assigned_fin_ids"].add(first_fin["fin_id"])
-                    edge_fin_ids.append(first_fin["fin_id"])
-            else:
-                second_path = paths_by_face[second_face]
-                path_senses[second_face] = second_path[0]["vertex_ids"][0] == body[
-                    "vertex_ids_by_point"
-                ][_binary32_point(edge["start_point_m"])]
-                second_by_segment = {}
-                for fin in second_path:
-                    key = frozenset(fin["vertex_ids"])
-                    if key in second_by_segment:
-                        raise ValueError("native edge coface has duplicate segment fins")
-                    second_by_segment[key] = fin
-                if len(canonical_segments) != len(second_path):
-                    raise ValueError("native edge cofaces have different segment counts")
-                step = (u_max - u_min) / len(canonical_segments)
-                for index, (segment, first_fin) in enumerate(canonical_segments):
-                    second_fin = second_by_segment.get(frozenset(segment))
-                    if second_fin is None:
-                        raise ValueError("native edge cofaces do not share segment endpoints")
-                    if tuple(second_fin["vertex_ids"]) != tuple(
-                        reversed(first_fin["vertex_ids"])
-                    ):
-                        raise ValueError("native edge coface fins run in the same direction")
-                    low = u_min + step * index
-                    high = u_min + step * (index + 1)
-                    first_reversed = first_fin["vertex_ids"][0] != segment[0]
-                    second_reversed = second_fin["vertex_ids"][0] != segment[0]
-                    first_start_u = high if first_reversed else low
-                    first_end_u = low if first_reversed else high
-                    second_start_u = high if second_reversed else low
-                    second_end_u = low if second_reversed else high
-                    first_fin.update(
-                        {
-                            "edge_reference_sha256": edge["edge_reference_sha256"],
-                            "classification": "native_edge",
-                            "start_u": first_start_u,
-                            "end_u": first_end_u,
-                            "start_evidence": _u_evidence(
-                                first_start_u,
-                                body["points_by_vertex_id"][first_fin["vertex_ids"][0]],
-                            ),
-                            "end_evidence": _u_evidence(
-                                first_end_u,
-                                body["points_by_vertex_id"][first_fin["vertex_ids"][1]],
-                            ),
-                            "cofin_raw_id": second_fin["fin_id"],
-                            "cofin_id": second_fin["fin_id"],
-                        }
-                    )
-                    second_fin.update(
-                        {
-                            "edge_reference_sha256": edge["edge_reference_sha256"],
-                            "classification": "native_edge",
-                            "start_u": second_start_u,
-                            "end_u": second_end_u,
-                            "start_evidence": _u_evidence(
-                                second_start_u,
-                                body["points_by_vertex_id"][second_fin["vertex_ids"][0]],
-                            ),
-                            "end_evidence": _u_evidence(
-                                second_end_u,
-                                body["points_by_vertex_id"][second_fin["vertex_ids"][1]],
-                            ),
-                            "cofin_raw_id": first_fin["fin_id"],
-                            "cofin_id": first_fin["fin_id"],
-                        }
-                    )
-                    body["assigned_fin_ids"].update(
-                        {first_fin["fin_id"], second_fin["fin_id"]}
-                    )
-                    edge_fin_ids.extend((first_fin["fin_id"], second_fin["fin_id"]))
-
-        senses = {
-            face_index: path_senses.get(face_index, index % 2 == 1)
-            for index, face_index in enumerate(face_indices)
-        }
-        curve_sense = edge.get("curve_sense", True)
-        curve_closed = edge.get("curve_closed", False)
-        curve_periodic = edge.get("curve_periodic", False)
-        if type(curve_sense) is not bool or type(curve_closed) is not bool or type(
-            curve_periodic
-        ) is not bool:
-            raise ValueError("native edge curve flags must be booleans")
-        curve_start_point = _binary32_point(edge["start_point_m"])
-        curve_end_point = _binary32_point(edge["end_point_m"])
-        curve_domain_transform = native_curve_domain_transform(
-            u_min,
-            u_max,
-            u_min,
-            u_max,
-            curve_sense,
-            curve_periodic,
-        )
-        if curve_domain_transform["rule_version"] != NATIVE_CURVE_DOMAIN_RULE:
-            raise ValueError("native curve domain rule differs")
-        topology_endpoints = native_curve_parameter_endpoints(
-            curve_start_point,
-            curve_end_point,
-        )
-        topology_assignment = native_curve_topology_endpoint_set_assignment(
-            topology_endpoints[0],
-            topology_endpoints[1],
-            edge["start_point_m"],
-            edge["end_point_m"],
-        )
-        edge_rows.append(
+        dependency_mapping.append(
             {
-                "body_type": body_key[0],
-                "body_index": body_key[1],
-                "edge_reference_sha256": edge["edge_reference_sha256"],
-                "native_edge_reference_sha256": edge[
-                    "native_edge_reference_sha256"
-                ],
-                "edge_identity_mode": edge["edge_identity_mode"],
-                "edge_identity": edge["edge_identity"],
-                "mapping_source_edge_index": edge.get(
-                    "mapping_source_edge_index"
-                ),
-                "mapping_source_edge_persistent_reference_sha256":
-                    edge.get(
-                        "mapping_source_edge_persistent_reference_sha256"
-                    ),
-                "start_vertex_reference_sha256": edge["start_vertex_reference_sha256"],
-                "end_vertex_reference_sha256": edge["end_vertex_reference_sha256"],
-                "start_point_m": [float(value) for value in edge["start_point_m"]],
-                "end_point_m": [float(value) for value in edge["end_point_m"]],
-                "start_vertex_error": None,
-                "end_vertex_error": None,
-                "start_point_error": None,
-                "end_point_error": None,
-                "start_vertex_state": "present",
-                "end_vertex_state": "present",
-                "start_reference_error": None,
-                "end_reference_error": None,
-                "face_indices": face_indices,
-                "fin_ids": sorted(edge_fin_ids),
-                "fin_ids_source": NATIVE_ID_ARRAY_SOURCE_FLAT,
-                "raw_fin_ids": sorted(edge_fin_ids),
-                "warnings": [],
-                "u_min": u_min,
-                "u_max": u_max,
-                "curve_start_point_m": list(curve_start_point),
-                "curve_end_point_m": list(curve_end_point),
-                "curve_sense": curve_sense,
-                "curve_type": edge.get("curve_type", 0),
-                "curve_closed": curve_closed,
-                "curve_periodic": curve_periodic,
-                "curve_end_params": _curve_end_params(
-                    u_min,
-                    u_max,
-                    is_closed=curve_closed,
-                    is_periodic=curve_periodic,
-                ),
-                "curve_domain_transform": curve_domain_transform,
-                "curve_endpoint_evaluations": {
-                    "start": _curve_endpoint_evaluation(
-                        u_min,
-                        curve_start_point,
-                        curve_end_point,
-                    ),
-                    "end": _curve_endpoint_evaluation(
-                        u_max,
-                        curve_end_point,
-                        curve_start_point,
-                    ),
-                },
-                "topology_endpoint_assignment": topology_assignment,
-                "endpoint_points_derived_from_curve": False,
-                "face_senses": [
-                    {
-                        "face_index": face_index,
-                        "EdgeInFaceSense": {
-                            "value": senses[face_index],
-                            "error": None,
-                        },
-                        "IEdgeInFaceSense2": {
-                            "value": senses[face_index],
-                            "error": None,
-                        },
-                    }
-                    for face_index in face_indices
-                ],
+                "instance": component,
+                "copy": scope["source_copy_path"],
+                "copy_sha256": copy_sha256,
+                "source": source_path,
+                "source_sha256": source_sha256,
             }
         )
+        original_files[source_path] = source_sha256
+        copy_files[scope["source_copy_path"]] = copy_sha256
 
-    for body_type, body_index in body_keys:
-        body_key = (body_type, body_index)
-        body = evidence_by_body[body_key]
-        body_rows.append(
-            {
-                "body_type": body_type,
-                "body_index": body_index,
-                "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
-                "tessellate_result": True,
-                "request": native_tessellation_request(),
-                "property_requests": copy.deepcopy(
-                    NATIVE_TESSELLATION_PROPERTIES
-                ),
-                "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
-                "facet_count": len(body["facets"]),
-                "fin_count": len(body["fins"]),
-                "vertex_count": len(body["vertex_ids_by_point"]),
-                "faces": body["faces"],
-                "facets": body["facets"],
-                "fins": body["fins"],
-            }
-        )
-
-    vertex_rows.sort(
-        key=lambda row: (row["body_type"], row["body_index"], row["vertex_id"])
-    )
-    native_fin_count = sum(
-        fin["classification"] == "native_edge"
-        for body in body_rows
-        for fin in body["fins"]
-    )
-    u_observations = native_fin_count * 2
-    solidworks_vertex_identities = []
-    vertex_identity_by_key = {}
-    for edge in input_edges:
-        body_key = (edge["body_type"], edge["body_index"])
-        for endpoint in ("start", "end"):
-            reference = edge[f"{endpoint}_vertex_reference_sha256"]
-            point = edge[f"{endpoint}_point_m"]
-            if reference is None or point is None:
-                continue
-            key = (
-                *body_key,
-                reference,
-                *(
-                    struct.pack("<d", float(value)).hex()
-                    for value in point
-                ),
-            )
-            previous = vertex_identity_by_key.get(key)
-            if previous is not None:
-                continue
-            vertex_identity_by_key[key] = point
-    next_vertex_index = {}
-    for body_key, reference, _point_bits, point in sorted(
-        (
-            (key[:2], key[2], key[3:], value)
-            for key, value in vertex_identity_by_key.items()
-        ),
-        key=lambda item: (item[0], item[1], item[2]),
-    ):
-        vertex_index = next_vertex_index.get(body_key, 0)
-        next_vertex_index[body_key] = vertex_index + 1
-        solidworks_vertex_identities.append(
-            {
-                "body_type": body_key[0],
-                "body_index": body_key[1],
-                "vertex_index": vertex_index,
-                "point_m": list(point),
-                "identity_mode": NATIVE_PERSISTENT_IDENTITY_RULE,
-                "native_reference_sha256": reference,
-                "identity": None,
-                "identity_sha256": reference,
-            }
-        )
-    expected_triangles = sum(span["triangle_count"] for span in spans)
-    if len(fixture_triangles) != expected_triangles:
-        raise ValueError("native tessellation triangle projection is incomplete")
-    stl_payload = bytearray(
-        b"native-tessellation-v3 fixture".ljust(80, b" ")
-        + struct.pack("<I", len(fixture_triangles))
-    )
-    cursor = 0
-    for face_index, span in enumerate(spans):
-        owner_id = span.get("face_owner_id")
-        if owner_id is None:
-            owner_id = face_index + 1
-            span["face_owner_id"] = owner_id
-        record_start = len(stl_payload)
-        for triangle in fixture_triangles[
-            cursor : cursor + span["triangle_count"]
-        ]:
-            stl_payload.extend(
-                struct.pack(
-                    "<12fH",
-                    0.0,
-                    0.0,
-                    0.0,
-                    *(coordinate for point in triangle for coordinate in point),
-                    owner_id,
-                )
-            )
-        span["triangle_records_sha256"] = hashlib.sha256(
-            bytes(stl_payload[record_start:])
-        ).hexdigest()
-        cursor += span["triangle_count"]
-    stl_bytes = bytes(stl_payload)
-    envelope = {
-        "schema_version": NATIVE_TESSELLATION_SCHEMA,
-        "faces": len(spans),
-        "face_spans": spans,
-        "native_edges": edge_rows,
-        "no_facets_faces": normalized_no_facets,
-        "itessellation": {
-            "interface_iid": ITESSELLATION_IID,
-            "u_rule_version": NATIVE_U_IDENTITY_RULE,
-            "u_resolution_rule": NATIVE_U_RESOLUTION_RULE,
-            "identity_rule": NATIVE_IDENTITY_POLICY_RULE,
-            "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
-            "u_observation_stats": {
-                "unique_observations": u_observations,
-                "cache_hits": 0,
-                "get_closest_point_on_calls": u_observations,
-                "evaluate2_calls": u_observations,
+    write_json(
+        root / "evidence/discovery.json",
+        {
+            "raw": {
+                "components": discovery_components,
+                "files": discovery_files,
             },
-            "property_requests": copy.deepcopy(
-                NATIVE_TESSELLATION_PROPERTIES
-            ),
-            "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
-            "reference_alias_audit": {
-                "body": [],
-                "face": [],
-                "edge": [],
-                "vertex": [],
-            },
-            "cross_kind_raw_aliases": [],
-            "bodies": body_rows,
-            "vertices": vertex_rows,
-            "solidworks_vertex_identities": solidworks_vertex_identities,
+            "files": [
+                {"path": path, "sha256": sha256}
+                for path, sha256 in discovery_files.items()
+            ],
         },
-    }
-    return NativeTessellationV3Fixture(
-        envelope,
-        stl_bytes=stl_bytes,
-        triangle_vertices=fixture_triangles,
     )
-
-
-def refresh_topology_endpoint_assignment(tessellation: dict[str, Any]) -> None:
-    """Recompute the topology audit after a test mutates curve or endpoint evidence."""
-
-    for edge in tessellation["native_edges"]:
-        if edge["start_point_m"] is None or edge["end_point_m"] is None:
-            edge["topology_endpoint_assignment"] = None
-            continue
-        topology_endpoints = native_curve_parameter_endpoints(
-            edge["curve_start_point_m"],
-            edge["curve_end_point_m"],
-        )
-        edge["topology_endpoint_assignment"] = (
-            native_curve_topology_endpoint_set_assignment(
-                topology_endpoints[0],
-                topology_endpoints[1],
-                edge["start_point_m"],
-                edge["end_point_m"],
-            )
-        )
+    write_json(
+        root / "evidence/raw/scene_raw.json",
+        {
+            "components": scene_components,
+            "mass_properties": scene_mass_properties,
+        },
+    )
+    capture_path = root / "evidence/capture.json"
+    capture = read_data(capture_path) if capture_path.is_file() else {}
+    capture["components"] = len(source_scopes)
+    capture["scene"] = {"components": scene_components}
+    write_json(capture_path, capture)
+    write_json(
+        root / "evidence/raw/geometry.json",
+        [{"component": component} for component in sorted(source_scopes)],
+    )
+    write_json(
+        root / "evidence/raw/dependency_closure.json",
+        {
+            "mapping": dependency_mapping,
+            "original_files": original_files,
+            "copy_files": copy_files,
+        },
+    )
+    write_json(
+        root / "evidence/raw/source_scopes.json",
+        source_scopes,
+    )
 
 
 def _matrix16(values: Sequence[float]) -> Matrix:
@@ -1057,6 +378,30 @@ def _identity() -> list[float]:
         0.0,
         0.0,
         1.0,
+    ]
+
+
+def solidworks_transform(matrix: Sequence[float]) -> list[float]:
+    """Convert one row-major scene matrix to SolidWorks' raw array order."""
+
+    values = _matrix16(matrix)
+    return [
+        values[0],
+        values[4],
+        values[8],
+        values[1],
+        values[5],
+        values[9],
+        values[2],
+        values[6],
+        values[10],
+        values[3],
+        values[7],
+        values[11],
+        1.0,
+        0.0,
+        0.0,
+        0.0,
     ]
 
 
@@ -1246,31 +591,17 @@ class FixtureCadBackend(CadBackend):
             name: list(matrix) for name, matrix in datums.items()
         }
         self._dependencies = [Path(path) for path in (dependencies or [])]
-        # failure-injection knobs for the closure contract
-        self.pack_drop_files: set[str] = set()
-        self.copy_unresolved = 0
-        self.copy_extra_components = 0
-        self.resolve_returns_empty = False
-        self.copy_configuration: str | None = None
-        self.copy_referenced_configuration_change = False
-        self.copy_missing_files = False
-        self.copy_outside_documents = False
-        self.copy_duplicate_instances = False
-        self.copy_rewrites_bytes = False
-        self.resolve_only_existing = False
         self.collected_scene_calls: list[str] = []
         self.scene_document_override: str | None = None
         self.originals_change_during_capture = False
-        self.state_calls: list[str] = []
-        self.unsaved_paths: set[str] = set()
-        self.drift_configuration_after_reading = False
-        self._drifted = False
-        self._original_paths = {str(self.document), *(str(path) for path in self._dependencies)}
-        # The fixture models the two owned processes used by the real freeze:
-        # collection/rewrite and the post-boundary capture session.
+        # The fixture models the one prepared capture process.
         self.session_pid = 100
-        self.capture_session_pid: int | None = None
-        self.retired_session_pids: list[int] = []
+
+    @contextmanager
+    def session(self):
+        """Provide the native lifetime boundary for the in-memory fixture."""
+
+        yield self
 
     def health(self) -> dict[str, Any]:
         return {
@@ -1289,7 +620,6 @@ class FixtureCadBackend(CadBackend):
         if order is None:
             order = self.order = []
         order.append("open_document")
-        self.capture_session_pid = self.session_pid
         self.open_documents.append(str(path))
         return {
             "opened": Path(path).name,
@@ -1299,17 +629,9 @@ class FixtureCadBackend(CadBackend):
             "warnings": 0,
         }
 
-    def close_document(self, name: str, confirm: bool = False) -> dict[str, Any]:
-        return {"closed": name}
-
     def document_state(self, path: str) -> dict[str, Any]:
-        self.state_calls.append(str(path))
         active = self.configurations[0]
-        if self._drifted and str(path) in self._original_paths:
-            # an edit made in the session during the capture: the file on disk is
-            # untouched, only the in-memory state moved
-            active = "Other"
-        saved = bool(self.saved and str(path) not in self.unsaved_paths)
+        saved = bool(self.saved)
         return {
             "path": str(path),
             "title": Path(path).name,
@@ -1322,189 +644,287 @@ class FixtureCadBackend(CadBackend):
             "unsupported": ["lightweight"],
         }
 
-    def save_flag_documents(self) -> list[str]:
-        """The working-tree documents the fake reports as needing a save."""
-
-        if not self.saved:
-            return sorted(
-                {
-                    str(self.document),
-                    *(str(path) for path in self._dependencies),
-                    *(str(path) for path in self.unsaved_paths),
-                }
-            )
-        return sorted(str(path) for path in self.unsaved_paths)
-
-    def list_dependencies(self, path: str) -> list[dict[str, Any]]:
-        return [
-            {"path": str(item), "exists": Path(item).is_file(), "type": Path(item).suffix.lower()}
-            for item in self._dependencies
-        ]
-
-    def collect_dependencies(
+    def prepare_prepared_capture(
         self,
-        path: str,
-        destination_dir: str,
-        *,
-        skip_missing=(),
-        excluded_paths=(),
-        required_names=(),
-        admitted_roots=(),
-        closure_documents=None,
-        required_paths=(),
+        source_root: str,
+        assembly: str,
+        configuration: str,
     ) -> dict[str, Any]:
+        """Bind the fixture's prepared static inventory without touching CAD."""
+
+        root = Path(source_root).resolve()
+        document = Path(assembly).resolve()
+        document.relative_to(root)
+        if not root.is_dir() or not document.is_file():
+            raise ValueError("prepared capture root or assembly is missing")
+        self._prepared_capture_root = str(root)
+        self._prepared_capture_document = str(document)
+        self._prepared_capture_configuration = configuration
+        self._capture_component_transforms = {
+            str(entry["name"]): tuple(
+                float(value)
+                for value in (entry.get("transform") or _identity())
+            )
+            for entry in self.components
+        }
+        return {
+            "mode": "prepared_read_only_copy",
+            "source_root": str(root),
+            "assembly": str(document),
+            "requested_configuration": configuration,
+            "session_role": "copy",
+            "search_root": str(root),
+            "sealed_documents": sorted(
+                str(path)
+                for path in root.rglob("*")
+                if path.is_file() and path.suffix.lower() in {".sldasm", ".sldprt"}
+            ),
+            "com_started": False,
+        }
+
+    def source_scopes(self, components: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Bind fixture occurrences to exact files in the prepared source copy."""
+
+        root = Path(self._prepared_capture_root)
+        original_root = Path(self.document).resolve().parent
+        scopes = {}
+        for component in components:
+            entry = next(
+                item
+                for item in self.components
+                if str(item["name"]) == str(component)
+            )
+            original = Path(entry.get("path") or self.document).resolve()
+            relative = original.relative_to(original_root)
+            copied = root / relative
+            checksum = file_digest(copied)
+            scope = fixture_source_scope(
+                str(component),
+                source_document_path=str(copied),
+                source_copy_path=f"source/{relative.as_posix()}",
+                source_document_sha256=checksum,
+                referenced_configuration=str(
+                    entry.get("configuration") or self.configurations[0]
+                ),
+            )
+            scopes[str(component)] = scope
+        return scopes
+
+    def capture_axis_reference(self, reference):
+        """Return deterministic raw axis evidence for the production projector."""
+
+        selector = copy.deepcopy(reference)
+        component = str(reference.get("component") or "")
+        common = {
+            "component": component,
+            "selector": selector,
+            "coordinate_frame": "component_local" if component else "assembly",
+            "read_errors": {},
+            "used_api": "fixture-raw-axis",
+        }
+        if reference.get("kind") == "reference_axis":
+            return {
+                **common,
+                "kind": "reference_axis",
+                "feature_name": str(reference.get("feature_name") or ""),
+                "suppressed_raw": False,
+                "feature_error_code_raw": 0,
+                "endpoints_raw": [0.0, 0.0, 0.1, 0.0, 0.0, 1.1],
+            }
+        return {
+            **common,
+            "kind": "cylinder",
+            "body_type": copy.deepcopy(reference.get("body_type")),
+            "body_type_native": str(reference.get("body_type") or "solid"),
+            "feature_name": copy.deepcopy(reference.get("feature_name")),
+            "face_index": copy.deepcopy(reference.get("face_index")),
+            "face_candidates": [
+                {
+                    "body_index": 0,
+                    "face_index": copy.deepcopy(reference.get("face_index")),
+                    "feature_name": copy.deepcopy(reference.get("feature_name")),
+                    "is_cylinder": True,
+                    "cylinder_params_raw": [0.0, 0.0, 0.1, 0.0, 0.0, 1.0, 0.006],
+                    "persist_reference_b64": None,
+                    "read_errors": {},
+                }
+            ],
+        }
+
+    def collect_prepared_scene(
+        self,
+        doc_path: str,
+        coordinate_systems: Sequence[str],
+        groups: Sequence[dict],
+        on_activity=None,
+        require_material: bool = True,
+    ) -> dict[str, Any]:
+        """Return the seven raw fact families consumed after CAD release."""
+
         order = getattr(self, "order", None)
         if order is None:
             order = self.order = []
-        order.append("collect_dependencies")
-        self.collect_skips = {
-            "skip_missing": sorted(str(item) for item in skip_missing),
-            "excluded_paths": sorted(str(item) for item in excluded_paths),
-            "required_names": sorted(str(item) for item in required_names),
-            "admitted_roots": [str(item) for item in admitted_roots],
-            "closure_documents": (
-                sorted((closure_documents or {}).keys()) if isinstance(closure_documents, dict) else None
-            ),
-            "required_paths": sorted(str(item) for item in required_paths),
+        order.append("collect_prepared_scene")
+        scene = self.collect_scene(
+            doc_path,
+            coordinate_systems,
+            on_activity=on_activity,
+            require_material=require_material,
+        )
+        component_entries = {
+            str(entry["name"]): entry
+            for entry in self.components
         }
-        target = Path(destination_dir)
-        target.mkdir(parents=True, exist_ok=True)
-        self.collected = []
-        excluded = {os.path.normcase(os.path.abspath(str(item))) for item in excluded_paths}
-        for item in [self.document, *self._dependencies]:
-            source = Path(item)
-            if os.path.normcase(os.path.abspath(source)) in excluded:
-                continue
-            if not source.is_file() or source.name in self.pack_drop_files:
-                continue
-            destination = target / source.name
-            payload = source.read_bytes()
-            if self.copy_rewrites_bytes and source.resolve() == self.document.resolve():
-                # an assembly carries its references, so Native reference collection legitimately
-                # rewrites it: the copy is not byte-identical to the source
-                payload = payload + b" (rewritten references)"
-            destination.write_bytes(payload)
-            self.collected.append(str(destination))
-        top_level = target / Path(self.document).name
-        if self.copy_missing_files:
-            # the collector reported the document but its bytes never landed
-            for path in list(self.collected):
-                if Path(path) != top_level:
-                    Path(path).unlink(missing_ok=True)
-        return {
-            "method": "fixture_reference_copy",
-            "destination": str(target),
-            "source_document": str(self.document),
-            "top_level": str(top_level),
-            "configured": ["SetSaveToName(True, destination)"],
-            "statuses": {
-                "count": len(self.collected),
-                "values": [0] * len(self.collected),
-                "failures": [],
-                "ok": bool(self.collected),
-            },
-            "files": list(self.collected),
-            "skipped_missing": self.collect_skips["skip_missing"],
-            "skipped_excluded": self.collect_skips["excluded_paths"],
-            "mapping": {
-                str(item): str(target / Path(item).name)
-                for item in [self.document, *self._dependencies]
-                if str(target / Path(item).name) in self.collected
-            },
-        }
-
-    def inspect_copy(self, assembly_path: str) -> dict[str, Any]:
-        """Report the component instances a re-opened document resolves (fixture).
-
-        Every failure knob describes the *copy* only: the original is the baseline
-        the copy is compared against, so injecting there would just make the
-        source look broken.
-        """
-
-        target = Path(assembly_path)
-        base = target.parent
-        is_copy = target.resolve() != Path(self.document).resolve()
-        extra = self.copy_extra_components if is_copy else 0
-        unresolved_count = self.copy_unresolved if is_copy else 0
-        entries = [dict(entry) for entry in self.components]
-        entries.extend({"name": f"extra-{index}", "path": str(self.document)} for index in range(extra))
-        instances = []
-        unresolved = []
-        suppressed = []
-        for position, entry in enumerate(entries):
-            name = str(entry["name"])
-            parent = str(entry.get("parent") or "")
-            # Name2 carries the assembly instance path, not the document path
-            instance = f"{parent}/{name}" if parent else str(entry.get("instance") or name)
-            if is_copy and self.copy_duplicate_instances and position == 1 and len(entries) > 1:
-                instance = str(entries[0].get("instance") or entries[0]["name"])
-            is_suppressed = bool(entry.get("suppressed"))
-            document: Path | None = base / Path(entry.get("path") or self.document).name
-            if position >= len(entries) - unresolved_count:
-                document = None
-            elif is_copy and self.copy_outside_documents:
-                # the realistic capture defect: the copy still resolves the
-                # same-named document from the working tree it was collected from
-                document = Path(self.document).parent / Path(entry.get("path") or self.document).name
-            configuration = str(entry.get("configuration") or "Default")
-            if is_copy and self.copy_referenced_configuration_change:
-                configuration = "Other"
-            if is_suppressed:
-                # A suppressed instance loads no model at all, which is not an
-                # escape as long as the copy is suppressed in the same places.
-                document = None
-            # The reported document is what the host resolved, whether or not the
-            # bytes are on disk; the closure check is what proves the file exists.
-            if document is None:
-                if is_suppressed:
-                    suppressed.append(instance)
-                else:
-                    unresolved.append(instance)
-            instances.append(
+        occurrences = []
+        components = []
+        for component in scene.components:
+            entry = component_entries.get(component.name, {})
+            occurrences.append(
                 {
-                    "instance": instance,
-                    "name": name,
-                    "document": str(document) if document is not None else None,
-                    "document_name": document.name.lower() if document is not None else None,
-                    "configuration": configuration,
-                    "defining": str(Path(assembly_path)),
-                    "defining_anchor": None,
-                    "virtual": False,
-                    "imported_path": None,
-                    "imported_error": None,
-                    "suppressed": is_suppressed,
-                    "depth": 0,
+                    "name": component.name,
+                    "path": component.path,
+                    "transform_raw": solidworks_transform(component.transform),
+                    "referenced_configuration": str(
+                        entry.get("configuration") or self.configurations[0]
+                    ),
+                    "is_fixed": component.is_fixed,
+                    "document_type": component.document_type,
                 }
             )
-        active = self.configurations[0]
-        if is_copy and self.copy_configuration:
-            active = self.copy_configuration
+            components.append(
+                {
+                    "name": component.name,
+                    "path": component.path,
+                    "is_fixed": component.is_fixed,
+                    "document_type": component.document_type,
+                }
+            )
+        raw_scene = {
+            "document": scene.document,
+            "configuration": self.configurations[0],
+            "source_sha256": file_digest(Path(doc_path)),
+            "document_state": self.document_state(doc_path),
+            "occurrences": occurrences,
+            "components": components,
+            "coordinate_systems": {
+                name: {
+                    "key": name,
+                    "name": name,
+                    "owner": "",
+                    "configuration": self.configurations[0],
+                    "document": scene.document,
+                    "array_data": solidworks_transform(matrix),
+                    "read_errors": {},
+                    "occurrence_transform_raw": None,
+                }
+                for name, matrix in scene.coordinate_systems.items()
+            },
+        }
+        part_mass = {
+            name: fixture_mass_fact(reading)
+            for name, reading in scene.mass_properties.items()
+        }
+        assembly_reader = getattr(self, "assembly_mass_properties", None)
+        assembly_mass = None
+        if callable(assembly_reader):
+            try:
+                reading = assembly_reader(doc_path)
+            except Exception:  # noqa: BLE001 - optional native probe
+                reading = None
+            if isinstance(reading, dict):
+                assembly_mass = fixture_mass_fact(reading)
+        context_reader = getattr(self, "assembly_component_mass_properties", None)
+        component_mass = None
+        if callable(context_reader):
+            try:
+                reading = context_reader(doc_path)
+            except Exception:  # noqa: BLE001 - optional native probe
+                reading = None
+            if isinstance(reading, dict):
+                component_mass = fixture_component_mass_fact(reading)
+        selections = {
+            str(group.get("name")): {
+                "selection": [
+                    str(name)
+                    for name in group.get("components") or []
+                ]
+            }
+            for group in groups
+            if isinstance(group, dict) and group.get("name")
+        }
+        link_reader = getattr(self, "link_group_mass_properties", None)
+        if callable(link_reader):
+            link_mass = fixture_link_group_mass_fact(
+                link_reader(doc_path, selections)
+            )
+        else:
+            link_mass = {
+                "assembly": scene.document,
+                "configuration": self.configurations[0],
+                "used_api": "IMassProperty2 (SelectedItems = component set)",
+                "selection_rule": "top_most_providers+uncovered_leaves",
+                "links": {},
+            }
+        scope_reader = getattr(self, "source_scopes", None)
+        component_names = [component.name for component in scene.components]
+        source_scopes = (
+            scope_reader(component_names)
+            if callable(scope_reader)
+            else {
+                name: copy.deepcopy(self._source_scope_overrides[name])
+                for name in component_names
+            }
+        )
         return {
-            "document": str(target),
-            "configuration": active,
-            "components": len(instances),
-            "unresolved": unresolved,
-            "suppressed": suppressed,
-            "instances": instances,
+            "scene_raw": raw_scene,
+            "part_mass_raw": part_mass,
+            "assembly_mass_raw": assembly_mass,
+            "component_mass_raw": component_mass,
+            "link_group_mass_raw": link_mass,
+            "source_scopes": source_scopes,
+            "notes": copy.deepcopy(scene.notes),
         }
 
-    def resolve_dependencies(self, path: str) -> list[dict[str, Any]]:
-        if self.resolve_returns_empty:
-            return []
-        target = Path(path).parent
-        entries = [
-            {
-                "path": str(target / Path(item).name),
-                "exists": (target / Path(item).name).is_file(),
-                "type": Path(item).suffix.lower(),
-            }
-            for item in [self.document, *self._dependencies]
-        ]
-        if self.resolve_only_existing:
-            # a build that lists only what it actually resolved, so a missing
-            # instance document has to be caught by the re-opened copy
-            entries = [entry for entry in entries if entry["exists"]]
+    def capture_prepared_geometry(
+        self,
+        source_scopes: Mapping[str, dict],
+        on_activity=None,
+    ) -> dict[str, dict]:
+        """Return direct raw triangle facts for each prepared occurrence."""
+
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("capture_prepared_geometry")
+        names = sorted(str(entry["name"]) for entry in self.components)
+        if set(source_scopes) != set(names):
+            raise ValueError("prepared geometry source scopes differ from its occurrences")
+        entries = {}
+        for index, name in enumerate(names, start=1):
+            entry = next(item for item in self.components if str(item["name"]) == name)
+            entries[name] = fixture_native_geometry(
+                name,
+                source_scopes[name],
+                solidworks_transform(entry.get("transform") or _identity()),
+            )
+            if on_activity is not None:
+                on_activity(
+                    {
+                        "phase": "capture",
+                        "action": "geometry_facts",
+                        "current_object": name,
+                        "completed": index,
+                        "total": len(names),
+                    }
+                )
         return entries
+
+    def release(self) -> None:
+        order = getattr(self, "order", None)
+        if order is None:
+            order = self.order = []
+        order.append("release")
+        self.open_documents.clear()
 
     def collect_scene(
         self,
@@ -1519,9 +939,7 @@ class FixtureCadBackend(CadBackend):
         order.append("collect_scene")
         self.collected_scene_calls.append(str(doc_path))
         if self.originals_change_during_capture:
-            Path(self.document).write_bytes(b"fixture assembly edited during capture")
-        if self.drift_configuration_after_reading:
-            self._drifted = True
+            Path(doc_path).write_bytes(b"fixture assembly edited during capture")
         scene = RawScene(document=str(self.scene_document_override or doc_path))
         for entry in self.components:
             scene.components.append(
@@ -1550,60 +968,76 @@ class FixtureCadBackend(CadBackend):
                 )
         return scene
 
-    def export_component_meshes(self, destinations: dict[str, str], on_activity=None) -> dict[str, dict[str, Any]]:
-        entries = {}
-        total = len(destinations)
-        for index, (component, dest_path) in enumerate(destinations.items(), start=1):
-            if on_activity is not None:
-                on_activity(
-                    {
-                        "phase": "capture",
-                        "action": "mesh_export",
-                        "current_object": component,
-                        "completed": index,
-                        "total": total,
-                    }
-                )
-            face_edges, native_edges = cube_native_edges()
-            mesh_triangles, _attributes = cube_triangles()
-            spans = []
-            start = 0
-            for face_index in range(6):
-                count = 2
-                spans.append(
-                    {
-                        "body_type": 0,
-                        "body_index": 0,
-                        "body_name": "fixture-solid",
-                        "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
-                        "face_index": face_index,
-                        "face_reference_sha256": hashlib.sha256(
-                            f"fixture-face-{face_index}".encode()
-                        ).hexdigest(),
-                        "face_owner_id": face_index + 1,
-                        "edge_references": face_edges[face_index],
-                        "triangle_start": start,
-                        "triangle_count": count,
-                        "triangle_records_sha256": "0" * 64,
-                    }
-                )
-                start += count
-            tessellation = native_tessellation_fixture(
-                spans,
-                native_edges,
-                triangle_vertices=mesh_triangles,
+    def assembly_mass_properties(self, path):
+        """Return one deterministic whole-assembly raw getter reading."""
+
+        names = [str(entry["name"]) for entry in self.components]
+        combined = compose_fixture_link_reads(
+            self.components,
+            {},
+            {"assembly": names},
+        )["assembly"]["reads"][0]
+        return {
+            "mass": combined["mass_kg"],
+            "com": combined["com_m"],
+            "inertia": combined["inertia_tensor_about_com"],
+            "reference": {
+                "used_api": "fixture-assembly-mass",
+                "product_convention": "solidworks_standard",
+                "reference_point": "center_of_mass",
+                "axes": "assembly_document_axes",
+                "use_system_units": True,
+                "scope": "assembly_document",
+                "overrides": {
+                    "OverrideMass": False,
+                    "OverrideCenterOfMass": False,
+                    "OverrideMomentsOfInertia": False,
+                },
+            },
+        }
+
+    def assembly_component_mass_properties(self, path):
+        """Return one assembly-context getter reading per fixture occurrence."""
+
+        effective = getattr(self, "effective_readings", None) or {}
+        instances = []
+        for entry in self.components:
+            name = str(entry["name"])
+            reading = entry["mass"]
+            reference = reading.get("reference") or {}
+            overrides = copy.deepcopy(
+                reference.get("overrides")
+                or {
+                    "OverrideMass": False,
+                    "OverrideCenterOfMass": False,
+                    "OverrideMomentsOfInertia": False,
+                }
             )
-            Path(dest_path).write_bytes(tessellation.stl_bytes)
-            self.exported.append(str(dest_path))
-            entries[component] = {
-                "component": component,
-                "written": dest_path,
-                "used_api": "fixture",
-                "triangles": len(mesh_triangles),
-                "bodies": {"solid": 1, "sheet": 0},
-                "tessellation": tessellation,
+            row = {
+                "name": name,
+                "parent": None,
+                "depth": 0,
+                "document": str(entry.get("path") or self.document),
+                "document_type": "part",
+                "context_mass_kg": float(reading["mass"]),
+                "context_volume_m3": reference.get("volume_m3"),
+                "overrides": overrides,
+                "read_errors": {},
+                "effective": None,
+                "effective_error": None,
             }
-        return entries
+            if name in effective:
+                row["effective"] = copy.deepcopy(effective[name])
+            instances.append(row)
+        return {
+            "assembly": str(path),
+            "configuration": str(getattr(self, "configuration_name", "Default")),
+            "instances": instances,
+            "errors": [],
+            "reference": {
+                "method": "IMassProperty2 (SelectedItems = component instance)",
+            },
+        }
 
     def link_group_mass_properties(self, path, selections):
         """Direct link reads for the fixture: the assembly-frame recombination."""
@@ -1612,16 +1046,23 @@ class FixtureCadBackend(CadBackend):
         if order is None:
             order = self.order = []
         order.append("link_group_read")
-        links = compose_fixture_link_reads(self.components, getattr(self, "effective_readings", None) or {}, selections)
+        normalized_selections = {
+            str(body): (
+                list(value.get("selection") or [])
+                if isinstance(value, dict)
+                else list(value)
+            )
+            for body, value in selections.items()
+        }
+        links = compose_fixture_link_reads(
+            self.components,
+            getattr(self, "effective_readings", None) or {},
+            normalized_selections,
+        )
         override = getattr(self, "link_group_selection_override", None) or {}
         for body, names in override.items():
             if str(body) in links:
                 links[str(body)]["selection"] = [str(name) for name in names]
-        if getattr(self, "link_group_payload_nonfinite", False):
-            links["base_link"]["reads"][0]["inertia_values_about_origin_api"] = {
-                "error": "fixture",
-                "values": [float("nan")] * 9,
-            }
         return {
             "assembly": str(self.scene_document_override or path),
             "configuration": str(getattr(self, "configuration_name", "Default")),
@@ -1629,54 +1070,6 @@ class FixtureCadBackend(CadBackend):
             "selection_rule": "top_most_providers+uncovered_leaves",
             "links": links,
         }
-
-    def close_all_documents(self):
-        """Fixture close-all for the pristine readout window."""
-
-        order = getattr(self, "order", None)
-        if order is None:
-            order = self.order = []
-        order.append("close_all_documents")
-        if getattr(self, "close_refuses", False):
-            raise CadError("cad_close_failed", "fixture refuses to close documents")
-        self.open_documents.clear()
-        return {"closed": True}
-
-    def retire_session(self, role: str = "copy") -> dict[str, Any]:
-        """Model the rewrite-to-capture owned-process boundary."""
-
-        order = getattr(self, "order", None)
-        if order is None:
-            order = self.order = []
-        order.append("retire_session")
-        if role != "copy":
-            raise AssertionError(f"unexpected retired role: {role}")
-        before = {
-            "pid": self.session_pid,
-            "state": "active",
-            "role": role,
-        }
-        self.retired_session_pids.append(self.session_pid)
-        self.open_documents.clear()
-        self.session_pid += 1
-        return {
-            "role": role,
-            "retired": True,
-            "before": before,
-            "after": {
-                "pid": self.session_pid,
-                "state": "active",
-                "role": role,
-            },
-        }
-
-    def verify_sources_unchanged(self) -> dict[str, Any]:
-        order = getattr(self, "order", None)
-        if order is None:
-            order = self.order = []
-        order.append("verify_sources")
-        files = [self.document, *self._dependencies]
-        return {str(item): {"sha256": file_digest(Path(item))} for item in files if Path(item).is_file()}
 
     def environment(self) -> dict[str, Any]:
         order = getattr(self, "order", None)
@@ -1699,6 +1092,53 @@ class FixtureCadBackend(CadBackend):
         }
 
 
+def capture_prepared_fixture(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    backend: FixtureCadBackend,
+    worker_version: str = "unknown",
+    on_activity=None,
+) -> dict[str, Any]:
+    """Run the production prepared-Capture entry over one fixture package."""
+
+    from description_pipeline.sources.solidworks.errors import BridgeError
+    from description_pipeline.sources.solidworks.freeze import capture_prepared
+
+    requests = capture_requests(config)
+    document = Path(backend.document).resolve()
+    package = document.parent
+    native_files = {}
+    outside = []
+    for path in [document, *backend._dependencies]:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            continue
+        try:
+            relative = resolved.relative_to(package)
+        except ValueError:
+            outside.append(str(resolved))
+            continue
+        native_files[relative.as_posix()] = file_digest(resolved)
+    if outside:
+        raise BridgeError(
+            "prepared_source_outside_root",
+            "prepared capture inputs must remain under the prepared package",
+            {"package": str(package), "outside": sorted(outside)},
+            exit_code=3,
+        )
+    return capture_prepared(
+        requests,
+        Path(destination),
+        package=package,
+        prepared_root=package,
+        native_files=native_files,
+        backend=backend,
+        worker_version=worker_version,
+        on_activity=on_activity,
+    )
+
+
 def make_cad_tree(root: Path) -> Path:
     """Create a tiny on-disk 'CAD' tree: one assembly plus two parts."""
 
@@ -1714,131 +1154,6 @@ def cleanup(path: Path) -> None:
     import shutil
 
     shutil.rmtree(path, ignore_errors=True)
-
-
-def write_link_group_mass_record(bundle: Path, model: dict, source: dict) -> None:
-    """Synthesize the direct link group record the producer will emit (fixture stand-in).
-
-    The record is derived from the bundle's sealed raw scene plus the model the
-    fixtures just built, so the verifier's direct-readout binding can run before
-    the native producer method lands.
-    """
-
-    import json as _json
-
-    import numpy as _np
-
-    from description_pipeline.sources.solidworks import verify as oracle
-
-    bundle = Path(bundle)
-    evidence = bundle / "evidence"
-    raw = _json.loads((evidence / "raw/scene_raw.json").read_text())
-    masses = _json.loads((evidence / "raw/mass_properties.json").read_text())
-    datums = _json.loads((evidence / "raw/coordinate_systems.json").read_text())
-    effective = oracle.effective_math_map(masses, raw)
-    links = {str(link["name"]): link for link in model.get("links", [])}
-    payload = {
-        "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
-        "assembly": raw.get("document") or raw.get("source_document"),
-        "configuration": str(source.get("configuration") or "Default"),
-        "used_api": "IMassProperty2 (SelectedItems = component set)",
-        "selection_rule": "top_most_providers+uncovered_leaves",
-        "links": {},
-    }
-    for body in source.get("bodies") or []:
-        name = str(body.get("name"))
-        selection = sorted(
-            str(note["component"])
-            for *_rest, note in oracle._resolved_contributions(body, raw, masses, effective)
-        )
-        mass, com_link, tensor_link = oracle._canonical_in_link_frame(links[name])
-        datum = _np.array(datums[body["frame"]["coordinate_system"]], dtype=float).reshape(4, 4)
-        com_assembly = datum[:3, :3] @ com_link + datum[:3, 3]
-        tensor_assembly = datum[:3, :3] @ tensor_link @ datum[:3, :3].T
-        read = {
-            "mass_kg": float(mass),
-            "volume_m3": 0.001,
-            "density_kg_m3": 1000.0,
-            "com_m": com_assembly.tolist(),
-            "inertia_tensor_about_com": tensor_assembly.tolist(),
-            "inertia_values_about_origin_api": {"error": "fixture"},
-            "overrides": {
-                "OverrideMass": False,
-                "OverrideCenterOfMass": False,
-                "OverrideMomentsOfInertia": False,
-            },
-        }
-        payload["links"][name] = {
-            "selection": selection,
-            "reads": [_json.loads(_json.dumps(read)), _json.loads(_json.dumps(read))],
-            "reproducibility": {
-                "mass_delta_kg": 0.0,
-                "com_delta_norm_m": 0.0,
-                "tensor_delta_max_abs": 0.0,
-            },
-        }
-    (evidence / "raw/link_group_mass_properties.json").write_text(
-        _json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-    )
-
-
-def write_link_group_mass_record_from_recombination(bundle: Path, source: dict) -> None:
-    """Seed the direct link record from the recombination (fixtures without a model yet).
-
-    Used before ``load_scene``/manifest verification so a fixture bundle is
-    shaped exactly like a native12 capture; the scene that consumes it later
-    regenerates the same link inertials by construction.
-    """
-
-    import json as _json
-
-    from description_pipeline.sources.solidworks import verify as oracle
-
-    bundle = Path(bundle)
-    evidence = bundle / "evidence"
-    raw = _json.loads((evidence / "raw/scene_raw.json").read_text())
-    masses = _json.loads((evidence / "raw/mass_properties.json").read_text())
-    effective = oracle.effective_math_map(masses, raw)
-    payload = {
-        "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
-        "assembly": raw.get("document") or raw.get("source_document"),
-        "configuration": str(source.get("configuration") or "Default"),
-        "used_api": "IMassProperty2 (SelectedItems = component set)",
-        "selection_rule": "top_most_providers+uncovered_leaves",
-        "links": {},
-    }
-    for body in source.get("bodies") or []:
-        name = str(body.get("name"))
-        selection = sorted(
-            str(note["component"])
-            for *_rest, note in oracle._resolved_contributions(body, raw, masses, effective)
-        )
-        world = oracle._raw_world(body, raw, masses)
-        read = {
-            "mass_kg": float(world["mass"]),
-            "volume_m3": None,
-            "density_kg_m3": None,
-            "com_m": [float(value) for value in world["com"]],
-            "inertia_tensor_about_com": [[float(value) for value in row] for row in world["inertia"]],
-            "inertia_values_about_origin_api": {"error": "fixture"},
-            "overrides": {
-                "OverrideMass": False,
-                "OverrideCenterOfMass": False,
-                "OverrideMomentsOfInertia": False,
-            },
-        }
-        payload["links"][name] = {
-            "selection": selection,
-            "reads": [_json.loads(_json.dumps(read)), _json.loads(_json.dumps(read))],
-            "reproducibility": {
-                "mass_delta_kg": 0.0,
-                "com_delta_norm_m": 0.0,
-                "tensor_delta_max_abs": 0.0,
-            },
-        }
-    (evidence / "raw/link_group_mass_properties.json").write_text(
-        _json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-    )
 
 
 def read_scene(snapshot: Path) -> dict:
@@ -1864,16 +1179,13 @@ def saved_document_state(configuration: str = "Default") -> dict:
     observed = {
         "save_flag": False,
         "configuration": configuration,
-        "needs_rebuild2_value": 0,
-        "configuration_needs_rebuild": False,
         "read_only": True,
     }
     return {
         "before": copy.deepcopy(observed),
         "after": copy.deepcopy(observed),
         "used_api": (
-            "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/"
-            "IConfiguration.Name/IConfiguration.NeedsRebuild"
+            "IModelDoc2.GetSaveFlag/IConfiguration.Name"
         ),
     }
 
@@ -2190,6 +1502,13 @@ def capture_requests(config: dict) -> dict:
     """
 
     cfg = dict(config)
+    for retired in (
+        "allowed_roots",
+        "closure",
+        "document_suffixes",
+        "require_saved",
+    ):
+        cfg.pop(retired, None)
     bodies = cfg.pop("bodies", None)
     if bodies is not None and "groups" not in cfg:
         cfg["groups"] = [
@@ -2622,7 +1941,6 @@ def native_record(
         "components": [dict(item) for item in components],
         "mates": [dict(item) for item in mates],
         "datums": [dict(item) for item in datums],
-        "masses": [dict(item) for item in masses],
         "assembly_mass_kg": float(
             assembly_mass_kg if assembly_mass_kg is not None else sum(float(row["mass_kg"]) for row in masses)
         ),
@@ -2698,48 +2016,9 @@ def seal_scene_inputs(
             },
         },
     }
-    rewrite_path = Path(destination) / "evidence/rewrite-environment.json"
-    rewrite = read_data(rewrite_path)
-    runtime_copy_pid = runtime_record.get("solidworks", {}).get("sessions", {}).get("copy", {}).get("pid")
-    rewrite_copy_pid = rewrite.get("solidworks", {}).get("sessions", {}).get("copy", {}).get("pid")
-    runtime_copy_pid = runtime_copy_pid if type(runtime_copy_pid) is int and runtime_copy_pid > 0 else 101
-    rewrite_copy_pid = rewrite_copy_pid if type(rewrite_copy_pid) is int and rewrite_copy_pid > 0 else 100
-    source_pid = min(runtime_copy_pid, rewrite_copy_pid) - 1
-    if source_pid <= 0:
-        source_pid = max(runtime_copy_pid, rewrite_copy_pid) + 1
-    runtime_sessions = {
-        "source": {"pid": source_pid, "state": "closed"},
-        "copy": {"pid": runtime_copy_pid, "state": "active"},
-    }
-    rewrite_sessions = {
-        "source": {"pid": source_pid, "state": "closed"},
-        "copy": {"pid": rewrite_copy_pid, "state": "active"},
-    }
-    runtime_record["platform"] = "Windows-11"
     runtime_record["toolchain"] = native_tool
     runtime_record["worker_version"] = str(native_tool["version"])
-    runtime_record["solidworks"]["sessions"] = runtime_sessions
-    boundary = runtime_record.get("session_boundary")
-    if isinstance(boundary, dict) and isinstance(boundary.get("retirement"), dict):
-        retirement = boundary["retirement"]
-        for key, state in (("before", "active"), ("after", "closed")):
-            identity = retirement.get(key)
-            if isinstance(identity, dict):
-                retirement[key] = {
-                    "pid": rewrite_copy_pid,
-                    "state": state,
-                    **{
-                        name: identity[name]
-                        for name in ("executable", "ownership", "lease")
-                        if name in identity
-                    },
-                }
-    rewrite["platform"] = "Windows-11"
-    rewrite["toolchain"] = native_tool
-    rewrite["worker_version"] = str(native_tool["version"])
-    rewrite["solidworks"]["sessions"] = rewrite_sessions
     write_json(runtime, runtime_record)
-    write_json(rewrite_path, rewrite)
     write_json(Path(destination) / "reports/native-tool.json", native_tool)
     from description_pipeline.sources.snapshot import write_manifest
 

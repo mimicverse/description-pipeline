@@ -96,7 +96,8 @@ Check 'wording.restore_path' ($source.Contains('Restore-PreviousEndpoint') -and 
 Check 'wording.stage_candidate_generation' ($source.Contains('Get-EndpointConfigCandidateProgram') -and
   $source.Contains('endpoint_config_unknown_keys') -and $source.Contains('candidate-identity.json') -and
   $source.Contains('candidate_config_mismatch'))
-Check 'wording.old_copy_removed' (-not $source.Contains('Copy-Item -LiteralPath (Action-Config $task)')) 'the byte-copy stage path is still present'
+Check 'wording.launcher_parser_removed' (-not $source.Contains('Action-Config') -and
+  -not $source.Contains('Get-RecoveryIdentity')) 'a second task-action parser is still present'
 Check 'wording.compat_tolerance_removed' ((-not $source.Contains('REMOVED_KEYS')) -and (-not $source.Contains('removed_keys'))) 'the removed-key tolerance channel is still present'
 Check 'wording.transform_receipt_removed' ((-not $source.Contains('config-transformation.json')) -and (-not $source.Contains('stage-config-transform'))) 'the obsolete transform receipt is still present'
 Check 'wording.no_lock_or_kill' (-not $source.Contains('Remove-Item -LiteralPath $lock')) 'never delete the ownership lock'
@@ -106,15 +107,19 @@ Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfi
 Check 'wording.python_module_task_action' ($source.Contains('function Runtime-LauncherArguments') -and
   $source.Contains('function Test-Runtime-Launcher') -and
   $source.Contains('-I -B -m description_pipeline.orchestration.windows serve --config') -and
-  $source.Contains('function Legacy-Launcher') -and
-  $source.Contains('function Legacy-LauncherArguments') -and
   $source.Contains('launch_contract=(Python-Module-LaunchContract)') -and
   $source.Contains('-Argument (Runtime-LauncherArguments $StageDir)'))
 Check 'wording.remote_python_bytecode_disabled' (-not @(($source -split "`r?`n") |
   Where-Object { $_ -match '\s-I\s' -and $_ -notmatch '\s-I\s+-B' }))
-Check 'wording.bytecode_transition_is_exact' ($source.Contains('Test-Bytecode-TransitionGeneration') -and
-  $source.Contains('140d39e51be5f0c39c32d7cfea9ca25fe642c273') -and
-  $source.Contains('351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec'))
+Check 'wording.history_special_cases_removed' (-not $source.Contains('55cdf8da178e37239d3ac199cd27fc50cf56540d') -and
+  -not $source.Contains('140d39e51be5f0c39c32d7cfea9ca25fe642c273') -and
+  -not $source.Contains('legacy_pip_launcher_v0'))
+Check 'wording.source_action_config_binding' (
+  $source.Contains('the raw source action does not carry its managed configuration path') -and
+  $source.Contains('Assert-ListenerMatch $sourceListener $preStopListener'))
+Check 'wording.status_exposes_raw_task_xml' (
+  $source.Contains('task_xml=$null') -and
+  $source.Contains('$live.task_xml = [string]$projection.xml'))
 Check 'wording.archive_is_read_only' ($source.Contains('function Protect-ManagedArchive') -and
   $source.Contains('function Assert-ManagedArchive') -and
   $source.Contains('Set-ItemProperty -LiteralPath $Path -Name IsReadOnly -Value $true') -and
@@ -127,13 +132,13 @@ Check 'wording.user_domain_pins' ($source.Contains("GetEnvironmentVariable(`$Nam
   $source.Contains("SetEnvironmentVariable(`$Name, `$Value, 'User')"))
 Check 'wording.windows_recovery_schema' ($source.Contains('recovery-snapshot') -and
   $source.Contains('recovery-restore') -and $source.Contains('recovery-verify') -and
-  $source.Contains('solidworks-to-urdf.windows-recovery/v1'))
+  $source.Contains('solidworks-to-urdf.windows-recovery/v2'))
 $snapshotStateStart = $source.IndexOf('$state = [ordered]@{')
 $snapshotStateEnd = $source.IndexOf('files = $files', $snapshotStateStart)
-Check 'wording.recovery_snapshot_launch_contract' ($snapshotStateStart -ge 0 -and
+Check 'wording.recovery_snapshot_is_opaque_source_state' ($snapshotStateStart -ge 0 -and
   $snapshotStateEnd -gt $snapshotStateStart -and
-  $source.Substring($snapshotStateStart, $snapshotStateEnd - $snapshotStateStart).Contains(
-    'runtime_launch_contract = $identity.runtime_launch_contract'))
+  -not $source.Substring($snapshotStateStart, $snapshotStateEnd - $snapshotStateStart).Contains(
+    'runtime_launch_contract'))
 $lookupStart = $source.IndexOf('function Find-GenerationLaunchContract')
 $lookupEnd = $source.IndexOf('function Get-GenerationLaunchContract', $lookupStart)
 Check 'wording.launch_contract_lookup_is_non_exiting' ($lookupStart -ge 0 -and
@@ -208,7 +213,7 @@ $startupToken = Join-Path $startupRoot 'token'
 $script:startupStates = @('Ready','Ready','Running')
 $script:startupNow = [datetime]'2026-10-22T00:00:00Z'
 function Get-ScheduledTask {
-  [CmdletBinding()] param([string]$TaskName)
+  [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
   $state = $script:startupStates[0]
   if ($script:startupStates.Count -gt 1) {
     $script:startupStates = @($script:startupStates | Select-Object -Skip 1)
@@ -248,7 +253,10 @@ Remove-Item -LiteralPath $startupRoot -Recurse -Force -ErrorAction SilentlyConti
 
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
-  'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
+  'Get-TaskGeneration', 'Get-ListenerEvidence', 'Get-EndpointIdentity',
+  'Read-EndpointRuntimeProbe',
+  'New-EndpointSourceState', 'Assert-EndpointSourceMatch', 'Assert-HealthSourceMatch',
+  'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
   'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
   'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
 $seams += 'Get-AclProjection', 'Set-AclProjection', 'Get-TaskProjection', 'Get-RecoveryCurrentState',
@@ -301,7 +309,7 @@ $taskText = '<Task />'
 [System.IO.File]::WriteAllText((Join-Path $recoverySource 'task.xml'), $taskText, (New-Object System.Text.UTF8Encoding($false)))
 $taskBytes = [System.Text.Encoding]::UTF8.GetBytes($taskText)
 $recoveryState = [ordered]@{
-  schema_version='solidworks-to-urdf.windows-recovery/v1'
+  schema_version='solidworks-to-urdf.windows-recovery/v2'
   members=@([ordered]@{member='task.xml';bytes=$taskBytes.Length;sha256=(Get-BytesSha256 $taskBytes)})
 }
 [System.IO.File]::WriteAllText(
@@ -311,11 +319,42 @@ $recoveryState = [ordered]@{
 $recoveryBundle = Join-Path $recoveryRoot 'recovery.zip'
 Compress-Archive -Path (Join-Path $recoverySource '*') -DestinationPath $recoveryBundle
 $recoveryRead = Read-RecoveryBundle $recoveryBundle
-Check 'windows_recovery.bundle_schema' ($recoveryRead.schema_version -eq 'solidworks-to-urdf.windows-recovery/v1')
+Check 'windows_recovery.bundle_schema' ($recoveryRead.schema_version -eq 'solidworks-to-urdf.windows-recovery/v2')
 $recoveryExpanded = Expand-RecoveryBundle $recoveryBundle $recoveryRoot
 Check 'windows_recovery.bundle_member' ((Get-FileHash -LiteralPath (Join-Path $recoveryExpanded.root 'task.xml') -Algorithm SHA256).Hash.ToLower() -eq
   [string]$recoveryRead.members[0].sha256)
 Remove-Item -LiteralPath $recoveryRoot -Recurse -Force -ErrorAction SilentlyContinue
+$readbackExpected = [ordered]@{
+  schema_version='solidworks-to-urdf.windows-recovery/v2'; ssh_host='fixture-host';
+  task=[ordered]@{
+    task_path='\'; task_name='fixture'; state='Disabled';
+    xml_sha256=('a' * 64); semantic_sha256=('b' * 64);
+    principal=@{sid='S-1-5-21-1-2-3-500'};
+    action=@{execute='C:/generation/runtime/Scripts/python.exe';
+      arguments='opaque source action'; working_directory='C:/state'};
+    settings=@{multiple_instances='IgnoreNew'};
+    triggers_sha256=('c' * 64); security_descriptor_sha256=('d' * 64)};
+  identity=@{config_digest=('e' * 64); install_id='win-' + ('f' * 32)};
+  files=@(
+    @{role='task_xml'; member='task.xml'; sha256=('a' * 64)},
+    @{role='endpoint_config'; member='endpoint.json'; sha256=('1' * 64)});
+  acl=@{task_file=@{projection_sha256=('2' * 64)}};
+  cad=@{lease_held=$false};
+  members=@(
+    @{member='task.xml'; sha256=('a' * 64)},
+    @{member='endpoint.json'; sha256=('1' * 64)})
+}
+$readbackCurrent = ($readbackExpected | ConvertTo-Json -Depth 12 | ConvertFrom-Json)
+$readbackCurrent.task.xml_sha256 = '9' * 64
+$readbackCurrent.files[0].sha256 = '9' * 64
+$readbackCurrent.members[0].sha256 = '9' * 64
+Check 'windows_recovery.readback_ignores_export_format_only' (
+  (Get-JsonSha256 (Get-RecoveryComparableState $readbackCurrent)) -eq
+  (Get-JsonSha256 (Get-RecoveryComparableState $readbackExpected)))
+$readbackCurrent.task.action.arguments = 'changed action'
+Check 'windows_recovery.readback_refuses_semantic_action_change' (
+  (Get-JsonSha256 (Get-RecoveryComparableState $readbackCurrent)) -ne
+  (Get-JsonSha256 (Get-RecoveryComparableState $readbackExpected)))
 
 # ---- strict JSON boundary on the bound CPython 3.12 (PowerShell 5.1-compatible path) --------
 $scanPython = Get-EndpointConfigScanPython
@@ -764,13 +803,13 @@ $script:CallLog = [System.Collections.Generic.List[string]]::new()
 $script:OldHealthOk = $true
 $script:HealthProbes = [System.Collections.Generic.List[string]]::new()
 function Get-ScheduledTask {
-  [CmdletBinding()] param([string]$TaskName)
+  [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
   if ($script:TaskMissing) { return $null }
   $actions = if ($null -eq $script:CurrentAction) { @() } else { @($script:CurrentAction) }
   return [pscustomobject]@{ State = $script:TaskState; Actions = $actions }
 }
-function Start-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:Starts++; $script:CallLog.Add('start') }
-function Stop-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:CallLog.Add('stop') }
+function Start-ScheduledTask { [CmdletBinding()] param([string]$TaskName, [string]$TaskPath) $script:Starts++; $script:CallLog.Add('start') }
+function Stop-ScheduledTask { [CmdletBinding()] param([string]$TaskName, [string]$TaskPath) $script:CallLog.Add('stop') }
 function Register-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, [string]$Xml, [switch]$Force)
   if ($PSBoundParameters.ContainsKey('TaskPath') -and -not $TaskPath) {
@@ -824,7 +863,7 @@ function Health-Probe {
   return @{ ready = $true }
 }
 function Write-Receipt {
-  param([string]$path, [hashtable]$payload)
+  param([string]$path, $payload)
   $parent = Split-Path -Parent $path
   if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
   [System.IO.File]::WriteAllText($path, ($payload | ConvertTo-Json -Depth 8 -Compress))
@@ -840,12 +879,6 @@ $previous = Join-Path $promotions 'previous-test'
 $null = New-Item -ItemType Directory -Path $generation -Force
 $null = New-Item -ItemType Directory -Path $previous -Force
 [System.IO.File]::WriteAllText((Join-Path $previous 'task.xml'), '<Task />')
-[System.IO.File]::WriteAllText(
-  (Join-Path $previous 'stage-receipt.json'),
-  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $previous); version='1.5.0';
-     source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
-     source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
-    ConvertTo-Json -Compress))
 $configPath = Join-Path $generation 'endpoint.json'
 [System.IO.File]::WriteAllText($configPath, ('{{"state_root":"{0}"}}' -f ($root -replace '\\', '/')))
 [System.IO.File]::WriteAllText(
@@ -863,86 +896,75 @@ Check 'launch.candidate_action_accepted' (Test-Runtime-Launcher (Runtime-Launche
   (Runtime-LauncherArguments $generation) $generation)
 Check 'launch.bytecode_flag_required' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `
   ((Runtime-LauncherArguments $generation) -replace ' -B', '') $generation))
-$bytecodeTransitionGeneration = Join-Path $root 'bytecode-transition-generation'
-$null = New-Item -ItemType Directory -Path $bytecodeTransitionGeneration
-[System.IO.File]::WriteAllText(
-  (Join-Path $bytecodeTransitionGeneration 'endpoint.json'),
-  ('{{"state_root":"{0}"}}' -f ($root -replace '\\', '/')))
-[System.IO.File]::WriteAllText(
-  (Join-Path $bytecodeTransitionGeneration 'stage-receipt.json'),
-  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $bytecodeTransitionGeneration);
-     launch_contract='python_module_v1'; version='1.5.0';
-     source_commit='140d39e51be5f0c39c32d7cfea9ca25fe642c273';
-     source_sha256='351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec'} |
-    ConvertTo-Json -Compress))
-$bytecodeTransitionArguments = '-I -m description_pipeline serve --config "' +
-  (Config-Path $bytecodeTransitionGeneration) + '"'
-Check 'launch.bytecode_transition_action_accepted' (Test-Runtime-Launcher `
-  (Runtime-Launcher $bytecodeTransitionGeneration) $bytecodeTransitionArguments $bytecodeTransitionGeneration)
-Check 'launch.bytecode_transition_is_not_broad' (-not (Test-Runtime-Launcher `
-  (Runtime-Launcher $generation) ('-I -m description_pipeline serve --config "' +
-    (Config-Path $generation) + '"') $generation))
 Check 'launch.interactive_flag_refused' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `
   ((Runtime-LauncherArguments $generation) -replace '^-I ', '-i ') $generation))
 Check 'launch.module_case_refused' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `
   ((Runtime-LauncherArguments $generation) -replace 'description_pipeline', 'Description_Pipeline') $generation))
 Check 'launch.argument_suffix_refused' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `
   ((Runtime-LauncherArguments $generation) + ' --foreign') $generation))
-Check 'launch.mixed_case_contract_refused' (-not (Test-Runtime-LauncherAction `
-  (Runtime-Launcher $generation) (Runtime-LauncherArguments $generation) $generation 'Python_Module_V1'))
-$legacyGeneration = Join-Path $root 'legacy-generation'
-$null = New-Item -ItemType Directory -Path $legacyGeneration
-[System.IO.File]::WriteAllText(
-  (Join-Path $legacyGeneration 'stage-receipt.json'),
-  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $legacyGeneration); version='1.5.0';
-     source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
-     source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
-    ConvertTo-Json -Compress))
-Check 'launch.legacy_description_exe_accepted_for_old_generation' (Test-Runtime-Launcher `
-  (Legacy-Launcher $legacyGeneration) (Legacy-LauncherArguments $legacyGeneration) $legacyGeneration)
-Check 'launch.legacy_description_exe_refused_for_new_generation' (-not (Test-Runtime-Launcher `
-  (Legacy-Launcher $generation) (Legacy-LauncherArguments $generation) $generation))
-$forgedLegacyGeneration = Join-Path $root 'forged-legacy-generation'
-$null = New-Item -ItemType Directory -Path $forgedLegacyGeneration
-[System.IO.File]::WriteAllText(
-  (Join-Path $forgedLegacyGeneration 'stage-receipt.json'),
-  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $legacyGeneration); version='1.5.0';
-     source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
-     source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
-    ConvertTo-Json -Compress))
-$message = ''
-try { $null = Test-Runtime-Launcher (Legacy-Launcher $forgedLegacyGeneration) `
-  (Legacy-LauncherArguments $forgedLegacyGeneration) $forgedLegacyGeneration } catch { $message = $_.Exception.Message }
-Check 'launch.forged_legacy_generation_refused' ($message -match 'generation is not an exact string')
-$wrongLegacySourceGeneration = Join-Path $root 'wrong-legacy-source-generation'
-$null = New-Item -ItemType Directory -Path $wrongLegacySourceGeneration
-[System.IO.File]::WriteAllText(
-  (Join-Path $wrongLegacySourceGeneration 'stage-receipt.json'),
-  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $wrongLegacySourceGeneration);
-     version='1.5.0'; source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
-     source_sha256=('a' * 64)} | ConvertTo-Json -Compress))
-$message = ''
-try { $null = Test-Runtime-Launcher (Legacy-Launcher $wrongLegacySourceGeneration) `
-  (Legacy-LauncherArguments $wrongLegacySourceGeneration) $wrongLegacySourceGeneration } catch {
-  $message = $_.Exception.Message
+$windowsConfigPath = 'C:/root/old/generation/endpoint.json'
+$windowsArguments = (
+  '-I -B -m description_pipeline serve --config "C:\root\old\generation\endpoint.json"')
+Check 'task.action_config_path_is_separator_neutral' (
+  Test-ActionConfigArgument $windowsArguments $windowsConfigPath)
+$textualWindowsConfigPath = 'C:/root/name --config text/generation/endpoint.json'
+Check 'task.action_config_text_inside_quoted_value_is_not_an_option' (
+  Test-ActionConfigArgument (
+    '-I -B -m description_pipeline serve --config ' +
+      '"C:\root\name --config text\generation\endpoint.json"'
+  ) $textualWindowsConfigPath)
+Check 'task.action_config_path_suffix_refused' (
+  -not (Test-ActionConfigArgument (
+    '-I -B -m description_pipeline serve --config "C:\root\old\generation\endpoint.json.bak"'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_missing_refused' (
+  -not (Test-ActionConfigArgument '-I -B -m description_pipeline serve' $windowsConfigPath))
+Check 'task.action_config_path_duplicate_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --config "C:\root\old\generation\endpoint.json"'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_unquoted_duplicate_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --config C:\foreign\generation\endpoint.json'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_equals_duplicate_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --config=C:\foreign\generation\endpoint.json'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_missing_value_duplicate_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --config'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_equals_form_refused' (
+  -not (Test-ActionConfigArgument (
+    '-I -B -m description_pipeline serve --config=C:\root\old\generation\endpoint.json'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_trailing_option_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --conf C:\foreign\generation\endpoint.json'
+  ) $windowsConfigPath))
+$sourceGeneration = Join-Path $root 'lifecycle/source-generation'
+$null = New-Item -ItemType Directory -Path $sourceGeneration
+$opaqueTask = [pscustomobject]@{
+  Actions=@([pscustomobject]@{
+    Execute=(Runtime-Python $sourceGeneration)
+    Arguments='-I -B -m description_pipeline serve --config "legacy-shaped.json"'
+    WorkingDirectory=$root
+  })
 }
-Check 'launch.wrong_legacy_source_refused' ($message -match 'approved legacy release identity')
-$legacyPythonContractGeneration = Join-Path $root 'legacy-python-contract-generation'
-$null = New-Item -ItemType Directory -Path $legacyPythonContractGeneration
-[System.IO.File]::WriteAllText(
-  (Join-Path $legacyPythonContractGeneration 'stage-receipt.json'),
-  (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $legacyPythonContractGeneration);
-     launch_contract='python_module_v1'; version='1.5.0';
-     source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
-     source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
-    ConvertTo-Json -Compress))
-$message = ''
-try { $null = Test-Runtime-Launcher (Runtime-Launcher $legacyPythonContractGeneration) `
-  (Runtime-LauncherArguments $legacyPythonContractGeneration) $legacyPythonContractGeneration } catch {
-  $message = $_.Exception.Message
+Check 'task.source_generation_from_execute' (
+  (Normalize-PathIdentity (Get-TaskGeneration $opaqueTask)) -eq
+  (Normalize-PathIdentity $sourceGeneration))
+$foreignExecuteTask = [pscustomobject]@{
+  Actions=@([pscustomobject]@{
+    Execute=(Join-Path $sourceGeneration 'runtime/Scripts/description.exe')
+    Arguments='serve --config "ignored.json"'
+    WorkingDirectory=$root
+  })
 }
-Check 'launch.legacy_release_python_contract_refused' (
-  $message -match 'approved legacy release cannot declare the Python module launcher')
+$message = ''
+try { $null = Get-TaskGeneration $foreignExecuteTask } catch { $message = $_.Exception.Message }
+Check 'task.foreign_source_execute_refused' ($message -match 'managed generation runtime')
 $typedGeneration = Join-Path $root 'typed-contract-generation'
 $null = New-Item -ItemType Directory -Path $typedGeneration
 $typedReceipt = Join-Path $typedGeneration 'stage-receipt.json'
@@ -986,28 +1008,6 @@ $message = ''
 try { $null = Test-Runtime-Launcher (Runtime-Launcher $emptyGeneration) `
   (Runtime-LauncherArguments $emptyGeneration) $emptyGeneration } catch { $message = $_.Exception.Message }
 Check 'launch.empty_contract_refused' ($message -match 'stage_launch_contract_unsupported')
-$legacyIdentity = [pscustomobject]@{
-  release_identity_sha256='62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200'}
-Check 'recovery.legacy_identity_without_contract_accepted' (
-  (Resolve-RecoveryLaunchContract $legacyIdentity) -eq (Legacy-LaunchContract))
-$foreignIdentity = [pscustomobject]@{release_identity_sha256=('f' * 64)}
-$message = ''
-try { $null = Resolve-RecoveryLaunchContract $foreignIdentity } catch { $message = $_.Exception.Message }
-Check 'recovery.contractless_foreign_identity_refused' ($message -match 'not the approved legacy release')
-$legacyPythonIdentity = [pscustomobject]@{
-  release_identity_sha256='62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200';
-  runtime_launch_contract='python_module_v1'}
-$message = ''
-try { $null = Resolve-RecoveryLaunchContract $legacyPythonIdentity } catch { $message = $_.Exception.Message }
-Check 'recovery.legacy_identity_python_contract_refused' (
-  $message -match 'approved legacy release cannot use the Python module launch contract')
-$newLegacyIdentity = [pscustomobject]@{
-  release_identity_sha256=('f' * 64);
-  runtime_launch_contract='legacy_pip_launcher_v0'}
-$message = ''
-try { $null = Resolve-RecoveryLaunchContract $newLegacyIdentity } catch { $message = $_.Exception.Message }
-Check 'recovery.new_identity_legacy_contract_refused' (
-  $message -match 'legacy launch contract is not bound to the approved release')
 $singleActionTask = [pscustomobject]@{Actions=@([pscustomobject]@{Execute='first'})}
 Check 'task.exact_one_action_accepted' (
   $null -eq (Assert-Single-TaskAction $singleActionTask))
@@ -1018,6 +1018,100 @@ $multiActionTask = [pscustomobject]@{Actions=@(
 $message = ''
 try { Assert-Single-TaskAction $multiActionTask } catch { $message = $_.Exception.Message }
 Check 'task.multi_action_refused' ($message -match 'task_ambiguous')
+function Resolve-Sid { param([string]$Identity) return $Identity }
+$listenerProjection = [pscustomobject]@{
+  principal=[pscustomobject]@{sid='S-1-5-21-1-2-3-500'}
+  action=[pscustomobject]@{
+    execute='C:/managed/generation/runtime/Scripts/python.exe'
+    arguments='-I -B -m description_pipeline serve --config "C:/managed/generation/endpoint.json"'
+  }
+}
+function Set-ListenerScenario([string]$Name) {
+  $script:ListenerScenario = $Name
+}
+function Get-NetTCPConnection {
+  [CmdletBinding()] param([int]$LocalPort, [string]$State)
+  if ($script:ListenerScenario -eq 'multi') {
+    return @([pscustomobject]@{OwningProcess=4242}, [pscustomobject]@{OwningProcess=4243})
+  }
+  return [pscustomobject]@{OwningProcess=4242}
+}
+function Get-CimInstance {
+  [CmdletBinding()] param([string]$ClassName, [string]$Filter)
+  $image = if ($script:ListenerScenario -eq 'image') {
+    'C:/foreign/python.exe'
+  } else {
+    $listenerProjection.action.execute
+  }
+  $command = if ($script:ListenerScenario -eq 'command') {
+    'python.exe foreign-action'
+  } else {
+    '"C:/managed/generation/runtime/Scripts/python.exe" ' +
+      $listenerProjection.action.arguments
+  }
+  return [pscustomobject]@{ExecutablePath=$image; CommandLine=$command}
+}
+function Get-Process {
+  [CmdletBinding()] param([int]$Id, [switch]$IncludeUserName)
+  $user = if ($script:ListenerScenario -eq 'user') {
+    'S-1-5-21-1-2-3-501'
+  } else {
+    'S-1-5-21-1-2-3-500'
+  }
+  return [pscustomobject]@{
+    UserName=$user
+    StartTime=[datetime]'2026-10-27T00:00:00Z'
+  }
+}
+Set-ListenerScenario 'valid'
+$evidence = Get-ListenerEvidence @{port=8765} $listenerProjection
+Check 'listener.exact_process_bound' (
+  ($evidence.listener_pid -eq 4242) -and
+  ($evidence.process_user_sid -eq 'S-1-5-21-1-2-3-500'))
+$changedListener = ($evidence | ConvertTo-Json -Compress | ConvertFrom-Json)
+$changedListener.process_start_utc = '2026-10-27T00:00:01Z'
+$message = ''
+try { Assert-ListenerMatch $evidence $changedListener } catch { $message = $_.Exception.Message }
+Check 'listener.mid_switch_change_refused' ($message -match 'windows_listener_changed')
+foreach ($case in @(
+    @('multi', 'windows_listener_ambiguous'),
+    @('image', 'windows_listener_identity_mismatch'),
+    @('command', 'windows_listener_identity_mismatch'),
+    @('user', 'windows_listener_identity_mismatch'))) {
+  Set-ListenerScenario $case[0]
+  $message = ''
+  try { $null = Get-ListenerEvidence @{port=8765} $listenerProjection } catch {
+    $message = $_.Exception.Message
+  }
+  Check ('listener.' + $case[0] + '_refused') ($message -match $case[1])
+}
+function Get-NetTCPConnection {
+  [CmdletBinding()] param([int]$LocalPort, [string]$State)
+  return $null
+}
+function Get-CimInstance {
+  [CmdletBinding()] param([string]$ClassName, [string]$Filter)
+  return $null
+}
+function Get-Process {
+  [CmdletBinding()] param([int]$Id)
+  switch ($script:ProcScenario) {
+    'missing' {
+      Write-Error ('Cannot find a process with the process ID: {0}.' -f $Id) -Category ObjectNotFound
+      return
+    }
+    'denied' {
+      Write-Error 'process query denied by injected observer failure' -Category PermissionDenied
+      return
+    }
+    'alive' {
+      return [pscustomobject]@{
+        Id=$Id; Path='C:\gen\runtime\Scripts\python.exe';
+        StartTime=[datetime]'2026-10-15T00:00:00Z'}
+    }
+    default { return $null }
+  }
+}
 $readyTask = [pscustomobject]@{State='Ready'; Actions=@([pscustomobject]@{Execute='first'})}
 $message = ''
 try { Assert-RunningTask $readyTask } catch { $message = $_.Exception.Message }
@@ -1035,12 +1129,6 @@ function Reset-State {
   $script:ServedStateRoot = $root
   $script:OldHealthOk = $true
   $script:HealthProbes.Clear()
-  [System.IO.File]::WriteAllText(
-    (Join-Path $previous 'stage-receipt.json'),
-    (@{passed=$true; verb='stage'; generation=(Normalize-PathIdentity $previous); version='1.5.0';
-       source_commit='55cdf8da178e37239d3ac199cd27fc50cf56540d';
-       source_sha256='66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec'} |
-      ConvertTo-Json -Compress))
   if (Test-Path -LiteralPath $lockPath) { Remove-Item -LiteralPath $lockPath -Force }
   $receipt = Join-Path $promotions 'lock-refusal.json'
   if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt -Force }
@@ -1262,88 +1350,226 @@ try { $null = Start-OrRefuse $configPath $binding $generation $promotions } catc
 Check 'flow.non_refusal_rethrows' (($message -match 'settle window') -and ($script:Starts -eq 1) -and
   ($script:Sleeps.Count -eq 0))
 
-# ---- failure-path restore: gated start + pinned previous identity -----------
-$sourceLauncher = Join-Path $previous 'runtime/Scripts/description.exe'
-$sourceArguments = 'serve --config "' + (Join-Path $previous 'endpoint.json') + '"'
+# ---- failure-path restore: exact opaque source snapshot ---------------------
+$sourceLauncher = Runtime-Python $sourceGeneration
+$sourceArguments = '-I -B -m description_pipeline serve --config "' +
+  (Join-Path $sourceGeneration 'endpoint.json') + '"'
 $sourceWorkingDirectory = $root
+$sourceTaskText = '<Task><Actions><Exec><Command>' + $sourceLauncher +
+  '</Command><Arguments>' + $sourceArguments +
+  '</Arguments><WorkingDirectory>' + $sourceWorkingDirectory +
+  '</WorkingDirectory></Exec></Actions></Task>'
+$sourceConfigText = ('{{"state_root":"{0}","port":8765}}' -f ($root -replace '\\', '/'))
+[System.IO.File]::WriteAllText((Join-Path $previous 'task.xml'), $sourceTaskText)
+[System.IO.File]::WriteAllText((Join-Path $previous 'endpoint-before.json'), $sourceConfigText)
+$sourceProjection = [pscustomobject]@{
+  task_path='\'; task_name='test-endpoint'; state='Running';
+  xml=$sourceTaskText; xml_sha256=(Get-TextSha256 $sourceTaskText);
+  semantic_sha256='a' * 64; security_descriptor_sha256='b' * 64;
+  triggers_sha256='c' * 64;
+  principal=[pscustomobject]@{sid='S-1-5-21-1'; administrator=$true};
+  action=[pscustomobject]@{
+    execute=$sourceLauncher; arguments=$sourceArguments; working_directory=$sourceWorkingDirectory}
+  settings=[pscustomobject]@{multiple_instances='IgnoreNew'}}
+$sourceProjection.semantic_sha256 = Get-JsonSha256 (
+  New-TaskSemanticDocument $sourceProjection.task_path $sourceProjection.task_name `
+    $sourceProjection.principal $sourceProjection.action $sourceProjection.settings `
+    $sourceProjection.triggers_sha256 $sourceProjection.security_descriptor_sha256)
+$sourceIdentity = [pscustomobject]@{
+  endpoint_root=(Normalize-PathIdentity $sourceGeneration);
+  config_path=(Normalize-PathIdentity (Join-Path $sourceGeneration 'endpoint.json'));
+  config_sha256=(Get-TextSha256 $sourceConfigText); config_digest='c' * 64;
+  package_root='C:/packages'; output_root='C:/results';
+  state_root=(Normalize-PathIdentity $root); port=8765;
+  install_id_path=(Join-Path $root 'install-id'); install_id='win-' + ('d' * 32);
+  release_identity_sha256='';
+  release=[pscustomobject]@{version='1.5.0'; source_commit='4ed0f03d'; source_sha256='f' * 64; role='native'}}
+$sourceIdentity.release_identity_sha256 = Get-ReleaseIdentitySha256 $sourceIdentity.release
+[System.IO.File]::WriteAllText($sourceIdentity.install_id_path, $sourceIdentity.install_id)
+$sourceState = New-EndpointSourceState ([pscustomobject]@{}) $sourceProjection $sourceIdentity
+Write-Receipt (Join-Path $previous 'source-state.json') $sourceState
+$sourceStateSha256 = Get-SourceStateAuthorityHash (Join-Path $previous 'source-state.json')
+function Get-TaskProjection {
+  param($Task)
+  $projection = $sourceProjection.PSObject.Copy()
+  $projection.action = [pscustomobject]@{
+    execute=$sourceProjection.action.execute
+    arguments=$script:RestoreActionArguments
+    working_directory=$sourceProjection.action.working_directory
+  }
+  return $projection
+}
+function Get-EndpointIdentity { param($Task, $TaskProjection, [string]$SshHost) return $sourceIdentity }
+function Read-EndpointRuntimeProbe {
+  param([string]$Generation, [string]$ConfigPath)
+  return [pscustomobject]@{
+    config_digest=$sourceIdentity.config_digest
+    package_root=$sourceIdentity.package_root
+    output_root=$sourceIdentity.output_root
+    state_root=$sourceIdentity.state_root
+    port=$sourceIdentity.port
+    release=[pscustomobject]@{
+      version=$sourceIdentity.release.version
+      source_sha256=$sourceIdentity.release.source_sha256
+      release=[pscustomobject]@{source_commit=$sourceIdentity.release.source_commit}
+    }
+  }
+}
+function Get-ListenerEvidence {
+  param([object]$binding, $TaskProjection)
+  return @{listener_pid=4242}
+}
+function Read-EndpointHealth {
+  param([string]$configPath)
+  if (-not $script:OldHealthOk) { throw 'the previous endpoint did not answer /health' }
+  return [pscustomobject]@{
+    install_id=$sourceIdentity.install_id; config_digest=$sourceIdentity.config_digest;
+    release=$sourceIdentity.release}
+}
 function Register-ScheduledTask {
   [CmdletBinding()]
-  param([string]$TaskName, [string]$Xml, [switch]$Force)
+  param([string]$TaskName, [string]$TaskPath, [string]$Xml, [switch]$Force)
   $script:CurrentAction = [pscustomobject]@{
     Execute=$sourceLauncher
-    Arguments=$sourceArguments
+    Arguments=$script:RestoreActionArguments
     WorkingDirectory=$sourceWorkingDirectory
   }
   $script:CallLog.Add('register')
 }
+$script:RestoreActionArguments = $sourceArguments
 Reset-State
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
-  $sourceLauncher $sourceArguments $sourceWorkingDirectory
-Check 'restore.success_pinned_health' ($restore.stopped -and $restore.restored -and $restore.startable -and $restore.started -and
-  ($restore.healthy -eq $true) -and ($restore.previous_generation -eq $previous) -and
-  ($script:HealthProbes.Count -eq 1) -and ($script:HealthProbes[0] -eq '1.5.0') -and
+$script:RestoreActionArguments = $sourceArguments
+$restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
+  -stageDir $generation -expectedTaskPath $sourceProjection.task_path `
+  -ExpectedSourceStateSha256 $sourceStateSha256
+Check 'restore.success_exact_source_identity' ($restore.stopped -and $restore.restored -and $restore.startable -and $restore.started -and
+  ($restore.healthy -eq $true) -and ($restore.previous_generation -eq (Normalize-PathIdentity $sourceGeneration)) -and
   (($script:CallLog -join ',') -eq 'stop,register,start')) `
   ($restore | ConvertTo-Json -Depth 8 -Compress)
 
 Reset-State
+$script:RestoreActionArguments = $sourceArguments
 [System.IO.File]::WriteAllText($lockPath, '999999')
 $script:ProcScenario = 'denied'
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
-  $sourceLauncher $sourceArguments $sourceWorkingDirectory
+$restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
+  -stageDir $generation -expectedTaskPath $sourceProjection.task_path `
+  -ExpectedSourceStateSha256 $sourceStateSha256
 Check 'restore.gate_unknown_no_start' ($restore.stopped -and $restore.restored -and (-not $restore.startable) -and (-not $restore.started) -and
   ($restore.start_gate -eq 'refused') -and ($restore.error -match 'start gate is refused') -and
   (($script:CallLog -join ',') -eq 'stop,register')) `
   ($restore | ConvertTo-Json -Depth 8 -Compress)
 
 Reset-State
+$script:RestoreActionArguments = $sourceArguments
 $script:OldHealthOk = $false
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
-  $sourceLauncher $sourceArguments $sourceWorkingDirectory
-Check 'restore.health_failure_pinned' ($restore.stopped -and $restore.restored -and $restore.started -and (-not $restore.healthy) -and
-  ($restore.error -match 'did not answer') -and ($script:HealthProbes.Count -eq 1) -and
-  ($script:HealthProbes[0] -eq '1.5.0')) ($restore | ConvertTo-Json -Depth 8 -Compress)
+$restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
+  -stageDir $generation -expectedTaskPath $sourceProjection.task_path `
+  -ExpectedSourceStateSha256 $sourceStateSha256
+Check 'restore.health_failure_is_not_success' ($restore.stopped -and $restore.restored -and $restore.started -and (-not $restore.healthy) -and
+  ($restore.error -match 'did not answer')) ($restore | ConvertTo-Json -Depth 8 -Compress)
 
 Reset-State
-Remove-Item -LiteralPath (Join-Path $previous 'stage-receipt.json') -Force
-$lookup = Find-GenerationLaunchContract $previous
-Check 'restore.contract_lookup_returns_failure_without_exit' (
-  ($lookup.passed -eq $false) -and ($lookup.code -eq 'stage_receipt_missing'))
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
-  $sourceLauncher $sourceArguments $sourceWorkingDirectory
-Check 'restore.missing_receipt_fails_closed' ((-not $restore.started) -and ($null -eq $restore.healthy) -and
-  ($restore.error -match 'stage_receipt_missing') -and ($script:HealthProbes.Count -eq 0))
+$script:RestoreActionArguments = $sourceArguments
+Remove-Item -LiteralPath (Join-Path $previous 'source-state.json') -Force
+$restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
+  -stageDir $generation -expectedTaskPath $sourceProjection.task_path `
+  -ExpectedSourceStateSha256 $sourceStateSha256
+Check 'restore.missing_source_state_fails_closed' ((-not $restore.stopped) -and (-not $restore.started) -and
+  ($null -eq $restore.healthy) -and ($restore.error -match 'source-state.json'))
+Write-Receipt (Join-Path $previous 'source-state.json') $sourceState
+$sourceStateSha256 = Get-SourceStateAuthorityHash (Join-Path $previous 'source-state.json')
 
 Reset-State
-$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation `
-  $sourceLauncher ($sourceArguments + ' --foreign') $sourceWorkingDirectory
-Check 'restore.foreign_source_action_fails_closed' ((-not $restore.started) -and ($null -eq $restore.healthy) -and
-  ($restore.error -match 'launch contract') -and ($script:HealthProbes.Count -eq 0) -and
-  (($script:CallLog -join ',') -eq 'stop,register'))
+$script:RestoreActionArguments = $sourceArguments + ' --foreign'
+$restore = Restore-PreviousEndpoint -binding $binding -previous $previous `
+  -stageDir $generation -expectedTaskPath $sourceProjection.task_path `
+  -ExpectedSourceStateSha256 $sourceStateSha256
+Check 'restore.changed_opaque_action_fails_closed' ((-not $restore.started) -and ($null -eq $restore.healthy) -and
+  ($restore.error -match 'arguments') -and (($script:CallLog -join ',') -eq 'stop,register'))
+$script:RestoreActionArguments = $sourceArguments
 
 # ---- real outer promote flow (child pwsh; real Invoke-Main) -----------------
 $harness = Join-Path $PSScriptRoot 'invoke-main-harness.ps1'
 $pwshExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+Check 'outer.path_predicates_are_host_neutral' (
+  ((Normalize-PathIdentity 'C:\root\new\runtime\Scripts\python.exe') -like
+    '*/new/runtime/Scripts/python.exe') -and
+  ((Normalize-PathIdentity 'C:\root\bound-previous') -like '*/bound-previous') -and
+  ((Normalize-PathIdentity 'start:C:\root\old\runtime\Scripts\python.exe') -like
+    'start:*/old/*') -and
+  ((Normalize-PathIdentity (
+      '-I -B -m description_pipeline serve --config "C:\root\old\generation\endpoint.json"'
+    )).IndexOf(
+      (Normalize-PathIdentity 'C:/root/old/generation/endpoint.json'),
+      [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
 function Invoke-Outer([string]$scenario) {
   $outerRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('il-outer-' + [guid]::NewGuid().ToString('N'))
   $null = New-Item -ItemType Directory -Path $outerRoot -Force
   $json = & $pwshExe -NoProfile -File $harness -ScriptPath $ScriptPath -Scenario $scenario -Root $outerRoot
   $result = ($json | Select-Object -Last 1) | ConvertFrom-Json
+  $lastFile = Join-Path $outerRoot 'instance-promotions/last-promotion.json'
+  $lastPromotion = if (Test-Path -LiteralPath $lastFile) {
+    Get-Content -LiteralPath $lastFile -Raw | ConvertFrom-Json
+  } else {
+    $null
+  }
+  $pendingFile = Join-Path $outerRoot 'instance-promotions/pending-promotion.json'
+  $pendingPromotion = if (Test-Path -LiteralPath $pendingFile) {
+    Get-Content -LiteralPath $pendingFile -Raw | ConvertFrom-Json
+  } else {
+    $null
+  }
+  $actualSourceAuthority = if ($lastPromotion -and
+      (Test-Path -LiteralPath (Join-Path ([string]$lastPromotion.previous) 'source-state.json'))) {
+    Get-SourceStateAuthorityHash (Join-Path ([string]$lastPromotion.previous) 'source-state.json')
+  } else {
+    $null
+  }
+  $rollbackFile = Get-ChildItem -LiteralPath (Join-Path $outerRoot 'instance-promotions') `
+    -Filter 'rollback-*.json' -ErrorAction SilentlyContinue | Select-Object -First 1
+  $rollbackReceipt = if ($rollbackFile) {
+    Get-Content -LiteralPath $rollbackFile.FullName -Raw | ConvertFrom-Json
+  } else {
+    $null
+  }
+  $result | Add-Member -NotePropertyName last_promotion -NotePropertyValue $lastPromotion -Force
+  $result | Add-Member -NotePropertyName pending_promotion `
+    -NotePropertyValue $pendingPromotion -Force
+  $result | Add-Member -NotePropertyName source_state_authority `
+    -NotePropertyValue $actualSourceAuthority -Force
+  $result | Add-Member -NotePropertyName rollback_receipt `
+    -NotePropertyValue $rollbackReceipt -Force
   Remove-Item -LiteralPath $outerRoot -Recurse -Force -ErrorAction SilentlyContinue
   return $result
 }
 $outer = Invoke-Outer 'unknown_owner'
 Check 'outer.unknown_owner_no_restart' ((@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 0) -and
   ($outer.receipt.restore.startable -eq $false) -and ($outer.receipt.restore.started -eq $false) -and
-  ($outer.receipt.restore.start_gate -eq 'refused') -and ($outer.message -match 'lock_refused_unproven'))
+  ($outer.receipt.restore.start_gate -eq 'refused') -and
+  ($outer.message -match 'promote_restore_failed'))
 Check 'outer.unknown_owner_candidate_started_once' ((@($outer.calls | Where-Object { $_ -like 'start:*new*' }).Count -eq 1))
+
+$outer = Invoke-Outer 'promote_prestop_identity_mismatch'
+Check 'outer.prestop_failure_has_no_mutation' (
+  ($outer.message -match 'promote_preflight_failed') -and
+  (@($outer.calls | Where-Object {
+    $_ -like 'stop*' -or $_ -like 'register*' -or
+    $_ -like 'start:*' -or $_ -like 'set:*' -or
+    $_ -like 'managed-endpoint-acl:*'
+  }).Count -eq 0) -and
+  (@($outer.setenv).Count -eq 0) -and
+  ($outer.receipt.restore.stopped -eq $false) -and
+  ($outer.receipt.restore.restored -eq $false) -and
+  ($outer.receipt.restore.started -eq $false)) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
 
 $outer = Invoke-Outer 'startable_second_refusal'
 Check 'outer.startable_starts_old_with_pinned_health' ((@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 1) -and
   ($outer.receipt.restore.startable -eq $true) -and ($outer.receipt.restore.started -eq $true) -and
   ($outer.receipt.restore.healthy -eq $true) -and (@($outer.sleeps) -contains 60))
 
-$outer = Invoke-Outer 'startable_missing_receipt'
-Check 'outer.missing_receipt_fails_closed' ((@($outer.calls).Count -eq 0) -and
+$outer = Invoke-Outer 'promote_missing_stage_receipt'
+Check 'outer.missing_stage_receipt_fails_closed' ((@($outer.calls).Count -eq 0) -and
   ($outer.message -match 'stage_receipt_missing'))
 
 $outer = Invoke-Outer 'restore_multi_action'
@@ -1357,7 +1583,7 @@ Check 'outer.restore_foreign_one_action_fails_closed' (
   (@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 0) -and
   (@($outer.calls | Where-Object { $_ -like 'start:*foreign*' }).Count -eq 0) -and
   ($outer.receipt.restore.started -eq $false) -and
-  ($outer.receipt.restore.error -match 'launch contract'))
+  ($outer.receipt.restore.error -match 'managed generation runtime'))
 
 $outer = Invoke-Outer 'stage_unknown_key_refused'
 Check 'outer.stage_unknown_key_refused' (($outer.message -match 'endpoint_config_unknown_keys') -and
@@ -1386,6 +1612,174 @@ Check 'outer.promote_candidate_mismatch' (($outer.message -match 'candidate_conf
 $outer = Invoke-Outer 'promote_source_mismatch'
 Check 'outer.promote_source_mismatch' (($outer.message -match 'candidate_source_mismatch') -and
   (@($outer.calls).Count -eq 0))
+
+$outer = Invoke-Outer 'status_pending_rollback'
+Check 'outer.status_exposes_pending_rollback_intent' (
+  ($outer.passed -eq $true) -and
+  ($outer.pending_rollback.state -eq 'present') -and
+  ($outer.pending_rollback.source_state_sha256 -eq ('a' * 64)) -and
+  ((Normalize-PathIdentity $outer.pending_rollback.previous) -like
+    '*/bound-previous') -and
+  ((Normalize-PathIdentity $outer.pending_rollback.target_generation) -like
+    '*/lifecycle/new/generation') -and
+  ((Normalize-PathIdentity $outer.pending_rollback.restore_to) -like
+    '*/lifecycle/old/generation') -and
+  ((Normalize-PathIdentity $outer.pending_rollback.current_snapshot) -like
+    '*/instance-promotions/rollback-before-fixture') -and
+  ($outer.live_task.state -eq 'Running')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'status_pending_rollback_invalid'
+Check 'outer.status_preserves_health_with_unknown_rollback_intent' (
+  ($outer.passed -eq $true) -and
+  ($outer.pending_rollback.state -eq 'unknown') -and
+  ($outer.pending_rollback.code -eq 'rollback_intent_unreadable') -and
+  ($outer.live_task.state -eq 'Running')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'status_pending_rollback_directory'
+Check 'outer.status_reports_non_file_rollback_intent_as_unknown' (
+  ($outer.passed -eq $true) -and
+  ($outer.pending_rollback.state -eq 'unknown') -and
+  ($outer.pending_rollback.code -eq 'rollback_intent_unreadable') -and
+  ($outer.pending_rollback.error -match 'not a regular file') -and
+  ($outer.live_task.state -eq 'Running')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'promote_4ed_success'
+Check 'outer.current_owned_shape_promotes_to_target' (
+  ($outer.passed -eq $true) -and
+  ($outer.last_promotion.source.release.source_commit -eq
+    '4ed0f03db9462c084d63cc7106125a794906ba30') -and
+  ($outer.last_promotion.source_state_sha256 -match '^[0-9a-f]{64}$') -and
+  ($outer.pending_promotion.intent -eq $true) -and
+  ($outer.pending_promotion.source_state_sha256 -ceq
+    $outer.last_promotion.source_state_sha256) -and
+  ($outer.source_state_authority -ceq $outer.last_promotion.source_state_sha256) -and
+  ($outer.last_promotion.source.arguments -match
+    '^-I -B -m description_pipeline serve --config "') -and
+  ((Normalize-PathIdentity $outer.last_promotion.target.action.execute) -like
+    '*/new/generation/runtime/Scripts/python.exe')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_success'
+Check 'outer.rollback_restores_exact_source_xml' (
+  ($outer.passed -eq $true) -and
+  ($outer.verb -eq 'rollback') -and
+  ((Normalize-PathIdentity $outer.restored_from) -like '*/bound-previous') -and
+  ($outer.rollback_receipt.source_state_sha256 -match '^[0-9a-f]{64}$') -and
+  ($outer.source_state_authority -ceq $outer.rollback_receipt.source_state_sha256)) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_bad_snapshot'
+Check 'outer.rollback_bad_snapshot_has_no_mutation' (
+  ($outer.message -match 'previous_invalid') -and
+  (@($outer.setenv).Count -eq 0) -and
+  (@($outer.calls | Where-Object {
+    $_ -like 'stop*' -or $_ -like 'register*' -or
+    $_ -like 'start:*' -or $_ -like 'set:*' -or $_ -like 'disable*'
+  }).Count -eq 0) -and
+  ($outer.task_state -eq 'Running') -and
+  ($outer.receipt.code -eq 'previous_invalid')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_task_path_mismatch'
+Check 'outer.rollback_foreign_task_path_has_no_mutation' (
+  ($outer.message -match 'previous_invalid') -and
+  (@($outer.setenv).Count -eq 0) -and
+  (@($outer.calls | Where-Object {
+    $_ -like 'stop*' -or $_ -like 'register*' -or
+    $_ -like 'start:*' -or $_ -like 'set:*' -or $_ -like 'disable*'
+  }).Count -eq 0) -and
+  ($outer.task_state -eq 'Running') -and
+  ($outer.receipt.code -eq 'previous_invalid')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_source_state_tamper'
+Check 'outer.rollback_source_state_tamper_has_no_mutation' (
+  ($outer.message -match 'previous_invalid') -and
+  (@($outer.setenv).Count -eq 0) -and
+  (@($outer.calls | Where-Object {
+    $_ -like 'stop*' -or $_ -like 'register*' -or
+    $_ -like 'start:*' -or $_ -like 'set:*' -or $_ -like 'disable*'
+  }).Count -eq 0) -and
+  ($outer.task_state -eq 'Running') -and
+  ($outer.receipt.code -eq 'previous_invalid')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_stop_refused'
+Check 'outer.rollback_stop_refusal_does_not_register_or_disable' (
+  ($outer.message -match 'rollback_stop_failed') -and
+  (@($outer.calls | Where-Object {
+    $_ -like 'register*' -or $_ -like 'start:*' -or
+    $_ -like 'set:*' -or $_ -like 'disable*'
+  }).Count -eq 0) -and
+  ($outer.task_state -eq 'Running') -and
+  (@($outer.setenv).Count -eq 4) -and
+  ($outer.receipt.code -eq 'rollback_stop_failed')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_stop_residue'
+Check 'outer.rollback_stop_timeout_does_not_register_or_disable' (
+  ($outer.message -match 'rollback_stop_failed') -and
+  (@($outer.calls | Where-Object {
+    $_ -like 'register*' -or $_ -like 'start:*' -or
+    $_ -like 'set:*' -or $_ -like 'disable*'
+  }).Count -eq 0) -and
+  ($outer.calls -contains 'stop') -and
+  ($outer.task_state -eq 'Ready') -and
+  (@($outer.setenv).Count -eq 4) -and
+  ($outer.receipt.code -eq 'rollback_stop_failed')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_restore_failure'
+Check 'outer.rollback_restore_failure_is_not_success' (
+  ($outer.message -match 'rollback_failed') -and
+  ($outer.message -match 'the current endpoint was restored') -and
+  (@($outer.calls | Where-Object {
+    (Normalize-PathIdentity $_) -like 'start:*/old/*'
+  }).Count -eq 1) -and
+  (@($outer.calls | Where-Object {
+    (Normalize-PathIdentity $_) -like 'start:*/new/*'
+  }).Count -eq 1) -and
+  ($outer.task_state -eq 'Running') -and
+  ($outer.receipt.code -eq 'rollback_failed_current_restored') -and
+  ($outer.receipt.current_recovery.healthy -eq $true)) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_receipt_missing'
+Check 'outer.rollback_missing_operation_binding_has_no_mutation' (
+  ($outer.message -match 'previous_invalid') -and
+  (@($outer.calls).Count -eq 0) -and
+  (@($outer.setenv).Count -eq 0) -and
+  ($outer.task_state -eq 'Running')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_receipt_conflict'
+Check 'outer.rollback_conflicting_operation_binding_has_no_mutation' (
+  ($outer.message -match 'previous_invalid') -and
+  ($outer.message -match 'different source-state authorities') -and
+  (@($outer.calls).Count -eq 0) -and
+  (@($outer.setenv).Count -eq 0) -and
+  ($outer.task_state -eq 'Running')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_target_mismatch'
+Check 'outer.rollback_foreign_receipt_target_has_no_mutation' (
+  ($outer.message -match 'previous_invalid') -and
+  ($outer.message -match 'valid source-state authority') -and
+  (@($outer.calls).Count -eq 0) -and
+  (@($outer.setenv).Count -eq 0) -and
+  ($outer.task_state -eq 'Running')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
+$outer = Invoke-Outer 'rollback_task_name_ambiguous'
+Check 'outer.rollback_ambiguous_task_name_has_no_mutation' (
+  ($outer.message -match 'windows_task_ambiguous') -and
+  (@($outer.calls).Count -eq 0) -and
+  (@($outer.setenv).Count -eq 0) -and
+  ($outer.task_state -eq 'Running')) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
 
 # The actual exception boundary runs in a child process so exit semantics are not mocked.
 $exceptionHarness = Join-Path $PSScriptRoot 'lifecycle-exception-harness.ps1'

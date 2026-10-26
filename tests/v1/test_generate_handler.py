@@ -19,6 +19,7 @@ from description_pipeline.pipeline.contracts import (
     ProtocolError,
     StageCandidate,
     StageCommand,
+    StageFailure,
     StageResult,
 )
 from description_pipeline.pipeline.engine import StageWorkspace
@@ -32,6 +33,10 @@ from description_pipeline.pipeline.stages.generate import (
     GenerateHandler,
 )
 from description_pipeline.sources.solidworks.naming import visual_name
+from description_pipeline.sources.solidworks.appearance import (
+    AppearanceAudit,
+    AppearanceError,
+)
 from description_pipeline.sources.snapshot import write_manifest
 
 from tests.sources import test_solidworks_mass_authority as authority_fixtures
@@ -55,6 +60,7 @@ class GenerateHandlerTests(unittest.TestCase):
         shutil.copytree(self.capture / "raw", evidence / "raw")
         shutil.copytree(self.capture / "source", evidence / "source")
         shutil.copytree(self.capture / "evidence", evidence / "evidence")
+        shutil.copytree(self.capture / "geometry", evidence / "geometry")
         shutil.copyfile(self.capture / "evidence" / "discovery.json", evidence / "discovery.json")
         shutil.copytree(self.capture / "reports", artifact_source / "reports")
         shutil.copyfile(self.capture / "native-runtime.json", evidence / "native-runtime.json")
@@ -95,10 +101,11 @@ class GenerateHandlerTests(unittest.TestCase):
         )
         self.handler = GenerateHandler(self.store)
 
-    def _workspace(self, name: str, fence: int):
+    def _workspace(self, name: str, fence: int, capture_ref=None):
         root = self.root / name
         root.mkdir()
-        source = self.store.materialize(self.capture_ref, root / "capture")
+        capture_ref = capture_ref or self.capture_ref
+        source = self.store.materialize(capture_ref, root / "capture")
         claim = ExecutionClaim(
             claim_id=f"claim-{fence}",
             command_id=self.command.command_id,
@@ -108,7 +115,123 @@ class GenerateHandlerTests(unittest.TestCase):
             lane_key=None,
             expires_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(minutes=5),
         )
-        return StageWorkspace(root=root, inputs={self.capture_ref.artifact_id: source}), claim
+        return StageWorkspace(root=root, inputs={capture_ref.artifact_id: source}), claim
+
+    def _native_capture_variant(self, name: str, *, all_false=False):
+        target = self.root / name
+        target.mkdir()
+        source = self.store.materialize(self.capture_ref, target / "capture")
+        evidence = source / "evidence"
+        native_facts_path = evidence / "raw/native_capture_facts.json"
+        native_facts = read_data(native_facts_path)
+        if all_false:
+            geometry = {
+                row["component"]: row
+                for row in read_data(evidence / "raw/geometry.json")
+            }
+            for occurrence in native_facts["scene_raw"]["occurrences"]:
+                component = str(occurrence["name"])
+                scope = native_facts["source_scopes"][component]
+                configuration = str(scope["referenced_configuration"])
+
+                def owner(
+                    member,
+                    *,
+                    active=False,
+                    configuration=configuration,
+                ):
+                    return {
+                        "used_api": member,
+                        "material_call": (
+                            {
+                                "configuration_semantics": "active_configuration",
+                                "active_configuration": configuration,
+                            }
+                            if active
+                            else {
+                                "configuration_semantics": "requested_configuration",
+                                "configuration_option": 3,
+                                "configuration_names": [configuration],
+                            }
+                        ),
+                        "presence_call": {
+                            "arguments": [],
+                            "configuration_semantics": "native_owner_context",
+                        },
+                        "material_property_values": [-1.0] * 9,
+                        "has_material_property_values": False,
+                        "texture": {
+                            "configuration": configuration,
+                            "state": "absent",
+                            "material_name": None,
+                        },
+                        "read_errors": {},
+                    }
+
+                occurrence["appearance_raw"] = {
+                    "component": component,
+                    "source_document_path": scope["source_document_path"],
+                    "referenced_configuration": configuration,
+                    "native_active_configuration": configuration,
+                    "native_active_configuration_error": None,
+                    "document": owner(
+                        "IModelDocExtension.GetMaterialPropertyValues"
+                    ),
+                    "occurrence": owner(
+                        "IComponent2.GetMaterialPropertyValues2"
+                    ),
+                    "bodies": [
+                        {
+                            "component": component,
+                            "enumeration_api": "IComponent2.GetBodies3",
+                            "body_type": body["body_type"],
+                            "body_index": body["body_index"],
+                            "body_name": body.get("body_name"),
+                            "appearance": owner(
+                                "IBody2.MaterialPropertyValues2",
+                                active=True,
+                            ),
+                        }
+                        for body in geometry[component]["tessellation"]["bodies"]
+                    ],
+                }
+            write_json(native_facts_path, native_facts)
+        manifest = read_data(evidence / "manifest.json")
+        identity = copy.deepcopy(manifest["identity"])
+        identity["capture"]["evidence_class"] = "cad"
+        write_manifest(
+            evidence,
+            kind=manifest["kind"],
+            identity=identity,
+            evidence_class="cad",
+        )
+        (target / "capture/manifest.json").unlink(missing_ok=True)
+        return self.store.seal_tree(
+            source,
+            kind=CAPTURE_ARTIFACT_KIND,
+            producer_run_id="native-capture-run",
+            producer_stage="capture",
+            producer_tool_sha256=digest({"tool": "native-capture"}),
+        )
+
+    def _command_for_capture(self, capture_ref):
+        return StageCommand.create(
+            command_id="generate-native-appearance",
+            run_id="generate-native-appearance-run",
+            stage="generate",
+            idempotency_key="generate-native-appearance/run",
+            request={
+                "schema_version": GENERATE_REQUEST_SCHEMA,
+                "capture_artifact_id": capture_ref.artifact_id,
+                "output_contract": GENERATE_OUTPUT_CONTRACT,
+            },
+            input_artifacts=(capture_ref,),
+            config_snapshot_sha256=self.command.config_snapshot_sha256,
+            contract_sha256=self.command.contract_sha256,
+            policy_sha256=self.command.policy_sha256,
+            expected_executor_sha256=self.command.expected_executor_sha256,
+            predecessor_decision_id="capture-decision",
+        )
 
     def test_generate_is_work_root_independent_and_survives_scratch_loss(self) -> None:
         first_workspace, first_claim = self._workspace("attempt-a", 1)
@@ -281,6 +404,89 @@ class GenerateHandlerTests(unittest.TestCase):
             )
         self.assertFalse((workspace.root / "output").exists())
 
+    def test_native_missing_or_all_false_appearance_fails_generate(self) -> None:
+        for name, all_false in (
+            ("native-appearance-missing", False),
+            ("native-appearance-all-false", True),
+        ):
+            with self.subTest(case=name):
+                capture_ref = self._native_capture_variant(
+                    name,
+                    all_false=all_false,
+                )
+                command = self._command_for_capture(capture_ref)
+                workspace, _claim_value = self._workspace(
+                    name + "-attempt",
+                    1,
+                    capture_ref=capture_ref,
+                )
+                claim = replace(
+                    _claim_value,
+                    command_id=command.command_id,
+                    claim_id=name + "-claim",
+                )
+                with self.assertRaises(StageFailure) as caught:
+                    self.handler.execute(
+                        command,
+                        claim,
+                        workspace,
+                        effects=object(),
+                    )
+                self.assertEqual(
+                    caught.exception.reason_code,
+                    "generate.appearance_unrepresentable",
+                )
+                self.assertIn(
+                    (
+                        "cad_appearance_record_missing"
+                        if not all_false
+                        else "cad_appearance_display_state_invalid"
+                    ),
+                    {
+                        issue["code"]
+                        for issue in caught.exception.detail["appearance"]["issues"]
+                    },
+                )
+                self.assertFalse((workspace.root / "output").exists())
+
+    def test_appearance_rejection_preserves_structured_failure_details(self) -> None:
+        workspace, claim = self._workspace("appearance-failure", 1)
+        audit = AppearanceAudit(
+            "arm-1",
+            "unrepresentable",
+            (
+                {
+                    "code": "cad_appearance_effective_scope_unproven",
+                    "path": "appearance_raw",
+                    "message": "delivered-face coverage is not proven",
+                },
+            ),
+            (),
+        )
+        with (
+            patch.object(
+                generate_stage,
+                "_compile_capture",
+                side_effect=AppearanceError(audit),
+            ),
+            self.assertRaises(StageFailure) as caught,
+        ):
+            self.handler.execute(
+                self.command,
+                claim,
+                workspace,
+                effects=object(),
+            )
+        self.assertEqual(
+            caught.exception.reason_code,
+            "generate.appearance_unrepresentable",
+        )
+        self.assertEqual(
+            caught.exception.detail["appearance"]["component"],
+            "arm-1",
+        )
+        self.assertFalse((workspace.root / "output").exists())
+
 
 class GenerateVerifyClosureTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -369,7 +575,6 @@ class GenerateVerifyClosureTests(unittest.TestCase):
         warnings = model["provenance"]["value_warnings"]
         by_code = {item["code"]: item for item in warnings}
         for code in (
-            "display.material_fallback",
             "display.constant",
             "geometry.derived_from_native",
             "physics.derived_from_native",
@@ -379,19 +584,12 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             self.assertTrue(by_code[code]["objects"])
             self.assertTrue(all(item.get("object") for item in by_code[code]["objects"]))
             self.assertTrue(all(item.get("fields") or item.get("field") for item in by_code[code]["objects"]))
+        self.assertNotIn("display.material_fallback", by_code)
 
     def test_producer_consistent_semantic_mutations_fail_independent_source_gates(self) -> None:
         def warning_objects(model: dict, code: str) -> list[dict]:
             warning = next(item for item in model["provenance"]["value_warnings"] if item["code"] == code)
             return warning["objects"]
-
-        def material_color(model: dict) -> None:
-            visual = model["links"][0]["visuals"][0]
-            visual["rgba"] = [1.0, 0.0, 0.0, 1.0]
-            for code in ("display.material_fallback", "display.constant"):
-                for row in warning_objects(model, code):
-                    if row["object"] == visual["name"]:
-                        row["actual"]["rgba"] = [1.0, 0.0, 0.0, 1.0]
 
         def mass_inertia(model: dict) -> None:
             inertial = model["links"][0]["inertial"]
@@ -416,7 +614,6 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             for code in (
                 "naming.derived_visual",
                 "naming.content_addressed_mesh",
-                "display.material_fallback",
                 "display.constant",
             ):
                 for row in warning_objects(model, code):
@@ -431,15 +628,10 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             model["provenance"]["value_warnings"] = [
                 item
                 for item in model["provenance"]["value_warnings"]
-                if item["code"] != "display.material_fallback"
+                if item["code"] != "display.constant"
             ]
 
         cases = (
-            (
-                "material-color",
-                material_color,
-                {"provenance.value_warnings"},
-            ),
             (
                 "mass-inertia",
                 mass_inertia,
@@ -457,7 +649,11 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             (
                 "object-binding",
                 object_binding,
-                {"provenance.value_warnings"},
+                {
+                    "appearance.native",
+                    "geometry.arm_link",
+                    "provenance.value_warnings",
+                },
             ),
             (
                 "missing-warning",
@@ -501,7 +697,7 @@ class GenerateVerifyClosureTests(unittest.TestCase):
                 self.assertEqual(members["urdf/robot.urdf"], receipt["urdf_sha256"])
                 if name == "missing-warning":
                     urdf = (generate.root / "urdf/robot.urdf").read_text(encoding="utf-8")
-                    self.assertNotIn("WARNING display.material_fallback:", urdf)
+                    self.assertNotIn("WARNING display.constant:", urdf)
                 self.assertEqual(digest(inventory(self.fixture.capture_root)), capture_before)
 
     def test_shared_aligned_status_cannot_suppress_unresolved_warning(self) -> None:

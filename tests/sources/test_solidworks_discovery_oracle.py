@@ -231,10 +231,6 @@ def native_record() -> dict:
             {"name": "CS_base_link", "owner": "base-1", "array": copy.deepcopy(IDENTITY)},
             {"name": "CS_arm_link", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.1)},
         ],
-        "masses": [
-            {"component": "base-1", "mass_kg": 0.192, "material": "Alloy Steel"},
-            {"component": "arm-1", "mass_kg": 0.105654866776462, "material": "Alloy Steel"},
-        ],
         "assembly_mass_kg": 0.2976548667764616,
         "assembly_extent_m": 0.42,
         "properties": {
@@ -796,40 +792,6 @@ class OracleSemanticsTests(unittest.TestCase):
         base = next(body for body in rebuild_rigid_bodies(record) if body["name"] == "base_link")
         self.assertEqual(base["components"], ["base-1"])
 
-    def test_container_mass_must_not_duplicate_its_parts(self) -> None:
-        def mutate(raw, payload):
-            raw["components"].append(self._container())
-            leaf = copy.deepcopy(raw["components"][1])
-            leaf.update({"name2": "sub-1/arm-1", "instance_id": "sub-1/arm-1"})
-            raw["components"].append(leaf)
-            raw["masses"].append({"component": "sub-1", "mass_kg": 0.2, "material": None})
-            raw["masses"].append({"component": "sub-1/arm-1", "mass_kg": 0.1, "material": None})
-
-        package = self.baseline()
-        self._native(package, mutate)
-        passed, errors, _checks = self.check(package)
-        self.assertFalse(passed, errors)
-        self.assertTrue(
-            any(
-                error["code"] == "discovery.masses"
-                and "assembly container mass duplicates its material parts" in error["message"]
-                for error in errors
-            ),
-            errors,
-        )
-
-    def test_container_mass_alone_is_not_a_duplicate(self) -> None:
-        """The container rule is bounded: it forbids double counting, not container readings."""
-
-        def mutate(raw, payload):
-            raw["components"].append(self._container())
-            raw["masses"].append({"component": "sub-1", "mass_kg": 0.2, "material": None})
-
-        package = self.baseline()
-        self._native(package, mutate)
-        _passed, _errors, checks = self.check(package)
-        self.assertTrue(checks["discovery.masses"]["passed"], checks["discovery.masses"])
-
     def test_hierarchy_and_fixed_flag_do_not_prove_rigidity(self) -> None:
         from description_pipeline.verification.native_discovery import _independent_clusters
 
@@ -1014,8 +976,6 @@ class OracleSemanticsTests(unittest.TestCase):
         self.assertTrue(checks["discovery.bodies"]["passed"], checks["discovery.bodies"])
         # The rigid attachment invents no world joint and no extra movement.
         self.assertEqual(checks["discovery.joints"]["details"]["joints"], 1)
-        self.assertTrue(checks["discovery.masses"]["passed"], checks["discovery.masses"])
-
     def test_top_owned_datum_binds_only_the_proven_frame_cluster(self) -> None:
         """The ownerless top-assembly datum channel opens exactly for the proven attachment."""
 

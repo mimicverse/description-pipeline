@@ -16,10 +16,11 @@
 | 检查域 | 独立证据与通过条件 |
 |---|---|
 | 身份与完整性 | 文件清单闭合、摘要正确、schema 有效；工程、配置、采集计划、原生运行和同版工具绑定一致 |
-| 原生来源 | 原生 API/build 与环境已资格化；每个依赖及物化导入件绑定封存原件、所有者和实例；无包外或未知来源 |
+| 原生来源 | 原生 API/build 与环境已资格化；每个依赖及内嵌虚拟件绑定封存原件、所有者和实例；普通文件与有完整证明的 `VC~~` 为唯一采集来源，`IC~~` 缓存物化在计划输入拒绝 |
 | 机械解释 | 独立判定声明存在性；有声明时独立解码，确证无声明时独立重建完整配合集合；模式、成员和结构一致 |
 | 对象与拓扑 | 每个纳入实例恰属一个刚体，其余显式未分配；名称唯一且合规；唯一 `base_link`、连通无环树，模型/XML 集合一致 |
-| 配置与状态 | 正确引用配置、活动实例和抑制状态；原生重建成功；读取及恢复有效；原件和采集副本的字节保持不变 |
+| 配置与来源 | 正确引用冻结配置、活动实例和抑制状态；原生读数、实际读取错误和对象绑定保真；原件字节保持不变；派生计算在 CAD 释放后独立复核 |
+| 外观与表示 | `appearance_raw` 保留 document/face 的 active property（active 必须等于 referenced configuration）、各 owner 配置/显示状态、九值、Has、原生 material count/NULL、持久引用索引、纹理和错误；独立 join 必须证明实际交付面的表示，未知绑定或无法消费的纹理使 Generate 和 Verify 明确失败 |
 | 坐标与零姿态 | 有限 SI 齐次变换、正交右手基准；独立从原生根基准计算零姿态 FK，实际产物的放置一致 |
 | 关节与轴线 | 类型、两端、完整原点、正向、限位一致；轴线绑定正确实例中的独立重读原生参考轴或圆柱面 |
 | 运动一致性 | 从原生刚性归属与接口端点独立计算非零姿态的逐叶实例运动；核对随动、组内相对变换及接口连续性，覆盖适用的单关节与关联组合 |
@@ -33,6 +34,63 @@
 | 报告绑定 | 根据同一主体与策略重算完整确定性报告，保存报告与重算结果完全一致 |
 
 原生读取以每个实例的实际引用配置为准，不借用共享零件文档的当前配置。网格从当前装配实例的实体和曲面取得，保持相关 COM 父接口存活；完整批次前后核对实例路径、配置和抑制状态。临时选择与配置恢复须有可核验结果。不可读活动基准、未知抑制状态或读取失败不能被静默省略，失败保留环境、会话和部分观察。
+
+外观 raw 位于 `native_capture_facts.scene_raw.occurrences[].appearance_raw`。document
+和 face 使用无参 active-configuration 属性，且只有实际 active 与 occurrence referenced
+configuration 相同时才能采用。top、parent 与 component-document owner 各自保留原生
+configuration/display-state，`GetRenderMaterials2` 的 NULL 原值与同一 owner、configuration、
+typed display-state 参数下的 `GetRenderMaterialsCount2` 分开保存。只有成功读取的
+exact-state 总数确证为 0 时才可证明没有 state render assignment；非零或未知总数下的
+NULL 仍是未解析事实，present rows 的基数必须与总数一致。
+
+state material 的 entity 与同次几何遍历的唯一原生实体／归属观察，以 material 实际
+owner document 的 persistent reference、exact occurrence、配置与显示状态独立 join。
+Source 只封存逐 face 的原生引用、parent-body／feature 关系及成功或失败，不另存由其
+推导的 body、feature、face 索引或 footprint；assembly occurrence 的直接原生引用保留一次。
+Generate 与 Verify 各自构造临时索引，不通过第二份封存派生结果及互比门建立资格。
+实际交付网格保持 occurrence 对象；Part 内 face、body 和 feature identity 须由 traversal
+证明 assembly input context，再复用 current captured component source document 的 Part
+extension 对 occurrence face 调用 `GetCorrespondingEntity2`。body 与 feature 从验证后的
+Part face 通过公开 `GetBody()`、`GetFeature()` 取得，最后由同一 Part extension 读取 reference，并用
+`GetObjectByPersistReference3` 的 exact status `0` 与预期 `IFace2`/`IBody2`/`IFeature`
+QI 验证解析结果仍在该 Part namespace；同一 reference 只解析一次并复用。父装配
+extension 不是 receiver 或 resolver；body 不调用 `GetCorresponding2`，不另遍历 Part 几何。
+材质实体必须保留全部受支持的 public QI 结果；命中 target kind 须有对应接口证明，
+文档目标仍以 `IModelDoc2`、path/configuration 核验，不强制其具有实体 reference。
+body footprint 必须来自同次实际 Part-face parent-body 关系；合法共享 identity 与多个
+occurrence fragments 保留实际 face 集合，不能 first-face 代全体，也不能把不同 Part
+body、缺失或分歧见证按相同 coverage 合并。参与绑定的未知归属失败，无关辅助失败不设全表门。
+
+不得把 assembly alias、双 namespace 或兜底匹配当成 Part 身份。按官方外观层级，
+assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
+part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不
+转换、提升或猜测其作用域。document target 必须核验 `IModelDoc2` QI、path、active
+configuration 与 leaf owner。Generate 与 Verify 分别从原始事实执行该 join，不信任
+Source 预填匹配。参与对象绑定的 owner key 无法命中，或命中 target 仍带有该
+对象/feature footprint 的 mapping 或 identity 错误时失败；只有已证明不同的 target、
+exact Count=0 owner 或 exact document proof 可忽略辅助诊断。同一 occurrence 内的 material
+优先级固定为 `face > feature > body > part document`；document target 表示 part 材质，
+不能无条件提升为 assembly occurrence override。真实 assembly occurrence override 仍优先
+于上述 part 内层级。同一 feature identity 可关联多个实际观察到的交付 face；原生关系
+观察冲突、不同 identity 被错误合并或无依据扩大覆盖均为未知并失败。
+Generate 与 Verify 分别执行该 join，并按交付 face 的 triangle span 无损分组为多个
+visual/material；alpha 从原生 index 7 的透明度派生并显示来源 warning。当前没有资产、
+UV 和绑定消费能力的 present texture、对象/配置错绑或冲突必须失败，不输出默认色，
+也不以 warning 代替失败。唯一例外是同一 GetEntities target 已证明为当前 leaf model
+document，exact linked display-state 的 ColorForm-one material 具有空 `TextureFilename`
+与 `SurfaceFinishFile` 并覆盖全部交付 face；此时旧 config-wide `GetTexture` pointer
+保留为诊断但非参与。`MaterialName=""` 本身仍是 present，不表示 absence。
+`IRenderMaterial.PrimaryColor` 按版本化 `appearance.primary_color_colorref/v1` 解码为
+R、G、B 低到高字节，alpha 为 `1-transparency`，并记录派生 warning。名称差异的非阻塞
+许可不扩及颜色、纹理或对象绑定。
+
+同一已证明对象、层级和适用上下文中的多条 RGBA 观察，按每通道全组最大值减最小值
+不超过绝对 `1e-12` 判定为数值等价，不采用相对容差或邻近串联合并。该界限只处理
+归一化通道在不同原生 API 编码与 binary64 运算中的数值表示差异，远小于 `1/255`
+的颜色编码一级；不得借此放行真实超限、纹理、对象归属或层级冲突。等价组确定性
+选择一条实际观察到的 RGBA 为输出代表，不量化、平均或修改原始事实；Generate 与
+Verify 各自从 raw 建立适用候选和绑定，仅可共用纯数值判定策略。
+
 
 声明存在性是封存原生观察中的 `present / absent / unreadable / unknown`。`absent` 只在交付配置中成功完成原生声明存储查询并证明不存在时成立，必须保留查询对象、接口、返回状态及结果；缺少记录、读取失败或空的损坏载荷不是不存在。`present` 必须支持格式版本、可完整解码、适用于交付配置，全部持久组件/基准/轴引用可解析，且与原生几何和可比较工作限位一致；否则失败。推导和验证分别执行语义核对，只有存在性契约共享。
 
@@ -85,43 +143,19 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 | 退化三角形 | 面积 `≤1e-14 m²` 定义为退化；逐原生网格及其对应完整交付分片集检查：退化数/总三角形数 `≤1%` 且退化面积/总面积 `≤1e-6`，两者同时通过，禁止跨对象摊平；零分母失败 |
 | 交付网格分片 | 每片不超过 `199999` 个三角形，保持全部原始三角形记录 |
 
+原生三角流派生 STL 时，精确为零的叉积无法定义单位法向，因此明确失败；不能为通过比例检查伪造法向或删除记录。面积小但非零的三角形仍按实际数值派生法向，并纳入上表的面积与数量比例检查，不将其整体归零。
+
 有效变换必须具有齐次末行、单位正交旋转与正行列式；schema 和检查策略规定这些数值合法性门。非有限值、零/负质量、非正主惯量和不满足惯量三角不等式始终失败。
 
-近零体积网格须有绑定具体实例的异常几何依据。原生曲面片记录正面积却返回零三角形和零 facets 时，可保留精确警告，包含实例、面及原生面积；其曲面几何完整性不获得资格。实体无网格、三角数据损坏、非空曲面缺失必要事实均失败。
+Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随后释放 CAD。坐标、物性投影、三角流序列化、STL 生成及工程校验均在离线执行；原生读取错误和必要对象、配置、来源及会话安全绑定仍须保全和核验。
 
-对同一次冻结 CAD、配置和实例，原生 ITessellation 的顶点、facet、fin 与边关系是交付 STL 和拓扑证据的共同来源。交付三角形必须由该 facet 的有向顶点环生成；binary32 序列化、坐标转换和必要的派生值保留原生原值、转换依据及 warning，并由 Linux 从原点、原始关系和实际 STL 字节独立复算。不得把另一种显示缓存的三角形数量当作相同网格的隐含保证，也不得拼接两套 tessellation；原件绑定、`50 µm` 表面比较、完整覆盖及朝向验收不变。
+几何唯一主读取链为 `IComponent2.GetBodies3(BodyType, BodiesInfo)` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`。`True` 表示不进行系统单位到用户单位转换，原始坐标以米计且位于 component local frame。每个实际 occurrence 分别读取，不按文档与配置提前合并，以免丢失 assembly-level feature 的几何差异。同次返回的 body 与 `BodiesInfo` 须等长并按位置绑定，逐 body 封存原生 `body_info_raw`（`0 = user body`、`1 = normal body`）；未知或无效分类保持读取失败，不能静默补值、丢项或切换到 Part 几何。Part 文档的 `IPartDoc.GetBodies2` 保持其独立查询职责。装配 placement 单独保留 `GetTotalTransform(False).ArrayData` 的原始 16 项，离线按 SolidWorks 变换语义转换，不将原始 SW16 当作 canonical 4×4。
 
-原生曲线端点与 `Evaluate2` 的一致性采用版本化 `native-curve-endpoint-float32-operation-v4`：对参数序端点 `c`、同一 U 的求值点 `v` 和曲线另一端点 `o`，允许界 `v4(c,v,o)` 由 `pair(c,v) + pair(c,o)` 组成，其中 `pair` 是两个有限 XYZ 点逐坐标 binary32 邻接界之和的最大值。必须独立要求 `L∞(c,v) <= v4(c,v,o)`；不得用 tessellation 投影点 `p` 替换 `c`，也不得把 `Evaluate2`-到-`p` 的诊断误差当作该门。producer 与独立 parser 使用同一规则；该界不放宽 U 域、持久引用、拓扑端点、fin/cofin 或同 U 证据，也不允许把任何端点跳过验证。
+`native-triangles/v1` 保留完整 body／face inventory、face span、实例来源 scope、placement 原值和原始 binary64 三角形流。原始流使用 `SWTESS64` 固定头、版本、数量及逐三角九项坐标；文件按实际 payload 摘要登记为 `raw/triangles/{sha}.triangles`。释放 CAD 后生成 `geometry/{sha}.stl`，仅对已经实际读得的相同 payload 按摘要复用文件，各 occurrence 的 placement 和来源绑定独立保留。派生的 STL 法向、binary32 坐标和 scope-local 身份必须携带对象及字段级 warning。
 
-原生曲线与 `IEdge` 端点采用版本化 `native-curve-topology-endpoint-set-v3`：分别保留参数域 endpoint-set 和实际 edge endpoint-set 的原始点，以 `max_abs_coordinate` 独立复算 direct 与 swapped 两种完整映射误差，二者共用既有 50 µm native tessellation projection 界，并保留两种完整接受状态。该集合检查证明几何覆盖，不通过最近距离或唯一匹配猜测方向；双匹配保留 `complete_match_count=2`。同一原生 `IEdge.GetCurveParams3` 的严格布尔 `ICurveParamData.Sense` 声明 curve 与 edge 的方向关系：`true` 同向、`false` 反向；它用于有据的方向解释和周期参数提升，不选择或替换原生 closest U。原始 `UMinValue`、`UMaxValue`、`StartPoint`、`EndPoint` 和 `Sense` 均保留；反向及负参数空间沿原生参数化规则独立复核。对象引用、component/body/face/edge/fin/vertex/cofin 归属、open sheet 的单面边界、完整逐面 U 覆盖及原始网格字节绑定分别验收；不再为参数几何建立第二套 open-edge scope 或距离选向身份。
+独立消费者从原始三角流、face span、来源 scope 和 SW16 重新核对实际 STL 的三角形数量、顺序、坐标、法向、归属及摘要，并核对场景 placement。原生读取失败、缺失必要几何、非法数值、错误归属或交付字节不对应原始事实均失败。拓扑审计记录实际观察，不把显示三角形天然宣称为闭合流形或精度证明；当前 CAD 的独立工程检查保持，`50 µm` 曲面等价仅用于下文声明适用输入的独立参考回归，不是生产或正式发布前置。
 
-方向关系依据 [SOLIDWORKS `ICurveParamData.Sense` 官方契约](https://help.solidworks.com/2020/english/api/sldworksapi/solidworks.interop.sldworks~solidworks.interop.sldworks.icurveparamdata~sense.html)。edge row 中保留的原生 tolerance 元数据必须如实记录来源、原值或读取失败；它不决定 closest U 的资格，不改变投影允许界，也不产生未实际使用 gap 的警告。
-
-原生 tessellation fin 端点采用版本化 `tessellation-edge-projection-v1` 绑定。令 `s` 为原始 tessellation vertex，`p/u` 为同一次 `IEdge.GetClosestPointOn(s)` 的原生返回，`v` 为 `IEdge.Evaluate2(u,1)` 返回点。全部 fin endpoint 共用同一几何条件：`L∞(s,p) <= 5e-5 m`、`L∞(p,v) <= 5e-5 m`、`L∞(s,v) <= 5e-5 m`；三者必须分别由原始点独立复算，不能仅以两个中间界代替第三个整体界。U 有效域、128 ULP 参数身份、原生响应与 packed success、Source scope、拓扑和覆盖保持严格；不按旧 API 的成功状态或 U 是否靠近边界选择另一几何预算。独立曲线参数端点 `c` 与其同 U 求值点的 v4 数值一致性仍单独验收，不能把 `s` 或 `p` 代入 `c`。v3 在同点身份、cofin 反向坐标等有独立必要性的比较中保持，不充当此 closest 来源的 `p/v` 几何门。删除此链的 `p/c <= v4` 普通门、tolerant gap 救援分类、相关 open-edge identity 与未实际使用的 gap warning；不新增回退、默认值或逐 fin 例外。交付网格顶点保持原值；上述 L∞ 点投影检查不等于已证明最终双向 L2 曲面距离，最终 50 µm 曲面上界、拓扑、覆盖和朝向资格仍须另行完整证明。
-
-原生 `GetPersistReference3` 的原始字节可能由同一 owner 的不同实体类型共同返回，因而不能单独充当全局实体身份。正常可区分对象继续使用按实体 kind 域分离的 typed persistent reference；不得把这类原生身份降级为派生值。仅当同一 body 内某一 kind 的全部对象返回同一个 body-scope reference、该 reference 不能识别具体 face/edge/vertex 时，才采用版本化 `native-scope-entity-id-v1`：该 identity 明确标记 `persistent=false`，绑定 source document identity、configuration、occurrence、body、object kind/index，并以原生 area、精确 binary64 bbox、tessellation coordinate/topology 或 edge endpoint/curve/相邻面证据生成唯一摘要。冻结 part 的唯一且可解析 reference 只作为映射 witness，不接管生产几何。原 raw reference、alias 审计和对象级 `cad_component_persistent_reference_aliased`／`cad_scope_local_identity_derived` warning 必须保留；scope-local 不得用于跨运行解析、恢复或宣称 persistent。若同 kind 出现 unique 与 alias 混合、scope 摘要重复/缺失、owner/configuration/body 不符或映射不是双向一一对应，必须 fail closed。跨 kind raw alias 仍须显式审计，不能用 alias 放宽拓扑归属、对象绑定或覆盖检查。原始网格点到最近点的 50 µm projection 只证明既定几何关系，不建立持久对象身份，也不能替代上述 scope-local 来源、映射和归属核验。
-
-fin endpoint 的唯一 U 来源为版本化 `native-u-closest-point-parameter-v1`：`IEdge.GetClosestPointOn(s)` 同次返回 `[PointX, PointY, PointZ, UParameter, NotUsed]`，前四项必须为有限原生值；最后一项为未使用槽，不作工程判据。严格要求 U 位于同一 edge 的有效参数域，保留负参数和周期参数的原值及既有绑定；不以 clamp、插值、另一次反求或其他对象的 U 替换。`Evaluate2` 必须 packed 成功，并由上述三条既有 50 µm 点投影条件独立接纳；原生曲线端点 v4、cofin/同点 v3、覆盖、Sense、Source scope、有效 warning 和网格字节绑定各保留真实语义。删除 `GetParameter` 二次反求、成功优先／失败 fallback、闲置状态字段与兼容开关；历史失败原件保全，不拼接新旧响应。域外、非有限、错误绑定、packed 失败或任一必要几何条件不闭合均拒绝，不切换另一 U。失败记录须定位具体对象与 predicate，保留原始 s、同次 p/U、域、Sense、edge/face 引用、Evaluate2 原始 payload/状态，以及所检关系的度量、误差、阈值和规则；声明的 tolerance 原生事实另列，不能以派生 evidence 为 null 推断原生状态。该来源依据 [SOLIDWORKS `IEdge.GetClosestPointOn` 官方契约](https://help.solidworks.com/2024/english/api/sldworksapi/solidworks.interop.sldworks~solidworks.interop.sldworks.iedge~getclosestpointon.html)。
-
-native edge 的 U 覆盖仍按每个实际三角面分别严格验收。对 closed+periodic edge 中跨越参数缝的 fin，采用版本化 `native-periodic-fin-interval-v1`：在 edge `[u_min,u_max]` 内比较直接区间与补区间，只有较短且无歧义的一侧可作为该 tessellation 段的覆盖证据，另一侧表示为沿 seam 的两段；半个 edge 域的歧义区间必须 unresolved。原始 fin start/end、面归属、cofin 反向关系及全部 fin 端点域检查均保留，不得用 edge-wide 并集放宽单面覆盖。
-
-面方向以可读的 `IEdge::EdgeInFaceSense` 为主证据；SolidWorks 2026 中 `IEdgeInFaceSense2` 为只写属性，其带错误记录的不可用结果可保留为诊断，但仅在它成功返回布尔值时才要求与主证据一致，主证据缺失或不合法仍拒绝。fin/cofin 跨面时允许使用各自 face-local 的 tessellation vertex ID；独立验证须确认 reciprocal cofin、不同面、反向 U、端点 U 对应以及反向端点坐标落在 v3 点界内，不得仅凭 vertex ID 相同或不同作结论。
-
-原生 tessellation schema v10 将 `ITessellation.GetFinCoFin` 的严格整数 `-1` 定义为开放 sheet body（`body_type=1`）的 boundary sentinel：记录必须保留原始 `cofin_raw_id=-1`，并将归一化 `cofin_id` 写为 `null`。只有唯一 incident face 的 sheet edge 可包含 boundary fins；该 face 具有 facet 时，edge 必须包含实际 fin，每个 fin 都须携带该 sentinel、指向该唯一 face，并由逐 face 的 U interval 证据证明完整覆盖。solid body（`body_type=0`）不得使用 boundary semantics。具有两个 incident faces 的 edge 不得包含 boundary fin；其实际 fin 都必须指向同一 edge fin set 内的非负 cofin，形成双向 reciprocal pair，并满足不同面、反向 U、端点 U 与坐标对应。允许同一 shared edge 以多段 reciprocal pairs 表示；实际 fin 任一端为 `null`、类型不是严格整数、cofin 不在该 edge set、非 reciprocal、在 shared edge 出现 `-1`、在 open edge 出现非负 cofin，或 incident face 数不为 1 或 2，均 fail closed。
-
-原生 body 的唯一 `IBody2.GetTessellation` 请求统一使用显式 `VARIANT(VT_EMPTY, None)`，对应 [SOLIDWORKS 官方 VBA 示例](https://help.solidworks.com/2020/english/api/sldworksapi/Create_and_Convert_Non-manifold_Bodies_Example_VB.htm) 的 `GetTessellation(Empty)`。这是一次 whole-body 主请求，不在失败后切换参数。请求原件保留恰好一个参数、`VT_EMPTY` 和空值；不得以裸 Python `None`、零长度 SAFEARRAY 或显式全 face 数组冒称同一 Variant 类型。完整原生 face inventory、引用、body 归属和后续集合闭包分别保留，不将未传入的 face 列表写入请求，也不在身份派生后改写请求。独立 consumer 严格核对请求字段、参数数量的整数类型及空值，拒绝旧请求变体。
-
-原生 body 统一采用一次 analysis tessellation：在唯一一次 `Tessellate` 前设置并严格回读 `ImprovedQuality=true`、`NeedErrorList=true`，保留原有 `MatchType=0`、`NeedFaceFacetMap=true`、`NeedEdgeFinMap=true`、`NeedVertexParams=true`。同次请求规则与实际属性保留来源和执行身份；独立 consumer 对顶层及每个 body 的字段集、精确类型和值分别核验，不能因 Python 的布尔／整数相等而混同读数。analysis 模式用于工程读取，不在失败后切换模式再 tessellate，不另猜 chord／angle／width 参数，也不替代最终曲面距离验收。`Tessellate=false` 明确为原生失败，以该 API 为首错停止；可从同次对象记录原始错误列表、face 身份／面积和失败态数量作诊断，但不得把失败后的零数量或空返回解释为无 facet。错误列表不可读或原始返回为 `None` 时如实保全，不推成无错误，不依赖不支持的原生指针接口。
-
-`GetFaceFacets` 与 `GetEdgeFins` 保留同次成功 tessellation、同一 typed face／edge 的原始返回。list／tuple 必须是不含重复项的扁平非负严格整数数组，未经递归展平、去重或排序的原值须封存；`GetFacetFins` 的原始返回同样须为恰好三个不同的非负严格整数，不能先展平再验收。嵌套数组、标量、未知或任一 COM 读取失败均拒绝；不增加另一套 tessellation 或备用网格。
-
-`native-tessellation/v13` 从完整集合闭包证明狭义空集合。对同一 body 的全部原生 face，分别保留 `GetFaceFacets(face)` 原始 nullable 返回、对象绑定和完整 face inventory；全部成功数组中的 facet IDs 必须跨 face 互不重叠，长度之和与并集大小均严格等于同次原生 `GetFacetCount`。依据原生 API 返回的是对应 face 的 facet 子集，完整无重叠子集达到原生总数，才可证明其余成功返回 `None` 的 face 无 facet。此推导仅适用于严格 `body_type=1`、`Tessellate=true`、全部所需属性真实回读正确的情形；solid、缺失 face、错误归属、重复 ID、总量不足或超出均拒绝。保留原始 `None`，零计数和空数组明确标为按完整 body 闭包派生，记录规则与对象／字段级来源 warning，不能冒称原生逐字直返；consumer 从原始数组、inventory 和原生全局数量独立重算。
-
-仅当严格 `body_type=1`，edge 的一或两个唯一 incident faces 均归属于同一 body，且每个 incident face 已由上述完整闭包证明 facet 数为 `0` 时，才允许该 edge 的空 `fin_ids=[]`。除同次 `Tessellate=true` 与所需 map 属性正确外，全部原始 facet→fin 关系也须完整、唯一归属，并与同次原生 `GetFinCount` 闭合。`GetEdgeFins` 成功返回的直接空数组如实保留；若成功返回 `None`，只有这些原生拓扑与全局闭包事实全部成立，才可依据 fin 必须属于其 incident face 的 facet 推导为空，并保留原始 `None`、具体规则和对象／字段级来源 warning。consumer 从原始 face／facet／fin、全局数量、face span 和实际三角形记录独立复算，不信任自报允许标志。此规则不要求或伪称读取了 `GetFacetFace`／`GetFinEdge`，也不增加反向 API 前置。边、端点、曲线、参数域、sense 及原生身份仍完整保留，不生成 fin、cofin 或虚假 U 区间，也不删边。任一相邻面具有 facet 时缺 fin、solid/未知 body、非法返回类型、COM 读取失败、缺失面、全局总量不闭合或归属矛盾均拒绝。无 facet 的原生曲面片继续保留既有的实例、face、正面积及精确 warning；空边不贡献 U coverage，不赋予该曲面片几何完整性、最终曲面距离或参考拓扑一致资格，其余几何、身份、覆盖及交付验收保持。
-
-v10 同时记录 immutable `raw/source_scopes.json`：file source 分开保存原文件与冻结 copy hash/path；virtual source 保存 path-derived identity、owner hash、`VC~~` session document/root 和 PID。包级验证须把 scope 与 discovery、scene、capture、geometry、dependency closure 和实际冻结字节交叉核对；允许 discovery 与 capture 使用不同的虚拟 session、root 和 PID；owner、实例、配置及 `VC~~` 相对身份必须一致，各自 session 的文档路径、root 与 PID 必须内部绑定自洽。producer、独立 parser 与 topology summary 使用同一规则；该规则不放宽 curve endpoint、U、surface、身份或 mesh 验收。
-
-极短 fin 的两个端点经原生 128-ULP U identity 视为同一参数时，可采用版本化 `native-fin-u-collapse-v1`：保留两端原始 U、坐标、投影和求值证据，要求 reciprocal cofin、不同面、反向坐标 v3 一致、主 sense 相反、两端投影/Evaluate2/U 域证据有效，且几何端点跨度严格大于零并不超过 50 µm。collapsed fin 只保留为零测度拓扑段，贡献零 U coverage；其余非 collapsed intervals 仍须对每个实际面独立覆盖完整 edge 域。零跨度、部分坍缩、跨度超过 50 µm、cofin/sense 异常、证据不可读或依赖该 fin 补洞的情形必须 unresolved。fin 输入保持 exact schema；规则名、跨度和 warning 是从上述原始证据复算得到的归一化输出，不属于可注入的原始真值，parser 不得修改调用方输入对象。
+原始证据记录 immutable `raw/source_scopes.json`：file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将 scope 与 discovery、scene、capture、geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
 
 <a id="qualification"></a>
 ## 警告与资格
@@ -159,67 +193,59 @@ CAD 原名的格式、词根、缩写或重名违规只产生命名 warning，�
 
 通过的预览加载绑定主体的实际 URDF 与网格，显示报告与资格。验证失败后仅允许显著标注“未验证”的诊断预览，附失败检查；缺乏可安全解析的模型时只展示诊断。预览控件不能产生验证结论。报告、页面、预览与 PR 显示同一用途、范围来源、参数缺失与资格；缺失驱动显示“未提供（未建立驱动能力）”；界面范围不得回写成模型限位或充当验证真值。
 
-最终真实端到端产物必须与固定手工版进行对比，生产结果以 CAD 原值及明确、可复用的规则独立生成。方向符号与手工参考不一致属于非阻塞对比项；保留逐关节差异，不为此回填参考符号。固定参考可以由验收工具读取，但生产生成器不得消费手工名称表、轴值、限位值或网格。比较双方绑定准确版本、主体摘要和原始来源；不能用临时手调或模拟产物代替最终结果。命名与引用逐项精确核对；拓扑、限位、轴线、零位和非零运动仍按同一语义及既有严格容差核对；网格按实际几何、实例覆盖及放置核对，不能只看路径或包围盒。XML 排版、来源 warning 及新增审计证据单独列出，不把字节不同比作机械不一致。
+固定手工版只作为隔离的参考单元测试和回归测试 fixture，不进入生产采集、Generate、Verify 真值、必需检查策略、正式端到端或发布必经链。参考测试仅在 fixture 明确绑定相同或明确兼容的 CAD 原件、配置和修订时执行；输入版本不同不得硬匹配旧 URDF，应声明不适用或建立新的版本化 fixture。生产结果仍以当前 CAD 原值和明确、可复用的规则独立生成，不读取参考名称表、轴值、限位值或网格。
 
-报告保留原始 XML diff 和逐对象语义差异，并为每个差异列明 CAD 原值、参考结果、适用规则、自动输出与独立验证证据。存在明确规范偏差且可由通用规则修正时实际修正；不能仅为消除参考方向差异而增加规则。方向符号差异，以及符合 CAD 来源规则的 `robot.name` 与参考 inspection 标签的差异，单独记录为非阻塞项；其他未解决的一致性项目仍保持未完成。模型名的格式、来源 warning 和从原生声明或冻结顶层装配名独立复算仍须通过；不能因为参考名称差异获准就接受任意自报名称。规则须按对象类型、已证明的机械角色、配置或几何条件适用，禁止由固定对象 ID 查询手工答案。
+参考测试报告保留逐对象语义差异，并说明 fixture 的适用 CAD 身份、规则、实际自动输出和独立 CAD 验证证据。测试不得锁死 XML 排版、元素顺序、来源 warning 文本顺序、STL 字节、三角形顺序或合法三角化差异；命名与引用须先按语义分类，拓扑、限位、轴线、零位、非零运动和几何按有依据的语义容差比较。方向符号、符合 CAD 来源规则的模型名以及 visual／material 名称与参考不同，仅在适用 fixture 中单独分类，不能据此豁免颜色、纹理、对象绑定、引用完整性、几何或运动检查，也不能倒填生产规则或逐对象答案。
 
-用户于 2026-10-20 进一步明确放行 visual 名称及展示材质名称与参考不同。比较器必须将名称字段与颜色、纹理、元素存在性、对象绑定及引用完整性分别比较；仅名称差异可记录为非阻塞，不能豁免整个 appearance 或 material 类别。稳定命名、来源 warning 和独立复算仍须通过，最终 diff 保留全部获批名称差异及依据。
+参考差异分类只说明 test fixture 中的表示或版本差异，不构成生产放行门。测试中的未知或未解释差异保持失败／未决，须修正测试绑定、补充适用容差，或明确新 fixture；不能把失败改成生产 warning，也不能因参考测试通过而替代当前 CAD 独立工程验证。
 
-差异分类仅用于说明问题性质，不构成放行。除已明确批准的纯轴向反号、模型名、上述两类名称差异，以及满足下述几何等价标准的参考网格表示差异外，其他未解决项仍阻塞验收和发布；不能仅以“展示差异”“遍历序号”或“内容摘要不同”判定通过。须完成有据规则修正及独立验证，或提交明确的参考／规范冲突供设计总师裁定，不能由实现方自行豁免。
-
-方向的独立 CAD 验证与手工参考对比采用不同判定（用户，2026-10-20）：前者仍检查有向轴读取、对象绑定、有效坐标转换、轴线及原生非零运动；后者报告同向／反向及其适用坐标系，不因纯符号差异判定导出流程失败。必要时可在比较器中明确对应的参数符号映射来解释运动差异，但该映射不能进入生成器，也不能掩盖其他几何或运动错误。实际驱动／编码器正向未绑定时记录未验证资格及 warning，不阻塞本次导出流程；不得据此宣称实机正向已验证。
+方向的独立 CAD 验证与参考 fixture 比较采用不同判定：前者仍检查有向轴读取、对象绑定、有效坐标转换、轴线及原生非零运动；后者只报告同向／反向、适用坐标系和 fixture 版本，不因纯符号差异把测试误判为生产回归。实际驱动／编码器正向未绑定时记录未验证资格及 warning；参考测试结果不能建立或否定该资格。
 
 <a id="geometry-equivalence"></a>
-### 参考网格几何等价（用户批准，2026-10-20）
+### 参考网格回归的几何等价（用户批准，2026-10-20）
 
-本标准只用于最终自动产物与固定手工参考之间的网格表示比较，不改变原生捕获、当前交付网格字节绑定、CAD 唯一工程来源或其他必需质量门。网格文件名、字节、三角形排列或三角化不同，只有按本标准证明等价后，才可作为已解释的参考差异关闭；最终 diff 仍保留双方真实路径和摘要。不得复制参考 STL、伪造摘要或用参考结果修改原生输入。
+本标准只用于独立参考单元测试和回归测试 fixture，不改变生产原生捕获、实际交付网格字节绑定、CAD 唯一工程来源或其他必需质量门。参考 fixture 与候选测试输出可以具有不同文件名、字节、三角形顺序或合法三角化，按语义几何证明等价；不得复制参考 STL、伪造摘要或用参考结果修改生产输入。
 
-双方必须绑定相同的冻结 CAD 文件、配置、原生实体及实例归属，保留原生采集接口、工具版本、三角化设置和坐标转换。逐原生网格／实例在同一有据坐标系和米制单位下比较；禁止额外拟合、缩放、镜像或 ICP 对齐来隐藏位姿差异，也禁止跨对象平均误差。
+fixture 双方必须声明适用关系并绑定其冻结 CAD 文件、配置、原生实体及实例归属，保留采集接口、工具版本、三角化设置和坐标转换。不同 CAD 或配置版本不能套用旧 fixture 的数值答案；逐原生网格／实例只在其声明的共同有据坐标系和米制单位下比较，禁止额外拟合、缩放、镜像或 ICP 对齐来隐藏位姿差异，也禁止跨对象平均误差。
 
 两个方向的点到三角曲面距离上界均须 **≤ `5e-5 m`（50 µm）**。距离定义覆盖全部三角曲面，不能只比较顶点、包围盒、平均值、分位数或有限抽样最大值。有误差界的自适应细分、完整曲面包络或其他可复核算法均可使用；算法版本、数值误差界和停止条件必须留证。已证明完整有向三角面集合相同且重数一致，可使用零距离的精确等价快速检查；仅顶点集合相同不足以证明通过。
 
 同一判定还必须通过原生拓扑、完整覆盖和朝向检查。不得新增或丢失实体、孔洞、开放边界、连通部分或原生面覆盖；合法曲面件不得被任意封口，整体翻面不视为等价。既有自交、非有限值、退化三角形、异常空网格、位姿和独立质量要求仍生效。面积、有符号体积及包围盒差异逐对象报告，但不能抵消其他失败。
 
-报告逐对象保存原生身份、双方文件摘要与路径、比较坐标系、采集设置、三角形数量、两个方向的距离上下界、最坏点／面、面积与体积差、拓扑／覆盖／朝向结果和判定。全部必需条件满足且两个保守上界均在阈值内才为 `PASS`；可信超限见证或任一必需条件失败为 `FAIL`；缺少上界、上下界未收敛、算法超时或证据不足为 `UNRESOLVED`。`FAIL` 和 `UNRESOLVED` 均阻塞发布，不能用来源 warning 替代。
+参考测试报告逐对象保存 fixture 适用身份、双方文件摘要与路径、比较坐标系、采集设置、三角形数量、两个方向的距离上下界、最坏点／面、面积与体积差、拓扑／覆盖／朝向结果和判定。全部必需条件满足且两个保守上界均在阈值内才为测试 `PASS`；可信超限见证或任一必需条件失败为 `FAIL`；缺少上界、上下界未收敛、算法超时、版本不适用或证据不足为 `UNRESOLVED`。失败和未决不能改成生产 warning，也不能据此替代当前 CAD 的实际质量检查。
 
 距离算法须通过独立已知答案验证，覆盖顶点、边、面内、面外、退化及混合退化三角形，并验证单位缩放和平移一致性。算法复算应保持固定输入字节不变；名称放行不豁免几何、颜色、引用或来源检查。
 
 拓扑核验可采用有据、版本化的数值表达归一化，但不能把固定焊接距离作为自动放行门。先按原生 body 身份和共享边／顶点的邻接证据确定可关联对象，再从实际坐标类型、单位转换及计算误差推导可审计的误差界；不能由手工结果相同或“增大到闭合”的试验反推规则。仅坐标接近不能证明原生身份相同，禁止跨独立 body 焊接；簇必须满足明确的整体误差界，不能用传递合并把较大的真实间隙串起来。
 
-归一化只用于拓扑关联和 T-junction 分析，不改原生捕获或交付 STL 字节。距离验收仍使用原始三角曲面，不能用归一化后的坐标消除实际距离。报告逐对象保留原始计数、精度和误差依据、规则版本、关联证据、应用后的计数及来源 warning。缺少足够的原生关联或误差证据时保持 `UNRESOLVED`；真实开口、漏面、错误归属、非流形或翻面仍须处理。独立反例覆盖合法量化接缝、刚超误差界的真实间隙、近邻但不同的原生顶点、跨 body 接触、缺面、翻面及 T-junction。
+归一化只用于参考测试的拓扑关联和 T-junction 分析，不改生产捕获或交付 STL 字节。距离测试仍使用 fixture 声明的三角曲面，不能用归一化后的坐标消除实际距离。报告逐对象保留原始计数、精度和误差依据、规则版本、关联证据、应用后的计数及适用性。缺少足够的关联或误差证据时保持 `UNRESOLVED`；测试中的真实开口、漏面、错误归属、非流形或翻面仍须解释或修正 fixture。独立反例覆盖合法量化接缝、刚超误差界的真实间隙、近邻但不同的原生顶点、跨 body 接触、缺面、翻面及 T-junction。
 
-### 本轮冻结参考（2026-10-20）
+### 参考测试输入与预期输出的成对绑定
 
-用户确认以 [description PR #289](https://github.com/mimicverse/description/pull/289) 的固定提交作为本轮结果参照；只读取以下提交，不能随 PR head、分支或工作区变化自动更新。参考包含具体数值及其资格限制，不能只冻结总数或名称。
+参考测试用例须将原生 CAD 输入包与手工导出参考成对冻结，记录各自来源、配置、修订、
+文件清单及摘要；切换用例时同时切换输入与参考，不能拿另一修订或另一组输入套答案。
+具体模型、固定对象数量、路径、已知缺陷与期望结果只保存在测试资料中，不写入生产
+代码、运行配置、生成规则、Verify 真值或发布门。测试 CAD 通过正常 Freeze 入口提交，
+生产阶段只读取本次请求接纳的输入；手工参考只由独立测试对照读取。参考自身的未决
+工程问题和不适用条件必须随用例保留，不能用它们改写生产事实或宣称工程资格。
 
-| 项目 | 固定值 |
-|---|---|
-| 原生主总装／配置 | `M3.0.3_20261016.SLDASM`／`Default` |
-| 原生主总装 SHA-256 | `647b756847bb08f99287b71b86ea55e4cfb554df22f51a3e9f2ed337472799ce` |
-| 原始上传清单 SHA-256 | `5f5c1f1a5dd874e8993486e0ddfe5043d422ec272bba63dbe59cb8a7488406db`（71 文件，52,400,231 字节） |
-| 手工参考提交 | `d750c18e0c6f0a4bae576e472f5ea0c0d71585c1` |
-| 手工参考 tree | `56bfb8c7a8b8f3167498b35d655dcbbdbf68ff4d` |
-| 参考 URDF 路径／SHA-256 | `urdf/robot.urdf`／`1496dc09c7110d39486defcbeb58ee6aa8202cddc9f750a3e4970787059bfdc8` |
-| 参考内部模型名 | `m303_20261016_inspection` |
-| 参考结构 | 24 links、23 个 revolute joints、85 visuals、41 个唯一网格、24 份惯性参数 |
-| 参考范围与驱动字段 | 全部位置范围为 `[-π, π]`，effort 与 velocity 均为 `0` |
-
-表中范围是手工配方明确标注的预览策略：`native_cad_ranges=false`、`hardware_qualified=false`；其正向沿用历史检查版约定。上述记录锁定比较对象，不赋予其原生机械资格，也不授权直接复制 `_inspection`、范围或符号。检查预览范围由契约中的 `inspection_rotation_full_turn/v1` 独立产生并验证，不从参考取值。内部模型名仍按顶层 CAD 原生值及命名契约生成；预览策略与机械限位分别比较。参考与原生事实或适用规范的矛盾必须逐项说明并解决，不能隐藏差异或为匹配而改写原件。`urdf/robot.urdf` 始终是固定文件入口。
-
-完整字段参考由该提交的 URDF、网格及来源／配方文件固定；验收报告同时记录它们的摘要、自动产物主体摘要和所用规则版本。逐对象比较覆盖全部名称与引用、拓扑、轴向、零位、非零运动、限位、质量、COM、完整惯量及网格几何，不将相同计数或总质量作为充分证据。来源审计和 CAD 问题警告保留对象／字段、原始值、违反的规范、规则 ID／版本、修正值、证据和未建立的资格；实际 URDF、报告、预览与 PR 的显示一致。
-
-`description check` 只读重算并核对完整报告；额外报告写到交付目录之外。源、工具、策略或文件变化均需重新执行规定阶段与验证。通过结果不能脱离其主体迁移。
+已登记的 Verify command 通过 `description stage <verify-command-id>` 执行正式 Verify
+阶段：尚无决定时取得执行权，从原始证据运行验证并提交正式 decision、certificate 与
+receipt；已有决定时核验并返回原封存结果，不重新计算。Verify 读取输入证据不改写
+原件，但阶段执行会写入业务事实。真正隔离复算须绑定既有 `DiagnosticReplayScope` 并
+走受控诊断入口，不登记正式资格；系统不提供任意目录的 check/rebuild 第二入口。源、
+工具、策略或文件变化均需重新执行规定阶段与验证，通过结果不能脱离其主体迁移。
 
 模型的工程批准、全行程安全、制造公差、接触/碰撞、仿真、训练和实机控制在各自验收中建立。中性原生夹具资格化其实际覆盖的工具行为，不资格化具体硬件。全部必需检查通过后可以发布绑定所选用途的待评审 PR；工程批准与实机资格未建立不新增自动失败门，也不能被 PR 创建授予；不同用途的候选与发布恢复身份相互隔离。
 
-方向专项验收要求：当前不引入基于右手定则或功能动作的新正向推导，优先验证原生有向轴、有效作者声明和必要坐标表达。CAD 偏离已有规范时 warning 完整且有据可修正项不阻断；转换对正反向、小幅非零姿态及适用组合均成立；斜轴不被强行对齐、镜像不被无条件翻转、零位／边界不同步的错误能够检出。原先报告的七处方向差异分别列明原生证据、CAD 运动语义、适用转换及结果，不预置其必须为负号。最终对比使用实际端到端产物，按相同语义姿态比较手工版，区别表示差异与真实运动差异。
+方向专项验收要求：当前不引入基于右手定则或功能动作的新正向推导，优先验证原生有向轴、有效作者声明和必要坐标表达。CAD 偏离已有规范时 warning 完整且有据可修正项不阻断；转换对正反向、小幅非零姿态及适用组合均成立；斜轴不被强行对齐、镜像不被无条件翻转、零位／边界不同步的错误能够检出。实际观察到的方向差异分别列明原生证据、CAD 运动语义、适用转换及结果，不预置其必须为负号。独立参考测试只在 fixture 的 CAD、配置和版本适用时按相同语义姿态比较，区别表示、已批准符号差异与真实运动差异；不得把参考测试设为生产方向真值或发布必经门。
 
 驱动／编码器方向关系须另有可追溯的依据：核对实际执行器身份与 CAD occurrence、命令类型／模式、编码器计数方向、零位、传动及关节物理运动。已有配置和验证记录只证明其明确覆盖的版本和范围，不把电机外观或安装朝向当成正转真值。覆盖执行器错绑、编码器与命令方向相反、版本不符、声明缺失及参考符号回填的反例；缺少证据时明确硬件资格未验证，不能以几何一致或 warning 冒称该资格通过，也不阻塞本次导出流程。查证外部配置不改变 CAD 唯一工程来源边界。
 
 逐项复核所有实际反号均有对象级 warning，原值、参考系、修正值、规则依据及联动字段完整，并在报告、URDF 来源记录、预览和 PR 保持一致。正例包含保持物理运动等价的纯符号变换；删除反号 warning、缺少规则或前后值、仅部分交付面显示 warning，以及用 warning 放行无依据反号，均须被检出并拒绝验收。
 
-须交付覆盖全部实际关节的固定输入核对表：原生身份与配置、有向轴原值及所在参考系、独立重读的参考轴绑定、作者声明及其语义和适用对象、CAD 运动定义、必要坐标转换、原生非零运动核验、输出轴／范围和字段级 warning。作者符号必须按正确绑定消费一次，不能被忽略或重复应用。未证明项保留原值并明确标记；参考方向不一致和未建立的硬件正向资格按上述非阻塞边界报告。必需 CAD 证据缺失仍失败，不得用默认正号填满矩阵或将未验证项标成已验证。
+须交付覆盖全部实际关节的固定输入核对表：原生身份与配置、有向轴原值及所在参考系、独立重读的参考轴绑定、作者声明及其语义和适用对象、CAD 运动定义、必要坐标转换、原生非零运动核验、输出轴／范围和字段级 warning。作者符号必须按正确绑定消费一次，不能被忽略或重复应用。未证明项保留原值并明确标记；参考 fixture 的方向差异只影响对应测试的语义分类，未建立的硬件正向资格仍单独报告。必需 CAD 证据缺失仍失败，不得用默认正号填满矩阵或将未验证项标成已验证。
 
 独立反例须覆盖：无向端点冒充正向、忽略或重复应用有效作者负号、作者声明错绑对象、混用参考系、非正交／共线基、用名称或功能投影代替原生正向、观测点不属于运动集合、终端或分支证据不足、斜轴及镜像轴向量、只翻轴而未同步坐标／范围、无依据改变零位与几何。更换同一物理问题的平移旋转参考系后，转换结论与实际运动须保持等价；纯符号映射分别核对姿态、角速度、范围边界及有来源的功率。有限正反步长按有效范围选择，真实零范围不可强行运动；同一假设轴上的公式自洽不能冒充独立 CAD 运动证据。
 
-参考隔离是发布验收项：生产生成与独立 CAD 工程验证在固定手工参考不可访问时仍能完成其规定行为，输出及工程判定不依赖参考。仅最终一致性比较读取参考；扰动参考的名称、轴或范围时，生产输出摘要不变，比较器须检出对应差异。检查路径依赖、规则及测试数据，禁止逐对象答案以角色表、符号表或预期值夹带。每类规则的适用证据与反例先于参考比较固定，不能看比较结果再无工程依据地调参。
+参考隔离是测试职责边界：生产采集、Generate、独立 Verify 和发布在参考 fixture 不可访问时仍须完成其规定行为，输出及工程判定不依赖参考。只有隔离的参考测试入口读取 fixture；扰动 fixture 的名称、轴或范围时，生产输出摘要与阶段资格不变，测试须报告对应差异或适用性失败。检查路径依赖、规则及测试数据，禁止逐对象答案以角色表、符号表或预期值夹带。每类生产规则的适用证据与反例先于参考测试固定，不能看测试结果再无工程依据地调参。

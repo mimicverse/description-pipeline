@@ -51,9 +51,10 @@ from ..stages import (
     publication_succeeded,
     stage_view,
 )
-from ..geometry.native_u import (
+from ..geometry.native_scope import (
+    NATIVE_GATE_WARNING_CODES,
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_scope_warning_details_match,
+    native_gate_warning_details_match,
 )
 from ..artifacts import ArtifactStore
 from .airflow_client import (
@@ -71,6 +72,7 @@ from ..io import PipelineError, canonical_json_value, digest
 from ..interface_records import REQUEST_PURPOSES
 from ..delivery import PIPELINE_ID, SUBJECT_DIRECTORIES, SUBJECT_FILES
 from ..platform.queries import read_run_projection
+from ..schemas import RUN_ACTIVITY_SCHEMA
 from ..pipeline.contracts import ArtifactRef, StageStatus
 from ..pipeline.dispatch import DispatchObservation
 from ..pipeline.effects import EffectState
@@ -301,10 +303,10 @@ def _quality_warnings(report: dict | None) -> list[dict]:
         "diagnostics",
         code_required=True,
     )
-    native_scope = [
+    native_warnings = [
         item
         for item in diagnostics
-        if str(item["code"]) in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        if str(item["code"]) in NATIVE_GATE_WARNING_CODES
     ]
     native_gate_warnings = None
     native_gate_passed = False
@@ -326,18 +328,24 @@ def _quality_warnings(report: dict | None) -> list[dict]:
             if isinstance(gate_warning_rows, list):
                 native_gate_warnings = gate_warning_rows
             break
-    raw_scope = [
+    raw_native = [
         item
         for item in native_gate_warnings or []
         if isinstance(item, dict)
-        and str(item.get("code")) in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        and str(item.get("code")) in NATIVE_GATE_WARNING_CODES
     ]
-    if (native_gate_passed and native_gate_warnings is None) or (
-        (native_scope or raw_scope)
+    if (
+        native_gate_passed
+        and not any(
+            item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+            for item in raw_native
+        )
+    ) or (
+        (native_warnings or raw_native)
         and (
             native_gate_warnings is None
-            or not native_scope_warning_details_match(
-                native_scope,
+            or not native_gate_warning_details_match(
+                native_warnings,
                 native_gate_warnings,
             )
         )
@@ -2876,6 +2884,24 @@ class PortalApp:
 
         if not isinstance(projection, dict):
             return None
+        stored_activity = projection.get("activity")
+        activity_record = None
+        activity_history = []
+        activity_final = None
+        if (
+            isinstance(stored_activity, Mapping)
+            and stored_activity.get("schema_version") == RUN_ACTIVITY_SCHEMA
+        ):
+            current = stored_activity.get("current")
+            activity_record = dict(current) if isinstance(current, Mapping) else None
+            history = stored_activity.get("history")
+            activity_history = (
+                [dict(item) for item in history if isinstance(item, Mapping)]
+                if isinstance(history, list)
+                else []
+            )
+            final = stored_activity.get("final")
+            activity_final = dict(final) if isinstance(final, Mapping) else None
         request = projection.get("request")
         request = request if isinstance(request, dict) else {}
         stages = projection.get("stages")
@@ -3048,6 +3074,9 @@ class PortalApp:
             "scope": projection.get("scope"),
             "formal_eligible": formal_eligible,
             "events": events,
+            "activity": activity_record,
+            "activity_history": activity_history,
+            "activity_final": activity_final,
             "result": result,
             "hardware_id": request.get("target_hardware"),
             "main_assembly": request.get("main_assembly"),

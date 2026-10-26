@@ -30,7 +30,7 @@ flowchart LR
 | `StageApplication` | 接纳、构造命令、组合六个 handler、路由对账和取消 | CAD 原生事实、网页授权 |
 | 共同 stage engine | claim、执行、候选校验、唯一 decision 及失败保全 | 各阶段领域算法 |
 | Linux handlers | 冻结、原生协调、模型生成、独立验证与发布 | Windows 会话所有权 |
-| Windows native runtime | 原生读取、重建、几何观察与本 operation 的会话管理 | 完整模型、URDF、独立质量结论、Git 和 PR |
+| Windows native runtime | 已保存 CAD 原生事实读取、几何观察、会话管理，以及释放后的原值投影、raw/STL 编码与证据封包 | 完整模型、URDF、独立质量结论、Git 和 PR |
 | PostgreSQL `FactStore` | 接纳、命令、执行权、effect 与阶段决定 | artifact 文件内容和 Airflow 调度状态 |
 | `ArtifactStore` | 不可变文件集合、manifest、摘要及物化 | 运行成功、阶段决定和业务显示状态 |
 
@@ -48,7 +48,9 @@ Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化
 | 执行、恢复和阶段成功 | 数据库中的不可变命令、执行权和追加事实；文件存在或网页绿标不建立资格 |
 | 工程批准和硬件资格 | 独立工程验收；PR、仿真加载或流水线通过均不代授 |
 
-CAD 有值时先读取、保留和检查，再按有据规则修正。规则不能复制手工答案、补造原生缺项或掩盖冲突；手工参考只进入最终比较工具。非直读值逐对象、逐字段显示来源 warning。命名、方向、限位以及已获允许的参考差异以[身份与来源](contracts.md#identity)和机械、质量规范为准。
+CAD 有值时先读取、保留和检查，再按有据规则修正。规则不能复制手工答案、补造原生缺项或掩盖冲突；手工参考仅作为独立参考单元测试和回归测试数据，不进入生产采集、生成、验证真值或发布必经链。非直读值逐对象、逐字段显示来源 warning。命名、方向、限位以及已获允许的参考差异以[身份与来源](contracts.md#identity)和机械、质量规范为准。
+
+外观身份只保留同次原生观察：材质实体的 public QI 集合、实际 owner 引用，以及 Part face 到 body/feature 的关系。交付 face footprint 由 Generate 和 Verify 分别从这些事实建立，不把 geometry index 与 Part identity 假定为一对一，也不保存 Source 自匹配答案。live COM handle 与可封存 JSON 事实分离，接口类型、body 归属和生命周期不能靠测试标签或对象深复制建立。
 
 完整上传、选定原生依赖闭包、prepared package、artifact 集合、tool source、完整 tool record 和交付 subject 的摘要属于不同语义域。逐域核验，不能因两个摘要不同就认定内容冲突，也不能以其中一个代替另一个。
 
@@ -81,6 +83,10 @@ StagePending -> EffectPollTrigger -> StageTaskOperator.execute_complete
 共同引擎不包含 CAD、URDF 或发布算法。各 handler 只持有所需 artifact 和 effect 端口，不能直接提交平台成功。生产组合必须完整安装六阶段、native/Git/PR 对账及 native 取消能力；测试可显式注入端口，缺失生产组件不得被当作可选功能静默忽略。
 
 Discover result 表达原生选择、prepared 输入和证据绑定，不作为第二个完整机器人模型。Generate 持久化一个 `EngineeringModel`，URDF 是其交付编码。Verify 独立读取原始证据和实际输出，不借用生成器的期望值、成功标志或缓存。共享代码限于纯数学、格式解析和无领域推导的契约基础，并用解析解、已知答案和变异反例验证。发布重验完整 certificate、execution receipt 及被验证字节。
+
+Capture 在一次原生采集中保留已保存配置、几何、轴线、配合、物性和外观事实，不执行 CAD 重建，不保留重建图、恢复日志或强制清零资格。原生事实以 manifest 绑定的 raw 成员为唯一封存来源，交付 capture 记录只保留必要投影，不重复内嵌完整 raw。外观复用同一几何遍历的对象与 face triangle spans；对象引用必须在已证明的同一文档与 occurrence 上下文中解释。Generate 离线完成坐标转换、面材质分组和 URDF 生成，Verify 从原始事实与交付字节独立复算；不得信任采集器预填的匹配答案。详细外观规则见[原生外观读数与交付](contracts.md#原生外观读数与交付)。
+
+Windows 的既有 `native_operation_event` 经同一 operation view 与 poll 形成 `run_display_metadata.activity`，Portal 展示当前活动、时间与历史。原生 sequence 与事件时间用于识别重复观察；activity 是显示数据，不建立第二套阶段状态、成功资格或 CAD 控制权，不增加独立轮询链。
 
 ## 持久化与一致性
 

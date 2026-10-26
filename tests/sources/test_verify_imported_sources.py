@@ -17,14 +17,7 @@ from . import support
 
 ROOT = r"C:\description-v1-review\capture-session\input-copy"
 TEMP = r"C:\Users\operator\AppData\Local\Temp\swx00001\IC~~"
-CACHED_TEMP_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx00002"
-CACHED_MATERIALIZATION = CACHED_TEMP_ROOT + r"\IC~~\bracket_a.stp.SLDASM"
-SELECTION_TEMP_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx00003"
-SELECTION_MATERIALIZATION = SELECTION_TEMP_ROOT + r"\IC~~\bracket_a.stp.SLDASM"
-CACHED_AUTHOR = r"D:\design-copy\change01\bracket_a.stp"
-CACHED_OWNER = "bracket_a.SLDASM"
-CACHED_OCCURRENCE = "bracket_a-21/bracket_a.stp-2"
-CACHED_API = "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+IMPORT_API = "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
 VIRTUAL_OWNER = "waist.SLDASM"
 VIRTUAL_OCCURRENCE = "waist-1/Copy of 复件 (2) 零件10^waist-1"
 VIRTUAL_CAPTURE_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx21040"
@@ -84,68 +77,6 @@ def foreign_component(name, *, containing=None):
     }
 
 
-def cached_provenance(owner_sha, **overrides):
-    provenance = {
-        "state": "cached_materialization",
-        "kind": "native_import_materialization",
-        "source_root": ROOT,
-        "owner": CACHED_OWNER,
-        "owner_sha256": owner_sha,
-        "occurrence": CACHED_OCCURRENCE,
-        "defining_anchor": None,
-        "materialization_path": CACHED_MATERIALIZATION,
-        "session_temp_root": CACHED_TEMP_ROOT,
-        "native_api_pid": 2,
-        "author_imported_path": CACHED_AUTHOR,
-        "is_virtual": False,
-        "used_api": CACHED_API,
-        "error": None,
-    }
-    provenance.update(overrides)
-    return provenance
-
-
-def cached_component(owner_sha, **overrides):
-    component = {
-        "name2": "bracket_a.stp-2",
-        "document": None,
-        "configuration": "Default",
-        "suppressed": False,
-        "lightweight": False,
-        "suppression_state": 2,
-        "source_provenance": cached_provenance(owner_sha),
-    }
-    component.update(overrides)
-    return component
-
-
-def cached_slot(owner_sha, occurrence=CACHED_OCCURRENCE, configuration="Default"):
-    return {
-        "document": CACHED_OWNER,
-        "instance": occurrence,
-        "owner_anchor": None,
-        "state": "cached_materialization",
-        "binding": "author_metadata_only",
-        "materialization": SELECTION_MATERIALIZATION,
-        "session_temp_root": SELECTION_TEMP_ROOT,
-        "native_api_pid": 3,
-        "author_imported_path": CACHED_AUTHOR,
-        "owner_sha256": owner_sha,
-        "configuration": configuration,
-        "suppression_state": 2,
-        "is_virtual": False,
-    }
-
-
-def cached_carrier(owner_sha, imports=None):
-    return sealed_selection(
-        {CACHED_OWNER: owner_sha},
-        CACHED_OWNER,
-        edges={CACHED_OWNER: []},
-        imports=list(imports) if imports is not None else [cached_slot(owner_sha)],
-    )
-
-
 def virtual_provenance(owner_sha, **overrides):
     provenance = {
         "state": "embedded_virtual_component",
@@ -163,7 +94,7 @@ def virtual_provenance(owner_sha, **overrides):
         "author_imported_path": None,
         "author_imported_error": None,
         "is_virtual": True,
-        "used_api": CACHED_API,
+        "used_api": IMPORT_API,
         "error": None,
     }
     provenance.update(overrides)
@@ -200,7 +131,7 @@ def virtual_slot(owner_sha, occurrence=VIRTUAL_OCCURRENCE, configuration="默认
         "configuration": configuration,
         "suppression_state": 2,
         "is_virtual": True,
-        "used_api": CACHED_API,
+        "used_api": IMPORT_API,
         "author_imported_path": None,
         "author_imported_error": None,
     }
@@ -215,38 +146,6 @@ def virtual_carrier(owner_sha, virtual_components=None):
         virtual_components=list(virtual_components)
         if virtual_components is not None
         else [virtual_slot(owner_sha)],
-    )
-
-
-DISCOVERY_ROOT = r"C:\discovery\m3-flat"
-SELECTION_ROOT = r"C:\selection\m3-flat-absence"
-NP_RELATIVE = "imported_part.step"
-
-
-def relocated_component(owner_sha):
-    provenance = cached_provenance(
-        owner_sha,
-        author_imported_in_source_root=True,
-        author_imported_relative=NP_RELATIVE,
-        author_imported_path=DISCOVERY_ROOT + r"\imported_part.step",
-        source_root=DISCOVERY_ROOT,
-    )
-    return cached_component(owner_sha, source_provenance=provenance)
-
-
-def relocated_carrier(owner_sha, np_sha):
-    slot = cached_slot(owner_sha)
-    slot.update(
-        author_metadata_in_stage=True,
-        bound_source=NP_RELATIVE,
-        author_imported_path=SELECTION_ROOT + r"\imported_part.step",
-    )
-    return sealed_selection(
-        {CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha},
-        CACHED_OWNER,
-        edges={CACHED_OWNER: [NP_RELATIVE], NP_RELATIVE: []},
-        imports=[slot],
-        stage_root=SELECTION_ROOT,
     )
 
 
@@ -527,116 +426,6 @@ class ImportedSourceTests(unittest.TestCase):
             )
             report = verify_discovery(package)
         self.assertIn("discovery.request", {item["code"] for item in report["errors"]})
-
-    def test_cached_materialization_is_accepted_through_the_sealed_carrier(self):
-        content = b"cached HD bytes"
-        sha = hashlib.sha256(content).hexdigest()
-        with tempfile.TemporaryDirectory() as directory:
-            package = self._package(
-                directory,
-                {CACHED_OWNER: content},
-                [cached_component(sha)],
-                extra_raw={"source_selection": cached_carrier(sha)},
-            )
-            report = verify_discovery(package)
-        check = self._check(report)
-        self.assertTrue(check["passed"], check["details"])
-        self.assertEqual(check["details"].get("cached_materializations"), 1)
-
-    def test_cached_materialization_requires_the_exact_carrier_evidence(self):
-        content = b"cached HD bytes"
-        sha = hashlib.sha256(content).hexdigest()
-        cases = {
-            "absent_carrier": (
-                cached_component(sha),
-                None,
-                "no sealed cached materialization matches",
-            ),
-            "owner_sha_mismatch": (
-                cached_component("f" * 64),
-                cached_carrier(sha),
-                "not bound to the sealed selection",
-            ),
-            "external_materialization": (
-                cached_component(sha, source_provenance=cached_provenance(sha, materialization_path=CACHED_AUTHOR)),
-                cached_carrier(sha),
-                "not a session temp materialization",
-            ),
-            "outside_temp_root": (
-                cached_component(
-                    sha,
-                    source_provenance=cached_provenance(
-                        sha, materialization_path=r"C:\other\swx00000\IC~~\bracket_a.stp.SLDASM"
-                    ),
-                ),
-                cached_carrier(sha),
-                "outside its recorded owned session temp root",
-            ),
-            "missing_temp_root": (
-                cached_component(sha, source_provenance=cached_provenance(sha, session_temp_root=None)),
-                cached_carrier(sha),
-                "carries no owned session temp root",
-            ),
-            "missing_owner": (
-                cached_component(sha, source_provenance=cached_provenance(sha, owner=None)),
-                cached_carrier(sha),
-                "names no ultimate owner",
-            ),
-            "occurrence_mismatch": (
-                cached_component(sha, source_provenance=cached_provenance(sha, occurrence="other-1")),
-                cached_carrier(sha),
-                "no sealed cached materialization matches",
-            ),
-            "configuration_mismatch": (
-                cached_component(sha),
-                cached_carrier(sha, imports=[cached_slot(sha, configuration="Other")]),
-                "no sealed cached materialization matches",
-            ),
-            "anchor_mismatch": (
-                cached_component(sha, source_provenance=cached_provenance(sha, defining_anchor="HD-...-21")),
-                cached_carrier(sha),
-                "no sealed cached materialization matches",
-            ),
-            "author_mismatch": (
-                cached_component(sha, source_provenance=cached_provenance(sha, author_imported_path=r"D:\other.stp")),
-                cached_carrier(sha),
-                "no sealed cached materialization matches",
-            ),
-            "unproven_owner_bytes": (
-                cached_component(sha, source_provenance=cached_provenance(sha, owner_sha256=None)),
-                cached_carrier(sha),
-                "owner bytes are unproven",
-            ),
-            "session_pid_mismatch": (
-                cached_component(sha, source_provenance=cached_provenance(sha, native_api_pid=99999)),
-                cached_carrier(sha),
-                "root does not match its native API session",
-            ),
-        }
-        for label, (component, carrier, token) in cases.items():
-            with self.subTest(case=label):
-                with tempfile.TemporaryDirectory() as directory:
-                    extra = {"source_selection": carrier} if carrier is not None else {}
-                    package = self._package(directory, {CACHED_OWNER: content}, [component], extra_raw=extra)
-                    report = verify_discovery(package)
-                detail = self._unbound(report)["detail"]
-                self.assertEqual(detail["unbound"], 1, detail)
-                self.assertIn(token, detail["samples"][0]["reason"])
-
-    def test_cached_materialization_coverage_is_two_sided(self):
-        content = b"cached HD bytes"
-        sha = hashlib.sha256(content).hexdigest()
-        carrier = cached_carrier(sha, imports=[cached_slot(sha), cached_slot(sha, occurrence="other-1")])
-        with tempfile.TemporaryDirectory() as directory:
-            package = self._package(
-                directory,
-                {CACHED_OWNER: content},
-                [cached_component(sha)],
-                extra_raw={"source_selection": carrier},
-            )
-            report = verify_discovery(package)
-        error = self._unbound(report)
-        self.assertEqual(error["detail"]["unmatched_count"], 1)
 
     def test_embedded_virtual_component_is_accepted_through_the_sealed_carrier(self):
         content = b"virtual owner bytes"
@@ -1002,91 +791,6 @@ class ImportedSourceTests(unittest.TestCase):
             report = verify_discovery(package)
         error = self._unbound(report)
         self.assertIn("defining anchor", error["detail"]["samples"][0]["reason"])
-
-    def test_relocated_in_root_author_source_matches_by_relative_name_and_bytes(self):
-        owner_bytes, np_bytes = b"cached HD bytes", b"NP bytes"
-        owner_sha = hashlib.sha256(owner_bytes).hexdigest()
-        np_sha = hashlib.sha256(np_bytes).hexdigest()
-        with tempfile.TemporaryDirectory() as directory:
-            package = self._package(
-                directory,
-                {CACHED_OWNER: owner_bytes, NP_RELATIVE: np_bytes},
-                [relocated_component(owner_sha)],
-                raw_files={CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha},
-                extra_raw={"source_selection": relocated_carrier(owner_sha, np_sha)},
-            )
-            report = verify_discovery(package)
-        check = self._check(report)
-        self.assertTrue(check["passed"], check["details"])
-
-        cases = {
-            "substituted_relative": lambda component, carrier, files: component["source_provenance"].update(
-                author_imported_relative="other.step"
-            ),
-            "substituted_bound_source": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
-                bound_source="other.step"
-            ),
-            "author_outside_root": lambda component, carrier, files: component["source_provenance"].update(
-                author_imported_path=r"D:\elsewhere\imported_part.step"
-            ),
-            "slot_not_in_stage": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
-                author_metadata_in_stage=False
-            ),
-            "slot_author_outside_stage": lambda component, carrier, files: carrier["closure"]["imports"][0].update(
-                author_imported_path=r"C:\elsewhere\imported_part.step"
-            ),
-        }
-        for label, mutate in cases.items():
-            with self.subTest(case=label):
-                component = relocated_component(owner_sha)
-                carrier = relocated_carrier(owner_sha, np_sha)
-                raw_files = {CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha}
-                mutate(component, carrier, raw_files)
-                with tempfile.TemporaryDirectory() as directory:
-                    package = self._package(
-                        directory,
-                        {CACHED_OWNER: owner_bytes, NP_RELATIVE: np_bytes},
-                        [component],
-                        raw_files=raw_files,
-                        extra_raw={"source_selection": carrier},
-                    )
-                    report = verify_discovery(package)
-                self.assertFalse(self._check(report)["passed"], label)
-
-        # A recorded bound source whose frozen bytes differ from the sealed source refuses.
-        with tempfile.TemporaryDirectory() as directory:
-            package = self._package(
-                directory,
-                {CACHED_OWNER: owner_bytes, NP_RELATIVE: b"different NP bytes"},
-                [relocated_component(owner_sha)],
-                raw_files={CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha},
-                extra_raw={"source_selection": relocated_carrier(owner_sha, np_sha)},
-            )
-            report = verify_discovery(package)
-        self.assertFalse(self._check(report)["passed"], "file_bytes_mismatch")
-
-        for label, mutate in {
-            "retained_source_missing_from_raw": lambda files: files.pop(NP_RELATIVE, None),
-            "retained_source_hash_mutated": lambda files: files.update({NP_RELATIVE: "f" * 64}),
-        }.items():
-            with self.subTest(case=label):
-                raw_files = {CACHED_OWNER: owner_sha, NP_RELATIVE: np_sha}
-                mutate(raw_files)
-                with tempfile.TemporaryDirectory() as directory:
-                    package = self._package(
-                        directory,
-                        {CACHED_OWNER: owner_bytes, NP_RELATIVE: np_bytes},
-                        [relocated_component(owner_sha)],
-                        raw_files=raw_files,
-                        extra_raw={"source_selection": relocated_carrier(owner_sha, np_sha)},
-                    )
-                    report = verify_discovery(package)
-                failed = [
-                    item for item in report["checks"] if item["id"] == "discovery.selection" and not item["passed"]
-                ]
-                self.assertTrue(failed, label)
-                self.assertIn("not bound by the raw record", str(failed[0]["details"]))
-
 
 if __name__ == "__main__":
     unittest.main()

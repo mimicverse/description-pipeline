@@ -1048,10 +1048,11 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         )
         get_save_calls: list = []
         robot.GetSaveFlag = lambda: (get_save_calls.append(1), False)[1]
-        robot.Extension.NeedsRebuild2 = 0
 
         class FakeApp:
-            RevisionNumber = "34.0.0"
+            @staticmethod
+            def RevisionNumber():
+                return "34.0.0"
 
             def __init__(self):
                 self.folders = ""
@@ -1122,7 +1123,6 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         state = readings["document_state"]
         self.assertEqual(state["before"]["save_flag"], False)
         self.assertEqual(state["after"]["save_flag"], False)
-        self.assertEqual(state["before"]["needs_rebuild2_value"], 0)
         self.assertEqual(state["after"]["configuration"], "默认")
         self.assertEqual(state["before"]["read_only"], True)
         self.assertIn("used_api", state)
@@ -1176,7 +1176,9 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         )
 
         class FakeApp:
-            RevisionNumber = "34.0.0"
+            @staticmethod
+            def RevisionNumber():
+                return "34.0.0"
 
             def __init__(self):
                 self.folders = ""

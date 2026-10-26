@@ -7,6 +7,7 @@ already verified identities and observations.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -71,9 +72,11 @@ from ..schemas import (
     DIAGNOSTIC_ADMISSION_SCHEMA,
     DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
     RUN_ADMISSION_SCHEMA,
+    RUN_ACTIVITY_SCHEMA,
     STAGE_EFFECT_WAIT_SCHEMA,
     STAGE_COMMAND_SCHEMA,
 )
+from ..stages import ACTIVITY_HISTORY_LIMIT, merge_activity, normalize_activity
 
 # Transaction locks are keyed by (namespace, hashtext(identity)). A hash collision can
 # only serialize unrelated operations, never permit two owners. Callers acquire command
@@ -83,6 +86,16 @@ _ADVISORY_RUN = 1
 _ADVISORY_COMMAND = 2
 _ADVISORY_EFFECT_LEDGER = 3
 _ADVISORY_EFFECT = 4
+
+
+def _encoded_run_activity(activity: Mapping[str, object]) -> str:
+    return json.dumps(
+        activity,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class FactStoreError(PipelineError):
@@ -550,6 +563,147 @@ class RunControlStore(AdmissionControlStore):
             )
             row = cursor.fetchone()
         return RunDisplayMetadata(*row) if row is not None else None
+
+    def record_run_activity(
+        self,
+        run_id: str,
+        operation_id: str,
+        activity: Mapping[str, object] | None,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        """Merge one display-only native activity observation into its run."""
+
+        self._require_run_id(run_id)
+        if not isinstance(activity, Mapping):
+            return
+        if (
+            not isinstance(operation_id, str)
+            or not operation_id
+            or len(operation_id) > 128
+            or "\x00" in operation_id
+        ):
+            raise FactStoreError("The native operation identity is invalid")
+        record = dict(activity)
+        sequence = record.get("seq")
+        if type(sequence) is not int or sequence <= 0:
+            raise FactStoreError("The run activity sequence is invalid")
+        observed_at = record.get("at")
+        if not isinstance(observed_at, str) or not observed_at:
+            raise FactStoreError("The run activity timestamp is invalid")
+        try:
+            parsed_at = datetime.fromisoformat(observed_at)
+        except ValueError as error:
+            raise FactStoreError("The run activity timestamp is invalid") from error
+        if parsed_at.tzinfo is None:
+            raise FactStoreError("The run activity timestamp must carry a timezone")
+        normalized = normalize_activity(
+            {
+                key: value
+                for key, value in record.items()
+                if key not in {"seq", "at"}
+            }
+        )
+        if normalized is None:
+            raise FactStoreError("The run activity record is invalid")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT 1 FROM run_admission WHERE run_id = %s FOR SHARE",
+                (run_id,),
+            )
+            if cursor.fetchone() is None:
+                raise RunNotAdmittedError("The run is not admitted")
+            cursor.execute(
+                """
+                INSERT INTO run_display_metadata (
+                    run_id, display_name, hidden_at, hidden_reason, updated_at
+                )
+                SELECT run_id, NULL, NULL, NULL, now()
+                FROM run_admission
+                WHERE run_id = %s
+                ON CONFLICT (run_id) DO NOTHING
+                """,
+                (run_id,),
+            )
+            cursor.execute(
+                "SELECT activity FROM run_display_metadata "
+                "WHERE run_id = %s FOR UPDATE",
+                (run_id,),
+            )
+            row = cursor.fetchone()
+            previous = row[0] if row is not None and isinstance(row[0], Mapping) else {}
+            same_operation = (
+                previous.get("schema_version") == RUN_ACTIVITY_SCHEMA
+                and previous.get("operation_id") == operation_id
+            )
+            previous_source_seq = previous.get("source_seq")
+            previous_current = (
+                previous.get("current") if isinstance(previous.get("current"), dict) else None
+            )
+            if (
+                same_operation
+                and type(previous_source_seq) is int
+                and sequence <= previous_source_seq
+            ):
+                if (
+                    not terminal
+                    or isinstance(previous.get("final"), dict)
+                    or previous_current is None
+                ):
+                    return
+                projection = copy.deepcopy(previous)
+                projection["final"] = copy.deepcopy(previous_current)
+                cursor.execute(
+                    "UPDATE run_display_metadata SET activity = %s::jsonb "
+                    "WHERE run_id = %s",
+                    (_encoded_run_activity(projection), run_id),
+                )
+                return
+            if not same_operation and previous_current is not None:
+                previous_at = previous_current.get("updated_at")
+                try:
+                    previous_observed_at = datetime.fromisoformat(previous_at)
+                except (TypeError, ValueError):
+                    previous_observed_at = None
+                if (
+                    previous_observed_at is not None
+                    and previous_observed_at.tzinfo is not None
+                    and parsed_at < previous_observed_at
+                ):
+                    return
+            current, transition = merge_activity(
+                previous_current if same_operation else None,
+                normalized,
+                at=observed_at,
+            )
+            previous_history = previous.get("history")
+            history = (
+                [
+                    copy.deepcopy(item)
+                    for item in previous_history
+                    if isinstance(item, dict)
+                    and isinstance(item.get("at"), str)
+                    and isinstance(item.get("code"), str)
+                ][-ACTIVITY_HISTORY_LIMIT:]
+                if isinstance(previous_history, list)
+                else []
+            )
+            if transition is not None:
+                history = [*history, transition][-ACTIVITY_HISTORY_LIMIT:]
+            projection = {
+                "schema_version": RUN_ACTIVITY_SCHEMA,
+                "operation_id": operation_id,
+                "source_seq": sequence,
+                "current": current,
+                "history": history,
+                "final": copy.deepcopy(current) if terminal else None,
+            }
+            cursor.execute(
+                "UPDATE run_display_metadata SET activity = %s::jsonb "
+                "WHERE run_id = %s",
+                (_encoded_run_activity(projection), run_id),
+            )
 
     def rename_run(self, run_id: str, display_name: str | None) -> RunDisplayMetadata:
         self._require_run_id(run_id)

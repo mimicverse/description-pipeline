@@ -13,22 +13,19 @@ ENGINEERING_MODEL_SCHEMA = "solidworks-to-urdf.engineering-model/v1"
 TOOL_SCHEMA = "solidworks-to-urdf.tool/v1"
 EFFECTIVE_INSTANCES_SCHEMA = "solidworks-to-urdf.effective-instances/v1"
 LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
-NATIVE_TESSELLATION_SCHEMA = "solidworks-to-urdf.native-tessellation/v13"
-NATIVE_ID_ARRAY_SOURCE_FLAT = "native-flat-array"
-NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO = (
-    "native-body-global-null-zero"
-)
-NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO = (
-    "native-incident-faces-null-zero"
-)
-NATIVE_FACETLESS_EVIDENCE_API = (
-    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets/"
-    "GetFacetFins/GetEdgeFins/GetFacetCount/GetFinCount"
-)
-NATIVE_MESH_CAPTURE_API = (
-    "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets/"
-    "GetFacetFins/GetEdgeFins/GetFinVertices/GetVertexPoint/"
-    "GetFacetCount/GetFinCount/GetVertexCount"
+NATIVE_TESSELLATION_SCHEMA = "native-triangles/v1"
+NATIVE_TRIANGLE_STREAM_VERSION = 1
+NATIVE_TRIANGLE_STREAM_MAGIC = b"SWTESS64        "
+NATIVE_CAPTURE_FACTS_KEYS = frozenset(
+    {
+        "scene_raw",
+        "part_mass_raw",
+        "assembly_mass_raw",
+        "component_mass_raw",
+        "link_group_mass_raw",
+        "source_scopes",
+        "notes",
+    }
 )
 NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
 NATIVE_DISCOVERY_FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
@@ -78,9 +75,10 @@ EFFECT_RECONCILIATION_SCHEMA = "solidworks-to-urdf.effect-reconciliation/v1"
 EFFECT_RECONCILIATION_FAILURE_SCHEMA = "solidworks-to-urdf.effect-reconciliation-failure/v1"
 NATIVE_CAPTURE_OPERATION_SCHEMA = "solidworks-to-urdf.native-capture-operation/v1"
 NATIVE_OPERATION_REQUEST_SCHEMA = "solidworks-to-urdf.native-operation-request/v2"
-NATIVE_OPERATION_VIEW_SCHEMA = "solidworks-to-urdf.native-operation-view/v2"
+NATIVE_OPERATION_VIEW_SCHEMA = "solidworks-to-urdf.native-operation-view/v3"
 NATIVE_OPERATION_OBSERVATION_SCHEMA = "solidworks-to-urdf.native-operation-observation/v1"
 NATIVE_OPERATION_IDENTITY_SCHEMA = "solidworks-to-urdf.native-operation-identity/v1"
+RUN_ACTIVITY_SCHEMA = "solidworks-to-urdf.run-activity/v1"
 CANCEL_REQUEST_SCHEMA = "solidworks-to-urdf.cancel-request/v1"
 OPERATION_CANCEL_EFFECT_SCHEMA = "solidworks-to-urdf.operation-cancel-effect/v1"
 PRODUCTION_ADMISSION_INTENT_SCHEMA = "solidworks-to-urdf.production-admission-intent/v1"

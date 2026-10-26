@@ -218,9 +218,15 @@ class MeshAssetReuseTests(unittest.TestCase):
                 ["meshes/visual/a.stl", "meshes/visual/a.stl", "meshes/visual/b.stl"],
             )
             self.assertEqual(result, {"meshes": 2, "references": 3})
-            with self.assertRaisesRegex(PipelineError, "Unused or multiply"):
+            with self.assertRaisesRegex(
+                PipelineError,
+                "Delivery mesh asset set differs from referenced meshes",
+            ):
                 solidworks_urdf._assets(root, ["meshes/visual/a.stl", "meshes/visual/a.stl"])
-            with self.assertRaisesRegex(PipelineError, "Unused or multiply"):
+            with self.assertRaisesRegex(
+                PipelineError,
+                "Delivery mesh asset set differs from referenced meshes",
+            ):
                 solidworks_urdf._assets(
                     root,
                     ["meshes/visual/a.stl", "meshes/visual/b.stl", "meshes/visual/missing.stl"],

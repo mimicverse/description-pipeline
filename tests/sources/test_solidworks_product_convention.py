@@ -17,14 +17,13 @@ import numpy as np
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
-from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
 
 from . import support  # noqa: E402
 
 
 def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
-    return _freeze(support.capture_requests(config), *args, **kwargs)
+    return support.capture_prepared_fixture(config, *args, **kwargs)
 
 
 def _Backend(document, components, **kwargs):  # fixture plumbing: supported native datum names
@@ -139,7 +138,7 @@ class ProductConventionTests(unittest.TestCase):
             "assembly": str(self.assembly),
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
-            "geometry": {"enabled": False},
+            "geometry": {"enabled": True},
             "coordinate_systems": ["CS_base_link"],
             "bodies": [
                 {

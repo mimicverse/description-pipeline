@@ -1914,17 +1914,6 @@ class PortalTests(unittest.TestCase):
                     "details": {"passed": True},
                 },
             },
-            {
-                "stage": "capture",
-                "state": "running",
-                "at": "2026-10-19T18:49:41Z",
-                "check": {
-                    "id": "runtime.ready",
-                    "boundary": "input",
-                    "state": "passed",
-                    "details": {"passed": True},
-                },
-            },
             {"stage": "capture", "state": "failed", "at": "2026-10-19T18:49:35Z"},
             {"stage": "generate", "state": "blocked", "at": "2026-10-19T18:49:41Z"},
             {"stage": "verify", "state": "blocked", "at": "2026-10-19T18:49:41Z"},

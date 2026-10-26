@@ -2,7 +2,7 @@
 
 部署由一台 Linux 平台主机和一个串行 Windows 原生执行端组成。用户仅访问一个 HTTPS 操作台；Airflow、数据库、内部 API 和原生端点不直接向用户开放。
 
-Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
+Linux 承担平台编排、工程模型与 URDF 生成、独立验证、报告和发布。Windows 运行原生 CAD 读取，并在释放 CAD 后完成当前 Capture 的原值投影、惯量规范化、raw/STL 序列化与证据封包；这部分不再占用 CAD 会话，但仍使用 Windows 主机，不能宣称全部可移植计算已迁到 Linux。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
 
 ## 开发与发行链路
 
@@ -16,7 +16,7 @@ Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖
 
 `description-pipeline` 与 `description` 仓库向 `main` 的合并只由当前设计总师根会话执行；实现总工和 workers 不得合并、直接推送 `main` 或开启自动合并。设计审核通过不转授合并权限。开发分支或 PR head 的隔离测试产物不得作为正式发行或部署包；禁止先发布后补合并及线上补拷代码绕过此流程。构建成功、组件测试、服务健康和手动导出不能替代真实端到端验收。
 
-本次真实端到端须保留与固定手工参考的方向对比，但仅方向符号不一致不阻塞发行、部署或验收；实际驱动／编码器正向未建立时如实显示未验证资格及 warning。CAD 轴向、对象绑定、坐标转换、原生运动或来源审计的真实缺陷，以及命名、限位和其他必需检查仍阻塞。不能把该非阻塞条款扩大为免除独立 CAD 验证、同版双端身份核验或真实端到端运行，也不能以手工符号替代生产输入。
+历史参考的方向对比仅用于独立参考测试，不进入生产或发布必经链；实际驱动／编码器正向未建立时如实显示未验证资格及 warning。CAD 轴向、对象绑定、坐标转换、原生运动或来源审计的真实缺陷，以及命名、限位和其他必需检查仍阻塞。不能把该非阻塞条款扩大为免除独立 CAD 验证、同版双端身份核验或真实端到端运行，也不能以手工符号替代生产输入。
 
 ## 主机准备
 
@@ -109,17 +109,29 @@ spec target；已存在 request 的重试先复用封存 Spec，不读取 later 
 
 Windows 端点的新 generation 只使用解释器入口 `runtime\Scripts\python.exe`，参数固定为
 `-I -B -m description_pipeline.orchestration.windows serve --config "<generation>\endpoint.json"`；
-其中 `-B` 禁止解释器向受管 generation 写入字节码缓存。stage receipt 必须声明
-`launch_contract=python_module_v1`，promote 必须拒绝缺失或不同契约的候选。为完成从
-已部署 `140d39e5` generation 的一次性安全迁移，验证只可接受该固定 source commit
-与 version 1.5.0 的精确旧形式
-`-I -m description_pipeline serve --config "<generation>\endpoint.json"`；该兼容
-不得扩展到新 generation、其他来源或其他 action。不得依赖 pip 生成的
-`description.exe` launcher；该 launcher 的代码完整性身份可能被主机 Device
-Guard/WDAC 策略拒绝，不能通过关闭策略、添加例外或复制旧可执行文件绕过。为完成从
-更早 generation 的一次性安全回滚，恢复只可接受无该契约历史 generation 的精确
-`description.exe + serve --config "<generation>\endpoint.json"` 形式，并须记录
-`legacy_pip_launcher_v0`；该过渡形式不得用于新 stage 或 promote。
+其中 `-B` 禁止解释器向受管 generation 写入字节码缓存。新目标的配置、发行身份和任务定义
+必须与当前 stage 记录一致，不接受替代启动方式。不得依赖 pip 生成的 `description.exe`
+launcher，也不得通过关闭 Device Guard/WDAC、添加例外或复制旧可执行文件绕过策略。
+
+当前受管实例的所有权与新目标的启动断言分开核验。既有任务须绑定精确 task name/path、
+唯一 action、受管服务账户和 ACL、同一 generation 的解释器与 `endpoint.json`、工作目录、
+安装与发行身份，以及即时进程和监听端点。不能仅因当前实例的启动串不同于新目标而拒绝
+既有受管对象，也不能接管外来任务、忽略身份冲突或把 UNKNOWN 当作已完成。
+
+在 Stop 或任何替换之前，先持久封存当前原始 task XML、配置、身份、必要权限与 pin、
+摘要和操作意图，再统一安装唯一目标状态。封存 `source-state.json` 后，以其原始字节
+SHA 绑定同一 `previous`／当前 target 的 pending 与成功 promotion receipt；外部
+rollback 必须命中该既有操作记录，缺失或冲突一律拒绝。失败恢复只使用本次绑定的封存源状态；恢复任务
+按原始 XML 的安全语义和实际旧端点身份核验，不套用新目标的启动串，也不按历史版本
+枚举兼容形式。Reader 在首次 mutation 前校验 receipt authority、XML 原件摘要、配置
+摘要、任务归属、生命周期边界及可取得的 runtime／release／install 身份；恢复直接向
+受管 Task API 提交原件，再读回核验实际 principal/action、settings、triggers、ACL
+及旧端点健康身份。导出格式差异不放宽这些必需语义，也不宣称已对每个 XML 字段独立
+复算等价。Rollback 恢复旧失败时，使用 mutation 前已保全的 current snapshot 与同一
+authority 恢复当前端点，不生成另一套回填摘要的日志。Windows
+统一解释任务和运行状态，Linux operator 只消费源／目标身份明确的
+结构化事实；status、health、reconcile、rollback、backup 和 restore 共用此边界。
+排空、维护锁、租约、不可变发行归档与 UNKNOWN 对账能力继续有效。
 
 Windows 的 canonical release archive 是不可变 lifecycle 输入，不进入可变 recovery snapshot/state。恢复只重建 runtime、配置和任务身份；archive 缺失、摘要漂移或 ReadOnly/protected ACL 不成立时必须从同一固定 release 重建并重新 stage，promote/rollback 复用前重新核验 ReadOnly、受保护 ACL 与摘要，不能静默恢复成可写归档。
 
@@ -240,7 +252,7 @@ start、stop、health 和 recovery。triggerer 缺失、版本不符、未运行
    生产身份与同一 SourceSet 原件血缘一致；SourceSet 与 prepared 保持不同摘要。两个
    operation 可以独立传输和物化，单 runtime/CAD owner 与 operation-local workspace
    不变；不得新增跨 operation source cache 或把内容复用当作工程资格。
-3. Linux 推导、生成、验证、报告与发布不调用 Windows；验证/发布重跑不创建 CAD 操作，Windows 安装不包含可移植运行依赖。
+3. Linux 推导、生成、验证、报告与发布不调用 Windows；验证/发布重跑不创建 CAD 操作，Windows 安装不包含可移植运行依赖。 外观验收须用本次原生事实证明实际交付面的对象、状态、RGBA 与无损分组；覆盖完整 public-QI 分类、Part face 到 body/feature 的原生归属、合法共享 identity/fragments，以及缺失、分歧和接口不兼容的拒绝。零参 COM 方法须按方法调用，live handle 不得进入深复制或封存事实。验证原生 activity 经既有 poll 到 Portal 的真实显示，activity 与阶段资格分别核验。隔离 Capture 与 Linux transfer 通过不能代替正式 Freeze 开始的六阶段验收。
 4. 同时提交、重复请求、断连与重启保持幂等；在全新进程中从已登记 command 和封存
    artifact 重建 workspace，不依赖前一阶段内存、缓存或临时目录。native operation
    串行，未知 CAD 会话被拒绝且不被访问或终止。
@@ -286,23 +298,19 @@ start、stop、health 和 recovery。triggerer 缺失、版本不符、未运行
     target 不 admit、不 create、不启动 executor，原 operation 保持未决。另证明
     `ready=false` 或 `unresolved>0` 不封锁只读观察、对账和恢复，且 same tool、平台
     origin claim、native worker owner 与 install target 分别核验。
-11. 使用 root-approved `native-tessellation/v13` source 验证一次 whole-body analysis
-    tessellation：唯一 `IBody2.GetTessellation` 请求恰有一个显式
-    `VARIANT(VT_EMPTY, None)`，参数数量、VARIANT 类型和空值均被独立复核；六个严格属性
-    均在唯一 `Tessellate` 前设置并逐 body 回读，
-    `ImprovedQuality` 只请求一次，`NeedErrorList` 的五项 byref VARIANT 和不支持接口的
-    诊断行为符合合同。`Tessellate=false` 必须在 `GetFaceFacets` 前失败，失败后零计数
-    或 `null` 不得成为空几何；独立 consumer 复算六属性及失败证据。
-12. 注入 `GetFaceFacets=None`、`GetEdgeFins=None`、直接空数组、重复/嵌套/标量 ID、
-    跨 face 重叠、facet/fin 总量不足或超出、错误 incident ownership、solid body 与
-    COM 读取失败：只有严格 sheet body、完整 face/facet/fin 集合闭合成立时才接受派生空
-    set，并核对原始 nullable、`raw/source_scopes`、typed 对象身份、具体 rule 和
-    `cad_face_facet_ids_derived_by_body_global_closure` /
-    `cad_edge_fin_ids_derived_by_empty_incident_faces` warning。其余情况全部拒绝。
+11. 使用固定候选的真实生产方法验证 `native-triangles/v1`：从 occurrence/body/face
+    的原生返回读取 raw 三角形、实际 placement、物性与基准值，证明 CAD 释放先于
+    离线投影、STL 序列化和封包。质量、质心及两种参考点的惯量须从同一实际原生
+    物性对象读取；测试不得用 support fixture 预填缺失原值来替代生产读取。
+12. 注入原生读取失败、原始矩阵和惯量缺失或篡改、非法数量、截断/尾随字节、非有限
+    三角形、错误 occurrence/configuration/source scope、face span 遗漏或重叠、
+    错误 placement 和 STL 派生字节。独立 consumer 必须从 raw 复算并拒绝，保留
+    primary 错误及 partial facts；正例覆盖合法原生读取、释放后的离线转换和原值复核。
+    raw/STL 一致性不替代当前 CAD 的独立工程验证。
 
 保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
-验收固定同一个已合入受保护 `main` 的提交。CI 的必需门包含锁定 Airflow 环境中的真实普通操作员提交/调度及发行完整性；模拟端点只覆盖运输与失败阻断。发布完整发行后，校验资产摘要并在两端按同一版本 stage/promote，不对活动发行目录补拷源码或脚本。最终记录绑定源码提交、发行清单、双端安装/配置、原始工程清单、运行、六阶段收据、独立报告、实际 URDF 预览和模型 PR。当前模型仓库为 `mimicverse/description`，集成 base 为 `main`；手工与历史 PR 不参与工程生成；本次正式产物还须按用户要求完成与固定手工版的对比，纯方向符号差异作为非阻塞项保留，其余一致性要求不变。参考结果不能代替 CAD、独立验证和真实端到端的必需门。
+验收固定同一个已合入受保护 `main` 的提交。CI 的必需门包含锁定 Airflow 环境中的真实普通操作员提交/调度及发行完整性；模拟端点只覆盖运输与失败阻断。发布完整发行后，校验资产摘要并在两端按同一版本 stage/promote，不对活动发行目录补拷源码或脚本。最终记录绑定源码提交、发行清单、双端安装/配置、原始工程清单、运行、六阶段收据、独立报告、实际 URDF 预览和模型 PR。当前模型仓库为 `mimicverse/description`，集成 base 为 `main`；手工与历史 PR 不参与工程生成；历史手工版仅进入独立参考单元测试和回归测试，不作为生产值来源、验证真值或正式发布必经输入。参考测试按语义区分合法表示与真实工程回归；正式验收仍依当前 CAD、独立验证和真实端到端的必需门。
 
 正式入口须验证普通操作员的必选目标及多行说明，并用浏览器实际加载绑定交付的 URDF/网格、执行关节交互。生成后自动显示预览；独立验证未通过时只提供明确标注的未验证诊断预览，不能使用通过绿标。页面阶段、检查计数和资格与同一封存结果一致。验收中的待执行项保持待执行，不因服务健康或历史运行通过而封板。
 
@@ -324,8 +332,7 @@ Airflow trigger。实际 Freeze task 只绑定启动后的真实 task context，
 方向验收绑定本次 CAD、规则版本、固定代码提交及实际交付：先核对全部关节的原值、作者声明绑定、必要坐标转换和未解决项，再通过门户预览执行有效范围内的非零运动，验证 CAD 运动语义、零位及范围的一致性。当前不发布基于右手定则或功能动作的新正向推导规则，历史试算不作为通过证据。必须注入共享 `status=local_class_aligned` 而作者正向证据仍缺失的负例，证明 Discovery、Generate、独立验证、模型来源、URDF、报告、预览和 PR 均保留同一
 `direction.semantics_unresolved` warning；同时核对 axis／xyz／rpy／limits、封存
 Capture bytes 和 `machine_qualification` 不受 warning 影响。生成与独立工程验证只取得
-CAD 和规则输入，固定手工参考由最终对比单独读取，并保留参考不可访问及扰动反例。方向与
-手工参考的纯符号差异不阻塞发布；未解决的命名、范围或其他真实一致性缺陷，以及 CAD
+CAD 和规则输入；固定手工参考仅由独立参考测试读取，测试覆盖缺失、错误版本与扰动反例，不进入实际生产或发布必经链。未解决的命名、范围或其他真实一致性缺陷，以及 CAD
 轴向、坐标转换和原生运动错误仍阻塞。不得以试算、旧运行或健康状态替代发布验收。
 
 <a id="lifecycle"></a>

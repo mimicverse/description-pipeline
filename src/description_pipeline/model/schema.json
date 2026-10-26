@@ -144,6 +144,41 @@
                 "mesh_name": {
                   "type": "string"
                 },
+                "mesh_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "face_references": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "minItems": 1,
+                  "uniqueItems": true
+                },
+                "triangle_ranges": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "triangle_start": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "triangle_count": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "triangle_start",
+                      "triangle_count"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "minItems": 1
+                },
                 "scale": {
                   "type": "array",
                   "items": {
@@ -293,6 +328,41 @@
                 },
                 "mesh_name": {
                   "type": "string"
+                },
+                "mesh_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "face_references": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "minItems": 1,
+                  "uniqueItems": true
+                },
+                "triangle_ranges": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "triangle_start": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "triangle_count": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "triangle_start",
+                      "triangle_count"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "minItems": 1
                 },
                 "scale": {
                   "type": "array",

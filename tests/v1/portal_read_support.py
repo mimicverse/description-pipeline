@@ -478,7 +478,6 @@ class RegisteredPlatform:
                 run_id=run_id,
             )
         )
-        handoff = read_data(capture / "input/handoff.json")
         source = read_data(capture / "input/source.json")
         self.stage(
             run_id,
@@ -497,7 +496,6 @@ class RegisteredPlatform:
                     capture / "reports/native-tool.json"
                 ),
                 "native_prepared_dir": "C:\\fixture\\prepared",
-                "native_prepared_files": dict(handoff["package_files"]),
             },
         )
         return capture

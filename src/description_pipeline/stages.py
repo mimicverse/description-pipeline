@@ -141,6 +141,7 @@ def publication_succeeded(submission, subject) -> bool:
 #: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
 FIXED_REQUIRED_CHECKS = frozenset(
     {
+        "appearance.native",
         "bundle.subject",
         "input.valid",
         "source.native_discovery",
@@ -400,6 +401,8 @@ def activity_view(job) -> dict:
             view["counts"] = counts
 
     final = job.get("activity_final") if isinstance(job.get("activity_final"), dict) else None
+    if final is None and isinstance(job.get("activity"), dict):
+        final = job["activity"]
     if status in {"passed", "failed", "native_complete"}:
         view["state"] = "finished"
         if final is not None or view["recent"]:

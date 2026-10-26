@@ -10,22 +10,14 @@ import json
 import re
 from pathlib import Path
 
-from .geometry.native_u import (
-    NATIVE_EDGE_FIN_IDS_DERIVED,
-    NATIVE_FACE_FACET_IDS_DERIVED,
+from .geometry.native_scope import (
+    NATIVE_GATE_WARNING_CODES,
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_scope_warning_details_match,
+    native_gate_warning_details_match,
     native_scope_warning_diagnostic_is_valid,
 )
-from .geometry.native_tessellation import parse_native_tessellation
 from .io import PipelineError, file_digest, read_data, write_json
-from .schemas import (
-    EFFECTIVE_INSTANCES_SCHEMA,
-    NATIVE_FACETLESS_EVIDENCE_API,
-    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
-    NATIVE_ID_ARRAY_SOURCE_FLAT,
-    NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO,
-)
+from .schemas import EFFECTIVE_INSTANCES_SCHEMA
 
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
@@ -264,199 +256,6 @@ def _canonical_effective_warnings(value) -> list | None:
     return warnings
 
 
-def _canonical_untessellated_faces(
-    value,
-) -> list | None:
-    """The canonical ``no_facets_faces`` rows of ``raw/geometry.json``, or ``None``.
-
-    The file is a list of per-component entries; each row is returned with its
-    component attached so the warning can name it.  Any schema deviation fails
-    closed.  Exactly two row shapes pass, mirroring the verification gate: the
-    proven-probe row (boolean ``tessellate_result`` with ``facet_count`` 0) and
-    the degenerate fallback row (no ``facet_count`` and no ``tessellate_result``;
-    a persistent ``com_error`` probe record) admitted only up to the same
-    numerically-zero area bound (1e-12 m2).  No area claim is derived anywhere.
-    """
-
-    import math
-
-    if not isinstance(value, list):
-        return None
-    pinned_api = NATIVE_FACETLESS_EVIDENCE_API
-    out: list[dict] = []
-    for entry in value:
-        if not isinstance(entry, dict):
-            return None
-        if any(key not in entry for key in ("component", "triangles", "bodies", "tessellation")):
-            return None
-        component = entry.get("component")
-        bodies = entry.get("bodies")
-        tessellation = entry.get("tessellation")
-        if not isinstance(component, str) or not component.strip():
-            return None
-        if not isinstance(bodies, dict) or not isinstance(tessellation, dict):
-            return None
-        for key in ("solid", "sheet"):
-            count = bodies.get(key)
-            if type(count) is not int or count < 0:
-                return None
-        try:
-            spans = parse_native_tessellation(
-                component,
-                tessellation,
-                bodies,
-                entry.get("triangles"),
-                native_fin_resolutions=[],
-                native_identity_warnings=[],
-            )
-        except PipelineError:
-            return None
-        faces = tessellation.get("faces")
-        if type(faces) is not int or faces < 0:
-            return None
-        face_evidence = {
-            (
-                body["body_type"],
-                body["body_index"],
-                face["face_index"],
-            ): face
-            for body in tessellation["itessellation"]["bodies"]
-            for face in body["faces"]
-        }
-        edge_evidence = {
-            (
-                edge["body_type"],
-                edge["body_index"],
-                edge["edge_reference_sha256"],
-            ): edge
-            for edge in tessellation["native_edges"]
-        }
-        rows = tessellation.get("no_facets_faces")
-        if not isinstance(rows, list):
-            return None
-        if faces <= len(rows):
-            return None
-        seen = set()
-        base = {
-            "body_type",
-            "body_index",
-            "face_index",
-            "triangle_count",
-            "area_m2",
-            "used_api",
-            "source_rule",
-            "warnings",
-            "derived_empty_edges",
-        }
-        for row in rows:
-            if not isinstance(row, dict):
-                return None
-            if set(row) not in (base | {"facet_count", "tessellate_result"}, base | {"tessellate_probe_error"}):
-                return None
-            if row.get("body_type") != 1:
-                return None
-            for key in ("body_index", "face_index"):
-                if type(row.get(key)) is not int or row[key] < 0:
-                    return None
-            if row["body_index"] >= bodies["sheet"]:
-                return None
-            if type(row.get("triangle_count")) is not int or row["triangle_count"] != 0:
-                return None
-            area = row.get("area_m2")
-            if isinstance(area, bool) or not isinstance(area, (int, float)) or not math.isfinite(area) or area < 0:
-                return None
-            if "tessellate_result" in row:
-                if type(row.get("facet_count")) is not int or row["facet_count"] != 0:
-                    return None
-                if not isinstance(row.get("tessellate_result"), bool):
-                    return None
-            else:
-                # A persistent DISP_E_EXCEPTION on a geometrically degenerate face
-                # is recorded as a probe error instead of a result: both facet_count
-                # and tessellate_result are products of the probe that failed, so
-                # this variant carries neither.  It is admissible only at
-                # numerically zero area, exactly as in the verification gate.
-                probe_error = row.get("tessellate_probe_error")
-                if not isinstance(probe_error, str) or not probe_error.startswith("com_error"):
-                    return None
-                if area > 1e-12:
-                    return None
-            if row.get("used_api") != pinned_api:
-                return None
-            key = (row["body_type"], row["body_index"], row["face_index"])
-            evidence_face = face_evidence.get(key)
-            if (
-                not isinstance(evidence_face, dict)
-                or row["source_rule"] != evidence_face["facet_ids_source"]
-                or row["warnings"] != evidence_face["warnings"]
-                or row["source_rule"]
-                not in {
-                    NATIVE_ID_ARRAY_SOURCE_FLAT,
-                    NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO,
-                }
-                or row["warnings"]
-                != (
-                    [NATIVE_FACE_FACET_IDS_DERIVED]
-                    if row["source_rule"]
-                    == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
-                    else []
-                )
-                or not isinstance(row["derived_empty_edges"], list)
-            ):
-                return None
-            derived_references = []
-            for derived in row["derived_empty_edges"]:
-                if not isinstance(derived, dict):
-                    return None
-                reference = derived.get("edge_reference_sha256")
-                edge = edge_evidence.get(
-                    (
-                        row["body_type"],
-                        row["body_index"],
-                        reference,
-                    )
-                )
-                if (
-                    set(derived)
-                    != {"edge_reference_sha256", "source_rule", "warnings"}
-                    or not isinstance(edge, dict)
-                    or row["face_index"] not in edge["face_indices"]
-                    or derived["source_rule"]
-                    != NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
-                    or derived["warnings"]
-                    != [NATIVE_EDGE_FIN_IDS_DERIVED]
-                    or edge["fin_ids_source"] != derived["source_rule"]
-                    or edge["warnings"] != derived["warnings"]
-                ):
-                    return None
-                derived_references.append(reference)
-            expected_derived_references = sorted(
-                reference
-                for (body_type, body_index, reference), edge
-                in edge_evidence.items()
-                if (
-                    body_type == row["body_type"]
-                    and body_index == row["body_index"]
-                    and row["face_index"] in edge["face_indices"]
-                    and edge["fin_ids_source"]
-                    == NATIVE_ID_ARRAY_SOURCE_INCIDENT_FACES_NULL_ZERO
-                )
-            )
-            if derived_references != expected_derived_references:
-                return None
-            if key in seen:
-                return None
-            seen.add(key)
-            out.append({"component": component, **row})
-        span_counts = {
-            (span["body_type"], span["body_index"], span["face_index"]): span["triangle_count"]
-            for span in spans
-        }
-        if set(seen) != {key for key, count in span_counts.items() if count == 0}:
-            return None
-    return out
-
-
 def _findings(value, source, *, severity=None):
     if isinstance(value, list):
         for index, entry in enumerate(value):
@@ -465,6 +264,11 @@ def _findings(value, source, *, severity=None):
     if not isinstance(value, dict):
         return
     code = value.get("code") or value.get("id")
+    if code == "geometry.native_tessellation" and (
+        value.get("passed") is True or value.get("state") == "passed"
+    ):
+        # Canonical diagnostics own display; the raw gate rows are compared below.
+        return
     message = value.get("message") or value.get("error")
     is_finding = isinstance(code, str) and (
         isinstance(message, str) or "blocking" in value or value.get("passed") is False
@@ -496,22 +300,7 @@ def _findings(value, source, *, severity=None):
         }
         detail = value.get("detail")
         if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES and isinstance(detail, dict):
-            for key in (
-                "component",
-                "entity_kind",
-                "body_type",
-                "body_index",
-                "owner_scope_key",
-                "object_indices",
-                "field",
-                "native_reference_sha256",
-                "mapping_source_part_document_sha256",
-                "mapping_source_body_reference_sha256",
-                "mapped_source_indices",
-                "mapped_source_persistent_reference_sha256",
-                "topology_signature_sha256s",
-            ):
-                finding[key] = detail.get(key)
+            finding.update(detail)
         yield finding
         return
     # Deterministic traversal: a persisted (sorted) receipt must render exactly
@@ -608,7 +397,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 if isinstance(warnings, list):
                     native_gate_warnings = warnings
                 break
-    if quality_diagnostics is not None:
+    if quality_diagnostics is not None or native_gate_passed:
         if not isinstance(quality_diagnostics, list):
             entries.append(
                 {
@@ -621,27 +410,27 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 }
             )
         else:
-            native_scope = [
+            native_warnings = [
                 item
                 for item in quality_diagnostics
                 if isinstance(item, dict)
-                and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+                and item.get("code") in NATIVE_GATE_WARNING_CODES
             ]
-            raw_scope = [
+            raw_native = [
                 item
                 for item in native_gate_warnings or []
                 if isinstance(item, dict)
-                and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+                and item.get("code") in NATIVE_GATE_WARNING_CODES
             ]
             if (
                 native_gate_passed
-                and native_gate_warnings is None
+                and not any(item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES for item in raw_native)
             ) or (
-                (native_scope or raw_scope)
+                (native_warnings or raw_native)
                 and (
                     native_gate_warnings is None
-                    or not native_scope_warning_details_match(
-                        native_scope,
+                    or not native_gate_warning_details_match(
+                        native_warnings,
                         native_gate_warnings,
                     )
                 )
@@ -652,10 +441,10 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "code": "report.native_identity_warning_invalid",
                         "object": receipt.get("main_assembly"),
                         "message": (
-                            "Native scope warning projection is incomplete or forged"
+                            "Native gate warning projection is incomplete or forged"
                         ),
                         "source": "reports/quality.json/diagnostics",
-                        "evidence": {"native_scope_warnings": native_scope},
+                        "evidence": {"native_gate_warnings": native_warnings},
                     }
                 )
     closure = ((receipt.get("selection") or {}).get("manifest") or {}).get("closure") or {}
@@ -673,35 +462,6 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 "evidence": opened,
             }
         )
-    dependency_closure = sources.get("evidence/raw/dependency_closure.json")
-    if isinstance(dependency_closure, dict):
-        # Every recorded automation issue is reported, even when it can remain a
-        # warning: evidence-covered unused stored references were never read or
-        # copied, so they are projected verbatim as warnings with their exact
-        # document/location evidence instead of disappearing into the raw record.
-        for item in dependency_closure.get("stale_stored_references") or []:
-            if not isinstance(item, dict):
-                continue
-            entries.append(
-                {
-                    "severity": "warning",
-                    "code": "native.stale_stored_reference",
-                    "object": item.get("document") or item.get("resolved_path"),
-                    "message": (
-                        "The stored SolidWorks reference is unused by the selected closure "
-                        "(it resolved to no active edge, its location may be stale, and it is outside the delivery). "
-                        "The pipeline neither read nor copied the external file; "
-                        "it only retained the recorded text and did not block generation or independent verification."
-                    ),
-                    "source": "evidence/raw/dependency_closure.json/stale_stored_references",
-                    "evidence": {
-                        "document": item.get("document"),
-                        "location": item.get("location"),
-                        "resolved_path": item.get("resolved_path"),
-                        "exists": item.get("exists"),
-                    },
-                }
-            )
     material_required = False
     effective_required = False
     geometry_required = False
@@ -834,9 +594,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 "code": "report.geometry_metadata_invalid",
                 "object": receipt.get("main_assembly"),
                 "message": (
-                    "Geometry metadata is unreadable. The evidence is invalid and independent "
-                    "verification must fail; this report applies no area tolerance or substitute "
-                    "interpretation."
+                    "Geometry evidence is unreadable, so this report cannot confirm that its "
+                    "diagnostics were retained. This is a diagnostic-completeness blocker only; "
+                    "native mesh verification owns the evidence schema and engineering result."
                 ),
                 "source": geometry_source,
                 "evidence": {"unreadable": True},
@@ -851,78 +611,15 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "object": receipt.get("main_assembly"),
                     "message": (
                         "The snapshot inventory requires geometry evidence "
-                        "(evidence/raw/geometry.json), but it is missing. The evidence is invalid "
-                        "and independent verification must fail; this report uses no defaults or "
-                        "substitute interpretation."
+                        "(evidence/raw/geometry.json), but it is missing, so the structural "
+                        "report cannot confirm that its diagnostics were retained. This is a "
+                        "diagnostic-completeness blocker only; native mesh verification owns "
+                        "the evidence schema and engineering result."
                     ),
                     "source": geometry_source,
                     "evidence": {"required_by_manifest": True},
                 }
             )
-    else:
-        untessellated = _canonical_untessellated_faces(
-            geometry,
-        )
-        if untessellated is None:
-            entries.append(
-                {
-                    "severity": "blocker",
-                    "code": "report.geometry_metadata_invalid",
-                    "object": receipt.get("main_assembly"),
-                    "message": (
-                        "Geometry metadata does not match the approved schema. The evidence is "
-                        "invalid and independent verification must fail; this report applies no area "
-                        "tolerance or substitute interpretation."
-                    ),
-                    "source": geometry_source,
-                    "evidence": {
-                        "type": type(geometry).__name__,
-                        "keys": sorted(geometry) if isinstance(geometry, dict) else None,
-                    },
-                }
-            )
-        else:
-            for row in untessellated:
-                if "tessellate_probe_error" in row:
-                    facets = (
-                        "Native tessellation returned zero triangles, and the facet probe still "
-                        "failed when retried on the degenerate geometry"
-                        f" ({row['tessellate_probe_error']})"
-                    )
-                else:
-                    facets = "native tessellation returned zero triangles and zero facets"
-                if (
-                    row["source_rule"]
-                    == NATIVE_ID_ARRAY_SOURCE_BODY_GLOBAL_NULL_ZERO
-                ):
-                    facets += (
-                        "; the successful null facet return was normalized only"
-                        " after the complete body facet inventory closed the"
-                        " native facet total"
-                    )
-                if row["derived_empty_edges"]:
-                    facets += (
-                        f"; {len(row['derived_empty_edges'])} incident sheet-edge"
-                        " fin sets were similarly derived as empty after the"
-                        " complete incident-face and global fin closure"
-                    )
-                entries.append(
-                    {
-                        "severity": "warning",
-                        "code": "cad_sheet_face_untessellated",
-                        "object": f"{row['component']} sheet body {row['body_index']} face {row['face_index']}",
-                        "message": (
-                            f"This surface (component {row['component']}; body_type 1; body_index {row['body_index']}, "
-                            f"face_index {row['face_index']}); {facets}; "
-                            f"native area is {row['area_m2']!r} m^2: CAD provided no exportable "
-                            "tessellation for the surface. This report retains the raw fact without "
-                            "claiming zero area; surface completeness and usability are not "
-                            "independently confirmed."
-                        ),
-                        "source": "evidence/raw/geometry.json/tessellation/no_facets_faces",
-                        "evidence": row,
-                    }
-                )
     material_provenance = sources.get(material_source)
     if isinstance(material_provenance, dict) and material_provenance.get("errors"):
         entries.extend(_findings(material_provenance, material_source))

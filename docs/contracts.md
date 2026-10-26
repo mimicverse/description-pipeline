@@ -7,7 +7,7 @@
 
 身份分为工程内容、执行和发布三个层次，不能相互替代。
 
-CAD 提供工程事实，版本化规则负责规范化、派生与有依据的修正。处理优先级固定为“读取并保留 CAD 原值 → 按适用规范和原生对象校验 → 沿用正确值或按确定规则校正 → 统一写出与独立复核”。CAD 已有名称、方向、坐标、零位和限位时，不能绕过原值直接另行生成；值正确则沿用，只有偏差有依据时才校正，确证缺失时才允许契约规定的推导。读取失败、无效或相互冲突不能假装缺失。原值、检查结论、适用规则、修正值及影响字段须可追溯，修正或推导值显示 warning。手工导出的 URDF、网格和历史结果不得作为生产输入或直接补值来源。按用户最新要求，固定手工版作为最终结果的一致性验收参照；自动结果须由 CAD 原值和明确规则独立生成，而非复制参考值。差异用于定位并完善有据的通用规则，不能倒填逐对象答案。允许根据当前 CAD 的对象、配置、几何和原生语义应用明确规则；不能为匹配手工结果编写逐对象例外。平台行政元数据与工程事实分别记录。
+CAD 提供工程事实，版本化规则负责规范化、派生与有依据的修正。处理优先级固定为“读取并保留 CAD 原值 → 按适用规范和原生对象校验 → 沿用正确值或按确定规则校正 → 统一写出与独立复核”。CAD 已有名称、方向、坐标、零位和限位时，不能绕过原值直接另行生成；值正确则沿用，只有偏差有依据时才校正，确证缺失时才允许契约规定的推导。读取失败、无效或相互冲突不能假装缺失。原值、检查结论、适用规则、修正值及影响字段须可追溯，修正或推导值显示 warning。手工导出的 URDF、网格和历史结果不得作为生产输入或直接补值来源。按用户 2026-10-26 最新要求，固定手工版仅作独立参考单元测试和回归测试数据，不进入生产采集、生成、验证真值或发布必经链。测试绑定适用的 CAD 原件、配置和修订，按工程语义及有依据的容差核对；不锁死 XML 排版、元素顺序、网格字节或三角形顺序，合法表示和已获准的名称、纯轴符号差异须正确分类。参考与 CAD 或规范冲突时查明原因，不能为固定答案改写生产逻辑或倒填逐对象值。允许根据当前 CAD 的对象、配置、几何和原生语义应用明确规则；不能为匹配手工结果编写逐对象例外。平台行政元数据与工程事实分别记录。
 
 | 对象 | 定义与不变量 |
 |---|---|
@@ -118,13 +118,13 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 
 工程交付标识采用 `<model>-<total>dof-<head><arm><waist><leg>-r<revision>`；配置码按头、单侧手臂、腰、单侧腿排列，对称结构满足 `total = head + 2 × arm + waist + 2 × leg`。型号和工程修订来自明确登记，不能从文件日期、执行号或代码版本猜测。重复导出或仅修复导出器不递增工程修订。
 
-本次用户于 2026-10-20 确认的初始基线为 `M3-23dof-2515-r01`，对应原主装配 `M3.0.3_20261016.SLDASM`，主装配 SHA-256 为 `647b756847bb08f99287b71b86ea55e4cfb554df22f51a3e9f2ed337472799ce`，原生交付选择摘要为 `5f5c1f1a5dd874e8993486e0ddfe5043d422ec272bba63dbe59cb8a7488406db`。登记必须绑定完整冻结来源和配置，并与本次请求核对；不得把登记值伪装为 CAD 内已有的属性。原件名称、原件字节、原始声明和失败证据不变，缺失的原生 `dp.revision` 仍记录为缺失。
+工程登记必须绑定本次完整冻结来源和配置，并与本次请求核对；具体模型、修订、文件名和摘要属于请求或测试资料，不作为规范中的固定基线。不得把登记值伪装为 CAD 内已有的属性。原件名称、原件字节、原始声明和失败证据不变，缺失的原生 `dp.revision` 仍记录为缺失。
 
 工程交付标识是行政登记，与 CAD 内部名称分别保存，不能补齐原生模型名或机械修订。URDF 文件入口固定为 `urdf/robot.urdf`。XML 内部模型名读取顶层装配中的有效原生声明或属性；确证缺失时，允许对本次原生顶层装配名作统一、确定的格式化，绑定原始文档名、配置和摘要，显示派生来源 warning。格式化不得猜测型号、自由度或修订，也不得引入登记名、发布目标或手工名称。原生属性读取失败、无效或相互冲突不得按缺失回退。
 
-用户于 2026-10-20 明确放行 XML `robot.name` 与固定手工参考的 inspection 标签之间的差异：符合上述 CAD 来源规则的模型名无需与参考字符串相同，不阻塞端到端验收或发布，最终 diff 仍须列出。此放行不允许任意生成或伪造模型名；格式、来源 warning 和独立复算仍须通过，也不改变其他对象名称、引用或固定文件入口的要求。
+参考测试允许 XML `robot.name` 与适用手工 fixture 的 inspection 标签不同，并在测试 diff 中列出；该标签不进入生产或发布判定。生产模型名仍须符合当前 CAD 来源规则、格式、来源 warning 和独立复算要求，不能任意生成或伪造，也不改变其他对象名称、引用及固定文件入口的要求。
 
-用户随后明确放行两类参考字符串差异：从 CAD 实例稳定派生的 visual 名称可不同于参考 `native_N` 序号，带来源 warning 的展示材质名称可不同于参考 `cad_gray`。本项只放行名称不同，最终 diff 仍须展示；名称稳定、格式合法、对象绑定、定义与引用一致、颜色和纹理、几何、来源及独立复算要求不变。不允许用名称放行掩盖材质缺失、颜色变化、错误绑定或未验证来源，也不放宽 link、joint、collision、frame 或网格的既有要求。
+参考测试允许两类字符串差异：从 CAD 实例稳定派生的 visual 名称可不同于 fixture 的显示序号名，带来源 warning 的展示材质名称可不同于 fixture 的展示标签，测试 diff 仍须展示。生产不读取这些参考名称；名称稳定、格式合法、对象绑定、定义与引用一致、颜色和纹理、几何、来源及独立复算要求不变。不允许用名称放行掩盖材质缺失、颜色变化、错误绑定或未验证来源，也不放宽 link、joint、collision、frame 或网格的既有要求。
 
 模型接口统一遵循[机械交付规范](mechanical-handoff-spec.md#名称与原生引用)：唯一根为 `base_link`，其他刚体使用 `_link` 后缀，运动关节使用 `_joint` 后缀，方位使用完整 `left/right/front/rear/upper/lower`，接口按实际用途使用 `_mount/_tcp/_optical/_frame`。声明模式与配合推导模式执行同一输出命名要求；仅通过 snake_case 语法检查不能视为符合语义规范。
 
@@ -132,7 +132,7 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 
 网格几何从本次 CAD 采集取得；输出文件名和路径可按明确的统一规则生成或规范化，绑定当前原生对象和实际内容摘要。不得复制手工网格、沿用手工网格别名来达成对齐或将历史哈希当作当前内容身份。当前清单记录真实字节摘要及实例绑定，独立几何验证以本次 CAD 证据为依据。
 
-最终参考比较采用用户批准的[网格几何等价标准](quality.md#geometry-equivalence)：同源同配置的每个原生对象，在同一坐标系中证明双向曲面距离上界均不超过 `5e-5 m`，且拓扑、覆盖、朝向及既有质量门通过后，可关闭参考网格表示差异。此规则不允许改变当前捕获的真实字节绑定；未证明上界、超限或结构不一致仍阻塞，最终 diff 保留真实路径和摘要。
+参考回归测试采用用户批准的[网格几何等价标准](quality.md#geometry-equivalence)：同源同配置的每个原生对象，在同一坐标系中证明双向曲面距离上界均不超过 `5e-5 m`，且拓扑、覆盖、朝向及既有质量门通过后，可关闭参考网格表示差异。此规则只判定适用测试 fixture 的参考几何关系；未证明上界、超限或结构不一致不得把该测试标为通过。测试报告保留真实路径和摘要，不将手工比较结果设为生产输入、验证真值或独立发布门；生产几何仍严格核验当前 CAD 原始事实与实际交付。
 
 ### 输入命名警告与输出一致性
 
@@ -167,7 +167,7 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 
 警告定位到稳定对象和字段，引用实际交付值及其原始依据，记录非原生来源类别和原因；计算派生值另引用算法／工具版本及必要常量来源。同一来源或算法可以聚合展示，但必须能展开到全部受影响字段。复用现有来源记录和诊断，不另外保存一份模型或数值状态；以已绑定交付中的精确字段引用取得实际值即可。
 
-质量报告、页面预览及 PR 使用同一组来源警告；URDF 文件也须包含可见的英文警告摘要及详细来源清单位置。英文提示明确值并非从 CAD 直接读取。工程登记 `M3-23dof-2515-r01` 只作行政记录，不能用来填内部模型名。警告说明来源，不授权手工或外部值补齐，也不授予工程或实机资格。
+质量报告、页面预览及 PR 使用同一组来源警告；URDF 文件也须包含可见的英文警告摘要及详细来源清单位置。英文提示明确值并非从 CAD 直接读取。工程登记只作行政记录，不能用来填内部模型名。警告说明来源，不授权手工或外部值补齐，也不授予工程或实机资格。
 
 <a id="purpose"></a>
 ## 用途与资格
@@ -199,7 +199,7 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 |---|---|---|---|
 | `freeze` 冻结输入 | Linux | originals、ruleset、platform configuration、认证主体、主装配、配置目标、用途及必填说明；artifact closure、路径、文件类型、大小和选择有效 | `stage-request.json`、`request.json`、`inputs.json`、`ruleset.json`、`configuration.json`、`checks.json`；清单闭合、字节及摘要一致；不启动 CAD |
 | `discover` 解析结构 | Windows 原生观察 + Linux 推导 | 已验证 Freeze 输出、SourceSet、ruleset/configuration identity 和准入的 native tool source/record identity；artifact 与工具身份一致 | `native-observation/`、`prepared/`、`request.json`、`checks.json`、`result.json`；原生观察、selection、ruleset 和 prepared bytes 一致 |
-| `capture` 采集证据 | Windows 原生读取 + Linux 传输核验 | 已验证 Freeze/Discover 输出和同版 native tool requirement；prepared bytes、source inventory、tool identity 与对象归属一致 | admitted tree 的 `input/`、`evidence/`、`reports/native-tool.json`、`reports/native-stages.json`、`transfer-manifest.json`；重建、原生读取、状态恢复、几何覆盖和资源结算通过 |
+| `capture` 采集证据 | Windows 原生读取 + Linux 传输核验 | 已验证 Freeze/Discover 输出和同版 native tool requirement；prepared bytes、source inventory、tool identity 与对象归属一致 | admitted tree 的 `input/`、`evidence/`、`reports/native-tool.json`、`reports/native-stages.json`、`transfer-manifest.json`；原生事实、对象和配置绑定、几何覆盖、失败保全和资源结算通过 |
 | `generate` 生成 URDF | Linux | 精确 committed Capture artifact；snapshot、schema、provenance、source warning、source binding 与 tool identity 有效 | `model/robot.json`、`urdf/robot.urdf`、`meshes/`、`tool.json`、`reports/generate.json`；确定性、完整并绑定 Capture |
 | `verify` 独立验证 | Linux | 精确 committed Generate/Capture pair；原始证据和实际生成字节未变 | `verification-certificate.json`、`verification-execution.json`；全部必需且适用的检查通过，并绑定 pair、verifier、contract、policy 与 subject |
 | `publish` 提交评审 PR | Linux | Generate/Capture/Verify artifacts 与 sealed RepositorySnapshot；重验、配置目标、前置基线和干净工作区有效 | `publication-receipt.json` 与 fenced Git/PR effects；copied bytes、committed tree、remote head/base、PR 和 verified subject 一致 |
@@ -646,63 +646,71 @@ operation runtime 和一个 CAD resource owner，workspace 是 operation-local �
 本版不新增共享 source cache、兼容链或第二生命周期。未来内容复用只能是可丢弃字节
 优化，不能改变工程资格或替代阶段独立 admission。
 
-### Native tessellation v13
+### 原生三角形事实
 
-当前 Capture `itessellation` 证据使用
-`solidworks-to-urdf.native-tessellation/v13`；
-`solidworks-to-urdf.capture-preparation/v3` 与
-`solidworks-to-urdf.rebuild-session-recovery/v3` 保持不变。旧 v8、v9、v10、v11 或 v12
-对象不得自动转换、重标或作为 v13 兼容输入；历史事实只按原 schema 保全。
+当前 Capture 使用唯一的 `native-triangles/v1` 事实契约。原生会话沿
+`occurrence.GetBodies3(BodyType, BodiesInfo) → GetFaces → GetTessTriangles(True)` 读取已保存配置的实际
+body、face 和三角形；每个 face 的直接返回按原始次序保留，不切换备用几何链。
 
-每个 body 恰使用一次 whole-body analysis tessellation。唯一一次
-`IBody2.GetTessellation` 请求必须精确包含一个显式
-`VARIANT(VT_EMPTY, None)` 参数；request 原件记录参数数量 `1`、
-`variant_type=VT_EMPTY` 与空值，consumer 拒绝裸 `None`、零长度 SAFEARRAY 或全 face
-数组。唯一一次 `Tessellate` 前 request 和 observed block 必须分别精确包含
-`improved_quality=true`、`match_type=0`、
-`need_error_list=true`、`need_face_facet_map=true`、`need_edge_fin_map=true`、
-`need_vertex_params=true`；字段集、精确 `bool`/`int` 类型和值在顶层及每个 body 均须
-一致。`MatchType` 是严格整数 0，其余布尔属性不得用整数 0/1 替代。失败后不得重设质量
-模式或采样参数再次 tessellate。
+`BodiesInfo` 与同次返回的 body 数组按位置一一对应，每个 body 保留其原生
+`body_info_raw`。按 `swBodyInfo_e`，`0 = swUserBody_e`（user body），
+`1 = swNormalBody_e`（normal body）；两种分类均保留，不把 user body 当作读取失败，
+也不因分类切换几何来源。长度不一致、非整数或未定义值须明确失败，不补值或静默丢项。
+这些标志不代替对象身份和归属证明，数组位置也不代表跨次稳定身份。这里的接收者是
+`IComponent2`；`IPartDoc.GetBodies2(BodyType, BVisibleOnly)` 仍用于 Part 文档查询，
+不是 occurrence 几何的备用或替代链。
+旧几何与准备收据按原 schema 保全，不能重标版本、填充新字段或自动晋升为当前输入。
 
-`Tessellate` 必须返回严格布尔。`false` 是 body 原生失败：在读取 `GetFaceFacets` 前
-停止成功路径，不得从失败后的零计数、空数组或 `null` 形成空几何。允许从同次对象保存
-五个 `GetErrorList` automation `VT_BYREF|VT_VARIANT` 输出、返回状态、face canonical
-IUnknown 诊断身份／面积和不完整全局数量，但这些只是失败诊断；`None`、不可读、映射
-失败或后处理异常均不得转换成空列表、成功或替代首因。
+原始三角形每项为九个有限 `binary64` 数值，单位为米、坐标位于 component-local。
+封存字节保留原值与顺序，严格核验格式版本、数量和文件长度，拒绝截断、尾随字节、
+非有限值和无效三角形。body/face inventory 与连续、正数量的 face spans 必须完整
+覆盖同一 raw stream，不允许重叠、遗漏、未知归属或把读取失败转为空几何。
 
-`GetFaceFacets` 与 `GetEdgeFins` 必须保存同次成功 tessellation 的原始返回和 typed
-face/edge 绑定。直接 list/tuple 必须为扁平、无重复、非负的严格整数数组，raw order
-原样保存后再做规范化；不得先递归展平、去重或排序再判断。`GetFacetFins` 必须返回恰好
-三个不同非负严格整数。嵌套数组、标量、未知类型、重复 ID、错误对象或 COM 读取失败
-均拒绝，不切换备用 API 或第二 tessellation。
+每份事实绑定 occurrence、配置、原始 placement、body/face、source scope 和冻结
+字节。由本次 source scope、实体类型及原生遍历索引派生的局部对象身份，必须保留
+规则和字段级来源 warning；不能冒称原生持久引用，也不能要求所有对象具有辅助
+persistent reference。scene 保留实际 placement，不能为简化转换替换为单位矩阵。
 
-成功 nullable 数组只有经完整集合闭包才可归一化为狭义空集合：
+`prepare_prepared_capture` 只绑定已封存 prepared 的 root/configuration，不打开
+COM；Freeze 保留初次准备职责。Capture 读取 scene 与内存几何事实后，按唯一会话
+所有权协议释放 CAD，再在 Windows 离线执行原值投影、惯量规范化、raw/STL 序列化
+和封包。这部分纯计算不再持有 CAD，会话释放不代表 Windows 作业已经结束。STL 从同一 raw
+三角形派生，保留 component-local 坐标，明确法向量和浮点编码的派生来源，不能重复
+应用 occurrence placement。原生错误及已取得的 partial facts 保全，不被离线异常替代。
 
-1. `GetFaceFacets(face) -> None` 仅允许严格 `body_type=1`、`Tessellate=true`、属性
-   request 与 observed 全部正确、完整 face inventory 已读，且全部成功 facet arrays
-   跨 face 不重叠、facet ID 总数与并集大小均等于同次原生 `GetFacetCount`。此时保留
-   `raw_facet_ids=null`，派生 `facet_ids=[]`、`facet_count=0`、
-   `facet_ids_source=native-body-global-null-zero`，并在该 face 字段记录
-   `cad_face_facet_ids_derived_by_body_global_closure` warning。
-2. `GetEdgeFins(edge) -> None` 仅允许同一 body 的一或两个唯一 incident faces 都已由
-   (1) 证明为零 facet，且全部 `GetFacetFins` 关系完整、唯一归属、fin 总数等于同次
-   `GetFinCount`。此时保留 `raw_fin_ids=null`，派生 `fin_ids=[]`、
-   `fin_ids_source=native-incident-faces-null-zero`，并记录
-   `cad_edge_fin_ids_derived_by_empty_incident_faces` warning。
-3. 成功直接空数组保留 `native-flat-array` 来源和空 raw array。solid body、另一 body、
-   缺失/额外 face、错误 incident ownership、任何未覆盖 facet/fin、总量不符或任何
-   warning 不自洽均拒绝。
+原生事实只在 `evidence/raw/native_capture_facts.json` 封存一份，由 source manifest 和
+Capture artifact 绑定其字节；`evidence/capture.json` 保留必要投影与其他证据块，不再
+内嵌完整原生事实。Generate 与独立 Verify 读取同一原始成员，各自执行匹配、派生与
+复算；原始事实缺失、被改写或与投影冲突时，按既有工程和完整性规则拒绝。
 
-这两条规则只表达原生闭包证明的真实 facet/fin 缺失；不得生成 fin、cofin、U interval，
-不得删除 edge，不得声称已经读取 `GetFacetFace`/`GetFinEdge`，也不得给零 facet face
-最终曲面距离、完整拓扑或参考几何资格。face 的实例、正面积、原生身份与
-`cad_sheet_face_untessellated` warning 继续保留，交付网格与最终 50 µm 曲面验收保持。
-`raw/source_scopes.json` 沿 v3 preparation/session-recovery 规则，与 discovery、scene、
-capture、geometry、dependency closure 及实际冻结字节逐层交叉核验。
+独立 consumer 从 raw 字节、face spans、原始 placement、物性和基准读数复算实际
+输出，核验源绑定、单位、坐标、对象归属、覆盖、朝向及派生 warning，不能只比较生产者的投影。
+raw/STL 一致性证明本次原始三角事实到交付的派生一致性，不自动建立原生 BRep 或
+光滑曲面误差界；几何资格按实际证据陈述，不借用历史证明或未验证预览。
+`docs/quality.md#geometry-equivalence` 的 50 µm 双向距离标准仅用于声明适用 CAD 的
+独立参考回归，不是生产或正式发布前置；当前 CAD 的独立工程检查继续执行。
 
-更详细的质量门由 root-owned `docs/quality.md` 定义；本 proposal 不覆盖该文件的
-`native-tessellation/v13` 文本。
+### 原生外观读数与交付
+
+`appearance_raw` 保留 document、occurrence、body、face、feature 和 display-state 的原生观察、实际 API 与参数、原值、配置、对象绑定及读取错误。document 与 face 的无参 active-configuration 属性只在实际 active 与实例 referenced configuration 相同时采用；各顶层、祖先与 leaf owner 使用自己的配置和显示状态。不得以多个旧层颜色相同替代未读覆盖层。
+
+`GetRenderMaterials2(3, names)` 与 `GetRenderMaterialsCount2(3, names)` 使用同一个表示 exact owner display state 的 typed `SAFEARRAY(BSTR)`。NULL 与计数分开保留；只有成功计数为零才证明该状态无 assignment，正数或未知计数不能解释为 absent。成功枚举的行数必须等于同状态计数，不使用旧无参 Count 或 fallback。
+
+文档实体通过真实 `IModelDoc2` QI、实际 `GetPathName` 与 active configuration 建立身份，不要求文档具有实体 persistent reference。其他材质实体记录实际支持的 public QI 集合，包括适用的 `IComponent2`、`IBody2`、`IFeature`、`IFace2`、`IEntity` 和文档接口；不能用首个成功接口或固定优先标签掩盖其他原生能力。原始接口查询与错误如实保留，`CDispatch`、未知类型、引用长度或非空字节均不能证明对象种类。
+
+材质实体与同次几何遍历的唯一原生实体／归属观察使用实际 owner document 的持久引用，绑定 exact occurrence、配置和显示状态。Source 只封存逐 face 的原生引用、parent-body／feature 关系及成功或失败，不再另存由这些观察推导的 body、feature 或 face 索引与 footprint。assembly occurrence 的直接原生引用只保留一次。Generate 与 Verify 分别从原始事实构造临时索引并执行 join，核验命中 target kind 与原生接口集合兼容；临时派生结果不成为第二份封存权威。Part 实体引用由同一 Part extension 通过 `GetObjectByPersistReference3` 解析，必须返回 exact integer `0` 和预期接口；null、非 OK、错误类型或错误 owner 不登记为成功。文档目标仍使用文档证明，不为它补造引用。引用按实际 owner 与字节解析一次并复用，类型只约束解析结果的 QI，不让同一引用因类型不同被重复解析；不保留重复引用权威。
+
+几何读取保持 `IComponent2.GetBodies3(BodyType, BodiesInfo)` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`，不改变 occurrence 几何、坐标或 face spans。每个已观察的 occurrence face 由目标 Part extension 的 `GetCorrespondingEntity2` 取得并验证 underlying Part face；在该 Part face 上调用公开方法 `GetBody()`、`GetFeature()`，取得实际 Part body 和 feature，再读取并解析同一 Part namespace 的引用。body 不使用 `GetCorresponding2`，不增加第二次 Part 几何遍历、父装配 receiver 或兜底转换。原生 COM handle 仅保留在自有会话内存中；复制和封存的事实必须为纯 JSON，不深复制或序列化 live handle。
+
+原生 identity 与交付 geometry footprint 是有证据的关系，不假定一一对应。复用同次 face 遍历的真实 parent-body 观察建立 body 的完整 face footprint，不能以第一个 face 代表整个 occurrence body；同一 Part body 或 face 对应多个 occurrence fragments 时，须保留实际关系。多个 Part body、缺失或分歧的见证，须逐 face 明确处理；参与材质绑定时无法证明的部分失败，不按顺序、名称、颜色或 coverage 猜归属。同一 native feature 仍可拥有多个面的完整 footprint。原生关系观察冲突或不同原生 identity 被错误合并时拒绝，不能通过扩大覆盖集合染色；Source 不输出预匹配或派生 footprint 答案，两个消费者独立重建适用关系，不再对两套封存派生结果增加互比检查。
+
+按官方外观层级，assembly-owned 材质只使用实际 assembly owner 上下文中的 component occurrence；face、body、feature 和 part assignment 使用 Part owner。装配材质指向非 occurrence target 时拒绝，不转换、提升或猜测作用域。参与对象绑定的原生读取或 mapping 错误、错误 component/source document、未绑定或真实歧义均拒绝；无关辅助诊断不另设全表零错误资格。测试标签、对象不相等或自报“属于 Part”均不能建立原生资格。
+
+有效外观按有文档依据的对象层级解释，不任意规定继承。已证明参与的单色现代 material 必须绑定 exact owner/state 与实际交付面，`ColorForm=1`，无参与纹理或 surface finish。通用规则 `appearance.primary_color_colorref` 版本 `v1` 对非布尔、范围为 `0..0xffffff` 的 `PrimaryColor` 整数计算 `R=(v&255)/255`、`G=((v>>8)&255)/255`、`B=((v>>16)&255)/255`，`alpha=1-Transparency`，不取最高字节作为 alpha。九值属性的 alpha 同样由其原生透明度派生。保留原值、规则版本、结果和字段级 derived warning；独立验证自行计算。位顺序依据固定成熟导出器的同 API 实现交叉证据，不能冒称官方文档明确给出了 byte packing，也不从手工参考回填。
+
+若真实文档身份、exact display state 和完整面覆盖证明现代单色 material 参与当前交付，可将配置范围内但不参与该状态的 legacy `GetTexture` pointer 保留为诊断事实，无须读取无关图像与 UV。空 `MaterialName` 本身不证明 absent。真正参与交付的纹理仍须有资产字节、UV、对象绑定和消费能力；缺证、颜色冲突、对象或配置错绑、必要读取失败均明确失败，不能默认色或 warning 放行。辅助诊断不另设所有 API 零错误资格。
+
+交付按已采集 face triangle spans 无损分组为一个或多个 visual/material，完整覆盖原始面且不增删几何。Verify 从原始读数和实际输出独立核验绑定、RGBA、覆盖、网格及来源 warning。visual 或展示材质名称参考差异的非阻塞许可不扩大到颜色、纹理或实际对象归属。
 
 ### Native target identity
 
@@ -746,7 +754,7 @@ inventory，只将受约束的相对路径定位到已登记工程副本，不�
 只保存 selection、原生对象、规则、证据和 prepared bytes 身份，不另存完整机器人模型；
 不得在采集结束后从配置或结果倒造新的计划。
 
-原生记录仅包含直接读数、API 状态、原生引用、配置、保存状态、环境及网格。长度、角度、质量和惯量转换为 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法。适配器只在 COM 边界转换单位和厂商矩阵布局；推导、闭包比较、几何统计、诊断解释与报告渲染全部在 Linux 完成。格式校验和封存摘要计算属于传输职责。
+原生记录保留直接读数、API 状态、原生引用、配置、保存状态、环境及原始几何。厂商矩阵布局、单位和原始数值先如实保全；释放 CAD 后从固定事实离线投影到 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法，保留原值到结果的规则和来源 warning。工程模型生成、闭包比较、独立工程验证、诊断解释与报告渲染在 Linux 完成；格式校验和封存摘要计算属于传输职责。
 
 当前方向处理不引入基于右手定则的新正向选择或符号推导规则，也不引入屈曲、外展等功能动作推导正向。输出遵循 URDF 既定格式和坐标约定，并按[《MimicVerse URDF 工程标准 v1》](https://hcnd2fgke1pv.feishu.cn/docx/N3iSdpYxGo151UxgBz6csCthnSb)检查表达一致性；这些约定不能用来绕过 CAD 已有有向轴及有效作者声明。斜轴保留真实机械轴，不吸附到主轴。名称、全局向量分量或镜像标记不能单独决定正向。
 
@@ -761,7 +769,7 @@ warning 记录原始 CAD 轴、运动类别、规则、delivered axis 和未解�
 `machine_qualification=unqualified`。模型来源、URDF、质量报告、预览和 PR 使用同一
 warning；只有独立、可复算的作者正向证据才能关闭该 warning。
 
-本次导出的方向以已保存 CAD 有向轴及有据的坐标转换为依据。与固定手工参考是否同号属于非阻塞对比项：真实端到端报告须保留差异，不强求通过规则生成相同符号，也不得复制参考值。原生轴缺失、读取失败、无效向量、坐标转换或轴线／对象绑定错误，以及不符合原生非零运动证据仍是阻塞缺陷。
+本次导出的方向以已保存 CAD 有向轴及有据的坐标转换为依据。参考测试保留与适用手工 fixture 的符号差异，不强求通过规则生成相同符号，也不得复制参考值。原生轴缺失、读取失败、无效向量、坐标转换或轴线／对象绑定错误，以及不符合原生非零运动证据仍是阻塞缺陷。
 
 实际驱动器／编码器方向定义属于单独的硬件资格。驱动正命令、编码器正计数与关节物理转向分别记录，不默认三者同号；命令类型、控制模式、零位和适用配置须明确。若声称已经验证实物方向，必须绑定 CAD 执行器 occurrence、原生机械轴、传动关系及实际执行器身份，并提供方向声明的来源、版本和验证依据；本次导出流程不以补齐这项硬件资格为前提。电机安装、局部坐标正轴、轴伸出方向或定转子中心关系本身不能证明驱动／编码器极性。
 
@@ -781,15 +789,15 @@ CAD 唯一工程来源的边界保持：本次冻结 CAD 缺少实际驱动／�
 
 每次方向反号（`s = -1`）必须给出可定位到具体关节的显式 warning，即使它是有据且保持物理运动等价的规范化，也不能静默处理。warning 记录原生身份、原始轴及其参考系、输出轴及其参考系、反号原因、规则 ID／版本／适用证据，以及坐标、范围和其他实际受影响字段的前后值；不适用或缺失的字段如实注明。报告、URDF 来源记录、预览和 PR 中的反号 warning 必须一致。该 warning 描述实际发生的规则变换，不能仅因反号就宣称 CAD 存在工程错误，也不能代替方向依据或掩盖未解决冲突。
 
-自动规范化作用于导出解释，封存 CAD 原件和失败证据保持不变。确需修复原生 CAD 工程时，在保留旧版的受控新副本上按具体工程依据修改并重新冻结；修改后再取得完整原生证据，不能把旧运行解释为新结果。最终真实端到端产物须与固定手工版本比较命名、方向、限位、位姿和非零运动，保留原始 diff 与语义分类；方向符号不一致本身不阻塞交付，其余既有一致性要求保持。参考比较不能取代 CAD 和规范验证，也不能把坐标变换、拓扑、零位、几何或原生运动的真实错误归为可忽略的符号差异。
+自动规范化作用于导出解释，封存 CAD 原件和失败证据保持不变。确需修复原生 CAD 工程时，在保留旧版的受控新副本上按具体工程依据修改并重新冻结；修改后再取得完整原生证据，不能把旧运行解释为新结果。参考单元测试和回归测试按适用 fixture 比较命名、方向、限位、位姿和非零运动，保留 diff 与语义分类，不将固定手工结果作为真实端到端或发布的必经输入。生产验收独立依据当前 CAD 和规范，坐标变换、拓扑、零位、几何或原生运动的真实错误仍阻塞，不能归为可忽略的表示差异。
 
-交付配置的证明同时要求：封存选择中的原件摘要与读取后的原件摘要完整相等；读取前后均为只读，实际 `IConfiguration.Name` 与已选交付配置一致，`IConfiguration.NeedsRebuild` 明确为 `false`。`IModelDocExtension.NeedsRebuild2` 按整数枚举解释：`0` 为完全重建，`1` 为非冻结特征需重建，`2` 为冻结特征需重建；布尔值、未知值及缺失均拒绝。允许受控读取从初值 `1` 或 `2` 完成解析，但最终值必须为 `0`。`GetSaveFlag` 保留原始诊断值，不作为原件是否已保存的判据；不得用它掩盖原件变化或配置、重建证据缺失。推导与独立验证分别从原始证据检验这些条件。
+交付配置的证明要求：封存选择中的原件摘要与读取后的原件摘要完整相等，顶层原件读取前后均为只读，实际 `IConfiguration.Name` 与已选交付配置一致。采集读取冻结 CAD 已保存配置中的原生事实，不保存或修改原件，不以原生状态标志归零作为接纳资格。`GetSaveFlag` 保留原始诊断值，不作为原件是否已保存的判据；不得用它掩盖原件变化或配置证据缺失。推导与独立验证分别从原始证据检验这些条件。
 
-采集准备从当前配置的实际实例拓扑建立参与装配清单，分别保留实例和共享文档身份。正常执行与恢复后的新会话共用同一有界重建流程：按当前图的依赖深度先处理子装配；每个候选文档执行前重新读取当前状态，仅对仍待重建的文档在本自有 CAD 会话中调用一次 `IModelDocExtension.Rebuild(2)`，立即核对收敛；明确清零的候选不调用。子装配处理结束后，重新读取顶层状态并取得当前会话中的顶层句柄，仅在顶层仍待重建时最多调用一次重建。此前子装配使父装配新变为待重建，或使兄弟装配自动清零时，以当时的原生状态决策；不能把动态状态强制等同于最初观察，也不能扩大到无关兄弟装配反复级联重建。顶层打开与完成均须明确只读；依赖文档保留实际读取的只读状态，不为制造一致读数改写其状态。全程不保存原件、不调用 `ForceRebuild3`、不写 `EnableAssemblyRebuild`。诊断属性不可读时保留失败事实，不将其擅自解释成新的机械状态。
+原生采集从当前配置的实际实例拓扑建立参与装配清单，分别保留实例和共享文档身份。读取前核对文件范围、配置、session 文档所属进程、受控临时根和对象绑定；归属未知、冲突或不可读均拒绝。一次采集保存可供后续离线复用的原始几何、轴线、配合、位姿、物性及必要归属事实，同时保留实际读取错误。所有读数绑定本次原件字节、配置、原生对象、工具和自有会话，不能以生成结果或手工参考补齐失败读数。
 
-仅当本轮已成功重建至少一个子装配，顶层 `Rebuild(2)` 明确返回 `true`、配置的 `NeedsRebuild=false`，但顶层文档的 `NeedsRebuild2` 仍为 `1` 或 `2` 时，允许一次有界的自有会话恢复。先完整保留首次失败、逐次调用、耗时及当时环境，确认旧自有 CAD 进程和文档已关闭，再通过既有排他及所有权机制，在不同的新自有进程中以同一配置只读重开同一 collected copy。新旧会话不得重叠；清场未知、文件或对象归属未知均不得继续。源文件字节、实例及配置、受控 session 对象与所有者绑定、稳定拓扑和已加载文档集合必须保持一致；临时路径的合法重物化须绑定各自进程与受控根，不以删除任意路径前缀代替证明。新会话须重新建立实际图，并按上述同一流程对其本次候选逐一读取当前状态、按需执行一次子装配重建，随后读取子装配完成后的顶层状态并按需最多执行一次顶层恢复重建；不得因历史会话曾重建子装配，就跳过新会话中实际仍待重建的同一文档。已明确清零时不再重建；任一子装配失败即终止，不继续顶层，也不触发嵌套恢复。不在旧会话中重复调用，不创建第三次尝试，不保存或重新采集另一份副本替换失败对象。收据保留新旧会话各自的图、候选、实际调用顺序、原始状态、耗时、跳过理由及各自的字节和进程身份；独立验证从这些原始事实复核同一有界流程。其余错误及恢复后未完全收敛均拒绝。
+读取完成后核对实际拓扑中的实例、路径、文档类型、配置、深度、抑制状态、存储及来源分类，并核对源文件字节与 session 依赖集合。合法文档复用和作者抑制保留既有语义；按文档去重不能丢失实例证明，也不能将合法复用误判为拓扑冲突。依赖文档保留实际读取的只读状态，不为制造一致读数改写其状态。实际读取失败、原件变化、配置冲突、无效几何或对象绑定错误均如实拒绝，不能用诊断标志、warning 或历史成功替代必要工程事实。
 
-重建前须完成文件范围、配置及 session 文档的所属进程、受控临时根和对象绑定校验；归属未知、冲突或不可读均在重建前拒绝。重建后重新遍历实际拓扑，核对实例、路径、文档类型、配置、深度、抑制状态、存储及来源分类，同时要求所有已加载装配和零件的文档级 `NeedsRebuild2=0`、实际使用的配置均明确无需重建，且源文件字节和 session 依赖集合不变。合法文档复用和作者抑制保留既有语义；它们不能因按文档去重而丢失实例证明，也不能被误判为拓扑冲突。准备证据记录在同一原生采集中；发生恢复时分开保留首次失败与最终成功会话、旧进程关闭及新进程身份、重开和全部不变量证明，后续读取与交付环境绑定最终会话。独立验证对照原始发现、选择闭包、源摘要及实际字节复算，不接受自报恢复成功，不另建工程模型或状态权威。
+原生采集封存原始事实与失败原件，并按既有排他和所有权协议完成资源结算、释放 CAD；未知外部结果继续通过原 operation 对账，不能登记虚假成功。后续坐标转换、模型生成、报告和独立工程验证从固定事实离线执行，保留原值、规则、来源 warning 与字节绑定；纯计算或验证修复复用同一份原始事实，不因此再次启动 CAD。独立验证对照原始发现、选择闭包、源摘要及实际字节复算，仍核验必需且适用的工程约束，不另建工程模型或状态权威。
 
 原生 API 错误保留调用名、返回值和完整整数位码、可解析的枚举名、SolidWorks/API 版本、文档/配置、失败操作及已取得的引用信息。位码不是错误数量。缺少具体引用绑定时明确记为未定位，不能据此宣称缺失文件数、原件损坏或工程师交错材料。路径诊断记录主装配、工作目录、搜索路径以及原生返回的存储/解析路径，秘密与无关工程信息不得外泄。阶段按实际执行归属记录；原生打开位于 `discover`，不能记成纯文件冻结失败。
 
@@ -857,10 +865,15 @@ transfer manifest、run/Freeze identity、源记录、原生发现和实际 inpu
 清单路径为相对 POSIX 路径，按 UTF-8 字节排序。JSON 使用 UTF-8、键排序、无多余空白、禁止 NaN/Infinity；模型 JSON、报告与 URDF 数值使用与 locale 无关、可精确往返 binary64 的最短十进制，统一零值格式，不截断有效位；每条文件记录包含路径、字节长度和 SHA-256。摘要对规范序列化对象求 SHA-256，并以对象类型区分用途。清单及其父目录不允许符号链接、junction、路径逃逸或大小写冲突。
 
 Linux 维护人员对已登记 Verify command 使用
-`description stage <verify-command-id>`。该入口从 canonical facts 取得原
-Generate/Capture artifact closure，重算 verification certificate 与 execution
-receipt，并保留原生证据；不提供直接 check/rebuild 任意交付目录的第二入口，不注册
-正式检查点，也不能导入发布或改变原交付。新建候选从 Freeze 重新接纳并执行规定阶段；
+`description stage <verify-command-id>`，执行同一正式 StageApplication 流程。
+尚无阶段决定时，入口取得执行权，从 canonical facts 物化 Generate/Capture artifact
+closure，执行验证并提交正式决定、verification certificate 与 execution receipt；
+这些结果按既有契约参与后续发布。已有决定时，入口核验绑定并返回原封存结果，不自动
+重新执行原始验证算法。验证读取不改写输入证据，但命令执行会写入阶段业务事实。
+
+真正隔离复算须沿既有受控诊断入口绑定 `DiagnosticReplayScope`，分别记录历史生产者、
+本次工具及输入闭包，不登记正式资格，也不能由普通后继消费；不能把正式命令描述为
+只读诊断。不提供直接 check/rebuild 任意目录的第二 CLI。新建候选从 Freeze 重新接纳；
 发布和恢复始终走同一 StageApplication/effect/fact 流程。
 
 <a id="publication"></a>

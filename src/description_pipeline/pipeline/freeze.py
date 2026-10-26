@@ -231,6 +231,22 @@ def ruleset_record_roots(root: Path, catalog: RulesetCatalog) -> tuple[Path, ...
     return tuple(result)
 
 
+def materialize_ruleset_record_roots(
+    root: Path,
+    catalog: RulesetCatalog,
+) -> tuple[Path, ...]:
+    """Restore cataloged empty roots lost by file-only artifact materialization."""
+
+    root = Path(root)
+    for item in catalog.roots:
+        if item.members:
+            continue
+        directory = confined(root, item.path, exists=False)
+        if not directory.exists():
+            directory.mkdir(parents=True)
+    return ruleset_record_roots(root, catalog)
+
+
 class FreezeRefusal(PipelineError):
     """A deterministic Freeze refusal with a stable machine code."""
 
@@ -449,7 +465,7 @@ def _ruleset_record(root: Path, expected_version: str) -> RulesetCatalog:
     if catalog.version != expected_version:
         raise FreezeRefusal("freeze.ruleset_invalid", "Ruleset catalog metadata is invalid or names another version")
     try:
-        ruleset_record_roots(root, catalog)
+        materialize_ruleset_record_roots(root, catalog)
     except PipelineError as error:
         raise FreezeRefusal(
             "freeze.ruleset_invalid",
@@ -662,6 +678,7 @@ __all__ = [
     "RulesetCatalog",
     "RulesetRoot",
     "configuration_snapshot_digest",
+    "materialize_ruleset_record_roots",
     "read_ruleset_catalog",
     "ruleset_record_roots",
 ]

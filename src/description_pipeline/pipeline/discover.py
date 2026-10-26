@@ -57,8 +57,8 @@ from .engine import StageWorkspace
 from .freeze import (
     RulesetCatalog,
     configuration_snapshot_digest,
+    materialize_ruleset_record_roots,
     read_ruleset_catalog,
-    ruleset_record_roots,
 )
 
 FREEZE_RESULT_KIND = "stage_output:freeze"
@@ -349,7 +349,7 @@ def _ruleset_version(root: Path, expected: str) -> RulesetCatalog:
     if catalog.version != expected:
         raise NativeDiscoverRefusal("discover.ruleset_invalid", "Ruleset catalog is invalid or names another version")
     try:
-        ruleset_record_roots(root, catalog)
+        materialize_ruleset_record_roots(root, catalog)
     except PipelineError as error:
         raise NativeDiscoverRefusal(
             "discover.ruleset_invalid",
@@ -690,7 +690,7 @@ class DiscoverHandler:
             output = workspace.root / f"discover-result-{claim.fence}"
             output.mkdir(parents=True, exist_ok=False)
             settings = DiscoverySettings(
-                record_roots=ruleset_record_roots(
+                record_roots=materialize_ruleset_record_roots(
                     roots["ruleset"],
                     ruleset,
                 ),

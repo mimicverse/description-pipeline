@@ -24,6 +24,7 @@ from description_pipeline.pipeline.contracts import (
     StageDecision,
     StageEffectWait,
     StageExecution,
+    StageFailure,
     StagePending,
     StageResult,
     StageStatus,
@@ -428,6 +429,83 @@ class DerivedStateTests(unittest.TestCase):
             ),
             StageStatus.UNRESOLVED,
         )
+
+
+class FailureEnvelopeTests(unittest.TestCase):
+    def test_frozen_failure_detail_round_trips_through_the_envelope(self) -> None:
+        value = command()
+        failure = StageFailure(
+            "generate.appearance_unrepresentable",
+            "appearance is unproven",
+            error_type="AppearanceError",
+            detail={
+                "appearance": {
+                    "issues": (
+                        {
+                            "code": "cad_appearance_effective_scope_unproven",
+                        },
+                    )
+                }
+            },
+        )
+        envelope = FailureEnvelope(
+            schema_version=FAILURE_ENVELOPE_SCHEMA,
+            command_id=value.command_id,
+            run_id=value.run_id,
+            stage=value.stage,
+            request_digest=value.request_digest,
+            outcome="failed",
+            actual_executor_sha256=value.expected_executor_sha256,
+            reason_code="generate.appearance_unrepresentable",
+            error_type="AppearanceError",
+            error_message="appearance is unproven",
+            error_detail=failure.detail,
+            effect_states=(),
+            evidence_artifacts=(),
+            retained_locations=(),
+            unavailable_reason=None,
+            occurred_at=datetime(2026, 10, 26, tzinfo=UTC),
+        )
+        record = envelope.to_record()
+        self.assertEqual(
+            record["error_detail"],
+            {
+                "appearance": {
+                    "issues": [
+                        {
+                            "code": "cad_appearance_effective_scope_unproven",
+                        },
+                    ]
+                }
+            },
+        )
+        self.assertEqual(
+            FailureEnvelope.from_record(record).to_record(),
+            record,
+        )
+
+    def test_non_json_failure_detail_is_rejected(self) -> None:
+        value = command()
+        with self.assertRaises(ProtocolError) as caught:
+            FailureEnvelope(
+                schema_version=FAILURE_ENVELOPE_SCHEMA,
+                command_id=value.command_id,
+                run_id=value.run_id,
+                stage=value.stage,
+                request_digest=value.request_digest,
+                outcome="failed",
+                actual_executor_sha256=value.expected_executor_sha256,
+                reason_code="domain_failed",
+                error_type="DomainFailure",
+                error_message="domain failure",
+                error_detail={"invalid": {1, 2}},
+                effect_states=(),
+                evidence_artifacts=(),
+                retained_locations=(),
+                unavailable_reason=None,
+                occurred_at=datetime(2026, 10, 26, tzinfo=UTC),
+            )
+        self.assertEqual(caught.exception.code, "failure.invalid")
 
 
 class CommandIdentityTests(unittest.TestCase):

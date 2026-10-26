@@ -9,6 +9,7 @@ joint definition is an error, not a default.
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -16,11 +17,9 @@ from typing import Any
 
 from .errors import ConfigError
 from .naming import (
-    DISPLAY_MATERIAL_FALLBACK_NAME,
-    DISPLAY_MATERIAL_FALLBACK_RGBA,
-    DISPLAY_MATERIAL_FALLBACK_RULE,
     asset_namespace,
     fixed_joint_name,
+    material_name,
     mesh_path,
     visual_name,
 )
@@ -601,7 +600,11 @@ def build_scene(
             entry = geometry_by_component.get(reading.name)
             if entry is None:
                 continue
-            if "rgba" in entry or "material" in entry:
+            if (
+                "rgba" in entry
+                or "material" in entry
+                or entry.get("appearance_groups") is not None
+            ) and not isinstance(entry.get("appearance_groups"), list):
                 raise ConfigError(
                     "This capture schema has no independently verified CAD appearance record",
                     {
@@ -610,27 +613,91 @@ def build_scene(
                         "rgba": entry.get("rgba"),
                     },
                 )
-            visual = {
-                "kind": "mesh",
-                "name": visual_name(reading.name, link=name),
-                "filename": entry["path"],
-                "sha256": entry.get("sha256"),
-                "mesh_name": mesh_path(
-                    str(entry.get("sha256") or ""),
-                    namespace=mesh_namespace,
-                ),
-                "material": DISPLAY_MATERIAL_FALLBACK_NAME,
-                "scale": [1.0, 1.0, 1.0],
-                "xyz": list(reading.relative_translation),
-                "rpy": list(rpy_from_matrix(reading.relative_rotation)),
-                "provenance": {
-                    "native_component": reading.name,
-                    "material_source": "platform_display_fallback",
-                    **DISPLAY_MATERIAL_FALLBACK_RULE,
-                },
-            }
-            visual["rgba"] = list(DISPLAY_MATERIAL_FALLBACK_RGBA)
-            visuals.append(visual)
+            groups = entry.get("appearance_groups")
+            if groups is not None:
+                if not isinstance(groups, list) or not groups:
+                    raise ConfigError(
+                        "Native appearance groups are empty or malformed",
+                        {"component": reading.name},
+                    )
+                for group in groups:
+                    if (
+                        not isinstance(group, dict)
+                        or not isinstance(group.get("group_id"), str)
+                        or len(group["group_id"]) != 16
+                        or group.get("rgba") is None
+                        or not isinstance(group.get("mesh_sha256"), str)
+                        or len(group["mesh_sha256"]) != 64
+                        or not isinstance(group.get("face_references"), list)
+                        or not group["face_references"]
+                        or not isinstance(group.get("triangle_ranges"), list)
+                        or not group["triangle_ranges"]
+                        or not isinstance(group.get("sources"), list)
+                        or not group["sources"]
+                    ):
+                        raise ConfigError(
+                            "Native appearance group is malformed",
+                            {"component": reading.name},
+                        )
+                    identity = (
+                        f"{reading.name}:appearance:{group['group_id']}"
+                    )
+                    visuals.append(
+                        {
+                            "kind": "mesh",
+                            "name": visual_name(identity, link=name),
+                            "filename": entry["path"],
+                            "sha256": entry["sha"],
+                            "mesh_sha256": group["mesh_sha256"],
+                            "mesh_name": mesh_path(
+                                group["mesh_sha256"],
+                                namespace=mesh_namespace,
+                            ),
+                            "face_references": list(
+                                group["face_references"]
+                            ),
+                            "triangle_ranges": copy.deepcopy(
+                                group["triangle_ranges"]
+                            ),
+                            "rgba": list(group["rgba"]),
+                            "material": material_name(
+                                identity,
+                                link=name,
+                            ),
+                            "scale": [1.0, 1.0, 1.0],
+                            "xyz": list(reading.relative_translation),
+                            "rpy": list(
+                                rpy_from_matrix(reading.relative_rotation)
+                            ),
+                            "provenance": {
+                                "native_component": reading.name,
+                                "material_source": "native_appearance",
+                                "appearance": {
+                                    "group_id": group["group_id"],
+                                    "face_references": list(
+                                        group["face_references"]
+                                    ),
+                                    "sources": copy.deepcopy(group["sources"]),
+                                },
+                            },
+                        }
+                    )
+            else:
+                visual = {
+                    "kind": "mesh",
+                    "name": visual_name(reading.name, link=name),
+                    "filename": entry["path"],
+                    "sha256": entry["sha"],
+                    "mesh_name": mesh_path(
+                        entry["sha"],
+                        namespace=mesh_namespace,
+                    ),
+                    "scale": [1.0, 1.0, 1.0],
+                    "xyz": list(reading.relative_translation),
+                    "rpy": list(rpy_from_matrix(reading.relative_rotation)),
+                    "provenance": {"native_component": reading.name},
+                }
+                visuals.append(visual)
         links.append(
             {
                 "id": body_id,
@@ -881,6 +948,7 @@ def _value_warnings(
     unqualified_drive = []
     visuals = []
     mesh_paths = []
+    native_appearances = []
     for body in bodies:
         if body.get("source_name") and body["source_name"] != body.get("name"):
             rule = body.get("name_rule") if isinstance(body.get("name_rule"), dict) else {}
@@ -1158,6 +1226,33 @@ def _value_warnings(
                     "reason": "native component identity formatting",
                 }
             )
+            if visual.get("provenance", {}).get("material_source") == "native_appearance":
+                appearance = visual["provenance"].get("appearance") or {}
+                native_appearances.append(
+                    {
+                        "object_type": "visual",
+                        "object": visual["name"],
+                        "fields": [
+                            "material.name",
+                            "material.color.rgba",
+                            "mesh.filename",
+                            "mesh.faces",
+                        ],
+                        "actual": {
+                            "material": visual.get("material"),
+                            "rgba": visual.get("rgba"),
+                            "mesh": visual.get("mesh_name"),
+                            "face_references": appearance.get("face_references"),
+                        },
+                        "sources": appearance.get("sources"),
+                        "rule_id": "appearance.native_owner_state",
+                        "rule_version": "v1",
+                        "reason": (
+                            "RGBA is resolved from the recorded native owner/display-state "
+                            "appearance and grouped by exact delivered face spans"
+                        ),
+                    }
+                )
             mesh_paths.append(
                 {
                     "object_type": "visual",
@@ -1165,7 +1260,10 @@ def _value_warnings(
                     "field": "mesh filename",
                     "actual": visual["mesh_name"],
                     "source": "current capture content addressing",
-                    "original": visual.get("sha256"),
+                    "original": visual.get(
+                        "mesh_sha256",
+                        visual.get("sha256"),
+                    ),
                     "rule_id": "naming.mesh",
                     "rule_version": "naming-v1",
                     "reason": "current capture content addressing",
@@ -1285,37 +1383,15 @@ def _value_warnings(
                 "objects": mesh_paths,
             }
         )
-    material_fallbacks = []
-    for link in links:
-        for visual in link.get("visuals") or []:
-            provenance = visual.get("provenance") or {}
-            if provenance.get("material_source") != "platform_display_fallback":
-                continue
-            material_fallbacks.append(
-                {
-                    "object_type": "visual",
-                    "object": visual["name"],
-                    "field": "material",
-                    "actual": {
-                        "name": visual.get("material"),
-                        "rgba": visual.get("rgba"),
-                    },
-                    "source": "platform display fallback; CAD appearance unobserved",
-                    "original": None,
-                    "rule_id": provenance.get("rule_id"),
-                    "rule_version": provenance.get("rule_version"),
-                    "reason": provenance.get("reason"),
-                }
-            )
-    if material_fallbacks:
+    if native_appearances:
         warnings.append(
             {
-                "code": "display.material_fallback",
+                "code": "appearance.native_derived",
                 "message": (
-                    "CAD appearance is unavailable; a platform display fallback is used "
-                    "without material semantics."
+                    "Material colors are derived from recorded native appearance owners "
+                    "and display-state assignments for the delivered faces."
                 ),
-                "objects": material_fallbacks,
+                "objects": native_appearances,
             }
         )
     if cfg.get("robot_name_source") == "cad_filename_derived":
@@ -1414,17 +1490,12 @@ def _value_warnings(
     constants = []
     for link in links:
         for visual in link.get("visuals") or []:
-            fields = ["scale"]
-            actual = {"scale": visual.get("scale")}
-            if visual.get("rgba"):
-                fields.append("material.rgba")
-                actual["rgba"] = visual["rgba"]
             constants.append(
                 {
                     "object_type": "visual",
                     "object": visual["name"],
-                    "fields": fields,
-                    "actual": actual,
+                    "fields": ["scale"],
+                    "actual": {"scale": visual.get("scale")},
                     "source": "display constant",
                 }
             )
@@ -1432,7 +1503,7 @@ def _value_warnings(
         warnings.append(
             {
                 "code": "display.constant",
-                "message": "Display scale and material color are platform constants, not CAD readings.",
+                "message": "Mesh display scale is a platform constant, not a CAD reading.",
                 "objects": constants,
             }
         )

@@ -29,7 +29,7 @@ from ..repository.publish import (
     seal_repository_snapshot,
 )
 from ..repository.review_branch import review_branch
-from ..runtime import scoped_executor_sha256, tool_record
+from ..runtime import python_version_is_supported, scoped_executor_sha256, tool_record
 from ..schemas import (
     NATIVE_TOOL_REQUIREMENT_KIND,
     PRODUCTION_ADMISSION_INTENT_SCHEMA,
@@ -232,7 +232,7 @@ def _formal_release(
         not isinstance(runtime, Mapping)
         or runtime.get("role") != role
         or runtime.get("system") != expected_system
-        or not str(runtime.get("python") or "").startswith("3.12")
+        or not python_version_is_supported(runtime.get("python"))
     ):
         raise ProtocolError(
             "admission_ingestion.release_invalid",
@@ -1017,8 +1017,6 @@ class ProductionAdmissionFactory:
                 logical_roots.append(
                     RulesetRoot(path=root_path, members=root_records)
                 )
-            if not records:
-                raise ProtocolError("admission_ingestion.ruleset_empty")
             version = "records-" + digest(
                 [root.to_record() for root in logical_roots]
             )

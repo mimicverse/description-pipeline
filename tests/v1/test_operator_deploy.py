@@ -319,26 +319,39 @@ match = re.search(r"FromBase64String\('([^']+)'\)", script)
 if match is None:
     raise SystemExit(2)
 expected = json.loads(base64.b64decode(match.group(1)).decode())
-contract = (
-    "legacy_pip_launcher_v0"
-    if expected["release"]["source_commit"] == "55cdf8da178e37239d3ac199cd27fc50cf56540d"
-    else "python_module_v1"
-)
 sample = {
     "task_name": expected["task_name"],
+    "task_path": "\\",
     "task_state": "Running",
     "action_count": 1,
+    "task_xml": "<Task/>",
+    "task_xml_sha256": "a" * 64,
+    "task_semantic_sha256": "c" * 64,
+    "task_acl_sha256": "d" * 64,
+    "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
+    "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
     "last_task_result": 267009,
     "listener_pid": 4242,
     "process_start_utc": "2026-10-21T00:00:00Z",
+    "process_command_sha256": "b" * 64,
+    "process_user_sid": "S-1-5-21-1",
+    "maintenance_relation": "target",
+    "source": {
+        "task_semantic_sha256": "c" * 64,
+        "task_acl_sha256": "d" * 64,
+        "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
+        "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
+        "config_digest": expected["config_digest"],
+        "install_id": expected["install_id"],
+        "release_identity_sha256": "e" * 64,
+    },
     "install_id": expected["install_id"],
     "config_digest": expected["config_digest"],
+    "release_identity_sha256": "e" * 64,
     "release": expected["release"],
     "health_install_id": expected["install_id"],
     "health_config_digest": expected["config_digest"],
     "health_release": expected["release"],
-    "launch_contract": contract,
-    "action_matches_generation": True,
 }
 print(json.dumps({"passed": True, "sample": sample}, sort_keys=True))
 PY
@@ -922,18 +935,36 @@ class LifecycleTests(unittest.TestCase):
             "release = identity['release']\n"
             "sample = {\n"
             "    'task_name': 'description-e2e-endpoint',\n"
+            "    'task_path': '\\\\',\n"
             "    'task_state': 'Running',\n"
             "    'action_count': 1,\n"
+            "    'task_xml': '<Task/>',\n"
+            "    'task_xml_sha256': 'a' * 64,\n"
+            "    'task_semantic_sha256': 'c' * 64,\n"
+            "    'task_acl_sha256': 'd' * 64,\n"
+            "    'endpoint_root': 'C:/description-e2e/state/lifecycle/gen-2/generation',\n"
+            "    'config_path': 'C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json',\n"
             "    'listener_pid': 4242,\n"
             "    'process_start_utc': '2026-10-21T00:00:00Z',\n"
+            "    'process_command_sha256': 'b' * 64,\n"
+            "    'process_user_sid': 'S-1-5-21-1',\n"
+            "    'maintenance_relation': 'target',\n"
             "    'install_id': identity['install_id'],\n"
             "    'config_digest': identity['config_digest'],\n"
+            "    'release_identity_sha256': 'e' * 64,\n"
+            "    'source': {\n"
+            "        'task_semantic_sha256': 'c' * 64,\n"
+            "        'task_acl_sha256': 'd' * 64,\n"
+            "        'endpoint_root': 'C:/description-e2e/state/lifecycle/gen-2/generation',\n"
+            "        'config_path': 'C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json',\n"
+            "        'config_digest': identity['config_digest'],\n"
+            "        'install_id': identity['install_id'],\n"
+            "        'release_identity_sha256': 'e' * 64,\n"
+            "    },\n"
             "    'release': release,\n"
             "    'health_install_id': identity['install_id'],\n"
             "    'health_config_digest': identity['config_digest'],\n"
             "    'health_release': release,\n"
-            "    'launch_contract': 'python_module_v1',\n"
-            "    'action_matches_generation': True,\n"
             "}\n"
             "if os.environ.get('FIXTURE_STATUS') == 'foreign':\n"
             "    sample['install_id'] = 'win-' + 'f' * 32\n"
@@ -972,46 +1003,61 @@ class LifecycleTests(unittest.TestCase):
             "  *\"-Verb status\"*|*\"two status probes returned different\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
-            "\"arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
-            "\"working_directory\":\"C:/description-e2e/state\","
-            "\"action_count\":1,\"launch_contract\":\"legacy_pip_launcher_v0\","
-            "\"action_matches_generation\":true,"
-            "\"config\":\"C:/original-install with spaces/endpoint.json\",\"state\":\"Running\"},"
+            "{\"state\":\"Running\",\"action_count\":1,"
+            "\"task_xml_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_semantic_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_acl_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"endpoint_root\":\"C:/original-install\","
+            "\"config_path\":\"C:/original-install/endpoint.json\","
+            "\"config_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+            "\"install_id\":\"win-11111111111111111111111111111111\","
+            "\"release_identity_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\","
+            "\"maintenance_relation\":\"source\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
-            "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
-            "\"source_arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
-            "\"source_working_directory\":\"C:/description-e2e/state\","
-            "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
+            "\"source\":{\"task_xml_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_semantic_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_acl_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"endpoint_root\":\"C:/original-install\","
+            "\"config_path\":\"C:/original-install/endpoint.json\","
+            "\"config_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+            "\"install_id\":\"win-11111111111111111111111111111111\","
+            "\"release_identity_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"},"
+            "\"target\":{\"task_xml_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"config_path\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"config_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\","
+            "\"config_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}},"
             "\"last_promotion\":null}'\n"
             '    elif [ "${FIXTURE_STATUS:-switched}" = "foreign" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/foreign/not-description.exe\","
-            "\"arguments\":\"foreign-service --option x\","
-            "\"working_directory\":\"C:/description-e2e/state\","
-            "\"action_count\":1,\"launch_contract\":null,"
-            "\"action_matches_generation\":false,"
-            "\"config\":\"C:/foreign/foreign.json\",\"state\":\"Running\"},"
+            "{\"state\":\"Running\",\"action_count\":1,"
+            "\"task_xml_sha256\":\"9999999999999999999999999999999999999999999999999999999999999999\","
+            "\"maintenance_relation\":\"unknown\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
-            "\"arguments\":\"-I -B -m description_pipeline.orchestration.windows serve --config "
-            "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
-            "\"working_directory\":\"C:/description-e2e/state\","
-            "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
-            "\"action_matches_generation\":true,"
-            "\"config\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
-            "\"state\":\"Running\"},"
+            "{\"state\":\"Running\",\"action_count\":1,"
+            "\"task_xml_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"endpoint_root\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
+            "\"config_path\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"config_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\","
+            "\"maintenance_relation\":\"target\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
-            "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
-            "\"source_arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
-            "\"source_working_directory\":\"C:/description-e2e/state\","
-            "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
+            "\"source\":{\"task_xml_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_semantic_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_acl_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"endpoint_root\":\"C:/original-install\","
+            "\"config_path\":\"C:/original-install/endpoint.json\","
+            "\"config_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+            "\"install_id\":\"win-11111111111111111111111111111111\","
+            "\"release_identity_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"},"
+            "\"target\":{\"task_xml_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"config_path\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"config_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\","
+            "\"config_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}},"
             "\"last_promotion\":null}'\n"
             "    fi ;;\n"
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
@@ -1315,7 +1361,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn("--native-receipt", control_text)
         self.assertNotIn("--orphan-operation-id", control_text)
 
-    def test_windows_reconciliation_requires_exact_python_module_action(self) -> None:
+    def test_windows_reconciliation_consumes_structured_source_and_target_state(self) -> None:
         control_text = CONTROL.read_text(encoding="utf-8")
         marker = (
             '      if ! "$CONTROL_PYTHON" - "$RECEIPT_DIR/windows-binding.json" '
@@ -1327,33 +1373,43 @@ class LifecycleTests(unittest.TestCase):
         script = control_text[start:end]
         target = "C:/description-e2e/state/lifecycle/gen-2/generation"
         previous = "C:/description-e2e/state/instance-promotions/previous-0001"
-        exact_arguments = (
-            '-I -B -m description_pipeline.orchestration.windows serve --config "'
-            + target
-            + '/endpoint.json"'
-        )
+        source_root = "C:/description-e2e/state/lifecycle/gen-main-4ed/generation"
+        target_hash = "b" * 64
         binding = {
             "dir": "C:/description-e2e/state/lifecycle/gen-2",
             "state_root": "C:/description-e2e/state",
         }
-        status = {
+        source_state = {
+            "task_xml_sha256": "a" * 64,
+            "task_semantic_sha256": "a" * 64,
+            "task_acl_sha256": "b" * 64,
+            "endpoint_root": source_root,
+            "config_path": source_root + "/endpoint.json",
+            "config_digest": "d" * 64,
+            "install_id": "win-" + "1" * 32,
+            "release_identity_sha256": "e" * 64,
+        }
+        target_state = {
+            "task_xml_sha256": target_hash,
+            "config_path": target + "/endpoint.json",
+            "config_sha256": "f" * 64,
+            "config_digest": "2" * 64,
+        }
+        target_status = {
             "live_task": {
-                "execute": target + "/runtime/Scripts/python.exe",
-                "arguments": exact_arguments,
-                "working_directory": binding["state_root"],
-                "config": target + "/endpoint.json",
                 "state": "Running",
                 "action_count": 1,
-                "launch_contract": "python_module_v1",
-                "action_matches_generation": True,
+                "task_xml_sha256": target_hash,
+                "endpoint_root": target,
+                "config_path": target + "/endpoint.json",
+                "config_digest": target_state["config_digest"],
+                "maintenance_relation": "target",
             },
             "pending": {
                 "generation": target,
                 "previous": previous,
-                "source_launcher": "C:/old/runtime/Scripts/description.exe",
-                "source_arguments": 'serve --config "C:/old/endpoint.json"',
-                "source_working_directory": binding["state_root"],
-                "source_config": "C:/old/endpoint.json",
+                "source": source_state,
+                "target": target_state,
             },
             "last_promotion": None,
         }
@@ -1372,141 +1428,66 @@ class LifecycleTests(unittest.TestCase):
                 )
                 return result.stdout.strip()
 
-        self.assertEqual(reconcile(status), previous)
-        for separator in ("\\", "mixed"):
-            with self.subTest(separator=separator):
-                variant = copy.deepcopy(status)
-                variant["live_task"].update(
-                    execute=(
-                        target.replace("/", "\\")
-                        if separator == "\\"
-                        else target.replace("lifecycle/gen-2", "lifecycle\\gen-2")
-                    )
-                    + (
-                        "\\runtime\\Scripts\\python.exe"
-                        if separator == "\\"
-                        else "/runtime\\Scripts/python.exe"
-                    ),
-                    arguments=exact_arguments.replace("/", "\\")
-                    if separator == "\\"
-                    else exact_arguments.replace("lifecycle/gen-2", "lifecycle\\gen-2"),
-                    config=target.replace("/", "\\") + "\\endpoint.json"
-                    if separator == "\\"
-                    else target + "\\endpoint.json",
-                )
-                self.assertEqual(reconcile(variant), previous)
-        source_status = copy.deepcopy(status)
+        self.assertEqual(reconcile(target_status), previous)
+        source_status = copy.deepcopy(target_status)
         source_status["live_task"] = {
-            "execute": "C:/old/runtime/Scripts/description.exe",
-            "arguments": 'serve --config "C:/old/endpoint.json"',
-            "working_directory": binding["state_root"],
-            "config": "C:/old/endpoint.json",
             "state": "Running",
             "action_count": 1,
-            "launch_contract": "legacy_pip_launcher_v0",
-            "action_matches_generation": True,
+            "task_xml_sha256": source_state["task_xml_sha256"],
+            "task_semantic_sha256": source_state["task_semantic_sha256"],
+            "task_acl_sha256": source_state["task_acl_sha256"],
+            "endpoint_root": source_root,
+            "config_path": source_state["config_path"],
+            "config_digest": source_state["config_digest"],
+            "install_id": source_state["install_id"],
+            "release_identity_sha256": source_state["release_identity_sha256"],
+            "maintenance_relation": "source",
         }
         self.assertEqual(reconcile(source_status), "before")
-        python_source = "C:/description-e2e/state/lifecycle/gen-1/generation"
-        python_source_status = copy.deepcopy(status)
-        python_source_status["live_task"] = {
-            "execute": python_source + "/runtime/Scripts/python.exe",
-            "arguments": '-I -m description_pipeline serve --config "'
-            + python_source
-            + '/endpoint.json"',
-            "working_directory": binding["state_root"],
-            "config": python_source + "/endpoint.json",
-            "state": "Running",
-            "action_count": 1,
-            "launch_contract": "python_module_v1",
-            "action_matches_generation": True,
-        }
-        python_source_status["pending"].update(
-            source_launcher=python_source + "/runtime/Scripts/python.exe",
-            source_arguments='-I -m description_pipeline serve --config "'
-            + python_source
-            + '/endpoint.json"',
-            source_working_directory=binding["state_root"],
-            source_config=python_source + "/endpoint.json",
+        source_mixed_slashes = copy.deepcopy(source_status)
+        source_mixed_slashes["live_task"]["endpoint_root"] = source_root.replace(
+            "lifecycle/gen-main-4ed",
+            "lifecycle\\gen-main-4ed",
         )
-        self.assertEqual(reconcile(python_source_status), "before")
-        source_near_match = copy.deepcopy(source_status)
-        source_near_match["live_task"]["arguments"] += " --foreign"
-        self.assertEqual(reconcile(source_near_match), "unknown")
-        source_case_mismatch = copy.deepcopy(source_status)
-        source_case_mismatch["live_task"]["arguments"] = (
-            source_case_mismatch["live_task"]["arguments"].replace("serve", "Serve", 1)
-        )
-        self.assertEqual(reconcile(source_case_mismatch), "unknown")
-        legacy_pending = copy.deepcopy(source_status)
-        legacy_pending["live_task"].update(
-            launch_contract="legacy_pip_launcher_v0",
-            action_matches_generation=True,
-        )
-        legacy_pending["pending"].pop("source_arguments")
-        legacy_pending["pending"].pop("source_working_directory")
-        self.assertEqual(reconcile(legacy_pending), "before")
+        self.assertEqual(reconcile(source_mixed_slashes), "before")
         for label, mutate in (
             (
-                "legacy-contract-missing",
-                lambda value: value["live_task"].pop("launch_contract"),
+                "source-task-semantic",
+                lambda value: value["live_task"].update(task_semantic_sha256="3" * 64),
             ),
             (
-                "legacy-action-mismatch",
-                lambda value: value["live_task"].update(
-                    action_matches_generation=False
-                ),
+                "source-task-acl",
+                lambda value: value["live_task"].update(task_acl_sha256="3" * 64),
             ),
             (
-                "legacy-source-arguments-unbound",
-                lambda value: value["live_task"].update(
-                    arguments=value["live_task"]["arguments"] + " --foreign"
-                ),
+                "source-endpoint",
+                lambda value: value["live_task"].update(endpoint_root="C:/foreign/generation"),
             ),
             (
-                "legacy-source-fields-partial",
-                lambda value: value["pending"].update(
-                    source_working_directory=binding["state_root"]
-                ),
+                "source-config",
+                lambda value: value["live_task"].update(config_digest="4" * 64),
             ),
             (
-                "legacy-source-config-unpaired",
-                lambda value: value["pending"].update(
-                    source_config="C:/unbound/endpoint.json"
-                ),
+                "source-install",
+                lambda value: value["live_task"].update(install_id="win-" + "5" * 32),
+            ),
+            (
+                "source-release",
+                lambda value: value["live_task"].update(release_identity_sha256="6" * 64),
+            ),
+            (
+                "relation-foreign",
+                lambda value: value["live_task"].update(maintenance_relation="foreign"),
             ),
         ):
             with self.subTest(label=label):
-                changed = copy.deepcopy(legacy_pending)
+                changed = copy.deepcopy(source_status)
                 mutate(changed)
                 self.assertEqual(reconcile(changed), "unknown")
-        python_source_missing_fields = copy.deepcopy(legacy_pending)
-        python_arguments = (
-            '-I -B -m description_pipeline serve --config "C:/old/endpoint.json"'
-        )
-        python_source_missing_fields["live_task"].update(
-            execute="C:/old/runtime/Scripts/python.exe",
-            arguments=python_arguments,
-            launch_contract="python_module_v1",
-        )
-        python_source_missing_fields["pending"][
-            "source_launcher"
-        ] = "C:/old/runtime/Scripts/python.exe"
-        self.assertEqual(reconcile(python_source_missing_fields), "unknown")
-        for label, arguments in (
-            ("additional-token", exact_arguments + " --foreign"),
-            ("bytecode-flag-missing", exact_arguments.replace("-I -B ", "-I ", 1)),
-            ("interactive-flag", exact_arguments.replace("-I ", "-i ", 1)),
-            ("module-case", exact_arguments.replace("description_pipeline", "Description_Pipeline")),
-        ):
-            with self.subTest(label=label):
-                near_match = copy.deepcopy(status)
-                near_match["live_task"]["arguments"] = arguments
-                self.assertEqual(reconcile(near_match), "unknown")
+        target_digest_mismatch = copy.deepcopy(target_status)
+        target_digest_mismatch["live_task"]["config_digest"] = "0" * 64
+        self.assertEqual(reconcile(target_digest_mismatch), "unknown")
         for label, changes in (
-            ("action-not-matched", {"action_matches_generation": False}),
-            ("contract-null", {"launch_contract": None}),
-            ("contract-foreign", {"launch_contract": "foreign_launcher_v1"}),
             ("action-count-boolean", {"action_count": True}),
             ("action-count-float", {"action_count": 1.0}),
             ("task-ready", {"state": "Ready"}),
@@ -1514,9 +1495,12 @@ class LifecycleTests(unittest.TestCase):
             ("task-unknown", {"state": "Unknown"}),
         ):
             with self.subTest(label=label):
-                changed = copy.deepcopy(status)
+                changed = copy.deepcopy(target_status)
                 changed["live_task"].update(changes)
                 self.assertEqual(reconcile(changed), "unknown")
+        missing_source = copy.deepcopy(source_status)
+        missing_source["pending"].pop("source")
+        self.assertEqual(reconcile(missing_source), "unknown")
 
     def test_promotion_replay_fresh_requires_both_stage_steps(self) -> None:
         promotion = OPERATOR / "promotion.py"
@@ -2775,17 +2759,22 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('"$output.transport.json"', control)
         self.assertIn('2> "$output.stderr"', control)
         self.assertIn('[ "$status" != "completed" ]', control)
-        self.assertIn("$python -I -B -c $program $configPath", control)
-        self.assertIn("Test-Bytecode-TransitionGeneration", control)
-        self.assertIn("Test-Transition-LaunchArguments", control)
-        self.assertIn("140d39e51be5f0c39c32d7cfea9ca25fe642c273", control)
+        self.assertIn("-File $lifecycle -Verb status -Binding $binding", control)
+        self.assertIn("the managed lifecycle status did not prove the running task identity", control)
+        self.assertNotIn("Test-Bytecode-TransitionGeneration", control)
+        self.assertNotIn("140d39e51be5f0c39c32d7cfea9ca25fe642c273", control)
+        self.assertNotIn("55cdf8da178e37239d3ac199cd27fc50cf56540d", control)
+        self.assertNotIn("legacy_pip_launcher_v0", control)
+        self.assertNotIn("parse_arguments", control)
+        self.assertIn("task_xml_sha256", control)
+        self.assertIn("process_command_sha256", control)
+        self.assertNotIn("Get-CimInstance Win32_Process", control)
         self.assertNotIn("gzip.compress(script", control)
         self.assertNotIn('ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST"', control)
         self.assertNotIn('ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST"', control)
         self.assertNotIn('"-Command",\n            "-",', control)
         self.assertIn("$task.Actions).Count -ne 1", control)
-        self.assertIn("$record.passed -isnot [bool]", control)
-        self.assertIn("$record.launch_contract -isnot [string]", control)
+        self.assertNotIn("launch_contract", control)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path, state, config_home, _ = self._render_units(root)
@@ -2836,18 +2825,28 @@ class LifecycleTests(unittest.TestCase):
             expected = json.loads((state / "install-record.json").read_text(encoding="utf-8"))["ends"]["windows"]
             raw_sample = {
                 "task_name": baseline_sample["task_name"],
+                "task_path": baseline_sample["task_path"],
                 "task_state": "Running",
                 "action_count": 1,
+                "task_xml": baseline_sample["task_xml"],
+                "task_xml_sha256": baseline_sample["task_xml_sha256"],
+                "task_semantic_sha256": baseline_sample["task_semantic_sha256"],
+                "task_acl_sha256": baseline_sample["task_acl_sha256"],
+                "endpoint_root": baseline_sample["endpoint_root"],
+                "config_path": baseline_sample["config_path"],
                 "listener_pid": baseline_sample["listener_pid"],
                 "process_start_utc": baseline_sample["process_start_utc"],
+                "process_command_sha256": baseline_sample["process_command_sha256"],
+                "process_user_sid": baseline_sample["process_user_sid"],
+                "maintenance_relation": baseline_sample["maintenance_relation"],
+                "source": baseline_sample["source"],
                 "install_id": baseline_sample["install_id"],
                 "config_digest": baseline_sample["config_digest"],
+                "release_identity_sha256": baseline_sample["release_identity_sha256"],
                 "release": expected["release"],
                 "health_install_id": baseline_sample["install_id"],
                 "health_config_digest": baseline_sample["config_digest"],
                 "health_release": expected["release"],
-                "launch_contract": baseline_sample["launch_contract"],
-                "action_matches_generation": True,
             }
             raw_transport = json.dumps(
                 {"passed": True, "sample": raw_sample},
@@ -2860,6 +2859,75 @@ class LifecycleTests(unittest.TestCase):
             )
             multiline = status()
             self.assertEqual(multiline.returncode, 0, multiline.stdout + multiline.stderr)
+
+            rollback_intent = {
+                "state": "present",
+                "previous": "C:/description-e2e/state/instance-promotions/previous-0001",
+                "target_generation": "C:/description-e2e/state/lifecycle/gen-2/generation",
+                "restore_to": "C:/description-e2e/state/instance-promotions/previous-0001",
+                "current_snapshot": (
+                    "C:/description-e2e/state/instance-promotions/rollback-before-0001"
+                ),
+                "source_state_sha256": "f" * 64,
+            }
+            raw_sample["pending_rollback"] = rollback_intent
+            status_path.write_text(
+                json.dumps({"passed": True, "sample": raw_sample}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            intent_status = status()
+            self.assertEqual(
+                intent_status.returncode,
+                0,
+                intent_status.stdout + intent_status.stderr,
+            )
+            intent_sample = json.loads(intent_status.stdout.strip().splitlines()[-1])
+            self.assertEqual(intent_sample["pending_rollback"], rollback_intent)
+            self.assertEqual(intent_sample["task_state"], "Running")
+            self.assertGreater(intent_sample["listener_pid"], 0)
+            self.assertEqual(
+                intent_sample["source"]["install_id"],
+                intent_sample["install_id"],
+            )
+
+            unknown_intent = {
+                "state": "unknown",
+                "code": "rollback_intent_unreadable",
+                "path": "C:/description-e2e/state/instance-promotions/pending-rollback.json",
+                "error": "the pending rollback intent is incomplete or malformed",
+            }
+            raw_sample["pending_rollback"] = unknown_intent
+            status_path.write_text(
+                json.dumps({"passed": True, "sample": raw_sample}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            unknown_status = status()
+            self.assertEqual(
+                unknown_status.returncode,
+                0,
+                unknown_status.stdout + unknown_status.stderr,
+            )
+            unknown_sample = json.loads(
+                unknown_status.stdout.strip().splitlines()[-1]
+            )
+            self.assertEqual(unknown_sample["pending_rollback"], unknown_intent)
+            self.assertEqual(unknown_sample["task_state"], "Running")
+            self.assertGreater(unknown_sample["listener_pid"], 0)
+
+            raw_sample["pending_rollback"] = {
+                **rollback_intent,
+                "source_state_sha256": "bad",
+            }
+            status_path.write_text(
+                json.dumps({"passed": True, "sample": raw_sample}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            invalid_intent = status()
+            self.assertNotEqual(invalid_intent.returncode, 0)
+            self.assertIn(
+                "Windows process/identity probe differs from the install record",
+                invalid_intent.stderr,
+            )
 
             for name, content, expected in (
                 ("empty", "", "Windows probe returned no JSON"),
@@ -3078,19 +3146,37 @@ class LifecycleTests(unittest.TestCase):
                     "passed": True,
                     "sample": {
                         "task_name": "description-e2e-endpoint",
+                        "task_path": "\\",
                         "task_state": task_state,
                         "action_count": 1,
+                        "task_xml": "<Task/>",
+                        "task_xml_sha256": "a" * 64,
+                        "task_semantic_sha256": "c" * 64,
+                        "task_acl_sha256": "d" * 64,
+                        "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
+                        "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
                         "last_task_result": 267009,
                         "listener_pid": 4242,
                         "process_start_utc": "2026-10-21T00:00:00Z",
+                        "process_command_sha256": "b" * 64,
+                        "process_user_sid": "S-1-5-21-1",
+                        "maintenance_relation": "target",
+                        "source": {
+                            "task_semantic_sha256": "c" * 64,
+                            "task_acl_sha256": "d" * 64,
+                            "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
+                            "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
+                            "config_digest": identity["config_digest"],
+                            "install_id": identity["install_id"],
+                            "release_identity_sha256": "e" * 64,
+                        },
                         "install_id": identity["install_id"],
                         "config_digest": identity["config_digest"],
+                        "release_identity_sha256": "e" * 64,
                         "release": identity["release"],
                         "health_install_id": identity["install_id"],
                         "health_config_digest": identity["config_digest"],
                         "health_release": identity["release"],
-                        "launch_contract": "python_module_v1",
-                        "action_matches_generation": True,
                     },
                 }
                 (root / "windows-status.json").write_text(
@@ -3114,9 +3200,14 @@ class LifecycleTests(unittest.TestCase):
                 )
 
             for label, changes in (
-                ("wrong-contract", {"launch_contract": "foreign_launcher_v1"}),
-                ("contract-case", {"launch_contract": "Python_Module_V1"}),
-                ("action-mismatch", {"action_matches_generation": False}),
+                ("task-path", {"task_path": ""}),
+                ("endpoint-root", {"endpoint_root": ""}),
+                ("config-path", {"config_path": ""}),
+                ("task-xml-body", {"task_xml": ""}),
+                ("task-xml", {"task_xml_sha256": "bad"}),
+                ("release-identity", {"release_identity_sha256": "bad"}),
+                ("process-command", {"process_command_sha256": "bad"}),
+                ("process-user", {"process_user_sid": ""}),
                 ("multi-action", {"action_count": 2}),
                 ("boolean-action-count", {"action_count": True}),
                 ("float-action-count", {"action_count": 1.0}),
@@ -3126,18 +3217,36 @@ class LifecycleTests(unittest.TestCase):
                         "passed": True,
                         "sample": {
                             "task_name": "description-e2e-endpoint",
+                            "task_path": "\\",
                             "task_state": "Running",
                             "action_count": 1,
+                            "task_xml": "<Task/>",
+                            "task_xml_sha256": "a" * 64,
+                            "task_semantic_sha256": "c" * 64,
+                            "task_acl_sha256": "d" * 64,
+                            "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
+                            "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
                             "listener_pid": 4242,
                             "process_start_utc": "2026-10-21T00:00:00Z",
+                            "process_command_sha256": "b" * 64,
+                            "process_user_sid": "S-1-5-21-1",
+                            "maintenance_relation": "target",
+                            "source": {
+                                "task_semantic_sha256": "c" * 64,
+                                "task_acl_sha256": "d" * 64,
+                                "endpoint_root": "C:/description-e2e/state/lifecycle/gen-2/generation",
+                                "config_path": "C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json",
+                                "config_digest": identity["config_digest"],
+                                "install_id": identity["install_id"],
+                                "release_identity_sha256": "e" * 64,
+                            },
                             "install_id": identity["install_id"],
                             "config_digest": identity["config_digest"],
+                            "release_identity_sha256": "e" * 64,
                             "release": identity["release"],
                             "health_install_id": identity["install_id"],
                             "health_config_digest": identity["config_digest"],
                             "health_release": identity["release"],
-                            "launch_contract": "python_module_v1",
-                            "action_matches_generation": True,
                         },
                     }
                     sample["sample"].update(changes)
@@ -3919,18 +4028,36 @@ class InstallOrderingTests(unittest.TestCase):
             "release = identity['release']\n"
             "sample = {\n"
             "    'task_name': 'description-e2e-endpoint',\n"
+            "    'task_path': '\\\\',\n"
             "    'task_state': 'Running',\n"
             "    'action_count': 1,\n"
+            "    'task_xml': '<Task/>',\n"
+            "    'task_xml_sha256': 'a' * 64,\n"
+            "    'task_semantic_sha256': 'c' * 64,\n"
+            "    'task_acl_sha256': 'd' * 64,\n"
+            "    'endpoint_root': 'C:/description-e2e/state/lifecycle/gen-2/generation',\n"
+            "    'config_path': 'C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json',\n"
             "    'listener_pid': 4242,\n"
             "    'process_start_utc': '2026-10-21T00:00:00Z',\n"
+            "    'process_command_sha256': 'b' * 64,\n"
+            "    'process_user_sid': 'S-1-5-21-1',\n"
+            "    'maintenance_relation': 'target',\n"
             "    'install_id': identity['install_id'],\n"
             "    'config_digest': identity['config_digest'],\n"
+            "    'release_identity_sha256': 'e' * 64,\n"
+            "    'source': {\n"
+            "        'task_semantic_sha256': 'c' * 64,\n"
+            "        'task_acl_sha256': 'd' * 64,\n"
+            "        'endpoint_root': 'C:/description-e2e/state/lifecycle/gen-2/generation',\n"
+            "        'config_path': 'C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json',\n"
+            "        'config_digest': identity['config_digest'],\n"
+            "        'install_id': identity['install_id'],\n"
+            "        'release_identity_sha256': 'e' * 64,\n"
+            "    },\n"
             "    'release': release,\n"
             "    'health_install_id': identity['install_id'],\n"
             "    'health_config_digest': identity['config_digest'],\n"
             "    'health_release': release,\n"
-            "    'launch_contract': 'python_module_v1',\n"
-            "    'action_matches_generation': True,\n"
             "}\n"
             "if os.environ.get('FIXTURE_STATUS') == 'foreign':\n"
             "    sample['install_id'] = 'win-' + 'f' * 32\n"
@@ -3984,46 +4111,61 @@ class InstallOrderingTests(unittest.TestCase):
             "  *\"-Verb status\"*|*\"two status probes returned different\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
-            "\"arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
-            "\"working_directory\":\"C:/description-e2e/state\","
-            "\"action_count\":1,\"launch_contract\":\"legacy_pip_launcher_v0\","
-            "\"action_matches_generation\":true,"
-            "\"config\":\"C:/original-install with spaces/endpoint.json\",\"state\":\"Running\"},"
+            "{\"state\":\"Running\",\"action_count\":1,"
+            "\"task_xml_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_semantic_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_acl_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"endpoint_root\":\"C:/original-install\","
+            "\"config_path\":\"C:/original-install/endpoint.json\","
+            "\"config_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+            "\"install_id\":\"win-11111111111111111111111111111111\","
+            "\"release_identity_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\","
+            "\"maintenance_relation\":\"source\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
-            "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
-            "\"source_arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
-            "\"source_working_directory\":\"C:/description-e2e/state\","
-            "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
+            "\"source\":{\"task_xml_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_semantic_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_acl_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"endpoint_root\":\"C:/original-install\","
+            "\"config_path\":\"C:/original-install/endpoint.json\","
+            "\"config_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+            "\"install_id\":\"win-11111111111111111111111111111111\","
+            "\"release_identity_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"},"
+            "\"target\":{\"task_xml_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"config_path\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"config_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\","
+            "\"config_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}},"
             "\"last_promotion\":null}'\n"
             '    elif [ "${FIXTURE_STATUS:-switched}" = "foreign" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/foreign/not-description.exe\","
-            "\"arguments\":\"foreign-service --option x\","
-            "\"working_directory\":\"C:/description-e2e/state\","
-            "\"action_count\":1,\"launch_contract\":null,"
-            "\"action_matches_generation\":false,"
-            "\"config\":\"C:/foreign/foreign.json\",\"state\":\"Running\"},"
+            "{\"state\":\"Running\",\"action_count\":1,"
+            "\"task_xml_sha256\":\"9999999999999999999999999999999999999999999999999999999999999999\","
+            "\"maintenance_relation\":\"unknown\"},"
             "\"pending\":null,\"last_promotion\":null}'\n"
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
-            "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
-            "\"arguments\":\"-I -B -m description_pipeline.orchestration.windows serve --config "
-            "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
-            "\"working_directory\":\"C:/description-e2e/state\","
-            "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
-            "\"action_matches_generation\":true,"
-            "\"config\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
-            "\"state\":\"Running\"},"
+            "{\"state\":\"Running\",\"action_count\":1,"
+            "\"task_xml_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"endpoint_root\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
+            "\"config_path\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"config_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\","
+            "\"maintenance_relation\":\"target\"},"
             "\"pending\":{\"intent\":true,\"verb\":\"promote\","
             "\"generation\":\"C:/description-e2e/state/lifecycle/gen-2/generation\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\","
-            "\"source_launcher\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
-            "\"source_arguments\":\"serve --config \\\"C:/original-install with spaces/endpoint.json\\\"\","
-            "\"source_working_directory\":\"C:/description-e2e/state\","
-            "\"source_config\":\"C:/original-install with spaces/endpoint.json\"},"
+            "\"source\":{\"task_xml_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_semantic_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+            "\"task_acl_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"endpoint_root\":\"C:/original-install\","
+            "\"config_path\":\"C:/original-install/endpoint.json\","
+            "\"config_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+            "\"install_id\":\"win-11111111111111111111111111111111\","
+            "\"release_identity_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"},"
+            "\"target\":{\"task_xml_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+            "\"config_path\":\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\","
+            "\"config_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\","
+            "\"config_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}},"
             "\"last_promotion\":null}'\n"
             "    fi ;;\n"
             "esac\n"

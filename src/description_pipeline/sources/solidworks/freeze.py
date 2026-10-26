@@ -1,18 +1,16 @@
-"""Capture a complete SolidWorks source into an immutable snapshot.
+"""Read and seal one prepared SolidWorks source.
 
-The adapter never saves over the original design: it reads a *copy* produced by
-SolidWorks' own dependency collector, proves that the copy's references resolve
-inside the snapshot, records the raw API readings and geometry, and only then
-commits the snapshot.
+Freeze and Discover own the first dependency closure and prepared package.
+Capture consumes those sealed bytes, opens one owned read-only session, records
+the native facts once, releases CAD, and then performs STL serialization,
+normalization, evidence projection, and snapshot publication offline.
 
 Nothing here derives values from a final URDF or from hand-written XML: every
-number in ``raw/`` comes from the CAD API during this capture.
+CAD value in ``raw/`` comes from the prepared native session.
 """
 
 from __future__ import annotations
 
-import copy
-import json
 import math
 import os
 import re
@@ -20,24 +18,16 @@ import shutil
 import contextlib
 from pathlib import Path, PurePosixPath
 from typing import Any
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from .errors import BridgeError, ConfigError
 from .inertia_convention import normalize_capture_inertia
-from .session_artifacts import (
-    SESSION_DOCUMENT_API,
-    embedded_virtual_component_path,
-    embedded_virtual_component_under_root,
-    session_artifact_path,
-    session_materialization_path,
-    session_root_pid,
-)
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, read_json, sha256_file, write_json
 
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
-from ...io import inventory
-from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA, NATIVE_TESSELLATION_SCHEMA
+from ...io import confined, inventory
+from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 
 #: Freeze/capture record ids live in the ``solidworks-to-urdf.*`` family only.
 #: Sealed evidence from before the XC-01 rename is replayed with its era
@@ -51,12 +41,8 @@ SOURCE_KEYS = {
     "provider",
     "assembly",
     "configuration",
-    "allowed_roots",
-    "closure",
-    "document_suffixes",
     "geometry",
     "coordinate_systems",
-    "require_saved",
     "groups",
     "axis_requests",
     "robot_name",
@@ -88,10 +74,6 @@ def _capture_note(activity, action: str, **fields) -> None:
 
     if activity is not None:
         activity.emit(action, phase="capture", **fields)
-
-
-def _normalise_path(value: str) -> str:
-    return os.path.normcase(os.path.abspath(value))
 
 
 def _expected_range(value: Any, where: str) -> list[float] | None:
@@ -155,15 +137,6 @@ def _prepare_destination(destination: Path) -> bool:
     return True
 
 
-def _under(path: str, roots: list[str]) -> bool:
-    candidate = _normalise_path(path)
-    for root in roots:
-        root_path = _normalise_path(root)
-        if candidate == root_path or candidate.startswith(root_path.rstrip(os.sep) + os.sep):
-            return True
-    return False
-
-
 def validate_source_config(config: object) -> dict[str, Any]:
     """Validate the ``source`` mapping before anything touches SolidWorks."""
 
@@ -171,7 +144,6 @@ def validate_source_config(config: object) -> dict[str, Any]:
     assert isinstance(config, dict)
     unknown = sorted(set(config) - SOURCE_KEYS)
     _require(not unknown, f"source config has unknown keys: {', '.join(unknown)}", unknown)
-    _require(config.get("require_saved", True) is True, "source.require_saved cannot be disabled for a frozen snapshot")
     provider = str(config.get("provider") or SOURCE_KIND)
     _require(provider == SOURCE_KIND, f"this adapter only serves provider=solidworks, got {provider!r}")
     assembly = config.get("assembly")
@@ -179,40 +151,22 @@ def validate_source_config(config: object) -> dict[str, Any]:
         isinstance(assembly, str) and assembly.strip() != "",
         "source.assembly must be the absolute path of the top-level SLDASM",
     )
-    suffixes = tuple(str(item).lower() for item in config.get("document_suffixes") or DEFAULT_ALLOWED_SUFFIXES)
-    _require(".sldasm" in suffixes, "source.document_suffixes must include .sldasm")
     configuration = config.get("configuration")
     _require(
         isinstance(configuration, str) and configuration.strip() != "",
         "source.configuration must be explicit; the adapter never guesses the active configuration",
     )
-    allowed_roots = config.get("allowed_roots") or []
-    _require(isinstance(allowed_roots, list), "source.allowed_roots must be a list of directories")
-    closure = config.get("closure")
-    if closure is not None:
-        # Internal carrier: the sealed native closure travels with the source
-        # config so the freeze stage can bind the admitted resolution (graph
-        # owner documents, cached materializations, suppressed placements)
-        # instead of pre-listing saved author paths.
-        _require(isinstance(closure, dict), "source.closure must be the sealed native closure mapping")
-        _require(
-            closure.get("schema_version") in (None, "solidworks-to-urdf.native-closure/v1"),
-            "source.closure must carry the native closure schema",
-        )
-        for name in ("graph", "documents", "imports", "virtual_components", "suppressed"):
-            if name in closure:
-                _require(isinstance(closure[name], (dict, list)), f"source.closure.{name} has the wrong shape")
     geometry = config.get("geometry") or {}
     _require(isinstance(geometry, dict), "source.geometry must be a mapping")
     groups = config.get("groups")
     _require(isinstance(groups, list) and groups, "source.groups must be the native link-group selections")
     axis_requests = config.get("axis_requests")
     _require(isinstance(axis_requests, list), "source.axis_requests must be the native axis requests")
-    if geometry.get("enabled"):
-        _require(
-            str(geometry.get("format", "stl_binary")) == "stl_binary",
-            "source.geometry.format must be stl_binary",
-        )
+    _require(geometry.get("enabled", True) is True, "source.geometry capture is required")
+    _require(
+        geometry.get("format", "stl_binary") == "stl_binary",
+        "source.geometry.format must be stl_binary",
+    )
     coordinate_systems = config.get("coordinate_systems") or []
     _require(isinstance(coordinate_systems, list), "source.coordinate_systems must be a list of names")
     # Geometry exclusions already charged in the physics model must be objects with
@@ -279,12 +233,8 @@ def validate_source_config(config: object) -> dict[str, Any]:
         "provider": provider,
         "assembly": str(assembly),
         "configuration": str(configuration),
-        "allowed_roots": [str(root) for root in allowed_roots],
-        "closure": dict(closure) if isinstance(closure, dict) else None,
-        "document_suffixes": suffixes,
         "geometry": dict(geometry),
         "coordinate_systems": [str(name) for name in coordinate_systems],
-        "require_saved": True,
         "groups": [dict(item) for item in (config.get("groups") or [])],
         "axis_requests": [dict(item) for item in (config.get("axis_requests") or [])],
         "robot_name": str(config.get("robot_name") or "robot"),
@@ -324,13 +274,12 @@ def _document_state(backend: Any, cfg: dict[str, Any]) -> dict[str, Any]:
         raise BridgeError("cad_document_state_unreadable", "the backend cannot read document state", exit_code=3)
     state = dict(reader(cfg["assembly"]) or {})
     if (
-        type(state.get("saved")) is not bool
-        or not isinstance(state.get("active_configuration"), str)
+        not isinstance(state.get("active_configuration"), str)
         or not state["active_configuration"].strip()
     ):
         raise BridgeError(
             "cad_document_state_unreadable",
-            "saved state and active configuration must both be known",
+            "the active configuration must be known",
             {"document": cfg["assembly"], "state": state},
             exit_code=3,
         )
@@ -554,839 +503,156 @@ def _source_inputs(cfg: dict[str, Any], closure: dict[str, Any]) -> dict[str, st
     return inputs
 
 
-def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> dict[str, Any]:
-    """Collect the source with its dependencies and prove the closure.
+def _sealed_capture_files(
+    package: Path,
+    cfg: dict[str, Any],
+    native_files: Mapping[str, str],
+) -> tuple[str, dict[str, str]]:
+    """Return the prepared main's relative path and sealed CAD-file digests."""
 
-    The pre-listing is advisory, so the decision is made on the copy SolidWorks
-    itself produced: it must name the exact top-level, every path it resolves must
-    exist inside the snapshot, and re-opening that top-level must show the same
-    component instances and configurations as the original.
+    package = Path(package).resolve()
+    if not isinstance(native_files, Mapping) or not native_files:
+        raise BridgeError(
+            "sealed_capture_incomplete",
+            "the sealed prepared source carries no CAD file inventory",
+            exit_code=3,
+        )
+    files: dict[str, str] = {}
+    for relative, checksum in native_files.items():
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or not isinstance(checksum, str)
+            or SHA256_RE.fullmatch(checksum) is None
+        ):
+            raise BridgeError(
+                "sealed_capture_incomplete",
+                "the sealed prepared source carries an invalid CAD file entry",
+                {"path": relative},
+                exit_code=3,
+            )
+        files[relative] = checksum
+    assembly = Path(str(cfg["assembly"])).resolve()
+    try:
+        main_relative = assembly.relative_to(package).as_posix()
+    except ValueError as error:
+        raise BridgeError(
+            "sealed_capture_scope",
+            "the prepared main assembly is outside its sealed package",
+            {"assembly": str(assembly), "package": str(package)},
+            exit_code=3,
+        ) from error
+    if main_relative not in files:
+        raise BridgeError(
+            "sealed_capture_incomplete",
+            "the sealed prepared source does not inventory its main assembly",
+            {"main_assembly": main_relative},
+            exit_code=3,
+        )
+    return main_relative, files
+
+
+def _copy_sealed_capture_source(
+    prepared_root: Path,
+    source_root: Path,
+    files: Mapping[str, str],
+) -> dict[str, str]:
+    """Copy the immutable prepared CAD files without collecting or rewriting."""
+
+    prepared_root = Path(prepared_root).resolve()
+    source_root = Path(source_root).resolve()
+    copied: dict[str, str] = {}
+    for relative, expected in sorted(files.items()):
+        source = confined(prepared_root, relative)
+        if source.is_symlink() or not source.is_file():
+            raise BridgeError(
+                "sealed_capture_incomplete",
+                "a sealed prepared CAD file is absent or linked",
+                {"path": relative},
+                exit_code=3,
+            )
+        target = confined(source_root, relative, exists=False)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        actual = sha256_file(target)
+        if actual != expected:
+            raise BridgeError(
+                "sealed_capture_changed",
+                "a sealed prepared CAD file changed before capture",
+                {"path": relative, "expected": expected, "actual": actual},
+                exit_code=3,
+            )
+        copied[relative] = actual
+    return copied
+
+
+def _sealed_dependency_closure(
+    cfg: dict[str, Any],
+    *,
+    package: Path,
+    source_root: Path,
+    main_relative: str,
+    copied: Mapping[str, str],
+) -> dict[str, Any]:
+    """Project the frozen inventory into the evidence closure shape.
+
+    This is a byte mapping, not dependency collection: the prepared package was
+    already closed and verified by Freeze and Discover.  Capture copies those
+    exact bytes once and never reopens author references or rewrites a CAD
+    document.
     """
 
-    lister = getattr(backend, "list_dependencies", None)
-    dependencies = list(lister(cfg["assembly"]) or []) if callable(lister) else []
-    # Suppressed placements are omitted from the sealed closure graph; a stored
-    # reference that only exists because of a suppressed placement must not fail
-    # the capture later.  Paths recorded as suppressed by the closure are
-    # skipped here (and in the collector) and reported as evidence.
-    closure = cfg.get("closure") or {}
-    suppressed_paths = {
-        os.path.normcase(os.path.abspath(str(entry.get("resolved_path"))))
-        for entry in closure.get("suppressed") or []
-        if isinstance(entry, dict) and entry.get("resolved_path")
-    }
-    # Exact-occurrence binding: the closure records which occurrences were
-    # session materializations.  The current session's materialization paths
-    # differ from the selection session's, so the stable key is the exact
-    # (owner, occurrence) pair: the owning document's canonical name, or -- for
-    # occurrences inside a materialization subtree -- the anchoring
-    # materialization occurrence.  Never a name alone, never a path pattern.
-    def _closure_owner_token(item: dict) -> tuple[str, str] | None:
-        anchor = item.get("owner_anchor")
-        if isinstance(anchor, str) and anchor:
-            return ("anchor", anchor)
-        owner = item.get("owner") if isinstance(item.get("owner"), str) and item.get("owner") else item.get("document")
-        if not isinstance(owner, str) or not owner:
-            return None
-        return ("document", owner.replace("\\", "/").casefold())
-
-    session_document_keys: set[tuple[str, str]] = set()
-    cached_materialization_keys: set[tuple[str, str]] = set()
-    virtual_component_keys: set[tuple[str, str]] = set()
-    session_bindings: dict[tuple[str, str], dict[str, Any]] = {}
-    for entry in closure.get("imports") or []:
-        if not isinstance(entry, dict) or entry.get("state") != "cached_materialization":
-            continue
-        native_api_pid = entry.get("native_api_pid")
-        if (
-            type(native_api_pid) is not int
-            or native_api_pid <= 0
-            or session_root_pid(entry.get("session_temp_root")) != native_api_pid
-        ):
-            raise BridgeError(
-                "dependency_materialization_uncovered",
-                "the admitted cached materialization has no current-session identity",
-                exit_code=3,
-            )
-        instance = entry.get("instance")
-        token = _closure_owner_token(entry)
-        if isinstance(instance, str) and instance and token is not None:
-            key = (token, instance)
-            if key in session_bindings:
-                raise BridgeError(
-                    "dependency_materialization_uncovered",
-                    "the admitted closure records one occurrence as multiple session documents",
-                    {"occurrence": instance},
-                    exit_code=3,
-                )
-            session_document_keys.add((token, instance))
-            cached_materialization_keys.add((token, instance))
-            session_bindings[(token, instance)] = entry
-    for entry in closure.get("virtual_components") or []:
-        if (
-            not isinstance(entry, dict)
-            or entry.get("state") != "embedded_virtual_component"
-            or entry.get("binding") != "owner_embedded_geometry"
-            or entry.get("kind") != "native_embedded_virtual_component"
-            or entry.get("used_api") != SESSION_DOCUMENT_API
-            or entry.get("is_virtual") is not True
-            or "author_imported_path" not in entry
-            or entry["author_imported_path"] is not None
-            or "author_imported_error" not in entry
-            or entry["author_imported_error"] is not None
-            or not isinstance(entry.get("owner"), str)
-            or not entry["owner"]
-            or not isinstance(entry.get("instance"), str)
-            or not entry["instance"]
-            or not isinstance(entry.get("owner_sha256"), str)
-            or SHA256_RE.match(entry["owner_sha256"]) is None
-            or not isinstance(entry.get("configuration"), str)
-            or not entry["configuration"].strip()
-            or not embedded_virtual_component_under_root(
-                entry.get("session_document_path"), entry.get("session_temp_root")
-            )
-            or type(entry.get("native_api_pid")) is not int
-            or entry["native_api_pid"] <= 0
-            or session_root_pid(entry.get("session_temp_root")) != entry["native_api_pid"]
-            or (
-                entry.get("owner_anchor") is not None
-                and (
-                    not isinstance(entry.get("owner_anchor"), str)
-                    or not entry["owner_anchor"]
-                    or not entry["instance"].startswith(entry["owner_anchor"] + "/")
-                )
-            )
-        ):
-            raise BridgeError(
-                "dependency_materialization_uncovered",
-                "the admitted embedded virtual component evidence is incomplete",
-                exit_code=3,
-            )
-        instance = entry.get("instance")
-        token = _closure_owner_token(entry)
-        if isinstance(instance, str) and instance and token is not None:
-            key = (token, instance)
-            if key in session_bindings:
-                raise BridgeError(
-                    "dependency_materialization_uncovered",
-                    "the admitted closure records one occurrence as multiple session documents",
-                    {"occurrence": instance},
-                    exit_code=3,
-                )
-            virtual_component_keys.add(key)
-            session_document_keys.add(key)
-            session_bindings[key] = entry
-
-    # Stale author source links recorded by the closure (import metadata): the
-    # exact author path may still be listed by the engine, but after the
-    # coverage proof below it is excluded from the required graph and copied
-    # graph as recorded evidence -- never a broad STEP or name rule.
-    # Only genuinely external author links are excluded: an author path that is
-    # itself inside the admitted roots is an ordinary delivered dependency and
-    # is never dropped (e.g. an imported part resolving inside the flat package).
-    def _author_link_is_external(value) -> bool:
-        roots = cfg.get("allowed_roots") or []
-        return bool(roots) and not _under(str(value), roots)
-
-    author_metadata_external = {
-        os.path.normcase(os.path.abspath(str(entry.get("author_imported_path"))))
-        for entry in closure.get("imports") or []
-        if isinstance(entry, dict)
-        and entry.get("state") == "cached_materialization"
-        and entry.get("author_imported_path")
-        and _author_link_is_external(entry.get("author_imported_path"))
-    }
-    inspector = getattr(backend, "inspect_copy", None)
-    if not callable(inspector):
-        raise BridgeError(
-            "dependency_resolution_unverified",
-            "the backend cannot re-open the copy to verify component coverage",
-            exit_code=3,
-        )
-    original = dict(inspector(cfg["assembly"]) or {})
-    # Occurrence coverage gate: every current occurrence must be covered by the
-    # admitted closure (a resolved edge, a recorded cached materialization or a
-    # recorded suppressed placement) by exact owner+occurrence identity.  Only
-    # then may session materializations or stale author links be excluded from
-    # the required/copied graph; otherwise nothing is skipped.
-    covered_keys: set[tuple[str, str]] = set()
-    for name, entry in (closure.get("documents") or {}).items():
-        if not isinstance(entry, dict):
-            continue
-        for edge in entry.get("resolved_edges") or []:
-            if not isinstance(edge, dict) or not isinstance(edge.get("instance"), str) or not edge["instance"]:
-                continue
-            anchor = edge.get("owner_anchor")
-            if isinstance(anchor, str) and anchor:
-                token = ("anchor", anchor)
-            else:
-                token = ("document", str(name).replace("\\", "/").casefold())
-            covered_keys.add((token, edge["instance"]))
-    for item in closure.get("imports") or []:
-        if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
-            continue
-        token = _closure_owner_token(item)
-        if token is not None:
-            covered_keys.add((token, item["instance"]))
-    for item in closure.get("virtual_components") or []:
-        if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
-            continue
-        token = _closure_owner_token(item)
-        if token is not None:
-            covered_keys.add((token, item["instance"]))
-    for item in closure.get("suppressed") or []:
-        if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
-            continue
-        token = _closure_owner_token(item)
-        if token is not None:
-            covered_keys.add((token, item["instance"]))
-
-    def _actual_owner_token(entry: dict, roots: list[str] | None = None) -> tuple[str, str]:
-        anchor = entry.get("defining_anchor")
-        if isinstance(anchor, str) and anchor:
-            return ("anchor", anchor)
-        defining = str(entry.get("defining") or "")
-        for root in roots if roots is not None else (cfg.get("allowed_roots") or []):
-            try:
-                relative = Path(defining).resolve().relative_to(Path(str(root)).resolve()).as_posix()
-                return ("document", relative.casefold())
-            except (OSError, ValueError):
-                continue
-        return ("document", os.path.normcase(os.path.abspath(defining)) if defining else "")
-
-    actual_keys = {
-        (_actual_owner_token(entry), str(entry.get("instance") or ""))
-        for entry in original.get("instances") or []
-        if entry.get("instance")
-    }
-    unread_virtual = [
-        str(entry.get("instance") or "")
-        for entry in original.get("instances") or []
-        if type(entry.get("virtual")) is not bool
-    ]
-    if unread_virtual:
-        raise BridgeError(
-            "dependency_instance_mismatch",
-            "the source occurrence inventory has an unread IsVirtual state",
-            {"instances": unread_virtual[:20], "count": len(unread_virtual)},
-            exit_code=3,
-        )
-
-    def _current_owner_path(slot: dict[str, Any]) -> str:
-        owner = slot.get("owner")
-        if not isinstance(owner, str) or not owner:
-            raise BridgeError(
-                "dependency_materialization_uncovered",
-                "the admitted session document names no ultimate owner",
-                exit_code=3,
-            )
-        relative = PurePosixPath(owner.replace("\\", "/"))
-        if relative.is_absolute() or ".." in relative.parts:
-            raise BridgeError(
-                "dependency_materialization_uncovered",
-                "the admitted session document owner is not a confined relative path",
-                {"owner": owner},
-                exit_code=3,
-            )
-        candidates = set()
-        for root in [*(cfg.get("allowed_roots") or []), str(Path(cfg["assembly"]).parent)]:
-            candidate = Path(str(root)).joinpath(*relative.parts)
-            if candidate.is_file():
-                candidates.add(os.path.normcase(os.path.abspath(candidate)))
-        anchor = slot.get("owner_anchor")
-        if isinstance(anchor, str) and anchor:
-            ancestor = next(
-                (
-                    entry
-                    for entry in original.get("instances") or []
-                    if str(entry.get("instance") or "") == anchor
-                ),
-                None,
-            )
-            ancestor_path = str((ancestor or {}).get("document") or "")
-            if (
-                ancestor_path
-                and not session_artifact_path(ancestor_path)
-                and (not cfg.get("allowed_roots") or _under(ancestor_path, cfg["allowed_roots"]))
-                and os.path.isfile(ancestor_path)
-            ):
-                candidates.add(os.path.normcase(os.path.abspath(ancestor_path)))
-        if len(candidates) != 1:
-            raise BridgeError(
-                "dependency_materialization_uncovered",
-                "the admitted session document owner does not resolve to one current source file",
-                {"owner": owner, "candidates": sorted(candidates)},
-                exit_code=3,
-            )
-        return candidates.pop()
-
-    owner_hashes: dict[str, str] = {}
-    original_session_paths: set[str] = set()
-    for entry in original.get("instances") or []:
-        instance = str(entry.get("instance") or "")
-        key = (_actual_owner_token(entry), instance)
-        slot = session_bindings.get(key)
-        if slot is None:
-            continue
-        document = str(entry.get("document") or "")
-        if key in virtual_component_keys:
-            path_matches = embedded_virtual_component_path(document)
-            expected_state = "embedded_virtual_component"
-            expected_virtual = True
-        elif key in cached_materialization_keys:
-            path_matches = session_materialization_path(document)
-            expected_state = "cached_materialization"
-            expected_virtual = False
-        else:
-            path_matches = False
-            expected_state = None
-            expected_virtual = None
-        if (
-            slot.get("state") != expected_state
-            or not path_matches
-            or entry.get("virtual") is not expected_virtual
-            or (
-                key in virtual_component_keys
-                and (
-                    "imported_path" not in entry
-                    or entry["imported_path"] is not None
-                    or "imported_error" not in entry
-                    or entry["imported_error"] is not None
-                )
-            )
-            or entry.get("configuration") != slot.get("configuration")
-            or bool(entry.get("suppressed")) != (slot.get("suppression_state") == 0)
-        ):
-            raise BridgeError(
-                "dependency_materialization_uncovered",
-                "the current occurrence is not the admitted session document, configuration, and state",
-                {
-                    "occurrence": instance,
-                    "document": document,
-                    "configuration": entry.get("configuration"),
-                    "sealed_configuration": slot.get("configuration"),
-                    "virtual": entry.get("virtual"),
-                    "state": slot.get("state"),
-                },
-                exit_code=3,
-            )
-        original_session_paths.add(os.path.normcase(os.path.abspath(document)))
-        owner_path = _current_owner_path(slot)
-        normalized_owner = os.path.normcase(owner_path)
-        if normalized_owner not in owner_hashes:
-            owner_hashes[normalized_owner] = sha256_file(Path(owner_path))
-        if owner_hashes[normalized_owner] != slot.get("owner_sha256"):
-            raise BridgeError(
-                "dependency_materialization_uncovered",
-                "the admitted session document owner bytes changed since selection",
-                {"occurrence": instance, "owner": owner_path},
-                exit_code=3,
-            )
-    materializations_verified = False
-    if closure:
-        if actual_keys != covered_keys:
-            raise BridgeError(
-                "dependency_materialization_uncovered",
-                "the source occurrence inventory differs from the admitted closure; a session "
-                "materialization can never be dropped without a recorded owner/occurrence",
-                {
-                    "missing_from_closure": sorted(str(item) for item in (actual_keys - covered_keys))[:20],
-                    "missing_from_session": sorted(str(item) for item in (covered_keys - actual_keys))[:20],
-                    "instances": len(actual_keys),
-                },
-                exit_code=3,
-            )
-        materializations_verified = True
-    suppressed_skipped: list[str] = []
-    session_temp_dependencies: list[str] = []
-    stale_source_links: list[str] = []
-    unresolved = []
-    outside = []
-    for entry in dependencies:
-        path = str(entry.get("path") or "")
-        if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
-            suppressed_skipped.append(path)
-            continue
-        normalized = os.path.normcase(os.path.abspath(path)) if path else ""
-        if path and materializations_verified and normalized in author_metadata_external:
-            stale_source_links.append(path)
-            continue
-        if path and normalized in original_session_paths:
-            session_temp_dependencies.append(path)
-            continue
-        if not entry.get("exists", True):
-            unresolved.append(path)
-        elif cfg["allowed_roots"] and not _under(path, cfg["allowed_roots"]):
-            outside.append(path)
-    if outside:
-        raise BridgeError(
-            "dependency_outside_allowed_roots",
-            "the assembly references files outside the admitted CAD source roots; "
-            "collect the required references into the controlled assembly delivery",
-            {"paths": outside[:20], "count": len(outside)},
-            exit_code=3,
-        )
-
-    # Bind every saved source file before copying, then recheck after all reads.
+    package = Path(package).resolve()
+    source_root = Path(source_root).resolve()
     original_files: dict[str, str] = {}
-    original_documents = [str(cfg["assembly"])]
-    session_temp_documents: list[str] = []
-    for entry in original.get("instances") or []:
-        document = str(entry.get("document") or "")
-        if not document:
-            continue
-        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
-        if key in session_document_keys:
-            session_temp_documents.append(document)
-            continue
-        original_documents.append(document)
-    for entry in dependencies:
-        path = str(entry.get("path") or "")
-        if not path or os.path.normcase(os.path.abspath(path)) in suppressed_paths:
-            continue
-        if materializations_verified and os.path.normcase(os.path.abspath(path)) in original_session_paths:
-            continue
-        if materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
-            continue
-        original_documents.append(path)
-    original_states: dict[str, dict[str, Any]] = {}
-    unreadable: list[dict[str, Any]] = []
-    save_flags: list[str] = []
-    for path in dict.fromkeys(original_documents):
-        if not path:
-            continue
-        try:
-            original_files[path] = sha256_file(Path(path))
-            if Path(path).suffix.lower() not in {*DEFAULT_ALLOWED_SUFFIXES, ".slddrw"}:
-                continue
-            state = _document_state(backend, {"assembly": path})
-        except Exception as exc:  # noqa: BLE001 - a source we cannot read blocks
-            unreadable.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
-            continue
-        original_states[path] = {
-            "saved": state.get("saved"),
-            "active_configuration": state.get("active_configuration"),
-            "read_only": state.get("read_only"),
-        }
-        if state.get("saved") is False:
-            save_flags.append(path)
-    if unreadable:
-        raise BridgeError(
-            "cad_document_state_unreadable",
-            "the state of a source document could not be read; the closure cannot be proven",
-            {"unreadable": unreadable[:20], "count": len(unreadable)},
-            exit_code=3,
-        )
-    # A document SolidWorks would prompt to save is recorded and reported, never a
-    # refusal: the flag is not evidence about the operator's session, and the bytes
-    # this capture copies are the revision it names (see _verify_originals_unchanged).
-
-    pack = getattr(backend, "collect_dependencies", None)
-    if not callable(pack):
-        raise BridgeError(
-            "dependency_collection_unsupported",
-            "the backend cannot collect dependencies; a verified copy is required to freeze a source",
-            exit_code=3,
-        )
-    # The collector contract is explicit: skipped/author-excluded paths are
-    # always passed, empty when the coverage proof did not authorize a skip.
-    closure_documents: dict[str, dict] = {}
-    for name, entry in (closure.get("documents") or {}).items():
-        if not isinstance(entry, dict):
-            continue
-        closure_documents[str(name)] = {
-            "stored_locations": [
-                str(item.get("location"))
-                for item in entry.get("stored_references") or []
-                if isinstance(item, dict) and isinstance(item.get("location"), str)
-            ],
-            "resolved_targets": [
-                str(edge.get("resolved"))
-                for edge in entry.get("resolved_edges") or []
-                if isinstance(edge, dict) and isinstance(edge.get("resolved"), str)
-            ],
-            "resolved_paths": [
-                str(edge.get("resolved_path"))
-                for edge in entry.get("resolved_edges") or []
-                if isinstance(edge, dict) and isinstance(edge.get("resolved_path"), str)
-            ],
-        }
-    collected = dict(
-        pack(
-            cfg["assembly"],
-            str(source_dir),
-            skip_missing=sorted(suppressed_paths),
-            excluded_paths=sorted(
-                (author_metadata_external if materializations_verified else set())
-                | original_session_paths
-            ),
-            required_names=sorted((closure.get("graph") or {}).keys()),
-            admitted_roots=[str(source_dir), *(cfg.get("allowed_roots") or [])],
-            closure_documents=closure_documents,
-            required_paths=sorted(original_files),
-        )
-        or {}
-    )
-    stale_stored: list[dict] = [dict(item) for item in collected.get("skipped_stale") or [] if isinstance(item, dict)]
-    stale_resolved_normalized = {
-        os.path.normcase(os.path.abspath(str(item.get("resolved_path"))))
-        for item in stale_stored
-        if item.get("resolved_path")
-    }
-    source_mapping = collected.get("mapping") or {}
-    if {os.path.normcase(os.path.abspath(path)) for path in source_mapping} != {
-        os.path.normcase(os.path.abspath(path)) for path in original_files
-    }:
-        raise BridgeError(
-            "dependency_collection_incomplete",
-            "the collector file graph differs from the original dependency closure",
-            {"expected": sorted(original_files), "collected": sorted(source_mapping)},
-            exit_code=3,
-        )
-
-    top = str(collected.get("top_level") or "")
-    if not top or not os.path.isfile(top):
-        raise BridgeError(
-            "dependency_collection_incomplete",
-            "the collector did not name a collected top-level assembly",
-            {"top_level": top, "destination": str(source_dir), "files": len(collected.get("files") or [])},
-            exit_code=3,
-        )
-    if not _under(top, [str(source_dir)]):
-        raise BridgeError(
-            "dependency_escape",
-            "the collected top-level lies outside the snapshot",
-            {"top_level": top, "source_dir": str(source_dir)},
-            exit_code=3,
-        )
-
-    resolved = getattr(backend, "resolve_dependencies", None)
-    if not callable(resolved):
-        raise BridgeError(
-            "dependency_resolution_unverified",
-            "the backend cannot prove where the collected copy resolves its references",
-            exit_code=3,
-        )
-    copy = dict(inspector(top) or {})
-    copy_session_paths = {
-        os.path.normcase(os.path.abspath(str(entry.get("document"))))
-        for entry in copy.get("instances") or []
-        if (_actual_owner_token(entry, [str(source_dir)]), str(entry.get("instance") or ""))
-        in session_document_keys
-        and entry.get("document")
-    }
-    entries = list(resolved(top) or [])
-    if not entries:
-        raise BridgeError(
-            "dependency_resolution_unverified",
-            "the copy reported no dependencies at all; the closure cannot be proven",
-            {"top_level": top},
-            exit_code=3,
-        )
-    problems: list[dict[str, Any]] = []
-    for entry in entries:
-        path = str(entry.get("path") or "")
-        if path and os.path.normcase(os.path.abspath(path)) in suppressed_paths:
-            suppressed_skipped.append(path)
-            continue
-        if path and os.path.normcase(os.path.abspath(path)) in stale_resolved_normalized:
-            # The copy still stores an evidence-covered unused reference; it
-            # was never ingested and is recorded (no name matching involved).
-            if not any(item.get("resolved_path") == path for item in stale_stored):
-                stale_stored.append(
-                    {"document": None, "location": None, "resolved_path": path, "exists": os.path.isfile(path)}
-                )
-            continue
-        if path and materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
-            stale_source_links.append(path)
-            continue
-        if path and os.path.normcase(os.path.abspath(path)) in copy_session_paths:
-            session_temp_dependencies.append(path)
-            continue
-        if not path or not _under(path, [str(source_dir)]):
-            problems.append({"path": path, "problem": "outside_snapshot"})
-        elif not os.path.isfile(path):
-            problems.append({"path": path, "problem": "missing_in_snapshot"})
-    if problems:
-        raise BridgeError(
-            "dependency_escape",
-            "the collected copy resolves references that are missing or outside the snapshot",
-            {"problems": problems[:20], "count": len(problems), "top_level": top},
-            exit_code=3,
-        )
-
-    # A copy that opened in a different configuration is a different model, so the
-    # instance comparison below would be meaningless.
-    original_config = original.get("configuration")
-    copy_config = copy.get("configuration")
-    requested_config = str(cfg["configuration"])
-    if not original_config or not copy_config or str(original_config) != str(copy_config):
-        raise BridgeError(
-            "dependency_configuration_mismatch",
-            "the collected copy does not reproduce the source top-level configuration",
-            {"original": original_config, "copy": copy_config, "top_level": top},
-            exit_code=3,
-        )
-    # The active configuration *is* the identity of the snapshot, so a request that
-    # names another configuration of the same document cannot be satisfied by
-    # reading whatever happens to be active - and switching the user's document
-    # configuration is not something this adapter does.
-    if str(copy_config) != requested_config:
-        raise BridgeError(
-            "cad_configuration_not_active",
-            "the requested configuration is not the active configuration of the document",
-            {
-                "requested": requested_config,
-                "active": str(copy_config),
-                "assembly": cfg["assembly"],
-                "hint": "activate the configuration in SolidWorks before freezing",
-            },
-            exit_code=3,
-        )
-    if original.get("unresolved"):
-        raise BridgeError(
-            "dependency_unresolved_in_original",
-            "the source assembly has component instances SolidWorks cannot resolve",
-            {"unresolved": original["unresolved"][:20], "count": len(original["unresolved"])},
-            exit_code=3,
-        )
-    if copy.get("unresolved"):
-        raise BridgeError(
-            "dependency_escape",
-            "the copy has component instances that resolve outside the snapshot",
-            {"unresolved": copy["unresolved"][:20], "count": len(copy["unresolved"]), "top_level": top},
-            exit_code=3,
-        )
-    if int(copy.get("components") or 0) != int(original.get("components") or 0):
-        raise BridgeError(
-            "dependency_collection_incomplete",
-            "the copy does not contain the same number of component instances as the source",
-            {"original": original.get("components"), "copy": copy.get("components"), "top_level": top},
-            exit_code=3,
-        )
-
-    def signatures(report: dict[str, Any]) -> dict[str, tuple[Any, Any, bool, Any, Any]]:
-        return {
-            str(entry["instance"]): (
-                entry.get("document_name"),
-                entry.get("configuration"),
-                bool(entry.get("suppressed")),
-                entry.get("virtual"),
-                entry.get("defining_anchor"),
-            )
-            for entry in report.get("instances") or []
-        }
-
-    original_instances = signatures(original)
-    copy_instances = signatures(copy)
-    # Identity has to be unambiguous per instance, so a duplicate instance path
-    # means the report cannot prove coverage and is not accepted.
-    for report, table, reported in (
-        ("original", original_instances, original),
-        ("copy", copy_instances, copy),
-    ):
-        listed = len(list(reported.get("instances") or []))
-        if len(table) != listed:
-            raise BridgeError(
-                "dependency_instance_identity_ambiguous",
-                f"the {report} report reuses component instance paths",
-                {"report": report, "unique": len(table), "listed": listed, "top_level": top},
-                exit_code=3,
-            )
-    missing = sorted(set(original_instances) - set(copy_instances))
-    extra = sorted(set(copy_instances) - set(original_instances))
-    if missing or extra:
-        raise BridgeError(
-            "dependency_collection_incomplete",
-            "the copy does not reproduce the component instance list of the source",
-            {
-                "missing": missing[:20],
-                "extra": extra[:20],
-                "original_instances": len(original_instances),
-                "copy_instances": len(copy_instances),
-            },
-            exit_code=3,
-        )
-    changed = sorted(
-        (name, original_instances[name], copy_instances[name])
-        for name in original_instances
-        if original_instances[name] != copy_instances[name]
-    )
-    if changed:
-        raise BridgeError(
-            "dependency_instance_mismatch",
-            "the copy resolves component instances to different documents or configurations",
-            {
-                "changed": [
-                    {"instance": name, "original": list(before), "copy": list(after)}
-                    for name, before, after in changed[:20]
-                ],
-                "count": len(changed),
-                "top_level": top,
-            },
-            exit_code=3,
-        )
-
-    outside_copy: list[str] = []
-    absent_copy: list[str] = []
-    for entry in copy.get("instances") or []:
-        path = str(entry.get("document") or "")
-        if not path:
-            continue  # suppressed instances are tracked, not resolved
-        key = (_actual_owner_token(entry, [str(source_dir)]), str(entry.get("instance") or ""))
-        if key in virtual_component_keys and (
-            not embedded_virtual_component_path(path)
-            or entry.get("virtual") is not True
-            or "imported_path" not in entry
-            or entry["imported_path"] is not None
-            or "imported_error" not in entry
-            or entry["imported_error"] is not None
-        ):
-            raise BridgeError(
-                "dependency_instance_mismatch",
-                "the reopened copy no longer resolves the admitted embedded virtual component class",
-                {
-                    "instance": str(entry.get("instance") or ""),
-                    "document": path,
-                    "imported_path": entry.get("imported_path"),
-                    "imported_error": entry.get("imported_error"),
-                },
-                exit_code=3,
-            )
-        if key in cached_materialization_keys and not session_materialization_path(path):
-            raise BridgeError(
-                "dependency_instance_mismatch",
-                "the reopened copy no longer resolves the admitted IC~~ import materialization",
-                {"instance": str(entry.get("instance") or ""), "document": path},
-                exit_code=3,
-            )
-        if (
-            key in session_document_keys
-        ):
-            session_temp_documents.append(path)
-            continue  # session materializations are evidence, not snapshot members
-        if not _under(path, [str(source_dir)]):
-            outside_copy.append(path)
-        elif not os.path.isfile(path):
-            absent_copy.append(path)
-
-    # SolidWorks resolves a reference to an already-open document that shares its
-    # file name, so a copy opened next to an open working tree can bind to the
-    # original.  That is never fixed by closing the user's document here; the
-    # capture has to run against an isolated instance or a renamed mapping, and the
-    # conflict is reported as such instead of as a generic escape.
-    open_documents = []
-    lister = getattr(backend, "list_documents", None)
-    if callable(lister):
-        try:
-            open_documents = [str(item) for item in (lister() or []) if item]
-        except Exception:  # noqa: BLE001 - the gate below does not depend on it
-            open_documents = []
-    conflicts = []
-    for path in set(outside_copy):
-        name = os.path.basename(path).lower()
-        for open_path in open_documents:
-            if os.path.basename(open_path).lower() == name:
-                conflicts.append(
-                    {
-                        "snapshot_reference": path,
-                        "open_document": open_path,
-                        "is_the_open_file": _same_document(open_path, path),
-                    }
-                )
-    if conflicts:
-        raise BridgeError(
-            "cad_same_name_conflict",
-            "the copy resolved a same-named document that is already open in this "
-            "SolidWorks session; capture it from an isolated session or with a "
-            "renamed mapping instead of closing the user's document",
-            {"conflicts": conflicts[:20], "count": len(conflicts), "top_level": top},
-            exit_code=3,
-        )
-    if outside_copy or absent_copy:
-        raise BridgeError(
-            "dependency_escape",
-            "the re-opened copy loads documents that are outside the snapshot or missing from it",
-            {
-                "outside": sorted(set(outside_copy))[:20],
-                "missing": sorted(set(absent_copy))[:20],
-                "count": len(outside_copy) + len(absent_copy),
-                "top_level": top,
-            },
-            exit_code=3,
-        )
-
-    # Native reference collection legitimately rewrites internal references and serialisation
-    # metadata, so the copy is *not* expected to be byte-identical to its source.
-    # What the snapshot relies on is the recorded mapping, the re-opened instance
-    # and configuration comparison above, and every copied file's own digest,
-    # rechecked after readings and geometry export.
-    mapping: dict[tuple[str, str], str] = dict.fromkeys(source_mapping.items(), "dependency")
-    if os.path.isfile(top):
-        mapping[(str(cfg["assembly"]), top)] = "top_level"
-    for entry in copy.get("instances") or []:
-        path = str(entry.get("document") or "")
-        key = (_actual_owner_token(entry, [str(source_dir)]), str(entry.get("instance") or ""))
-        if (
-            not path
-            or key in session_document_keys
-        ):
-            continue
-        for source_entry in original.get("instances") or []:
-            if str(source_entry.get("instance")) == str(entry.get("instance")) and source_entry.get("document"):
-                mapping[(str(source_entry["document"]), path)] = str(entry.get("instance"))
-                break
-    # Recorded relative to the snapshot root: the staging tree is renamed into
-    # place when the capture succeeds, so absolute staging paths would go stale.
-    snapshot_root = source_dir.parent
-    copy_files = _copy_inventory(source_dir)
-
-    return {
-        "method": collected.get("method", "unknown"),
-        "source_dir": str(source_dir),
-        "top_level": top,
-        "declared_dependencies": dependencies,
-        "declared_unresolved": unresolved,
-        "suppressed_skipped": sorted(set(suppressed_skipped)),
-        "session_temp_dependencies": sorted(set(session_temp_dependencies)),
-        "stale_source_links": sorted(set(stale_source_links)),
-        "stale_stored_references": sorted(
-            stale_stored,
-            key=lambda item: (str(item.get("document")), str(item.get("location")), str(item.get("resolved_path"))),
-        ),
-        "seeded_required_leaves": sorted(collected.get("seeded_required_leaves") or []),
-        "materializations_verified": materializations_verified,
-        "session_document_keys": sorted(
-            [token[0], token[1], instance] for token, instance in session_document_keys
-        ),
-        "virtual_component_keys": sorted(
-            [token[0], token[1], instance] for token, instance in virtual_component_keys
-        ),
-        "session_temp_documents": sorted(set(session_temp_documents)),
-        "resolved_inside_snapshot": len(entries),
-        "collected_files": len(collected.get("files") or []),
-        "configuration": copy_config,
-        "components_verified": copy.get("components"),
-        "component_instances_inside": sum(1 for entry in copy.get("instances") or [] if entry.get("document")),
-        "component_instances_compared": len(copy_instances),
-        "suppressed_instances": len(copy.get("suppressed") or []),
-        "original_files": original_files,
-        "original_states": original_states,
-        # Documents SolidWorks reported as needing a save.  Evidence for the reader,
-        # deliberately not a refusal: see the note above.
-        "save_flag_documents": sorted(save_flags),
-        "copy_files": copy_files,
-        "mapping": [
+    copy_files: dict[str, str] = {}
+    mapping: list[dict[str, Any]] = []
+    for relative, checksum in sorted(copied.items()):
+        source = str(package / relative)
+        copy_relative = f"source/{relative}"
+        original_files[source] = checksum
+        copy_files[copy_relative] = checksum
+        mapping.append(
             {
                 "source": source,
-                "copy": os.path.relpath(copy_path, snapshot_root).replace(os.sep, "/"),
-                "instance": label,
-                "copy_sha256": copy_files.get(os.path.relpath(copy_path, snapshot_root).replace(os.sep, "/")),
-                "source_sha256": original_files.get(source),
+                "copy": copy_relative,
+                "instance": "top_level" if relative == main_relative else relative,
+                "copy_sha256": checksum,
+                "source_sha256": checksum,
             }
-            for (source, copy_path), label in sorted(mapping.items(), key=lambda item: item[1])
-        ],
-        "collector": {"configured": collected.get("configured"), "reference_edges": collected.get("reference_edges")},
+        )
+    return {
+        "schema_version": "solidworks-to-urdf.native-closure/v1",
+        "method": "sealed_prepared_inventory",
+        "source_dir": str(source_root),
+        "top_level": str(source_root / main_relative),
+        "configuration": str(cfg["configuration"]),
+        "original_files": original_files,
+        "copy_files": copy_files,
+        "mapping": mapping,
+    }
+
+
+def _verify_sealed_capture_copy(closure: dict[str, Any]) -> dict[str, Any]:
+    """Rehash the read-only prepared copy after CAD release."""
+
+    source_dir = Path(str(closure.get("source_dir") or ""))
+    actual = _copy_inventory(source_dir)
+    expected = dict(closure.get("copy_files") or {})
+    if actual != expected:
+        changed = sorted(
+            path
+            for path in set(actual) | set(expected)
+            if actual.get(path) != expected.get(path)
+        )
+        raise BridgeError(
+            "cad_copy_changed",
+            "the prepared CAD bytes changed during capture",
+            {"changed": changed[:20], "count": len(changed)},
+            exit_code=3,
+        )
+    return {
+        "files_checked": len(actual),
     }
 
 
@@ -1408,6 +674,8 @@ def _redact(value: Any, key: str = "") -> Any:
         return {str(name): _redact(item, str(name)) for name, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact(item, key) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"native_non_finite_float": value.hex()}
     if key and any(marker in key.lower() for marker in _CREDENTIAL_MARKERS):
         return "<redacted>" if value not in (None, "") else value
     if isinstance(value, str) and "://" in value:
@@ -1417,12 +685,13 @@ def _redact(value: Any, key: str = "") -> Any:
 
 
 def _retain_failure(
-    staging: Path, destination: Path, error: BaseException, stage: str, request: dict[str, Any]
+    staging: Path, destination: Path, error: BaseException, stage: str, request: dict[str, Any],
+    observations: dict[str, Any] | None = None,
 ) -> str | None:
     """Keep a failed attempt's staging tree instead of deleting the evidence.
 
-    The staging tree holds the collected CAD copy, the raw readings and the
-    re-opened-copy evidence, so removing it on failure would destroy the only
+    The staging tree holds the prepared CAD bytes and raw readings, so
+    removing it on failure would destroy the only
     material that explains the failure.  Every attempt gets its own directory, so
     a retry never overwrites an earlier diagnosis, and the request is recorded
     without credentials.
@@ -1455,8 +724,11 @@ def _retain_failure(
             os.replace(staging, moved)
         except OSError:
             moved = staging
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, TypeError, ValueError):
             write_json(candidate / "failure.json", {**payload, "partial": str(moved)})
+        if observations:
+            with contextlib.suppress(OSError, TypeError, ValueError):
+                write_json(candidate / "native_observations.json", _redact(observations))
         return str(candidate)
     return None
 
@@ -1475,13 +747,19 @@ def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
             module = frame.f_globals.get("__name__", "")
             if isinstance(module, str) and module.startswith("description_pipeline.sources.solidworks."):
                 site = {"module": module, "function": frame.f_code.co_name, "line": trace.tb_lineno}
-                if module.endswith(".native") and frame.f_code.co_name in ("_member", "_method"):
+                if module.endswith(".native") and frame.f_code.co_name in (
+                    "_indexed_property",
+                    "_property",
+                    "_method",
+                ):
                     member = frame.f_locals.get("name")
                     if isinstance(member, str):
                         site["member"] = member
                 frames.append(site)
             trace = trace.tb_next
         record = {"type": type(error).__name__, "message": str(error), "frames": frames}
+        if getattr(error, "__notes__", None):
+            record["notes"] = list(error.__notes__)
         hresult = getattr(error, "hresult", None)
         if isinstance(hresult, int):
             record["hresult"] = hresult
@@ -1490,33 +768,25 @@ def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
     return chain
 
 
-def _component_context_record(reading: dict[str, Any], assembly_mass: float | None) -> dict[str, Any]:
-    """Native component-context observations, verbatim; no derived math.
-
-    Windows records only what CAD answered: per-instance identity, context
-    mass/volume, override flags, effective readings and their failures.
-    Document basis, deltas, totals, coverage and the effective recombination
-    are rebuilt on Linux from the sealed evidence; there is no compatibility
-    format and no computed field survives here.
-    """
+def _component_context_record(
+    reading: dict[str, Any],
+    assembly_mass: float | None,
+) -> dict[str, Any]:
+    """Project one already-normalized component context into sealed evidence."""
 
     instances = []
     errors = list(reading.get("errors") or [])
     for entry in reading.get("instances") or []:
-        name = str(entry.get("name"))
+        name = str(entry.get("name") or "")
         try:
             if not name:
                 raise ValueError("component instance row has no name")
             raw_depth = entry.get("depth")
-            if not isinstance(raw_depth, int) or isinstance(raw_depth, bool):
+            if type(raw_depth) is not int:
                 raise ValueError(f"row for {name} has no integer depth")
-            depth = raw_depth
-            expected_depth = name.count("/")
-            if depth != expected_depth:
-                raise ValueError(f"row for {name} has depth {depth}, expected {expected_depth}")
             parent = name.rsplit("/", 1)[0] if "/" in name else None
-            if entry.get("parent") != parent:
-                raise ValueError(f"row for {name} has parent {entry.get('parent')!r}, expected {parent!r}")
+            if raw_depth != name.count("/") or entry.get("parent") != parent:
+                raise ValueError(f"row for {name} has inconsistent hierarchy")
             mass = float(entry["context_mass_kg"])
             if not math.isfinite(mass) or mass <= 0.0:
                 raise ValueError("component mass is not finite and positive")
@@ -1525,23 +795,36 @@ def _component_context_record(reading: dict[str, Any], assembly_mass: float | No
             if volume is not None and not math.isfinite(volume):
                 raise ValueError("component volume is not finite")
             raw_overrides = entry.get("overrides")
-            if not isinstance(raw_overrides, dict):
-                raise ValueError("component row has no override flags")
-            if not {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"} <= set(raw_overrides):
-                raise ValueError("component row is missing override flags")
-            overrides: dict[str, bool] = {}
-            for key, value in raw_overrides.items():
-                if not isinstance(value, bool):
-                    raise ValueError(f"override flag {key!r} is not a boolean")
-                overrides[str(key)] = value
-        except (KeyError, TypeError, ValueError) as exc:
-            errors.append({"name": name, "error": "cad_component_context_invalid", "message": str(exc)[:200]})
+            if (
+                not isinstance(raw_overrides, dict)
+                or not {
+                    "OverrideMass",
+                    "OverrideCenterOfMass",
+                    "OverrideMomentsOfInertia",
+                }
+                <= set(raw_overrides)
+            ):
+                raise ValueError("component row has no complete override flags")
+            overrides = {
+                str(key): value
+                for key, value in raw_overrides.items()
+            }
+            if any(type(value) is not bool for value in overrides.values()):
+                raise ValueError("component override flags must be booleans")
+        except (KeyError, TypeError, ValueError) as error:
+            errors.append(
+                {
+                    "name": name,
+                    "error": "cad_component_context_invalid",
+                    "message": str(error)[:200],
+                }
+            )
             continue
         instances.append(
             {
                 "name": name,
                 "parent": parent,
-                "depth": depth,
+                "depth": raw_depth,
                 "document": entry.get("document"),
                 "document_type": str(entry.get("document_type") or ""),
                 "context_mass_kg": mass,
@@ -1561,153 +844,52 @@ def _component_context_record(reading: dict[str, Any], assembly_mass: float | No
     }
 
 
-def _component_mass_context(
-    backend: Any,
-    cfg: dict[str, Any],
-    assembly_mass: float | None,
-    document: str | None = None,
+def _mass_closure_from_projection(
+    assembly_mass: dict[str, Any] | None,
+    component_mass: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """The assembly context reading when the backend can produce it; best-effort, never fatal."""
+    """Project normalized assembly/component readings into one sealed closure."""
 
-    reader = getattr(backend, "assembly_component_mass_properties", None)
-    if not callable(reader):
+    if assembly_mass is None and component_mass is None:
         return None
-    try:
-        # The closure must describe the document the capture actually read: the
-        # collected copy, never the author's working tree.
-        reading = reader(str(document or cfg["assembly"]))
-    except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
-        return {
-            "schema_version": "solidworks-to-urdf.component-mass-context/v1",
-            "status": "unavailable",
-            "reason": str(getattr(error, "code", "") or type(error).__name__),
-            "message": " ".join(str(error).split())[:200],
-        }
-    if not isinstance(reading, dict):
-        return {
-            "schema_version": "solidworks-to-urdf.component-mass-context/v1",
-            "status": "unavailable",
-            "reason": "cad_component_context_malformed",
-            "message": "the backend returned no component mass context object",
-        }
-    try:
-        return _component_context_record(reading, assembly_mass)
-    except Exception as error:  # noqa: BLE001 - an optional probe must never abort a capture
-        return {
-            "schema_version": "solidworks-to-urdf.component-mass-context/v1",
-            "status": "unavailable",
-            "reason": "cad_component_context_invalid",
-            "message": " ".join(str(error).split())[:200],
-        }
-
-
-def _mass_closure(backend: Any, cfg: dict[str, Any], document: str | None = None) -> dict[str, Any] | None:
-    """Native closure observations only: the assembly reading and instance context.
-
-    The Windows boundary records what CAD answered (whole-assembly reading,
-    per-instance context with overrides and effective readings) plus explicit
-    unavailable/error receipts.  All comparison math - leaf totals, deltas,
-    totals, coverage and the effective recombination - lives on Linux from the
-    sealed evidence; no computed field survives here.
-    """
-
-    closure_reader = getattr(backend, "assembly_mass_properties", None)
-    context_reader = getattr(backend, "assembly_component_mass_properties", None)
-    if not callable(closure_reader) and not callable(context_reader):
-        return None
-    measured = str(document or cfg["assembly"])
-    top_level: dict[str, Any] | None = None
-    failure: dict[str, str] | None = None
-    if callable(closure_reader):
+    top_mass = None
+    if isinstance(assembly_mass, dict):
         try:
-            top_level = closure_reader(measured)
-        except Exception as error:  # noqa: BLE001 - an optional probe must not fail a valid capture
-            failure = {
-                "reason": str(getattr(error, "code", "") or type(error).__name__),
-                "message": " ".join(str(error).split())[:200],
-            }
-    top_mass: float | None = None
-    if isinstance(top_level, dict):
-        try:
-            top_mass = float(top_level["mass"])
+            top_mass = float(assembly_mass["mass"])
         except (KeyError, TypeError, ValueError):
-            top_level = None
-            failure = failure or {
-                "reason": "cad_mass_property_invalid",
-                "message": "the assembly reading carried no usable mass",
-            }
-    elif top_level is not None:
-        top_level = None
-        failure = failure or {
-            "reason": "cad_mass_property_invalid",
-            "message": "the assembly reading is not an object",
-        }
-    # The override evidence is required for a pure-CAD claim, so it is collected even when the
-    # optional assembly reading failed (or the record would earn cad equivalence by omission).
-    component_context = _component_mass_context(backend, cfg, top_mass, measured)
-    if top_level is None or top_mass is None:
-        unavailable_record: dict[str, Any] = {
+            assembly_mass = None
+    elif assembly_mass is not None:
+        assembly_mass = None
+    component_context = (
+        _component_context_record(component_mass, top_mass)
+        if isinstance(component_mass, dict)
+        else None
+    )
+    if assembly_mass is None or top_mass is None:
+        record: dict[str, Any] = {
             "schema_version": "solidworks-to-urdf.mass-closure/v1",
             "status": "unavailable",
-            **(
-                failure
-                or {"reason": "cad_mass_property_unavailable", "message": "no assembly mass reading was recorded"}
-            ),
+            "reason": "cad_mass_property_unavailable",
+            "message": "no usable assembly mass reading was projected",
         }
-        if component_context is not None:
-            unavailable_record["component_context"] = component_context
-        return unavailable_record
-    record = {
-        "schema_version": "solidworks-to-urdf.mass-closure/v1",
-        "status": "recorded",
-        "mode": "full",
-        "top_level": {
-            "mass": top_mass,
-            "com": [float(value) for value in top_level["com"]],
-            "inertia": [[float(value) for value in row] for row in top_level["inertia"]],
-            "reference": dict(top_level.get("reference") or {}),
-        },
-    }
+    else:
+        record = {
+            "schema_version": "solidworks-to-urdf.mass-closure/v1",
+            "status": "recorded",
+            "mode": "full",
+            "top_level": {
+                "mass": top_mass,
+                "com": [float(value) for value in assembly_mass["com"]],
+                "inertia": [
+                    [float(value) for value in row]
+                    for row in assembly_mass["inertia"]
+                ],
+                "reference": dict(assembly_mass.get("reference") or {}),
+            },
+        }
     if component_context is not None:
         record["component_context"] = component_context
     return record
-
-
-def _capture_readings(
-    backend: Any, cfg: dict[str, Any], closure: dict[str, Any], source_root: Path, activity=None
-) -> tuple[Any, dict[str, Any]]:
-    """Read the raw scene from the collected copy, never from the working tree.
-
-    The closure proved the copy resolves every component inside ``source_dir``, so
-    reading the copy is what makes the recorded masses and tessellation describe
-    the bytes that travel with the snapshot.  The reported document is checked
-    instead of trusted: a backend that quietly kept the working-tree document
-    open would otherwise pass its readings off as the copy's.
-    """
-
-    document = str(closure.get("top_level") or "")
-    if not document or not os.path.isfile(document):
-        raise BridgeError(
-            "dependency_collection_incomplete",
-            "the closure left no collected copy to read",
-            {"top_level": document, "source_root": str(source_root)},
-            exit_code=3,
-        )
-    scene = backend.collect_scene(
-        document,
-        cfg["coordinate_systems"],
-        on_activity=activity.publish if activity is not None else None,
-        require_material=True,
-    )
-    reported = str(getattr(scene, "document", "") or "")
-    if not _same_document(reported, document):
-        raise BridgeError(
-            "capture_source_mismatch",
-            "the backend read a working-tree document instead of the collected copy",
-            {"requested": document, "reported": reported, "assembly": cfg["assembly"]},
-            exit_code=3,
-        )
-    return scene, _raw_scene_payload(scene, cfg, source_root)
 
 
 def _raw_scene_payload(scene: Any, cfg: dict[str, Any], source_root: Path) -> dict[str, Any]:
@@ -1908,43 +1090,11 @@ def _effective_instance_record(
     }
 
 
-def _verify_originals_unchanged(closure: dict[str, Any]) -> dict[str, Any]:
-    """Rehash saved inputs without reopening the retired source application.
-
-    Original configuration/save observations describe the initial source session,
-    not current state. The disk revision supplied the copy; all live configuration
-    and occurrence guards apply to that copy, which supplies the measurements.
-    """
-
-    recorded = dict(closure.get("original_files") or {})
-    changed: list[dict[str, Any]] = []
-    for path, digest in recorded.items():
-        try:
-            current = sha256_file(Path(path))
-        except OSError:
-            current = ""
-        if current != digest:
-            changed.append({"path": path, "before": digest, "after": current or None})
-    if changed:
-        raise BridgeError(
-            "cad_source_changed",
-            "a working-tree document changed while the snapshot was being captured",
-            {"changed": changed[:20], "count": len(changed)},
-            exit_code=3,
-        )
-    return {
-        "files_checked": len(recorded),
-        "states_recorded": len(closure.get("original_states") or {}),
-        "state_scope": "initial_source_observation",
-    }
-
-
 def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """Resolve every structured joint axis reference to a native line.
+    """Read raw facts for each structured joint axis reference.
 
-    A joint that names a native component/face must yield numeric evidence
-    (point + direction + identity); a backend that cannot resolve it is a
-    capture failure, never a silently skipped record.
+    Axis line projection and numeric validation run after CAD release.
+    Unreadable references remain failures rather than silently skipped rows.
     """
 
     reader = getattr(backend, "capture_axis_reference", None)
@@ -1961,104 +1111,32 @@ def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str
                 {"joint": joint_name, "axis_reference": reference},
                 exit_code=3,
             )
-        captured.append({"joint": joint_name, **reader(reference)})
+        try:
+            captured.append({"joint": joint_name, **reader(reference)})
+        except Exception as error:
+            error.partial_axis_facts = captured
+            raise
     return captured
 
 
-def _export_geometry(
-    backend: Any, cfg: dict[str, Any], geometry_dir: Path, components: list[str], activity=None
-) -> list[dict[str, Any]]:
+def _geometry_destinations(geometry_dir: Path, components: list[str]) -> dict[str, str]:
+    """Return one stable binary-STL destination for every occurrence."""
+
     geometry_dir.mkdir(parents=True, exist_ok=True)
-    # Keep one native geometry phase alive across all occurrence reads.
-    # Instance identities stay in the evidence; filenames remain bounded.
     destinations = {
         component: str(geometry_dir / f"{index:04d}_{digest_json(component)[:24]}.stl")
         for index, component in enumerate(sorted(components), start=1)
     }
     if len(destinations) != len(components):
         raise BridgeError("cad_mesh_export_failed", "geometry contains duplicate occurrence identities", exit_code=3)
-    entries = backend.export_component_meshes(
-        destinations,
-        on_activity=activity.publish if activity is not None else None,
-    )
-    if not isinstance(entries, dict) or set(entries) != set(destinations):
-        raise BridgeError("cad_mesh_export_failed", "geometry export returned a different occurrence set", exit_code=3)
-    exported: list[dict[str, Any]] = []
-    for component, destination in destinations.items():
-        target = Path(destination)
-        info = entries[component]
-        if not isinstance(info, dict) or info.get("component") != component or str(info.get("written")) != destination:
-            raise BridgeError(
-                "cad_mesh_export_failed",
-                "geometry export returned a different occurrence or path",
-                {"component": component},
-                exit_code=3,
-            )
-        tessellation = info.get("tessellation")
-        if (
-            not isinstance(tessellation, dict)
-            or set(tessellation) != {
-                "schema_version",
-                "faces",
-                "face_spans",
-                "native_edges",
-                "no_facets_faces",
-                "itessellation",
-            }
-            or tessellation.get("schema_version") != NATIVE_TESSELLATION_SCHEMA
-            or not isinstance(tessellation.get("faces"), int)
-            or not isinstance(tessellation.get("face_spans"), list)
-            or not isinstance(tessellation.get("native_edges"), list)
-            or not isinstance(tessellation.get("no_facets_faces"), list)
-            or not isinstance(tessellation.get("itessellation"), dict)
-        ):
-            raise BridgeError(
-                "cad_mesh_export_failed",
-                "native geometry carries no complete face-span evidence",
-                {"component": component},
-                exit_code=3,
-            )
-        # Raw identity plus the binary-header triangle count only: area, volume,
-        # topology and degeneracy stay with the independent Linux verifier.
-        with target.open("rb") as handle:
-            header = handle.read(84)
-        if len(header) < 84:
-            raise BridgeError(
-                "cad_mesh_invalid",
-                "geometry export produced no binary STL header",
-                {"component": component},
-                exit_code=3,
-            )
-        triangles = int.from_bytes(header[80:84], "little")
-        if triangles <= 0 or target.stat().st_size != 84 + 50 * triangles:
-            raise BridgeError(
-                "cad_mesh_invalid",
-                "geometry export produced an inconsistent mesh size",
-                {"component": component},
-                exit_code=3,
-            )
-        exported.append(
-            {
-                "component": component,
-                "path": target.relative_to(geometry_dir.parent).as_posix(),
-                "triangles": triangles,
-                "used_api": info.get("used_api"),
-                "bodies": info.get("bodies"),
-                "tessellation": tessellation,
-                "sha256": sha256_file(target),
-            }
-        )
-    return exported
+    return destinations
+
+
 
 
 LINK_GROUP_SCHEMA = LINK_GROUP_MASS_SCHEMA
 LINK_GROUP_USED_API = "IMassProperty2 (SelectedItems = component set)"
 LINK_GROUP_SELECTION_RULE = "top_most_providers+uncovered_leaves"
-#: Marker for the whole-assembly and direct link reads taken in the reopened,
-#: never-touched readout window (probe v5: close+reopen restores the opened
-#: state bit-identically; any earlier instance read in the session shifts the
-#: direct group reads and the whole-assembly read - probe v4).
-PRISTINE_WINDOW = "pristine-reopen"
 
 
 def _link_group_selections(cfg: dict[str, Any], scene: Any, effective: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -2286,15 +1364,6 @@ def _link_group_record_from_payload(
     }
 
 
-def _write_link_group_diagnostic(path: Path, payload: Any) -> None:
-    """Preserve the native payload even when CAD supplied non-finite numbers."""
-
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=True),
-        encoding="utf-8",
-    )
-
-
 def _link_group_read_valid(body: str, index: int, read: Any) -> None:
     def invalid(field: str) -> None:
         raise BridgeError(
@@ -2337,447 +1406,300 @@ def _link_group_read_valid(body: str, index: int, read: Any) -> None:
         invalid("overrides")
 
 
-def _top_level_record(reading: dict[str, Any]) -> dict[str, Any]:
-    """The mass_closure ``top_level`` projection of one whole-assembly reading."""
+def _prepared_document_state(backend: Any, document: str, configuration: str) -> dict[str, Any]:
+    """Observe the one prepared session without making rebuild state a gate."""
 
-    return {
-        "mass": float(reading["mass"]),
-        "com": [float(value) for value in reading["com"]],
-        "inertia": [[float(value) for value in row] for row in reading["inertia"]],
-        "reference": dict(reading.get("reference") or {}),
-    }
-
-
-def _pristine_readout_window(
-    backend: Any,
-    cfg: dict[str, Any],
-    closure: dict[str, Any],
-    selections: dict[str, dict[str, Any]],
-    activity=None,
-    diagnostic_dir: Path | None = None,
-) -> dict[str, Any]:
-    """Whole-assembly and direct link reads in the pristine reopen window.
-
-    Probe v4: any component-instance mass read contaminates the later direct
-    group reads and the whole-assembly read of the same session.  Probe v5:
-    closing the read-only probe session and reopening the same captured copy
-    restores the opened state bit-identically (deltas exactly zero, 61/61
-    documents).  Closing the real capture needs ``CloseAllDocuments(True)``:
-    the collected copy was opened read-write and rebuilt/recalculated, so the
-    dirty documents only release with close-without-save (native16 left 61
-    documents open with False); nothing after this window saves and freeze
-    re-hashes the post-window copy to prove no writes.  This runs after every
-    other CAD-facing step; inside the window only the two readers run, in the
-    v5-proven order (link groups first, whole assembly second), and nothing
-    else touches the reopened document.
-    """
-
-    document = str((closure or {}).get("top_level") or cfg["assembly"])
-    closer = getattr(backend, "close_all_documents", None)
-    opener = getattr(backend, "open_document", None)
-    reader = getattr(backend, "link_group_mass_properties", None)
-    if not callable(closer) or not callable(opener) or not callable(reader):
+    state = _document_state(backend, {"assembly": document})
+    if (
+        not _same_document(str(state.get("path") or ""), document)
+        or state.get("read_only") is not True
+        or state.get("active_configuration") != configuration
+    ):
         raise BridgeError(
-            "cad_pristine_readout_unavailable",
-            "the backend cannot reopen a pristine readout window",
-            exit_code=3,
-        )
-    _capture_note(activity, "window_close")
-    closer()
-    prepare = getattr(backend, "prepare_source", None)
-    if callable(prepare):
-        prepare(document, cfg["configuration"])
-    _capture_note(activity, "window_reopen")
-    opened = opener(document)
-    if not isinstance(opened, dict) or not _same_document(str(opened.get("path") or ""), document):
-        raise BridgeError(
-            "capture_source_mismatch",
-            "the pristine reopen named another document",
+            "cad_prepared_capture_state",
+            "the prepared capture document is not the requested read-only configuration",
             {
-                "requested": document,
-                "reported": opened.get("path") if isinstance(opened, dict) else opened,
+                "document": document,
+                "configuration": configuration,
+                "state": state,
             },
             exit_code=3,
         )
-    _capture_note(activity, "window_read", params={"scope": "link_groups"})
-    if diagnostic_dir is not None:
-        diagnostic_dir.mkdir(parents=True, exist_ok=True)
-        write_json(
-            diagnostic_dir / "link-group-read-request.json",
-            {
-                "assembly": document,
-                "configuration": cfg.get("configuration"),
-                "selection_order": "lexicographic_full_list",
-                "units": {
-                    "mass": "kg",
-                    "length": "m",
-                    "inertia": "kg_m2",
-                },
-                "groups": cfg.get("groups") or [],
-                "selections": selections,
-            },
-        )
-    payload = reader(document, {name: entry["selection"] for name, entry in selections.items()})
-    if diagnostic_dir is not None:
-        _write_link_group_diagnostic(
-            diagnostic_dir / "link-group-mass-properties.payload.json",
-            payload,
-        )
-    record = _link_group_record_from_payload(
-        payload,
-        selections,
-        document,
-        configuration=str(cfg.get("configuration") or ""),
-    )
-    record["readout_window"] = PRISTINE_WINDOW
-    assembly = getattr(backend, "assembly_mass_properties", None)
-    top_level = None
-    if callable(assembly):
-        _capture_note(activity, "window_read", params={"scope": "assembly"})
-        try:
-            top_level = assembly(document)
-        except Exception:  # noqa: BLE001 - mirrors _mass_closure's optional whole-assembly reader
-            top_level = None
-    state_reader = getattr(backend, "verify_capture_documents_ready", None)
-    document_state = state_reader() if callable(state_reader) else None
-    _capture_note(activity, "window_close")
-    closer()
-    return {
-        "top_level": top_level,
-        "record": record,
-        "document_state_after_pristine_readout": document_state,
-    }
+    return state
 
 
-def _freeze_local(
+def _capture_prepared_local(
     config: dict[str, Any],
     destination: Path,
     *,
+    package: Path,
+    prepared_root: Path,
+    native_files: Mapping[str, str],
     backend: Any,
-    worker_version: str = "unknown",
+    worker_version: str,
     on_activity=None,
 ) -> dict[str, Any]:
-    """Capture ``config['assembly']`` into ``destination`` and return the manifest.
+    """Capture one already sealed prepared assembly in a single owned session."""
 
-    ``on_activity`` optionally observes best-effort capture progress records for
-    the portal's live-activity view (component walk, per-instance reads, mesh
-    export, closure and the pristine window); it never changes the snapshot or
-    its checks.
-    """
-
-    # Check the path the caller gave us *before* resolving: resolving a symlink
-    # would hide the fact that the destination is a link.
     destination = Path(destination)
     existing_empty = _prepare_destination(destination)
     destination = destination.resolve()
     cfg = validate_source_config(config)
-    if not os.path.isfile(cfg["assembly"]):
+    package = Path(package).resolve()
+    prepared_root = Path(prepared_root).resolve()
+    if not prepared_root.is_dir():
         raise BridgeError(
-            "assembly_missing", "the configured assembly does not exist", {"assembly": cfg["assembly"]}, exit_code=3
+            "sealed_capture_incomplete",
+            "the archived prepared CAD source is unavailable",
+            {"prepared_root": str(prepared_root)},
+            exit_code=3,
         )
-    extension = os.path.splitext(cfg["assembly"])[1].lower()
-    if extension not in cfg["document_suffixes"]:
-        raise ConfigError("source.assembly must point at a supported CAD document", {"extension": extension})
     staging = destination.with_name(destination.name + ".partial")
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
+    source_root = staging / "source"
     request = {
         "assembly": cfg["assembly"],
         "configuration": cfg["configuration"],
-        "allowed_roots": cfg["allowed_roots"],
         "coordinate_systems": cfg["coordinate_systems"],
         "geometry": cfg["geometry"],
-        "require_saved": cfg["require_saved"],
         "bodies": len(cfg.get("groups") or []),
         "joints": len(cfg.get("axis_requests") or []),
     }
+
     from .native import ACTIVITY_KEEPALIVE_SECONDS, _ActivityEmitter
 
     activity = _ActivityEmitter(on_activity, keepalive_seconds=ACTIVITY_KEEPALIVE_SECONDS)
     activity.start_keepalive()
     _capture_note(activity, "start", force=True)
-    stage = "document_state"
-    _capture_note(activity, "document_state")
+    stage = "prepared_source"
+    released = False
+    raw_facts = None
+    raw_geometry: dict[str, Any] = {}
+    axis_references: list[dict[str, Any]] = []
     try:
-        prepare = getattr(backend, "prepare_source", None)
-        if callable(prepare):
-            prepare(cfg["assembly"], cfg["configuration"])
-        # `state["saved"]` is SolidWorks' own "would prompt to save" answer.  It is
-        # recorded in raw/document_state.json, and it never blocks: the capture copies
-        # the revision from disk in a session the adapter owns, so the flag cannot
-        # say anything about the operator's session (SolidWorksBackend._record_save_flag).
-        state = _document_state(backend, cfg)
-        if state.get("configurations") and cfg["configuration"] not in state["configurations"]:
-            raise BridgeError(
-                "cad_configuration_missing",
-                "the requested configuration does not exist in the document",
-                {"requested": cfg["configuration"], "available": state["configurations"]},
-                exit_code=3,
-            )
-
-        stage = "dependency_closure"
-        _capture_note(activity, "closure")
-        closure = _dependency_closure(backend, cfg, staging / "source")
-        _capture_note(
-            activity,
-            "closure",
-            params={"documents": len(closure.get("documents") or {}), "files": len(closure.get("copy_files") or {})},
+        main_relative, sealed_files = _sealed_capture_files(
+            package,
+            cfg,
+            native_files,
         )
-        # Persist the rewritten copy and the pre-boundary environment before the
-        # process boundary. If the fresh capture session fails to open, the
-        # failure packet still carries the exact closure and rewrite session.
+        _capture_note(activity, "prepared_source")
+        copied = _copy_sealed_capture_source(prepared_root, source_root, sealed_files)
+        closure = _sealed_dependency_closure(
+            cfg,
+            package=package,
+            source_root=source_root,
+            main_relative=main_relative,
+            copied=copied,
+        )
+        document = str(closure["top_level"])
         write_json(staging / "raw" / "dependency_closure.json", closure)
-        rewrite_environment = capture_environment(backend, worker_version)
-        write_json(staging / "evidence" / "rewrite-environment.json", rewrite_environment)
 
-        # ReplaceReferencedDocument leaves the rewrite application in a state
-        # that is not suitable for the final capture. Retire that owned copy
-        # process, reopen the exact collected top level in a fresh owned copy
-        # process, and only then record the actual capture environment.
-        retire = getattr(backend, "retire_session", None)
-        if not callable(retire):
-            raise BridgeError(
-                "cad_session_boundary_unavailable",
-                "the backend cannot retire the rewrite session before capture",
-                exit_code=3,
-            )
-        retirement = retire("copy")
+        prepare_capture = getattr(backend, "prepare_prepared_capture", None)
+        collect_scene = getattr(backend, "collect_prepared_scene", None)
+        capture_geometry = getattr(backend, "capture_prepared_geometry", None)
         opener = getattr(backend, "open_document", None)
-        if not callable(opener):
+        if (
+            not callable(prepare_capture)
+            or not callable(collect_scene)
+            or not callable(capture_geometry)
+            or not callable(opener)
+        ):
             raise BridgeError(
-                "cad_session_boundary_unavailable",
-                "the backend cannot open the collected top level in a fresh session",
+                "cad_prepared_capture_unavailable",
+                "the backend does not provide the prepared Capture seam",
                 exit_code=3,
             )
-        top = str(closure.get("top_level") or "")
-        opened = opener(top)
+
+        stage = "open_prepared"
+        _capture_note(activity, "open_prepared")
+        prepared_policy = prepare_capture(
+            str(source_root),
+            document,
+            cfg["configuration"],
+        )
+        if not isinstance(prepared_policy, dict):
+            raise BridgeError(
+                "cad_prepared_capture_policy",
+                "the backend returned no prepared capture policy evidence",
+                {"returned": type(prepared_policy).__name__},
+                exit_code=3,
+            )
+        opened = opener(document)
         if (
             not isinstance(opened, dict)
-            or not _same_document(str(opened.get("path") or ""), top)
+            or not _same_document(str(opened.get("path") or ""), document)
             or opened.get("read_only") is not True
         ):
             raise BridgeError(
-                "cad_session_boundary_failed",
-                "the collected top level did not reopen read-only in the fresh capture session",
-                {"top_level": top, "opened": opened},
+                "cad_prepared_capture_open",
+                "the prepared top assembly did not open read-only in the owned capture session",
+                {"document": document, "opened": opened},
                 exit_code=3,
             )
-        state_reader = getattr(backend, "document_state", None)
-        if not callable(state_reader):
-            raise BridgeError(
-                "cad_session_boundary_unavailable",
-                "the backend cannot verify the fresh capture configuration",
-                {"top_level": top},
-                exit_code=3,
-            )
-        capture_state = state_reader(top)
-        observed_configuration = (
-            capture_state.get("active_configuration") if isinstance(capture_state, dict) else None
+        state_before = _prepared_document_state(
+            backend,
+            document,
+            str(cfg["configuration"]),
         )
-        if (
-            not isinstance(capture_state, dict)
-            or not _same_document(str(capture_state.get("path") or ""), top)
-            or capture_state.get("read_only") is not True
-            or observed_configuration != str(cfg["configuration"])
-        ):
-            raise BridgeError(
-                "cad_session_boundary_configuration",
-                "the fresh capture session did not reopen the requested configuration",
-                {
-                    "top_level": top,
-                    "requested": str(cfg["configuration"]),
-                    "observed": observed_configuration,
-                    "state": capture_state,
-                },
-                exit_code=3,
-            )
+        write_json(staging / "raw" / "document_state.json", state_before)
+
         stage = "environment"
-        _capture_note(activity, "environment")
         environment = capture_environment(backend, worker_version)
-        environment["session_boundary"] = {
-            "closure_top_level": top,
-            "configuration": str(cfg["configuration"]),
-            "observed_configuration": observed_configuration,
-            "capture_state": capture_state,
-            "retirement": retirement,
+        environment["prepared_capture"] = {
+            "mode": "single_read_only_prepared_capture",
+            "policy": prepared_policy,
             "opened": opened,
+            "state_before": state_before,
         }
         write_json(staging / "evidence" / "environment.json", environment)
+
         stage = "readings"
         _capture_note(activity, "readings")
-        scene, raw = _capture_readings(backend, cfg, closure, staging / "source", activity=activity)
-        preparation = (scene.notes or {}).get("capture_preparation")
-        recovery = (
-            preparation.get("session_recovery")
-            if isinstance(preparation, dict)
+        raw_facts = collect_scene(
+            document,
+            cfg["coordinate_systems"],
+            groups=cfg["groups"],
+            on_activity=activity.publish,
+            require_material=True,
+        )
+
+        stage = "axis_references"
+        axis_references = _capture_axis_references(backend, cfg)
+
+        stage = "geometry_facts"
+        _capture_note(activity, "geometry_facts")
+        source_scopes_raw = (
+            raw_facts.get("source_scopes")
+            if isinstance(raw_facts, dict)
             else None
         )
-        if recovery is not None:
-            # Keep the environment observed before the failure and replace the
-            # delivery environment with the session that actually produced the
-            # final readings.
-            write_json(
-                staging / "evidence" / "capture-environment-before-recovery.json",
-                environment,
+        raw_geometry = capture_geometry(
+            source_scopes_raw,
+            on_activity=activity.publish,
+        )
+
+        stage = "document_state_after_reads"
+        state_after = _prepared_document_state(
+            backend,
+            document,
+            str(cfg["configuration"]),
+        )
+        write_json(staging / "raw" / "document_state_after_reads.json", state_after)
+
+        stage = "release"
+        _capture_note(activity, "release")
+        release = getattr(backend, "release", None)
+        if not callable(release):
+            raise BridgeError(
+                "cad_release_unavailable",
+                "the prepared capture backend cannot release its owned session",
+                exit_code=3,
             )
-            final_environment = capture_environment(backend, worker_version)
-            final_copy = (
-                (final_environment.get("solidworks") or {}).get("sessions") or {}
-            ).get("copy")
-            if (
-                not isinstance(final_copy, dict)
-                or final_copy != preparation["session"]["identity"]
-            ):
+        release()
+        released = True
+
+        stage = "scene_projection"
+        _capture_note(activity, "scene_projection")
+        raw_scene = raw_facts.get("scene_raw") if isinstance(raw_facts, dict) else None
+        raw_occurrences = raw_scene.get("occurrences") if isinstance(raw_scene, dict) else None
+        for occurrence in raw_occurrences if isinstance(raw_occurrences, list) else ():
+            if not isinstance(occurrence, dict):
+                continue
+            geometry_row = raw_geometry.get(occurrence.get("name"))
+            if isinstance(geometry_row, dict) and "appearance_raw" in geometry_row:
+                occurrence["appearance_raw"] = geometry_row["appearance_raw"]
+        write_json(staging / "raw" / "native_capture_facts.json", raw_facts)
+        from .native import project_prepared_capture, project_axis_references
+
+        axis_references = project_axis_references(axis_references)
+        projected = project_prepared_capture(raw_facts)
+        scene = projected["scene"]
+        if not _same_document(str(getattr(scene, "document", "") or ""), document):
+            raise BridgeError(
+                "capture_source_mismatch",
+                "the offline scene projection named another document",
+                {"requested": document, "reported": getattr(scene, "document", None)},
+                exit_code=3,
+            )
+        backend_readings = projected["effective_instances"]
+        cache_error = projected["effective_instances_error"]
+        mass_closure = _mass_closure_from_projection(
+            projected["assembly_mass"],
+            projected["component_mass"],
+        )
+        projected_source_scopes = raw_facts["source_scopes"]
+        if not isinstance(projected_source_scopes, dict):
+            raise BridgeError(
+                "cad_prepared_capture_projection",
+                "the raw source-scope projection is not an object",
+                exit_code=3,
+            )
+        source_scopes = _bind_source_scope_origins(
+            projected_source_scopes,
+            closure,
+            source_root,
+        )
+        components = [component.name for component in scene.components]
+        for component in components if raw_geometry else ():
+            facts = raw_geometry.get(component)
+            if not isinstance(facts, dict) or facts.get("source_scope") != projected_source_scopes[component]:
                 raise BridgeError(
-                    "cad_rebuild_recovery_environment",
-                    "The final capture environment does not bind the recovered session",
-                    {
-                        "preparation_session": preparation.get("session"),
-                        "environment_copy": final_copy,
-                    },
+                    "cad_source_scope_mismatch",
+                    "geometry facts do not bind their captured occurrence source",
+                    {"component": component},
                     exit_code=3,
                 )
-            final_environment["session_boundary"] = copy.deepcopy(
-                environment["session_boundary"]
-            )
-            environment = final_environment
-            write_json(
-                staging / "evidence" / "environment.json",
-                environment,
-            )
-        write_json(staging / "raw" / "scene_raw.json", raw)
-        write_json(staging / "raw" / "document_state.json", state)
-        write_json(staging / "raw" / "coordinate_systems.json", raw["coordinate_systems"])
-        write_json(staging / "raw" / "mass_properties.json", raw["mass_properties"])
+        if cache_error is not None:
+            scene.notes["effective_instances_error"] = cache_error
+        scene.notes["effective_instances"] = backend_readings
+        raw_scene = _raw_scene_payload(scene, cfg, source_root)
+        write_json(staging / "raw" / "scene_raw.json", raw_scene)
+        write_json(staging / "raw" / "coordinate_systems.json", raw_scene["coordinate_systems"])
+        write_json(staging / "raw" / "mass_properties.json", raw_scene["mass_properties"])
+        write_json(staging / "raw" / "axis_references.json", axis_references)
+        write_json(staging / "raw" / "source_scopes.json", source_scopes)
         write_json(
             staging / "raw" / "material_provenance.json",
             _material_provenance_record(scene, cfg),
         )
-        axis_references = _capture_axis_references(backend, cfg)
-        if axis_references:
-            write_json(staging / "raw" / "axis_references.json", axis_references)
-        # Computed here so `component_context` observes exactly the walked
-        # session; `top_level` is replaced by the pristine window reading below.
-        _capture_note(activity, "mass_closure")
-        mass_closure = _mass_closure(backend, cfg, getattr(scene, "document", None))
-        # Effective instance readings (overridden instances, sheet-only
-        # fallback) come from the SAME component-context traversal; they are
-        # injected into the scene notes and the raw scene file is rewritten so
-        # notes, canonical record and closure rows carry exactly the same
-        # reading.  The canonical record is written for every capture.
-        backend_readings: dict[str, Any] = {}
-        cache_error: dict[str, Any] | None = None
-        collector = getattr(backend, "effective_instance_readings", None)
-        if callable(collector):
-            _capture_note(activity, "effective_instances")
-            try:
-                backend_readings = collector()
-            except Exception as error:  # noqa: BLE001 - preserved as evidence, never fatal
-                cache_error = {
-                    "reason": str(getattr(error, "code", "") or type(error).__name__),
-                    "message": " ".join(str(error).split())[:200],
-                }
-        if cache_error is not None:
-            scene.notes["effective_instances_error"] = cache_error
-        scene.notes["effective_instances"] = backend_readings
-        write_json(staging / "raw" / "scene_raw.json", _raw_scene_payload(scene, cfg, staging / "source"))
         write_json(
             staging / "raw" / "effective_instances.json",
             _effective_instance_record(scene, cfg, backend_readings, cache_error),
         )
-        components = [component.name for component in scene.components]
-        source_scopes = {}
-        scope_reader = getattr(backend, "source_scopes", None)
-        if callable(scope_reader):
-            source_scopes = _bind_source_scope_origins(
-                scope_reader(components),
-                closure,
-                staging / "source",
-            )
-            backend._source_scope_overrides = source_scopes
-        write_json(staging / "raw" / "source_scopes.json", source_scopes)
-        geometry_entries: list[dict[str, Any]] = []
-        if cfg["geometry"].get("enabled", True):
-            stage = "geometry"
-            _capture_note(activity, "geometry")
-            geometry_entries = _export_geometry(backend, cfg, staging / "geometry", components, activity=activity)
-            write_json(staging / "raw" / "geometry.json", geometry_entries)
-
-        stage = "verify_sources"
-        _capture_note(activity, "verify_sources")
-        # Verify the live copy state and saved original bytes independently.
-        backend.verify_sources_unchanged()
-        final_reader = getattr(backend, "verify_capture_documents_ready", None)
-        final_document_state = final_reader() if callable(final_reader) else None
-        if final_document_state is not None:
-            write_json(
-                staging / "raw" / "document_state_after_reads.json",
-                final_document_state,
-            )
-        originals = _verify_originals_unchanged(closure)
-        copied = _copy_inventory(staging / "source")
-        if copied != closure["copy_files"]:
-            changed = sorted(
-                path
-                for path in set(copied) | set(closure["copy_files"])
-                if copied.get(path) != closure["copy_files"].get(path)
-            )
-            raise BridgeError(
-                "cad_copy_changed",
-                "collected files changed while readings were captured",
-                {"changed": changed},
-                exit_code=3,
-            )
-
-        # Pristine readout window: every CAD-facing step above may have
-        # contaminated the session's direct group reads (probe v4), so close
-        # all documents and reopen the captured copy; the whole-assembly read
-        # and all direct link-group reads then come from a never-touched window
-        # (probe v5: close+reopen restores the opened state bit-identically).
-        # This is the last CAD activity of the capture; only file-level steps
-        # follow.  The record selections are the late composition of the walked
-        # per-instance evidence and the payload echo must match them exactly.
-        stage = "pristine_readout"
-        _capture_note(activity, "pristine_readout")
+        link_payload = projected["link_group_mass_properties"]
         selections = _link_group_selections(cfg, scene, backend_readings)
-        diagnostic_dir = staging / "reports" / "diagnostics"
-        window = _pristine_readout_window(
-            backend,
-            cfg,
-            closure,
+        link_groups = _link_group_record_from_payload(
+            link_payload,
             selections,
-            activity=activity,
-            diagnostic_dir=diagnostic_dir,
+            document,
+            configuration=str(cfg["configuration"]),
         )
-        if window.get("document_state_after_pristine_readout") is not None:
-            write_json(
-                staging / "raw" / "document_state_after_pristine_readout.json",
-                window["document_state_after_pristine_readout"],
-            )
-        if isinstance(mass_closure, dict) and mass_closure.get("status") == "recorded":
-            if not isinstance(window["top_level"], dict):
-                raise BridgeError(
-                    "cad_pristine_readout_unavailable",
-                    "the reopened window produced no whole-assembly reading",
-                    exit_code=3,
-                )
-            mass_closure["top_level"] = _top_level_record(window["top_level"])
-            mass_closure["top_level"]["reference"]["readout_window"] = PRISTINE_WINDOW
+        link_groups["readout_window"] = "single-read-only-pass"
+        write_json(staging / "raw" / "link_group_mass_properties.json", link_groups)
         if mass_closure is not None:
             write_json(staging / "raw" / "mass_closure.json", mass_closure)
-        write_json(staging / "raw" / "link_group_mass_properties.json", window["record"])
 
-        # Scene construction is portable work. Seal its exact inputs here;
-        # Linux derives the scene without rewriting this native snapshot.
+        stage = "geometry"
+        _capture_note(activity, "geometry")
+        destinations = _geometry_destinations(
+            staging / "geometry",
+            components,
+        )
+        from .native import materialize_native_triangles
 
-        # Product-convention proof and normalization, once, at the single
-        # throat where the raw native evidence is final: the sealed dual reads
-        # decide the family, a positive-products capture is rewritten to the
-        # standard convention, and the proof is sealed beside the documents
-        # before the evidence block and the manifest bind their digests.
+        serialized = materialize_native_triangles(raw_geometry, destinations)
+        geometry_entries = list(serialized.values())
+        write_json(staging / "raw" / "geometry.json", geometry_entries)
+
+        for lock in _native_lock_files(source_root):
+            lock.unlink()
+        originals = _verify_sealed_capture_copy(closure)
+
+        stage = "seal"
+        _capture_note(activity, "seal")
         _seal_inertia_convention(staging)
-
         source_inputs = _source_inputs(cfg, closure)
         identity = {
             "provider": SOURCE_KIND,
@@ -2791,7 +1713,7 @@ def _freeze_local(
                 "evidence_class": _evidence_class(backend, cfg),
                 "coordinate_systems": cfg["coordinate_systems"],
                 "geometry": cfg["geometry"],
-                "require_saved": cfg["require_saved"],
+                "mode": "sealed_prepared_single_read_only_pass",
             },
         }
         evidence = build_evidence(
@@ -2802,43 +1724,25 @@ def _freeze_local(
                 "components": len(scene.components),
                 "mass_properties": len(scene.mass_properties),
                 "geometry_files": len(geometry_entries),
-                # The revision read from disk, by the same names the digest uses.  The
-                # snapshot's own copies are bound by manifest.json; naming them here with
-                # job paths would point at directories that no longer exist.
-                "source_hashes": {name: {"sha256": digest} for name, digest in sorted(source_inputs.items())},
-                "collected_document": closure.get("top_level"),
+                "source_hashes": {
+                    name: {"sha256": checksum}
+                    for name, checksum in sorted(source_inputs.items())
+                },
+                "collected_document": closure["top_level"],
                 "originals_unchanged": originals,
-                # SolidWorks' own save flags, kept for the reader: the snapshot names the
-                # bytes it copied, and a flag never decided whether the capture ran.
-                "save_flag_documents": list(closure.get("save_flag_documents") or []),
             },
             limits={
                 "native_cad": True,
                 "kinematics_defined_by": (
-                    "source.groups/source.axis_requests" if cfg.get("axis_requests") else "not_defined"
+                    "source.groups/source.axis_requests"
+                    if cfg.get("axis_requests")
+                    else "not_defined"
                 ),
             },
         )
         write_json(staging / "evidence" / "collection.json", evidence)
 
-        # Windows cannot rename a directory while CAD owns file handles inside
-        # it. Release the owned applications before atomically publishing.
-        stage = "release"
-        _capture_note(activity, "release")
-        release = getattr(backend, "release", None)
-        if callable(release):
-            release()
-        # Job termination can leave session locks behind. Only discard locks
-        # inside our staged copy, after all owned CAD handles have been released.
-        for lock in _native_lock_files(staging / "source"):
-            lock.unlink()
-        if _copy_inventory(staging / "source") != closure["copy_files"]:
-            raise BridgeError("cad_source_changed", "collected files changed during CAD cleanup", exit_code=3)
-
         stage = "publish"
-        _capture_note(activity, "seal")
-        if diagnostic_dir.exists():
-            shutil.rmtree(diagnostic_dir)
         write_manifest = _shared_manifest_writer()
         manifest = write_manifest(
             staging,
@@ -2848,21 +1752,27 @@ def _freeze_local(
         )
         write_json(staging / "manifest.json", manifest)
         if existing_empty:
-            # The caller owns the directory; replace it only once the snapshot
-            # is complete, so an interrupted freeze never leaves a half snapshot.
             destination.rmdir()
         os.replace(staging, destination)
         return manifest
     except BaseException as error:
-        release = getattr(backend, "release", None)
-        if callable(release):
-            with contextlib.suppress(Exception):
-                release()
-        _retain_failure(staging, destination, error, stage, request)
+        if not released:
+            release = getattr(backend, "release", None)
+            if callable(release):
+                try:
+                    release()
+                except Exception as cleanup_error:
+                    error.add_note(f"CAD cleanup also failed: {cleanup_error}")
+        observations = {
+            "scene": raw_facts if raw_facts is not None else getattr(error, "partial_native_facts", None),
+            "geometry": raw_geometry,
+            "axis_references": axis_references or getattr(error, "partial_axis_facts", []),
+        }
+        with contextlib.suppress(Exception):
+            _retain_failure(staging, destination, error, stage, request, observations)
         raise
     finally:
         activity.stop_keepalive()
-
 
 #: Every raw native document that records an inertia tensor, in write order.
 _CONVENTION_DOCUMENTS = (
@@ -2900,23 +1810,27 @@ def _seal_inertia_convention(staging: Path) -> None:
     write_json(raw / "inertia_convention.json", report)
 
 
-def freeze(
+def capture_prepared(
     config: dict[str, Any],
     destination: Path,
     *,
-    backend: Any = None,
-    worker_version: str = "unknown",
+    package: Path,
+    prepared_root: Path,
+    native_files: Mapping[str, str],
+    backend: Any,
+    worker_version: str,
     on_activity=None,
 ) -> dict[str, Any]:
-    """Freeze from saved files in a job-owned STA session."""
-    from contextlib import nullcontext
+    """Capture one sealed prepared package through the single production path."""
 
-    if backend is None:
-        from .native import SolidWorksBackend
-
-        backend = SolidWorksBackend()
-    session = getattr(backend, "session", None)
-    with session() if callable(session) else nullcontext():
-        return _freeze_local(
-            config, destination, backend=backend, worker_version=worker_version, on_activity=on_activity
+    with backend.session():
+        return _capture_prepared_local(
+            config,
+            destination,
+            package=package,
+            prepared_root=prepared_root,
+            native_files=native_files,
+            backend=backend,
+            worker_version=worker_version,
+            on_activity=on_activity,
         )

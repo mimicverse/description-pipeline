@@ -25,7 +25,7 @@ GRANT SELECT, INSERT ON
     TO platform_service;
 GRANT UPDATE (last_seen_at, closed_at, closure_code, yield_effect_id)
     ON :"platform_schema".execution_claim TO platform_service;
-GRANT UPDATE (display_name, hidden_at, hidden_reason, updated_at)
+GRANT UPDATE (display_name, hidden_at, hidden_reason, activity, updated_at)
     ON :"platform_schema".run_display_metadata TO platform_service;
 GRANT SELECT ON
     :"platform_schema".lifecycle_projection,

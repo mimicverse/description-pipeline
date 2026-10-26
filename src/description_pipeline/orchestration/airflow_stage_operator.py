@@ -30,13 +30,18 @@ def _binding_from_context(
     *,
     stage: StageId,
     expected_task_id: str,
+    expected_dag_id: str,
     context: Mapping[str, Any],
-    fallback_dag_id: str | None,
 ) -> tuple[AirflowTaskBinding, str]:
     dag_run = context.get("dag_run")
     task_instance = context.get("ti")
     dag = context.get("dag")
-    dag_id = getattr(dag, "dag_id", None) or fallback_dag_id
+    dag_id = getattr(dag, "dag_id", None)
+    if dag_id != expected_dag_id:
+        raise AirflowFailException(
+            f"Airflow dag_id {dag_id!r} differs from operator dag_id "
+            f"{expected_dag_id!r}"
+        )
     dag_run_id = getattr(dag_run, "run_id", None)
     task_id = getattr(task_instance, "task_id", None)
     map_index = getattr(task_instance, "map_index", None)
@@ -140,8 +145,8 @@ class StageTaskOperator(BaseOperator):
         binding, run_id = _binding_from_context(
             stage=self.stage,
             expected_task_id=self.task_id,
+            expected_dag_id=self.dag_id,
             context=context,
-            fallback_dag_id=self.dag_id,
         )
         application = _application_from_binding(binding)
         try:
@@ -171,8 +176,8 @@ class StageTaskOperator(BaseOperator):
         binding, run_id = _binding_from_context(
             stage=self.stage,
             expected_task_id=self.task_id,
+            expected_dag_id=self.dag_id,
             context=context,
-            fallback_dag_id=self.dag_id,
         )
         expected = _wait_from_record(
             wait,
