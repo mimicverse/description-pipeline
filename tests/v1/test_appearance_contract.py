@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from itertools import permutations
 
 from description_pipeline.appearance_contract import (
     RGBA_ATOL,
@@ -63,15 +64,15 @@ class AppearanceContractTests(unittest.TestCase):
                 )
 
     def test_scoped_rgba_rejects_invalid_values_and_cross_tolerance_chains(self):
-        self.assertIsNone(
-            scoped_rgba(
-                (
-                    (0.0, 0.0, 0.0, 1.0),
-                    (0.9 * RGBA_ATOL, 0.0, 0.0, 1.0),
-                    (1.8 * RGBA_ATOL, 0.0, 0.0, 1.0),
-                )
-            )
+        anchor = 0.25
+        spanning = (
+            (anchor, 0.0, 0.0, 1.0),
+            (anchor + 0.75 * RGBA_ATOL, 0.0, 0.0, 1.0),
+            (anchor - 0.75 * RGBA_ATOL, 0.0, 0.0, 1.0),
         )
+        for ordered in permutations(spanning):
+            with self.subTest(ordered=ordered):
+                self.assertIsNone(scoped_rgba(ordered))
         self.assertIsNone(
             scoped_rgba(
                 (

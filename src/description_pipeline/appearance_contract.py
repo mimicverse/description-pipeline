@@ -40,12 +40,10 @@ def scoped_rgba(values: Sequence[object]) -> tuple[float, float, float, float] |
         raise ValueError("At least one RGBA candidate is required")
     candidates = tuple(_rgba_values(value) for value in values)
     if any(
-        max(
-            abs(left - right)
-            for left, right in zip(candidates[0], candidate, strict=True)
-        )
+        max(candidate[index] for candidate in candidates)
+        - min(candidate[index] for candidate in candidates)
         > RGBA_ATOL
-        for candidate in candidates[1:]
+        for index in range(4)
     ):
         return None
     return min(candidates)
