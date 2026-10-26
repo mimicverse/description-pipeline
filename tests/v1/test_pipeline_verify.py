@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import shutil
 import tempfile
 import unittest
@@ -414,6 +415,104 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 configuration="Painted",
                 where="capture",
             )
+
+    def test_independent_color_encodings_share_one_observed_rgba(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        for owner_red, should_pass in ((57 / 255.0, True), (58 / 255.0, False)):
+            with self.subTest(owner_red=owner_red):
+                raw = hermetic._fixture_appearance_raw(
+                    "arm-1",
+                    {
+                        "source_document_path": "C:/cad/arm.SLDPRT",
+                        "referenced_configuration": "Painted",
+                    },
+                    [{"body_type": 0, "body_index": 0, "face_index": 0}],
+                )
+                owner_channel = (
+                    math.nextafter(owner_red, -math.inf)
+                    if should_pass
+                    else owner_red
+                )
+                face = raw["bodies"][0]["faces"][0]["appearance"]
+                face["material_property_values"] = [
+                    owner_channel,
+                    owner_channel,
+                    owner_channel,
+                    1.0,
+                    1.0,
+                    0.5,
+                    0.3125,
+                    0.0,
+                    0.0,
+                ]
+                owner = raw["state_render_materials"][-1]
+                owner["call_state"] = "observed"
+                owner["native_render_material_count"] = 1
+                owner["mapping_errors"] = []
+                owner["native_reference_index"] = [
+                    _appearance_index_record(
+                        reference=(1, 2, 3),
+                        target={
+                            "kind": "face",
+                            "component": "arm-1",
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": 0,
+                        },
+                    )
+                ]
+                owner["materials"] = [
+                    {
+                        "material_index": 0,
+                        "linked_display_states": ["Default_Display_State"],
+                        "entities": ["face"],
+                        "entities_state": "observed",
+                        "entity_records": [
+                            _appearance_entity_record(
+                                reference=(1, 2, 3),
+                                native_interface_kind="IEntity",
+                            )
+                        ],
+                        "primary_color": 0x393939,
+                        "transparency": 0.0,
+                        "color_form": 1,
+                        "texture_filename": "",
+                        "surface_finish_file": "",
+                        "read_errors": {},
+                    }
+                ]
+                if should_pass:
+                    resolved = _resolved_faces(
+                        raw,
+                        configuration="Painted",
+                        where="capture",
+                    )
+                    self.assertEqual(
+                        resolved["faces"][(0, 0, 0)]["rgba"],
+                        (
+                            owner_channel,
+                            owner_channel,
+                            owner_channel,
+                            1.0,
+                        ),
+                    )
+                    self.assertEqual(
+                        {
+                            source["kind"]
+                            for source in resolved["faces"][(0, 0, 0)]["source"]["owners"]
+                        },
+                        {"owner", "display_state_render_material"},
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        PipelineError, "conflicting appearances"
+                    ):
+                        _resolved_faces(
+                            raw,
+                            configuration="Painted",
+                            where="capture",
+                        )
 
     def test_independent_appearance_scopes_mapping_errors_to_participants(
         self,

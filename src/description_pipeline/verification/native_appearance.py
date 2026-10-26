@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from ..appearance_contract import index_conversion_mismatch
+from ..appearance_contract import index_conversion_mismatch, scoped_rgba
 from ..geometry.native_tessellation import native_stl_subset
 from ..io import PipelineError, confined, file_digest
 from ..sources.solidworks.naming import (
@@ -1104,13 +1104,13 @@ def _resolved_faces(
                     )
             if not current:
                 continue
-            colors = {tuple(choice["rgba"]) for choice in current}
+            selected_rgba = scoped_rgba([choice["rgba"] for choice in current])
             _require(
-                len(colors) == 1,
+                selected_rgba is not None,
                 f"{where} has conflicting appearances at proven scope {scope}",
             )
             selected = {
-                "rgba": colors.pop(),
+                "rgba": selected_rgba,
                 "source": {
                     "scopes": [scope],
                     "configuration": configuration,
@@ -1313,7 +1313,13 @@ def verify_native_appearance(
                 link=str(link["name"]),
             )
             _require(shape.get("name") == expected_name, f"{component} visual name differs")
-            _require(shape.get("rgba") == group["rgba"], f"{component} visual RGBA differs")
+            try:
+                rgba_matches = (
+                    scoped_rgba((shape.get("rgba"), group["rgba"])) is not None
+                )
+            except ValueError as error:
+                raise PipelineError(f"{component} visual RGBA is invalid") from error
+            _require(rgba_matches, f"{component} visual RGBA differs")
             _require(
                 shape.get("material")
                 == material_name(

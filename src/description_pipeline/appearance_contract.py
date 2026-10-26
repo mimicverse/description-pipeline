@@ -2,8 +2,53 @@
 
 from __future__ import annotations
 
+import math
 import posixpath
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+
+RGBA_ATOL = 1e-12
+
+
+def _rgba_values(value: object) -> tuple[float, float, float, float]:
+    """Validate and return one unquantized RGBA tuple."""
+
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) != 4
+    ):
+        raise ValueError("RGBA must contain four channels")
+    channels = []
+    for item in value:
+        if type(item) not in (int, float):
+            raise ValueError("RGBA channels must be numeric")
+        channel = float(item)
+        if not math.isfinite(channel) or not 0 <= channel <= 1:
+            raise ValueError("RGBA channels must be finite and within [0, 1]")
+        channels.append(channel)
+    return tuple(channels)
+
+
+def scoped_rgba(values: Sequence[object]) -> tuple[float, float, float, float] | None:
+    """Return one observed RGBA when every channel agrees within the bound."""
+
+    if (
+        not isinstance(values, Sequence)
+        or isinstance(values, (str, bytes))
+        or not values
+    ):
+        raise ValueError("At least one RGBA candidate is required")
+    candidates = tuple(_rgba_values(value) for value in values)
+    if any(
+        max(
+            abs(left - right)
+            for left, right in zip(candidates[0], candidate, strict=True)
+        )
+        > RGBA_ATOL
+        for candidate in candidates[1:]
+    ):
+        return None
+    return min(candidates)
 
 
 def _path_key(value):

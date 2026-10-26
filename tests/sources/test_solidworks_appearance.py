@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import unittest
 from pathlib import Path
 
@@ -510,6 +511,112 @@ class AppearanceResolutionTests(unittest.TestCase):
             },
             {0: ["face"], 1: ["document"]},
         )
+
+    def test_same_scope_color_encodings_share_one_observed_rgba(self):
+        for owner_red, should_pass in ((57 / 255.0, True), (58 / 255.0, False)):
+            with self.subTest(owner_red=owner_red):
+                owner_channel = (
+                    math.nextafter(owner_red, -math.inf)
+                    if should_pass
+                    else owner_red
+                )
+                raw = _resolved_raw(
+                    [
+                        [
+                            owner_channel,
+                            owner_channel,
+                            owner_channel,
+                            1.0,
+                            1.0,
+                            0.5,
+                            0.3125,
+                            0.0,
+                            0.0,
+                        ]
+                    ]
+                )
+                owner = _empty_state_owner(
+                    scope="component_document",
+                    document_path=DOCUMENT,
+                    configuration=CONFIGURATION,
+                    display_state="Display State 1",
+                )
+                owner["call_state"] = "observed"
+                owner["native_render_material_count"] = 1
+                owner["native_reference_index"] = [
+                    _reference_row(
+                        reference=(1, 2, 3),
+                        target={
+                            "kind": "face",
+                            "component": COMPONENT,
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": 0,
+                        },
+                    )
+                ]
+                owner["materials"] = [
+                    {
+                        "material_index": 0,
+                        "linked_display_states": ["Display State 1"],
+                        "entities": ["face"],
+                        "entities_state": "observed",
+                        "entity_records": [
+                            _state_entity_record(kind="entity", reference=(1, 2, 3))
+                        ],
+                        "primary_color": 0x393939,
+                        "transparency": 0.0,
+                        "color_form": 1,
+                        "texture_filename": "",
+                        "surface_finish_file": "",
+                        "read_errors": {},
+                    }
+                ]
+                raw["state_render_materials"] = [owner]
+                spans = [
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "triangle_start": 0,
+                        "triangle_count": 1,
+                        "face_reference_sha256": "a" * 64,
+                    }
+                ]
+                if should_pass:
+                    resolved = resolve_deliverable_appearance(
+                        raw,
+                        component=COMPONENT,
+                        expected_document_path=DOCUMENT,
+                        expected_configuration=CONFIGURATION,
+                        face_spans=spans,
+                    )
+                    self.assertEqual(
+                        resolved.faces[0].rgba,
+                        (
+                            owner_channel,
+                            owner_channel,
+                            owner_channel,
+                            1.0,
+                        ),
+                    )
+                    self.assertEqual(
+                        {source["kind"] for source in resolved.faces[0].source["owners"]},
+                        {"owner", "display_state_render_material"},
+                    )
+                else:
+                    with self.assertRaises(AppearanceError) as caught:
+                        resolve_deliverable_appearance(
+                            raw,
+                            component=COMPONENT,
+                            expected_document_path=DOCUMENT,
+                            expected_configuration=CONFIGURATION,
+                            face_spans=spans,
+                        )
+                    self.assertEqual(
+                        caught.exception.appearance["issues"][0]["code"],
+                        "cad_appearance_owner_conflict",
+                    )
 
     def test_assembly_occurrence_override_precedes_part_and_face(self):
         case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))

@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from ...appearance_contract import index_conversion_mismatch
+from ...appearance_contract import index_conversion_mismatch, scoped_rgba
 from ...io import PipelineError
 
 UNRECORDED_APPEARANCE = object()
@@ -98,9 +98,7 @@ def appearance_groups(
             raise PipelineError("Resolved appearance repeats a delivered face")
         seen_faces.add(face.face_reference_sha256)
         next_triangle += face.triangle_count
-        by_rgba.setdefault(tuple(float(value) for value in face.rgba), []).append(
-            face
-        )
+        by_rgba.setdefault(tuple(float(value) for value in face.rgba), []).append(face)
 
     groups = []
     for rgba, group_faces in by_rgba.items():
@@ -1801,7 +1799,10 @@ def resolve_deliverable_appearance(
                 tuple(float(value) for value in choice["rgba"])
                 for choice in choices
             }
-            if len(colors) != 1:
+            selected_rgba = scoped_rgba(
+                [choice["rgba"] for choice in choices]
+            )
+            if selected_rgba is None:
                 code = (
                     "cad_appearance_ancestor_precedence_unproven"
                     if scope == "occurrence"
@@ -1816,7 +1817,7 @@ def resolve_deliverable_appearance(
                     sources=[choice["source"] for choice in choices],
                 )
             selected = {
-                "rgba": colors.pop(),
+                "rgba": selected_rgba,
                 "sources": [choice["source"] for choice in choices],
                 "scopes": [scope],
             }
