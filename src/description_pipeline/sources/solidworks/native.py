@@ -5013,6 +5013,7 @@ class SolidWorksBackend(CadBackend):
         owner_scope,
         primary_component,
         extension,
+        source_document_object,
     ):
         """Resolve one underlying-document object into the assembly owner context."""
 
@@ -5030,13 +5031,27 @@ class SolidWorksBackend(CadBackend):
         }
         target_reference = None
         target_error = None
-        if extension is not None:
+        skip_cross_document_direct = (
+            source_document_object
+            and owner_scope == "component_document"
+        )
+        if not skip_cross_document_direct and extension is not None:
             target_reference, target_error = (
                 _appearance_persistent_reference(
                     extension,
                     entity,
                 )
             )
+        elif skip_cross_document_direct:
+            target_error = {
+                "code": "cad_appearance_cross_document_reference_not_attempted",
+                "message": (
+                    "component-document objects are converted into the "
+                    "assembly owner context before requesting a persistent "
+                    "reference"
+                ),
+                "detail": {"owner_scope": owner_scope},
+            }
         record["target_reference_attempt"] = {
             "api": "IModelDocExtension.GetPersistReference3",
             "persistent_reference": copy.deepcopy(target_reference),
@@ -5201,6 +5216,7 @@ class SolidWorksBackend(CadBackend):
                 owner_scope=owner_scope,
                 primary_component=component,
                 extension=corresponding_extension,
+                source_document_object=False,
             )
             if context["state"] != "observed":
                 mapping_errors.append(
@@ -5688,6 +5704,7 @@ class SolidWorksBackend(CadBackend):
                 owner_scope=owner_scope,
                 primary_component=primary_component,
                 extension=corresponding_extension,
+                source_document_object=True,
             )
         )
         binding_context = {

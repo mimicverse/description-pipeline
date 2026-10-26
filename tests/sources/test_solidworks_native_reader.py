@@ -3374,23 +3374,31 @@ class AppearanceHelperTests(unittest.TestCase):
         )
         self.assertEqual(persistent_calls, [])
 
-    def test_material_body_uses_target_reference_without_face_probe(
+    def test_material_body_converts_without_face_probe(
         self,
     ) -> None:
         face_reads = []
-        body = types.SimpleNamespace(
-            _persist_reference=b"body-reference",
+        source_body = types.SimpleNamespace(
+            _persist_reference=b"source-body-reference",
+            GetFaces=lambda: face_reads.append(True) or [],
+        )
+        target_body = types.SimpleNamespace(
+            _persist_reference=b"target-body-reference",
             GetFaces=lambda: face_reads.append(True) or [],
         )
         context = native_module.SolidWorksBackend._appearance_entity_context(
-            body,
+            source_body,
             {
                 "native_interface_kind": None,
-                "source_persistent_reference": None,
+                "source_persistent_reference": list(
+                    source_body._persist_reference
+                ),
                 "source_read_errors": {},
             },
             owner_scope="component_document",
-            primary_component=types.SimpleNamespace(),
+            primary_component=types.SimpleNamespace(
+                GetCorresponding=lambda entity: target_body,
+            ),
             component_name="arm-1",
             binding_document_path="C:\\robot.SLDASM",
             corresponding_extension=types.SimpleNamespace(
@@ -3404,18 +3412,30 @@ class AppearanceHelperTests(unittest.TestCase):
         )
         self.assertEqual(
             context["record"]["persistent_reference"],
-            list(b"body-reference"),
+            list(b"target-body-reference"),
         )
         self.assertEqual(
             context["record"]["native_identity"]["context"]["api"],
-            "IModelDocExtension.GetPersistReference3",
+            "IComponent2.GetCorresponding",
+        )
+        self.assertEqual(
+            context["record"]["native_identity"]["context"][
+                "target_reference_attempt"
+            ]["error"]["code"],
+            "cad_appearance_cross_document_reference_not_attempted",
         )
         self.assertEqual(face_reads, [])
 
-    def test_target_reference_survives_source_interface_failure(
+    def test_unknown_source_interface_does_not_use_target_reference(
         self,
     ) -> None:
         entity = types.SimpleNamespace(_persist_reference=b"target-body")
+        target_reference_calls = []
+
+        def target_reference(value):
+            target_reference_calls.append(value)
+            return list(value._persist_reference)
+
         conversion = _raiser(
             AssertionError(
                 "an unknown source interface cannot select a conversion"
@@ -3442,25 +3462,24 @@ class AppearanceHelperTests(unittest.TestCase):
             component_name="arm-1",
             binding_document_path="C:\\robot.SLDASM",
             corresponding_extension=types.SimpleNamespace(
-                GetPersistReference3=lambda value: list(
-                    value._persist_reference
-                )
+                GetPersistReference3=target_reference
             ),
             owner_document_path="C:\\arm.SLDPRT",
             owner_configuration="Default",
             display_state="State",
         )
-        self.assertEqual(context["record"]["read_errors"], {})
-        self.assertEqual(
-            context["record"]["persistent_reference"],
-            list(b"target-body"),
+        self.assertIn(
+            "interface_query",
+            context["record"]["read_errors"],
         )
+        self.assertIsNone(context["record"]["persistent_reference"])
         self.assertEqual(
             context["record"]["native_identity"]["context"]["api"],
-            "IModelDocExtension.GetPersistReference3",
+            None,
         )
+        self.assertEqual(target_reference_calls, [])
 
-    def test_reference_index_attempts_target_reference_after_source_qi_failure(
+    def test_reference_index_keeps_target_reference_after_source_qi_failure(
         self,
     ) -> None:
         face = types.SimpleNamespace(
@@ -3506,7 +3525,6 @@ class AppearanceHelperTests(unittest.TestCase):
                 )
             )
         self.assertEqual(errors, [])
-        self.assertEqual(len(reference_index), 1)
         self.assertEqual(
             reference_index[0]["persistent_reference"],
             list(b"assembly-face"),
@@ -3795,13 +3813,18 @@ class AppearanceHelperTests(unittest.TestCase):
                 AssertionError("IEntity must use GetCorrespondingEntity")
             ),
         )
+        direct_reference_calls = []
+
         def corresponding_reference(entity):
+            direct_reference_calls.append(
+                entity._persist_reference
+            )
             if entity._persist_reference in {
                 b"part-face",
                 b"part-feature",
             }:
-                raise RuntimeError(
-                    "part entity has no assembly-context reference"
+                raise AssertionError(
+                    "source objects must not be queried in the target namespace"
                 )
             return list(entity._persist_reference)
 
@@ -3834,6 +3857,12 @@ class AppearanceHelperTests(unittest.TestCase):
         self.assertEqual(
             converted["record"]["native_identity"]["context"]["api"],
             "IComponent2.GetCorrespondingEntity",
+        )
+        self.assertEqual(
+            converted["record"]["native_identity"]["context"][
+                "target_reference_attempt"
+            ]["error"]["code"],
+            "cad_appearance_cross_document_reference_not_attempted",
         )
         self.assertEqual(
             converted["record"]["persistent_reference"],
@@ -3881,6 +3910,10 @@ class AppearanceHelperTests(unittest.TestCase):
         self.assertEqual(
             converted_feature["record"]["persistent_reference"],
             list(assembly_feature._persist_reference),
+        )
+        self.assertEqual(
+            direct_reference_calls,
+            [b"assembly-face", b"assembly-feature"],
         )
 
         primary_component = types.SimpleNamespace(
@@ -4328,7 +4361,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         )
         self.assertEqual(
             parent_reference_calls,
-            [source_face, assembly_face],
+            [assembly_face],
         )
 
     def test_top_parent_and_leaf_use_their_own_configuration_and_state(self) -> None:
