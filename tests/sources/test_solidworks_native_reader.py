@@ -3020,6 +3020,48 @@ class AppearanceRawTests(unittest.TestCase):
 
 
 class AppearanceHelperTests(unittest.TestCase):
+    def test_null_state_materials_retain_the_native_count_decision(self) -> None:
+        cases = (
+            (lambda: 1, 1, None, False),
+            (
+                _raiser(RuntimeError("count failed")),
+                None,
+                "RuntimeError",
+                True,
+            ),
+        )
+        for count_method, expected_count, expected_error, has_error in cases:
+            with self.subTest(count=expected_count), _com_stubs():
+                extension = types.SimpleNamespace(
+                    GetRenderMaterialsCount=count_method,
+                    GetRenderMaterials2=lambda _option, _names: None,
+                )
+                document = types.SimpleNamespace(Extension=extension)
+                record, _extension = native_module._state_render_materials_raw(
+                    document,
+                    configuration="Default",
+                    display_state="State",
+                )
+                self.assertEqual(record["call_state"], "null_result")
+                self.assertIsNone(record["materials"])
+                self.assertEqual(
+                    record["native_render_material_count"],
+                    expected_count,
+                )
+                if has_error:
+                    self.assertEqual(
+                        record["native_render_material_count_error"]["code"],
+                        expected_error,
+                    )
+                    self.assertIn(
+                        "native_render_material_count",
+                        record["read_errors"],
+                    )
+                else:
+                    self.assertIsNone(
+                        record["native_render_material_count_error"]
+                    )
+
     def test_display_state_preserves_null_and_empty_results(self) -> None:
         for raw_states, expected_state, expected_raw in (
             (None, "null_result", None),
