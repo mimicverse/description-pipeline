@@ -414,9 +414,9 @@ function Read-EndpointHealth {
       WorkingDirectory=$Root})
   }) $null ''
   return [pscustomobject]@{
-    schema_version='solidworks-to-urdf.health/v1'; ready=$true; native_platform=$true;
-    install_id=$identity.install_id; config_digest=$identity.config_digest;
-    release=$identity.release; target_identity=[pscustomobject]@{target_id='fixture-target'}}
+    schema_version='solidworks-to-urdf.health/v1'
+    pipeline_id='solidworks-to-urdf'; ready=$true; native_platform=$true;
+    release=$identity.release; endpoint=[pscustomobject]@{port=$identity.port}}
 }
 $script:RollbackPrevious = Join-Path $Root 'bound-previous'
 $null = New-Item -ItemType Directory -Path $script:RollbackPrevious -Force

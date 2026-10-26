@@ -134,6 +134,7 @@ authority 恢复当前端点，不生成另一套回填摘要的日志。Windows
 排空、维护锁、租约、不可变发行归档与 UNKNOWN 对账能力继续有效。
 
 Windows 受管运行时使用 venv launcher 与 base Python 直接子进程的单一启动关系。任务 action 绑定 launcher；端口绑定其唯一直接子进程。三个进程的 PID/start/SID/session，以及 scheduler→launcher→listener 两条直接父子关系，连同 launcher 与 listener 的完整参数、配置、服务账户，与该 runtime 的 pyvenv 原件和 base 解释器共同证明归属；不能把监听子进程的可执行文件路径直接等同于任务 launcher，也不能接受任意同参 Python。launcher 的父进程还须与实际运行的 Schedule 服务 ProcessId 一致，不以固定 svchost 命令文本代替服务事实。Windows 产生单一 v2 listener 证据，嵌入既有 source-state 并由其原始字节 seal 绑定；Linux operator 与 recovery 共用结构和 source 上下文绑定校验，不另建 Task/CIM/pyvenv 解释模型。完整 listener 同窗观察必须稳定，包括 PID/start、映像与 argv 绑定等必要身份；停止并恢复后应证明新进程与封存任务、配置和解释器静态绑定一致，并在新观察中记录新 PID/start，不能将其与历史动态观察强制相等、要求历史 PID 复活或改写原封存件。受支持 CPython 角色与实际 version 绑定仍按发行契约核验，不为旧部署版本或等价命令行排列增加兼容白名单。
+维护端的健康观察与工程端点准入承担不同责任。维护命令只消费 schema、pipeline、ready、native_platform、release 和 endpoint.port，并与已绑定的 source release／port 核对；安装与配置归属由封存任务、配置摘要、install-id 文件、runtime 和 listener 链证明，不再要求健康响应重复安装布局。该观察不解释历史 nested／flat 安装字段，不授予工程目标资格。新目标切换后，完整 canonical health、NativeTargetIdentity 与实际部署登记的 install/config/target 绑定继续作为工程准入和正式健康验收要求。
 
 Windows 的 canonical release archive 是不可变 lifecycle 输入，不进入可变 recovery snapshot/state。恢复只重建 runtime、配置和任务身份；archive 缺失、摘要漂移或 ReadOnly/protected ACL 不成立时必须从同一固定 release 重建并重新 stage，promote/rollback 复用前重新核验 ReadOnly、受保护 ACL 与摘要，不能静默恢复成可写归档。
 

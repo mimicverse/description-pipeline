@@ -1462,7 +1462,10 @@ from windows_transport import (
     run_powershell,
     write_metadata,
 )
-from windows_identity import sealed_source_listener_matches
+from windows_identity import (
+    endpoint_health_matches_source,
+    sealed_source_listener_matches,
+)
 
 config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
@@ -1589,13 +1592,20 @@ function Get-Sample {{
       source_sha256 = [string]$live.release.source_sha256
       role = [string]$live.release.role
     }}
-    health_install_id = [string]$health.install_id
-    health_config_digest = [string]$health.config_digest
-    health_release = [ordered]@{{
-      version = [string]$health.release.version
-      source_commit = [string]$health.release.source_commit
-      source_sha256 = [string]$health.release.source_sha256
-      role = [string]$health.release.role
+    health = [ordered]@{{
+      schema_version = [string]$health.schema_version
+      pipeline_id = [string]$health.pipeline_id
+      ready = [bool]$health.ready
+      native_platform = [bool]$health.native_platform
+      release = [ordered]@{{
+        version = [string]$health.release.version
+        source_commit = [string]$health.release.source_commit
+        source_sha256 = [string]$health.release.source_sha256
+        role = [string]$health.release.role
+      }}
+      endpoint = [ordered]@{{
+        port = [int]$health.endpoint.port
+      }}
     }}
     maintenance_relation = [string]$live.maintenance_relation
     source = $live.source
@@ -1743,6 +1753,7 @@ if not isinstance(result, dict) or result.get("passed") is not True:
 sample = result.get("sample")
 source = sample.get("source") if isinstance(sample, dict) else None
 listener = sample.get("listener") if isinstance(sample, dict) else None
+health = sample.get("health") if isinstance(sample, dict) else None
 pending_rollback = sample.get("pending_rollback") if isinstance(sample, dict) else None
 pending_source = pending_rollback.get("source") if isinstance(pending_rollback, dict) else None
 
@@ -1755,10 +1766,7 @@ if (
     or sample.get("action_count") != 1
     or sample.get("install_id") != identity["install_id"]
     or sample.get("config_digest") != identity["config_digest"]
-    or sample.get("health_install_id") != identity["install_id"]
-    or sample.get("health_config_digest") != identity["config_digest"]
     or sample.get("release") != identity["release"]
-    or sample.get("health_release") != identity["release"]
     or not isinstance(sample.get("release_identity_sha256"), str)
     or not re.fullmatch(r"[0-9a-f]{64}", sample.get("release_identity_sha256", ""))
     or not isinstance(sample.get("task_path"), str)
@@ -1792,6 +1800,7 @@ if (
     != sample.get("release_identity_sha256")
     or listener != (source.get("listener") if isinstance(source, dict) else None)
     or not sealed_source_listener_matches(source)
+    or not endpoint_health_matches_source(health, source)
     or (
         pending_rollback is not None
         and (
@@ -1851,6 +1860,7 @@ print(
             "task_state": "Running",
             "action_count": sample["action_count"],
             "listener": listener,
+            "health": health,
             "task_xml_sha256": sample["task_xml_sha256"],
             "task_xml": sample["task_xml"],
             "task_semantic_sha256": sample["task_semantic_sha256"],

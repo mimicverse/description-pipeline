@@ -121,9 +121,14 @@ def windows_status_fixture(install_id: str, config_digest: str, release: dict) -
         "release_identity_sha256": source["release_identity_sha256"],
         "source": source,
         "release": release,
-        "health_install_id": install_id,
-        "health_config_digest": config_digest,
-        "health_release": release,
+        "health": {
+            "schema_version": "solidworks-to-urdf.health/v1",
+            "pipeline_id": "solidworks-to-urdf",
+            "ready": True,
+            "native_platform": True,
+            "release": release,
+            "endpoint": {"port": 9765},
+        },
     }
 
 
@@ -1072,13 +1077,17 @@ class LifecycleTests(unittest.TestCase):
             "    'release_identity_sha256': source['release_identity_sha256'],\n"
             "    'source': source,\n"
             "    'release': release,\n"
-            "    'health_install_id': identity['install_id'],\n"
-            "    'health_config_digest': identity['config_digest'],\n"
-            "    'health_release': release,\n"
+            "    'health': {\n"
+            "        'schema_version': 'solidworks-to-urdf.health/v1',\n"
+            "        'pipeline_id': 'solidworks-to-urdf',\n"
+            "        'ready': True,\n"
+            "        'native_platform': True,\n"
+            "        'release': release,\n"
+            "        'endpoint': {'port': expected['port']},\n"
+            "    },\n"
             "}\n"
             "if os.environ.get('FIXTURE_STATUS') == 'foreign':\n"
             "    sample['install_id'] = 'win-' + 'f' * 32\n"
-            "    sample['health_install_id'] = sample['install_id']\n"
             "print(json.dumps({'passed': True, 'sample': sample}, sort_keys=True))\n"
             "PY\n"
             "    ;;\n"
@@ -2952,9 +2961,7 @@ class LifecycleTests(unittest.TestCase):
                 "config_digest": baseline_sample["config_digest"],
                 "release_identity_sha256": baseline_sample["release_identity_sha256"],
                 "release": expected["release"],
-                "health_install_id": baseline_sample["install_id"],
-                "health_config_digest": baseline_sample["config_digest"],
-                "health_release": expected["release"],
+                "health": baseline_sample["health"],
             }
             raw_transport = json.dumps(
                 {"passed": True, "sample": raw_sample},
@@ -3296,6 +3303,13 @@ class LifecycleTests(unittest.TestCase):
                 ("source-port", ("source", "port"), 8766),
                 ("source-release", ("source", "release"), {"version": "foreign"}),
                 ("source-listener", ("source", "listener"), {}),
+                ("health-ready", ("health", "ready"), False),
+                ("health-port", ("health", "endpoint", "port"), 8766),
+                (
+                    "health-release",
+                    ("health", "release"),
+                    {"version": "foreign"},
+                ),
                 ("multi-action", ("action_count",), 2),
                 ("boolean-action-count", ("action_count",), True),
                 ("float-action-count", ("action_count",), 1.0),
@@ -4100,7 +4114,6 @@ class InstallOrderingTests(unittest.TestCase):
             ")\n"
             "if os.environ.get('FIXTURE_STATUS') == 'foreign':\n"
             "    sample['install_id'] = 'win-' + 'f' * 32\n"
-            "    sample['health_install_id'] = sample['install_id']\n"
             "print(json.dumps({'passed': True, 'sample': sample}, sort_keys=True))\n"
             "PY\n"
             "    ;;\n"

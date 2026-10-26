@@ -120,6 +120,21 @@ _LISTENER_SESSIONS = (
     "listener_session_id",
 )
 
+_HEALTH_FIELDS = frozenset(
+    {
+        "schema_version",
+        "pipeline_id",
+        "ready",
+        "native_platform",
+        "release",
+        "endpoint",
+    }
+)
+
+_HEALTH_RELEASE_FIELDS = frozenset(
+    {"version", "source_commit", "source_sha256", "role"}
+)
+
 
 def _normalize_path(value: object) -> str:
     return str(value or "").replace("\\", "/").rstrip("/").casefold()
@@ -242,3 +257,32 @@ def sealed_source_listener_matches(source_value: object) -> bool:
         if not isinstance(source_value.get(key), str) or HEX64.fullmatch(source_value[key]) is None:
             return False
     return True
+
+
+def endpoint_health_matches_source(health: object, source_value: object) -> bool:
+    """Validate only the maintenance health facts that the sealed source can bind."""
+
+    if (
+        not isinstance(health, dict)
+        or set(health) != _HEALTH_FIELDS
+        or not isinstance(source_value, dict)
+        or health.get("schema_version") != "solidworks-to-urdf.health/v1"
+        or health.get("pipeline_id") != "solidworks-to-urdf"
+        or health.get("ready") is not True
+        or health.get("native_platform") is not True
+        or not isinstance(health.get("release"), dict)
+        or set(health["release"]) != _HEALTH_RELEASE_FIELDS
+        or not isinstance(health.get("endpoint"), dict)
+        or set(health["endpoint"]) != {"port"}
+    ):
+        return False
+    release = health["release"]
+    if any(not isinstance(release.get(key), str) or not release[key] for key in release):
+        return False
+    port = health["endpoint"].get("port")
+    return (
+        release.get("role") == "native"
+        and release == source_value.get("release")
+        and type(port) is int
+        and port == source_value.get("port")
+    )

@@ -5,7 +5,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from .windows_fixtures import valid_source
+from .windows_fixtures import operator_status_sample, valid_source
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "deploy" / "operator"))
@@ -40,6 +40,40 @@ class WindowsIdentityTests(unittest.TestCase):
                 self.assertFalse(
                     windows_identity.sealed_source_listener_matches(source)
                 )
+
+    def test_maintenance_health_binds_only_source_release_and_port(self) -> None:
+        source = valid_source()
+        sample = operator_status_sample(
+            source["install_id"], source["config_digest"], source["release"]
+        )
+        source = sample["source"]
+        self.assertTrue(
+            windows_identity.endpoint_health_matches_source(
+                sample["health"], source
+            )
+        )
+        for field, value in (
+            ("schema_version", "solidworks-to-urdf.health/v2"),
+            ("pipeline_id", "foreign-pipeline"),
+            ("ready", False),
+            ("native_platform", False),
+            ("endpoint", {"port": 8766}),
+            ("release", {**source["release"], "source_commit": "f" * 40}),
+        ):
+            with self.subTest(field=field):
+                health = copy.deepcopy(sample["health"])
+                health[field] = value
+                self.assertFalse(
+                    windows_identity.endpoint_health_matches_source(health, source)
+                )
+        with_legacy = copy.deepcopy(sample["health"])
+        with_legacy["install"] = {
+            "install_id": source["install_id"],
+            "config_digest": source["config_digest"],
+        }
+        self.assertFalse(
+            windows_identity.endpoint_health_matches_source(with_legacy, source)
+        )
 
     def test_process_lineage_is_exact_and_ordered(self) -> None:
         mutations = (

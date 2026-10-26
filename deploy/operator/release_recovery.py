@@ -305,6 +305,9 @@ def _status_identity_matches(value: object, install_id: str, config_digest: str)
         and source.get("install_id") == install_id
         and source.get("config_digest") == config_digest
         and windows_identity.sealed_source_listener_matches(source)
+        and windows_identity.endpoint_health_matches_source(
+            value.get("health"), source
+        )
     )
 
 

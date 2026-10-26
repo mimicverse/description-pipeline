@@ -638,6 +638,34 @@ function Assert-RunningTask([object]$task) {
     Die 'task_not_running' ('the instance task state is not Running: ' + $task.State)
   }
 }
+function Test-MaintenanceHealthShape($Health, [int]$Port) {
+  return (
+    $null -ne $Health -and
+    [string]$Health.schema_version -ceq 'solidworks-to-urdf.health/v1' -and
+    [string]$Health.pipeline_id -ceq 'solidworks-to-urdf' -and
+    $Health.ready -is [bool] -and $Health.ready -eq $true -and
+    $Health.native_platform -is [bool] -and $Health.native_platform -eq $true -and
+    -not [string]::IsNullOrWhiteSpace([string]$Health.release.version) -and
+    -not [string]::IsNullOrWhiteSpace([string]$Health.release.source_commit) -and
+    -not [string]::IsNullOrWhiteSpace([string]$Health.release.source_sha256) -and
+    [string]$Health.release.role -ceq 'native' -and
+    ($Health.endpoint.port -is [int] -or $Health.endpoint.port -is [long]) -and
+    [int]$Health.endpoint.port -eq $Port
+  )
+}
+function Assert-MaintenanceHealth(
+    $Health,
+    [string]$Version,
+    [string]$SourceCommit,
+    [string]$SourceSha256,
+    [int]$Port) {
+  if (-not (Test-MaintenanceHealthShape $Health $Port) -or
+      [string]$Health.release.version -cne $Version -or
+      [string]$Health.release.source_commit -cne $SourceCommit -or
+      [string]$Health.release.source_sha256 -cne $SourceSha256) {
+    throw 'the maintenance endpoint /health differs from the bound release or port'
+  }
+}
 function Read-EndpointHealth([string]$configPath) {
   $config = Read-Json $configPath
   $token = (Get-Content -LiteralPath $config.token_file -Raw).Trim()
@@ -650,21 +678,16 @@ function Read-EndpointHealth([string]$configPath) {
     } catch { Start-Sleep -Milliseconds 500 }
   } while (-not $health -and (Get-Date) -lt $deadline)
   if (-not $health) { throw 'the instance endpoint did not answer /health within 30s' }
-  if ($health.schema_version -ne 'solidworks-to-urdf.health/v1' -or -not $health.ready -or -not $health.native_platform) {
-    throw 'the instance endpoint /health is not a ready IF-09 identity'
-  }
-  if (-not $health.install_id -or -not $health.config_digest -or -not $health.target_identity.target_id) {
-    throw 'the instance endpoint /health does not carry its install identity'
+  if (-not (Test-MaintenanceHealthShape $health ([int]$config.port))) {
+    throw 'the instance endpoint /health does not satisfy the maintenance readiness contract'
   }
   return $health
 }
 function Health-Probe([string]$configPath, [object]$binding) {
   $health = Read-EndpointHealth $configPath
-  if ($health.release.version -ne $binding.version -or
-      $health.release.source_commit -ne $binding.source_commit -or
-      $health.release.source_sha256 -ne $binding.source_sha256) {
-    throw 'the instance endpoint /health release identity differs from the bound release'
-  }
+  Assert-MaintenanceHealth $health ([string]$binding.version) `
+    ([string]$binding.source_commit) ([string]$binding.source_sha256) `
+    ([int]$binding.port)
   return $health
 }
 function Get-ListenerProcess([int]$port) {
@@ -686,7 +709,11 @@ function Get-ProcessLineageEvidence($Process) {
   } catch {
     throw 'the process lineage node carries no creation time'
   }
-  $ownerSid = Get-ProcessOwnerSid $Process
+  $ownerSid = if ($null -ne $Process.OwnerSid) {
+    [string]$Process.OwnerSid
+  } else {
+    Get-ProcessOwnerSid $Process
+  }
   return [ordered]@{
     pid=[int]$Process.ProcessId
     parent_pid=[int]$Process.ParentProcessId
@@ -717,11 +744,22 @@ function Get-ListenerProcesses {
 function Get-ScheduleService {
   return @(Get-CimInstance Win32_Service -Filter "Name='Schedule'" -ErrorAction Stop)
 }
-function Get-ListenerEvidence([object]$binding, $TaskProjection) {
-  try {
-    $listeners = @(Get-ListenerConnections ([int]$binding.port))
-  } catch {
-    if (Test-NetTcpNoMatchError $_) { $listeners = @() } else { throw }
+function Get-ListenerEvidence([object]$binding, $TaskProjection, $ListenerFacts = $null) {
+  if ($ListenerFacts -is [scriptblock]) {
+    $ListenerFacts = & $ListenerFacts
+  }
+  if ($null -ne $ListenerFacts) {
+    $listeners = @($ListenerFacts.listeners)
+    $processes = @($ListenerFacts.processes)
+    $schedulerServices = @($ListenerFacts.scheduler_services)
+  } else {
+    try {
+      $listeners = @(Get-ListenerConnections ([int]$binding.port))
+    } catch {
+      if (Test-NetTcpNoMatchError $_) { $listeners = @() } else { throw }
+    }
+    $processes = @(Get-ListenerProcesses)
+    $schedulerServices = @(Get-ScheduleService)
   }
   $listenerPids = @($listeners | ForEach-Object {
     [int]$_.OwningProcess
@@ -742,11 +780,6 @@ function Get-ListenerEvidence([object]$binding, $TaskProjection) {
   $configPath = Config-Path $generation
   if (-not (Test-ActionConfigArgument $actionArguments $configPath)) {
     Die 'windows_listener_identity_mismatch' 'the projected task action names another configuration'
-  }
-  try {
-    $processes = @(Get-ListenerProcesses)
-  } catch {
-    Die 'windows_listener_identity_mismatch' 'the process inventory is unavailable'
   }
   $listenerMatches = @($processes | Where-Object {
     [int]$_.ProcessId -eq $listenerPid
@@ -818,11 +851,6 @@ function Get-ListenerEvidence([object]$binding, $TaskProjection) {
       $scheduler.user_sid -cne 'S-1-5-18' -or
       $scheduler.session_id -ne 0) {
     Die 'windows_listener_identity_mismatch' 'the task-action launcher parent is not the Task Scheduler host'
-  }
-  try {
-    $schedulerServices = @(Get-ScheduleService)
-  } catch {
-    Die 'windows_listener_identity_mismatch' 'the Task Scheduler service is unavailable'
   }
   if ($schedulerServices.Count -ne 1 -or
       [string]$schedulerServices[0].Name -cne 'Schedule' -or
@@ -934,8 +962,12 @@ function Wait-StartupHealthy([string]$configPath, [object]$binding) {
       try {
         $probe = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
           -Headers @{Authorization=('Bearer ' + $token)} -TimeoutSec 3
-        $ready = ($probe.ready -eq $true) -and ($probe.native_platform -eq $true) -and `
-          $probe.schema_version -eq 'solidworks-to-urdf.health/v1'
+        $ready = (
+          (Test-MaintenanceHealthShape $probe ([int]$config.port)) -and
+          [string]$probe.release.version -ceq [string]$binding.version -and
+          [string]$probe.release.source_commit -ceq [string]$binding.source_commit -and
+          [string]$probe.release.source_sha256 -ceq [string]$binding.source_sha256
+        )
       } catch { $ready = $false }
     }
     if ($ready) { $listenerPid = $pidNow; break }
@@ -968,8 +1000,11 @@ function Wait-Settled([string]$configPath, [object]$binding) {
       $probe = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
         -Headers @{Authorization=('Bearer ' + $token)} -TimeoutSec 3
     } catch { throw ('the settle window observed /health not ready: ' + $_.Exception.Message) }
-    if (-not $probe.ready -or -not $probe.native_platform -or $probe.schema_version -ne 'solidworks-to-urdf.health/v1') {
-      throw 'the settle window observed /health without the ready IF-09 identity'
+    if (-not (Test-MaintenanceHealthShape $probe ([int]$config.port)) -or
+        [string]$probe.release.version -cne [string]$binding.version -or
+        [string]$probe.release.source_commit -cne [string]$binding.source_commit -or
+        [string]$probe.release.source_sha256 -cne [string]$binding.source_sha256) {
+      throw 'the settle window observed /health outside the bound maintenance readiness contract'
     }
     Start-Sleep -Seconds 10
   }
@@ -2748,12 +2783,13 @@ function Assert-EndpointSourceMatch($Expected, $Current) {
   }
 }
 function Assert-HealthSourceMatch($Health, $Source) {
-  if ([string]$Health.install_id -cne [string]$Source.install_id -or
-      [string]$Health.config_digest -cne [string]$Source.config_digest -or
-      [string]$Health.release.version -cne [string]$Source.release.version -or
-      [string]$Health.release.source_commit -cne [string]$Source.release.source_commit -or
-      [string]$Health.release.source_sha256 -cne [string]$Source.release.source_sha256) {
-    Die 'windows_source_health_mismatch' 'the restored endpoint health differs from the sealed source identity'
+  try {
+    Assert-MaintenanceHealth $Health ([string]$Source.release.version) `
+      ([string]$Source.release.source_commit) `
+      ([string]$Source.release.source_sha256) ([int]$Source.port)
+  } catch {
+    Die 'windows_source_health_mismatch' (
+      'the endpoint health differs from the sealed release or port')
   }
 }
 function Get-RecoveryComparableState($State) {
@@ -3384,13 +3420,13 @@ function Invoke-RecoveryResume($Binding) {
     Die 'windows_resume_not_disabled' ('the Windows task is neither Disabled nor Running: ' + $projection.state)
   }
   $health = $settled.health
-  if ($health.install_id -ne [string]$Binding.install_id -or
-      $health.config_digest -ne [string]$Binding.config_digest -or
-      $health.release.version -ne [string]$Binding.version -or
-      $health.release.source_commit -ne [string]$Binding.source_commit -or
-      $health.release.source_sha256 -ne [string]$Binding.source_sha256) {
+  try {
+    Assert-MaintenanceHealth $health ([string]$Binding.version) `
+      ([string]$Binding.source_commit) ([string]$Binding.source_sha256) `
+      ([int]$Binding.port)
+  } catch {
     try { Disable-ManagedTask ([string]$task.TaskName) ([string]$task.TaskPath) } catch { }
-    Die 'windows_health_mismatch' 'the resumed endpoint did not report the bound identity'
+    Die 'windows_health_mismatch' 'the resumed endpoint did not report the bound release or port'
   }
   $runningTask = Get-RecoveryTask ([string]$Binding.task_name) ([string]$Binding.task_path)
   $runningProjection = Get-TaskProjection $runningTask
@@ -3869,9 +3905,6 @@ if ($Verb -eq 'promote') {
     $lockRefusal = $started.lock_refusal
     $retriedAfter = $started.retried_after_s
     $health = $settled.health
-    if ($health.config_digest -ne $candidate.config_digest) {
-      throw 'the running endpoint config digest differs from the staged generation configuration'
-    }
     $targetListener = Get-ListenerEvidence $binding $targetProjection
     $receipt = @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;

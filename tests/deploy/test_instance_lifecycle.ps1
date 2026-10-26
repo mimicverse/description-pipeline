@@ -224,15 +224,24 @@ function Get-ListenerProcess { param([int]$port) return 4242 }
 function Invoke-RestMethod {
   param([string]$Uri, [hashtable]$Headers, [int]$TimeoutSec)
   return [pscustomobject]@{
-    ready=$true; native_platform=$true;
-    schema_version='solidworks-to-urdf.health/v1'}
+    schema_version='solidworks-to-urdf.health/v1'
+    pipeline_id='solidworks-to-urdf'
+    ready=$true
+    native_platform=$true
+    release=[pscustomobject]@{
+      version='1.0.0'; source_commit=('a' * 40);
+      source_sha256=('b' * 64); role='native'}
+    endpoint=[pscustomobject]@{port=8765}}
 }
 function Get-Date { return $script:startupNow }
 function Start-Sleep {
   param([int]$Milliseconds)
   $script:startupNow = $script:startupNow.AddMilliseconds($Milliseconds)
 }
-$startupResult = Wait-StartupHealthy $startupConfig @{task_name='test-endpoint'}
+$startupBinding = @{
+  task_name='test-endpoint'; port=8765; version='1.0.0';
+  source_commit=('a' * 40); source_sha256=('b' * 64)}
+$startupResult = Wait-StartupHealthy $startupConfig $startupBinding
 Check 'settle.startup_ready_then_running' ($startupResult.listener_pid -eq 4242)
 function Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
@@ -240,13 +249,50 @@ function Get-ScheduledTask {
 }
 $script:startupNow = [datetime]'2026-10-22T00:00:00Z'
 try {
-  $null = Wait-StartupHealthy $startupConfig @{task_name='test-endpoint'}
+  $null = Wait-StartupHealthy $startupConfig $startupBinding
   $startupTimeout = ''
 } catch {
   $startupTimeout = $_.Exception.Message
 }
 Check 'settle.startup_ready_timeout_refused' (
   $startupTimeout -match 'did not answer /health within the startup window')
+$commonHealth = [pscustomobject]@{
+  schema_version='solidworks-to-urdf.health/v1'
+  pipeline_id='solidworks-to-urdf'
+  ready=$true
+  native_platform=$true
+  release=[pscustomobject]@{
+    version='1.0.0'; source_commit=('a' * 40);
+    source_sha256=('b' * 64); role='native'}
+  endpoint=[pscustomobject]@{port=8765}
+  install=[pscustomobject]@{
+    install_id='source-install'; config_digest=('c' * 64)}
+}
+Check 'health.common_legacy_extras_ignored' (
+  Test-MaintenanceHealthShape $commonHealth 8765)
+foreach ($mutation in @(
+    @('schema', 'schema_version', 'solidworks-to-urdf.health/v2'),
+    @('pipeline', 'pipeline_id', 'foreign-pipeline'),
+    @('ready', 'ready', $false),
+    @('native', 'native_platform', $false),
+    @('port', 'port', 8766),
+    @('release', 'source_commit', ('d' * 40)))) {
+  $changedHealth = ($commonHealth | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+  if ($mutation[0] -eq 'port') {
+    $changedHealth.endpoint.port = $mutation[2]
+  } elseif ($mutation[0] -eq 'release') {
+    $changedHealth.release.source_commit = $mutation[2]
+  } else {
+    $changedHealth.($mutation[1]) = $mutation[2]
+  }
+  $healthAccepted = $true
+  try {
+    Assert-MaintenanceHealth $changedHealth '1.0.0' ('a' * 40) ('b' * 64) 8765
+  } catch {
+    $healthAccepted = $false
+  }
+  Check ('health.common_' + $mutation[0] + '_refused') (-not $healthAccepted)
+}
 Remove-Item Function:\Get-ScheduledTask, Function:\Get-ListenerProcess, Function:\Invoke-RestMethod,
   Function:\Get-Date, Function:\Start-Sleep -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $startupRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1197,8 +1243,15 @@ function Get-ProcessOwnerSid {
   param($Process)
   return [string]$Process.OwnerSid
 }
+function Get-CurrentListenerFacts {
+  return @{
+    listeners=@($script:ListenerPorts)
+    processes=@($script:ListenerProcesses)
+    scheduler_services=@($script:SchedulerService)
+  }
+}
 Reset-ListenerProcesses
-$evidence = Get-ListenerEvidence @{port=8765} $listenerProjection
+$evidence = Get-ListenerEvidence @{port=8765} $listenerProjection (Get-CurrentListenerFacts)
 Check 'listener.direct_venv_child_bound' (
   ($evidence.schema_version -eq 'solidworks-to-urdf.windows-listener/v2') -and
   ($evidence.relation -eq 'direct_venv_child') -and
@@ -1225,7 +1278,8 @@ try { Assert-ListenerSourceMatch $evidence $listenerSourceContext } catch {
 }
 Check 'listener.static_source_binding_passes' $staticBindingPassed
 Reset-ListenerProcesses 'multiple_rows_same_listener'
-$dualStackEvidence = Get-ListenerEvidence @{port=8765} $listenerProjection
+$dualStackEvidence = Get-ListenerEvidence @{port=8765} $listenerProjection `
+  (Get-CurrentListenerFacts)
 Check 'listener.dual_stack_rows_same_pid_pass' (
   $dualStackEvidence.listener_pid -eq 15124)
 foreach ($replacement in @(
@@ -1277,7 +1331,10 @@ foreach ($case in @(
     @('missing_base', 'base interpreter is missing'))) {
   Reset-ListenerProcesses $case[0]
   $message = ''
-  try { $null = Get-ListenerEvidence @{port=8765} $listenerProjection } catch {
+  try {
+    $null = Get-ListenerEvidence @{port=8765} $listenerProjection `
+      (Get-CurrentListenerFacts)
+  } catch {
     $message = $_.Exception.Message
   }
   Check ('listener.' + $case[0] + '_refused') ($message -match $case[1]) $message
@@ -1288,14 +1345,25 @@ $foreignConfigArguments = '-I -B -m description_pipeline serve --config "' +
 $message = ''
 try {
   $null = Get-ListenerEvidence @{port=8765} ([pscustomobject]@{
-    principal=$listenerProjection.principal
-    action=[pscustomobject]@{
-      execute=$listenerLauncher
-      arguments=$foreignConfigArguments
-    }
-  })
+      principal=$listenerProjection.principal
+      action=[pscustomobject]@{
+        execute=$listenerLauncher
+        arguments=$foreignConfigArguments
+      }
+    }) (Get-CurrentListenerFacts)
 } catch { $message = $_.Exception.Message }
 Check 'listener.task_action_config_refused' ($message -match 'another configuration') $message
+$message = ''
+try {
+  $null = Get-ListenerEvidence @{port=8765} $listenerProjection {
+    throw 'injected process inventory failure'
+  }
+} catch {
+  $message = $_.Exception.Message
+}
+Check 'listener.process_inventory_failure_is_not_identity_mismatch' (
+  ($message -match 'injected process inventory failure') -and
+  ($message -notmatch 'windows_listener_identity_mismatch')) $message
 $env:SystemRoot = $script:OriginalListenerSystemRoot
 Remove-Item -LiteralPath $listenerFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
 function Get-NetTCPConnection {
@@ -1700,8 +1768,13 @@ function Read-EndpointHealth {
   param([string]$configPath)
   if (-not $script:OldHealthOk) { throw 'the previous endpoint did not answer /health' }
   return [pscustomobject]@{
-    install_id=$sourceIdentity.install_id; config_digest=$sourceIdentity.config_digest;
-    release=$sourceIdentity.release}
+    schema_version='solidworks-to-urdf.health/v1'
+    pipeline_id='solidworks-to-urdf'; ready=$true; native_platform=$true;
+    release=$sourceIdentity.release;
+    endpoint=[pscustomobject]@{port=8765};
+    install=[pscustomobject]@{
+      install_id=$sourceIdentity.install_id
+      config_digest=$sourceIdentity.config_digest}}
 }
 function Register-ScheduledTask {
   [CmdletBinding()]

@@ -10,6 +10,7 @@ def valid_source(
     config_digest: str = "a" * 64,
     release: dict | None = None,
 ) -> dict:
+    release_record = {"role": "native", **(release or {})}
     arguments = (
         '-I -B -m description_pipeline serve --config "'
         f'{endpoint_root}/endpoint.json"'
@@ -70,8 +71,9 @@ def valid_source(
         "install_id_path": "C:/description/state/install-id",
         "install_id": install_id,
         "release_identity_sha256": "c" * 64,
-        "release": release
-        or {
+        "release": release_record
+        if release is not None
+        else {
             "version": "1.0.0",
             "source_commit": "d" * 40,
             "source_sha256": "e" * 64,
@@ -87,6 +89,7 @@ def operator_status_sample(
     release: dict,
     *,
     endpoint_root: str = "C:/description-e2e/state/lifecycle/gen-2/generation",
+    port: int = 8765,
 ) -> dict:
     source = valid_source(
         endpoint_root=endpoint_root,
@@ -108,6 +111,7 @@ def operator_status_sample(
             "package_root": "C:/description-e2e/packages",
             "output_root": "C:/description-e2e/results",
             "state_root": "C:/description-e2e/state",
+            "port": port,
             "install_id_path": "C:/description-e2e/state/install-id",
             "release_identity_sha256": "e" * 64,
         }
@@ -132,8 +136,13 @@ def operator_status_sample(
         "config_digest": config_digest,
         "release_identity_sha256": source["release_identity_sha256"],
         "source": source,
-        "release": release,
-        "health_install_id": install_id,
-        "health_config_digest": config_digest,
-        "health_release": release,
+        "release": source["release"],
+        "health": {
+            "schema_version": "solidworks-to-urdf.health/v1",
+            "pipeline_id": "solidworks-to-urdf",
+            "ready": True,
+            "native_platform": True,
+            "release": source["release"],
+            "endpoint": {"port": port},
+        },
     }
