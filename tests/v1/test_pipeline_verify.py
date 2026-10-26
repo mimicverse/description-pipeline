@@ -369,11 +369,8 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             {
                 "persistent_reference": [4, 5, 6],
                 "target": {
-                    "kind": "face",
+                    "kind": "occurrence",
                     "component": "arm-1",
-                    "body_type": 0,
-                    "body_index": 0,
-                    "face_index": 0,
                 },
             }
         ]
@@ -405,15 +402,15 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 "read_errors": {},
             }
         ]
-        with self.assertRaisesRegex(
-            PipelineError,
-            "PrimaryColor byte packing is not proven",
-        ):
-            _resolved_faces(
-                raw,
-                configuration="Painted",
-                where="capture",
-            )
+        resolved = _resolved_faces(
+            raw,
+            configuration="Painted",
+            where="capture",
+        )
+        self.assertEqual(
+            resolved["faces"][(0, 0, 0)]["rgba"],
+            (0xCC / 255, 0xBB / 255, 0xAA / 255, 1.0),
+        )
 
     def test_native_face_color_tamper_fails_independent_verify(self):
         source = self.root / "mutated-native-appearance"

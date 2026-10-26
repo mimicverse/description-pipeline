@@ -1063,12 +1063,53 @@ def resolve_deliverable_appearance(
                     errors=dict(errors),
                     observed=dict(material),
                 )
-            raise _appearance_resolution_error(
-                component,
-                "cad_appearance_render_color_encoding_unproven",
-                path + ".primary_color",
-                "IRenderMaterial.PrimaryColor byte packing is not proven by the current evidence",
-                observed=material.get("primary_color"),
+            rgba = _rgba_from_colorref(
+                material.get("primary_color"),
+                material.get("transparency"),
+            )
+            if rgba is None:
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_material_unsupported",
+                    path,
+                    "a participating display-state appearance has invalid color values",
+                    primary_color=material.get("primary_color"),
+                    transparency=material.get("transparency"),
+                )
+            parsed_materials.append(
+                {
+                    "rgba": rgba,
+                    "source": {
+                        "kind": "display_state_render_material",
+                        "owner_scope": owner.get("owner_scope"),
+                        "owner_document_path": owner.get(
+                            "owner_document_path"
+                        ),
+                        "configuration": owner.get("configuration"),
+                        "display_state": owner_display_state,
+                        "material_index": material_position,
+                        "primary_color": material.get("primary_color"),
+                        "transparency": material.get("transparency"),
+                        "derivation": {
+                            "rule_id": "appearance.primary_color_colorref",
+                            "rule_version": "v1",
+                            "warning_code": (
+                                "appearance.primary_color_colorref_derived"
+                            ),
+                            "red_shift": 0,
+                            "green_shift": 8,
+                            "blue_shift": 16,
+                            "alpha_rule": {
+                                "operation": "one_minus",
+                                "source_field": "transparency",
+                            },
+                        },
+                    },
+                    "faces_by_scope": {
+                        kind: set(faces)
+                        for kind, faces in faces_by_scope.items()
+                    },
+                }
             )
 
     resolved = []

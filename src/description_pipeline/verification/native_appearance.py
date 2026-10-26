@@ -395,7 +395,12 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                 bool(material["entity_records"]),
                 f"{material_path} has no entity records",
             )
-            faces = set()
+            faces_by_scope = {
+                "occurrence": set(),
+                "face": set(),
+                "feature": set(),
+                "body": set(),
+            }
             for entity_index, entity in enumerate(material["entity_records"]):
                 entity_path = f"{material_path}.entities[{entity_index}]"
                 _require(
@@ -430,7 +435,7 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         continue
                     kind = target["kind"]
                     if kind == "occurrence":
-                        faces |= all_faces
+                        faces_by_scope["occurrence"] |= all_faces
                         continue
                     face_key = _face_key(
                         target.get("body_type"),
@@ -442,14 +447,15 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         f"{entity_path} target identity is invalid",
                     )
                     if kind == "body":
-                        faces |= {
+                        faces_by_scope["body"] |= {
                             face
                             for face in all_faces
                             if face[:2] == face_key[:2]
                         }
                     elif face_key in all_faces:
-                        faces.add(face_key)
-            if not faces:
+                        faces_by_scope[kind].add(face_key)
+            material_faces = set().union(*faces_by_scope.values())
+            if not material_faces:
                 continue
             _require(
                 not material.get("read_errors")
@@ -464,8 +470,48 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                 and material.get("surface_finish_file") in (None, ""),
                 f"{material_path} is not a qualified solid-color appearance",
             )
-            raise PipelineError(
-                "IRenderMaterial.PrimaryColor byte packing is not proven"
+            rgba = _colorref(
+                material.get("primary_color"),
+                material.get("transparency"),
+            )
+            _require(
+                rgba is not None,
+                f"{material_path} has invalid color values",
+            )
+            state_materials.append(
+                {
+                    "rgba": rgba,
+                    "source": {
+                        "kind": "display_state_render_material",
+                        "owner_scope": owner.get("owner_scope"),
+                        "owner_document_path": owner.get(
+                            "owner_document_path"
+                        ),
+                        "configuration": owner.get("configuration"),
+                        "display_state": owner_display_state,
+                        "material_index": index,
+                        "primary_color": material.get("primary_color"),
+                        "transparency": material.get("transparency"),
+                        "derivation": {
+                            "rule_id": "appearance.primary_color_colorref",
+                            "rule_version": "v1",
+                            "warning_code": (
+                                "appearance.primary_color_colorref_derived"
+                            ),
+                            "red_shift": 0,
+                            "green_shift": 8,
+                            "blue_shift": 16,
+                            "alpha_rule": {
+                                "operation": "one_minus",
+                                "source_field": "transparency",
+                            },
+                        },
+                    },
+                    "faces_by_scope": {
+                        kind: set(faces)
+                        for kind, faces in faces_by_scope.items()
+                    },
+                }
             )
 
     resolved = {}

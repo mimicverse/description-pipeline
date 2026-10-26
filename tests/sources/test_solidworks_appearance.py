@@ -6,6 +6,7 @@ import unittest
 
 from description_pipeline.sources.solidworks.appearance import (
     AppearanceError,
+    _rgba_from_colorref,
     appearance_groups,
     bind_capture_appearance,
     resolve_deliverable_appearance,
@@ -352,11 +353,8 @@ class AppearanceResolutionTests(unittest.TestCase):
             {
                 "persistent_reference": [4, 5, 6],
                 "target": {
-                    "kind": "face",
+                    "kind": "occurrence",
                     "component": COMPONENT,
-                    "body_type": 0,
-                    "body_index": 0,
-                    "face_index": 0,
                 },
             }
         ]
@@ -397,27 +395,50 @@ class AppearanceResolutionTests(unittest.TestCase):
                 display_state="Display State 1",
             ),
         ]
-        with self.assertRaises(AppearanceError) as caught:
-            resolve_deliverable_appearance(
-                raw,
-                component=COMPONENT,
-                expected_document_path=DOCUMENT,
-                expected_configuration=CONFIGURATION,
-                face_spans=[
-                    {
-                        "body_type": 0,
-                        "body_index": 0,
-                        "face_index": 0,
-                        "triangle_start": 0,
-                        "triangle_count": 1,
-                        "face_reference_sha256": "a" * 64,
-                    }
-                ],
-            )
-        self.assertEqual(
-            caught.exception.appearance["issues"][0]["code"],
-            "cad_appearance_render_color_encoding_unproven",
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }
+            ],
         )
+        self.assertEqual(
+            resolved.faces[0].rgba,
+            (0xCC / 255, 0xBB / 255, 0xAA / 255, 1.0),
+        )
+        self.assertEqual(
+            resolved.faces[0].source["owners"][0]["derivation"][
+                "rule_id"
+            ],
+            "appearance.primary_color_colorref",
+        )
+
+    def test_primary_color_colorref_known_answers(self):
+        cases = (
+            (0x000000FF, 0.0, (1.0, 0.0, 0.0, 1.0)),
+            (0x0000FF00, 0.0, (0.0, 1.0, 0.0, 1.0)),
+            (0x00FF0000, 0.0, (0.0, 0.0, 1.0, 1.0)),
+            (
+                0x00332211,
+                0.25,
+                (0x11 / 255, 0x22 / 255, 0x33 / 255, 0.75),
+            ),
+        )
+        for primary_color, transparency, expected in cases:
+            with self.subTest(primary_color=hex(primary_color)):
+                self.assertEqual(
+                    _rgba_from_colorref(primary_color, transparency),
+                    expected,
+                )
 
     def test_missing_body_owner_is_absence_not_a_malformed_record(self):
         raw = _resolved_raw([None])
@@ -644,7 +665,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                     "cad_appearance_render_entity_binding_unproven",
                 )
 
-    def test_source_render_material_owner_shape_stops_before_unproven_color_decode(self):
+    def test_source_render_material_uses_colorref_decode(self):
         raw = _resolved_raw(
             [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
         )
@@ -701,37 +722,33 @@ class AppearanceResolutionTests(unittest.TestCase):
                     {
                         "persistent_reference": [1, 2, 3],
                         "target": {
-                            "kind": "face",
+                            "kind": "occurrence",
                             "component": COMPONENT,
-                            "body_type": 0,
-                            "body_index": 0,
-                            "face_index": 0,
                         },
                     }
                 ],
                 "read_errors": {},
             }
         ]
-        with self.assertRaises(AppearanceError) as caught:
-            resolve_deliverable_appearance(
-                raw,
-                component=COMPONENT,
-                expected_document_path=DOCUMENT,
-                expected_configuration=CONFIGURATION,
-                face_spans=[
-                    {
-                        "body_type": 0,
-                        "body_index": 0,
-                        "face_index": 0,
-                        "triangle_start": 0,
-                        "triangle_count": 1,
-                        "face_reference_sha256": "a" * 64,
-                    }
-                ],
-            )
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }
+            ],
+        )
         self.assertEqual(
-            caught.exception.appearance["issues"][0]["code"],
-            "cad_appearance_render_color_encoding_unproven",
+            resolved.faces[0].rgba,
+            (0xCC / 255, 0xBB / 255, 0xAA / 255, 0.75),
         )
 
 
