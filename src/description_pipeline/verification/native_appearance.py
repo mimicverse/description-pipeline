@@ -571,12 +571,27 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     else None
                 )
                 if document_identity is not None:
+                    document_source_context = document_identity.get(
+                        "source_context"
+                    )
                     _require(
                         not entity["read_errors"]
                         and context_key[0] == "component_document"
                         and context_key[3] is None
                         and entity["binding_context"].get("api")
                         == DOCUMENT_BINDING_API
+                        and isinstance(document_source_context, Mapping)
+                        and document_source_context.get("api")
+                        == "IModelDoc2"
+                        and document_source_context.get("state")
+                        == "document"
+                        and document_source_context.get("component")
+                        == component
+                        and isinstance(
+                            document_source_context.get("read_errors"),
+                            Mapping,
+                        )
+                        and not document_source_context.get("read_errors")
                         and document_identity.get("qi_iid")
                         == IMODELDOC2_IID
                         and document_identity.get("state") == "observed"
@@ -615,6 +630,18 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         source_context.get("state")
                         if isinstance(source_context, Mapping)
                         else None
+                    )
+                    _require(
+                        isinstance(source_context, Mapping)
+                        and isinstance(source_context.get("api"), str)
+                        and bool(source_context.get("api"))
+                        and source_context.get("component") == component
+                        and isinstance(
+                            source_context.get("read_errors"),
+                            Mapping,
+                        )
+                        and not source_context.get("read_errors"),
+                        f"{entity_path} source context is incomplete",
                     )
                     if source_state == "document":
                         expected_api = (

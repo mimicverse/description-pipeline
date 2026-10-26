@@ -1182,12 +1182,27 @@ def resolve_deliverable_appearance(
                     else None
                 )
                 if document_identity is not None:
+                    document_source_context = document_identity.get(
+                        "source_context"
+                    )
                     if (
                         entity["read_errors"]
                         or context_key[0] != "component_document"
                         or context_key[3] is not None
                         or entity["binding_context"].get("api")
                         != DOCUMENT_BINDING_API
+                        or not isinstance(document_source_context, Mapping)
+                        or document_source_context.get("api")
+                        != "IModelDoc2"
+                        or document_source_context.get("state")
+                        != "document"
+                        or document_source_context.get("component")
+                        != component
+                        or not isinstance(
+                            document_source_context.get("read_errors"),
+                            Mapping,
+                        )
+                        or document_source_context.get("read_errors")
                         or document_identity.get("qi_iid")
                         != IMODELDOC2_IID
                         or document_identity.get("state") != "observed"
@@ -1233,6 +1248,24 @@ def resolve_deliverable_appearance(
                         if isinstance(source_context, Mapping)
                         else None
                     )
+                    if (
+                        not isinstance(source_context, Mapping)
+                        or not isinstance(source_context.get("api"), str)
+                        or not source_context.get("api")
+                        or source_context.get("component") != component
+                        or not isinstance(
+                            source_context.get("read_errors"),
+                            Mapping,
+                        )
+                        or source_context.get("read_errors")
+                    ):
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_binding_unproven",
+                            entity_path + ".native_identity.source_context",
+                            "the material source context is incomplete",
+                            observed=source_context,
+                        )
                     if source_state == "document":
                         expected_api = (
                             COMPONENT_ENTITY_BINDING_API
