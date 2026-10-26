@@ -122,7 +122,7 @@ def windows_status_fixture(install_id: str, config_digest: str, release: dict) -
         "source": source,
         "release": release,
         "health": {
-            "schema_version": "solidworks-to-urdf.health/v1",
+            "schema_version": ir.HEALTH_SCHEMA,
             "pipeline_id": "solidworks-to-urdf",
             "ready": True,
             "native_platform": True,
@@ -1078,7 +1078,7 @@ class LifecycleTests(unittest.TestCase):
             "    'source': source,\n"
             "    'release': release,\n"
             "    'health': {\n"
-            "        'schema_version': 'solidworks-to-urdf.health/v1',\n"
+            f"        'schema_version': {ir.HEALTH_SCHEMA!r},\n"
             "        'pipeline_id': 'solidworks-to-urdf',\n"
             "        'ready': True,\n"
             "        'native_platform': True,\n"

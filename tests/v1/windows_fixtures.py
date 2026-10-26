@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 
+from description_pipeline.schemas import HEALTH_SCHEMA
+
 
 def valid_source(
     *,
@@ -138,7 +140,7 @@ def operator_status_sample(
         "source": source,
         "release": source["release"],
         "health": {
-            "schema_version": "solidworks-to-urdf.health/v1",
+            "schema_version": HEALTH_SCHEMA,
             "pipeline_id": "solidworks-to-urdf",
             "ready": True,
             "native_platform": True,
