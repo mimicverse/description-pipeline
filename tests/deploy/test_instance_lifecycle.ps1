@@ -1436,6 +1436,15 @@ Check 'outer.unknown_owner_no_restart' ((@($outer.calls | Where-Object { $_ -lik
   ($outer.message -match 'promote_restore_failed'))
 Check 'outer.unknown_owner_candidate_started_once' ((@($outer.calls | Where-Object { $_ -like 'start:*new*' }).Count -eq 1))
 
+$outer = Invoke-Outer 'promote_prestop_identity_mismatch'
+Check 'outer.prestop_failure_has_no_mutation' (
+  ($outer.message -match 'promote_preflight_failed') -and
+  (@($outer.calls | Where-Object { $_ -like 'stop*' -or $_ -like 'register*' -or $_ -like 'start:*' }).Count -eq 0) -and
+  ($outer.receipt.restore.stopped -eq $false) -and
+  ($outer.receipt.restore.restored -eq $false) -and
+  ($outer.receipt.restore.started -eq $false)) `
+  ($outer | ConvertTo-Json -Depth 12 -Compress)
+
 $outer = Invoke-Outer 'startable_second_refusal'
 Check 'outer.startable_starts_old_with_pinned_health' ((@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 1) -and
   ($outer.receipt.restore.startable -eq $true) -and ($outer.receipt.restore.started -eq $true) -and

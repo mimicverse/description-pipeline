@@ -2932,7 +2932,7 @@ if ($Verb -eq 'promote') {
     previous=$previous; task_before=(Join-Path $previous 'task.xml');
     source=$sourceState; source_listener=$sourceListener;
     target=$pendingTarget}
-  $mutationStarted = $true
+  $mutationStarted = $false
   try {
     $preStopTask = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction Stop
     $preStopProjection = Get-TaskProjection $preStopTask
@@ -2943,6 +2943,7 @@ if ($Verb -eq 'promote') {
     Assert-ListenerMatch $sourceListener $preStopListener
     $preStopHealth = Read-EndpointHealth ([string]$preStopIdentity.config_path)
     Assert-HealthSourceMatch $preStopHealth $sourceState
+    $mutationStarted = $true
     Stop-Endpoint $binding
     $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
       -Argument (Runtime-LauncherArguments $StageDir) -WorkingDirectory $binding.state_root
@@ -3024,6 +3025,10 @@ if ($Verb -eq 'promote') {
       if ($script:SettleRefusal.retried_after_s) { $failed['retried']=@{after_s=$script:SettleRefusal.retried_after_s} }
     }
     Write-Receipt (Join-Path $previous 'failed-promotion.json') $failed
+    if (-not $mutationStarted) {
+      Die 'promote_preflight_failed' (
+        'the promotion was refused before any Windows mutation: ' + $_.Exception.Message)
+    }
     if ($restore.healthy -ne $true) {
       Die 'promote_restore_failed' (
         'the promotion failed and the sealed source endpoint is not proven healthy: ' +

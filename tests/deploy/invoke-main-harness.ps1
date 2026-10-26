@@ -7,7 +7,7 @@
 # health probe run for real (Wait-Settled runs real and fails fast on the stub task state).
 # Scenarios: unknown_owner | startable_second_refusal | promote_missing_stage_receipt |
 # stage_unknown_key_refused | stage_legacy_targets_refused | stage_duplicate_key_refused |
-# stage_acl_boundary |
+# stage_acl_boundary | promote_prestop_identity_mismatch |
 # promote_candidate_mismatch | promote_source_mismatch.
 # Prints one JSON object (scenario, message, calls, sleeps, receipt) and exits 0.
 param(
@@ -99,6 +99,7 @@ $script:TaskState = 'Running'
 $script:Calls = [System.Collections.Generic.List[string]]::new()
 $script:Sleeps = [System.Collections.Generic.List[int]]::new()
 $script:AccountEnv = @{}
+$script:ListenerCallCount = 0
 
 function Get-AccountEnvironment { param([string]$Name) return [string]$script:AccountEnv[$Name] }
 function Set-AccountEnvironment { param([string]$Name, [string]$Value) $script:AccountEnv[$Name] = $Value }
@@ -230,8 +231,13 @@ function Get-EndpointIdentity {
 }
 function Get-ListenerEvidence {
   param([object]$binding, $TaskProjection)
+  $script:ListenerCallCount++
+  $listenerPid = if (
+    $Scenario -eq 'promote_prestop_identity_mismatch' -and
+    $script:ListenerCallCount -ge 2
+  ) { 4243 } else { 4242 }
   return [pscustomobject]@{
-    listener_pid=4242
+    listener_pid=$listenerPid
     process_start_utc='2026-10-27T00:00:00Z'
     process_command_sha256=('c' * 64)
     process_user_sid=$TaskProjection.principal.sid}
