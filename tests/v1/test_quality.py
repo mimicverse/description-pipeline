@@ -1983,10 +1983,12 @@ class MeshChunkContractTests(unittest.TestCase):
             "visuals": [
                 {
                     "filename": "geometry/0001_mesh.stl",
+                    "sha256": hashlib.sha256(payload).hexdigest(),
                     "mesh_name": "meshes/visual/board_0.stl",
                     "scale": [1, 1, 1],
                     "xyz": [0, 0, 0],
                     "rpy": [0, 0, 0],
+                    "provenance": {"native_component": "pcb-1"},
                 }
             ],
             "collisions": [],
@@ -2067,6 +2069,7 @@ class MeshChunkContractTests(unittest.TestCase):
                 struct.pack_into("<12f", flipped, offset, *[-value for value in normal], *first, *third, *second)
             source.write_bytes(flipped)
             geometry["pcb-1"]["sha"] = hashlib.sha256(flipped).hexdigest()
+            model_link["visuals"][0]["sha256"] = geometry["pcb-1"]["sha"]
             for index, part in enumerate(self._parts(flipped, 2)):
                 (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
             with (
@@ -2114,6 +2117,7 @@ class MeshChunkContractTests(unittest.TestCase):
                 )
             source.write_bytes(flipped)
             geometry["pcb-1"]["sha"] = hashlib.sha256(flipped).hexdigest()
+            model_link["visuals"][0]["sha256"] = geometry["pcb-1"]["sha"]
             for index, part in enumerate(self._parts(flipped, 2)):
                 (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
             with mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 2):
@@ -2167,6 +2171,7 @@ class MeshChunkContractTests(unittest.TestCase):
             source = root / "evidence/geometry/0001_mesh.stl"
             source.write_bytes(payload)
             geometry["pcb-1"]["sha"] = hashlib.sha256(payload).hexdigest()
+            model_link["visuals"][0]["sha256"] = geometry["pcb-1"]["sha"]
             geometry["pcb-1"]["triangles"] = 8
             spans = geometry["pcb-1"]["tessellation"]["face_spans"]
             spans[0]["triangle_count"] = 4
@@ -2594,10 +2599,12 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
             "visuals": [
                 {
                     "filename": "geometry/0001_mesh.stl",
+                    "sha256": digest,
                     "mesh_name": "meshes/visual/board_0.stl",
                     "scale": [1, 1, 1],
                     "xyz": [0, 0, 0],
                     "rpy": [0, 0, 0],
+                    "provenance": {"native_component": occurrence},
                 }
             ],
             "collisions": [],

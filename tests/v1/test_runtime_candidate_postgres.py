@@ -17,7 +17,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror
@@ -2447,6 +2447,9 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             {"done": 1, "total": 3, "unit": "documents"},
         )
         stored = display[2]
+        previous_at = datetime.fromisoformat(stored["current"]["updated_at"])
+        stale_at = (previous_at - timedelta(milliseconds=1)).isoformat()
+        newer_at = (previous_at + timedelta(milliseconds=1)).isoformat()
         same_source = {
             "seq": stored["source_seq"],
             "at": stored["current"]["updated_at"],
@@ -2471,7 +2474,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             "operation-after",
             {
                 "seq": 1,
-                "at": "2026-10-26T04:00:00Z",
+                "at": previous_at.isoformat(),
                 "phase": "capture",
                 "action": "mesh",
             },
@@ -2489,7 +2492,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             operation_id,
             {
                 "seq": stored["source_seq"],
-                "at": stored["current"]["updated_at"],
+                "at": stale_at,
                 "phase": "capture",
                 "action": "readings",
             },
@@ -2508,7 +2511,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             operation_id,
             {
                 "seq": stored["source_seq"] + 1,
-                "at": "2026-10-26T04:00:01Z",
+                "at": newer_at,
                 "phase": "capture",
                 "action": "readings",
                 "current_object": "cad/robot.SLDASM",

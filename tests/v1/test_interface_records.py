@@ -545,7 +545,7 @@ class InterfaceRecordTests(unittest.TestCase):
         # Pinned digest: generation, verification and the manifest consume this object.
         self.assertEqual(
             ir.check_policy_digest(),
-            "673b6501b2edf434634c7d1347433495b0dada34d3926416acee6dc07cbd6bb9",
+            "6e587058502c2e1173123b92534693b0840e4cc854996e000fbc5ce6a9345e46",
             "the check policy changed; the digest is re-registered",
         )
         bad = copy.deepcopy(ir.CHECK_POLICY_V1)
