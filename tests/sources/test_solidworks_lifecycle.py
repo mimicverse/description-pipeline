@@ -75,22 +75,30 @@ class AbortOwnedProcessesTests(unittest.TestCase):
 
 class SessionTests(unittest.TestCase):
     def test_loaded_references_must_also_be_read_only(self):
-        doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT")
+        state = {"read_only": False}
+        doc = SimpleNamespace(
+            IsOpenedReadOnly=lambda: state["read_only"],
+            GetPathName=lambda: "part.SLDPRT",
+        )
         calls = []
 
         def protect(value):
             calls.append(value)
-            doc.IsOpenedReadOnly = value
+            state["read_only"] = value
             return True
 
         doc.SetReadOnlyState = protect
         self.assertIs(_read_only_document(doc), doc)
-        self.assertTrue(doc.IsOpenedReadOnly)
+        self.assertTrue(doc.IsOpenedReadOnly())
         _read_only_document(doc)
         self.assertEqual(calls, [True])
 
     def test_read_only_failure_blocks_capture(self):
-        doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT", SetReadOnlyState=lambda value: True)
+        doc = SimpleNamespace(
+            IsOpenedReadOnly=lambda: False,
+            GetPathName=lambda: "part.SLDPRT",
+            SetReadOnlyState=lambda value: True,
+        )
         with self.assertRaises(CadError) as caught:
             _read_only_document(doc)
         self.assertEqual(caught.exception.code, "cad_read_only_failed")

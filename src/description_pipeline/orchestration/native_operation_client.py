@@ -1631,7 +1631,6 @@ class NativeOperationEffectObserver:
         upstream = [
             dict(record) for record in native_request.upstream_artifacts
         ]
-        prepared_files = dict(native_request.package_files)
         operation_id = identity.operation_id
         observed = self._operation(
             operation_id,
@@ -1728,7 +1727,6 @@ class NativeOperationEffectObserver:
             expected_main_assembly=request.main_assembly,
             expected_native_tool=native_tool,
             expected_prepared_dir=None,
-            expected_prepared_files=prepared_files,
             expected_upstream_artifacts=upstream,
             expected_execution=execution,
         )

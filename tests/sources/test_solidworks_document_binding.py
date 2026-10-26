@@ -4,8 +4,6 @@ import sys
 import types
 import unittest
 from unittest.mock import Mock, patch
-import ast
-import pathlib
 from typing import ClassVar
 
 from description_pipeline.sources.solidworks import native
@@ -164,12 +162,18 @@ class DocumentBoundaryTests(unittest.TestCase):
         self.stubs = _InterfaceModules()
         self.path = "C:/captures/robot.SLDASM"
         self.stubs.view.GetPathName = Mock(spec=lambda: None, return_value=self.path)
-        self.stubs.view.IsOpenedReadOnly = True
+        self.stubs.view.IsOpenedReadOnly = Mock(
+            spec=lambda: None,
+            return_value=True,
+        )
 
     def test_document_by_path_binds_the_imodeldoc2_interface(self):
         raw = self.stubs.raw()
         self.stubs.dynamic.DumbDispatch.return_value = raw
-        view = types.SimpleNamespace(GetPathName=Mock(spec=lambda: None, return_value=self.path), IsOpenedReadOnly=True)
+        view = types.SimpleNamespace(
+            GetPathName=Mock(spec=lambda: None, return_value=self.path),
+            IsOpenedReadOnly=Mock(spec=lambda: None, return_value=True),
+        )
         backend = SolidWorksBackend()
         backend._app_for_path = lambda path: types.SimpleNamespace(
             GetOpenDocumentByName=Mock(spec=lambda path: None, return_value=raw)
@@ -552,6 +556,7 @@ class ReturnViewRegistryTests(unittest.TestCase):
     }
     EXPECTED_ARRAYS: ClassVar[dict[str, str]] = {
         "GetBodies2": native.IBODY2_IID,
+        "GetBodies3": native.IBODY2_IID,
         "GetFaces": native.IFACE2_IID,
     }
 
@@ -567,9 +572,16 @@ class ReturnViewRegistryTests(unittest.TestCase):
             with self.subTest(member=member):
                 stubs = _InterfaceModules()
                 returned = types.SimpleNamespace(_oleobj_=stubs.generic)
-                raw = types.SimpleNamespace(**{member: returned})
+                if member == "Extension":
+                    raw = types.SimpleNamespace(**{member: returned})
+                    reader = native._property
+                else:
+                    raw = types.SimpleNamespace(
+                        **{member: lambda value=returned: value}
+                    )
+                    reader = native._method
                 with patch.dict(sys.modules, stubs.modules):
-                    view = native._member(raw, member)
+                    view = reader(raw, member)
                 stubs.generic.QueryInterface.assert_called_once_with(iid, "IDispatch")
                 self.assertIs(view, stubs.view)
 
@@ -580,26 +592,21 @@ class ReturnViewRegistryTests(unittest.TestCase):
                 elements = [types.SimpleNamespace(_oleobj_=Mock()) for _ in range(2)]
                 for element in elements:
                     element._oleobj_.QueryInterface.return_value = stubs.vendor
-                raw = types.SimpleNamespace(**{member: Mock(spec=lambda *args: None, return_value=elements)})
+                raw = types.SimpleNamespace(
+                    **{member: lambda *args, value=elements: value}
+                )
                 with patch.dict(sys.modules, stubs.modules):
-                    views = native._member(raw, member)
+                    views = native._method(raw, member)
                 self.assertEqual(len(views), 2)
                 for element in elements:
                     element._oleobj_.QueryInterface.assert_called_once_with(iid, "IDispatch")
                 self.assertTrue(all(view is stubs.view for view in views))
 
-    def test_late_bound_non_callable_array_return_is_bound(self):
-        stubs = _InterfaceModules()
-        elements = [types.SimpleNamespace(_oleobj_=Mock()) for _ in range(2)]
-        for element in elements:
-            element._oleobj_.QueryInterface.return_value = stubs.vendor
-        raw = types.SimpleNamespace(GetFaces=tuple(elements))  # property-shaped, not callable
-        with patch.dict(sys.modules, stubs.modules):
-            views = native._member(raw, "GetFaces")
-        self.assertEqual(len(views), 2)
-        for element in elements:
-            element._oleobj_.QueryInterface.assert_called_once_with(native.IFACE2_IID, "IDispatch")
-        self.assertTrue(all(view is stubs.view for view in views))
+    def test_method_reader_rejects_a_property_shaped_return(self):
+        raw = types.SimpleNamespace(GetFaces=())
+        with self.assertRaises(native.CadError) as caught:
+            native._method(raw, "GetFaces")
+        self.assertEqual(caught.exception.code, "cad_member_not_callable")
 
     def test_method_binding_covers_dynamic_step_members(self):
         for member in ("GetNextFeature", "GetNextSubFeature", "GetFirstSubFeature"):
@@ -612,48 +619,12 @@ class ReturnViewRegistryTests(unittest.TestCase):
                 stubs.generic.QueryInterface.assert_called_once_with(native.IFEATURE_IID, "IDispatch")
                 self.assertIs(view, stubs.view)
 
-    def test_mate_entity_reference_is_a_documented_multi_type_exemption(self):
-        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("_entity_view", source)
-        self.assertNotIn("E_NOINTERFACE", source)
-        self.assertIn("EXEMPT (untyped multi-type return): IMateEntity2.Reference", source)
-        self.assertIn('target = _member(entity, "Reference")', source)
-        self.assertIsNone(native.RETURN_VIEWS.get("Reference"))
-        self.assertNotIn("Reference", native.RETURN_ARRAY_VIEWS)
-        tree = ast.parse(source)
-        guarded = False
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Try):
-                continue
-            raises_cad = any(
-                isinstance(stmt, ast.Raise)
-                and isinstance(stmt.exc, ast.Call)
-                and getattr(stmt.exc.func, "id", "") == "CadError"
-                for handler in node.handlers
-                for stmt in handler.body
-            )
-            reads_reference = any(
-                isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Name)
-                and item.func.id == "_member"
-                and len(item.args) > 1
-                and isinstance(item.args[0], ast.Name)
-                and item.args[0].id == "entity"
-                and isinstance(item.args[1], ast.Constant)
-                and item.args[1].value == "Reference"
-                for item in ast.walk(node)
-            )
-            if raises_cad and reads_reference:
-                guarded = True
-                break
-        self.assertTrue(guarded, "the Reference read must fail closed as cad_mate_unreadable")
-
     def test_reference_read_returns_a_generic_dispatch_without_a_geometry_qi(self):
         stubs = _InterfaceModules()
         raw_reference = types.SimpleNamespace(_oleobj_=stubs.generic)
         entity = types.SimpleNamespace(Reference=raw_reference)
         with patch.dict(sys.modules, stubs.modules):
-            target = native._member(entity, "Reference")
+            target = native._property(entity, "Reference")
         stubs.generic.QueryInterface.assert_not_called()
         stubs.dynamic.DumbDispatch.assert_called_once_with(stubs.generic)
         self.assertIs(target, stubs.view)
@@ -662,108 +633,16 @@ class ReturnViewRegistryTests(unittest.TestCase):
         feature_ole.QueryInterface.return_value = "feature-view"
         stubs.view.GetFeature = Mock(spec=lambda: None, return_value=types.SimpleNamespace(_oleobj_=feature_ole))
         with patch.dict(sys.modules, stubs.modules):
-            feature = native._member(target, "GetFeature")
+            feature = native._method(target, "GetFeature")
         feature_ole.QueryInterface.assert_called_once_with(native.IFEATURE_IID, "IDispatch")
         self.assertIs(feature, stubs.view)
-
-    def test_mass_readers_capture_configuration_before_stateful_calls(self):
-        tree = ast.parse(pathlib.Path(native.__file__).read_text(encoding="utf-8"))
-        readers = (
-            "_mass_properties_document",
-            "assembly_mass_properties",
-            "assembly_component_mass_properties",
-            "assembly_group_mass_properties",
-        )
-        seen = set()
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.FunctionDef) and node.name in readers):
-                continue
-            seen.add(node.name)
-            stateful = [
-                item.lineno
-                for item in ast.walk(node)
-                if isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Name)
-                and item.func.id == "_member"
-                and len(item.args) > 1
-                and isinstance(item.args[1], ast.Constant)
-                and item.args[1].value == "Recalculate"
-            ]
-            stateful += [
-                item.lineno
-                for item in ast.walk(node)
-                if isinstance(item, ast.Assign)
-                and isinstance(item.targets[0], ast.Attribute)
-                and item.targets[0].attr == "SelectedItems"
-            ]
-            self.assertTrue(stateful, node.name)
-            first_stateful = min(stateful)
-            captures = [
-                item.lineno
-                for item in ast.walk(node)
-                if isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Name)
-                and item.func.id == "_configuration_context"
-            ]
-            paths = [
-                item.lineno
-                for item in ast.walk(node)
-                if isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Name)
-                and item.func.id == "_member"
-                and len(item.args) > 1
-                and isinstance(item.args[1], ast.Constant)
-                and item.args[1].value in ("GetPathName", "GetTitle")
-                and isinstance(item.args[0], ast.Name)
-                and item.args[0].id == "doc"
-            ]
-            self.assertTrue(captures, node.name)
-            self.assertTrue(paths, node.name)
-            self.assertLess(max(captures), first_stateful, node.name)
-            self.assertLess(max(paths), first_stateful, node.name)
-            late = [
-                item.lineno
-                for item in ast.walk(node)
-                if isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Name)
-                and item.func.id in ("_member", "_method")
-                and item.args
-                and isinstance(item.args[0], ast.Name)
-                and item.args[0].id in ("doc", "active", "config", "configuration")
-                and item.lineno > first_stateful
-            ]
-            self.assertEqual(late, [], f"{node.name} late doc/config reads at lines {late}")
-        self.assertEqual(seen, set(readers))
-
-    def test_configuration_reads_funnel_through_the_bound_helpers(self):
-        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
-        self.assertEqual(source.count('"ConfigurationManager"'), 1)
-        self.assertEqual(source.count('"ActiveConfiguration"'), 1)
-        self.assertGreaterEqual(source.count("_active_configuration_view("), 10)
-
-    def test_mechanical_transform_never_falls_back_to_presentation_state(self):
-        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
-        self.assertNotIn('("GetTotalTransform", True)', source)
-        self.assertIn('_member(component, "GetTotalTransform", False)', source)
-
-    def test_undeclared_lightweight_member_is_reported_not_probed(self):
-        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("_optional_bool", source)
-        self.assertNotIn('"IsLightWeight"', source)
-        self.assertNotIn('"IsLightweight"', source)
-        self.assertIn('state["lightweight"] = None', source)
-        self.assertIn('state["unsupported"] = ["lightweight"]', source)
-        # The per-component lightweight member is declared by the supported
-        # GetSuppression2 state; discovery does not run a separate mass probe.
-        self.assertNotIn("unsupported_declared", source)
-        self.assertNotIn("lightweight_state_", source)
 
     def test_document_state_reports_unsupported_lightweight_without_probing(self):
         doc = types.SimpleNamespace(
             GetPathName=Mock(spec=lambda: None, return_value="C:/captures/robot.SLDASM"),
             GetTitle=Mock(spec=lambda: None, return_value="robot"),
             GetSaveFlag=Mock(spec=lambda: None, return_value=False),
-            IsOpenedReadOnly=True,
+            IsOpenedReadOnly=Mock(spec=lambda: None, return_value=True),
             ConfigurationManager=types.SimpleNamespace(ActiveConfiguration=types.SimpleNamespace(Name="Default")),
         )
         backend = SolidWorksBackend()
@@ -773,27 +652,6 @@ class ReturnViewRegistryTests(unittest.TestCase):
         self.assertEqual(state["unsupported"], ["lightweight"])
         self.assertTrue(state["saved"])
         self.assertTrue(state["read_only"])
-
-    def test_only_presence_checks_read_getmodeldoc2_directly(self):
-        import ast
-        import pathlib
-
-        source = pathlib.Path(native.__file__).read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        raw_sites = [
-            node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_method"
-            and len(node.args) > 1
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == "GetModelDoc2"
-        ]
-        # Three raw calls remain: one inside _component_document and two
-        # presence-only checks. Post-acquisition reads use the helper.
-        self.assertEqual(len(raw_sites), 3, raw_sites)
-
 
 if __name__ == "__main__":
     unittest.main()

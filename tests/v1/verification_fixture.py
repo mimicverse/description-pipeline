@@ -20,7 +20,7 @@ from description_pipeline.delivery import read_delivery_manifest
 from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.io import digest
 from description_pipeline.pipeline.contracts import ArtifactRef
-from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
+from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.runtime import tool_record
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
@@ -135,7 +135,7 @@ def _fixture_appearance_raw(
             body_key,
             {
                 "component": component,
-                "enumeration_api": "IComponent2.GetBodies2",
+                "enumeration_api": "IComponent2.GetBodies3",
                 "body_type": body_key[0],
                 "body_index": body_key[1],
                 "body_name": "fixture-solid",
@@ -163,7 +163,7 @@ def _fixture_appearance_raw(
                                 "owner_scope": "assembly_occurrence",
                                 "object_kind": "assembly_occurrence",
                                 "source_api": (
-                                    "IComponent2.GetBodies2/"
+                                    "IComponent2.GetBodies3/"
                                     "IBody2.GetFaces"
                                 ),
                                 "traversal_api": (
@@ -211,7 +211,7 @@ def _fixture_appearance_raw(
                                     "owner_scope": "assembly_occurrence",
                                     "object_kind": "assembly_occurrence",
                                     "source_api": (
-                                        "IComponent2.GetBodies2/"
+                                        "IComponent2.GetBodies3/"
                                         "IBody2.GetFaces"
                                     ),
                                     "traversal_api": (
@@ -509,6 +509,15 @@ class HermeticNativeFixture:
             "owner_sha256": digest({"owner": "hermetic-capture"}),
             "run_id": RUN_ID,
         }
+        request = build_request_evidence(
+            purpose=PURPOSE_ENGINEERING,
+            request_id="hermetic-six-stage",
+            target_hardware="nd_fixture",
+            change_summary="Hermetic six-stage delivery",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=handoff_digest,
+            platform_config_digest="c" * 64,
+        )
         with patch("description_pipeline.runtime.tool_record", return_value=native_identity):
             from description_pipeline.pipeline.capture import (
                 _capture_native_transaction,
@@ -527,20 +536,9 @@ class HermeticNativeFixture:
                 native_tool_factory=lambda: dict(native_identity),
                 upstream_artifacts=upstream_artifacts,
                 execution=execution,
+                request_evidence=request,
             )
         self.assertEqual(capture["state"], "native_complete", capture.get("error"))
-        request = build_request_evidence(
-            purpose=PURPOSE_ENGINEERING,
-            request_id="hermetic-six-stage",
-            target_hardware="nd_fixture",
-            change_summary="Hermetic six-stage delivery",
-            main_assembly=MAIN_ASSEMBLY,
-            handoff_digest=handoff_digest,
-            platform_config_digest="c" * 64,
-        )
-        request_path = self.root / "capture/input/request.json"
-        request_path.parent.mkdir(parents=True, exist_ok=True)
-        request_path.write_bytes(request_evidence_bytes(request))
         return self.root / "capture", {"freeze": frozen, "capture": capture}
 
     def _repository(self) -> Path:

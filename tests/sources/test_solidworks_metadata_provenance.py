@@ -230,7 +230,7 @@ class NativeMetadataTests(unittest.TestCase):
             GetPathName=Mock(spec=lambda: None, return_value=r"C:\captures\robot.SLDASM"),
             GetTitle=Mock(spec=lambda: None, return_value="robot.SLDASM"),
             GetSaveFlag=Mock(spec=lambda: None, return_value=save_flag),
-            IsOpenedReadOnly=True,
+            IsOpenedReadOnly=Mock(spec=lambda: None, return_value=True),
             ConfigurationManager=SimpleNamespace(
                 ActiveConfiguration=SimpleNamespace(Name="Default")
             ),
@@ -287,9 +287,9 @@ class NativeMetadataTests(unittest.TestCase):
                     RevisionNumber=lambda: "34.4.1",
                     GetBuildNumbers=lambda: "2026.1",
                     GetCurrentLicenseType=lambda: 1,
-                    Visible=lambda: True,
+                    Visible=True,
                 )
-                setattr(app, member, lambda value=value: value)
+                setattr(app, member, value)
                 backend = SolidWorksBackend()
                 backend._app_obj = lambda app=app: app
                 facts = backend.environment()

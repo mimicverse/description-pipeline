@@ -8,6 +8,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from airflow import DAG
 from airflow.sdk.exceptions import AirflowFailException, TaskDeferred
 
 from description_pipeline.io import digest
@@ -30,6 +31,15 @@ DAG_ID = "solidworks_to_urdf"
 RUN_ID = "run-1"
 DAG_RUN_ID = "portal-run-1"
 EXECUTOR_SHA256 = digest({"executor": "capture"})
+
+
+def _operator(**kwargs):
+    return StageTaskOperator(
+        task_id=kwargs.pop("task_id", "capture"),
+        stage=kwargs.pop("stage", "capture"),
+        dag=DAG(DAG_ID),
+        **kwargs,
+    )
 
 
 def _artifact() -> ArtifactRef:
@@ -112,7 +122,7 @@ def _keys(value: object) -> set[str]:
 
 class StageTaskOperatorTests(unittest.TestCase):
     def test_execute_binds_all_four_real_task_fields_and_returns_result(self) -> None:
-        operator = StageTaskOperator(task_id="capture", stage="capture")
+        operator = _operator()
         application = Mock()
         application.run_stage.return_value = _result()
         factory = Mock(return_value=application)
@@ -134,11 +144,35 @@ class StageTaskOperatorTests(unittest.TestCase):
         self.assertEqual(output["outcome"], "completed")
         self.assertEqual(output["actual_executor_sha256"], EXECUTOR_SHA256)
 
+    def test_context_dag_must_match_the_operator_authority(self) -> None:
+        operator = _operator()
+        factory = Mock()
+        contexts = []
+        missing = _context()
+        missing.pop("dag")
+        contexts.append(missing)
+        contexts.append(
+            {
+                **_context(),
+                "dag": SimpleNamespace(dag_id="another_dag"),
+            }
+        )
+        with patch.object(
+            airflow_stage_operator,
+            "_application_from_binding",
+            factory,
+        ):
+            for context in contexts:
+                with self.assertRaisesRegex(
+                    AirflowFailException,
+                    "differs from operator dag_id",
+                ):
+                    operator.execute(context)
+        factory.assert_not_called()
+
     def test_pending_defers_with_only_the_canonical_wait(self) -> None:
         wait = _wait()
-        operator = StageTaskOperator(
-            task_id="capture",
-            stage="capture",
+        operator = _operator(
             poll_interval=7,
             defer_timeout=90,
         )
@@ -182,7 +216,7 @@ class StageTaskOperatorTests(unittest.TestCase):
 
     def test_complete_uses_a_new_task_binding_and_resumes_the_same_wait(self) -> None:
         wait = _wait()
-        operator = StageTaskOperator(task_id="capture", stage="capture")
+        operator = _operator()
         application = Mock()
         application.resume_stage.return_value = _result()
         factory = Mock(return_value=application)
@@ -216,7 +250,7 @@ class StageTaskOperatorTests(unittest.TestCase):
 
     def test_still_pending_resume_keeps_the_same_wait(self) -> None:
         wait = _wait()
-        operator = StageTaskOperator(task_id="capture", stage="capture")
+        operator = _operator()
         application = Mock()
         application.resume_stage.return_value = StagePending(wait)
 
@@ -236,7 +270,7 @@ class StageTaskOperatorTests(unittest.TestCase):
         self.assertEqual(deferred.kwargs, {"wait": wait.to_record()})
 
     def test_stale_run_stage_or_extra_event_field_is_refused_before_application(self) -> None:
-        operator = StageTaskOperator(task_id="capture", stage="capture")
+        operator = _operator()
         wait = _wait()
         factory = Mock()
 

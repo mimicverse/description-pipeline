@@ -67,7 +67,7 @@
     "bodies": [
       {
         "component": "arm-1",
-        "enumeration_api": "IComponent2.GetBodies2",
+        "enumeration_api": "IComponent2.GetBodies3",
         "body_type": 0,
         "body_index": 0,
         "body_name": "arm",
@@ -125,7 +125,7 @@
                   "input_context": {
                     "owner_scope": "assembly_occurrence",
                     "object_kind": "assembly_occurrence",
-                    "source_api": "IComponent2.GetBodies2/IBody2.GetFaces",
+                    "source_api": "IComponent2.GetBodies3/IBody2.GetFaces",
                     "traversal_api": "IConfiguration.GetRootComponent3/IComponent2.GetChildren"
                   },
                   "receiver": {

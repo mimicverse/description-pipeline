@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from ... import __version__
 from ...interface_records import (
@@ -434,9 +436,9 @@ def capture_native_package(
     package: Path,
     staging: Path,
     *,
-    expected_inputs=None,
-    handoff_sha256=None,
-    backend=None,
+    expected_inputs: Mapping[str, str],
+    handoff_sha256: str,
+    backend: Any,
     on_event=None,
     on_activity=None,
 ):
@@ -445,10 +447,7 @@ def capture_native_package(
     _state(on_event, "capture", "running")
 
     def inspect_and_archive():
-        if (
-            expected_inputs is not None
-            and package_inventory(package) != expected_inputs
-        ):
+        if package_inventory(package) != expected_inputs:
             raise PipelineError(
                 "Prepared inputs changed after discovery"
             )

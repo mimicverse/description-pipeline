@@ -162,7 +162,7 @@ def _appearance_index_record(
                     "owner_scope": "assembly_occurrence",
                     "object_kind": "assembly_occurrence",
                     "source_api": (
-                        "IComponent2.GetBodies2/IBody2.GetFaces"
+                        "IComponent2.GetBodies3/IBody2.GetFaces"
                     ),
                     "traversal_api": (
                         "IConfiguration.GetRootComponent3/"
@@ -283,7 +283,7 @@ def _attach_body_witnesses(raw, references=None):
                             "owner_scope": "assembly_occurrence",
                             "object_kind": "assembly_occurrence",
                             "source_api": (
-                                "IComponent2.GetBodies2/IBody2.GetFaces"
+                                "IComponent2.GetBodies3/IBody2.GetFaces"
                             ),
                             "traversal_api": (
                                 "IConfiguration.GetRootComponent3/"
@@ -1338,20 +1338,20 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 "IFace2.GetBody+"
                 "IModelDocExtension.GetPersistReference3",
                 "IBody2",
-                "IComponent2.GetBodies2/IBody2.GetFaces",
+                "IComponent2.GetBodies3/IBody2.GetFaces",
             ),
             (
                 "face",
                 "IModelDocExtension.GetCorrespondingEntity2",
                 "IFace2",
-                "IComponent2.GetBodies2/IBody2.GetFaces",
+                "IComponent2.GetBodies3/IBody2.GetFaces",
             ),
             (
                 "feature",
                 "IFace2.GetFeature+"
                 "IModelDocExtension.GetPersistReference3",
                 "IFeature",
-                "IComponent2.GetBodies2/IBody2.GetFaces",
+                "IComponent2.GetBodies3/IBody2.GetFaces",
             ),
         ):
             indexed = copy.deepcopy(base)
@@ -1987,7 +1987,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 body_rows.append(
                     {
                         "component": component,
-                        "enumeration_api": "IComponent2.GetBodies2",
+                        "enumeration_api": "IComponent2.GetBodies3",
                         "body_type": body["body_type"],
                         "body_index": body["body_index"],
                         "body_name": body.get("body_name"),

@@ -106,7 +106,7 @@ def appearance_evidence(*, claimed: bool) -> tuple[dict, dict]:
         "bodies": [
             {
                 "component": "part-1",
-                "enumeration_api": "IComponent2.GetBodies2",
+                "enumeration_api": "IComponent2.GetBodies3",
                 "body_type": 0,
                 "body_index": 0,
                 "body_name": "part",

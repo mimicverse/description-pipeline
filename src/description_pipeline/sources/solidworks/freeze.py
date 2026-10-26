@@ -747,7 +747,11 @@ def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
             module = frame.f_globals.get("__name__", "")
             if isinstance(module, str) and module.startswith("description_pipeline.sources.solidworks."):
                 site = {"module": module, "function": frame.f_code.co_name, "line": trace.tb_lineno}
-                if module.endswith(".native") and frame.f_code.co_name in ("_member", "_method"):
+                if module.endswith(".native") and frame.f_code.co_name in (
+                    "_indexed_property",
+                    "_property",
+                    "_method",
+                ):
                     member = frame.f_locals.get("name")
                     if isinstance(member, str):
                         site["member"] = member
@@ -1813,16 +1817,12 @@ def capture_prepared(
     package: Path,
     prepared_root: Path,
     native_files: Mapping[str, str],
-    backend: Any = None,
-    worker_version: str = "unknown",
+    backend: Any,
+    worker_version: str,
     on_activity=None,
 ) -> dict[str, Any]:
     """Capture one sealed prepared package through the single production path."""
 
-    if backend is None:
-        from .native import SolidWorksBackend
-
-        backend = SolidWorksBackend()
     with backend.session():
         return _capture_prepared_local(
             config,

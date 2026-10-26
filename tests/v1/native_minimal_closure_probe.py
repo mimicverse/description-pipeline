@@ -324,11 +324,13 @@ def _prior_native_events(
 
 def _run(workspace: Path) -> dict:
     from description_pipeline import native_transfer
+    from description_pipeline.interface_records import PURPOSE_ENGINEERING
     from description_pipeline.io import digest
     from description_pipeline.orchestration import stage_transfer
     from description_pipeline.pipeline.contracts import ArtifactRef
     from description_pipeline.pipeline.capture import _capture_native_transaction
     from description_pipeline.sources.solidworks.revision import package_inventory
+    from description_pipeline.request_evidence import build_request_evidence
 
     capture_evidence = importlib.import_module("description_pipeline.verification.capture_evidence")
     facts_module = importlib.import_module("description_pipeline.verification.native_capture_facts")
@@ -368,6 +370,15 @@ def _run(workspace: Path) -> dict:
         "owner_sha256": digest({"owner": "minimal-capture"}),
         "run_id": RUN_ID,
     }
+    request_evidence = build_request_evidence(
+        purpose=PURPOSE_ENGINEERING,
+        request_id="minimal-native-closure",
+        target_hardware="nd_fixture",
+        change_summary="Minimal native closure probe",
+        main_assembly=main_assembly,
+        handoff_digest=handoff_sha256,
+        platform_config_digest="c" * 64,
+    )
     capture = workspace / "capture"
     with mock.patch(
         "description_pipeline.runtime.tool_record",
@@ -386,6 +397,7 @@ def _run(workspace: Path) -> dict:
             native_tool_factory=_native_tool,
             upstream_artifacts=upstream_artifacts,
             execution=execution,
+            request_evidence=request_evidence,
         )
     if receipt.get("state") != "native_complete":
         raise RuntimeError(f"solidworks.capture did not complete: {receipt.get('error')} {receipt.get('detail')}")
@@ -404,7 +416,6 @@ def _run(workspace: Path) -> dict:
     )
     transfer = native_transfer.verify_transfer(
         admitted,
-        capture_only=True,
         expected_upstream_artifacts=upstream_artifacts,
         expected_execution=execution,
     )

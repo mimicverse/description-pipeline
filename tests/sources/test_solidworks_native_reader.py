@@ -85,23 +85,30 @@ class _FixtureAppearanceInterfaceMixin:
 
 
 class _Plane:
-    IsCylinder = False
-    IsPlane = True
+    def IsCylinder(self):
+        return False
+
+    def IsPlane(self):
+        return True
 
     def __init__(self, normal, point):
         self.PlaneParams = tuple(normal) + tuple(point)
 
 
 class _Cylinder:
-    IsCylinder = True
-    IsPlane = False
+    def IsCylinder(self):
+        return True
+
+    def IsPlane(self):
+        return False
 
     def __init__(self, point, direction, radius):
         self.CylinderParams = tuple(point) + tuple(direction) + (radius,)
 
 
 class _Circle:
-    IsCircle = True
+    def IsCircle(self):
+        return True
 
     def __init__(self, center, normal, radius):
         self.CircleParams = tuple(center) + tuple(normal) + (radius,)
@@ -150,6 +157,14 @@ class _MateEntity:
         self.ReferenceType2 = reference_type2
         self.EntityParams = entity_params
 
+    def __getattribute__(self, name):
+        value = object.__getattribute__(self, name)
+        if name in {"ReferenceType", "ReferenceType2", "EntityParams"} and callable(
+            value
+        ):
+            return value()
+        return value
+
 
 class _MateSpecific:
     """``IMate2``-like specific feature. ``count`` overrides the entity list."""
@@ -164,6 +179,7 @@ class _MateSpecific:
     def _value(self, provider):
         return provider() if callable(provider) else provider
 
+    @property
     def Type(self):
         return self._value(self._mate_type)
 
@@ -262,11 +278,11 @@ class _Component:
         #: ``swComponentSuppressionState_e`` raw state (0 suppressed, 1 lightweight,
         #: 2 fully resolved, 3 resolved, 4 fully lightweight, 5 internal-ID mismatch).
         self._suppression = suppression if suppression is not None else (0 if suppressed else 2)
-        self.IsFixed = False
+        self._fixed = False
         # The read-only root-signature probe on the frozen production assembly
         # (2026-10-10) shows IsRoot as a native boolean: True on the root
         # reference, False on part references.  Mocks default to the part case.
-        self.IsRoot = is_root
+        self._is_root = is_root
         self.ReferencedConfiguration = configuration
         self.IsVirtual = False
 
@@ -285,6 +301,12 @@ class _Component:
 
     def GetSuppression2(self):
         return self._suppression
+
+    def IsFixed(self):
+        return self._fixed
+
+    def IsRoot(self):
+        return self._is_root
 
     def GetTotalTransform(self, _resolved):
         return types.SimpleNamespace(ArrayData=list(self._transform))
@@ -316,6 +338,9 @@ class _PropertyManager:
         self._get_names_error = get_names_error
         self.get6_calls = []
         self.get_calls = []
+        self._oleobj_ = types.SimpleNamespace(
+            QueryInterface=lambda *_args: self,
+        )
 
     def GetNames(self):
         if self._get_names_error is not None:
@@ -352,13 +377,36 @@ class _Extension:
         self._coordinate_systems = dict(coordinate_systems or {})
         self._manager = manager
         self._scope_managers = dict(scope_managers or {})
+        self._oleobj_ = types.SimpleNamespace(
+            QueryInterface=lambda *_args: self,
+            GetIDsOfNames=lambda name: (
+                83 if name == "CustomPropertyManager" else -1
+            ),
+            Invoke=self._invoke_property_get,
+        )
 
-    def CustomPropertyManager(self, scope):
+    def _custom_property_manager(self, scope):
         if scope in self._scope_managers:
             return self._scope_managers[scope]
         if self._manager is not _AUTO:
             return self._manager
         return _PropertyManager(self._scopes.get(scope, {}))
+
+    def _invoke_property_get(
+        self,
+        dispid,
+        _lcid,
+        invoke_type,
+        result_wanted,
+        scope,
+    ):
+        if (
+            dispid != 83
+            or invoke_type != sys.modules["pythoncom"].DISPATCH_PROPERTYGET
+            or result_wanted != 1
+        ):
+            raise AssertionError("CustomPropertyManager property-get call differs")
+        return self._custom_property_manager(scope)
 
     def GetCoordinateSystemTransformByName(self, name):
         transform = self._coordinate_systems.get(name)
@@ -447,7 +495,8 @@ class _ConfigurationManager:
 class _Doc:
     """``IModelDoc2``-like assembly/part document, read-only and pre-opened."""
 
-    IsOpenedReadOnly = True
+    def IsOpenedReadOnly(self):
+        return True
 
     def __init__(
         self,
@@ -536,7 +585,9 @@ class _App:
     StartupProcessCompleted = True
     """Minimal ``ISldWorks`` surface; documents are pre-opened read-only."""
 
-    RevisionNumber = "2026-portable-mock"
+    @staticmethod
+    def RevisionNumber():
+        return "2026-portable-mock"
     Visible = False
 
     def __init__(self, docs, open_errors=None, not_preopened=None, dependencies=None, dependency_error=None):
@@ -811,6 +862,20 @@ def _mesh_body(faces, key: str):
     return body
 
 
+def _component_bodies3(provider):
+    def read(body_type, body_info):
+        bodies = provider(body_type)
+        body_info.value = [1] * len(bodies)
+        return bodies
+
+    return read
+
+
+def _component_body_count(holder, body_type):
+    body_info = types.SimpleNamespace(value=None)
+    return len(holder.GetBodies3(body_type, body_info))
+
+
 
 
 @contextmanager
@@ -825,7 +890,10 @@ def _com_stubs():
     pythoncom.VT_EMPTY = 0
     pythoncom.VT_DISPATCH = 9
     pythoncom.VT_ARRAY = 0x2000
+    pythoncom.VT_VARIANT = 12
     pythoncom.VT_UI1 = 17
+    pythoncom.DISPATCH_PROPERTYGET = 2
+    pythoncom.IID_IDispatch = 9
     pythoncom.COINIT_APARTMENTTHREADED = 2
     pythoncom.CoInitializeEx = lambda *_args, **_kwargs: None
     pythoncom.CoUninitialize = lambda: None
@@ -836,8 +904,20 @@ def _com_stubs():
     win32com = types.ModuleType("win32com")
     client = types.ModuleType("win32com.client")
     client.VARIANT = pythoncom.VARIANT
+    client.Dispatch = lambda value: value
     win32com.client = client
-    added = {"pythoncom": pythoncom, "win32com": win32com, "win32com.client": client}
+    dynamic = types.ModuleType("win32com.client.dynamic")
+    dynamic.DumbDispatch = lambda value: value
+    client.dynamic = dynamic
+    pywintypes = types.ModuleType("pywintypes")
+    pywintypes.IID = lambda value: value
+    added = {
+        "pythoncom": pythoncom,
+        "pywintypes": pywintypes,
+        "win32com": win32com,
+        "win32com.client": client,
+        "win32com.client.dynamic": dynamic,
+    }
     saved = {name: sys.modules.get(name) for name in added}
     sys.modules.update(added)
     try:
@@ -1571,11 +1651,11 @@ class SolverObservationTests(unittest.TestCase):
             base = _write(root, "base.SLDPRT")
             wrench = _write(root, "wrench.SLDPRT")
             grounded = _Component("base-1", base)
-            grounded.IsFixed = True
+            grounded._fixed = True
             grounded.Solving = 0
             grounded.GetConstrainedStatus = lambda: 3
             free = _Component("wrench-1", wrench)
-            free.IsFixed = False
+            free._fixed = False
             free.Solving = 0
             free.GetConstrainedStatus = lambda: 3
             assembly = _write(root, "robot.SLDASM")
@@ -1805,8 +1885,9 @@ class CaptureSceneTests(unittest.TestCase):
                 raise AssertionError("occurrence geometry must not read the shared document")
 
         class ConfiguredComponent(_Component):
-            def GetBodies2(self, body_type):
+            def GetBodies3(self, body_type, body_info):
                 if body_type != 0:
+                    body_info.value = []
                     return []
                 if not hasattr(self, "_configured_body"):
                     triangles = {
@@ -1821,6 +1902,7 @@ class CaptureSceneTests(unittest.TestCase):
                         [face],
                         self.ReferencedConfiguration,
                     )
+                body_info.value = [1]
                 return [self._configured_body]
 
         class ConfiguredBackend(_CaptureBackend):
@@ -1902,7 +1984,7 @@ class CaptureSceneTests(unittest.TestCase):
                 }
 
             def _body_count(self, holder, body_type, component):
-                return len(holder.GetBodies2(body_type))
+                return _component_body_count(holder, body_type)
 
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
@@ -1933,7 +2015,11 @@ class CaptureSceneTests(unittest.TestCase):
                 result = []
                 for name, configuration, count in (("part-short", "Short", 1), ("part-long", "Long", 2)):
                     component = _Component(name, path, doc=shared, configuration=configuration)
-                    component.GetBodies2 = lambda body_type, count=count: [object()] * count if body_type == 0 else []
+                    component.GetBodies3 = _component_bodies3(
+                        lambda body_type, count=count: (
+                            [object()] * count if body_type == 0 else []
+                        )
+                    )
                     result.append(BorrowedOccurrence(component))
                 return result
 
@@ -1965,7 +2051,7 @@ class CaptureSceneTests(unittest.TestCase):
 
         class FailingBackend(_CaptureBackend):
             def _body_count(self, holder, body_type, component):
-                return len(holder.GetBodies2(body_type))
+                return _component_body_count(holder, body_type)
 
             def _mass_properties_document(self, doc, require_material=True):
                 raise CadError("cad_empty_model", "part has no solid bodies", {"marker": "kept"})
@@ -1974,8 +2060,10 @@ class CaptureSceneTests(unittest.TestCase):
                 raise CadError("cad_group_unavailable", "no assembly context here")
 
         class SheetOnlyComponent(_Component):
-            def GetBodies2(self, body_type):
-                return [] if body_type == 0 else [object()]
+            def GetBodies3(self, body_type, body_info):
+                return _component_bodies3(
+                    lambda value: [] if value == 0 else [object()]
+                )(body_type, body_info)
 
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
@@ -2011,7 +2099,7 @@ class CaptureSceneTests(unittest.TestCase):
                 self.group_calls = []
 
             def _body_count(self, holder, body_type, component):
-                return len(holder.GetBodies2(body_type))
+                return _component_body_count(holder, body_type)
 
             def _mass_properties_document(self, doc, require_material=True):
                 raise CadError("cad_empty_model", "part has no solid bodies")
@@ -2065,8 +2153,12 @@ class CaptureSceneTests(unittest.TestCase):
                 }
 
         class SheetOnlyComponent(_Component):
-            def GetBodies2(self, body_type):
-                return [] if body_type == 0 else [object()] * 2350
+            def GetBodies3(self, body_type, body_info):
+                return _component_bodies3(
+                    lambda value: (
+                        [] if value == 0 else [object()] * 2350
+                    )
+                )(body_type, body_info)
 
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
@@ -2114,7 +2206,7 @@ class CaptureSceneTests(unittest.TestCase):
                 self.group_calls = 0
 
             def _body_count(self, holder, body_type, component):
-                return len(holder.GetBodies2(body_type))
+                return _component_body_count(holder, body_type)
 
             def _mass_properties_document(self, doc, require_material=True):
                 raise CadError("cad_empty_model", "part has no solid bodies")
@@ -2124,8 +2216,8 @@ class CaptureSceneTests(unittest.TestCase):
                 raise AssertionError("no fallback may be attempted without sheet bodies")
 
         class EmptyComponent(_Component):
-            def GetBodies2(self, body_type):
-                return []
+            def GetBodies3(self, body_type, body_info):
+                return _component_bodies3(lambda _value: [])(body_type, body_info)
 
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
@@ -2352,6 +2444,28 @@ class CaptureSceneTests(unittest.TestCase):
 
 
 class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
+    def test_component_body_info_must_align_with_each_returned_body(self) -> None:
+        class Component:
+            @staticmethod
+            def _FlagAsMethod(_name):
+                return None
+
+            @staticmethod
+            def GetBodies3(_body_type, body_info):
+                body_info.value = [1, 0]
+                return [object()]
+
+        with _com_stubs(), self.assertRaises(CadError) as caught:
+            SolidWorksBackend()._component_bodies(
+                Component(),
+                0,
+                "part-1",
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "cad_component_body_info_invalid",
+        )
+
     def test_capture_records_document_occurrence_body_and_face_appearance_raw(self) -> None:
         occurrence_calls = []
         body_type_calls = []
@@ -2482,7 +2596,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
                     }:
                         body_appearance_calls.append(name)
                         raise AssertionError(
-                            "IComponent2.GetBodies2 bodies are not the documented "
+                            "IComponent2.GetBodies3 bodies are not the documented "
                             "IBody2.MaterialPropertyValues2 owner path"
                         )
                     return getattr(self._value, name)
@@ -2497,11 +2611,19 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
             face._fixture_component = component
             component.ReferencedDisplayState2 = "FaceState"
 
-            def get_bodies(body_type):
-                body_type_calls.append(body_type)
-                return [body_view] if body_type == 0 else []
+            def get_bodies(body_type, body_info):
+                import pythoncom
 
-            component.GetBodies2 = get_bodies
+                self.assertEqual(
+                    body_info.varianttype,
+                    pythoncom.VT_BYREF | pythoncom.VT_VARIANT,
+                )
+                body_type_calls.append(body_type)
+                bodies = [body_view] if body_type == 0 else []
+                body_info.value = [1] * len(bodies)
+                return bodies
+
+            component.GetBodies3 = get_bodies
             component.GetMaterialPropertyValues2 = (
                 lambda option, names: occurrence_calls.append((option, names))
                 or list(occurrence_values)
@@ -2663,6 +2785,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
                     "body_type",
                     "body_index",
                     "body_name",
+                    "body_info_raw",
                     "native_identity",
                     "faces",
                 },
@@ -2677,12 +2800,13 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
                 },
                 {
                     "component": "arm-1",
-                    "enumeration_api": "IComponent2.GetBodies2",
+                    "enumeration_api": "IComponent2.GetBodies3",
                     "body_type": 0,
                     "body_index": 0,
                     "body_name": body.Name,
                 },
             )
+            self.assertEqual(body_raw["body_info_raw"], 1)
             self.assertEqual(body_appearance_calls, [])
             self.assertEqual(body_type_calls, [0, 1])
             self.assertEqual(face_enumeration_calls, [True])
@@ -2875,7 +2999,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
                     doc=part_document,
                 )
                 face._fixture_component = component
-                component.GetBodies2 = (
+                component.GetBodies3 = _component_bodies3(
                     lambda body_type, value=body: (
                         [value] if body_type == 0 else []
                     )
@@ -2946,7 +3070,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
             body = _mesh_body([face], "null-appearance")
             component = _Component("arm-1", part, doc=part_document)
             face._fixture_component = component
-            component.GetBodies2 = (
+            component.GetBodies3 = _component_bodies3(
                 lambda body_type: [body] if body_type == 0 else []
             )
             component.GetMaterialPropertyValues2 = (
@@ -3014,7 +3138,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
             body = _mesh_body([face], "triangle-error")
             component = _Component("arm-1", part, doc=part_document)
             face._fixture_component = component
-            component.GetBodies2 = (
+            component.GetBodies3 = _component_bodies3(
                 lambda body_type: [body] if body_type == 0 else []
             )
             component.GetMaterialPropertyValues2 = (
@@ -3097,7 +3221,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
             body = _mesh_body([face], "extension-failure")
             component = _Component("arm-1", part, doc=part_document)
             face._fixture_component = component
-            component.GetBodies2 = (
+            component.GetBodies3 = _component_bodies3(
                 lambda body_type: [body] if body_type == 0 else []
             )
             component.GetMaterialPropertyValues2 = (
@@ -3169,7 +3293,9 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
             body = _mesh_body([face], "appearance-errors")
             component = _Component("arm-1", part, doc=part_document)
             face._fixture_component = component
-            component.GetBodies2 = lambda body_type: [body] if body_type == 0 else []
+            component.GetBodies3 = _component_bodies3(
+                lambda body_type: [body] if body_type == 0 else []
+            )
             component.GetMaterialPropertyValues2 = (
                 lambda _option, _names: [0.0] * 8
             )
@@ -3471,7 +3597,7 @@ class AppearanceHelperTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase)
             {
                 "owner_scope": "assembly_occurrence",
                 "object_kind": "assembly_occurrence",
-                "source_api": "IComponent2.GetBodies2/IBody2.GetFaces",
+                "source_api": "IComponent2.GetBodies3/IBody2.GetFaces",
                 "traversal_api": (
                     "IConfiguration.GetRootComponent3/"
                     "IComponent2.GetChildren"
@@ -6100,7 +6226,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
             component = _Component("base-1", base)
             assembly = _write(root, "robot.SLDASM")
             not_root = _Component("robot", assembly)
-            not_root.IsRoot = False
+            not_root._is_root = False
             mate = _mate(
                 "not_root_seat",
                 0,
@@ -6123,7 +6249,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
             component = _Component("base-1", base)
             assembly = _write(root, "robot.SLDASM")
             unreadable = _Component("robot", assembly, is_root=True)
-            del unreadable.IsRoot
+            unreadable.IsRoot = _raiser(RuntimeError("unreadable"))
             mate = _mate(
                 "unreadable_seat",
                 0,
@@ -6147,7 +6273,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
             component = _Component("base-1", base)
             assembly = _write(root, "robot.SLDASM")
             not_bool = _Component("robot", assembly, is_root=True)
-            not_bool.IsRoot = 1
+            not_bool.IsRoot = lambda: 1
             mate = _mate(
                 "non_boolean_seat",
                 0,
@@ -6887,7 +7013,10 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
 
     @staticmethod
     def _doc(path):
-        return types.SimpleNamespace(IsOpenedReadOnly=True, GetPathName=lambda: str(path))
+        return types.SimpleNamespace(
+            IsOpenedReadOnly=lambda: True,
+            GetPathName=lambda: str(path),
+        )
 
     def test_collected_copy_owns_the_materialization_without_creating_a_source(self) -> None:
         from description_pipeline.sources.solidworks import native as N

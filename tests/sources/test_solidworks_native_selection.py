@@ -1050,7 +1050,9 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         robot.GetSaveFlag = lambda: (get_save_calls.append(1), False)[1]
 
         class FakeApp:
-            RevisionNumber = "34.0.0"
+            @staticmethod
+            def RevisionNumber():
+                return "34.0.0"
 
             def __init__(self):
                 self.folders = ""
@@ -1174,7 +1176,9 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         )
 
         class FakeApp:
-            RevisionNumber = "34.0.0"
+            @staticmethod
+            def RevisionNumber():
+                return "34.0.0"
 
             def __init__(self):
                 self.folders = ""

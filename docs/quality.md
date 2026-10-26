@@ -149,7 +149,7 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 
 Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随后释放 CAD。坐标、物性投影、三角流序列化、STL 生成及工程校验均在离线执行；原生读取错误和必要对象、配置、来源及会话安全绑定仍须保全和核验。
 
-几何唯一主读取链为 `IComponent2.GetBodies2` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`。`True` 表示不进行系统单位到用户单位转换，原始坐标以米计且位于 component local frame。每个实际 occurrence 分别读取，不按文档与配置提前合并，以免丢失 assembly-level feature 的几何差异。装配 placement 单独保留 `GetTotalTransform(False).ArrayData` 的原始 16 项，离线按 SolidWorks 变换语义转换，不将原始 SW16 当作 canonical 4×4。
+几何唯一主读取链为 `IComponent2.GetBodies3(BodyType, BodiesInfo)` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`。`True` 表示不进行系统单位到用户单位转换，原始坐标以米计且位于 component local frame。每个实际 occurrence 分别读取，不按文档与配置提前合并，以免丢失 assembly-level feature 的几何差异。同次返回的 body 与 `BodiesInfo` 须等长并按位置绑定，逐 body 封存原生 `body_info_raw`（`0 = user body`、`1 = normal body`）；未知或无效分类保持读取失败，不能静默补值、丢项或切换到 Part 几何。Part 文档的 `IPartDoc.GetBodies2` 保持其独立查询职责。装配 placement 单独保留 `GetTotalTransform(False).ArrayData` 的原始 16 项，离线按 SolidWorks 变换语义转换，不将原始 SW16 当作 canonical 4×4。
 
 `native-triangles/v1` 保留完整 body／face inventory、face span、实例来源 scope、placement 原值和原始 binary64 三角形流。原始流使用 `SWTESS64` 固定头、版本、数量及逐三角九项坐标；文件按实际 payload 摘要登记为 `raw/triangles/{sha}.triangles`。释放 CAD 后生成 `geometry/{sha}.stl`，仅对已经实际读得的相同 payload 按摘要复用文件，各 occurrence 的 placement 和来源绑定独立保留。派生的 STL 法向、binary32 坐标和 scope-local 身份必须携带对象及字段级 warning。
 

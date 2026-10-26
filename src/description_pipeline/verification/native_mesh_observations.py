@@ -35,7 +35,7 @@ _GEOMETRY_KEYS = {
     "used_api",
     "tessellation",
 }
-_USED_API = "IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetTessTriangles(True)"
+_USED_API = "IComponent2.GetBodies3/IBody2.GetFaces/IFace2.GetTessTriangles(True)"
 _STL_TRIANGLE_SIZE = 50
 
 

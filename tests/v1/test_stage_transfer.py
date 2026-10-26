@@ -21,6 +21,7 @@ from description_pipeline.build.archive import write_zip
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import PipelineError, canonical, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
+from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
 from description_pipeline import native_transfer
@@ -59,8 +60,43 @@ def native_tool() -> dict:
     }
 
 
+def upstream_artifacts() -> list[dict]:
+    return [
+        ArtifactRef(
+            artifact_id=f"{stage}-artifact",
+            kind=f"{stage}-output",
+            locator=f"cas://artifact/{stage}-artifact",
+            manifest_sha256=character * 64,
+            set_sha256=character * 64,
+            producer_run_id=RUN_ID,
+            producer_stage=stage,
+            producer_tool_sha256="f" * 64,
+        ).to_record()
+        for stage, character in (("freeze", "a"), ("discover", "b"))
+    ]
+
+
+def execution() -> dict:
+    return {
+        "claim_id": "capture-claim",
+        "command_id": "capture-command",
+        "effect_key": "capture-effect",
+        "executor_sha256": "c" * 64,
+        "fence": 1,
+        "native_tool_sha256": digest(native_tool()),
+        "owner_sha256": "d" * 64,
+        "run_id": RUN_ID,
+    }
+
+
+def _verify_transfer(path: Path, **kwargs) -> dict | None:
+    kwargs.setdefault("expected_upstream_artifacts", upstream_artifacts())
+    kwargs.setdefault("expected_execution", execution())
+    return native_transfer.verify_transfer(path, **kwargs)
+
+
 def stage_view(
-    *, run_id: str = RUN_ID, handoff: str = HANDOFF, scope=("freeze", "discover", "capture"), events=None
+    *, run_id: str = RUN_ID, handoff: str = HANDOFF, scope=("capture",), events=None
 ) -> dict:
     """The real rendered receipt (from synthetic protocol events) carrying its raw events list."""
 
@@ -82,13 +118,7 @@ def _capture_events(
     root: Path,
     *,
     handoff: str,
-    main: str,
-    native_files: dict[str, str],
-    upload: str | None = None,
-    upload_files: dict[str, str] | None = None,
 ) -> list[dict]:
-    upload = upload or handoff
-    upload_files = dict(upload_files or native_files)
     started = datetime(2026, 10, 10, tzinfo=UTC)
 
     def event(offset: int, stage: str, state: str, check=None):
@@ -110,24 +140,11 @@ def _capture_events(
         }
 
     handoff_record = read_data(root / "input/handoff.json")
-    discovery_record = read_data(root / "evidence/discovery.json")
-    discovery_identity = discovery_record.get("identity") or {}
-    native_discovery_path = root / "input/discovery/native-discovery.json"
     input_inventory = {
         name: checksum
         for name, checksum in inventory(root / "input").items()
         if name not in {"handoff.json", "request.json"}
     }
-    binding_files = {
-        f"input/{name}": checksum
-        for name, checksum in input_inventory.items()
-    }
-    prepared_files = dict(input_inventory)
-    capture_plan = root / "evidence/capture-plan.json"
-    if capture_plan.is_file():
-        plan_sha256 = file_digest(capture_plan)
-        binding_files["input/capture-plan.json"] = plan_sha256
-        prepared_files["capture-plan.json"] = plan_sha256
     evidence_inventory = {
         name: checksum
         for name, checksum in inventory(root / "evidence").items()
@@ -139,89 +156,9 @@ def _capture_events(
             "native-runtime.json",
         }
     }
-    main_sha256 = native_files[main]
     return [
         event(
             0,
-            "freeze",
-            "running",
-            check(
-                "input",
-                "handoff.admission",
-                {"handoff_sha256": upload, "package": "fixture"},
-            ),
-        ),
-        event(
-            1,
-            "freeze",
-            "running",
-            check(
-                "output",
-                "handoff.integrity",
-                {
-                    "files": {
-                        f"handoff/{name}": checksum
-                        for name, checksum in upload_files.items()
-                    },
-                    "handoff_sha256": upload,
-                    "main_assembly": main,
-                    "main_assembly_sha256": main_sha256,
-                },
-            ),
-        ),
-        event(2, "freeze", "completed"),
-        event(
-            3,
-            "discover",
-            "running",
-            check(
-                "input",
-                "discovery.inputs",
-                {
-                    "files_sha256": handoff,
-                    "handoff_sha256": handoff,
-                    "main_assembly": main,
-                    "record_roots": [],
-                },
-            ),
-        ),
-        event(
-            4,
-            "discover",
-            "running",
-            check(
-                "output",
-                "discovery.definition",
-                {
-                    "discovery_sha256": file_digest(native_discovery_path),
-                    "findings": discovery_record.get("findings") or [],
-                    "hardware_id": discovery_identity.get("hardware_id"),
-                    "passed": True,
-                    "revision": discovery_identity.get("revision"),
-                },
-            ),
-        ),
-        event(
-            5,
-            "discover",
-            "running",
-            check(
-                "output",
-                "discovery.binding",
-                {
-                    "base": "fixture",
-                    "discovery_sha256": file_digest(native_discovery_path),
-                    "files": binding_files,
-                    "hardware_id": discovery_identity.get("hardware_id"),
-                    "prepared_sha256": digest(prepared_files),
-                    "repository_slug": "example/fixture",
-                    "revision": discovery_identity.get("revision"),
-                },
-            ),
-        ),
-        event(6, "discover", "completed"),
-        event(
-            7,
             "capture",
             "running",
             check(
@@ -241,7 +178,7 @@ def _capture_events(
             ),
         ),
         event(
-            9,
+            1,
             "capture",
             "running",
             check(
@@ -257,7 +194,7 @@ def _capture_events(
             ),
         ),
         event(
-            10,
+            2,
             "capture",
             "running",
             check(
@@ -271,7 +208,7 @@ def _capture_events(
                 },
             ),
         ),
-        event(11, "capture", "completed"),
+        event(3, "capture", "completed"),
     ]
 
 
@@ -468,14 +405,7 @@ def capture_root(
         evidence_class="cad",
     )
     write_json(root / "reports/native-tool.json", tool)
-    events = _capture_events(
-        root,
-        handoff=handoff,
-        upload=upload,
-        upload_files=upload_files,
-        main=main,
-        native_files=native_files,
-    )
+    events = _capture_events(root, handoff=handoff)
     write_json(
         root / "reports/native-stages.json",
         stage_view(run_id=run_id, handoff=handoff, events=events),
@@ -504,6 +434,8 @@ def seal(root: Path, archive: Path, **overrides) -> dict:
         "upload_sha256": HANDOFF,
         "main_assembly": MAIN_ASSEMBLY,
         "native_tool": native_tool(),
+        "upstream_artifacts": upstream_artifacts(),
+        "execution": execution(),
     }
     arguments.update(overrides)
     return transfer.seal_capture(root, archive, **arguments)
@@ -516,6 +448,8 @@ def admit(archive: Path, destination: Path, **overrides) -> dict:
         "expected_upload_sha256": HANDOFF,
         "expected_main_assembly": MAIN_ASSEMBLY,
         "expected_native_tool": native_tool(),
+        "expected_upstream_artifacts": upstream_artifacts(),
+        "expected_execution": execution(),
     }
     arguments.update(overrides)
     return transfer.admit_capture(archive, destination, **arguments)
@@ -590,11 +524,41 @@ class StageTransferTests(unittest.TestCase):
 
     def test_complete_roundtrip_installs_the_closed_capture(self) -> None:
         manifest = seal(self.root, self.archive)
-        self.assertEqual(manifest["schema_version"], native_transfer.TRANSFER_SCHEMA)
+        self.assertEqual(
+            manifest["schema_version"],
+            native_transfer.CAPTURE_TRANSFER_SCHEMA,
+        )
         self.assertEqual(manifest["run_id"], RUN_ID)
         self.assertEqual(manifest["file_count"], len(manifest["files"]))
-        self.assertEqual(manifest["native_stage_scope"], list(native_transfer.NATIVE_STAGE_SCOPE))
+        self.assertEqual(manifest["upstream_artifacts"], upstream_artifacts())
+        self.assertEqual(manifest["execution"], execution())
+        self.assertNotIn("native_stage_scope", manifest)
         self.assertEqual(manifest["main_assembly_sha256"], manifest["files"]["input/cad/" + MAIN_ASSEMBLY])
+
+    def test_transfer_requires_exact_upstream_and_execution_bindings(self) -> None:
+        seal(self.root, self.archive)
+        destination = self.base / "bound"
+        admit(self.archive, destination)
+
+        wrong_upstream = copy.deepcopy(upstream_artifacts())
+        wrong_upstream[0]["producer_run_id"] = (
+            "20261010-0000-4000-8000-000000000099"
+        )
+        with self.assertRaisesRegex(PipelineError, "different upstream"):
+            native_transfer.verify_transfer(
+                destination,
+                expected_upstream_artifacts=wrong_upstream,
+                expected_execution=execution(),
+            )
+
+        wrong_execution = execution()
+        wrong_execution["owner_sha256"] = "e" * 64
+        with self.assertRaisesRegex(PipelineError, "another execution"):
+            native_transfer.verify_transfer(
+                destination,
+                expected_upstream_artifacts=upstream_artifacts(),
+                expected_execution=wrong_execution,
+            )
 
     def test_archive_and_in_memory_receipts_use_the_same_manifest_verifier(self) -> None:
         seal(self.root, self.archive)
@@ -603,7 +567,7 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(verify.call_count, 1)
         for label, mutation in (
             ("unknown", lambda manifest: {**manifest, "unexpected_field": True}),
-            ("scope", lambda manifest: {**manifest, "native_stage_scope": ["capture"]}),
+            ("execution", lambda manifest: {**manifest, "execution": None}),
         ):
             with self.subTest(case=label):
                 broken = self.base / f"manifest-{label}.zip"
@@ -661,7 +625,7 @@ class StageTransferTests(unittest.TestCase):
 
         destination = self.base / "separate-upload-admitted"
         admit(archive, destination, expected_upload_sha256=upload_sha256)
-        summary = native_transfer.verify_transfer(
+        summary = _verify_transfer(
             destination,
             expected_upload_sha256=upload_sha256,
         )
@@ -672,24 +636,30 @@ class StageTransferTests(unittest.TestCase):
         manifest = seal(self.root, self.archive)
         destination = self.base / "admitted"
         admit(self.archive, destination)
-        summary = native_transfer.verify_transfer(destination)
+        summary = _verify_transfer(destination)
         self.assertEqual(summary["files"], manifest["file_count"])
 
         # The admitted capture stays strict when the sealed report bytes change ...
         (destination / "reports/structural-team.md").write_text("# regenerated\n", encoding="utf-8")
         (destination / "reports/structural-team.json").write_text('{"findings": []}\n', encoding="utf-8")
         with self.assertRaisesRegex(PipelineError, "differs from the transfer manifest"):
-            native_transfer.verify_transfer(destination)
+            _verify_transfer(destination)
         # ... while a delivery may carry its own regenerated copy ...
-        summary = native_transfer.verify_transfer(destination, regenerated=native_transfer.TEAM_REPORTS)
+        summary = _verify_transfer(
+            destination,
+            regenerated=native_transfer.TEAM_REPORTS,
+        )
         self.assertEqual(summary["files"], manifest["file_count"])
         # ... or none at all before the report is stamped.
         (destination / "reports/structural-team.md").unlink()
         (destination / "reports/structural-team.json").unlink()
-        summary = native_transfer.verify_transfer(destination, regenerated=native_transfer.TEAM_REPORTS)
+        summary = _verify_transfer(
+            destination,
+            regenerated=native_transfer.TEAM_REPORTS,
+        )
         self.assertEqual(summary["files"], manifest["file_count"])
         with self.assertRaises(PipelineError):
-            native_transfer.verify_transfer(destination)
+            _verify_transfer(destination)
 
     def test_sealing_is_deterministic(self) -> None:
         first = self.base / "first.zip"
@@ -917,8 +887,8 @@ class StageTransferTests(unittest.TestCase):
         portable = {**native_tool(), "runtime": {"role": "portable"}}
         cases.append(("portable-tool", portable, "reports/native-tool.json", "runtime.role", portable))
 
-        wide_scope = stage_view(scope=("freeze", "discover", "capture", "generate"))
-        cases.append(("wide-scope", wide_scope, "reports/native-stages.json", "native execution scope"))
+        wide_scope = stage_view(scope=("capture", "generate"))
+        cases.append(("wide-scope", wide_scope, "reports/native-stages.json", "capture execution scope"))
 
         failed_check = stage_view()
         failed_check["stages"][2]["output_qc"][0]["state"] = "failed"
@@ -971,12 +941,7 @@ class StageTransferTests(unittest.TestCase):
         report = json.loads((self.root / "input/handoff.json").read_text(encoding="utf-8"))
         report["package_files"]["big.bin"] = hashlib.sha256(payload).hexdigest()
         write_json(self.root / "input/handoff.json", report)
-        events = _capture_events(
-            self.root,
-            handoff=HANDOFF,
-            main=MAIN_ASSEMBLY,
-            native_files={MAIN_ASSEMBLY: file_digest(self.root / "input/cad" / MAIN_ASSEMBLY)},
-        )
+        events = _capture_events(self.root, handoff=HANDOFF)
         write_json(
             self.root / "reports/native-stages.json",
             stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
@@ -1248,12 +1213,7 @@ class StageTransferTests(unittest.TestCase):
             handoff_record["package_files"] = dict(sorted(package_files.items()))
             write_json(capture / "input/handoff.json", handoff_record)
             write_json(capture / "reports/native-tool.json", native_identity)
-            events = _capture_events(
-                capture,
-                handoff=handoff_sha256,
-                main=assembly.name,
-                native_files=native_files,
-            )
+            events = _capture_events(capture, handoff=handoff_sha256)
             write_json(
                 capture / "reports/native-stages.json",
                 stage_view(run_id=RUN_ID, handoff=handoff_sha256, events=events),
@@ -1296,7 +1256,10 @@ class StageTransferTests(unittest.TestCase):
 
         write_json(bundle / "reports/native-tool.json", native_tool())
         write_json(bundle / "reports/native-stages.json", stage_view())
-        write_json(bundle / transfer.CAPTURE_MANIFEST, {"schema_version": native_transfer.TRANSFER_SCHEMA})
+        write_json(
+            bundle / transfer.CAPTURE_MANIFEST,
+            {"schema_version": native_transfer.CAPTURE_TRANSFER_SCHEMA},
+        )
         for name in ("reports/native-tool.json", "reports/native-stages.json", transfer.CAPTURE_MANIFEST):
             self.assertNotIn(name, subject)
         self.assertEqual(subject_inventory(bundle), subject)  # receipts never bind into the subject
@@ -1326,26 +1289,26 @@ class StageTransferTests(unittest.TestCase):
             manifest_path.write_bytes(canonical(manifest))
 
         clean = bundle("gate-clean")
-        self.assertEqual(native_transfer.verify_transfer(clean)["main_assembly"], MAIN_ASSEMBLY)
+        self.assertEqual(_verify_transfer(clean)["main_assembly"], MAIN_ASSEMBLY)
 
         neutral = self.base / "gate-neutral"
         (neutral / "input").mkdir(parents=True)
         (neutral / "evidence").mkdir()
         write_json(neutral / "reports/tool.json", {"role": "portable"})
-        self.assertIsNone(native_transfer.verify_transfer(neutral))
+        self.assertIsNone(_verify_transfer(neutral))
 
         staged = bundle("gate-stages")
         view = stage_view()
         next(stage for stage in view["stages"] if stage["id"] == "capture")["checks_passed"] = 0
         reseal(staged, {"reports/native-stages.json": canonical(view)})
         with self.assertRaisesRegex(PipelineError, "receipts are incomplete"):
-            native_transfer.verify_transfer(staged)
+            _verify_transfer(staged)
 
         retooled = bundle("gate-tool")
         bumped = {**native_tool(), "version": "9.9.9"}
         reseal(retooled, {"reports/native-tool.json": canonical(bumped)})
         with self.assertRaisesRegex(PipelineError, "another release"):
-            native_transfer.verify_transfer(retooled)
+            _verify_transfer(retooled)
 
         remade = bundle("gate-main")
         replacement = b"OTHER-BYTES"
@@ -1359,12 +1322,12 @@ class StageTransferTests(unittest.TestCase):
             },
         )
         with self.assertRaisesRegex(PipelineError, "Native discovery inventory"):
-            native_transfer.verify_transfer(remade)
+            _verify_transfer(remade)
 
         removed = bundle("gate-removed")
         (removed / "reports/native-stages.json").unlink()
         with self.assertRaises(PipelineError):
-            native_transfer.verify_transfer(removed)
+            _verify_transfer(removed)
 
     def test_immutable_receipts_cannot_hide_corrupt_disk_copies(self) -> None:
         seal(self.root, self.archive)
@@ -1382,12 +1345,15 @@ class StageTransferTests(unittest.TestCase):
             ).read_bytes(),
         }
         self.assertEqual(
-            native_transfer.verify_transfer(destination, native_receipts=receipts)["main_assembly"],
+            _verify_transfer(
+                destination,
+                native_receipts=receipts,
+            )["main_assembly"],
             MAIN_ASSEMBLY,
         )
         (destination / "reports/native-tool.json").write_bytes(b'{"forged":true}\n')
         with self.assertRaisesRegex(PipelineError, "disk receipt differs"):
-            native_transfer.verify_transfer(destination, native_receipts=receipts)
+            _verify_transfer(destination, native_receipts=receipts)
 
     def test_immutable_receipts_always_verify_the_complete_total_bytes(self) -> None:
         seal(self.root, self.archive)
@@ -1409,7 +1375,7 @@ class StageTransferTests(unittest.TestCase):
         for name in native_transfer.TEAM_REPORTS:
             (destination / name).unlink()
         with self.assertRaisesRegex(PipelineError, "size differs"):
-            native_transfer.verify_transfer(
+            _verify_transfer(
                 destination,
                 regenerated=native_transfer.TEAM_REPORTS,
                 native_receipts=receipts,
@@ -1455,12 +1421,7 @@ class StageTransferTests(unittest.TestCase):
         evidence_manifest = read_data(record_bound / "evidence/manifest.json")
         evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
         write_json(record_bound / "evidence/manifest.json", evidence_manifest)
-        events = _capture_events(
-            record_bound,
-            handoff=HANDOFF,
-            main=MAIN_ASSEMBLY,
-            native_files=NATIVE_FILES,
-        )
+        events = _capture_events(record_bound, handoff=HANDOFF)
         write_json(
             record_bound / "reports/native-stages.json",
             stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
@@ -1510,12 +1471,7 @@ class StageTransferTests(unittest.TestCase):
             evidence_manifest = read_data(root / "evidence/manifest.json")
             evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
             write_json(root / "evidence/manifest.json", evidence_manifest)
-            events = _capture_events(
-                root,
-                handoff=HANDOFF,
-                main=MAIN_ASSEMBLY,
-                native_files=NATIVE_FILES,
-            )
+            events = _capture_events(root, handoff=HANDOFF)
             write_json(
                 root / "reports/native-stages.json",
                 stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
@@ -1538,12 +1494,7 @@ class StageTransferTests(unittest.TestCase):
             evidence_manifest = read_data(root / "evidence/manifest.json")
             evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
             write_json(root / "evidence/manifest.json", evidence_manifest)
-            events = _capture_events(
-                root,
-                handoff=HANDOFF,
-                main=MAIN_ASSEMBLY,
-                native_files=NATIVE_FILES,
-            )
+            events = _capture_events(root, handoff=HANDOFF)
             write_json(
                 root / "reports/native-stages.json",
                 stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
@@ -1597,18 +1548,20 @@ class StageTransferTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "input.valid"):
             seal(root, self.base / "input-details.zip")
 
-    def test_all_native_stage_check_details_are_bound(self) -> None:
+    def test_capture_stage_check_details_are_bound(self) -> None:
         mutations = (
             (
-                "handoff.admission",
-                lambda details: details.update(handoff_sha256="0" * 64),
+                "input.valid",
+                lambda details: details["files"].update(
+                    {f"input/cad/{MAIN_ASSEMBLY}": "0" * 64}
+                ),
             ),
             (
-                "discovery.definition",
-                lambda details: details.update(discovery_sha256="0" * 64),
+                "capture.integrity",
+                lambda details: details.update(manifest_sha256="0" * 64),
             ),
             (
-                "discovery.binding",
+                "capture.input_stability",
                 lambda details: details["files"].update(
                     {"input/forged.SLDPRT": "0" * 64}
                 ),
@@ -1631,44 +1584,10 @@ class StageTransferTests(unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     seal(root, self.base / f"details-{label.replace('.', '-')}.zip")
 
-    def test_discovery_binding_is_a_complete_prepared_to_archived_mapping(self) -> None:
-        relative = f"input/cad/{MAIN_ASSEMBLY}"
-        for label in ("omitted", "foreign-path"):
-            with self.subTest(case=label):
-                root = capture_root(self.base / f"binding-{label}")
-                view = read_data(root / "reports/native-stages.json")
-                event = next(
-                    event
-                    for event in view["events"]
-                    if (event.get("check") or {}).get("id") == "discovery.binding"
-                )
-                files = dict(event["check"]["details"]["files"])
-                checksum = files.pop(relative)
-                if label == "foreign-path":
-                    files[f"input/foreign/{MAIN_ASSEMBLY}"] = checksum
-                event["check"]["details"]["files"] = files
-                event["check"]["details"]["prepared_sha256"] = digest(
-                    {
-                        name.removeprefix("input/"): value
-                        for name, value in files.items()
-                    }
-                )
-                write_json(
-                    root / "reports/native-stages.json",
-                    stage_view(run_id=RUN_ID, handoff=HANDOFF, events=view["events"]),
-                )
-                with self.assertRaises(PipelineError):
-                    seal(root, self.base / f"binding-{label}.zip")
-
     def test_unknown_discovery_input_is_not_a_derived_file(self) -> None:
         root = capture_root(self.base / "unknown-discovery-input")
         write_json(root / "input/discovery/evil.txt", {"forged": True})
-        events = _capture_events(
-            root,
-            handoff=HANDOFF,
-            main=MAIN_ASSEMBLY,
-            native_files=NATIVE_FILES,
-        )
+        events = _capture_events(root, handoff=HANDOFF)
         write_json(
             root / "reports/native-stages.json",
             stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
@@ -1714,20 +1633,16 @@ class StageTransferTests(unittest.TestCase):
         started = datetime(2026, 10, 10, tzinfo=UTC)
 
         root = capture_root(self.base / "stage-order")
-        events = copy.deepcopy(read_data(root / "reports/native-stages.json")["events"])
-        reordered = [
-            event
-            for stage in ("capture", "freeze", "discover")
-            for event in events
-            if event["stage"] == stage
-        ]
-        for index, event in enumerate(reordered):
-            event["at"] = (started + timedelta(microseconds=index)).isoformat()
-        write_json(
-            root / "reports/native-stages.json",
-            stage_view(run_id=RUN_ID, handoff=HANDOFF, events=reordered),
+        foreign_view = stage_view()
+        foreign_view["events"].append(
+            {
+                "at": (started + timedelta(seconds=1)).isoformat(),
+                "stage": "freeze",
+                "state": "completed",
+            }
         )
-        with self.assertRaisesRegex(PipelineError, "reordered, missing or interleaved"):
+        write_json(root / "reports/native-stages.json", foreign_view)
+        with self.assertRaisesRegex(PipelineError, "out-of-scope stage"):
             seal(root, self.base / "stage-order.zip")
 
         root = capture_root(self.base / "stage-time")
@@ -1795,12 +1710,7 @@ class StageTransferTests(unittest.TestCase):
         evidence_manifest["files"]["evidence/collection.json"] = file_digest(collection_path)
         evidence_manifest["files"]["capture.json"] = file_digest(root / "evidence/capture.json")
         write_json(root / "evidence/manifest.json", evidence_manifest)
-        events = _capture_events(
-            root,
-            handoff=HANDOFF,
-            main=MAIN_ASSEMBLY,
-            native_files=NATIVE_FILES,
-        )
+        events = _capture_events(root, handoff=HANDOFF)
         write_json(
             root / "reports/native-stages.json",
             stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
@@ -1838,11 +1748,11 @@ class StageTransferTests(unittest.TestCase):
             *foreign["events"],
             {"at": "2026-10-10T00:00:00+00:00", "stage": "generate", "state": "completed"},
         ]
-        cases["foreign-stage"] = (foreign, "first three stages")
+        cases["foreign-stage"] = (foreign, "out-of-scope stage")
 
         missing_stage = stage_view()
         missing_stage["events"] = [event for event in missing_stage["events"] if event.get("stage") != "capture"]
-        cases["incomplete-events"] = (missing_stage, "reordered, missing or interleaved")
+        cases["incomplete-events"] = (missing_stage, "carry the raw protocol events")
 
         malformed = stage_view()
         malformed["events"] = [
@@ -1869,7 +1779,7 @@ class StageTransferTests(unittest.TestCase):
         receipt["events"] = [event for event in receipt["events"] if isinstance(event.get("check"), dict)][:1]
         root = capture_root(self.base / "fabricated")
         write_json(root / "reports/native-stages.json", receipt)
-        with self.assertRaisesRegex(PipelineError, "reordered, missing or interleaved"):
+        with self.assertRaisesRegex(PipelineError, "exactly one completed"):
             seal(root, self.base / "fabricated.zip")
 
     def test_windows_evidence_paths_transport_onto_linux(self) -> None:
@@ -1912,12 +1822,7 @@ class StageTransferTests(unittest.TestCase):
         manifest["files"]["raw/material_provenance.json"] = file_digest(material_path)
         manifest["files"]["capture.json"] = file_digest(evidence / "capture.json")
         manifest_path.write_bytes(canonical(manifest))
-        events = _capture_events(
-            root,
-            handoff=HANDOFF,
-            main=MAIN_ASSEMBLY,
-            native_files=NATIVE_FILES,
-        )
+        events = _capture_events(root, handoff=HANDOFF)
         write_json(
             root / "reports/native-stages.json",
             stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
@@ -1927,7 +1832,10 @@ class StageTransferTests(unittest.TestCase):
         seal(root, archive)
         destination = self.base / "winpath-out"
         admit(archive, destination)
-        self.assertEqual(native_transfer.verify_transfer(destination)["main_assembly"], MAIN_ASSEMBLY)
+        self.assertEqual(
+            _verify_transfer(destination)["main_assembly"],
+            MAIN_ASSEMBLY,
+        )
 
     def test_git_attributes_protect_the_delivered_bytes(self) -> None:
         from description_pipeline.repository.publish import GIT_ATTRIBUTES

@@ -107,6 +107,7 @@ RETURN_VIEWS = {
 # Members whose declared return is an array of one published interface.
 RETURN_ARRAY_VIEWS = {
     "GetBodies2": IBODY2_IID,
+    "GetBodies3": IBODY2_IID,
     "GetFaces": IFACE2_IID,
 }
 
@@ -176,10 +177,10 @@ def _configuration(value):
 
 def _active_configuration_view(doc):
     """Bound manager/configuration views; both stay alive in the caller's frame."""
-    manager = _configurationmanager(_member(doc, "ConfigurationManager"))
+    manager = _configurationmanager(_property(doc, "ConfigurationManager"))
     if manager is None:
         return None, None
-    return manager, _configuration(_member(manager, "ActiveConfiguration"))
+    return manager, _configuration(_property(manager, "ActiveConfiguration"))
 
 
 def _configuration_context(doc):
@@ -193,7 +194,7 @@ def _configuration_context(doc):
     manager, configuration = _active_configuration_view(doc)
     if configuration is None:
         raise CadError("cad_configuration_missing", "the document has no active configuration")
-    return manager, configuration, str(_member(configuration, "Name"))
+    return manager, configuration, str(_property(configuration, "Name"))
 
 
 def _return_view(name, value):
@@ -210,7 +211,7 @@ def _return_view(name, value):
 
 def _part_bodies(doc, body_type=0):
     """Part bodies through the published IPartDoc interface (memid 132)."""
-    return _as_list(_member(_partdoc(doc), "GetBodies2", body_type, False) or ())
+    return _as_list(_method(_partdoc(doc), "GetBodies2", body_type, False) or ())
 
 
 def _part_material(doc, query):
@@ -231,6 +232,7 @@ COMPONENT_LIGHTWEIGHT = 1
 COMPONENT_FULLY_LIGHTWEIGHT = 4
 COMPONENT_INTERNAL_ID_MISMATCH = 5
 _COMPONENT_STATES = (0, 1, 2, 3, 4)
+_COMPONENT_BODY_INFO_VALUES = (0, 1)
 
 
 def _component_state(component):
@@ -302,26 +304,18 @@ def _hint_method(obj, name):
             hints.add(name)
 
 
-def _member(obj, name, *args):
-    # Flag methods BEFORE getattr: late binding may otherwise invoke them as
-    # zero-argument properties, even crashing an incorrectly invoked CAD API.
-    if args:
-        _hint_method(obj, name)
+def _property(obj, name):
+    """Read one property without routing it through method dispatch."""
+
     try:
         value = getattr(obj, name)
     except AttributeError as error:  # stable error code instead of leaking a raw AttributeError
         raise CadError("cad_member_missing", name) from error
     if hasattr(value, "_oleobj_"):
-        if args:
-            raise CadError("cad_member_not_callable", name)
         bound = _return_view(name, value)
         return bound if bound is not None else _dynamic(value)
     if callable(value):
-        result = value(*args)
-        bound = _return_view(name, result)
-        return bound if bound is not None else _dynamic(result)
-    if args:
-        raise CadError("cad_member_not_callable", name)
+        raise CadError("cad_member_not_property", name)
     # Late-bound property results can be arrays without being callable; bind
     # mapped arrays here too instead of skipping them.
     bound = _return_view(name, value)
@@ -342,15 +336,15 @@ def _is_text_name(value):
 
 def _read_only_document(doc):
     # OpenDoc6's read-only option does not propagate to loaded references.
-    state = _member(doc, "IsOpenedReadOnly")
+    state = _method(doc, "IsOpenedReadOnly")
     if state is False:
-        _member(doc, "SetReadOnlyState", True)
-        state = _member(doc, "IsOpenedReadOnly")
+        _method(doc, "SetReadOnlyState", True)
+        state = _method(doc, "IsOpenedReadOnly")
     if state is not True:
         raise CadError(
             "cad_read_only_failed",
             "The capture document is not verifiably read-only",
-            {"path": _member(doc, "GetPathName"), "read_only": _raw_scalar(state)},
+            {"path": _method(doc, "GetPathName"), "read_only": _raw_scalar(state)},
         )
     return doc
 
@@ -361,9 +355,7 @@ def _method(obj, name, *args):
     Late binding needs the method hint before ``getattr``.  Without it win32com
     dispatches a zero-argument method as a property get, and SolidWorks answers
     ``DISP_E_PARAMNOTOPTIONAL`` (-2147352561) instead of returning the object.
-    ``_member`` only flags names it is given arguments for, so every parameterless
-    call that must reach a method (``GetProcessID`` and reference queries) goes
-    through here.
+    Property reads go through ``_property``.
     """
 
     _hint_method(obj, name)
@@ -380,11 +372,37 @@ def _method(obj, name, *args):
     raise CadError("cad_member_not_callable", name)
 
 
+def _indexed_property(obj, name, *args):
+    """Read one parameterized COM property without pywin32's getter alias."""
+
+    import pythoncom
+
+    ole = getattr(obj, "_oleobj_", None)
+    if ole is None:
+        raise CadError("cad_member_not_com_dispatch", name)
+    try:
+        dispid = ole.GetIDsOfNames(name)
+        raw = ole.Invoke(
+            dispid,
+            0,
+            pythoncom.DISPATCH_PROPERTYGET,
+            1,
+            *args,
+        )
+    except AttributeError as error:
+        raise CadError("cad_member_missing", name) from error
+    if raw is None:
+        return None
+    result = _win32().Dispatch(raw)
+    bound = _return_view(name, result)
+    return bound if bound is not None else result
+
+
 def _active_configuration(doc):
     """Name of the configuration a document currently has active."""
 
     _manager, active = _active_configuration_view(doc)
-    name = _member(active, "Name") if active is not None else None
+    name = _property(active, "Name") if active is not None else None
     return name if _is_text_name(name) else None
 
 
@@ -395,7 +413,7 @@ def _capture_document_identity(doc, path, phase, state=None):
     if state is not None:
         detail["state"] = state
     try:
-        document = str(_member(doc, "GetPathName") or "")
+        document = str(_method(doc, "GetPathName") or "")
     except Exception as error:  # noqa: BLE001 - raw COM failures need stable evidence
         detail["error"] = f"{type(error).__name__}: {error}"[:300]
         if state is None:
@@ -440,8 +458,8 @@ def _discovery_document_state(doc):
     state = {}
     for name, reader, expected in (
         ("save_flag", lambda: _method(doc, "GetSaveFlag"), bool),
-        ("needs_rebuild2_value", lambda: _member(_member(doc, "Extension"), "NeedsRebuild2"), int),
-        ("read_only", lambda: _member(doc, "IsOpenedReadOnly"), bool),
+        ("needs_rebuild2_value", lambda: _property(_property(doc, "Extension"), "NeedsRebuild2"), int),
+        ("read_only", lambda: _method(doc, "IsOpenedReadOnly"), bool),
     ):
         try:
             value = reader()
@@ -463,7 +481,7 @@ def _discovery_document_state(doc):
         state["configuration_needs_rebuild_error"] = f"{type(error).__name__}: {error}"[:300]
     else:
         try:
-            configuration = _member(active, "Name")
+            configuration = _property(active, "Name")
         except Exception as error:  # noqa: BLE001
             state["configuration"] = None
             state["configuration_error"] = f"{type(error).__name__}: {error}"[:300]
@@ -474,7 +492,7 @@ def _discovery_document_state(doc):
                     f"unexpected native value {configuration!r} with type {type(configuration).__name__}"
                 )
         try:
-            value = _member(active, "NeedsRebuild")
+            value = _property(active, "NeedsRebuild")
         except Exception as error:  # noqa: BLE001
             state["configuration_needs_rebuild"] = None
             state["configuration_needs_rebuild_error"] = f"{type(error).__name__}: {error}"[:300]
@@ -678,7 +696,7 @@ def read_search_folders(app, folder_type=SEARCH_FOLDER_DOCUMENT_TYPE):
     """The session search folders as SolidWorks reports them, with the raw value."""
 
     try:
-        raw = _member(app, "GetSearchFolders", folder_type)
+        raw = _method(app, "GetSearchFolders", folder_type)
     except Exception as error:  # noqa: BLE001 - an unreadable configuration is a refusal
         raise CadError(
             "cad_search_folders_unreadable",
@@ -699,7 +717,7 @@ def pin_search_folders(app, root, folder_type=SEARCH_FOLDER_DOCUMENT_TYPE):
 
     before = read_search_folders(app, folder_type)
     try:
-        written = _member(app, "SetSearchFolders", folder_type, str(root))
+        written = _method(app, "SetSearchFolders", folder_type, str(root))
     except Exception as error:  # noqa: BLE001 - fail closed instead of resolving by chance
         raise CadError(
             "cad_search_folders_unwritable",
@@ -762,7 +780,7 @@ def _matches_assembly_root(reference, root, reference_full, reference_name, asse
         return False
     try:
         root_full = str(_method(root, "GetPathName") or "")
-        root_name = str(_member(root, "Name2") or "")
+        root_name = str(_property(root, "Name2") or "")
     except Exception:  # noqa: BLE001 - an unreadable root object cannot prove identity
         return False
     reference_key = normalize_document_path(reference_full)
@@ -773,7 +791,7 @@ def _matches_assembly_root(reference, root, reference_full, reference_name, asse
     if not root_name or reference_name != root_name:
         return False
     try:
-        flag = _member(reference, "IsRoot")
+        flag = _method(reference, "IsRoot")
     except Exception:  # noqa: BLE001 - an unreadable IsRoot is no proof
         return False
     return type(flag) is bool and flag is True
@@ -897,7 +915,7 @@ def _appearance_value(owner, name: str, *, method: bool = False, args=()):
     """Read one auxiliary native value without converting an error into null."""
 
     try:
-        value = _method(owner, name, *args) if method else _member(owner, name)
+        value = _method(owner, name, *args) if method else _property(owner, name)
     except Exception as error:  # noqa: BLE001 - caller records the field failure
         return None, _native_error_record(error)
     return _json_raw_value(value), None
@@ -934,7 +952,7 @@ def _appearance_persistent_reference(extension, entity):
             "detail": {},
         }
     try:
-        raw = _member(extension, "GetPersistReference3", entity)
+        raw = _method(extension, "GetPersistReference3", entity)
     except Exception as error:  # noqa: BLE001 - identity failure is field-local
         return None, _native_error_record(error)
     if raw is None:
@@ -1165,7 +1183,7 @@ def _appearance_active_configuration(document):
         _manager, active = _active_configuration_view(document)
         if active is None:
             raise ValueError("the document has no active configuration")
-        value = _json_raw_value(_member(active, "Name"))
+        value = _json_raw_value(_property(active, "Name"))
     except Exception as error:  # noqa: BLE001 - identity remains field-local
         return None, _native_error_record(error)
     if not _is_text_name(value):
@@ -1367,7 +1385,7 @@ def _appearance_render_material(material, index: int, extension):
 
 def _appearance_display_state(holder):
     try:
-        raw = _member(holder, "ReferencedDisplayState2")
+        raw = _property(holder, "ReferencedDisplayState2")
     except Exception as error:  # noqa: BLE001 - retain a field-local read failure
         return None, _native_error_record(error)
     value = _json_raw_value(raw)
@@ -1385,7 +1403,7 @@ def _appearance_document_display_state(document):
         _manager, active = _active_configuration_view(document)
         if active is None:
             raise ValueError("the owner document has no active configuration")
-        configuration = str(_member(active, "Name"))
+        configuration = str(_property(active, "Name"))
     except Exception as error:  # noqa: BLE001 - active owner failure
         return None, None, _native_error_record(error), None, "error"
     try:
@@ -1472,7 +1490,7 @@ def _state_render_materials_raw(
     try:
         import pythoncom
 
-        extension = _member(document, "Extension")
+        extension = _property(document, "Extension")
         display_state_names = _win32().VARIANT(
             pythoncom.VT_ARRAY | pythoncom.VT_BSTR,
             (display_state,),
@@ -1501,7 +1519,7 @@ def _state_render_materials_raw(
             record["read_errors"]["native_render_material_count"] = copy.deepcopy(
                 count_error
             )
-        raw_materials = _member(
+        raw_materials = _method(
             extension,
             "GetRenderMaterials2",
             3,
@@ -1536,7 +1554,7 @@ def _appearance_texture_raw(owner, configuration, read_errors):
     """Read one documented texture pointer without making it a primary gate."""
 
     try:
-        texture = _member(owner, "GetTexture", configuration)
+        texture = _method(owner, "GetTexture", configuration)
     except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
         read_errors["texture"] = _native_error_record(error)
         return {
@@ -1551,7 +1569,7 @@ def _appearance_texture_raw(owner, configuration, read_errors):
             "material_name": None,
         }
     try:
-        raw_name = _member(texture, "MaterialName")
+        raw_name = _property(texture, "MaterialName")
     except Exception as error:  # noqa: BLE001 - preserve the applied texture
         read_errors["texture.material_name"] = _native_error_record(error)
         return {
@@ -1585,6 +1603,7 @@ def _appearance_raw(
     *,
     configuration,
     material_member: str,
+    material_method: bool,
     material_args=(),
     material_context: dict,
     used_api: str,
@@ -1609,7 +1628,9 @@ def _appearance_raw(
     material_read_failed = False
     try:
         material_values = _json_raw_value(
-            _member(owner, material_member, *material_args)
+            _method(owner, material_member, *material_args)
+            if material_method
+            else _property(owner, material_member)
         )
     except Exception as error:  # noqa: BLE001 - appearance is auxiliary evidence
         material_read_failed = True
@@ -1699,7 +1720,7 @@ def _optional_mass_scalar(mass_property, member, read_errors):
         "Density": "density_kg_m3",
     }.get(member, member)
     try:
-        return _json_raw_value(_member(mass_property, member))
+        return _json_raw_value(_property(mass_property, member))
     except Exception as error:  # noqa: BLE001 - auxiliary getter cannot hide primary mass
         read_errors[key] = _native_error_record(error)
         return None
@@ -1713,7 +1734,11 @@ def _read_mass_primary(mass_property, read_errors):
         ("inertia_values", "GetMomentOfInertia", (0,)),
     ):
         try:
-            value = _member(mass_property, member, *args)
+            value = (
+                _method(mass_property, member, *args)
+                if args
+                else _property(mass_property, member)
+            )
         except Exception as error:  # noqa: BLE001 - each primary getter stands alone
             read_errors[key] = _native_error_record(error)
         else:
@@ -1744,7 +1769,7 @@ def _read_material(obj, method, configuration):
     import pythoncom
 
     database = _win32().VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
-    name = _member(obj, method, configuration, database)
+    name = _method(obj, method, configuration, database)
     if not isinstance(name, str) or not isinstance(database.value, str):
         raise TypeError("Unexpected material name/database result")
     return {"name": name.strip(), "database": database.value.strip()}
@@ -1763,8 +1788,8 @@ def _material_assignments_document(doc, bodies):
     """
     try:
         _manager, active = _active_configuration_view(doc)
-        configuration = str(_member(active, "Name"))
-        configurations = list(_member(doc, "GetConfigurationNames") or ())
+        configuration = str(_property(active, "Name"))
+        configurations = list(_method(doc, "GetConfigurationNames") or ())
         if not configuration or configuration not in configurations:
             raise ValueError("Active configuration is not in the document")
         # The API documents an empty argument for a sole Default configuration.
@@ -1777,7 +1802,7 @@ def _material_assignments_document(doc, bodies):
             rows.append(
                 {
                     "index": index,
-                    "name": str(_member(body, "Name")),
+                    "name": str(_property(body, "Name")),
                     "material": material,
                     "effective_source": "body" if material["name"] else "part",
                 }
@@ -1909,8 +1934,12 @@ def _merge_property_scopes(document: dict, configuration: dict) -> dict:
 def _read_property_scope(doc, scope: str) -> dict:
     detail = {"configuration": scope}
     try:
-        detail["document"] = _member(doc, "GetPathName")
-        manager = _member(_member(doc, "Extension"), "CustomPropertyManager", scope)
+        detail["document"] = _method(doc, "GetPathName")
+        manager = _indexed_property(
+            _property(doc, "Extension"),
+            "CustomPropertyManager",
+            scope,
+        )
         if manager is None:
             raise ValueError("the custom property manager is unavailable")
         names = _as_list(_method(manager, "GetNames"))
@@ -1963,13 +1992,13 @@ def _plane_or_cylinder(target):
     """Recorded surface geometry of one mate entity, in its component frame."""
 
     try:
-        surface = _dynamic(_member(target, "GetSurface"))
+        surface = _dynamic(_method(target, "GetSurface"))
     except Exception:  # noqa: BLE001
         surface = None
     if surface is not None:
         try:
-            if _member(surface, "IsCylinder"):
-                params = [float(value) for value in (_as_list(_member(surface, "CylinderParams")) or [])]
+            if _method(surface, "IsCylinder"):
+                params = [float(value) for value in (_as_list(_property(surface, "CylinderParams")) or [])]
                 if len(params) == 7:
                     if not all(math.isfinite(value) for value in params):
                         raise CadError(
@@ -1993,8 +2022,8 @@ def _plane_or_cylinder(target):
         except Exception:  # noqa: BLE001
             pass
         try:
-            if _member(surface, "IsPlane"):
-                params = [float(value) for value in (_as_list(_member(surface, "PlaneParams")) or [])]
+            if _method(surface, "IsPlane"):
+                params = [float(value) for value in (_as_list(_property(surface, "PlaneParams")) or [])]
                 if len(params) == 6:
                     if not all(math.isfinite(value) for value in params):
                         raise CadError(
@@ -2014,9 +2043,9 @@ def _plane_or_cylinder(target):
         except Exception:  # noqa: BLE001
             pass
     try:
-        curve = _dynamic(_member(target, "GetCurve"))
-        if curve is not None and _member(curve, "IsCircle"):
-            values = [float(value) for value in (_as_list(_member(curve, "CircleParams")) or [])]
+        curve = _dynamic(_method(target, "GetCurve"))
+        if curve is not None and _method(curve, "IsCircle"):
+            values = [float(value) for value in (_as_list(_property(curve, "CircleParams")) or [])]
             if len(values) == 7:
                 normal = values[3:6]
                 center = values[0:3]
@@ -2052,8 +2081,8 @@ def _plane_or_cylinder(target):
 
 def _feature_name(target):
     try:
-        feature = _dynamic(_member(target, "GetFeature"))
-        name = _member(feature, "Name")
+        feature = _dynamic(_method(target, "GetFeature"))
+        name = _property(feature, "Name")
         return str(name) if _is_text_name(name) else None
     except Exception:  # noqa: BLE001
         return None
@@ -2159,17 +2188,17 @@ def _mate_entity_reference(entity):
         "error": None,
     }
     try:
-        reference_type = _member(entity, "ReferenceType")
+        reference_type = _property(entity, "ReferenceType")
     except Exception as error:  # noqa: BLE001 - provenance must not abort the entity read
         reference_type = None
         record["error"] = f"{type(error).__name__}: {error}"
     try:
-        reference_type2 = _member(entity, "ReferenceType2")
+        reference_type2 = _property(entity, "ReferenceType2")
     except Exception as error:  # noqa: BLE001 - provenance-only reading
         reference_type2 = None
         record["reference_type2_error"] = f"{type(error).__name__}: {error}"
     try:
-        raw_params = _member(entity, "EntityParams")
+        raw_params = _property(entity, "EntityParams")
     except Exception as error:  # noqa: BLE001 - provenance must not abort the entity read
         raw_params = None
         if record["error"] is None:
@@ -2336,7 +2365,7 @@ def _coordinate_system_features(doc):
     while feature is not None:
         try:
             type_name = str(_method(feature, "GetTypeName2") or "")
-            name = _member(feature, "Name")
+            name = _property(feature, "Name")
         except Exception as error:  # noqa: BLE001
             raise CadError(
                 "cad_geometry_unreadable", "a datum feature could not be classified", {"error": str(error)}
@@ -2432,7 +2461,7 @@ def _capture_reference_axis_raw(doc, name, component="", selector=None):
         matching = [
             feature
             for feature in _features_of_type(doc, {"RefAxis"})
-            if _member(feature, "Name") == name
+            if _property(feature, "Name") == name
         ]
         if len(matching) != 1:
             raise ValueError(f"expected one exact RefAxis feature, found {len(matching)}")
@@ -2553,7 +2582,7 @@ def _urdf_exporter_attribute(app, doc, source_root, configuration):
         features = [
             feature
             for feature in _features_of_type(doc, {"Attribute"})
-            if str(_member(feature, "Name") or "").startswith(URDF_EXPORTER_ATTRIBUTE_NAME)
+            if str(_property(feature, "Name") or "").startswith(URDF_EXPORTER_ATTRIBUTE_NAME)
         ]
     except Exception as error:  # noqa: BLE001 - unread must never become absent
         result["error"] = f"attribute feature traversal failed: {type(error).__name__}: {error}"[:300]
@@ -2596,7 +2625,7 @@ def _urdf_exporter_attribute(app, doc, source_root, configuration):
                 "exporter_version": version,
                 "pid_bindings": _urdf_exporter_pid_bindings(
                     xml,
-                    _member(doc, "Extension"),
+                    _property(doc, "Extension"),
                     source_root,
                     native_api_pid=native_api_pid,
                 ),
@@ -2646,11 +2675,11 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_
                 if resolved is None:
                     raise ValueError("GetObjectByPersistReference3 returned no object")
                 component = _component(_dynamic(resolved))
-                row["name2"] = str(_member(component, "Name2") or "") or None
+                row["name2"] = str(_property(component, "Name2") or "") or None
                 row.update(_component_source_document(component, source_root))
                 if isinstance(row.get("source_provenance"), dict) and type(native_api_pid) is int:
                     row["source_provenance"]["native_api_pid"] = native_api_pid
-                row["configuration"] = str(_member(component, "ReferencedConfiguration") or "") or None
+                row["configuration"] = str(_property(component, "ReferencedConfiguration") or "") or None
                 provenance = row.get("source_provenance")
                 session_document = (
                     isinstance(provenance, dict)
@@ -2702,7 +2731,7 @@ def _mate_specific(feature, strict=False):
             raise CadError(
                 "cad_mate_unreadable",
                 "a feature inside the mate group is not a readable mate",
-                {"feature": str(_member(feature, "Name") or ""), "type": type_name},
+                {"feature": str(_property(feature, "Name") or ""), "type": type_name},
             )
         return None
     try:
@@ -2712,7 +2741,7 @@ def _mate_specific(feature, strict=False):
         raise CadError(
             "cad_mate_unreadable",
             "a recognised mate feature could not be read",
-            {"feature": str(_member(feature, "Name") or ""), "type": type_name, "error": str(error)},
+            {"feature": str(_property(feature, "Name") or ""), "type": type_name, "error": str(error)},
         ) from error
     if type(raw_count) is not int or raw_count <= 0:
         raise CadError(
@@ -2820,7 +2849,7 @@ def _component_source_document(component, source_root, *, native_path=None):
     result = {"document": None, "source_provenance": provenance}
     virtual = None
     try:
-        reading = _member(component, "IsVirtual")
+        reading = _property(component, "IsVirtual")
         virtual = reading if type(reading) is bool else None
     except Exception as error:  # noqa: BLE001 - an unreadable virtual flag stays unknown
         provenance["virtual_error"] = f"{type(error).__name__}: {error}"[:200]
@@ -2939,7 +2968,11 @@ def _solver_observation(component, defining_document, source_root, *, configurat
             "configuration": str(configuration or ""),
             "scope": str(scope or ""),
         },
-        "solving": reading("IComponent2.Solving", "swComponentSolvingOption_e", lambda: _member(component, "Solving")),
+        "solving": reading(
+            "IComponent2.Solving",
+            "swComponentSolvingOption_e",
+            lambda: _property(component, "Solving"),
+        ),
         "constrained_status": reading(
             "IComponent2.GetConstrainedStatus",
             "swConstrainedStatus_e",
@@ -3591,7 +3624,7 @@ class SolidWorksBackend(CadBackend):
         self._requested_configurations.clear()
 
     def _active_document(self):
-        doc = _modeldoc2(_member(self._app_obj(), "ActiveDoc"))
+        doc = _modeldoc2(_property(self._app_obj(), "ActiveDoc"))
         if doc is None:
             raise EnvironmentError_("no_active_document", "SolidWorks has no active document")
         return _read_only_document(doc)
@@ -3601,8 +3634,8 @@ class SolidWorksBackend(CadBackend):
 
         if not path:
             return self._active_document()
-        doc = _modeldoc2(_member(self._app_for_path(path), "GetOpenDocumentByName", path))
-        if doc is None or not document_paths_match(_member(doc, "GetPathName"), path):
+        doc = _modeldoc2(_method(self._app_for_path(path), "GetOpenDocumentByName", path))
+        if doc is None or not document_paths_match(_method(doc, "GetPathName"), path):
             raise CadError(
                 "document_not_open",
                 "requested document is not open in the CAD session the adapter owns; "
@@ -3619,23 +3652,23 @@ class SolidWorksBackend(CadBackend):
 
     def health(self):
         app = self._app_obj()
-        doc = _modeldoc2(_member(app, "ActiveDoc"))
+        doc = _modeldoc2(_property(app, "ActiveDoc"))
         active_document = None
         active_document_error = None
         if doc is not None:
             try:
-                active_document = _member(doc, "GetPathName")
+                active_document = _method(doc, "GetPathName")
             except Exception as error:  # noqa: BLE001 - title/path are diagnostic here
                 active_document_error = _native_error_record(error)
             if not isinstance(active_document, str) or not active_document:
                 try:
-                    active_document = _member(doc, "GetTitle")
+                    active_document = _method(doc, "GetTitle")
                 except Exception as error:  # noqa: BLE001
                     active_document_error = _native_error_record(error)
         facts = {
             "ok": True,
             "backend": self.name,
-            "sw_version": _member(app, "RevisionNumber"),
+            "sw_version": _method(app, "RevisionNumber"),
             "active_document": active_document,
         }
         if active_document_error is not None:
@@ -3644,10 +3677,10 @@ class SolidWorksBackend(CadBackend):
 
     def list_documents(self):
         documents = []
-        for doc in _member(self._app_obj(), "GetDocuments") or ():
+        for doc in _method(self._app_obj(), "GetDocuments") or ():
             document = _modeldoc2(doc)
             try:
-                path = _member(document, "GetPathName")
+                path = _method(document, "GetPathName")
             except Exception as error:  # noqa: BLE001
                 self.notes[f"list_documents_error:{len(documents)}"] = _native_error_record(error)
                 continue
@@ -3655,7 +3688,7 @@ class SolidWorksBackend(CadBackend):
                 documents.append(path)
                 continue
             try:
-                title = _member(document, "GetTitle")
+                title = _method(document, "GetTitle")
             except Exception as error:  # noqa: BLE001
                 self.notes[f"list_documents_error:{len(documents)}"] = _native_error_record(error)
                 continue
@@ -3669,7 +3702,7 @@ class SolidWorksBackend(CadBackend):
         if doc is None or errors.value:
             raise self._open_failure(path, errors.value, warnings.value)
         try:
-            title = _member(doc, "GetTitle")
+            title = _method(doc, "GetTitle")
         except Exception as error:  # noqa: BLE001 - title is diagnostic only
             title = None
             title_error = _native_error_record(error)
@@ -3677,8 +3710,8 @@ class SolidWorksBackend(CadBackend):
             title_error = None
         result = {
             "opened": title,
-            "path": _member(doc, "GetPathName"),
-            "read_only": _raw_scalar(_member(doc, "IsOpenedReadOnly")),
+            "path": _method(doc, "GetPathName"),
+            "read_only": _raw_scalar(_method(doc, "IsOpenedReadOnly")),
             "errors": errors.value,
             "warnings": warnings.value,
         }
@@ -3704,7 +3737,7 @@ class SolidWorksBackend(CadBackend):
         errors = wc.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         warnings = wc.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         configuration = self._requested_configurations.get(normalize_document_path(path), "")
-        doc = _member(self._app_for_path(path), "OpenDoc6", path, kind, 3, configuration, errors, warnings)
+        doc = _method(self._app_for_path(path), "OpenDoc6", path, kind, 3, configuration, errors, warnings)
         return doc, errors, warnings
 
     def _unresolved_references(self, path, limit=32):
@@ -3716,7 +3749,7 @@ class SolidWorksBackend(CadBackend):
         """
 
         try:
-            raw = _member(self._app_for_path(path), "GetDocumentDependencies2", path, True, True, True)
+            raw = _method(self._app_for_path(path), "GetDocumentDependencies2", path, True, True, True)
         except Exception:  # noqa: BLE001 - diagnostics must never mask the open error
             return None
         try:
@@ -3751,22 +3784,22 @@ class SolidWorksBackend(CadBackend):
         return CadError("cad_document_open_failed", path, detail)
 
     def _placement(self, component):
-        holder = _member(component, "GetTotalTransform", False)
+        holder = _method(component, "GetTotalTransform", False)
         if holder is None:
-            raise CadError("cad_transform_failed", _member(component, "Name2"))
-        raw = _member(holder, "ArrayData")
+            raise CadError("cad_transform_failed", _property(component, "Name2"))
+        raw = _property(holder, "ArrayData")
         if not isinstance(raw, (list, tuple)):
             raise CadError(
                 "cad_transform_invalid",
                 "GetTotalTransform(False).ArrayData did not return an array",
-                {"component": _member(component, "Name2"), "value": _raw_scalar(raw)},
+                {"component": _property(component, "Name2"), "value": _raw_scalar(raw)},
             )
         return _json_raw_value(list(raw))
 
     def _mass_properties_document(self, doc, require_material=True):
-        if _member(doc, "GetType") != 1:
+        if _method(doc, "GetType") != 1:
             raise CadError("cad_not_part", "mass reader requires a leaf part")
-        document_path = str(_member(doc, "GetPathName"))
+        document_path = str(_method(doc, "GetPathName"))
         _manager, _configuration, configuration_name = _configuration_context(doc)
         bodies = _part_bodies(doc)
         if not bodies:
@@ -3777,7 +3810,7 @@ class SolidWorksBackend(CadBackend):
         except Exception as exc:  # noqa: BLE001 - material is auxiliary to mass values
             materials = unverified_material_record(exc, configuration_name)
             read_errors["material"] = _native_error_record(exc)
-        mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+        mp = _method(_property(doc, "Extension"), "CreateMassProperty2")
         if mp is None:
             raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
         import pythoncom
@@ -3786,12 +3819,12 @@ class SolidWorksBackend(CadBackend):
         mp.IncludeHiddenBodiesOrComponents = True
         # Calculation-object selection only; never clears the user's selection.
         mp.SelectedItems = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tuple(bodies))
-        _member(mp, "Recalculate")
+        _method(mp, "Recalculate")
         overrides = {}
         try:
-            override = _member(mp, "GetOverrideOptions")
+            override = _method(mp, "GetOverrideOptions")
             overrides = {
-                name: _member(override, name)
+                name: _property(override, name)
                 for name in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
             }
         except Exception as error:  # noqa: BLE001 - flags are auxiliary to mass values
@@ -3852,12 +3885,12 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _member(doc, "GetType") != 2:
+        if _method(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "assembly mass reader requires a saved SLDASM")
-        document_path = str(_member(doc, "GetPathName"))
+        document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
-        root = _component(_member(configuration, "GetRootComponent3", True))
-        mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+        root = _component(_method(configuration, "GetRootComponent3", True))
+        mp = _method(_property(doc, "Extension"), "CreateMassProperty2")
         if mp is None:
             raise CadError(
                 "cad_mass_property_unavailable",
@@ -3871,13 +3904,13 @@ class SolidWorksBackend(CadBackend):
         mp.IncludeHiddenBodiesOrComponents = True
         # Calculation-object selection only; the root component is the whole assembly.
         mp.SelectedItems = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (root,))
-        _member(mp, "Recalculate")
+        _method(mp, "Recalculate")
         read_errors = {}
         overrides = {}
         try:
-            override = _member(mp, "GetOverrideOptions")
+            override = _method(mp, "GetOverrideOptions")
             overrides = {
-                name: _member(override, name)
+                name: _property(override, name)
                 for name in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
             }
         except Exception as error:  # noqa: BLE001 - flags are auxiliary to mass values
@@ -3934,11 +3967,11 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _member(doc, "GetType") != 2:
+        if _method(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "link group mass reader requires a saved SLDASM")
-        document_path = str(_member(doc, "GetPathName"))
+        document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
-        root = _component(_member(configuration, "GetRootComponent3", True))
+        root = _component(_method(configuration, "GetRootComponent3", True))
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly has no root component")
         if not isinstance(selections, dict) or not selections:
@@ -3966,26 +3999,26 @@ class SolidWorksBackend(CadBackend):
                 continue
             children = list(_method(component, "GetChildren") or ())
             stack.extend(reversed(children))
-            name = str(_member(component, "Name2"))
+            name = str(_property(component, "Name2"))
             if name in wanted:
                 found[name] = component
         import pythoncom
 
         def read_once(body_name: str, components: list[object]) -> dict:
-            mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+            mp = _method(_property(doc, "Extension"), "CreateMassProperty2")
             if mp is None:
                 raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null", {"link": body_name})
             mp.UseSystemUnits = True
             mp.IncludeHiddenBodiesOrComponents = True
             selection = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tuple(components))
             mp.SelectedItems = selection
-            _member(mp, "Recalculate")
+            _method(mp, "Recalculate")
             read_errors = {}
             overrides = {}
             try:
-                override = _member(mp, "GetOverrideOptions")
+                override = _method(mp, "GetOverrideOptions")
                 overrides = {
-                    key: _member(override, key)
+                    key: _property(override, key)
                     for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
                 }
             except Exception as error:  # noqa: BLE001 - flags are auxiliary to mass values
@@ -4005,7 +4038,7 @@ class SolidWorksBackend(CadBackend):
             }
             try:
                 read["inertia_values_about_origin_api"] = _json_raw_value(
-                    _member(mp, "GetMomentOfInertia", 1)
+                    _method(mp, "GetMomentOfInertia", 1)
                 )
             except Exception as error:  # noqa: BLE001 - origin sample stands alone
                 read_errors["inertia_values_about_origin_api"] = _native_error_record(
@@ -4063,11 +4096,11 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _member(doc, "GetType") != 2:
+        if _method(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "component mass context requires a saved SLDASM")
-        document_path = str(_member(doc, "GetPathName"))
+        document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
-        root = _component(_member(configuration, "GetRootComponent3", True))
+        root = _component(_method(configuration, "GetRootComponent3", True))
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly mass context has no root component")
         import pythoncom
@@ -4084,7 +4117,7 @@ class SolidWorksBackend(CadBackend):
             children: list = []
             try:
                 component = _component(raw)
-                raw_name = _member(component, "Name2")
+                raw_name = _property(component, "Name2")
                 if raw_name is None or not str(raw_name):
                     raise CadError("cad_component_name_missing", "component instance has no Name2")
                 name = str(raw_name)
@@ -4093,7 +4126,7 @@ class SolidWorksBackend(CadBackend):
                 children = list(_method(component, "GetChildren") or ())
                 component_path = str(_method(component, "GetPathName"))
                 try:
-                    referenced_configuration = str(_member(component, "ReferencedConfiguration") or "")
+                    referenced_configuration = str(_property(component, "ReferencedConfiguration") or "")
                 except Exception:  # noqa: BLE001 - optional context, never fatal
                     referenced_configuration = ""
             except Exception as error:  # noqa: BLE001 - one unreadable instance must not stop the walk
@@ -4101,7 +4134,7 @@ class SolidWorksBackend(CadBackend):
                 continue
             stack.extend((child, name, depth + 1) for child in reversed(children))
             try:
-                mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+                mp = _method(_property(doc, "Extension"), "CreateMassProperty2")
                 if mp is None:
                     raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
                 mp.UseSystemUnits = True
@@ -4110,14 +4143,14 @@ class SolidWorksBackend(CadBackend):
                 # right after the property put would leave the selection's lifetime to the binder.
                 selection = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (component,))
                 mp.SelectedItems = selection
-                _member(mp, "Recalculate")
+                _method(mp, "Recalculate")
                 read_errors = {}
                 primary = _read_mass_primary(mp, read_errors)
                 flags = {}
                 try:
-                    override = _member(mp, "GetOverrideOptions")
+                    override = _method(mp, "GetOverrideOptions")
                     flags = {
-                        key: _member(override, key)
+                        key: _property(override, key)
                         for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
                     }
                 except Exception as error:  # noqa: BLE001 - flags are auxiliary to context mass
@@ -4228,7 +4261,7 @@ class SolidWorksBackend(CadBackend):
             "coordinate_frame": "component_local",
             "read_errors": {},
             "used_api": (
-                "IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetSurface/"
+                "IComponent2.GetBodies3/IBody2.GetFaces/IFace2.GetSurface/"
                 "ISurface.IsCylinder/ISurface.CylinderParams"
             ),
         }
@@ -4317,12 +4350,16 @@ class SolidWorksBackend(CadBackend):
         try:
             with self._current_components("axis_reference") as current:
                 holder = current[component]
-                bodies = self._body_list(holder, body_type, component)
+                bodies, body_info = self._component_bodies(
+                    holder,
+                    body_type,
+                    component,
+                )
                 readable_faces = 0
                 for body_index, raw_body in enumerate(bodies):
                     try:
                         body = _interface(_dynamic(raw_body), IBODY2_IID)
-                        faces = _as_list(_member(body, "GetFaces"))
+                        faces = _as_list(_method(body, "GetFaces"))
                     except Exception as error:  # noqa: BLE001 - retain body/face read failure
                         raw["read_errors"][f"body:{body_index}"] = _native_error_record(error)
                         continue
@@ -4330,8 +4367,8 @@ class SolidWorksBackend(CadBackend):
                         current_feature_name = None
                         if named:
                             try:
-                                feature = _member(face, "GetFeature")
-                                current_feature_name = _member(feature, "Name")
+                                feature = _method(face, "GetFeature")
+                                current_feature_name = _property(feature, "Name")
                             except Exception as error:  # noqa: BLE001 - retain feature read failure
                                 raw["read_errors"][
                                     f"face:{body_index}:{local_face_index}:feature"
@@ -4344,6 +4381,7 @@ class SolidWorksBackend(CadBackend):
                             continue
                         candidate = {
                             "body_index": body_index,
+                            "body_info_raw": body_info[body_index],
                             "face_index": readable_faces,
                             "body_face_index": local_face_index,
                             "feature_name": current_feature_name,
@@ -4353,21 +4391,21 @@ class SolidWorksBackend(CadBackend):
                             "read_errors": {},
                         }
                         try:
-                            surface = _member(face, "GetSurface")
+                            surface = _method(face, "GetSurface")
                         except Exception as error:  # noqa: BLE001 - retain face read failure
                             candidate["read_errors"]["surface"] = _native_error_record(error)
                             surface = None
                         if surface is not None:
                             try:
                                 candidate["is_cylinder"] = _raw_scalar(
-                                    _member(surface, "IsCylinder")
+                                    _method(surface, "IsCylinder")
                                 )
                             except Exception as error:  # noqa: BLE001 - retain type read failure
                                 candidate["read_errors"]["is_cylinder"] = _native_error_record(error)
                             try:
                                 candidate["cylinder_params_raw"] = [
                                     _raw_scalar(value)
-                                    for value in _as_list(_member(surface, "CylinderParams"))
+                                    for value in _as_list(_property(surface, "CylinderParams"))
                                 ]
                             except Exception as error:  # noqa: BLE001 - retain params read failure
                                 candidate["read_errors"]["cylinder_params"] = _native_error_record(error)
@@ -4394,7 +4432,7 @@ class SolidWorksBackend(CadBackend):
             import base64
 
             doc = self._captured_document(self._scene_document_key, phase="axis_reference")
-            data = _member(_member(doc, "Extension"), "GetPersistReference3", face)
+            data = _method(_property(doc, "Extension"), "GetPersistReference3", face)
             if data is None:
                 return None
             blob = bytes(int(value) & 0xFF for value in data)
@@ -4418,11 +4456,11 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _member(doc, "GetType") != 2:
+        if _method(doc, "GetType") != 2:
             raise CadError("cad_not_assembly", "group mass reader requires a saved SLDASM")
-        document_path = str(_member(doc, "GetPathName"))
+        document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
-        root = _component(_member(configuration, "GetRootComponent3", True))
+        root = _component(_method(configuration, "GetRootComponent3", True))
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly has no root component")
         wanted = {str(name) for name in names}
@@ -4437,7 +4475,7 @@ class SolidWorksBackend(CadBackend):
                 continue
             children = list(_method(component, "GetChildren") or ())
             stack.extend(reversed(children))
-            name = str(_member(component, "Name2"))
+            name = str(_property(component, "Name2"))
             if name not in wanted:
                 continue
             selected_names.append(name)
@@ -4457,20 +4495,20 @@ class SolidWorksBackend(CadBackend):
             )
         import pythoncom
 
-        mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
+        mp = _method(_property(doc, "Extension"), "CreateMassProperty2")
         if mp is None:
             raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null")
         mp.UseSystemUnits = True
         mp.IncludeHiddenBodiesOrComponents = True
         array = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tuple(selection))
         mp.SelectedItems = array
-        _member(mp, "Recalculate")
+        _method(mp, "Recalculate")
         read_errors = {}
         overrides = {}
         try:
-            override = _member(mp, "GetOverrideOptions")
+            override = _method(mp, "GetOverrideOptions")
             overrides = {
-                key: _member(override, key)
+                key: _property(override, key)
                 for key in ("OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia")
             }
         except Exception as error:  # noqa: BLE001 - flags are auxiliary to group mass values
@@ -4679,7 +4717,7 @@ class SolidWorksBackend(CadBackend):
 
             note("prepare_capture", current_object=_activity_object(doc_path), force=True)
             doc = self._document_by_path(doc_path)
-            if _member(doc, "GetType") != 2:
+            if _method(doc, "GetType") != 2:
                 raise CadError("cad_not_assembly", "export requires a saved SLDASM")
             document, configuration = _capture_document_identity(
                 doc,
@@ -4742,8 +4780,8 @@ class SolidWorksBackend(CadBackend):
                 "notes": self.notes,
             }
             _manager, config = _active_configuration_view(doc)
-            self._scene_document_key = self._record_source_document(doc_path, str(_member(config, "Name")))
-            root = _component(_member(config, "GetRootComponent3", True))
+            self._scene_document_key = self._record_source_document(doc_path, str(_property(config, "Name")))
+            root = _component(_method(config, "GetRootComponent3", True))
             stack = [
                 (component, doc_path)
                 for component in list(_method(root, "GetChildren") or ())
@@ -4777,8 +4815,8 @@ class SolidWorksBackend(CadBackend):
                     raw_values = None
                     array_error = None
                     try:
-                        holder = _member(
-                            _member(document, "Extension"),
+                        holder = _method(
+                            _property(document, "Extension"),
                             "GetCoordinateSystemTransformByName",
                             datum,
                         )
@@ -4786,7 +4824,7 @@ class SolidWorksBackend(CadBackend):
                             raise CadError(
                                 "cad_missing_coordinate_system", "native coordinate-system transform is null"
                             )
-                        raw_values = _json_raw_value(_member(holder, "ArrayData"))
+                        raw_values = _json_raw_value(_property(holder, "ArrayData"))
                     except Exception as error:
                         array_error = _native_error_record(error)
                     record = {
@@ -4794,7 +4832,7 @@ class SolidWorksBackend(CadBackend):
                         "name": datum,
                         "owner": owner,
                         "configuration": _active_configuration(document),
-                        "document": str(_member(document, "GetPathName")),
+                        "document": str(_method(document, "GetPathName")),
                         "array_data": raw_values,
                         "read_errors": (
                             {"array_data": array_error}
@@ -4823,7 +4861,7 @@ class SolidWorksBackend(CadBackend):
                 if _measured_component_state(comp) == COMPONENT_SUPPRESSED:
                     continue
                 borrowed_components.append(comp)
-                raw_name = _member(comp, "Name2")
+                raw_name = _property(comp, "Name2")
                 if not isinstance(raw_name, str) or not raw_name.strip():
                     raise CadError(
                         "cad_component_identity_unreadable",
@@ -4874,7 +4912,7 @@ class SolidWorksBackend(CadBackend):
                         {"component": name, "path": path, "source_provenance": provenance},
                     )
                 self._record_save_flag(part, path)
-                referenced = _member(comp, "ReferencedConfiguration")
+                referenced = _property(comp, "ReferencedConfiguration")
                 if not isinstance(referenced, str) or not referenced.strip():
                     raise CadError(
                         "cad_component_configuration_unreadable",
@@ -4894,14 +4932,14 @@ class SolidWorksBackend(CadBackend):
                         "detail": error.detail,
                     }
                 if children:
-                    if _member(part, "GetType") != 2:
+                    if _method(part, "GetType") != 2:
                         raise CadError("cad_component_type", name)
                     document_type = "assembly"
                     stack.extend(
                         (child, path) for child in children
                     )
                 else:
-                    if _member(part, "GetType") != 1:
+                    if _method(part, "GetType") != 1:
                         raise CadError("cad_empty_subassembly", name)
                     document_type = "part"
                     body_counts = {"solid": None, "sheet": None}
@@ -4918,7 +4956,7 @@ class SolidWorksBackend(CadBackend):
                 fixed = None
                 fixed_error = None
                 try:
-                    fixed = _member(comp, "IsFixed")
+                    fixed = _method(comp, "IsFixed")
                 except Exception as error:  # noqa: BLE001 - preserve the getter failure
                     fixed_error = _native_error_record(error)
                 else:
@@ -5090,27 +5128,62 @@ class SolidWorksBackend(CadBackend):
             raise
 
     def _coordinate_system_transform(self, doc, name):
-        tf = _member(_member(doc, "Extension"), "GetCoordinateSystemTransformByName", name)
+        tf = _method(_property(doc, "Extension"), "GetCoordinateSystemTransformByName", name)
         if tf is None:
             raise CadError("cad_missing_coordinate_system", name)
         self.notes["coordinate_system:" + name] = "IModelDocExtension.GetCoordinateSystemTransformByName"
-        return transform_from_solidworks(_member(tf, "ArrayData"))
+        return transform_from_solidworks(_property(tf, "ArrayData"))
 
-    def _body_list(self, holder, body_type, component):
-        """Read bodies from the captured IComponent2 occurrence."""
+    def _component_bodies(self, holder, body_type, component):
+        """Read one exact occurrence body list and SolidWorks' BodiesInfo array."""
+
+        import pythoncom
+
+        body_info = _win32().VARIANT(
+            pythoncom.VT_BYREF | pythoncom.VT_VARIANT,
+            None,
+        )
         try:
-            bodies = _as_list(_member(holder, "GetBodies2", body_type))
+            bodies = _as_list(
+                _method(holder, "GetBodies3", body_type, body_info) or ()
+            )
+            body_info_values = _as_list(body_info.value)
         except Exception as error:
             raise CadError(
                 "cad_component_bodies_unreadable",
                 "the component occurrence's bodies could not be read",
                 {"component": component, "body_type": body_type, "error": str(error)},
             ) from error
-        self.notes[f"bodies_api:{component}:{body_type}"] = "IComponent2.GetBodies2(type)"
-        return bodies
+        if (
+            len(body_info_values) != len(bodies)
+            or any(
+                type(value) is not int
+                or value not in _COMPONENT_BODY_INFO_VALUES
+                for value in body_info_values
+            )
+        ):
+            raise CadError(
+                "cad_component_body_info_invalid",
+                "IComponent2.GetBodies3 returned an invalid BodiesInfo array",
+                {
+                    "component": component,
+                    "body_type": body_type,
+                    "body_count": len(bodies),
+                    "body_info": _raw_scalar(body_info_values),
+                },
+            )
+        self.notes[f"bodies_api:{component}:{body_type}"] = (
+            "IComponent2.GetBodies3(type, BodiesInfo)"
+        )
+        return bodies, body_info_values
 
     def _body_count(self, holder, body_type, component):
-        return len(self._body_list(holder, body_type, component))
+        bodies, _body_info = self._component_bodies(
+            holder,
+            body_type,
+            component,
+        )
+        return len(bodies)
 
     def _appearance_owner_rows(
         self,
@@ -5156,7 +5229,7 @@ class SolidWorksBackend(CadBackend):
             )
             top_path_error = None
             try:
-                top_path = _member(top_document, "GetPathName")
+                top_path = _method(top_document, "GetPathName")
             except Exception as error:  # noqa: BLE001 - path stays field-local
                 top_path = None
                 top_path_error = _native_error_record(error)
@@ -5184,7 +5257,7 @@ class SolidWorksBackend(CadBackend):
             ancestors.append(name)
             try:
                 ancestor_document = _component_document(ancestor)
-                configuration = _member(
+                configuration = _property(
                     ancestor,
                     "ReferencedConfiguration",
                 )
@@ -5208,7 +5281,7 @@ class SolidWorksBackend(CadBackend):
                 continue
             path_error = None
             try:
-                document_path = _member(
+                document_path = _method(
                     ancestor_document,
                     "GetPathName",
                 )
@@ -5230,7 +5303,7 @@ class SolidWorksBackend(CadBackend):
             )
 
         try:
-            leaf_path = _member(leaf_document, "GetPathName")
+            leaf_path = _method(leaf_document, "GetPathName")
             leaf_path_error = None
         except Exception as error:  # noqa: BLE001 - path stays field-local
             leaf_path = None
@@ -5323,7 +5396,7 @@ class SolidWorksBackend(CadBackend):
             }
         else:
             try:
-                corresponding = _member(
+                corresponding = _method(
                     part_extension,
                     "GetCorrespondingEntity2",
                     face,
@@ -5385,7 +5458,7 @@ class SolidWorksBackend(CadBackend):
         record = SolidWorksBackend._appearance_conversion_record(
             component=component,
             part_document_path=part_document_path,
-            source_api="IComponent2.GetBodies2/IBody2.GetFaces",
+            source_api="IComponent2.GetBodies3/IBody2.GetFaces",
             api=api,
             output_interface_kind="IFace2",
             errors=errors,
@@ -5442,7 +5515,7 @@ class SolidWorksBackend(CadBackend):
         conversion = SolidWorksBackend._appearance_conversion_record(
             component=component,
             part_document_path=part_document_path,
-            source_api="IComponent2.GetBodies2/IBody2.GetFaces",
+            source_api="IComponent2.GetBodies3/IBody2.GetFaces",
             api=api,
             output_interface_kind="IFeature",
             errors=errors,
@@ -5542,7 +5615,7 @@ class SolidWorksBackend(CadBackend):
         record = SolidWorksBackend._appearance_conversion_record(
             component=component,
             part_document_path=part_document_path,
-            source_api="IComponent2.GetBodies2/IBody2.GetFaces",
+            source_api="IComponent2.GetBodies3/IBody2.GetFaces",
             api=api,
             output_interface_kind="IBody2",
             errors=errors,
@@ -6088,7 +6161,7 @@ class SolidWorksBackend(CadBackend):
         face_count = 0
         occurrence_transform = self._component_transforms.get(component)
         used_api = (
-            "IComponent2.GetBodies2/IBody2.GetFaces/"
+            "IComponent2.GetBodies3/IBody2.GetFaces/"
             "IFace2.GetTessTriangles(True)"
         )
         configuration = source_scope.get("referenced_configuration")
@@ -6107,8 +6180,8 @@ class SolidWorksBackend(CadBackend):
                 component,
                 "appearance",
             )
-            document_type = _member(document, "GetType")
-            document_path = _member(document, "GetPathName")
+            document_type = _method(document, "GetType")
+            document_path = _method(document, "GetPathName")
             if (
                 document_type != 1
                 or not _is_text_name(document_path)
@@ -6164,7 +6237,7 @@ class SolidWorksBackend(CadBackend):
         else:
             extension_error = None
             try:
-                document_extension = _member(document, "Extension")
+                document_extension = _property(document, "Extension")
             except Exception as error:  # noqa: BLE001 - diagnostic owner only
                 extension_error = _native_error_record(error)
             try:
@@ -6172,6 +6245,7 @@ class SolidWorksBackend(CadBackend):
                     document,
                     configuration=native_active_configuration,
                     material_member="MaterialPropertyValues",
+                    material_method=False,
                     material_context={
                         "configuration_semantics": "active_configuration",
                         "active_configuration": native_active_configuration,
@@ -6209,6 +6283,7 @@ class SolidWorksBackend(CadBackend):
                 holder,
                 configuration=configuration,
                 material_member="GetMaterialPropertyValues2",
+                material_method=True,
                 material_args=(3, (configuration,)),
                 material_context=requested_context,
                 used_api=occurrence_api,
@@ -6238,14 +6313,18 @@ class SolidWorksBackend(CadBackend):
         }
         for body_type, kind in ((0, "solid"), (1, "sheet")):
             try:
-                bodies = self._body_list(holder, body_type, component)
+                bodies, body_info = self._component_bodies(
+                    holder,
+                    body_type,
+                    component,
+                )
             except CadError as error:
                 errors.append(
                     {
                         "body_type": body_type,
                         "body_index": None,
                         "face_index": None,
-                        "api": "IComponent2.GetBodies2",
+                        "api": "IComponent2.GetBodies3",
                         "code": error.code,
                         "error": error.message,
                         "detail": error.detail,
@@ -6262,14 +6341,14 @@ class SolidWorksBackend(CadBackend):
                             "body_type": body_type,
                             "body_index": body_index,
                             "face_index": None,
-                            "api": "IComponent2.GetBodies2 binding",
+                            "api": "IComponent2.GetBodies3 binding",
                             "error": f"{type(error).__name__}: {error}"[:300],
                         }
                     )
                     continue
                 body_name_error = None
                 try:
-                    raw_body_name = _member(body, "Name")
+                    raw_body_name = _property(body, "Name")
                     body_name = raw_body_name if isinstance(raw_body_name, str) else None
                     if not isinstance(raw_body_name, str):
                         body_name_error = {
@@ -6287,21 +6366,22 @@ class SolidWorksBackend(CadBackend):
                         f"body_name_read_error:{component}:{body_type}/{body_index}"
                     ] = copy.deepcopy(body_name_error)
                 # IBody2.MaterialPropertyValues2 is the related-body owner path
-                # through IPartDoc.EnumRelatedBodies2; GetBodies2 here remains
+                # through IPartDoc.EnumRelatedBodies2; GetBodies3 here remains
                 # the geometry traversal and cannot be relabeled as that owner.
                 body_appearance_record = {
                     "component": component,
-                    "enumeration_api": "IComponent2.GetBodies2",
+                    "enumeration_api": "IComponent2.GetBodies3",
                     "body_type": body_type,
                     "body_index": body_index,
                     "body_name": body_name,
+                    "body_info_raw": body_info[body_index],
                     "faces": [],
                     "native_identity": None,
                 }
                 appearance_raw["bodies"].append(body_appearance_record)
                 part_body_observations = []
                 try:
-                    faces = _as_list(_member(body, "GetFaces"))
+                    faces = _as_list(_method(body, "GetFaces"))
                 except Exception as error:  # noqa: BLE001
                     errors.append(
                         {
@@ -6360,6 +6440,7 @@ class SolidWorksBackend(CadBackend):
                             face,
                             configuration=native_active_configuration,
                             material_member="MaterialPropertyValues",
+                            material_method=False,
                             material_context={
                                 "configuration_semantics": "active_configuration",
                                 "active_configuration": native_active_configuration,
@@ -6405,7 +6486,7 @@ class SolidWorksBackend(CadBackend):
                                         "source_document_path"
                                     ),
                                     source_api=(
-                                        "IComponent2.GetBodies2/"
+                                        "IComponent2.GetBodies3/"
                                         "IBody2.GetFaces"
                                     ),
                                     api=(
@@ -6492,7 +6573,7 @@ class SolidWorksBackend(CadBackend):
                                     "source_document_path"
                                 ),
                                 source_api=(
-                                    "IComponent2.GetBodies2/"
+                                    "IComponent2.GetBodies3/"
                                     "IBody2.GetFaces"
                                 ),
                                 api=(
@@ -6512,7 +6593,7 @@ class SolidWorksBackend(CadBackend):
                         }
                     )
                     try:
-                        raw_values = _member(
+                        raw_values = _method(
                             face,
                             "GetTessTriangles",
                             True,
@@ -6866,14 +6947,14 @@ class SolidWorksBackend(CadBackend):
         current = {}
         try:
             _manager, config = _active_configuration_view(doc)
-            root = _component(_member(config, "GetRootComponent3", True))
+            root = _component(_method(config, "GetRootComponent3", True))
             if root is None:
                 raise ValueError("the assembly has no readable root component")
             stack = list(_method(root, "GetChildren") or ())
             while stack:
                 name = ""
                 comp = _component(stack.pop())
-                name = _member(comp, "Name2")
+                name = _property(comp, "Name2")
                 if not _is_text_name(name):
                     raise ValueError("the occurrence has no readable full name")
                 state = _component_state(comp)
@@ -6887,7 +6968,7 @@ class SolidWorksBackend(CadBackend):
                 expected_path = self._source_documents[document_key][0]
                 occurrence = {
                     "path": _method(comp, "GetPathName"),
-                    "referenced_configuration": _member(comp, "ReferencedConfiguration"),
+                    "referenced_configuration": _property(comp, "ReferencedConfiguration"),
                 }
                 if not all(_is_text_name(value) for value in occurrence.values()):
                     raise ValueError("the occurrence path or referenced configuration is unreadable")
@@ -6930,13 +7011,16 @@ class SolidWorksBackend(CadBackend):
 
         app = self._app_obj()
         facts = {
-            "revision": _member(app, "RevisionNumber"),
+            "revision": _method(app, "RevisionNumber"),
             "input_mode": "saved_documents",
             "sessions": {role: session.identity() for role, session in self._sessions.items()},
         }
-        for key, member in (("build", "GetBuildNumbers"), ("license", "GetCurrentLicenseType")):
+        for key, member in (
+            ("build", "GetBuildNumbers"),
+            ("license", "GetCurrentLicenseType"),
+        ):
             try:
-                value = _member(app, member)
+                value = _method(app, member)
             except Exception as exc:  # noqa: BLE001 - optional API surface
                 facts[key] = None
                 facts.setdefault("unavailable", {})[member] = str(exc)
@@ -6948,7 +7032,7 @@ class SolidWorksBackend(CadBackend):
                     f"Unsupported native type: {type(value).__name__}"
                 )
         try:
-            visible = _member(app, "Visible")
+            visible = _property(app, "Visible")
         except Exception as error:
             facts["visible"] = None
             facts.setdefault("unavailable", {})["Visible"] = str(error)
@@ -6990,7 +7074,7 @@ class SolidWorksBackend(CadBackend):
         """
 
         try:
-            document = _member(doc, "GetPathName")
+            document = _method(doc, "GetPathName")
         except Exception:  # noqa: BLE001 - path fallback is supplied by the caller
             document = None
         key = normalize_document_path(os.path.abspath(str(document or path)))
@@ -7017,7 +7101,7 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._ensure_document(path)
-        document_path = _member(doc, "GetPathName")
+        document_path = _method(doc, "GetPathName")
         if not isinstance(document_path, str) or not document_path.strip():
             raise CadError(
                 "cad_document_identity",
@@ -7026,7 +7110,7 @@ class SolidWorksBackend(CadBackend):
             )
         try:
             _manager, active = _active_configuration_view(doc)
-            configuration = _member(active, "Name")
+            configuration = _property(active, "Name")
         except Exception as error:  # noqa: BLE001 - real configuration identity is required
             raise CadError(
                 "cad_configuration_unreadable",
@@ -7045,7 +7129,7 @@ class SolidWorksBackend(CadBackend):
         save_flag = state.get("save_flag")
         state["saved"] = not save_flag if type(save_flag) is bool else None
         try:
-            title = _member(doc, "GetTitle")
+            title = _method(doc, "GetTitle")
         except Exception as error:  # noqa: BLE001 - title is diagnostic only
             state["title"] = None
             state["title_error"] = _native_error_record(error)
@@ -7058,7 +7142,7 @@ class SolidWorksBackend(CadBackend):
                     "detail": {"value_type": type(title).__name__, "value": repr(title)},
                 }
         try:
-            configurations = _as_list(_member(doc, "GetConfigurationNames"))
+            configurations = _as_list(_method(doc, "GetConfigurationNames"))
         except Exception as error:  # noqa: BLE001 - configuration names are diagnostic only
             state["configurations"] = None
             state["configurations_error"] = _native_error_record(error)
@@ -7108,7 +7192,7 @@ class SolidWorksBackend(CadBackend):
             app = self._app_obj()
             session_info = {
                 "native_api_pid": int(_method(app, "GetProcessID")),
-                "solidworks_revision": str(_member(app, "RevisionNumber")),
+                "solidworks_revision": str(_method(app, "RevisionNumber")),
             }
             evidence = self.staged_search_evidence()
             pinned = dict(evidence[-1]) if evidence else {}
@@ -7131,7 +7215,7 @@ class SolidWorksBackend(CadBackend):
                 readings["stored_references"] = stored
                 readings["stored_references_phase"] = "preopen"
                 readings["stored_references_count"] = len(stored)
-                readings["documents_before"] = int(_member(app, "GetDocumentCount"))
+                readings["documents_before"] = int(_method(app, "GetDocumentCount"))
                 entry = self._probe_document(str(stage / main_assembly))
                 readings["open"] = {
                     "already_open": entry.get("already_open"),
@@ -7173,7 +7257,7 @@ class SolidWorksBackend(CadBackend):
                 # The "after" snapshot is taken when the native walk below has
                 # completed and before the document is closed.
                 readings["saved_configuration"] = str(configuration_name or "") or None
-                root = _component(_member(configuration, "GetRootComponent3", True))
+                root = _component(_method(configuration, "GetRootComponent3", True))
                 occurrences = []
                 stack = [
                     (child, "", 0, str(main_assembly), None, str(main_assembly))
@@ -7184,7 +7268,7 @@ class SolidWorksBackend(CadBackend):
                     if depth > 40:
                         raise CadError("cad_assembly_too_deep", str(stage / main_assembly), {"depth": depth})
                     component = _component(item)
-                    name = str(_member(component, "Name2") or _member(component, "Name") or "")
+                    name = str(_property(component, "Name2") or _property(component, "Name") or "")
                     instance = name if not context or name.startswith(context + "/") else f"{context}/{name}"
                     record = {
                         "instance": instance,
@@ -7194,7 +7278,7 @@ class SolidWorksBackend(CadBackend):
                         "defining_anchor": anchor,
                         "native_owner": native_owner,
                     }
-                    referenced = _member(component, "ReferencedConfiguration")
+                    referenced = _property(component, "ReferencedConfiguration")
                     record["configuration"] = str(referenced) if referenced is not None else None
                     try:
                         state = _method(component, "GetSuppression2")
@@ -7211,7 +7295,7 @@ class SolidWorksBackend(CadBackend):
                         record["path_error"] = f"{type(error).__name__}: {error}"[:200]
                     virtual = None
                     try:
-                        reading = _member(component, "IsVirtual")
+                        reading = _property(component, "IsVirtual")
                         virtual = reading if type(reading) is bool else None
                     except Exception:  # noqa: BLE001 - an unreadable virtual flag stays unknown
                         virtual = None
@@ -7243,7 +7327,7 @@ class SolidWorksBackend(CadBackend):
                     for child in reversed(_as_list(_method(component, "GetChildren"))):
                         stack.append((child, instance, depth + 1, child_defining, anchor_for_children, child_owner))
                 readings["occurrences"] = occurrences
-                readings["documents_after"] = int(_member(app, "GetDocumentCount"))
+                readings["documents_after"] = int(_method(app, "GetDocumentCount"))
                 readings["document_state"] = {
                     "before": document_state_before,
                     "after": _discovery_document_state(doc),
@@ -7254,7 +7338,7 @@ class SolidWorksBackend(CadBackend):
                 }
             finally:
                 try:
-                    _member(app, "SetSearchFolders", SEARCH_FOLDER_DOCUMENT_TYPE, ";".join(pinned.get("before") or []))
+                    _method(app, "SetSearchFolders", SEARCH_FOLDER_DOCUMENT_TYPE, ";".join(pinned.get("before") or []))
                     restored = read_search_folders(app, SEARCH_FOLDER_DOCUMENT_TYPE)
                     restored_folders = restored["folders"]
                     restored_raw = restored["raw"]
@@ -7498,7 +7582,7 @@ class SolidWorksBackend(CadBackend):
             activity.emit("read_document_state", current_object=_activity_object(main_path, source_root), force=True)
             document_state_before = _discovery_document_state(doc)
             _manager, active = _active_configuration_view(doc)
-            configuration = str(_member(active, "Name") or "")
+            configuration = str(_property(active, "Name") or "")
             if not configuration:
                 raise CadError("cad_configuration_missing", "the saved main assembly configuration is unreadable")
             # Capture native persistent identities in the initial saved root
@@ -7548,12 +7632,12 @@ class SolidWorksBackend(CadBackend):
                 )
                 _select_configuration(assembly, referenced_configuration, prefix or "assembly")
                 _manager, active_config = _active_configuration_view(assembly)
-                root = _component(_member(active_config, "GetRootComponent3", True))
+                root = _component(_method(active_config, "GetRootComponent3", True))
                 root_children = list(_method(root, "GetChildren") or [])
                 components_total += len(root_children)
                 for raw in root_children:
                     component = _component(raw)
-                    name = str(_member(component, "Name2") or "")
+                    name = str(_property(component, "Name2") or "")
                     if not name:
                         components_done += 1
                         continue
@@ -7623,9 +7707,9 @@ class SolidWorksBackend(CadBackend):
                     # become an alternate mechanical reading.
                     transform_error = "GetTotalTransform(False) returned no transform data"
                     try:
-                        holder = _member(component, "GetTotalTransform", False)
+                        holder = _method(component, "GetTotalTransform", False)
                         local_transform = [
-                            float(value) for value in transform_from_solidworks(_member(holder, "ArrayData"))
+                            float(value) for value in transform_from_solidworks(_property(holder, "ArrayData"))
                         ]
                     except Exception as error:  # noqa: BLE001 - an unreadable transform must block, not guess
                         transform_error = f"GetTotalTransform(False): {error}"
@@ -7649,8 +7733,8 @@ class SolidWorksBackend(CadBackend):
                         "instance_id": path_name,
                         "document": source_document["document"]
                         or (normalize_document_path(str(document_path)) if _is_text_name(document_path) else ""),
-                        "configuration": str(_member(component, "ReferencedConfiguration") or ""),
-                        "fixed": bool(_member(component, "IsFixed")),
+                        "configuration": str(_property(component, "ReferencedConfiguration") or ""),
+                        "fixed": bool(_method(component, "IsFixed")),
                         "suppressed": state == COMPONENT_SUPPRESSED,
                         "suppression_state": state,
                         "lightweight": state in (1, 4),
@@ -7683,7 +7767,7 @@ class SolidWorksBackend(CadBackend):
                             notes.append(f"transform:{path_name}:subtree_skipped_unreadable_parent")
                         part = _method(component, "GetModelDoc2") if transform else None
                         if part is not None:
-                            referenced = str(_member(component, "ReferencedConfiguration") or "")
+                            referenced = str(_property(component, "ReferencedConfiguration") or "")
                             # A containment chain that repeats a document (an assembly
                             # holding itself, directly or through its ancestors) is a
                             # reference cycle: recursing would never converge and the
@@ -7715,7 +7799,7 @@ class SolidWorksBackend(CadBackend):
                 mate_list = list(_mate_features(assembly))
                 mates_total += len(mate_list)
                 for feature, specific, entity_count in mate_list:
-                    name = str(_member(feature, "Name") or "")
+                    name = str(_property(feature, "Name") or "")
                     activity.emit(
                         "read_mates",
                         current_object=_activity_object(name),
@@ -7723,7 +7807,7 @@ class SolidWorksBackend(CadBackend):
                         total=mates_total,
                     )
                     try:
-                        type_index = _method(specific, "Type")
+                        type_index = _property(specific, "Type")
                         if type(type_index) is not int:
                             raise ValueError("mate type is not a native integer")
                     except Exception as error:  # noqa: BLE001
@@ -7757,10 +7841,10 @@ class SolidWorksBackend(CadBackend):
                             continue
                         try:
                             entity = _dynamic(_method(specific, "MateEntity", entity_index))
-                            reference = _component(_member(entity, "ReferenceComponent"))
+                            reference = _component(_property(entity, "ReferenceComponent"))
                             reference_full = str(_method(reference, "GetPathName") or "")
-                            reference_name = str(_member(reference, "Name2") or "")
-                            reference_configuration = str(_member(reference, "ReferencedConfiguration") or "")
+                            reference_name = str(_property(reference, "Name2") or "")
+                            reference_configuration = str(_property(reference, "ReferencedConfiguration") or "")
                             reference_path = _relative_document(reference_full, source_root)
                             # An entity may lie on the owning assembly's own reference
                             # geometry (assembly planes/axes): it has no component
@@ -7776,7 +7860,7 @@ class SolidWorksBackend(CadBackend):
                             # with no single declared view, so the generic dispatch
                             # stays and the unambiguous GetFeature/GetSurface/GetCurve
                             # returns are bound to their own published interfaces.
-                            target = _member(entity, "Reference")
+                            target = _property(entity, "Reference")
                         except Exception as error:  # noqa: BLE001
                             raise CadError(
                                 "cad_mate_unreadable",
@@ -7804,8 +7888,8 @@ class SolidWorksBackend(CadBackend):
                     variation_upper = None
                     if suppressed is False and error_code == 0:
                         try:
-                            variation_lower = float(_member(specific, "MinimumVariation"))
-                            variation_upper = float(_member(specific, "MaximumVariation"))
+                            variation_lower = float(_property(specific, "MinimumVariation"))
+                            variation_upper = float(_property(specific, "MaximumVariation"))
                         except Exception as error:  # noqa: BLE001
                             if type_index in {5, 6}:
                                 raise CadError(
@@ -7847,7 +7931,7 @@ class SolidWorksBackend(CadBackend):
                             else:
                                 iid = IANGLEMATEFEATUREDATA_IID if type_index == 6 else IDISTANCEMATEFEATUREDATA_IID
                                 bound = _interface(definition, iid)
-                                value = _member(bound, "IsAdvancedMate")
+                                value = _property(bound, "IsAdvancedMate")
                                 if type(value) is bool:
                                     is_advanced_mate = value
                                     is_advanced_mate_api = f"{interface_prefix}MateFeatureData.IsAdvancedMate"
@@ -7856,7 +7940,7 @@ class SolidWorksBackend(CadBackend):
                                 if is_advanced_mate is True:
                                     values = {}
                                     for key in names:
-                                        raw_value = _member(bound, key)
+                                        raw_value = _property(bound, key)
                                         parsed = float(raw_value)
                                         if not math.isfinite(parsed):
                                             raise ValueError(f"{key} is not finite")
@@ -7936,7 +8020,7 @@ class SolidWorksBackend(CadBackend):
                             definition = _method(feature, "GetDefinition")
                             if definition is not None:
                                 bound = _interface(definition, ICONCENTRICMATEFEATUREDATA_IID)
-                                raw_lock = _member(bound, "LockRotation")
+                                raw_lock = _property(bound, "LockRotation")
                                 if isinstance(raw_lock, bool):
                                     lock_rotation = raw_lock
                                     lock_rotation_api = "IConcentricMateFeatureData.LockRotation"
@@ -8044,7 +8128,7 @@ class SolidWorksBackend(CadBackend):
                 if type(suppressed) is not bool:
                     raise CadError("cad_axis_reference_unreadable", "reference axis suppression state is unreadable")
                 if not suppressed:
-                    reference_axes.append(_reference_axis_record(doc, str(_member(feature, "Name"))))
+                    reference_axes.append(_reference_axis_record(doc, str(_property(feature, "Name"))))
             for entry in components:
                 source = by_component.get(entry["name2"])
                 if source is None or not source[1] or entry["suppressed"]:

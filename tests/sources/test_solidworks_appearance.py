@@ -107,7 +107,7 @@ def _raw(
         "bodies": [
             {
                 "component": COMPONENT,
-                "enumeration_api": "IComponent2.GetBodies2",
+                "enumeration_api": "IComponent2.GetBodies3",
                 "body_type": 0,
                 "body_index": 0,
                 "body_name": "arm",
@@ -251,7 +251,7 @@ def _reference_row(
                     "owner_scope": "assembly_occurrence",
                     "object_kind": "assembly_occurrence",
                     "source_api": (
-                        "IComponent2.GetBodies2/IBody2.GetFaces"
+                        "IComponent2.GetBodies3/IBody2.GetFaces"
                     ),
                     "traversal_api": (
                         "IConfiguration.GetRootComponent3/"
@@ -334,7 +334,7 @@ def _resolved_raw(values):
         "bodies": [
             {
                 "component": COMPONENT,
-                "enumeration_api": "IComponent2.GetBodies2",
+                "enumeration_api": "IComponent2.GetBodies3",
                 "body_type": 0,
                 "body_index": 0,
                 "body_name": "arm",
@@ -458,7 +458,7 @@ def _attach_body_witnesses(raw, references=None):
                             "owner_scope": "assembly_occurrence",
                             "object_kind": "assembly_occurrence",
                             "source_api": (
-                                "IComponent2.GetBodies2/IBody2.GetFaces"
+                                "IComponent2.GetBodies3/IBody2.GetFaces"
                             ),
                             "traversal_api": (
                                 "IConfiguration.GetRootComponent3/"
@@ -568,20 +568,20 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "IFace2.GetBody+"
                 "IModelDocExtension.GetPersistReference3",
                 "IBody2",
-                "IComponent2.GetBodies2/IBody2.GetFaces",
+                "IComponent2.GetBodies3/IBody2.GetFaces",
             ),
             (
                 "face",
                 "IModelDocExtension.GetCorrespondingEntity2",
                 "IFace2",
-                "IComponent2.GetBodies2/IBody2.GetFaces",
+                "IComponent2.GetBodies3/IBody2.GetFaces",
             ),
             (
                 "feature",
                 "IFace2.GetFeature+"
                 "IModelDocExtension.GetPersistReference3",
                 "IFeature",
-                "IComponent2.GetBodies2/IBody2.GetFaces",
+                "IComponent2.GetBodies3/IBody2.GetFaces",
             ),
         ):
             target = copy.deepcopy(indexed["target"])

@@ -887,7 +887,7 @@ class FreezeTests(unittest.TestCase):
 
     def test_failed_readings_retain_exact_native_member_and_original_rpc_cause(self) -> None:
         from description_pipeline.sources.solidworks.errors import CadError
-        from description_pipeline.sources.solidworks.native import _member, _method
+        from description_pipeline.sources.solidworks.native import _method, _property
 
         class RpcError(Exception):
             hresult = -2147023130
@@ -910,7 +910,7 @@ class FreezeTests(unittest.TestCase):
                 raise RpcError("RPC failed at http://user:secret@192.0.2.10/api?token=abc")
 
         for reader, name, arguments in (
-            (_member, "ConfigurationManager", ()),
+            (_property, "ConfigurationManager", ()),
             (_method, "ReadValue", (NoRepresentation(),)),
         ):
             with self.subTest(reader=reader.__name__):

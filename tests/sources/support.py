@@ -216,7 +216,7 @@ def fixture_native_geometry(
     ]
     return {
         "component": component,
-        "used_api": "IComponent2.GetBodies2/IBody2.GetFaces/IFace2.GetTessTriangles(True)",
+        "used_api": "IComponent2.GetBodies3/IBody2.GetFaces/IFace2.GetTessTriangles(True)",
         "triangles": len(triangles),
         "triangle_values": values,
         "body_inventory": body_inventory,

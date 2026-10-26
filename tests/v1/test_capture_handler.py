@@ -21,6 +21,7 @@ from urllib import error as urlerror
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.delivery import PIPELINE_ID
+from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.io import (
     canonical,
     digest,
@@ -67,6 +68,7 @@ from description_pipeline.pipeline.freeze import FreezeHandler
 from description_pipeline.pipeline.reconciliation import (
     EffectReconciliationResult,
 )
+from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.orchestration.native_operation_client import (
     ArtifactDownload,
     NativeOperationClient,
@@ -1027,7 +1029,7 @@ class CaptureHandlerTests(unittest.TestCase):
         manifest = json.loads((admitted / "transfer-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["schema_version"], "solidworks-to-urdf.capture-transfer/v3")
         self.assertEqual(manifest["run_id"], CHILD)
-        self.assertEqual(manifest["native_stage_scope"], ["capture"])
+        self.assertNotIn("native_stage_scope", manifest)
         self.assertEqual(manifest["execution"]["effect_key"], "capture-native")
         self.assertEqual(manifest["execution"]["executor_sha256"], self.stage_executor)
         self.assertEqual(manifest["execution"]["native_tool_sha256"], self.native_tool_sha256)
@@ -2916,7 +2918,6 @@ class CaptureHandlerTests(unittest.TestCase):
                 expected_main_assembly=MAIN,
                 expected_native_tool=self.capture_tool,
                 expected_prepared_dir=str(self.package),
-                expected_prepared_files=self.prepared_files,
                 expected_upstream_artifacts=expected_upstream,
                 expected_execution=execution_record,
             )
@@ -2954,7 +2955,6 @@ class CaptureHandlerTests(unittest.TestCase):
                 expected_main_assembly=MAIN,
                 expected_native_tool=self.capture_tool,
                 expected_prepared_dir=None,
-                expected_prepared_files=self.prepared_files,
                 expected_upstream_artifacts=(self.freeze_ref.to_record(), self.discover_ref.to_record()),
                 expected_execution=execution_record,
             )
@@ -2995,6 +2995,16 @@ class CaptureTransactionPreservationTests(unittest.TestCase):
                 (staging / "raw-native.bin").write_bytes(b"original native bytes")
                 raise RuntimeError("native reader failed")
 
+            handoff = digest({"handoff": 1})
+            request_evidence = build_request_evidence(
+                purpose=PURPOSE_ENGINEERING,
+                request_id="capture-preservation",
+                target_hardware="nd_fixture",
+                change_summary="Verify failure diagnostic preservation",
+                main_assembly=MAIN,
+                handoff_digest=handoff,
+                platform_config_digest=digest({"platform": "fixture"}),
+            )
             with (
                 patch(
                     "description_pipeline.pipeline.capture.capture_native_package",
@@ -3009,9 +3019,46 @@ class CaptureTransactionPreservationTests(unittest.TestCase):
                 capture_module._capture_native_transaction(
                     package,
                     output,
+                    backend=object(),
                     run_id=CHILD,
-                    handoff_sha256=digest({"handoff": 1}),
+                    handoff_sha256=handoff,
+                    upload_sha256=digest({"upload": 1}),
                     main_assembly=MAIN,
+                    expected_inputs={},
+                    upstream_artifacts=(
+                        ArtifactRef(
+                            artifact_id="freeze-dummy",
+                            kind="stage_output:freeze",
+                            locator="cas://artifact/freeze-dummy",
+                            manifest_sha256="a" * 64,
+                            set_sha256="b" * 64,
+                            producer_run_id=CHILD,
+                            producer_stage="freeze",
+                            producer_tool_sha256="c" * 64,
+                        ).to_record(),
+                        ArtifactRef(
+                            artifact_id="discover-dummy",
+                            kind="stage_output:discover",
+                            locator="cas://artifact/discover-dummy",
+                            manifest_sha256="d" * 64,
+                            set_sha256="e" * 64,
+                            producer_run_id=CHILD,
+                            producer_stage="discover",
+                            producer_tool_sha256="f" * 64,
+                        ).to_record(),
+                    ),
+                    execution={
+                        "claim_id": "claim-dummy",
+                        "command_id": "command-dummy",
+                        "effect_key": "effect-dummy",
+                        "executor_sha256": "1" * 64,
+                        "fence": 1,
+                        "native_tool_sha256": digest(build_capture_tool()),
+                        "owner_sha256": "2" * 64,
+                        "run_id": CHILD,
+                    },
+                    native_tool_factory=build_capture_tool,
+                    request_evidence=request_evidence,
                 )
 
             retained = list(root.glob(".output-capture-*"))

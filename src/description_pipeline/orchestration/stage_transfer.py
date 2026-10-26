@@ -44,8 +44,8 @@ def seal_capture(
     upload_sha256: str,
     main_assembly: str,
     native_tool: dict,
-    upstream_artifacts=None,
-    execution=None,
+    upstream_artifacts,
+    execution,
 ) -> dict:
     """Seal a completed Windows capture into one closed, self-describing archive."""
 
@@ -177,10 +177,9 @@ def admit_capture(
     expected_upload_sha256: str,
     expected_main_assembly: str,
     expected_native_tool: dict,
+    expected_upstream_artifacts,
+    expected_execution,
     expected_prepared_dir: str | None = None,
-    expected_prepared_files: dict[str, str] | None = None,
-    expected_upstream_artifacts=None,
-    expected_execution=None,
 ) -> dict:
     """Admit one transferred capture: validate in private staging, then install atomically."""
 
@@ -201,8 +200,6 @@ def admit_capture(
             expected_main_assembly=expected_main_assembly,
             expected_native_tool=expected_native_tool,
             native_prepared_dir=expected_prepared_dir,
-            native_prepared_files=expected_prepared_files,
-            capture_only=True,
             expected_upstream_artifacts=expected_upstream_artifacts,
             expected_execution=expected_execution,
         )

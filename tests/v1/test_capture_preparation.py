@@ -95,9 +95,11 @@ class NativeReceiptTests(unittest.TestCase):
             ("unknown_field", lambda transfer: transfer.update(extra=True), "incomplete or unknown"),
             ("run_id", lambda transfer: transfer.update(run_id=RUN_ID + "-other"), "UUID"),
             (
-                "stage_scope",
-                lambda transfer: transfer.update(native_stage_scope=["freeze"]),
-                "stage scope",
+                "execution_run",
+                lambda transfer: transfer["execution"].update(
+                    run_id=RUN_ID + "-other"
+                ),
+                "execution run differs",
             ),
         )
         for label, mutate, pattern in mutations:
@@ -140,7 +142,11 @@ class NativeReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "omits required capture reports"):
             from description_pipeline.native_transfer import verify_transfer
 
-            verify_transfer(root)
+            verify_transfer(
+                root,
+                expected_upstream_artifacts=transfer["upstream_artifacts"],
+                expected_execution=transfer["execution"],
+            )
 
 
 if __name__ == "__main__":

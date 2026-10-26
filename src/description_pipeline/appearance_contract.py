@@ -98,9 +98,9 @@ def index_conversion_mismatch(
             },
         }
     expected_source_api = (
-        "IComponent2.GetBodies2/IBody2.GetFaces"
+        "IComponent2.GetBodies3/IBody2.GetFaces"
         if kind in {"body", "face", "feature"}
-        else "IComponent2.GetBodies2"
+        else "IComponent2.GetBodies3"
     )
     expected_api = {
         "body": (

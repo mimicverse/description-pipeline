@@ -183,7 +183,7 @@ class GenerateHandlerTests(unittest.TestCase):
                     "bodies": [
                         {
                             "component": component,
-                            "enumeration_api": "IComponent2.GetBodies2",
+                            "enumeration_api": "IComponent2.GetBodies3",
                             "body_type": body["body_type"],
                             "body_index": body["body_index"],
                             "body_name": body.get("body_name"),

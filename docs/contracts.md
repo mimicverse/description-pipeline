@@ -649,8 +649,16 @@ operation runtime 和一个 CAD resource owner，workspace 是 operation-local �
 ### 原生三角形事实
 
 当前 Capture 使用唯一的 `native-triangles/v1` 事实契约。原生会话沿
-`occurrence.GetBodies2 → GetFaces → GetTessTriangles(True)` 读取已保存配置的实际
+`occurrence.GetBodies3(BodyType, BodiesInfo) → GetFaces → GetTessTriangles(True)` 读取已保存配置的实际
 body、face 和三角形；每个 face 的直接返回按原始次序保留，不切换备用几何链。
+
+`BodiesInfo` 与同次返回的 body 数组按位置一一对应，每个 body 保留其原生
+`body_info_raw`。按 `swBodyInfo_e`，`0 = swUserBody_e`（user body），
+`1 = swNormalBody_e`（normal body）；两种分类均保留，不把 user body 当作读取失败，
+也不因分类切换几何来源。长度不一致、非整数或未定义值须明确失败，不补值或静默丢项。
+这些标志不代替对象身份和归属证明，数组位置也不代表跨次稳定身份。这里的接收者是
+`IComponent2`；`IPartDoc.GetBodies2(BodyType, BVisibleOnly)` 仍用于 Part 文档查询，
+不是 occurrence 几何的备用或替代链。
 旧几何与准备收据按原 schema 保全，不能重标版本、填充新字段或自动晋升为当前输入。
 
 原始三角形每项为九个有限 `binary64` 数值，单位为米、坐标位于 component-local。
@@ -692,7 +700,7 @@ raw/STL 一致性证明本次原始三角事实到交付的派生一致性，不
 
 材质实体与同次几何遍历的唯一原生实体／归属观察使用实际 owner document 的持久引用，绑定 exact occurrence、配置和显示状态。Source 只封存逐 face 的原生引用、parent-body／feature 关系及成功或失败，不再另存由这些观察推导的 body、feature 或 face 索引与 footprint。assembly occurrence 的直接原生引用只保留一次。Generate 与 Verify 分别从原始事实构造临时索引并执行 join，核验命中 target kind 与原生接口集合兼容；临时派生结果不成为第二份封存权威。Part 实体引用由同一 Part extension 通过 `GetObjectByPersistReference3` 解析，必须返回 exact integer `0` 和预期接口；null、非 OK、错误类型或错误 owner 不登记为成功。文档目标仍使用文档证明，不为它补造引用。引用按实际 owner 与字节解析一次并复用，类型只约束解析结果的 QI，不让同一引用因类型不同被重复解析；不保留重复引用权威。
 
-几何读取保持 `IComponent2.GetBodies2` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`，不改变 occurrence 几何、坐标或 face spans。每个已观察的 occurrence face 由目标 Part extension 的 `GetCorrespondingEntity2` 取得并验证 underlying Part face；在该 Part face 上调用公开方法 `GetBody()`、`GetFeature()`，取得实际 Part body 和 feature，再读取并解析同一 Part namespace 的引用。body 不使用 `GetCorresponding2`，不增加第二次 Part 几何遍历、父装配 receiver 或兜底转换。原生 COM handle 仅保留在自有会话内存中；复制和封存的事实必须为纯 JSON，不深复制或序列化 live handle。
+几何读取保持 `IComponent2.GetBodies3(BodyType, BodiesInfo)` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`，不改变 occurrence 几何、坐标或 face spans。每个已观察的 occurrence face 由目标 Part extension 的 `GetCorrespondingEntity2` 取得并验证 underlying Part face；在该 Part face 上调用公开方法 `GetBody()`、`GetFeature()`，取得实际 Part body 和 feature，再读取并解析同一 Part namespace 的引用。body 不使用 `GetCorresponding2`，不增加第二次 Part 几何遍历、父装配 receiver 或兜底转换。原生 COM handle 仅保留在自有会话内存中；复制和封存的事实必须为纯 JSON，不深复制或序列化 live handle。
 
 原生 identity 与交付 geometry footprint 是有证据的关系，不假定一一对应。复用同次 face 遍历的真实 parent-body 观察建立 body 的完整 face footprint，不能以第一个 face 代表整个 occurrence body；同一 Part body 或 face 对应多个 occurrence fragments 时，须保留实际关系。多个 Part body、缺失或分歧的见证，须逐 face 明确处理；参与材质绑定时无法证明的部分失败，不按顺序、名称、颜色或 coverage 猜归属。同一 native feature 仍可拥有多个面的完整 footprint。原生关系观察冲突或不同原生 identity 被错误合并时拒绝，不能通过扩大覆盖集合染色；Source 不输出预匹配或派生 footprint 答案，两个消费者独立重建适用关系，不再对两套封存派生结果增加互比检查。
 
