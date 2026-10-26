@@ -14,6 +14,14 @@ from typing import Any
 from ...io import PipelineError
 
 UNRECORDED_APPEARANCE = object()
+IMODELDOC2_IID = "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}"
+DOCUMENT_BINDING_API = (
+    "IModelDoc2.GetPathName"
+    "+ConfigurationManager.ActiveConfiguration.Name"
+)
+COMPONENT_ENTITY_BINDING_API = "IComponent2.GetCorrespondingEntity"
+COMPONENT_OBJECT_BINDING_API = "IComponent2.GetCorresponding"
+OWNER_CONTEXT_BINDING_API = "IModelDocExtension.GetPersistReference3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1173,6 +1181,10 @@ def resolve_deliverable_appearance(
                 if document_identity is not None:
                     if (
                         entity["read_errors"]
+                        or context_key[0] != "component_document"
+                        or context_key[3] != DOCUMENT_BINDING_API
+                        or document_identity.get("qi_iid")
+                        != IMODELDOC2_IID
                         or document_identity.get("state") != "observed"
                         or document_identity.get("read_errors")
                         or _document_path_key(
@@ -1201,6 +1213,30 @@ def resolve_deliverable_appearance(
                         ("occurrence", component, 0, 0, 0): {}
                     }
                 else:
+                    identity_kind = (
+                        native_identity.get("kind")
+                        if isinstance(native_identity, Mapping)
+                        else None
+                    )
+                    if context_key[0] == "component_document":
+                        expected_api = (
+                            COMPONENT_ENTITY_BINDING_API
+                            if identity_kind == "entity"
+                            else COMPONENT_OBJECT_BINDING_API
+                            if identity_kind == "object"
+                            else None
+                        )
+                    else:
+                        expected_api = OWNER_CONTEXT_BINDING_API
+                    if expected_api is None or context_key[3] != expected_api:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_binding_unproven",
+                            entity_path + ".binding_context.api",
+                            "the native binding API does not match the entity context",
+                            observed=context_key[3],
+                            expected=expected_api,
+                        )
                     entity_key = _persistent_reference_key(
                         entity.get("persistent_reference")
                     )

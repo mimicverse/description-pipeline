@@ -18,6 +18,15 @@ from ..sources.solidworks.naming import (
     visual_name,
 )
 
+IMODELDOC2_IID = "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}"
+DOCUMENT_BINDING_API = (
+    "IModelDoc2.GetPathName"
+    "+ConfigurationManager.ActiveConfiguration.Name"
+)
+COMPONENT_ENTITY_BINDING_API = "IComponent2.GetCorrespondingEntity"
+COMPONENT_OBJECT_BINDING_API = "IComponent2.GetCorresponding"
+OWNER_CONTEXT_BINDING_API = "IModelDocExtension.GetPersistReference3"
+
 
 def _require(condition: object, message: str) -> None:
     if not condition:
@@ -558,6 +567,10 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                 if document_identity is not None:
                     _require(
                         not entity["read_errors"]
+                        and context_key[0] == "component_document"
+                        and context_key[3] == DOCUMENT_BINDING_API
+                        and document_identity.get("qi_iid")
+                        == IMODELDOC2_IID
                         and document_identity.get("state") == "observed"
                         and not document_identity.get("read_errors")
                         and _document_path_key(
@@ -580,6 +593,26 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         ("occurrence", component, 0, 0, 0): {}
                     }
                 else:
+                    identity_kind = (
+                        native_identity.get("kind")
+                        if isinstance(native_identity, Mapping)
+                        else None
+                    )
+                    if context_key[0] == "component_document":
+                        expected_api = (
+                            COMPONENT_ENTITY_BINDING_API
+                            if identity_kind == "entity"
+                            else COMPONENT_OBJECT_BINDING_API
+                            if identity_kind == "object"
+                            else None
+                        )
+                    else:
+                        expected_api = OWNER_CONTEXT_BINDING_API
+                    _require(
+                        expected_api is not None
+                        and context_key[3] == expected_api,
+                        f"{entity_path} native binding API is inconsistent",
+                    )
                     entity_key = _persistent_reference_key(
                         entity.get("persistent_reference")
                     )

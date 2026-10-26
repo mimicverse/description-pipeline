@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import unittest
 
 from description_pipeline.sources.solidworks.appearance import (
@@ -149,6 +150,14 @@ def _binding_context(
         "owner_document_path": owner_document_path,
         "component": COMPONENT,
         "api": api,
+    }
+
+
+def _native_identity(kind: str):
+    return {
+        "kind": kind,
+        "state": "observed",
+        "read_errors": {},
     }
 
 
@@ -372,6 +381,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "binding_context": _binding_context(
                     owner_scope="top_assembly",
                     owner_document_path=r"C:\capture\robot.SLDASM",
+                    api="IModelDocExtension.GetPersistReference3",
                 ),
                 "target": {
                     "kind": "occurrence",
@@ -393,7 +403,9 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "binding_context": _binding_context(
                             owner_scope="top_assembly",
                             owner_document_path=r"C:\capture\robot.SLDASM",
+                            api="IModelDocExtension.GetPersistReference3",
                         ),
+                        "native_identity": _native_identity("object"),
                         "matched_identity": {
                             "occurrences": [],
                             "bodies": [],
@@ -610,6 +622,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                             owner_document_path=DOCUMENT,
                             api="IComponent2.GetCorresponding",
                         ),
+                        "native_identity": _native_identity("object"),
                         "matched_identity": {},
                         "read_errors": {},
                     }
@@ -694,6 +707,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                             owner_document_path=DOCUMENT,
                             api="IComponent2.GetCorrespondingEntity",
                         ),
+                        "native_identity": _native_identity("entity"),
                         "matched_identity": {},
                         "read_errors": {},
                     }
@@ -806,6 +820,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                                 "native_object_type": "_CDispatch",
                                 "persistent_reference": [1, 2, 3],
                                 "binding_context": binding_context,
+                                "native_identity": _native_identity("object"),
                                 "matched_identity": {},
                                 "read_errors": {},
                             }
@@ -905,6 +920,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "binding_context": binding_context,
                         "native_identity": {
                             "kind": "document",
+                            "qi_iid": "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}",
                             "document_path": DOCUMENT,
                             "active_configuration": CONFIGURATION,
                             "owner_document_path": DOCUMENT,
@@ -947,6 +963,44 @@ class AppearanceResolutionTests(unittest.TestCase):
             {face.rgba for face in resolved.faces},
             {(1.0, 0.0, 0.0, 1.0)},
         )
+        for field, value in (
+            ("qi_iid", "{wrong-iid}"),
+            ("binding_api", "IModelDocExtension.GetCorrespondingEntity2"),
+        ):
+            malformed = copy.deepcopy(raw)
+            entity = malformed["state_render_materials"][0]["materials"][
+                0
+            ]["entity_records"][0]
+            if field == "qi_iid":
+                entity["native_identity"]["qi_iid"] = value
+            else:
+                entity["binding_context"]["api"] = value
+            with (
+                self.subTest(field=field),
+                self.assertRaises(AppearanceError) as caught,
+            ):
+                resolve_deliverable_appearance(
+                    malformed,
+                    component=COMPONENT,
+                    expected_document_path=DOCUMENT,
+                    expected_configuration=CONFIGURATION,
+                    face_spans=[
+                        {
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": face_index,
+                            "triangle_start": face_index,
+                            "triangle_count": 1,
+                            "face_reference_sha256": str(face_index + 1)
+                            * 64,
+                        }
+                        for face_index in (0, 1)
+                    ],
+                )
+            self.assertEqual(
+                caught.exception.appearance["issues"][0]["code"],
+                "cad_appearance_render_entity_binding_unproven",
+            )
 
     def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
         for failure in (
@@ -995,6 +1049,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                         owner_document_path=DOCUMENT,
                         api="IComponent2.GetCorresponding",
                     ),
+                    "native_identity": _native_identity("object"),
                     "matched_identity": {
                         "occurrences": [],
                         "bodies": [],
@@ -1108,6 +1163,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                                     owner_document_path=DOCUMENT,
                                     api="IComponent2.GetCorrespondingEntity",
                                 ),
+                                "native_identity": _native_identity("entity"),
                                 "read_errors": {},
                                 "matched_identity": {
                                     "occurrences": [],

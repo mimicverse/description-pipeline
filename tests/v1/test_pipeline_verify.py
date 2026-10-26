@@ -290,6 +290,11 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "component": "arm-1",
                             "api": "IComponent2.GetCorresponding",
                         },
+                        "native_identity": {
+                            "kind": "object",
+                            "state": "observed",
+                            "read_errors": {},
+                        },
                         "matched_identity": {
                             "occurrences": [],
                             "bodies": [],
@@ -376,6 +381,11 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_document_path": "C:/cad/arm.SLDPRT",
                             "component": "arm-1",
                             "api": "IComponent2.GetCorrespondingEntity",
+                        },
+                        "native_identity": {
+                            "kind": "entity",
+                            "state": "observed",
+                            "read_errors": {},
                         },
                         "matched_identity": {},
                         "read_errors": {},
@@ -468,6 +478,11 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                                 "native_object_type": "_CDispatch",
                                 "persistent_reference": [1, 2, 3],
                                 "binding_context": binding_context,
+                                "native_identity": {
+                                    "kind": "object",
+                                    "state": "observed",
+                                    "read_errors": {},
+                                },
                                 "matched_identity": {},
                                 "read_errors": {},
                             }
@@ -555,6 +570,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         },
                         "native_identity": {
                             "kind": "document",
+                            "qi_iid": "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}",
                             "document_path": "C:/cad/arm.SLDPRT",
                             "active_configuration": "Painted",
                             "owner_document_path": "C:/cad/arm.SLDPRT",
@@ -592,6 +608,24 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             },
             {(1.0, 0.0, 0.0, 1.0)},
         )
+        for field, value in (
+            ("qi_iid", "{wrong-iid}"),
+            ("binding_api", "IModelDocExtension.GetCorrespondingEntity2"),
+        ):
+            malformed = copy.deepcopy(raw)
+            entity = malformed["state_render_materials"][-1]["materials"][
+                0
+            ]["entity_records"][0]
+            if field == "qi_iid":
+                entity["native_identity"]["qi_iid"] = value
+            else:
+                entity["binding_context"]["api"] = value
+            with self.subTest(field=field), self.assertRaises(PipelineError):
+                _resolved_faces(
+                    malformed,
+                    configuration="Painted",
+                    where="capture",
+                )
 
     def test_independent_appearance_accepts_null_with_zero_native_count(self):
         from description_pipeline.verification.native_appearance import _resolved_faces
@@ -647,7 +681,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     "owner_scope": "top_assembly",
                     "owner_document_path": "fixture-top.SLDASM",
                     "component": "arm-1",
-                    "api": "IComponent2.GetCorrespondingEntity",
+                    "api": "IModelDocExtension.GetPersistReference3",
                 },
                 "target": {
                     "kind": "occurrence",
@@ -670,7 +704,12 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "owner_scope": "top_assembly",
                             "owner_document_path": "fixture-top.SLDASM",
                             "component": "arm-1",
-                            "api": "IComponent2.GetCorrespondingEntity",
+                            "api": "IModelDocExtension.GetPersistReference3",
+                        },
+                        "native_identity": {
+                            "kind": "object",
+                            "state": "observed",
+                            "read_errors": {},
                         },
                         "matched_identity": {
                             "occurrences": [],
