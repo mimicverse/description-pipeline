@@ -4941,7 +4941,6 @@ class SolidWorksBackend(CadBackend):
         }
         mapping_errors = []
         native_reference_index = []
-        index_keys = set()
 
         def add(kind, entity, identity):
             reference, error = _appearance_persistent_reference(
@@ -4960,25 +4959,22 @@ class SolidWorksBackend(CadBackend):
             key = _appearance_reference_key(reference)
             if key is not None:
                 maps[kind].setdefault(key, []).append(identity)
-                index_key = (kind, key)
-                if index_key not in index_keys:
-                    index_keys.add(index_key)
-                    target = copy.deepcopy(identity)
-                    target.pop("persistent_reference", None)
-                    native_reference_index.append(
-                        {
-                            "persistent_reference": copy.deepcopy(reference),
-                            "target": {
-                                "kind": {
-                                    "occurrences": "occurrence",
-                                    "bodies": "body",
-                                    "faces": "face",
-                                    "features": "feature",
-                                }[kind],
-                                **target,
-                            },
-                        }
-                    )
+                target = copy.deepcopy(identity)
+                target.pop("persistent_reference", None)
+                native_reference_index.append(
+                    {
+                        "persistent_reference": copy.deepcopy(reference),
+                        "target": {
+                            "kind": {
+                                "occurrences": "occurrence",
+                                "bodies": "body",
+                                "faces": "face",
+                                "features": "feature",
+                            }[kind],
+                            **target,
+                        },
+                    }
+                )
 
         for name, component in holders:
             add("occurrences", component, {"component": name})

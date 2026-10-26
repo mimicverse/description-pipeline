@@ -3536,6 +3536,7 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
     def test_cached_owner_facts_are_remapped_per_occurrence(self) -> None:
         render_calls = []
         face_a = types.SimpleNamespace(_persist_reference=b"face-a")
+        alias_face_a = types.SimpleNamespace(_persist_reference=b"face-a")
         face_b = types.SimpleNamespace(_persist_reference=b"face-b")
         failing_face = types.SimpleNamespace(_persist_reference=b"face-fail")
         null_reference_face = types.SimpleNamespace(
@@ -3609,7 +3610,14 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                         "body_index": 0,
                         "face_index": 0,
                         "face": face_a,
-                    }
+                    },
+                    {
+                        "component": "component-a",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 1,
+                        "face": alias_face_a,
+                    },
                 ],
                 features=[],
                 cache=cache,
@@ -3664,6 +3672,13 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             first_entity["matched_identity"]["faces"][0]["component"],
             "component-a",
         )
+        self.assertEqual(
+            {
+                row["face_index"]
+                for row in first_entity["matched_identity"]["faces"]
+            },
+            {0, 1},
+        )
         self.assertEqual(second_entity["matched_identity"]["faces"], [])
         self.assertEqual(second[0]["mapping_errors"][0]["entity_kind"], "faces")
         self.assertEqual(
@@ -3685,6 +3700,16 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 "body_type": 0,
                 "body_index": 0,
                 "face_index": 0,
+            },
+            first_targets,
+        )
+        self.assertIn(
+            {
+                "kind": "face",
+                "component": "component-a",
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": 1,
             },
             first_targets,
         )
