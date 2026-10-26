@@ -47,6 +47,9 @@ state material 的原生对象绑定由 entity persistent reference、同一 own
 `native_reference_index` 独立 join，不能信任 Source 预填的 `matched_identity`。document
 target 必须保留并核验 `IModelDoc2` QI、path、active configuration 与 leaf owner；assembly
 context 只接受已证明方向的 `IComponent2.GetCorresponding` / `GetCorrespondingEntity`。
+同一 occurrence 内的 material 优先级固定为 `face > feature > body > part document`；
+document target 表示 part 材质，不能无条件提升为 assembly occurrence override。真实
+assembly occurrence override 仍优先于上述 part 内层级。
 同一 feature identity 可拥有多个 `faces[]`，不同 identity 共享 reference 仍为未知。
 没有索引或索引失败的 entity 视为未知；只有成功的原生 context 明确指向当前交付 scope
 外对象时才能忽略。

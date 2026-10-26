@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import unittest
+from pathlib import Path
 
 from description_pipeline.sources.solidworks.appearance import (
     AppearanceError,
@@ -19,6 +21,11 @@ from . import support
 COMPONENT = "arm-1"
 DOCUMENT = r"C:\capture\arm.SLDPRT"
 CONFIGURATION = "Painted"
+PART_FACE_OVERRIDE_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "fixtures"
+    / "native-appearance-part-face-override.json"
+)
 
 
 def _layer(
@@ -284,6 +291,108 @@ class CaptureAppearanceBindingTests(unittest.TestCase):
 
 
 class AppearanceResolutionTests(unittest.TestCase):
+    def test_part_material_precedes_only_lower_scopes(self):
+        case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))
+        resolved = resolve_deliverable_appearance(
+            copy.deepcopy(case["raw"]),
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=case["face_spans"],
+        )
+        self.assertEqual(
+            {face.face_index: face.rgba for face in resolved.faces},
+            {
+                0: (0.0, 0.0, 1.0, 1.0),
+                1: (1.0, 0.0, 0.0, 1.0),
+            },
+        )
+        self.assertEqual(
+            {
+                face.face_index: face.source["scopes"]
+                for face in resolved.faces
+            },
+            {0: ["face"], 1: ["document"]},
+        )
+
+    def test_assembly_occurrence_override_precedes_part_and_face(self):
+        case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))
+        raw = copy.deepcopy(case["raw"])
+        top = _empty_state_owner(
+            scope="top_assembly",
+            document_path=r"C:\capture\robot.SLDASM",
+            configuration="Top Configuration",
+            display_state="Top State",
+            display_states=["Top State"],
+            display_states_state="observed",
+        )
+        top["call_state"] = "observed"
+        top["native_render_material_count"] = 1
+        top["native_reference_index"] = [
+            {
+                "persistent_reference": [4, 5, 6],
+                "binding_context": _binding_context(
+                    owner_scope="top_assembly",
+                    owner_document_path=r"C:\capture\robot.SLDASM",
+                    api="IModelDocExtension.GetPersistReference3",
+                ),
+                "target": {"kind": "occurrence", "component": COMPONENT},
+            }
+        ]
+        top["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Top State"],
+                "entities": ["top-occurrence"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "IComponent2",
+                        "persistent_reference": [4, 5, 6],
+                        "binding_context": _binding_context(
+                            owner_scope="top_assembly",
+                            owner_document_path=r"C:\capture\robot.SLDASM",
+                            api="IModelDocExtension.GetPersistReference3",
+                        ),
+                        "source_persistent_reference": None,
+                        "source_read_errors": {},
+                        "native_identity": _native_identity(
+                            "object",
+                            owner_scope="top_assembly",
+                            api="IModelDocExtension.GetPersistReference3",
+                            persistent_reference=[4, 5, 6],
+                            target_reference=[4, 5, 6],
+                        ),
+                        "matched_identity": {},
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x0000FF00,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        raw["state_render_materials"].insert(0, top)
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=case["face_spans"],
+        )
+        self.assertEqual(
+            {face.rgba for face in resolved.faces},
+            {(0.0, 1.0, 0.0, 1.0)},
+        )
+        self.assertEqual(
+            {tuple(face.source["scopes"]) for face in resolved.faces},
+            {("occurrence",)},
+        )
+
     def test_face_owners_partition_one_occurrence_into_multiple_materials(self):
         red = [1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.25, 0.0]
         blue = [0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]

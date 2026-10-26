@@ -18,6 +18,8 @@ Linux 负责上传冻结、受控规格、结构推导、模型生成、独立�
 
 外观读取在同一个只读会话中保留 document/face 的无参 active-configuration 属性（仅当 active 与 referenced configuration 相同）、各 owner 自己的 configuration/display-state wrapper、同一 exact state 的 `GetRenderMaterialsCount2` 总数与 NULL 原值，以及同 owner/context 的持久引用和对象观察索引。Generate 与 Verify 分别从这些 raw 事实重建绑定；原生总数确证为 0 不等于把 NULL 改写成空数组，无法绑定或无法证明无关的实体不会被静默忽略。
 
+part 内材质按 `face > feature > body > part document` 解析；document target 不会提升为 assembly occurrence override。真实 assembly occurrence override 仍优先于 part 内层级。
+
 历史手工 URDF 只作为隔离的参考单元测试和回归测试 fixture，不进入生产采集、Generate、Verify 真值或发布必经链。测试只在 fixture 声明兼容的 CAD 原件、配置和修订上运行，按拓扑、几何和运动语义及有依据的容差比较，不锁定 XML／STL 字节、元素或三角形顺序、合法三角化或已批准的纯表示差异；不同版本不得硬匹配旧 URDF。
 
 每份交付绑定输入、原生证据、工具身份、模型和实际文件。独立验证从原始证据重新建立预期值，并检查交付的 XML、网格与 MuJoCo 加载结果。发布再次核对 Git 中的字节和远端 PR。

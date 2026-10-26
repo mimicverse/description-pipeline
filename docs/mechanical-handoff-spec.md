@@ -168,7 +168,9 @@ parent 和 component-document owner 分别保留自己的 configuration/display-
 state render assignment；present rows 的基数必须与总数一致。Generate 与 Verify 必须从
 entity reference 与同一 owner/context 索引独立 join，不信任 Source 预填匹配；document
 target 必须核验 `IModelDoc2` QI、path 与 active configuration，feature 的多 face 只在
-同一 native feature identity 下合法。
+同一 native feature identity 下合法。part 内材质优先级为 `face > feature > body >
+part document`；document target 只表示 part 材质，不能提升为 assembly occurrence
+override。真实 assembly occurrence override 仍高于该 part 内层级。
 
 最终表示按实际交付 face 的 triangle spans 生成一个或多个 visual/material；alpha 从原生
 透明度派生并保留来源 warning。`PrimaryColor` 按版本化 COLORREF 规则从低到高解码 RGB，

@@ -1,0 +1,327 @@
+{
+  "scenario": "One leaf document has an exact-state red part material and an exact-state blue material on face 0. Both entity identities are independently bound. Face 1 has no local assignment.",
+  "expected_rgba": {
+    "0": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+    ],
+    "1": [
+      1.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "raw": {
+    "component": "arm-1",
+    "source_document_path": "C:\\capture\\arm.SLDPRT",
+    "referenced_configuration": "Painted",
+    "native_active_configuration": "Painted",
+    "native_active_configuration_error": null,
+    "document": {
+      "used_api": "appearance/Painted",
+      "material_call": {
+        "configuration_semantics": "requested_configuration",
+        "configuration_option": 3,
+        "configuration_names": [
+          "Painted"
+        ]
+      },
+      "presence_call": {
+        "arguments": [],
+        "configuration_semantics": "native_owner_context"
+      },
+      "material_property_values": null,
+      "has_material_property_values": false,
+      "texture": {
+        "configuration": "Painted",
+        "state": "absent",
+        "material_name": null
+      },
+      "read_errors": {}
+    },
+    "occurrence": {
+      "used_api": "appearance/Painted",
+      "material_call": {
+        "configuration_semantics": "requested_configuration",
+        "configuration_option": 3,
+        "configuration_names": [
+          "Painted"
+        ]
+      },
+      "presence_call": {
+        "arguments": [],
+        "configuration_semantics": "native_owner_context"
+      },
+      "material_property_values": null,
+      "has_material_property_values": false,
+      "texture": {
+        "configuration": "Painted",
+        "state": "absent",
+        "material_name": null
+      },
+      "read_errors": {}
+    },
+    "bodies": [
+      {
+        "component": "arm-1",
+        "enumeration_api": "IComponent2.GetBodies2",
+        "body_type": 0,
+        "body_index": 0,
+        "body_name": "arm",
+        "appearance": {
+          "used_api": "appearance/Painted",
+          "material_call": {
+            "configuration_semantics": "active_configuration",
+            "active_configuration": "Painted"
+          },
+          "presence_call": {
+            "arguments": [],
+            "configuration_semantics": "native_owner_context"
+          },
+          "material_property_values": null,
+          "has_material_property_values": false,
+          "texture": {
+            "configuration": "Painted",
+            "state": "absent",
+            "material_name": null
+          },
+          "read_errors": {}
+        },
+        "faces": [
+          {
+            "face_index": 0,
+            "appearance": {
+              "used_api": "appearance/Painted",
+              "material_call": {
+                "configuration_semantics": "requested_configuration",
+                "configuration_option": 3,
+                "configuration_names": [
+                  "Painted"
+                ]
+              },
+              "presence_call": {
+                "arguments": [],
+                "configuration_semantics": "native_owner_context"
+              },
+              "material_property_values": null,
+              "has_material_property_values": false,
+              "texture": {
+                "configuration": "Painted",
+                "state": "absent",
+                "material_name": null
+              },
+              "read_errors": {}
+            }
+          },
+          {
+            "face_index": 1,
+            "appearance": {
+              "used_api": "appearance/Painted",
+              "material_call": {
+                "configuration_semantics": "requested_configuration",
+                "configuration_option": 3,
+                "configuration_names": [
+                  "Painted"
+                ]
+              },
+              "presence_call": {
+                "arguments": [],
+                "configuration_semantics": "native_owner_context"
+              },
+              "material_property_values": null,
+              "has_material_property_values": false,
+              "texture": {
+                "configuration": "Painted",
+                "state": "absent",
+                "material_name": null
+              },
+              "read_errors": {}
+            }
+          }
+        ]
+      }
+    ],
+    "native_referenced_display_state": "Display State 1",
+    "native_referenced_display_state_error": null,
+    "state_render_materials": [
+      {
+        "owner_document_path": "C:\\capture\\arm.SLDPRT",
+        "owner_scope": "component_document",
+        "api": "IModelDocExtension.GetRenderMaterials2",
+        "display_state_option": 3,
+        "configuration": "Painted",
+        "display_state": "Display State 1",
+        "display_states": null,
+        "display_states_state": "not_applicable",
+        "native_render_material_count_api": "IModelDocExtension.GetRenderMaterialsCount2",
+        "native_render_material_count": 2,
+        "native_render_material_count_error": null,
+        "call_state": "observed",
+        "materials": [
+          {
+            "material_index": 0,
+            "linked_display_states": [
+              "Display State 1"
+            ],
+            "entities": [
+              "document"
+            ],
+            "entities_state": "observed",
+            "entity_records": [
+              {
+                "entity_index": 0,
+                "native_object_type": "IModelDoc2",
+                "persistent_reference": null,
+                "binding_context": {
+                  "owner_scope": "component_document",
+                  "owner_document_path": "C:\\capture\\parent.SLDASM",
+                  "component": "arm-1",
+                  "api": "IModelDoc2.GetPathName+ConfigurationManager.ActiveConfiguration.Name"
+                },
+                "native_identity": {
+                  "kind": "document",
+                  "qi_iid": "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}",
+                  "document_path": "C:\\capture\\arm.SLDPRT",
+                  "active_configuration": "Painted",
+                  "owner_document_path": "C:\\capture\\arm.SLDPRT",
+                  "owner_configuration": "Painted",
+                  "owner_display_state": "Display State 1",
+                  "state": "observed",
+                  "read_errors": {}
+                },
+                "matched_identity": {},
+                "read_errors": {}
+              }
+            ],
+            "primary_color": 255,
+            "transparency": 0.0,
+            "color_form": 1,
+            "texture_filename": "",
+            "surface_finish_file": "",
+            "read_errors": {}
+          },
+          {
+            "material_index": 1,
+            "linked_display_states": [
+              "Display State 1"
+            ],
+            "entities": [
+              "face-zero"
+            ],
+            "entities_state": "observed",
+            "entity_records": [
+              {
+                "entity_index": 0,
+                "native_object_type": "IFace2",
+                "persistent_reference": [
+                  11,
+                  12,
+                  13
+                ],
+                "source_persistent_reference": [
+                  1,
+                  2,
+                  3
+                ],
+                "source_read_errors": {},
+                "binding_context": {
+                  "owner_scope": "component_document",
+                  "owner_document_path": "C:\\capture\\parent.SLDASM",
+                  "component": "arm-1",
+                  "api": "IComponent2.GetCorrespondingEntity"
+                },
+                "native_identity": {
+                  "kind": "entity",
+                  "owner_document_path": "C:\\capture\\arm.SLDPRT",
+                  "owner_configuration": "Painted",
+                  "owner_display_state": "Display State 1",
+                  "binding_context": {
+                    "owner_scope": "component_document",
+                    "owner_document_path": "C:\\capture\\parent.SLDASM",
+                    "component": "arm-1",
+                    "api": "IComponent2.GetCorrespondingEntity"
+                  },
+                  "context": {
+                    "owner_scope": "component_document",
+                    "input_kind": "IEntity",
+                    "api": "IComponent2.GetCorrespondingEntity",
+                    "persistent_reference": [
+                      11,
+                      12,
+                      13
+                    ],
+                    "target_reference_attempt": {
+                      "api": "IModelDocExtension.GetPersistReference3",
+                      "persistent_reference": null,
+                      "error": {
+                        "code": "cad_appearance_persistent_reference_missing",
+                        "message": "the apparent owner reference is unavailable",
+                        "detail": {}
+                      }
+                    },
+                    "state": "observed",
+                    "read_errors": {}
+                  },
+                  "state": "observed",
+                  "read_errors": {}
+                },
+                "read_errors": {}
+              }
+            ],
+            "primary_color": 16711680,
+            "transparency": 0.0,
+            "color_form": 1,
+            "texture_filename": "",
+            "surface_finish_file": "",
+            "read_errors": {}
+          }
+        ],
+        "mapping_errors": [],
+        "native_reference_index": [
+          {
+            "persistent_reference": [
+              11,
+              12,
+              13
+            ],
+            "binding_context": {
+              "owner_scope": "component_document",
+              "owner_document_path": "C:\\capture\\parent.SLDASM",
+              "component": "arm-1",
+              "api": "IComponent2.GetCorrespondingEntity"
+            },
+            "target": {
+              "kind": "face",
+              "component": "arm-1",
+              "body_type": 0,
+              "body_index": 0,
+              "face_index": 0
+            }
+          }
+        ],
+        "read_errors": {}
+      }
+    ]
+  },
+  "face_spans": [
+    {
+      "body_type": 0,
+      "body_index": 0,
+      "face_index": 0,
+      "triangle_start": 0,
+      "triangle_count": 1,
+      "face_reference_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "body_type": 0,
+      "body_index": 0,
+      "face_index": 1,
+      "triangle_start": 1,
+      "triangle_count": 1,
+      "face_reference_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ]
+}

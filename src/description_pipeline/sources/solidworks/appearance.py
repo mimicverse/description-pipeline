@@ -22,6 +22,13 @@ DOCUMENT_BINDING_API = (
 COMPONENT_ENTITY_BINDING_API = "IComponent2.GetCorrespondingEntity"
 COMPONENT_OBJECT_BINDING_API = "IComponent2.GetCorresponding"
 OWNER_CONTEXT_BINDING_API = "IModelDocExtension.GetPersistReference3"
+APPEARANCE_SCOPE_ORDER = (
+    "occurrence",
+    "face",
+    "feature",
+    "body",
+    "document",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1151,6 +1158,7 @@ def resolve_deliverable_appearance(
                 "face": set(),
                 "feature": set(),
                 "body": set(),
+                "document": set(),
             }
             for entity_index, entity in enumerate(entities):
                 entity_path = f"{path}.entities[{entity_index}]"
@@ -1218,7 +1226,7 @@ def resolve_deliverable_appearance(
                             observed=dict(document_identity),
                         )
                     current_targets = {
-                        ("occurrence", component, 0, 0, 0): {}
+                        ("document", component, 0, 0, 0): {}
                     }
                 else:
                     identity_kind = (
@@ -1420,6 +1428,9 @@ def resolve_deliverable_appearance(
                 if kind == "occurrence":
                     faces_by_scope["occurrence"] |= set(all_faces)
                     continue
+                if kind == "document":
+                    faces_by_scope["document"] |= set(all_faces)
+                    continue
                 face_key = (body_type, body_index, face_index)
                 if kind == "body":
                     faces_by_scope["body"] |= {
@@ -1504,7 +1515,7 @@ def resolve_deliverable_appearance(
         body_key = key[:2]
         body_owner_raw, body_faces_raw = body_owners[body_key]
         selected = None
-        for scope in ("occurrence", "face", "feature", "body", "document"):
+        for scope in APPEARANCE_SCOPE_ORDER:
             choices = []
             if scope == "occurrence" and occurrence_owner is not None:
                 owner = _owner_color(
@@ -1545,23 +1556,33 @@ def resolve_deliverable_appearance(
                 if owner is not None:
                     choices.append({"rgba": owner[0], "source": owner[1]})
             elif scope == "document":
-                owner = _owner_color(
-                    document_owner,
-                    component=component,
-                    path="appearance_raw.document",
-                    expected_configuration=configuration,
-                    use_presence=False,
+                choices.extend(
+                    {
+                        "rgba": material["rgba"],
+                        "source": material["source"],
+                    }
+                    for material in parsed_materials
+                    if key in material["faces_by_scope"].get(scope, set())
                 )
-                if owner is not None:
-                    choices.append({"rgba": owner[0], "source": owner[1]})
-            choices.extend(
-                {
-                    "rgba": material["rgba"],
-                    "source": material["source"],
-                }
-                for material in parsed_materials
-                if key in material["faces_by_scope"].get(scope, set())
-            )
+                if not choices:
+                    owner = _owner_color(
+                        document_owner,
+                        component=component,
+                        path="appearance_raw.document",
+                        expected_configuration=configuration,
+                        use_presence=False,
+                    )
+                    if owner is not None:
+                        choices.append({"rgba": owner[0], "source": owner[1]})
+            if scope != "document":
+                choices.extend(
+                    {
+                        "rgba": material["rgba"],
+                        "source": material["source"],
+                    }
+                    for material in parsed_materials
+                    if key in material["faces_by_scope"].get(scope, set())
+                )
             if not choices:
                 continue
             colors = {

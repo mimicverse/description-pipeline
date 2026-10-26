@@ -26,6 +26,13 @@ DOCUMENT_BINDING_API = (
 COMPONENT_ENTITY_BINDING_API = "IComponent2.GetCorrespondingEntity"
 COMPONENT_OBJECT_BINDING_API = "IComponent2.GetCorresponding"
 OWNER_CONTEXT_BINDING_API = "IModelDocExtension.GetPersistReference3"
+APPEARANCE_SCOPE_ORDER = (
+    "occurrence",
+    "face",
+    "feature",
+    "body",
+    "document",
+)
 
 
 def _require(condition: object, message: str) -> None:
@@ -542,6 +549,7 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                 "face": set(),
                 "feature": set(),
                 "body": set(),
+                "document": set(),
             }
             for entity_index, entity in enumerate(material["entity_records"]):
                 entity_path = f"{material_path}.entities[{entity_index}]"
@@ -594,7 +602,7 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                         f"{entity_path} document identity is not the current leaf",
                     )
                     current_targets = {
-                        ("occurrence", component, 0, 0, 0): {}
+                        ("document", component, 0, 0, 0): {}
                     }
                 else:
                     identity_kind = (
@@ -739,6 +747,9 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                 if kind == "occurrence":
                     faces_by_scope["occurrence"] |= all_faces
                     continue
+                if kind == "document":
+                    faces_by_scope["document"] |= all_faces
+                    continue
                 face_key = (body_type, body_index, face_index)
                 if kind == "body":
                     faces_by_scope["body"] |= {
@@ -812,7 +823,7 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
     for face in sorted(all_faces):
         body_key = face[:2]
         selected = None
-        for scope in ("occurrence", "face", "feature", "body", "document"):
+        for scope in APPEARANCE_SCOPE_ORDER:
             current = []
             owner = {
                 "occurrence": occurrence,
@@ -820,7 +831,16 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                 "body": body_owners[body_key],
                 "document": document,
             }.get(scope)
-            if owner is not None:
+            if scope == "document":
+                current.extend(
+                    {
+                        "rgba": material["rgba"],
+                        "source": material["source"],
+                    }
+                    for material in state_materials
+                    if face in material.get("faces_by_scope", {}).get(scope, set())
+                )
+            elif owner is not None:
                 resolved_owner = _owner_rgba(
                     owner,
                     configuration=configuration,
@@ -834,14 +854,29 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                             "source": resolved_owner[1],
                         }
                     )
-            current.extend(
-                {
-                    "rgba": material["rgba"],
-                    "source": material["source"],
-                }
-                for material in state_materials
-                if face in material.get("faces_by_scope", {}).get(scope, set())
-            )
+            if scope != "document":
+                current.extend(
+                    {
+                        "rgba": material["rgba"],
+                        "source": material["source"],
+                    }
+                    for material in state_materials
+                    if face in material.get("faces_by_scope", {}).get(scope, set())
+                )
+            elif not current and owner is not None:
+                resolved_owner = _owner_rgba(
+                    owner,
+                    configuration=configuration,
+                    where=f"{where}.{scope}",
+                    use_presence=False,
+                )
+                if resolved_owner is not None:
+                    current.append(
+                        {
+                            "rgba": resolved_owner[0],
+                            "source": resolved_owner[1],
+                        }
+                    )
             if not current:
                 continue
             colors = {tuple(choice["rgba"]) for choice in current}

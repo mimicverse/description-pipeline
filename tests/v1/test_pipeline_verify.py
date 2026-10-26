@@ -64,6 +64,11 @@ from tests.v1 import verification_fixture as hermetic
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_SCHEMA = Path(__file__).resolve().parents[2] / "deploy" / "platform" / "schema.sql"
+PART_FACE_OVERRIDE_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "fixtures"
+    / "native-appearance-part-face-override.json"
+)
 
 
 class PipelineVerifyHandlerTests(unittest.TestCase):
@@ -799,6 +804,15 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 "read_errors": {},
             }
         ]
+        for base_owner in (raw["document"], raw["occurrence"]):
+            base_owner["material_property_values"] = None
+            base_owner["has_material_property_values"] = False
+        for body in raw["bodies"]:
+            body["appearance"]["material_property_values"] = None
+            body["appearance"]["has_material_property_values"] = False
+            for face in body["faces"]:
+                face["appearance"]["material_property_values"] = None
+                face["appearance"]["has_material_property_values"] = False
         raw["document"]["texture"] = {
             "configuration": "Painted",
             "state": "present",
@@ -834,6 +848,151 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     configuration="Painted",
                     where="capture",
                 )
+
+    def test_independent_appearance_applies_part_and_face_scope_priority(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        case = read_data(PART_FACE_OVERRIDE_FIXTURE)
+        resolved = _resolved_faces(
+            copy.deepcopy(case["raw"]),
+            configuration="Painted",
+            where="capture",
+        )
+        self.assertEqual(
+            {
+                face: row["rgba"]
+                for face, row in resolved["faces"].items()
+            },
+            {
+                (0, 0, 0): (0.0, 0.0, 1.0, 1.0),
+                (0, 0, 1): (1.0, 0.0, 0.0, 1.0),
+            },
+        )
+        self.assertEqual(
+            {
+                face: row["source"]["scopes"]
+                for face, row in resolved["faces"].items()
+            },
+            {
+                (0, 0, 0): ["face"],
+                (0, 0, 1): ["document"],
+            },
+        )
+
+    def test_independent_assembly_override_beats_part_and_face(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        case = read_data(PART_FACE_OVERRIDE_FIXTURE)
+        raw = copy.deepcopy(case["raw"])
+        top = {
+            "owner_document_path": "C:/cad/robot.SLDASM",
+            "owner_scope": "top_assembly",
+            "api": "IModelDocExtension.GetRenderMaterials2",
+            "display_state_option": 3,
+            "configuration": "Top Configuration",
+            "display_state": "Top State",
+            "display_states": ["Top State"],
+            "display_states_state": "observed",
+            "native_render_material_count_api": (
+                "IModelDocExtension.GetRenderMaterialsCount2"
+            ),
+            "native_render_material_count": 1,
+            "native_render_material_count_error": None,
+            "call_state": "observed",
+            "materials": [
+                {
+                    "material_index": 0,
+                    "linked_display_states": ["Top State"],
+                    "entities": ["top-occurrence"],
+                    "entities_state": "observed",
+                    "entity_records": [
+                        {
+                            "entity_index": 0,
+                            "native_object_type": "IComponent2",
+                            "persistent_reference": [4, 5, 6],
+                            "binding_context": {
+                                "owner_scope": "top_assembly",
+                                "owner_document_path": "C:/cad/robot.SLDASM",
+                                "component": "arm-1",
+                                "api": (
+                                    "IModelDocExtension.GetPersistReference3"
+                                ),
+                            },
+                            "native_identity": {
+                                "kind": "object",
+                                "owner_document_path": "C:/cad/arm.SLDPRT",
+                                "owner_configuration": "Painted",
+                                "owner_display_state": "Top State",
+                                "context": {
+                                    "owner_scope": "top_assembly",
+                                    "input_kind": "persistent_object",
+                                    "api": (
+                                        "IModelDocExtension.GetPersistReference3"
+                                    ),
+                                    "persistent_reference": [4, 5, 6],
+                                    "target_reference_attempt": {
+                                        "api": (
+                                            "IModelDocExtension.GetPersistReference3"
+                                        ),
+                                        "persistent_reference": [4, 5, 6],
+                                        "error": None,
+                                    },
+                                    "state": "observed",
+                                    "read_errors": {},
+                                },
+                                "state": "observed",
+                                "read_errors": {},
+                            },
+                            "matched_identity": {},
+                            "read_errors": {},
+                        }
+                    ],
+                    "primary_color": 0x0000FF00,
+                    "transparency": 0.0,
+                    "color_form": 1,
+                    "texture_filename": "",
+                    "surface_finish_file": "",
+                    "read_errors": {},
+                }
+            ],
+            "mapping_errors": [],
+            "native_reference_index": [
+                {
+                    "persistent_reference": [4, 5, 6],
+                    "binding_context": {
+                        "owner_scope": "top_assembly",
+                        "owner_document_path": "C:/cad/robot.SLDASM",
+                        "component": "arm-1",
+                        "api": "IModelDocExtension.GetPersistReference3",
+                    },
+                    "target": {
+                        "kind": "occurrence",
+                        "component": "arm-1",
+                    },
+                }
+            ],
+            "read_errors": {},
+        }
+        raw["state_render_materials"].insert(0, top)
+        resolved = _resolved_faces(
+            raw,
+            configuration="Painted",
+            where="capture",
+        )
+        self.assertEqual(
+            {
+                row["rgba"]
+                for row in resolved["faces"].values()
+            },
+            {(0.0, 1.0, 0.0, 1.0)},
+        )
+        self.assertEqual(
+            {
+                tuple(row["source"]["scopes"])
+                for row in resolved["faces"].values()
+            },
+            {("occurrence",)},
+        )
 
     def test_independent_appearance_accepts_null_with_zero_native_count(self):
         from description_pipeline.verification.native_appearance import _resolved_faces
