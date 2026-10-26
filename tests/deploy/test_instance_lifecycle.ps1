@@ -1439,7 +1439,12 @@ Check 'outer.unknown_owner_candidate_started_once' ((@($outer.calls | Where-Obje
 $outer = Invoke-Outer 'promote_prestop_identity_mismatch'
 Check 'outer.prestop_failure_has_no_mutation' (
   ($outer.message -match 'promote_preflight_failed') -and
-  (@($outer.calls | Where-Object { $_ -like 'stop*' -or $_ -like 'register*' -or $_ -like 'start:*' }).Count -eq 0) -and
+  (@($outer.calls | Where-Object {
+    $_ -like 'stop*' -or $_ -like 'register*' -or
+    $_ -like 'start:*' -or $_ -like 'set:*' -or
+    $_ -like 'managed-endpoint-acl:*'
+  }).Count -eq 0) -and
+  (@($outer.setenv).Count -eq 0) -and
   ($outer.receipt.restore.stopped -eq $false) -and
   ($outer.receipt.restore.restored -eq $false) -and
   ($outer.receipt.restore.started -eq $false)) `

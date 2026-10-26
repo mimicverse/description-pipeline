@@ -2900,8 +2900,6 @@ if ($Verb -eq 'promote') {
   $candidateDocument = Read-Json (Config-Path $StageDir)
   $installIdPath = Join-Path ([string]$candidateDocument.state_root) 'install-id'
   $taskFile = Get-TaskFilePath $task
-  Set-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
-    $installIdPath $taskFile
   Assert-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
     $installIdPath $taskFile
   New-Item -ItemType Directory -Path $promotions -ErrorAction SilentlyContinue | Out-Null
@@ -2945,6 +2943,8 @@ if ($Verb -eq 'promote') {
     Assert-HealthSourceMatch $preStopHealth $sourceState
     $mutationStarted = $true
     Stop-Endpoint $binding
+    Set-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
+      $installIdPath $taskFile
     $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
       -Argument (Runtime-LauncherArguments $StageDir) -WorkingDirectory $binding.state_root
     Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
@@ -3007,9 +3007,9 @@ if ($Verb -eq 'promote') {
     Emit @{passed=$true; verb='promote'; generation=$StageDir; previous=$previous}
     exit 0
   } catch {
-    Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $pins.previous_root
-    Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' $pins.previous_ownership
     $restore = if ($mutationStarted) {
+      Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $pins.previous_root
+      Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' $pins.previous_ownership
       Restore-PreviousEndpoint $binding $previous $StageDir
     } else {
       @{stopped=$false; restored=$false; started=$false; healthy=$null; error='mutation did not begin'}
@@ -3027,7 +3027,8 @@ if ($Verb -eq 'promote') {
     Write-Receipt (Join-Path $previous 'failed-promotion.json') $failed
     if (-not $mutationStarted) {
       Die 'promote_preflight_failed' (
-        'the promotion was refused before any Windows mutation: ' + $_.Exception.Message)
+        'the promotion was refused before any Windows task or domain-pin mutation: ' +
+        $_.Exception.Message)
     }
     if ($restore.healthy -ne $true) {
       Die 'promote_restore_failed' (

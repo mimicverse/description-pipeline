@@ -97,12 +97,17 @@ $script:CurrentAction = if ($Scenario -like 'rollback_*') {
 $script:RegisteredActions = @($script:CurrentAction)
 $script:TaskState = 'Running'
 $script:Calls = [System.Collections.Generic.List[string]]::new()
+$script:SetEnvCalls = [System.Collections.Generic.List[string]]::new()
 $script:Sleeps = [System.Collections.Generic.List[int]]::new()
 $script:AccountEnv = @{}
 $script:ListenerCallCount = 0
 
 function Get-AccountEnvironment { param([string]$Name) return [string]$script:AccountEnv[$Name] }
-function Set-AccountEnvironment { param([string]$Name, [string]$Value) $script:AccountEnv[$Name] = $Value }
+function Set-AccountEnvironment {
+  param([string]$Name, [string]$Value)
+  $script:SetEnvCalls.Add($Name + '=' + $Value)
+  $script:AccountEnv[$Name] = $Value
+}
 function Get-ServedStateRoot { param([string]$configPath) return [string]$Root }
 function Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
@@ -368,7 +373,8 @@ $lastPromotion = if (Test-Path -LiteralPath $lastFile) {
 } else {
   $null
 }
-@{scenario=$Scenario; message=$message; stack=$stack; calls=@($script:Calls); sleeps=@($script:Sleeps);
+@{scenario=$Scenario; message=$message; stack=$stack; calls=@($script:Calls);
+  setenv=@($script:SetEnvCalls); sleeps=@($script:Sleeps);
   receipt=$receipt; last_promotion=$lastPromotion} |
   ConvertTo-Json -Depth 12 -Compress
 exit 0
