@@ -62,6 +62,7 @@ from description_pipeline.pipeline.ingestion import (
     ProductionAdmissionRequest,
     ProductionFreezeSuccessorRequest,
     ReceivedUploadReceipt,
+    _formal_release,
     load_production_admission,
     load_production_freeze_successor,
 )
@@ -1847,7 +1848,7 @@ class ProductionAdmissionTests(unittest.TestCase):
             )
         self.assertEqual(calls, 1)
 
-    def test_empty_rules_unknown_target_and_native_identity_mismatch_are_refused(self) -> None:
+    def test_empty_ruleset_is_valid_but_unknown_target_is_refused(self) -> None:
         work = self.root / "work"
         work.mkdir()
         empty = self.root / "empty-records"
@@ -1856,8 +1857,11 @@ class ProductionAdmissionTests(unittest.TestCase):
         snapshot["resolved"]["specifications"]["record_roots"] = [str(empty)]
         snapshot["resolved"]["derived"]["discovery"]["record_roots"] = [str(empty)]
         self._write_snapshot(snapshot)
-        with self.assertRaisesRegex(ProtocolError, "ruleset_empty"):
-            self._factory(work_root=work).prepare(self.request)
+        prepared = self._factory(work_root=work).prepare(self.request)
+        self.assertEqual(
+            prepared.spec.ruleset.roots,
+            (RulesetRoot(path="root-000", members={}),),
+        )
 
         other_artifacts = self.root / "other-artifacts"
         other_artifacts.mkdir()
@@ -1887,6 +1891,55 @@ class ProductionAdmissionTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ProtocolError, "release_mismatch"):
             self._factory(work_root=work).prepare(self.request)
+
+    def test_empty_ruleset_root_is_materialized_and_remains_closed(self) -> None:
+        work = self.root / "empty-root-work"
+        work.mkdir()
+        empty = self.root / "empty-records"
+        empty.mkdir()
+        snapshot = self._config_snapshot()
+        snapshot["resolved"]["specifications"]["record_roots"] = [str(empty)]
+        snapshot["resolved"]["derived"]["discovery"]["record_roots"] = [
+            str(empty)
+        ]
+        self._write_snapshot(snapshot)
+        prepared = self._factory(work_root=work).prepare(self.request)
+        materialized = self.artifacts.materialize(
+            prepared.spec.ruleset.artifact.ref,
+            work / "empty-ruleset",
+        )
+        self.assertFalse((materialized / "root-000").exists())
+
+        catalog = discover_module._ruleset_version(
+            materialized,
+            prepared.spec.ruleset.version,
+        )
+        roots = ruleset_record_roots(materialized, catalog)
+        self.assertEqual(len(roots), 1)
+        self.assertTrue(roots[0].is_dir())
+        self.assertEqual(list(roots[0].iterdir()), [])
+
+        (roots[0] / "unlisted.json").write_text("{}\n", encoding="utf-8")
+        with self.assertRaises(PipelineError):
+            discover_module._ruleset_version(
+                materialized,
+                prepared.spec.ruleset.version,
+            )
+
+        self._write_snapshot(self._config_snapshot())
+        nonempty_work = self.root / "nonempty-missing-work"
+        nonempty_work.mkdir()
+        nonempty = self._factory(work_root=nonempty_work).prepare(self.request)
+        nonempty_materialized = self.artifacts.materialize(
+            nonempty.spec.ruleset.artifact.ref,
+            nonempty_work / "ruleset",
+        )
+        shutil.rmtree(nonempty_materialized / "root-000")
+        with self.assertRaises(PipelineError):
+            discover_module._ruleset_version(
+                nonempty_materialized,
+                nonempty.spec.ruleset.version,
+            )
 
     def test_formal_dual_end_release_identity_is_required_and_exact(self) -> None:
         work = self.root / "release-work"
@@ -2034,6 +2087,27 @@ class ProductionAdmissionTests(unittest.TestCase):
                     invalid.exception.detail["role"],
                     role,
                 )
+
+    def test_formal_release_requires_exact_python_version_contract(self) -> None:
+        for value in ("3.12", "3.12.10"):
+            with self.subTest(value=repr(value)):
+                tool = copy.deepcopy(self.native_tool)
+                tool["runtime"]["python"] = value
+                self.assertEqual(
+                    _formal_release(tool, role="native"),
+                    tool["release"],
+                )
+        for value in ("3.120", "3.12garbage", "3.12.0rc1", 3.12):
+            with self.subTest(value=repr(value)):
+                tool = copy.deepcopy(self.native_tool)
+                tool["runtime"]["python"] = value
+                with self.assertRaises(ProtocolError) as caught:
+                    _formal_release(tool, role="native")
+                self.assertEqual(
+                    caught.exception.code,
+                    "admission_ingestion.release_invalid",
+                )
+                self.assertEqual(caught.exception.detail["where"], "runtime")
 
     def test_missing_publication_actor_configuration_is_refused(self) -> None:
         _git(self.checkout, "config", "--unset", "user.email")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import unittest
@@ -168,18 +169,33 @@ def _state_entity_record(
     reference=(1, 2, 3),
     owner_scope: str = "component_document",
     owner_document_path: str = DOCUMENT,
+    native_interface_kinds=None,
 ):
+    interface_kinds = (
+        list(native_interface_kinds)
+        if native_interface_kinds is not None
+        else ["IFace2", "IEntity"]
+    )
     return {
         "entity_index": 0,
         "native_object_type": "_CDispatch",
-        "native_interface_kind": (
-            "IEntity" if kind == "entity" else None
-        ),
+        "native_interface_kinds": interface_kinds,
         "persistent_reference": list(reference),
         "binding_context": _binding_context(
             owner_scope=owner_scope,
             owner_document_path=owner_document_path,
         ),
+        "native_identity": {
+            "kind": "reference",
+            "state": "observed",
+            "proof_api": (
+                "IModelDocExtension.GetObjectByPersistReference3"
+            ),
+            "status": 0,
+            "owner_document_path": owner_document_path,
+            "interface_kinds": interface_kinds,
+            "read_errors": {},
+        },
         "read_errors": {},
     }
 
@@ -192,6 +208,27 @@ def _reference_row(
     owner_document_path: str = DOCUMENT,
 ):
     target_kind = target.get("kind")
+    if target_kind == "body":
+        target = {
+            "kind": "body",
+            "component": target.get("component", COMPONENT),
+            "faces": [
+                {
+                    "body_type": target.get("body_type"),
+                    "body_index": target.get("body_index"),
+                    "face_index": target.get("face_index", 0),
+                }
+            ],
+            "occurrence_bodies": [
+                [
+                    target.get("body_type"),
+                    target.get("body_index"),
+                ]
+            ],
+            "persistent_reference_sha256": hashlib.sha256(
+                bytes(item & 0xFF for item in reference)
+            ).hexdigest(),
+        }
     is_assembly_occurrence = target_kind == "occurrence"
     is_body = target_kind == "body"
     is_feature = target_kind == "feature"
@@ -214,9 +251,7 @@ def _reference_row(
                     "owner_scope": "assembly_occurrence",
                     "object_kind": "assembly_occurrence",
                     "source_api": (
-                        "IComponent2.GetBodies2"
-                        if is_body
-                        else "IComponent2.GetBodies2/IBody2.GetFaces"
+                        "IComponent2.GetBodies2/IBody2.GetFaces"
                     ),
                     "traversal_api": (
                         "IConfiguration.GetRootComponent3/"
@@ -230,7 +265,8 @@ def _reference_row(
                     "object_source": "captured_component_source_document",
                 },
                 "api": (
-                    "IModelDocExtension.GetCorresponding2"
+                    "IFace2.GetBody+"
+                    "IModelDocExtension.GetPersistReference3"
                     if is_body
                     else "IFace2.GetFeature+"
                     "IModelDocExtension.GetPersistReference3"
@@ -283,7 +319,7 @@ def _resolved_raw(values):
                 ),
             }
         )
-    return {
+    raw = {
         **_raw(),
         "native_referenced_display_state": "Display State 1",
         "native_referenced_display_state_error": None,
@@ -309,6 +345,164 @@ def _resolved_raw(values):
             }
         ],
     }
+    for body in raw["bodies"]:
+        for face in body["faces"]:
+            face_key = (
+                body["body_type"],
+                body["body_index"],
+                face["face_index"],
+            )
+            face_row = _reference_row(
+                reference=(1, 2, face_key[2] + 3),
+                target={
+                    "kind": "face",
+                    "component": COMPONENT,
+                    "body_type": face_key[0],
+                    "body_index": face_key[1],
+                    "face_index": face_key[2],
+                },
+            )
+            feature_row = _reference_row(
+                reference=(4, 5, 6),
+                target={
+                    "kind": "feature",
+                    "component": COMPONENT,
+                    "name": "Boss-Extrude1",
+                    "type_name": "Extrusion",
+                    "faces": [
+                        {
+                            "body_type": face_key[0],
+                            "body_index": face_key[1],
+                            "face_index": face_key[2],
+                        }
+                    ],
+                },
+            )
+            face["appearance"]["native_identity"] = {
+                "persistent_reference": face_row["persistent_reference"],
+                "conversion": face_row["conversion"],
+                "read_errors": {},
+                "feature": {
+                    "name": "Boss-Extrude1",
+                    "type_name": "Extrusion",
+                    "persistent_reference": feature_row[
+                        "persistent_reference"
+                    ],
+                    "conversion": feature_row["conversion"],
+                    "read_errors": {},
+                },
+            }
+    return raw
+
+
+def _attach_body_witnesses(raw, references=None):
+    references = references or {}
+    for body in raw["bodies"]:
+        observations = []
+        distinct_references = set()
+        for face_position, face in enumerate(body["faces"]):
+            face_key = (
+                body["body_type"],
+                body["body_index"],
+                face["face_index"],
+            )
+            face_reference = [101, face_position]
+            feature_reference = [201, face_position]
+            face_row = _reference_row(
+                reference=face_reference,
+                target={
+                    "kind": "face",
+                    "component": COMPONENT,
+                    "body_type": face_key[0],
+                    "body_index": face_key[1],
+                    "face_index": face_key[2],
+                },
+            )
+            feature_row = _reference_row(
+                reference=feature_reference,
+                target={
+                    "kind": "feature",
+                    "component": COMPONENT,
+                    "name": "Boss-Extrude1",
+                    "type_name": "Extrusion",
+                    "faces": [
+                        {
+                            "body_type": face_key[0],
+                            "body_index": face_key[1],
+                            "face_index": face_key[2],
+                        }
+                    ],
+                },
+            )
+            face["appearance"]["native_identity"] = {
+                "persistent_reference": face_reference,
+                "conversion": face_row["conversion"],
+                "read_errors": {},
+                "feature": {
+                    "name": "Boss-Extrude1",
+                    "type_name": "Extrusion",
+                    "persistent_reference": feature_reference,
+                    "conversion": feature_row["conversion"],
+                    "read_errors": {},
+                },
+            }
+            reference = list(references.get(face_key, (1, 2, 3)))
+            distinct_references.add(tuple(reference))
+            observations.append(
+                {
+                    "face_index": face["face_index"],
+                    "persistent_reference": reference,
+                    "conversion": {
+                        "component": raw["component"],
+                        "input_context": {
+                            "owner_scope": "assembly_occurrence",
+                            "object_kind": "assembly_occurrence",
+                            "source_api": (
+                                "IComponent2.GetBodies2/IBody2.GetFaces"
+                            ),
+                            "traversal_api": (
+                                "IConfiguration.GetRootComponent3/"
+                                "IComponent2.GetChildren"
+                            ),
+                        },
+                        "receiver": {
+                            "owner_scope": "component_document",
+                            "owner_document_path": DOCUMENT,
+                            "interface": "IModelDocExtension",
+                            "object_source": (
+                                "captured_component_source_document"
+                            ),
+                        },
+                        "api": (
+                            "IFace2.GetBody+"
+                            "IModelDocExtension.GetPersistReference3"
+                        ),
+                        "output_interface_kind": "IBody2",
+                        "output_domain": {
+                            "proof_api": (
+                                "IModelDocExtension."
+                                "GetObjectByPersistReference3"
+                            ),
+                            "status": 0,
+                            "interface_kind": "IBody2",
+                            "expected_owner_document_path": DOCUMENT,
+                        },
+                        "state": "observed",
+                        "read_errors": {},
+                    },
+                    "read_errors": {},
+                }
+            )
+        body["native_identity"] = {
+            "owner_scope": "component_document",
+            "owner_document_path": DOCUMENT,
+            "state": "observed",
+            "part_body_reference_count": len(distinct_references),
+            "read_errors": {},
+            "observation_errors": [],
+            "face_body_observations": observations,
+        }
+    return raw
 
 
 class CaptureAppearanceBindingTests(unittest.TestCase):
@@ -349,13 +543,21 @@ class AppearanceResolutionTests(unittest.TestCase):
     def test_part_conversion_evidence_is_required_and_target_specific(self):
         case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))
         raw = copy.deepcopy(case["raw"])
-        owner = raw["state_render_materials"][0]
-        indexed = owner["native_reference_index"][0]
+        indexed = _reference_row(
+            reference=(1, 2, 3),
+            target={
+                "kind": "face",
+                "component": COMPONENT,
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": 0,
+            },
+        )
         _validate_index_conversion(
             COMPONENT,
             {
                 **indexed,
-                "target": owner["native_reference_index"][0]["target"],
+                "target": indexed["target"],
             },
             owner_document_path=DOCUMENT,
             path="capture",
@@ -363,9 +565,10 @@ class AppearanceResolutionTests(unittest.TestCase):
         for target_kind, api, interface, source_api in (
             (
                 "body",
-                "IModelDocExtension.GetCorresponding2",
+                "IFace2.GetBody+"
+                "IModelDocExtension.GetPersistReference3",
                 "IBody2",
-                "IComponent2.GetBodies2",
+                "IComponent2.GetBodies2/IBody2.GetFaces",
             ),
             (
                 "face",
@@ -384,7 +587,20 @@ class AppearanceResolutionTests(unittest.TestCase):
             target = copy.deepcopy(indexed["target"])
             target["kind"] = target_kind
             if target_kind == "body":
-                target.pop("face_index", None)
+                target["persistent_reference_sha256"] = hashlib.sha256(
+                    bytes(
+                        item & 0xFF
+                        for item in indexed["persistent_reference"]
+                    )
+                ).hexdigest()
+                target["faces"] = [
+                    {
+                        "body_type": target.pop("body_type"),
+                        "body_index": target.pop("body_index"),
+                        "face_index": target.pop("face_index", 0),
+                    }
+                ]
+                target["occurrence_bodies"] = [[0, 0]]
             elif target_kind == "feature":
                 target.update(
                     {
@@ -471,8 +687,18 @@ class AppearanceResolutionTests(unittest.TestCase):
                     caught.exception.appearance["issues"][0]["code"],
                     "cad_appearance_render_conversion_unproven",
                 )
+            if target_kind == "body":
+                malformed = copy.deepcopy(valid)
+                malformed["target"]["persistent_reference_sha256"] = "0" * 64
+                with self.assertRaises(AppearanceError):
+                    _validate_index_conversion(
+                        COMPONENT,
+                        malformed,
+                        owner_document_path=DOCUMENT,
+                        path="capture",
+                    )
         malformed = copy.deepcopy(raw)
-        malformed["state_render_materials"][0]["native_reference_index"][0][
+        malformed["bodies"][0]["faces"][0]["appearance"]["native_identity"][
             "conversion"
         ]["receiver"]["owner_scope"] = "top_assembly"
         with self.assertRaises(AppearanceError) as caught:
@@ -543,18 +769,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                 )
                 owner["call_state"] = "observed"
                 owner["native_render_material_count"] = 1
-                owner["native_reference_index"] = [
-                    _reference_row(
-                        reference=(1, 2, 3),
-                        target={
-                            "kind": "face",
-                            "component": COMPONENT,
-                            "body_type": 0,
-                            "body_index": 0,
-                            "face_index": 0,
-                        },
-                    )
-                ]
+                owner["native_reference_index"] = []
                 owner["materials"] = [
                     {
                         "material_index": 0,
@@ -618,6 +833,388 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "cad_appearance_owner_conflict",
                     )
 
+    def test_body_target_uses_its_exact_face_footprint(self):
+        raw = _resolved_raw([None, None])
+        _attach_body_witnesses(raw)
+        owner = _empty_state_owner(
+            scope="component_document",
+            document_path=DOCUMENT,
+            configuration=CONFIGURATION,
+            display_state="Display State 1",
+        )
+        owner["call_state"] = "observed"
+        owner["native_render_material_count"] = 1
+        owner["native_reference_index"] = []
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Display State 1"],
+                "entities": ["body"],
+                "entities_state": "observed",
+                "entity_records": [
+                    _state_entity_record(
+                        reference=(1, 2, 3),
+                        native_interface_kinds=["IBody2"],
+                    )
+                ],
+                "primary_color": 0x0000FF00,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        raw["state_render_materials"] = [owner]
+        spans = [
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": face_index,
+                "triangle_start": face_index,
+                "triangle_count": 1,
+                "face_reference_sha256": str(face_index + 1) * 64,
+            }
+            for face_index in (0, 1)
+        ]
+
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=spans,
+        )
+        self.assertEqual(
+            {face.rgba for face in resolved.faces},
+            {(0.0, 1.0, 0.0, 1.0)},
+        )
+        self.assertEqual(
+            {tuple(face.source["scopes"]) for face in resolved.faces},
+            {("body",)},
+        )
+
+        for label in ("wrong_component", "owner", "api", "interface"):
+            with self.subTest(label=label):
+                malformed_observation = copy.deepcopy(raw)
+                body = malformed_observation["bodies"][0]
+                conversion = body["native_identity"][
+                    "face_body_observations"
+                ][1]["conversion"]
+                if label == "wrong_component":
+                    body["component"] = "other-1"
+                elif label == "owner":
+                    conversion["receiver"][
+                        "owner_document_path"
+                    ] = "C:/cad/other.SLDPRT"
+                elif label == "api":
+                    conversion["api"] = "IModelDocExtension.GetCorresponding2"
+                else:
+                    conversion["output_interface_kind"] = "IFace2"
+                with self.assertRaises(AppearanceError) as malformed_caught:
+                    resolve_deliverable_appearance(
+                        malformed_observation,
+                        component=COMPONENT,
+                        expected_document_path=DOCUMENT,
+                        expected_configuration=CONFIGURATION,
+                        face_spans=spans,
+                    )
+                self.assertIn(
+                    malformed_caught.exception.appearance["issues"][0][
+                        "code"
+                    ],
+                    {
+                        "cad_appearance_body_identity_invalid",
+                        "cad_appearance_render_entity_binding_unproven",
+                        "cad_appearance_render_identity_unresolved",
+                    },
+                )
+
+        duplicate_body = copy.deepcopy(raw)
+        duplicate = copy.deepcopy(duplicate_body["bodies"][0])
+        duplicate["native_identity"]["face_body_observations"][0][
+            "persistent_reference"
+        ] = [4, 5, 6]
+        duplicate_body["bodies"].append(duplicate)
+        with self.assertRaises(AppearanceError) as duplicate_caught:
+            resolve_deliverable_appearance(
+                duplicate_body,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=spans,
+            )
+        self.assertEqual(
+            duplicate_caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_body_identity_invalid",
+        )
+
+        no_reference_fragment = copy.deepcopy(raw)
+        failed_body = copy.deepcopy(no_reference_fragment["bodies"][0])
+        failed_body["body_index"] = 1
+        failed_body["faces"] = [copy.deepcopy(failed_body["faces"][0])]
+        failed_body["native_identity"] = {
+            "owner_scope": "component_document",
+            "owner_document_path": DOCUMENT,
+            "state": "error",
+            "part_body_reference_count": 0,
+            "read_errors": {
+                "body_reference": {
+                    "code": "cad_appearance_part_body_missing"
+                }
+            },
+            "observation_errors": [
+                {
+                    "face_index": 0,
+                    "read_errors": {
+                        "body": {
+                            "code": "cad_appearance_part_body_missing"
+                        }
+                    },
+                }
+            ],
+            "face_body_observations": [
+                {
+                    "face_index": 0,
+                    "persistent_reference": None,
+                    "conversion": {
+                        "state": "error",
+                        "read_errors": {
+                            "body": {
+                                "code": "cad_appearance_part_body_missing"
+                            }
+                        },
+                    },
+                    "read_errors": {
+                        "body": {
+                            "code": "cad_appearance_part_body_missing"
+                        }
+                    },
+                }
+            ],
+        }
+        no_reference_fragment["bodies"].append(failed_body)
+        failed_spans = [
+            *spans,
+            {
+                "body_type": 0,
+                "body_index": 1,
+                "face_index": 0,
+                "triangle_start": 2,
+                "triangle_count": 1,
+                "face_reference_sha256": "3" * 64,
+            },
+        ]
+        with self.assertRaises(AppearanceError) as failed_fragment_caught:
+            resolve_deliverable_appearance(
+                no_reference_fragment,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=failed_spans,
+            )
+        self.assertEqual(
+            failed_fragment_caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_identity_unresolved",
+        )
+
+        wrong_interface = copy.deepcopy(raw)
+        wrong_entity = wrong_interface["state_render_materials"][0][
+            "materials"
+        ][0]["entity_records"][0]
+        wrong_entity["native_interface_kinds"] = ["IFeature"]
+        wrong_entity["native_identity"]["interface_kinds"] = ["IFeature"]
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                wrong_interface,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=spans,
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_entity_interface_mismatch",
+        )
+
+        cross_fragment = _resolved_raw([None, None])
+        second_body = copy.deepcopy(cross_fragment["bodies"][0])
+        second_body["body_index"] = 1
+        second_body["faces"] = [copy.deepcopy(second_body["faces"][0])]
+        cross_fragment["bodies"].append(second_body)
+        _attach_body_witnesses(cross_fragment)
+        conflicting_observation = copy.deepcopy(
+            cross_fragment["bodies"][0]["native_identity"][
+                "face_body_observations"
+            ][0]
+        )
+        conflicting_observation["persistent_reference"] = [4, 5, 6]
+        cross_fragment["bodies"][0]["native_identity"][
+            "face_body_observations"
+        ].append(conflicting_observation)
+        cross_fragment["bodies"][0]["native_identity"][
+            "part_body_reference_count"
+        ] = 2
+        cross_owner = copy.deepcopy(raw["state_render_materials"][0])
+        cross_owner["native_reference_index"] = []
+        cross_owner["mapping_errors"] = []
+        cross_fragment["state_render_materials"] = [cross_owner]
+        cross_spans = [
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": face_index,
+                "triangle_start": face_index,
+                "triangle_count": 1,
+                "face_reference_sha256": str(face_index + 1) * 64,
+            }
+            for face_index in (0, 1)
+        ]
+        cross_spans.append(
+            {
+                "body_type": 0,
+                "body_index": 1,
+                "face_index": 0,
+                "triangle_start": 2,
+                "triangle_count": 1,
+                "face_reference_sha256": "3" * 64,
+            }
+        )
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                cross_fragment,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=cross_spans,
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_identity_unresolved",
+        )
+
+    def test_body_target_accepts_legal_multi_body_and_cross_fragment_ownership(
+        self,
+    ):
+        def attach_material(raw):
+            owner = _empty_state_owner(
+                scope="component_document",
+                document_path=DOCUMENT,
+                configuration=CONFIGURATION,
+                display_state="Display State 1",
+            )
+            owner["call_state"] = "observed"
+            owner["native_render_material_count"] = 1
+            owner["native_reference_index"] = []
+            owner["materials"] = [
+                {
+                    "material_index": 0,
+                    "linked_display_states": ["Display State 1"],
+                    "entities": ["body"],
+                    "entities_state": "observed",
+                    "entity_records": [
+                        _state_entity_record(
+                            reference=(1, 2, 3),
+                            native_interface_kinds=["IBody2"],
+                        )
+                    ],
+                    "primary_color": 0x0000FF00,
+                    "transparency": 0.0,
+                    "color_form": 1,
+                    "texture_filename": "",
+                    "surface_finish_file": "",
+                    "read_errors": {},
+                }
+            ]
+            raw["state_render_materials"] = [owner]
+            return raw
+
+        multi_body = _resolved_raw([None, None])
+        _attach_body_witnesses(
+            multi_body,
+            {
+                (0, 0, 0): (1, 2, 3),
+                (0, 0, 1): (4, 5, 6),
+            },
+        )
+        attach_material(multi_body)
+        multi_owner = multi_body["state_render_materials"][0]
+        second_material = copy.deepcopy(multi_owner["materials"][0])
+        second_material["material_index"] = 1
+        second_material["primary_color"] = 0x000000FF
+        second_material["entity_records"][0][
+            "persistent_reference"
+        ] = [4, 5, 6]
+        second_material["entity_records"][0]["native_identity"][
+            "interface_kinds"
+        ] = ["IBody2"]
+        multi_owner["materials"].append(second_material)
+        multi_owner["native_render_material_count"] = 2
+        multi_spans = [
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": face_index,
+                "triangle_start": face_index,
+                "triangle_count": 1,
+                "face_reference_sha256": str(face_index + 1) * 64,
+            }
+            for face_index in (0, 1)
+        ]
+        multi_resolved = resolve_deliverable_appearance(
+            multi_body,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=multi_spans,
+        )
+        self.assertEqual(
+            next(
+                face
+                for face in multi_resolved.faces
+                if face.face_index == 0
+            ).rgba,
+            (0.0, 1.0, 0.0, 1.0),
+        )
+        self.assertEqual(
+            next(
+                face
+                for face in multi_resolved.faces
+                if face.face_index == 1
+            ).rgba,
+            (1.0, 0.0, 0.0, 1.0),
+        )
+
+        cross_fragment = _resolved_raw([None, None])
+        second_body = copy.deepcopy(cross_fragment["bodies"][0])
+        second_body["body_index"] = 1
+        second_body["faces"] = [copy.deepcopy(second_body["faces"][0])]
+        cross_fragment["bodies"].append(second_body)
+        _attach_body_witnesses(cross_fragment)
+        attach_material(cross_fragment)
+        cross_spans = [
+            *multi_spans,
+            {
+                "body_type": 0,
+                "body_index": 1,
+                "face_index": 0,
+                "triangle_start": 2,
+                "triangle_count": 1,
+                "face_reference_sha256": "3" * 64,
+            },
+        ]
+        cross_resolved = resolve_deliverable_appearance(
+            cross_fragment,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=cross_spans,
+        )
+        self.assertEqual(
+            {tuple(face.source["scopes"]) for face in cross_resolved.faces},
+            {("body",)},
+        )
+
     def test_assembly_occurrence_override_precedes_part_and_face(self):
         case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))
         raw = copy.deepcopy(case["raw"])
@@ -651,6 +1248,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                         reference=(4, 5, 6),
                         owner_scope="top_assembly",
                         owner_document_path=r"C:\capture\robot.SLDASM",
+                        native_interface_kinds=["IComponent2"],
                     )
                 ],
                 "primary_color": 0x0000FF00,
@@ -682,7 +1280,16 @@ class AppearanceResolutionTests(unittest.TestCase):
             0
         ]["entity_records"][0]
         entity["persistent_reference"] = [7, 8, 9]
-        entity["native_interface_kind"] = "IEntity"
+        entity["native_interface_kinds"] = ["IFace2", "IEntity"]
+        entity["native_identity"] = {
+            "kind": "reference",
+            "state": "observed",
+            "proof_api": "IModelDocExtension.GetObjectByPersistReference3",
+            "status": 0,
+            "owner_document_path": DOCUMENT,
+            "interface_kinds": ["IFace2", "IEntity"],
+            "read_errors": {},
+        }
         non_occurrence["state_render_materials"][0][
             "native_reference_index"
         ] = [
@@ -870,6 +1477,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                         reference=(4, 5, 6),
                         owner_scope="top_assembly",
                         owner_document_path=r"C:\capture\robot.SLDASM",
+                        native_interface_kinds=["IComponent2"],
                     )
                 ],
                 "primary_color": 0x00AABBCC,
@@ -994,7 +1602,7 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         self.assertEqual(resolved.faces[0].source["scopes"], ["face"])
 
-    def test_mapping_errors_only_block_participating_object_bindings(self):
+    def test_component_owner_requires_no_derived_footprint_authority(self):
         mapping_error = {
             "owner_scope": "component_document",
             "owner_document_path": DOCUMENT,
@@ -1016,9 +1624,6 @@ class AppearanceResolutionTests(unittest.TestCase):
         empty = _resolved_raw(
             [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
         )
-        empty["state_render_materials"][0]["mapping_errors"] = [
-            unrelated_error
-        ]
         resolved_empty = resolve_deliverable_appearance(
             empty,
             component=COMPONENT,
@@ -1036,6 +1641,36 @@ class AppearanceResolutionTests(unittest.TestCase):
             ],
         )
         self.assertEqual(resolved_empty.faces[0].source["scopes"], ["face"])
+        for field, value in (
+            ("mapping_errors", [unrelated_error]),
+            ("native_reference_index", [{"derived": "footprint"}]),
+        ):
+            with self.subTest(field=field):
+                malformed = copy.deepcopy(empty)
+                malformed["state_render_materials"][0][field] = value
+                with self.assertRaises(AppearanceError) as malformed_caught:
+                    resolve_deliverable_appearance(
+                        malformed,
+                        component=COMPONENT,
+                        expected_document_path=DOCUMENT,
+                        expected_configuration=CONFIGURATION,
+                        face_spans=[
+                            {
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                                "triangle_start": 0,
+                                "triangle_count": 1,
+                                "face_reference_sha256": "a" * 64,
+                            }
+                        ],
+                    )
+                self.assertEqual(
+                    malformed_caught.exception.appearance["issues"][0][
+                        "code"
+                    ],
+                    "cad_appearance_render_owner_invalid",
+                )
 
         object_raw = _resolved_raw(
             [
@@ -1051,26 +1686,8 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         owner["call_state"] = "observed"
         owner["native_render_material_count"] = 1
-        owner["mapping_errors"] = [unrelated_error]
-        owner["native_reference_index"] = [
-            _reference_row(
-                reference=(1, 2, 3),
-                target={
-                    "kind": "face",
-                    "component": COMPONENT,
-                    "body_type": 0,
-                    "body_index": 0,
-                    "face_index": 0,
-                },
-            )
-        ]
-        owner["native_reference_index"][0]["read_errors"] = {
-            "interface_query": {
-                "code": "cad_appearance_interface_unavailable",
-                "message": "optional QI failed",
-                "detail": {},
-            }
-        }
+        owner["mapping_errors"] = []
+        owner["native_reference_index"] = []
         owner["materials"] = [
             {
                 "material_index": 0,
@@ -1118,62 +1735,6 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         self.assertEqual(resolved_object.faces[0].source["scopes"], ["face"])
 
-        same_target = copy.deepcopy(object_raw)
-        same_target["state_render_materials"][0]["mapping_errors"] = [
-            mapping_error
-        ]
-        with self.assertRaises(AppearanceError) as caught:
-            resolve_deliverable_appearance(
-                same_target,
-                component=COMPONENT,
-                expected_document_path=DOCUMENT,
-                expected_configuration=CONFIGURATION,
-                face_spans=[
-                    {
-                        "body_type": 0,
-                        "body_index": 0,
-                        "face_index": face_index,
-                        "triangle_start": face_index,
-                        "triangle_count": 1,
-                        "face_reference_sha256": str(face_index + 1) * 64,
-                    }
-                    for face_index in (0, 1)
-                ],
-            )
-        self.assertEqual(
-            caught.exception.appearance["issues"][0]["code"],
-            "cad_appearance_render_identity_unresolved",
-        )
-
-        incomplete_target_error = copy.deepcopy(object_raw)
-        incomplete_identity = copy.deepcopy(mapping_error)
-        incomplete_identity["identity"].pop("face_index")
-        incomplete_target_error["state_render_materials"][0][
-            "mapping_errors"
-        ] = [incomplete_identity]
-        with self.assertRaises(AppearanceError) as caught:
-            resolve_deliverable_appearance(
-                incomplete_target_error,
-                component=COMPONENT,
-                expected_document_path=DOCUMENT,
-                expected_configuration=CONFIGURATION,
-                face_spans=[
-                    {
-                        "body_type": 0,
-                        "body_index": 0,
-                        "face_index": face_index,
-                        "triangle_start": face_index,
-                        "triangle_count": 1,
-                        "face_reference_sha256": str(face_index + 1) * 64,
-                    }
-                    for face_index in (0, 1)
-                ],
-            )
-        self.assertEqual(
-            caught.exception.appearance["issues"][0]["code"],
-            "cad_appearance_render_identity_unresolved",
-        )
-
         document = _resolved_raw([None])
         document["document"] = _layer(
             owner_configuration=CONFIGURATION,
@@ -1188,7 +1749,7 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         owner["call_state"] = "observed"
         owner["native_render_material_count"] = 1
-        owner["mapping_errors"] = [unrelated_error]
+        owner["mapping_errors"] = []
         owner["materials"] = [
             {
                 "material_index": 0,
@@ -1199,7 +1760,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                     {
                         "entity_index": 0,
                         "native_object_type": "IModelDoc2",
-                        "native_interface_kind": "IModelDoc2",
+                        "native_interface_kinds": ["IModelDoc2"],
                         "persistent_reference": None,
                         "binding_context": _binding_context(
                             owner_scope="component_document",
@@ -1308,12 +1869,7 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         owner["call_state"] = "observed"
         owner["native_render_material_count"] = 2
-        owner["native_reference_index"] = [
-            _reference_row(
-                reference=(1, 2, 3),
-                target={"kind": "occurrence", "component": COMPONENT},
-            )
-        ]
+        owner["native_reference_index"] = []
         owner["materials"] = [
             {
                 "material_index": 0,
@@ -1324,6 +1880,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                     _state_entity_record(
                         kind="object",
                         reference=(1, 2, 3),
+                        native_interface_kinds=["IComponent2"],
                     )
                 ],
                 "primary_color": 0x000000FF,
@@ -1372,19 +1929,10 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         owner["call_state"] = "observed"
         owner["native_render_material_count"] = 1
-        owner["native_reference_index"] = [
-            _reference_row(
-                reference=(1, 2, 3),
-                target={
-                    "kind": "face",
-                    "component": COMPONENT,
-                    "body_type": 0,
-                    "body_index": 0,
-                    "face_index": face_index,
-                },
-            )
-            for face_index in (0, 1)
-        ]
+        owner["native_reference_index"] = []
+        raw["bodies"][0]["faces"][1]["appearance"]["native_identity"][
+            "persistent_reference"
+        ] = [1, 2, 3]
         owner["materials"] = [
             {
                 "material_index": 0,
@@ -1459,34 +2007,11 @@ class AppearanceResolutionTests(unittest.TestCase):
                 )
                 owner["call_state"] = "observed"
                 owner["native_render_material_count"] = 1
-                feature_identities = (
-                    [(feature_names[0], [0, 1])]
-                    if should_pass
-                    else [("Boss-Extrude1", [0]), ("Cut-Extrude1", [1])]
-                )
-                owner["native_reference_index"] = [
-                    _reference_row(
-                        reference=(1, 2, 3),
-                        target={
-                            "kind": "feature",
-                            "component": COMPONENT,
-                            "name": feature_name,
-                            "type_name": "Extrusion",
-                            "persistent_reference": [4, 5, 6 + index],
-                            "faces": [
-                                {
-                                    "body_type": 0,
-                                    "body_index": 0,
-                                    "face_index": face_index,
-                                }
-                                for face_index in face_indices
-                            ],
-                        },
-                    )
-                    for index, (feature_name, face_indices) in enumerate(
-                        feature_identities
-                    )
-                ]
+                owner["native_reference_index"] = []
+                if not should_pass:
+                    raw["bodies"][0]["faces"][1]["appearance"][
+                        "native_identity"
+                    ]["feature"]["name"] = feature_names[1]
                 owner["materials"] = [
                     {
                         "material_index": 0,
@@ -1496,7 +2021,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "entity_records": [
                             _state_entity_record(
                                 kind="object",
-                                reference=(1, 2, 3),
+                                reference=(4, 5, 6),
+                                native_interface_kinds=["IFeature"],
                             )
                         ],
                         "primary_color": 0x000000FF,
@@ -1532,25 +2058,14 @@ class AppearanceResolutionTests(unittest.TestCase):
                         {(1.0, 0.0, 0.0, 1.0)},
                     )
                     incomplete = copy.deepcopy(raw)
-                    incomplete["state_render_materials"][0][
-                        "native_reference_index"
-                    ][0]["read_errors"] = {
-                        "faces": [
-                            {
-                                "face": {
-                                    "body_type": 0,
-                                    "body_index": 0,
-                                    "face_index": 0,
-                                },
-                                "read_errors": {
-                                    "name": {
-                                        "code": "cad_member_missing",
-                                        "message": "missing",
-                                        "detail": {},
-                                    }
-                                },
-                            }
-                        ]
+                    incomplete["bodies"][0]["faces"][0]["appearance"][
+                        "native_identity"
+                    ]["feature"]["read_errors"] = {
+                        "name": {
+                            "code": "cad_member_missing",
+                            "message": "missing",
+                            "detail": {},
+                        }
                     }
                     with self.assertRaises(AppearanceError) as caught:
                         resolve_deliverable_appearance(
@@ -1564,75 +2079,15 @@ class AppearanceResolutionTests(unittest.TestCase):
                         caught.exception.appearance["issues"][0]["code"],
                         "cad_appearance_render_identity_unresolved",
                     )
-                    footprint_error = copy.deepcopy(raw)
-                    footprint_error["state_render_materials"][0][
-                        "mapping_errors"
-                    ] = [
-                        {
-                            "owner_scope": "component_document",
-                            "owner_document_path": DOCUMENT,
-                            "component": COMPONENT,
-                            "entity_kind": "faces",
-                            "target_kind": "face",
-                            "identity": {
-                                "component": COMPONENT,
-                                "body_type": 0,
-                                "body_index": 0,
-                                "face_index": 0,
-                            },
-                            "persistent_reference": None,
-                            "native_interface_kind": "IEntity",
-                            "error": {
-                                "code": (
-                                    "cad_appearance_persistent_reference_invalid"
-                                )
-                            },
-                        }
-                    ]
-                    with self.assertRaises(AppearanceError) as caught:
-                        resolve_deliverable_appearance(
-                            footprint_error,
-                            component=COMPONENT,
-                            expected_document_path=DOCUMENT,
-                            expected_configuration=CONFIGURATION,
-                            face_spans=spans,
-                        )
-                    self.assertEqual(
-                        caught.exception.appearance["issues"][0]["code"],
-                        "cad_appearance_render_identity_unresolved",
-                    )
                     missing_feature_reference = copy.deepcopy(raw)
-                    missing_feature_reference["state_render_materials"][0][
-                        "mapping_errors"
-                    ] = [
-                        {
-                            "owner_scope": "component_document",
-                            "owner_document_path": DOCUMENT,
-                            "component": COMPONENT,
-                            "entity_kind": "features",
-                            "target_kind": "feature",
-                            "identity": {
-                                "component": COMPONENT,
-                                "name": feature_names[0],
-                                "type_name": "Extrusion",
-                                "persistent_reference": None,
-                                "faces": [
-                                    {
-                                        "body_type": 0,
-                                        "body_index": 0,
-                                        "face_index": 0,
-                                    }
-                                ],
-                            },
-                            "persistent_reference": None,
-                            "native_interface_kind": None,
-                            "error": {
-                                "code": (
-                                    "cad_appearance_persistent_reference_missing"
-                                )
-                            },
-                        }
-                    ]
+                    missing_feature_reference["bodies"][0]["faces"][0][
+                        "appearance"
+                    ]["native_identity"]["feature"][
+                        "persistent_reference"
+                    ] = None
+                    missing_feature_reference["bodies"][0]["faces"][0][
+                        "appearance"
+                    ]["native_identity"]["feature"]["conversion"] = None
                     with self.assertRaises(AppearanceError) as caught:
                         resolve_deliverable_appearance(
                             missing_feature_reference,
@@ -1656,82 +2111,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                         )
                     self.assertEqual(
                         caught.exception.appearance["issues"][0]["code"],
-                        "cad_appearance_render_entity_ambiguous",
+                        "cad_appearance_render_identity_unresolved",
                     )
-
-    def test_same_feature_identity_cannot_have_conflicting_footprints(self):
-        raw = _resolved_raw([None, None])
-        raw["document"] = _layer(
-            owner_configuration=CONFIGURATION,
-            values=[0.0, 1.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
-            has_values=True,
-        )
-        owner = _empty_state_owner(
-            scope="component_document",
-            document_path=DOCUMENT,
-            configuration=CONFIGURATION,
-            display_state="Display State 1",
-        )
-        owner["call_state"] = "observed"
-        owner["native_render_material_count"] = 1
-        owner["native_reference_index"] = [
-            _reference_row(
-                reference=(1, 2, 3),
-                target={
-                    "kind": "feature",
-                    "component": COMPONENT,
-                    "name": "Boss-Extrude1",
-                    "type_name": "Extrusion",
-                    "persistent_reference": [4, 5, 6],
-                    "faces": [
-                        {
-                            "body_type": 0,
-                            "body_index": 0,
-                            "face_index": face_index,
-                        }
-                    ],
-                },
-            )
-            for face_index in (0, 1)
-        ]
-        owner["materials"] = [
-            {
-                "material_index": 0,
-                "linked_display_states": ["Display State 1"],
-                "entities": ["feature"],
-                "entities_state": "observed",
-                "entity_records": [_state_entity_record()],
-                "primary_color": 0x000000FF,
-                "transparency": 0.0,
-                "color_form": 1,
-                "texture_filename": "",
-                "surface_finish_file": "",
-                "read_errors": {},
-            }
-        ]
-        raw["state_render_materials"] = [owner]
-        with self.assertRaises(AppearanceError) as caught:
-            resolve_deliverable_appearance(
-                raw,
-                component=COMPONENT,
-                expected_document_path=DOCUMENT,
-                expected_configuration=CONFIGURATION,
-                face_spans=[
-                    {
-                        "body_type": 0,
-                        "body_index": 0,
-                        "face_index": face_index,
-                        "triangle_start": face_index,
-                        "triangle_count": 1,
-                        "face_reference_sha256": str(face_index + 1) * 64,
-                    }
-                    for face_index in (0, 1)
-                ],
-            )
-        self.assertEqual(
-            caught.exception.appearance["issues"][0]["code"],
-            "cad_appearance_render_entity_ambiguous",
-        )
 
     def test_exact_document_material_is_not_overridden_by_legacy_texture(self):
         raw = _resolved_raw([None, None])
@@ -1778,6 +2159,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                     {
                         "entity_index": 0,
                         "native_object_type": "IModelDoc2",
+                        "native_interface_kinds": ["IModelDoc2"],
                         "persistent_reference": None,
                         "binding_context": binding_context,
                         "native_identity": {
@@ -1866,7 +2248,7 @@ class AppearanceResolutionTests(unittest.TestCase):
     def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
         for failure in (
             "persistent_reference",
-            "unmapped_target_with_mapping_error",
+            "unmapped_raw_relation",
             "source_claim_without_index",
             "wrong_owner",
             "conversion_in_owner",
@@ -1915,33 +2297,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                             "code": "cad_appearance_persistent_reference_missing"
                         }
                     }
-                elif failure == "unmapped_target_with_mapping_error":
-                    owner["native_reference_index"] = [
-                        _reference_row(
-                            reference=(9, 9, 9),
-                            target={
-                                "kind": "face",
-                                "component": COMPONENT,
-                                "body_type": 0,
-                                "body_index": 0,
-                                "face_index": 0,
-                            },
-                        )
-                    ]
-                    owner["mapping_errors"] = [
-                        {
-                            "entity_kind": "faces",
-                            "identity": {
-                                "component": COMPONENT,
-                                "body_type": 0,
-                                "body_index": 0,
-                                "face_index": 0,
-                            },
-                            "error": {
-                                "code": "cad_appearance_persistent_reference_invalid"
-                            },
-                        }
-                    ]
+                elif failure == "unmapped_raw_relation":
+                    entity["persistent_reference"] = [9, 9, 9]
                 elif failure == "source_claim_without_index":
                     entity["matched_identity"] = {
                         "occurrences": [],
@@ -2005,14 +2362,6 @@ class AppearanceResolutionTests(unittest.TestCase):
                     caught.exception.appearance["issues"][0]["code"],
                     "cad_appearance_render_entity_binding_unproven",
                 )
-                if failure == "unmapped_target_with_mapping_error":
-                    self.assertEqual(
-                        caught.exception.appearance["issues"][0][
-                            "mapping_errors"
-                        ],
-                        owner["mapping_errors"],
-                    )
-
     def test_source_render_material_uses_colorref_decode(self):
         raw = _resolved_raw(
             [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
@@ -2043,6 +2392,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                             _state_entity_record(
                                 kind="entity",
                                 reference=(1, 2, 3),
+                                native_interface_kinds=["IFace2", "IEntity"],
                             )
                         ],
                         "primary_color": 0x00AABBCC,
@@ -2054,18 +2404,16 @@ class AppearanceResolutionTests(unittest.TestCase):
                     }
                 ],
                 "mapping_errors": [],
-                "native_reference_index": [
-                    _reference_row(
-                        reference=(1, 2, 3),
-                        target={
-                            "kind": "occurrence",
-                            "component": COMPONENT,
-                        },
-                    )
-                ],
+                "native_reference_index": [],
                 "read_errors": {},
             }
         ]
+        raw["bodies"][0]["faces"][0]["appearance"][
+            "material_property_values"
+        ] = None
+        raw["bodies"][0]["faces"][0]["appearance"][
+            "has_material_property_values"
+        ] = False
         resolved = resolve_deliverable_appearance(
             raw,
             component=COMPONENT,

@@ -107,7 +107,7 @@
 
 先建立当前配置的“实例 → 有据的刚体 → 原生关节两端”映射，再选择根和父子连接。依据包含完整配合端点、抑制与错误状态、约束剩余自由度，以及刚性/柔性子装配和跨装配配合的求解语义。约束状态按实际 API 版本解释；`IsFixed` 只说明装配固定锚点，`false` 不等于未连接，局部欠约束也须结合预期运动判定。多个同轴对象由原生引用消歧，轴线重合本身不确定连接两端。
 
-历史模型与手工导出只可用于隔离的参考单元测试、回归测试和历史调查，不用于生产阶段输入、当前接口名、方向、归属、连接或数值真值，也不参与放行。参考测试只在 fixture 声明兼容的 CAD 原件、配置和修订上运行，按工程语义和有依据容差比较，不锁 XML／STL 字节、元素或三角形顺序或合法三角化；版本不同不得硬匹配旧 URDF。局部约束秩或保存姿态下的刚性证明只适用于其对象、配置和姿态，不能外推为完整机构自由度资格。
+参考会话的模型专用资料只用于隔离测试与历史调查。参考测试须成对固定原生 CAD 输入与手工期望输出；切换时同时切换两者。配套 CAD 通过正常 Freeze 作为本次测试请求的原生输入，不能把 fixture 作为生产实现或固定配置。手工导出不进入任何生产阶段，不提供当前接口名、方向、归属、连接或数值真值，也不参与放行。参考测试只在 fixture 声明兼容的 CAD 原件、配置和修订上运行，按工程语义和有依据容差比较，不锁 XML／STL 字节、元素或三角形顺序或合法三角化；版本不同不得硬匹配旧 URDF。局部约束秩或保存姿态下的刚性证明只适用于其对象、配置和姿态，不能外推为完整机构自由度资格。
 
 模型以唯一 `base_link` 为根，支持固定、有限转动、连续转动和直线运动的树状连接。真实闭环、并联、齿轮、螺旋、耦合及其他多自由度关系不属于该模型表达范围，须保留真实设计，由平台明确报告不支持，不能通过删杆、解耦或固定被动件伪装。
 
@@ -163,26 +163,33 @@ CAD 方向表达偏离规范时给出明确 warning，按 CAD 运动关系和统
 要求实际 active configuration 与 occurrence referenced configuration 相同。top、
 parent 和 component-document owner 分别保留自己的 configuration/display-state 与读取
 错误；`GetRenderMaterials2` 的 NULL 原值、同 state `GetRenderMaterialsCount2`、
-`native_reference_index`、实体 binding context、document QI、feature face footprint 和
-纹理事实分别封存。只有成功读取的 exact-state 总数确证为 0 时，NULL 才可证明没有
+逐 face 的唯一原生实体／parent-body／feature 关系观察及成功或失败、实体 binding
+context、document QI 和纹理事实分别封存。Source 不另存可从同批观察推导的 body、
+feature、face 索引或 footprint；assembly occurrence 直接原生引用只保留一次。只有成功读取的 exact-state 总数确证为 0 时，NULL 才可证明没有
 state render assignment；present rows 的基数必须与总数一致。Generate 与 Verify 必须从
 material 实际 owner document 的 persistent reference、exact occurrence、配置与显示状态，
-与同一 owner 的索引独立 join，不信任 Source 预填匹配。实际交付网格保持 occurrence
+与同一 owner 的原生观察独立 join。Generate 与 Verify 各自临时构造索引，不信任
+Source 预填匹配，也不增加两份封存派生结果的互比门。实际交付网格保持 occurrence
 对象；对 Part 内 face、body 和 feature assignment，须由几何遍历保留 assembly input
 context，再复用 current captured component source document 的 Part extension 对
-occurrence face/body 调用 `GetCorrespondingEntity2`/`GetCorresponding2`，feature 从转换后的
-Part face 取得，最后由同一 Part extension 读取唯一 reference，并以
+occurrence face 调用 `GetCorrespondingEntity2`；body 与 feature 从验证后的 Part face
+分别通过 `GetBody()`、`GetFeature()` 取得，最后由同一 Part extension 读取唯一 reference，并以
 `GetObjectByPersistReference3` 返回的 exact status `0` 和预期 `IFace2`/`IBody2`/`IFeature`
 QI 证明该 reference 仍属于同一 Part namespace。同一 reference 只解析一次并复用结果。
-父装配 extension 不是该转换或解析的 receiver；
+父装配 extension 不是该转换或解析的 receiver；body 不调用 `GetCorresponding2`。
+材质实体记录完整 public QI 集合，并按实际 target kind 核验支持接口；文档目标不用补造
+实体 reference。body 的交付 face footprint 须由同次实际 Part-face parent-body 观察证明，
+不 first-face 代全体；合法同一 identity 对应多个 occurrence fragments 时保留其实际关系，
+不同 Part body 或缺失、分歧的见证不能按顺序、名称或 coverage 合并。
+
 不得把 assembly alias、双 namespace 或兜底匹配当成 Part 身份。按官方外观层级，
 assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
 part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不
 转换、提升或猜测其作用域。document target 必须核验 `IModelDoc2` QI、path 与 active
 configuration。part 内材质优先级为 `face > feature > body > part document`；document
 target 只表示 part 材质，不能提升为 assembly occurrence override。真实 assembly
-occurrence override 仍高于该 part 内层级。同一 native feature identity 可有多个面的完整
-footprint；重复 footprint 冲突或不同 identity 共享 reference 时不得并集扩张。
+occurrence override 仍高于该 part 内层级。同一 native feature identity 可关联多个实际
+交付 face；原生关系观察冲突或不同 identity 被错误合并时不得扩大覆盖。
 
 最终表示按实际交付 face 的 triangle spans 生成一个或多个 visual/material；alpha 从原生
 透明度派生并保留来源 warning。`PrimaryColor` 按版本化 COLORREF 规则从低到高解码 RGB，

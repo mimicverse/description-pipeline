@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.metadata
 import importlib
 import platform
+import re
 import sys
 from pathlib import Path
 
@@ -39,6 +40,9 @@ SUPPORTED_PYTHON = ">=3.12,<3.13"
 #: offline archives are built for (older-glibc spellings stay installable, a
 #: newer baseline never enters an archive).
 TARGET_PYTHON = "3.12"
+_PYTHON_RUNTIME_VERSION = re.compile(
+    rf"\A{re.escape(TARGET_PYTHON)}(?:\.[0-9]+)?\Z"
+)
 TARGET_ABI = "cp312"
 WINDOWS_PLATFORMS = ("win_amd64",)
 LINUX_GLIBC_BASELINE = 28
@@ -58,6 +62,12 @@ RUNTIME_HOSTS = {
 }
 
 
+def python_version_is_supported(value: object) -> bool:
+    """Whether a recorded CPython version has the supported 3.12[.N] form."""
+
+    return isinstance(value, str) and _PYTHON_RUNTIME_VERSION.fullmatch(value) is not None
+
+
 def runtime_role(role: str | None = None) -> str:
     role = role or ("native" if sys.platform == "win32" else "portable")
     if role not in {"native", "portable"}:
@@ -73,7 +83,7 @@ def native_readiness() -> dict:
     """Check native prerequisites without opening CAD or importing a consumer."""
     if sys.platform != "win32":
         raise PipelineError("Native CAD capture requires Windows with licensed SolidWorks")
-    if sys.version_info[:2] != (3, 12):
+    if not python_version_is_supported(platform.python_version()):
         raise PipelineError("Native CAD capture requires Python 3.12")
     if importlib.metadata.version("pywin32") != RUNTIME_VERSIONS["pywin32"]:
         raise PipelineError("Reinstall the pinned Windows runtime: pywin32 version differs")

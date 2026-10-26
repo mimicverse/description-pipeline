@@ -1005,6 +1005,26 @@ class StageTransferTests(unittest.TestCase):
             ("system", {"runtime": {**native_tool()["runtime"], "system": "Linux"}}, "Windows host"),
             ("python", {"runtime": {**native_tool()["runtime"], "python": "3.11.9"}}, "Python 3.12"),
             (
+                "python-decimal",
+                {"runtime": {**native_tool()["runtime"], "python": "3.120"}},
+                "Python 3.12",
+            ),
+            (
+                "python-garbage",
+                {"runtime": {**native_tool()["runtime"], "python": "3.12garbage"}},
+                "Python 3.12",
+            ),
+            (
+                "python-number",
+                {"runtime": {**native_tool()["runtime"], "python": 3.12}},
+                "Python 3.12",
+            ),
+            (
+                "python-prerelease",
+                {"runtime": {**native_tool()["runtime"], "python": "3.12.0rc1"}},
+                "Python 3.12",
+            ),
+            (
                 "pin",
                 {
                     "runtime": {

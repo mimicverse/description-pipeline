@@ -29,7 +29,7 @@ from .io import (
     read_data,
 )
 from .request_evidence import read_request_evidence
-from .runtime import RUNTIME_VERSIONS, required_packages
+from .runtime import RUNTIME_VERSIONS, python_version_is_supported, required_packages
 from .schemas import TOOL_SCHEMA, NATIVE_DISCOVERY_SCHEMA
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.handoff import MAX_HANDOFF_BYTES, MAX_HANDOFF_FILES
@@ -203,7 +203,10 @@ def _validate_native_tool(native_tool) -> None:
         "Native tool record must declare runtime.role = 'native'",
     )
     _require(str(runtime.get("system") or "") == "Windows", "Native tool record must come from the Windows host")
-    _require(str(runtime.get("python") or "").startswith("3.12"), "Native tool record must pin Python 3.12")
+    _require(
+        python_version_is_supported(runtime.get("python")),
+        "Native tool record must pin Python 3.12",
+    )
     packages = runtime.get("packages")
     _require(isinstance(packages, dict) and packages, "Native tool record lacks its package pins")
     pins = {canonicalize_name(str(name)): value for name, value in packages.items()}

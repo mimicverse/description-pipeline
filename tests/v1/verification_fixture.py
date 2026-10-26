@@ -152,11 +152,107 @@ def _fixture_appearance_raw(
                         face_values[face["face_index"] % 2],
                     ),
                     "native_identity": {
-                        "persistent_reference": None,
+                        "persistent_reference": [
+                            1,
+                            2,
+                            face["face_index"] + 3,
+                        ],
+                        "conversion": {
+                            "component": component,
+                            "input_context": {
+                                "owner_scope": "assembly_occurrence",
+                                "object_kind": "assembly_occurrence",
+                                "source_api": (
+                                    "IComponent2.GetBodies2/"
+                                    "IBody2.GetFaces"
+                                ),
+                                "traversal_api": (
+                                    "IConfiguration.GetRootComponent3/"
+                                    "IComponent2.GetChildren"
+                                ),
+                            },
+                            "receiver": {
+                                "owner_scope": "component_document",
+                                "owner_document_path": source_scope[
+                                    "source_document_path"
+                                ],
+                                "interface": "IModelDocExtension",
+                                "object_source": (
+                                    "captured_component_source_document"
+                                ),
+                            },
+                            "api": (
+                                "IModelDocExtension."
+                                "GetCorrespondingEntity2"
+                            ),
+                            "output_interface_kind": "IFace2",
+                            "output_domain": {
+                                "proof_api": (
+                                    "IModelDocExtension."
+                                    "GetObjectByPersistReference3"
+                                ),
+                                "status": 0,
+                                "interface_kind": "IFace2",
+                                "expected_owner_document_path": (
+                                    source_scope["source_document_path"]
+                                ),
+                            },
+                            "state": "observed",
+                            "read_errors": {},
+                        },
+                        "read_errors": {},
                         "feature": {
                             "name": "fixture-solid",
                             "type_name": "Fixture",
-                            "persistent_reference": None,
+                            "persistent_reference": [4, 5, 6],
+                            "conversion": {
+                                "component": component,
+                                "input_context": {
+                                    "owner_scope": "assembly_occurrence",
+                                    "object_kind": "assembly_occurrence",
+                                    "source_api": (
+                                        "IComponent2.GetBodies2/"
+                                        "IBody2.GetFaces"
+                                    ),
+                                    "traversal_api": (
+                                        "IConfiguration."
+                                        "GetRootComponent3/"
+                                        "IComponent2.GetChildren"
+                                    ),
+                                },
+                                "receiver": {
+                                    "owner_scope": "component_document",
+                                    "owner_document_path": source_scope[
+                                        "source_document_path"
+                                    ],
+                                    "interface": "IModelDocExtension",
+                                    "object_source": (
+                                        "captured_component_source_document"
+                                    ),
+                                },
+                                "api": (
+                                    "IFace2.GetFeature+"
+                                    "IModelDocExtension."
+                                    "GetPersistReference3"
+                                ),
+                                "output_interface_kind": "IFeature",
+                                "output_domain": {
+                                    "proof_api": (
+                                        "IModelDocExtension."
+                                        "GetObjectByPersistReference3"
+                                    ),
+                                    "status": 0,
+                                    "interface_kind": "IFeature",
+                                    "expected_owner_document_path": (
+                                        source_scope[
+                                            "source_document_path"
+                                        ]
+                                    ),
+                                },
+                                "state": "observed",
+                                "read_errors": {},
+                            },
+                            "read_errors": {},
                         },
                     },
                 },

@@ -10,7 +10,12 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from ..appearance_contract import index_conversion_mismatch, scoped_rgba
+from ..appearance_contract import (
+    APPEARANCE_OBJECT_INTERFACE_KINDS,
+    APPEARANCE_OBJECT_INTERFACE_ORDER,
+    index_conversion_mismatch,
+    scoped_rgba,
+)
 from ..geometry.native_tessellation import native_stl_subset
 from ..io import PipelineError, confined, file_digest
 from ..sources.solidworks.naming import (
@@ -99,43 +104,72 @@ def _unique_current_targets(targets: Sequence[Mapping], *, component: str):
         if target_component != component:
             continue
         kind = target["kind"]
+        _require(
+            kind in {
+                "occurrence",
+                "body",
+                "face",
+                "feature",
+                "document",
+            },
+            "A native reference target has an unsupported kind",
+        )
         footprint = None
         if kind == "occurrence":
             identity = ("occurrence", component, 0, 0, 0)
-        elif kind == "feature":
-            feature_identity = _feature_target_identity(target)
-            _require(
-                isinstance(target.get("faces"), list),
-                "A native feature target has no footprint",
+        elif kind in {"body", "feature"}:
+            feature_identity = (
+                _feature_target_identity(target)
+                if kind == "feature"
+                else None
             )
+            body_identity = target.get("persistent_reference_sha256")
+            _require(
+                (
+                    kind == "feature"
+                    and feature_identity is not None
+                )
+                or (
+                    kind == "body"
+                    and isinstance(body_identity, str)
+                    and len(body_identity) == 64
+                    and all(
+                        character in "0123456789abcdef"
+                        for character in body_identity
+                    )
+                ),
+                "A native body or feature target has no exact identity",
+            )
+            _require(
+                isinstance(target.get("faces"), list) and bool(target["faces"]),
+                "A native body or feature target has no footprint",
+            )
+            target_face_keys = set()
             for face in target["faces"]:
-                _require(
-                    isinstance(face, Mapping)
-                    and _face_key(
+                face_key = (
+                    _face_key(
                         face.get("body_type"),
                         face.get("body_index"),
                         face.get("face_index"),
                     )
-                    is not None,
-                    "A native feature footprint has an invalid face",
+                    if isinstance(face, Mapping)
+                    else None
                 )
+                _require(
+                    face_key is not None and face_key not in target_face_keys,
+                    "A native footprint has an invalid or repeated face",
+                )
+                target_face_keys.add(face_key)
             identity = (
-                "feature",
+                kind,
                 component,
                 0,
                 0,
                 0,
-                feature_identity,
+                feature_identity if kind == "feature" else body_identity,
             )
             footprint = tuple(
-                sorted(
-                    (
-                        face["body_type"],
-                        face["body_index"],
-                        face["face_index"],
-                    )
-                    for face in target["faces"]
-                )
+                sorted(target_face_keys)
             )
         else:
             face_key = _face_key(
@@ -165,7 +199,7 @@ def _unique_current_targets(targets: Sequence[Mapping], *, component: str):
                 )
                 _require(
                     previous_footprint == footprint,
-                    "One native feature identity carries conflicting face footprints",
+                    "One native identity carries conflicting face footprints",
                 )
             continue
         current[identity] = target
@@ -239,18 +273,26 @@ def _mapping_errors_for_targets(
         if kind == "faces" and not complete_face(identity):
             applicable.append(error)
             continue
-        if kind == "bodies" and not all(
-            type(identity.get(field)) is int
-            and (
-                identity[field] in (0, 1)
-                if field == "body_type"
-                else identity[field] >= 0
-            )
-            for field in ("body_type", "body_index")
-        ):
-            applicable.append(error)
-            continue
         error_faces = identity.get("faces")
+        body_key = None
+        if kind == "bodies":
+            if (
+                type(identity.get("body_type")) is int
+                and identity["body_type"] in (0, 1)
+                and type(identity.get("body_index")) is int
+                and identity["body_index"] >= 0
+            ):
+                body_key = (
+                    identity["body_type"],
+                    identity["body_index"],
+                )
+            if (
+                not isinstance(error_faces, list)
+                or not error_faces
+                or any(not complete_face(face) for face in error_faces)
+            ) and body_key is None:
+                applicable.append(error)
+                continue
         if kind == "features" and (
             not isinstance(identity.get("name"), str)
             or not identity["name"]
@@ -273,9 +315,27 @@ def _mapping_errors_for_targets(
                     for field in ("body_type", "body_index", "face_index")
                 )
             elif kind == "bodies" and target_kind == "body":
-                matches = all(
-                    identity.get(field) == target.get(field)
-                    for field in ("body_type", "body_index")
+                target_faces = {
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        face["face_index"],
+                    )
+                    for face in target.get("faces", ())
+                    if complete_face(face)
+                }
+                error_footprint = {
+                    (
+                        face["body_type"],
+                        face["body_index"],
+                        face["face_index"],
+                    )
+                    for face in error_faces or ()
+                    if complete_face(face)
+                }
+                matches = bool(error_footprint & target_faces) or (
+                    body_key is not None
+                    and any(face[:2] == body_key for face in target_faces)
                 )
             elif kind == "features" and target_kind == "feature":
                 feature_identity = _feature_target_identity(target)
@@ -364,6 +424,387 @@ def _feature_target_identity(target: Mapping):
     ) not in (int, str):
         raise PipelineError("A feature target identity is not canonical")
     return name, type_name, persistent_identity
+
+
+def _persistent_reference_digest(value: object):
+    reference_key = _persistent_reference_key(value)
+    if reference_key is None:
+        return None
+    return hashlib.sha256(bytes(reference_key)).hexdigest()
+
+
+def _body_witness_evidence(
+    bodies: Sequence[object],
+    *,
+    component: str,
+    expected_document_path: str,
+    all_face_keys: set[tuple[int, int, int]],
+):
+    """Independently rebuild Part-body footprints from face witnesses."""
+
+    footprints: dict[str, set[tuple[int, int, int]]] = {}
+    body_errors: dict[tuple[int, int], dict] = {}
+    body_conversions: dict[str, Mapping] = {}
+    body_reference_values: dict[str, list[int]] = {}
+    for position, body in enumerate(bodies):
+        if not isinstance(body, Mapping):
+            continue
+        key = _face_key(body.get("body_type"), body.get("body_index"), 0)
+        if key is None:
+            continue
+        body_key = key[:2]
+        expected_faces = {
+            face for face in all_face_keys if face[:2] == body_key
+        }
+        identity = body.get("native_identity")
+        path = f"bodies[{position}].native_identity"
+        identity_errors = []
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("owner_scope") != "component_document"
+            or _document_path_key(identity.get("owner_document_path"))
+            != _document_path_key(expected_document_path)
+            or identity.get("state") != "observed"
+            or not isinstance(identity.get("read_errors"), Mapping)
+            or identity.get("read_errors")
+            or not isinstance(identity.get("observation_errors"), list)
+            or identity.get("observation_errors")
+        ):
+            identity_errors.append(
+                "the occurrence body does not carry a complete observed witness set"
+            )
+        observations = (
+            identity.get("face_body_observations")
+            if isinstance(identity, Mapping)
+            else None
+        )
+        if not isinstance(observations, list):
+            identity_errors.append(
+                "the occurrence body carries no face-body observation inventory"
+            )
+            observations = []
+        observations_by_face = {}
+        distinct_references = set()
+        for observation_position, observation in enumerate(observations):
+            face = (
+                _face_key(
+                    body_key[0],
+                    body_key[1],
+                    observation.get("face_index")
+                    if isinstance(observation, Mapping)
+                    else None,
+                )
+            )
+            if face is None or face not in expected_faces:
+                identity_errors.append(
+                    "a face-body observation is outside the delivered "
+                    f"occurrence body at position {observation_position}"
+                )
+                continue
+            observations_by_face.setdefault(face, []).append(observation)
+            reference_key = _persistent_reference_key(
+                observation.get("persistent_reference")
+            )
+            if reference_key is not None:
+                distinct_references.add(reference_key)
+                digest = _persistent_reference_digest(
+                    observation.get("persistent_reference")
+                )
+                if digest is not None:
+                    body_reference_values.setdefault(
+                        digest,
+                        copy.deepcopy(
+                            observation.get("persistent_reference")
+                        ),
+                    )
+        for face in expected_faces:
+            face_observations = observations_by_face.get(face, [])
+            if len(face_observations) != 1:
+                identity_errors.append(
+                    "each delivered face requires exactly one Part-body "
+                    f"observation; face {face} has {len(face_observations)}"
+                )
+                continue
+            observation = face_observations[0]
+            reference_key = _persistent_reference_key(
+                observation.get("persistent_reference")
+            )
+            digest = _persistent_reference_digest(
+                observation.get("persistent_reference")
+            )
+            conversion = observation.get("conversion")
+            read_errors = observation.get("read_errors")
+            conversion_mismatch = index_conversion_mismatch(
+                {
+                    "persistent_reference": copy.deepcopy(
+                        observation.get("persistent_reference")
+                    ),
+                    "native_interface_kind": "IBody2",
+                    "conversion": conversion,
+                    "target": {
+                        "kind": "body",
+                        "component": component,
+                        "persistent_reference_sha256": digest,
+                    },
+                },
+                component=component,
+                owner_document_path=expected_document_path,
+            )
+            if (
+                reference_key is None
+                or digest is None
+                or not isinstance(read_errors, Mapping)
+                or read_errors
+                or conversion_mismatch is not None
+            ):
+                identity_errors.append(
+                    f"delivered face {face} has no exact successful Part-body "
+                    "observation"
+                )
+                continue
+            footprints.setdefault(digest, set()).add(face)
+            body_conversions.setdefault(digest, conversion)
+        reference_count = (
+            identity.get("part_body_reference_count")
+            if isinstance(identity, Mapping)
+            else None
+        )
+        if (
+            type(reference_count) is not int
+            or reference_count < 0
+            or reference_count != len(distinct_references)
+        ):
+            identity_errors.append(
+                "the occurrence body reference count disagrees with its face "
+                "observations"
+            )
+        if identity_errors:
+            body_errors[body_key] = {
+                "path": path,
+                "errors": identity_errors,
+            }
+    return (
+        footprints,
+        body_errors,
+        body_conversions,
+        body_reference_values,
+    )
+
+
+def _component_native_relations(
+    bodies: Sequence[object],
+    *,
+    component: str,
+    expected_document_path: str,
+    all_face_keys: set[tuple[int, int, int]],
+):
+    """Independently build native object relations for verification."""
+
+    (
+        body_footprints,
+        body_errors_by_body,
+        body_conversions,
+        body_reference_values,
+    ) = _body_witness_evidence(
+        bodies,
+        component=component,
+        expected_document_path=expected_document_path,
+        all_face_keys=all_face_keys,
+    )
+    relations = {}
+    errors = {"body": [], "feature": []}
+
+    def add(
+        reference,
+        target,
+        *,
+        native_interface_kind,
+        conversion,
+    ):
+        reference_key = _persistent_reference_key(reference)
+        if reference_key is None:
+            return False
+        relations.setdefault(reference_key, []).append(
+            {
+                "persistent_reference": copy.deepcopy(reference),
+                "native_interface_kind": native_interface_kind,
+                "conversion": copy.deepcopy(conversion),
+                "read_errors": {},
+                "target": copy.deepcopy(target),
+            }
+        )
+        return True
+
+    errors["body"].extend(
+        {
+            "occurrence_body": list(body_key),
+            **copy.deepcopy(error),
+        }
+        for body_key, error in body_errors_by_body.items()
+    )
+    for digest, faces in body_footprints.items():
+        add(
+            body_reference_values.get(digest),
+            {
+                "kind": "body",
+                "component": component,
+                "faces": [
+                    {
+                        "body_type": face[0],
+                        "body_index": face[1],
+                        "face_index": face[2],
+                    }
+                    for face in sorted(faces)
+                ],
+                "occurrence_bodies": [
+                    [body_type, body_index]
+                    for body_type, body_index in sorted(
+                        {face[:2] for face in faces}
+                    )
+                ],
+                "persistent_reference_sha256": digest,
+            },
+            native_interface_kind="IBody2",
+            conversion=body_conversions.get(digest),
+        )
+
+    feature_groups = {}
+    for _position, body in enumerate(bodies):
+        if not isinstance(body, Mapping):
+            continue
+        for face_row in body.get("faces", ()):
+            if not isinstance(face_row, Mapping):
+                continue
+            face = _face_key(
+                body.get("body_type"),
+                body.get("body_index"),
+                face_row.get("face_index"),
+            )
+            appearance = face_row.get("appearance")
+            identity = (
+                appearance.get("native_identity")
+                if isinstance(appearance, Mapping)
+                else None
+            )
+            if face is None or not isinstance(identity, Mapping):
+                continue
+            face_reference = identity.get("persistent_reference")
+            face_conversion = identity.get("conversion")
+            add(
+                face_reference,
+                {
+                    "kind": "face",
+                    "component": component,
+                    "body_type": face[0],
+                    "body_index": face[1],
+                    "face_index": face[2],
+                },
+                native_interface_kind="IEntity",
+                conversion=face_conversion,
+            )
+
+            feature = identity.get("feature")
+            if not isinstance(feature, Mapping):
+                errors["feature"].append(
+                    {
+                        "face": list(face),
+                        "message": "a delivered face has no feature witness",
+                    }
+                )
+                continue
+            feature_reference = feature.get("persistent_reference")
+            feature_key = _persistent_reference_key(feature_reference)
+            feature_conversion = feature.get("conversion")
+            feature_mismatch = index_conversion_mismatch(
+                {
+                    "persistent_reference": copy.deepcopy(feature_reference),
+                    "native_interface_kind": None,
+                    "conversion": feature_conversion,
+                    "target": {
+                        "kind": "feature",
+                        "component": component,
+                        "name": feature.get("name"),
+                        "type_name": feature.get("type_name"),
+                        "persistent_identity": (
+                            list(feature_key)
+                            if feature_key is not None
+                            else None
+                        ),
+                        "faces": [
+                            {
+                                "body_type": face[0],
+                                "body_index": face[1],
+                                "face_index": face[2],
+                            }
+                        ],
+                    },
+                },
+                component=component,
+                owner_document_path=expected_document_path,
+            )
+            if (
+                feature_key is None
+                or feature_mismatch is not None
+                or feature.get("read_errors")
+            ):
+                errors["feature"].append(
+                    {
+                        "face": list(face),
+                        "mismatch": feature_mismatch,
+                        "read_errors": copy.deepcopy(
+                            feature.get("read_errors")
+                        ),
+                    }
+                )
+                continue
+            group = feature_groups.setdefault(
+                feature_key,
+                {
+                    "name": feature.get("name"),
+                    "type_name": feature.get("type_name"),
+                    "persistent_reference": copy.deepcopy(feature_reference),
+                    "conversion": copy.deepcopy(feature_conversion),
+                    "faces": set(),
+                },
+            )
+            if (
+                group["name"] != feature.get("name")
+                or group["type_name"] != feature.get("type_name")
+            ):
+                errors["feature"].append(
+                    {
+                        "feature": list(feature_key),
+                        "message": (
+                            "one native feature reference carries different "
+                            "names or types"
+                        ),
+                    }
+                )
+            group["faces"].add(face)
+    for group in feature_groups.values():
+        add(
+            group["persistent_reference"],
+            {
+                "kind": "feature",
+                "component": component,
+                "name": group["name"],
+                "type_name": group["type_name"],
+                "persistent_reference": copy.deepcopy(
+                    group["persistent_reference"]
+                ),
+                "faces": [
+                    {
+                        "body_type": face[0],
+                        "body_index": face[1],
+                        "face_index": face[2],
+                    }
+                    for face in sorted(group["faces"])
+                ],
+            },
+            native_interface_kind=None,
+            conversion=group["conversion"],
+        )
+    return relations, errors
 
 
 def _validate_index_conversion(
@@ -631,7 +1072,14 @@ def _resolved_faces(
         _require(isinstance(body, Mapping), f"{where}.bodies[{body_index}] is malformed")
         key = _face_key(body.get("body_type"), body.get("body_index"), 0)
         body_key = key[:2]
-        _require(body_key not in body_owners, f"{where} repeats a body appearance owner")
+        _require(
+            body.get("component") == component,
+            f"{where}.bodies[{body_index}] names another component",
+        )
+        _require(
+            body_key not in body_owners,
+            f"{where} repeats a body appearance owner",
+        )
         body_owners[body_key] = body.get("appearance")
         rows = body.get("faces")
         _require(
@@ -645,6 +1093,14 @@ def _resolved_faces(
             _require(face not in all_faces, f"{where} repeats face {face}")
             all_faces.add(face)
             face_owners[body_key][face] = row.get("appearance")
+    component_relations, component_relation_errors = (
+        _component_native_relations(
+            bodies,
+            component=component,
+            expected_document_path=source_document_path,
+            all_face_keys=all_faces,
+        )
+    )
     occurrence = raw.get("occurrence")
     document = raw.get("document")
 
@@ -725,9 +1181,20 @@ def _resolved_faces(
             ),
             f"{owner_path} native material count disagrees with material rows",
         )
+        _require(
+            owner["owner_scope"] != "component_document"
+            or (
+                owner["native_reference_index"] == []
+                and owner["mapping_errors"] == []
+            ),
+            f"{owner_path} component-document owner carries a derived "
+            "footprint index or mapping answer",
+        )
         reference_index = {}
         for index_position, indexed in enumerate(
             owner["native_reference_index"]
+            if owner["owner_scope"] != "component_document"
+            else ()
         ):
             index_path = (
                 owner_path
@@ -820,8 +1287,17 @@ def _resolved_faces(
                     isinstance(entity, Mapping)
                     and entity.get("entity_index") == entity_index
                     and isinstance(entity.get("native_object_type"), str)
-                    and entity.get("native_interface_kind")
-                    in {"IModelDoc2", "IEntity", None}
+                    and isinstance(
+                        entity.get("native_interface_kinds"), list
+                    )
+                    and entity["native_interface_kinds"]
+                    == [
+                        kind
+                        for kind in APPEARANCE_OBJECT_INTERFACE_ORDER
+                        if kind in entity["native_interface_kinds"]
+                    ]
+                    and set(entity["native_interface_kinds"])
+                    <= APPEARANCE_OBJECT_INTERFACE_KINDS
                     and isinstance(entity.get("read_errors"), Mapping),
                     f"{entity_path} is malformed",
                 )
@@ -854,6 +1330,8 @@ def _resolved_faces(
                         == _document_path_key(owner.get("owner_document_path"))
                         and entity["binding_context"].get("api")
                         == DOCUMENT_BINDING_API
+                        and "IModelDoc2"
+                        in entity["native_interface_kinds"]
                         and document_identity.get("qi_iid")
                         == IMODELDOC2_IID
                         and document_identity.get("state") == "observed"
@@ -870,6 +1348,12 @@ def _resolved_faces(
                         ("document", component, 0, 0, 0): {}
                     }
                 else:
+                    reference_identity = (
+                        native_identity
+                        if isinstance(native_identity, Mapping)
+                        and native_identity.get("kind") == "reference"
+                        else None
+                    )
                     entity_key = _persistent_reference_key(
                         entity.get("persistent_reference")
                     )
@@ -886,15 +1370,53 @@ def _resolved_faces(
                         == _binding_context_key(owner_context)
                         and entity["binding_context"].get("api")
                         == OWNER_CONTEXT_BINDING_API
-                        and native_identity is None
+                        and bool(entity["native_interface_kinds"])
+                        and reference_identity is not None
+                        and reference_identity.get("state") == "observed"
+                        and reference_identity.get("proof_api")
+                        == (
+                            "IModelDocExtension."
+                            "GetObjectByPersistReference3"
+                        )
+                        and type(reference_identity.get("status")) is int
+                        and reference_identity.get("status") == 0
+                        and _document_path_key(
+                            reference_identity.get("owner_document_path")
+                        )
+                        == _document_path_key(owner.get("owner_document_path"))
+                        and reference_identity.get("interface_kinds")
+                        == entity["native_interface_kinds"]
+                        and not reference_identity.get("read_errors")
                     )
                     _require(
                         source_context_proven,
                         f"{entity_path} is not bound to its actual owner document",
                     )
-                    targets = reference_index.get(
-                        (entity_key, context_key)
-                    )
+                    if owner["owner_scope"] == "component_document":
+                        interface_target_kind = {
+                            "IBody2": "body",
+                            "IFeature": "feature",
+                        }
+                        applicable_native_errors = {
+                            target_kind: component_relation_errors[target_kind]
+                            for interface_kind, target_kind in (
+                                interface_target_kind.items()
+                            )
+                            if interface_kind
+                            in entity["native_interface_kinds"]
+                            and component_relation_errors[target_kind]
+                        }
+                        _require(
+                            not applicable_native_errors,
+                            f"{entity_path} native object relation evidence "
+                            f"is unresolved: "
+                            f"{json.dumps(applicable_native_errors, sort_keys=True)}",
+                        )
+                        targets = component_relations.get(entity_key, ())
+                    else:
+                        targets = reference_index.get(
+                            (entity_key, context_key)
+                        )
                     _require(
                         bool(targets),
                         f"{entity_path} has no native reference-index binding; "
@@ -914,6 +1436,49 @@ def _resolved_faces(
                         [item["target"] for item in targets],
                         component=component,
                     )
+                    target_faces_by_identity = {}
+                    for identity_key, target in current_targets.items():
+                        if target["kind"] in {"body", "feature"}:
+                            target_faces = {
+                                (
+                                    face["body_type"],
+                                    face["body_index"],
+                                    face["face_index"],
+                                )
+                                for face in target["faces"]
+                            }
+                        elif target["kind"] == "face":
+                            target_faces = {
+                                (
+                                    target["body_type"],
+                                    target["body_index"],
+                                    target["face_index"],
+                                )
+                            }
+                        else:
+                            target_faces = set()
+                        target_faces_by_identity[identity_key] = target_faces
+                        _require(
+                            target_faces <= all_faces,
+                            f"{entity_path} native target contains a face "
+                            "outside the delivered geometry",
+                        )
+                    target_interfaces = {
+                        "occurrence": "IComponent2",
+                        "body": "IBody2",
+                        "face": "IFace2",
+                        "feature": "IFeature",
+                        "document": "IModelDoc2",
+                    }
+                    _require(
+                        all(
+                            target_interfaces[target["kind"]]
+                            in entity["native_interface_kinds"]
+                            for target in current_targets.values()
+                        ),
+                        f"{entity_path} public interfaces do not match its "
+                        "native target kinds",
+                    )
                     for item in targets:
                         if item["target"] in current_targets.values():
                             _validate_index_conversion(
@@ -925,12 +1490,16 @@ def _resolved_faces(
                                 path=entity_path
                                 + ".persistent_reference",
                             )
-                    applicable_errors = _mapping_errors_for_targets(
-                        owner["mapping_errors"],
-                        current_targets,
-                        owner_scope=owner["owner_scope"],
-                        owner_document_path=owner["owner_document_path"],
-                        component=component,
+                    applicable_errors = (
+                        []
+                        if owner["owner_scope"] == "component_document"
+                        else _mapping_errors_for_targets(
+                            owner["mapping_errors"],
+                            current_targets,
+                            owner_scope=owner["owner_scope"],
+                            owner_document_path=owner["owner_document_path"],
+                            component=component,
+                        )
                     )
                     _require(
                         not applicable_errors,
@@ -941,26 +1510,33 @@ def _resolved_faces(
                 if not current_targets:
                     continue
                 if all(
-                    identity[0] == "feature"
+                    identity[0] in {"body", "feature"}
                     for identity in current_targets
                 ):
-                    feature_identities = {
-                        _feature_target_identity(target)
+                    target_kinds = {identity[0] for identity in current_targets}
+                    _require(
+                        len(target_kinds) == 1,
+                        f"{entity_path} native reference aliases body and "
+                        "feature targets",
+                    )
+                    target_kind = next(iter(target_kinds))
+                    native_identities = {
+                        (
+                            _feature_target_identity(target)
+                            if target_kind == "feature"
+                            else target.get("persistent_reference_sha256")
+                        )
                         for target in current_targets.values()
                     }
                     _require(
-                        len(feature_identities) == 1,
-                        f"{entity_path} native reference aliases multiple features",
+                        len(native_identities) == 1,
+                        f"{entity_path} native reference aliases multiple "
+                        f"{target_kind}s",
                     )
-                    for target in current_targets.values():
-                        for item in target["faces"]:
-                            face = (
-                                item["body_type"],
-                                item["body_index"],
-                                item["face_index"],
-                            )
-                            if face in all_faces:
-                                faces_by_scope["feature"].add(face)
+                    for identity_key in current_targets:
+                        faces_by_scope[target_kind].update(
+                            target_faces_by_identity[identity_key]
+                        )
                     continue
                 _require(
                     len(current_targets) <= 1,
@@ -976,13 +1552,7 @@ def _resolved_faces(
                     faces_by_scope["document"] |= all_faces
                     continue
                 face_key = (body_type, body_index, face_index)
-                if kind == "body":
-                    faces_by_scope["body"] |= {
-                        face
-                        for face in all_faces
-                        if face[:2] == face_key[:2]
-                    }
-                elif face_key in all_faces:
+                if face_key in all_faces:
                     faces_by_scope[kind].add(face_key)
             material_faces = set().union(*faces_by_scope.values())
             if not material_faces:

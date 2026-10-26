@@ -1498,6 +1498,28 @@ class StructuralQualityTests(unittest.TestCase):
             )
             self.assertEqual("1.0.0", quality._tool(root)["version"])
 
+    def test_structural_quality_uses_exact_python_runtime_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tool = {
+                "schema_version": "solidworks-to-urdf.tool/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "source_sha256": "a" * 64,
+                "version": "1.0.0",
+                "runtime": {
+                    "python": "3.12",
+                    "packages": {"numpy": "2.5.3", "pywin32": "311"},
+                },
+            }
+            write_json(root / "tool.json", tool)
+            self.assertEqual("1.0.0", quality._tool(root)["version"])
+            for value in ("3.120", "3.12garbage", "3.12.0rc1", 3.12):
+                with self.subTest(value=repr(value)):
+                    wrong = {**tool, "runtime": {**tool["runtime"], "python": value}}
+                    write_json(root / "tool.json", wrong)
+                    with self.assertRaisesRegex(PipelineError, "Missing pinned build runtime"):
+                        quality._tool(root)
+
     def test_captured_matrices_are_rowmajor_and_reflections_fail(self):
         transform = np.array([[0, -1, 0, 0.1], [1, 0, 0, 0.2], [0, 0, 1, 0.3], [0, 0, 0, 1]], dtype=float)
         np.testing.assert_array_equal(transform, quality._cad_pose(transform.ravel()))

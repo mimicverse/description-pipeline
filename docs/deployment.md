@@ -240,7 +240,7 @@ start、stop、health 和 recovery。triggerer 缺失、版本不符、未运行
    生产身份与同一 SourceSet 原件血缘一致；SourceSet 与 prepared 保持不同摘要。两个
    operation 可以独立传输和物化，单 runtime/CAD owner 与 operation-local workspace
    不变；不得新增跨 operation source cache 或把内容复用当作工程资格。
-3. Linux 推导、生成、验证、报告与发布不调用 Windows；验证/发布重跑不创建 CAD 操作，Windows 安装不包含可移植运行依赖。 外观验收须用本次原生事实证明实际交付面的对象、状态、RGBA 与无损分组；验证原生 activity 经既有 poll 到 Portal 的真实显示，activity 与阶段资格分别核验。隔离 Capture 与 Linux transfer 通过不能代替正式 Freeze 开始的六阶段验收。
+3. Linux 推导、生成、验证、报告与发布不调用 Windows；验证/发布重跑不创建 CAD 操作，Windows 安装不包含可移植运行依赖。 外观验收须用本次原生事实证明实际交付面的对象、状态、RGBA 与无损分组；覆盖完整 public-QI 分类、Part face 到 body/feature 的原生归属、合法共享 identity/fragments，以及缺失、分歧和接口不兼容的拒绝。零参 COM 方法须按方法调用，live handle 不得进入深复制或封存事实。验证原生 activity 经既有 poll 到 Portal 的真实显示，activity 与阶段资格分别核验。隔离 Capture 与 Linux transfer 通过不能代替正式 Freeze 开始的六阶段验收。
 4. 同时提交、重复请求、断连与重启保持幂等；在全新进程中从已登记 command 和封存
    artifact 重建 workspace，不依赖前一阶段内存、缓存或临时目录。native operation
    串行，未知 CAD 会话被拒绝且不被访问或终止。

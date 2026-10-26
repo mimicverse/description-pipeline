@@ -113,7 +113,40 @@
                 "state": "absent",
                 "material_name": null
               },
-              "read_errors": {}
+              "read_errors": {},
+              "native_identity": {
+                "persistent_reference": [
+                  1,
+                  2,
+                  3
+                ],
+                "conversion": {
+                  "component": "arm-1",
+                  "input_context": {
+                    "owner_scope": "assembly_occurrence",
+                    "object_kind": "assembly_occurrence",
+                    "source_api": "IComponent2.GetBodies2/IBody2.GetFaces",
+                    "traversal_api": "IConfiguration.GetRootComponent3/IComponent2.GetChildren"
+                  },
+                  "receiver": {
+                    "owner_scope": "component_document",
+                    "owner_document_path": "C:\\capture\\arm.SLDPRT",
+                    "interface": "IModelDocExtension",
+                    "object_source": "captured_component_source_document"
+                  },
+                  "api": "IModelDocExtension.GetCorrespondingEntity2",
+                  "output_interface_kind": "IFace2",
+                  "output_domain": {
+                    "proof_api": "IModelDocExtension.GetObjectByPersistReference3",
+                    "status": 0,
+                    "interface_kind": "IFace2",
+                    "expected_owner_document_path": "C:\\capture\\arm.SLDPRT"
+                  },
+                  "state": "observed",
+                  "read_errors": {}
+                },
+                "read_errors": {}
+              }
             }
           },
           {
@@ -174,7 +207,9 @@
               {
                 "entity_index": 0,
                 "native_object_type": "IModelDoc2",
-                "native_interface_kind": "IModelDoc2",
+                "native_interface_kinds": [
+                  "IModelDoc2"
+                ],
                 "persistent_reference": null,
                 "binding_context": {
                   "owner_scope": "component_document",
@@ -213,7 +248,10 @@
               {
                 "entity_index": 0,
                 "native_object_type": "IFace2",
-                "native_interface_kind": "IEntity",
+                "native_interface_kinds": [
+                  "IFace2",
+                  "IEntity"
+                ],
                 "persistent_reference": [
                   1,
                   2,
@@ -224,6 +262,18 @@
                   "owner_document_path": "C:\\capture\\arm.SLDPRT",
                   "component": "arm-1",
                   "api": "IModelDocExtension.GetPersistReference3"
+                },
+                "native_identity": {
+                  "kind": "reference",
+                  "state": "observed",
+                  "proof_api": "IModelDocExtension.GetObjectByPersistReference3",
+                  "status": 0,
+                  "owner_document_path": "C:\\capture\\arm.SLDPRT",
+                  "interface_kinds": [
+                    "IFace2",
+                    "IEntity"
+                  ],
+                  "read_errors": {}
                 },
                 "read_errors": {}
               }
@@ -237,55 +287,7 @@
           }
         ],
         "mapping_errors": [],
-        "native_reference_index": [
-          {
-            "persistent_reference": [
-              1,
-              2,
-              3
-            ],
-            "native_interface_kind": "IEntity",
-            "read_errors": {},
-        "conversion": {
-          "component": "arm-1",
-          "input_context": {
-            "owner_scope": "assembly_occurrence",
-            "object_kind": "assembly_occurrence",
-            "source_api": "IComponent2.GetBodies2/IBody2.GetFaces",
-            "traversal_api": "IConfiguration.GetRootComponent3/IComponent2.GetChildren"
-          },
-          "receiver": {
-            "owner_scope": "component_document",
-            "owner_document_path": "C:\\capture\\arm.SLDPRT",
-            "interface": "IModelDocExtension",
-            "object_source": "captured_component_source_document"
-          },
-          "api": "IModelDocExtension.GetCorrespondingEntity2",
-          "output_interface_kind": "IFace2",
-          "output_domain": {
-            "proof_api": "IModelDocExtension.GetObjectByPersistReference3",
-            "status": 0,
-            "interface_kind": "IFace2",
-            "expected_owner_document_path": "C:\\capture\\arm.SLDPRT"
-          },
-          "state": "observed",
-          "read_errors": {}
-        },
-            "binding_context": {
-              "owner_scope": "component_document",
-              "owner_document_path": "C:\\capture\\arm.SLDPRT",
-              "component": "arm-1",
-              "api": "IModelDocExtension.GetPersistReference3"
-            },
-            "target": {
-              "kind": "face",
-              "component": "arm-1",
-              "body_type": 0,
-              "body_index": 0,
-              "face_index": 0
-            }
-          }
-        ],
+      "native_reference_index": [],
         "read_errors": {}
       }
     ]

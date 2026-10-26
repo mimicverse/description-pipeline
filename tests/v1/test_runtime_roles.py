@@ -162,6 +162,31 @@ class RuntimeRoleTests(unittest.TestCase):
         project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
         self.assertEqual(project["requires-python"], runtime.SUPPORTED_PYTHON)
 
+    def test_python_version_record_contract(self):
+        for value in ("3.12", "3.12.0", "3.12.10", "3.12.999"):
+            with self.subTest(value=value):
+                self.assertTrue(runtime.python_version_is_supported(value))
+        for value in (
+            "",
+            "3.11.9",
+            "3.13.0",
+            "3.120",
+            "3.12garbage",
+            "3.12.garbage",
+            "3.12.",
+            "3.12.0rc1",
+            "3.12.0.dev0",
+            "3.12.10+local",
+            "3.12.10.1",
+            " 3.12",
+            "3.12\n",
+            None,
+            3.12,
+            True,
+        ):
+            with self.subTest(value=repr(value)):
+                self.assertFalse(runtime.python_version_is_supported(value))
+
     def test_release_domain_identity_comes_from_the_machine_definitions(self):
         from description_pipeline import interface_records, stages
 

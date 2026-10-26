@@ -309,6 +309,35 @@ class FreezeDomainTests(unittest.TestCase):
             ],
         )
 
+    def test_empty_catalog_root_is_restored_inside_freeze(self) -> None:
+        root = self.harness.ruleset / "root-000"
+        shutil.rmtree(root)
+        roots = (RulesetRoot(path="root-000", members={}),)
+        catalog = RulesetCatalog(
+            version="records-" + digest([item.to_record() for item in roots]),
+            roots=roots,
+            records={},
+        )
+        self.harness.ruleset_version = catalog.version
+        write_json(
+            self.harness.ruleset / "catalog.json",
+            catalog.to_record(),
+        )
+        self.harness.ruleset_ref = _artifact(
+            RULESET_KIND,
+            self.harness.ruleset,
+        )
+        command = self.harness.command()
+        execution = self.handler.execute(
+            command,
+            self.harness.claim(command),
+            self.harness.workspace(),
+            effects=NoEffects(),
+        )
+        self.assertEqual(execution.outcome, "completed")
+        self.assertTrue(root.is_dir())
+        self.assertEqual(list(root.iterdir()), [])
+
     def test_freeze_refuses_a_fabricated_predecessor(self) -> None:
         source = self.harness.command()
         command = StageCommand.create(

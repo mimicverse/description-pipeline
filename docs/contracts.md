@@ -118,13 +118,13 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 
 工程交付标识采用 `<model>-<total>dof-<head><arm><waist><leg>-r<revision>`；配置码按头、单侧手臂、腰、单侧腿排列，对称结构满足 `total = head + 2 × arm + waist + 2 × leg`。型号和工程修订来自明确登记，不能从文件日期、执行号或代码版本猜测。重复导出或仅修复导出器不递增工程修订。
 
-本次用户于 2026-10-20 确认的初始基线为 `M3-23dof-2515-r01`，对应原主装配 `M3.0.3_20261016.SLDASM`，主装配 SHA-256 为 `647b756847bb08f99287b71b86ea55e4cfb554df22f51a3e9f2ed337472799ce`，原生交付选择摘要为 `5f5c1f1a5dd874e8993486e0ddfe5043d422ec272bba63dbe59cb8a7488406db`。登记必须绑定完整冻结来源和配置，并与本次请求核对；不得把登记值伪装为 CAD 内已有的属性。原件名称、原件字节、原始声明和失败证据不变，缺失的原生 `dp.revision` 仍记录为缺失。
+工程登记必须绑定本次完整冻结来源和配置，并与本次请求核对；具体模型、修订、文件名和摘要属于请求或测试资料，不作为规范中的固定基线。不得把登记值伪装为 CAD 内已有的属性。原件名称、原件字节、原始声明和失败证据不变，缺失的原生 `dp.revision` 仍记录为缺失。
 
 工程交付标识是行政登记，与 CAD 内部名称分别保存，不能补齐原生模型名或机械修订。URDF 文件入口固定为 `urdf/robot.urdf`。XML 内部模型名读取顶层装配中的有效原生声明或属性；确证缺失时，允许对本次原生顶层装配名作统一、确定的格式化，绑定原始文档名、配置和摘要，显示派生来源 warning。格式化不得猜测型号、自由度或修订，也不得引入登记名、发布目标或手工名称。原生属性读取失败、无效或相互冲突不得按缺失回退。
 
 参考测试允许 XML `robot.name` 与适用手工 fixture 的 inspection 标签不同，并在测试 diff 中列出；该标签不进入生产或发布判定。生产模型名仍须符合当前 CAD 来源规则、格式、来源 warning 和独立复算要求，不能任意生成或伪造，也不改变其他对象名称、引用及固定文件入口的要求。
 
-参考测试允许两类字符串差异：从 CAD 实例稳定派生的 visual 名称可不同于 fixture 的 `native_N` 序号，带来源 warning 的展示材质名称可不同于 fixture 的 `cad_gray`，测试 diff 仍须展示。生产不读取这些参考名称；名称稳定、格式合法、对象绑定、定义与引用一致、颜色和纹理、几何、来源及独立复算要求不变。不允许用名称放行掩盖材质缺失、颜色变化、错误绑定或未验证来源，也不放宽 link、joint、collision、frame 或网格的既有要求。
+参考测试允许两类字符串差异：从 CAD 实例稳定派生的 visual 名称可不同于 fixture 的显示序号名，带来源 warning 的展示材质名称可不同于 fixture 的展示标签，测试 diff 仍须展示。生产不读取这些参考名称；名称稳定、格式合法、对象绑定、定义与引用一致、颜色和纹理、几何、来源及独立复算要求不变。不允许用名称放行掩盖材质缺失、颜色变化、错误绑定或未验证来源，也不放宽 link、joint、collision、frame 或网格的既有要求。
 
 模型接口统一遵循[机械交付规范](mechanical-handoff-spec.md#名称与原生引用)：唯一根为 `base_link`，其他刚体使用 `_link` 后缀，运动关节使用 `_joint` 后缀，方位使用完整 `left/right/front/rear/upper/lower`，接口按实际用途使用 `_mount/_tcp/_optical/_frame`。声明模式与配合推导模式执行同一输出命名要求；仅通过 snake_case 语法检查不能视为符合语义规范。
 
@@ -167,7 +167,7 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 
 警告定位到稳定对象和字段，引用实际交付值及其原始依据，记录非原生来源类别和原因；计算派生值另引用算法／工具版本及必要常量来源。同一来源或算法可以聚合展示，但必须能展开到全部受影响字段。复用现有来源记录和诊断，不另外保存一份模型或数值状态；以已绑定交付中的精确字段引用取得实际值即可。
 
-质量报告、页面预览及 PR 使用同一组来源警告；URDF 文件也须包含可见的英文警告摘要及详细来源清单位置。英文提示明确值并非从 CAD 直接读取。工程登记 `M3-23dof-2515-r01` 只作行政记录，不能用来填内部模型名。警告说明来源，不授权手工或外部值补齐，也不授予工程或实机资格。
+质量报告、页面预览及 PR 使用同一组来源警告；URDF 文件也须包含可见的英文警告摘要及详细来源清单位置。英文提示明确值并非从 CAD 直接读取。工程登记只作行政记录，不能用来填内部模型名。警告说明来源，不授权手工或外部值补齐，也不授予工程或实机资格。
 
 <a id="purpose"></a>
 ## 用途与资格
@@ -688,7 +688,15 @@ raw/STL 一致性证明本次原始三角事实到交付的派生一致性，不
 
 `GetRenderMaterials2(3, names)` 与 `GetRenderMaterialsCount2(3, names)` 使用同一个表示 exact owner display state 的 typed `SAFEARRAY(BSTR)`。NULL 与计数分开保留；只有成功计数为零才证明该状态无 assignment，正数或未知计数不能解释为 absent。成功枚举的行数必须等于同状态计数，不使用旧无参 Count 或 fallback。
 
-文档实体通过真实 `IModelDoc2` QI、实际 `GetPathName` 与 active configuration 建立身份，不要求文档具有实体 persistent reference。其他材质实体与同次几何遍历的 `native_reference_index` 使用实际材质所属文档的原生持久引用，并绑定 exact occurrence、配置和显示状态；Generate 与 Verify 各自从原始事实独立 join。`component_document` 的材质与索引使用同一真实 Part owner extension。组件 API 返回的 occurrence-context 面先由目标 Part extension 的 `GetCorrespondingEntity2` 取得 underlying Part face，body 由同一 extension 的 `GetCorresponding2` 取得 underlying Part body；feature 从该 Part face 取得，再由同一 Part extension 读取唯一持久引用。这里只适配原生身份，实际 occurrence 几何、坐标和 face spans 不换源，首读结果复用。 该引用须在同一 Part extension 通过 `GetObjectByPersistReference3` 原生解析，状态为 `swPersistReferencedObject_Ok`（0）且对象支持预期 `IFace2`、`IBody2` 或 `IFeature`，再作为有效索引；无效、抑制、删除、空结果或错误类型保留原生错误，不登记成功绑定。解析按 Part 文档、引用和类型复用一次，不增加 Part 几何遍历。Generate 与 Verify 对参与实体独立核对该次原生解析及引用关联，并执行 raw join；测试专用标签、`ISldWorks.IsSame` 或自报“属于 Part”均不能建立资格。输入对象的装配上下文不决定方法 receiver；不新增 parent/root assembly receiver 选择，也不转换到装配引用或保留第二套备用匹配。按官方外观层级，assembly-owned 材质使用实际 assembly owner 上下文中的组件实例；face、feature、body 和 part assignment 使用 Part owner。装配材质指向非 occurrence target 时明确拒绝，不转换、提升或猜测其作用域。不能以非空引用、颜色相同或索引覆盖全组件证明身份，不保留无消费者的转换及重复引用副本。参与对象绑定的原生读取或 mapping 错误、错误 component／source document、未绑定或真实歧义均拒绝；没有参与该绑定的辅助诊断不另设零错误资格。同一 native feature identity 可有多个面的完整 `faces[]` footprint，重复记录的完整 footprint 不一致须拒绝，不对不同对象或不同覆盖取并集染色。
+文档实体通过真实 `IModelDoc2` QI、实际 `GetPathName` 与 active configuration 建立身份，不要求文档具有实体 persistent reference。其他材质实体记录实际支持的 public QI 集合，包括适用的 `IComponent2`、`IBody2`、`IFeature`、`IFace2`、`IEntity` 和文档接口；不能用首个成功接口或固定优先标签掩盖其他原生能力。原始接口查询与错误如实保留，`CDispatch`、未知类型、引用长度或非空字节均不能证明对象种类。
+
+材质实体与同次几何遍历的唯一原生实体／归属观察使用实际 owner document 的持久引用，绑定 exact occurrence、配置和显示状态。Source 只封存逐 face 的原生引用、parent-body／feature 关系及成功或失败，不再另存由这些观察推导的 body、feature 或 face 索引与 footprint。assembly occurrence 的直接原生引用只保留一次。Generate 与 Verify 分别从原始事实构造临时索引并执行 join，核验命中 target kind 与原生接口集合兼容；临时派生结果不成为第二份封存权威。Part 实体引用由同一 Part extension 通过 `GetObjectByPersistReference3` 解析，必须返回 exact integer `0` 和预期接口；null、非 OK、错误类型或错误 owner 不登记为成功。文档目标仍使用文档证明，不为它补造引用。引用按实际 owner 与字节解析一次并复用，类型只约束解析结果的 QI，不让同一引用因类型不同被重复解析；不保留重复引用权威。
+
+几何读取保持 `IComponent2.GetBodies2` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`，不改变 occurrence 几何、坐标或 face spans。每个已观察的 occurrence face 由目标 Part extension 的 `GetCorrespondingEntity2` 取得并验证 underlying Part face；在该 Part face 上调用公开方法 `GetBody()`、`GetFeature()`，取得实际 Part body 和 feature，再读取并解析同一 Part namespace 的引用。body 不使用 `GetCorresponding2`，不增加第二次 Part 几何遍历、父装配 receiver 或兜底转换。原生 COM handle 仅保留在自有会话内存中；复制和封存的事实必须为纯 JSON，不深复制或序列化 live handle。
+
+原生 identity 与交付 geometry footprint 是有证据的关系，不假定一一对应。复用同次 face 遍历的真实 parent-body 观察建立 body 的完整 face footprint，不能以第一个 face 代表整个 occurrence body；同一 Part body 或 face 对应多个 occurrence fragments 时，须保留实际关系。多个 Part body、缺失或分歧的见证，须逐 face 明确处理；参与材质绑定时无法证明的部分失败，不按顺序、名称、颜色或 coverage 猜归属。同一 native feature 仍可拥有多个面的完整 footprint。原生关系观察冲突或不同原生 identity 被错误合并时拒绝，不能通过扩大覆盖集合染色；Source 不输出预匹配或派生 footprint 答案，两个消费者独立重建适用关系，不再对两套封存派生结果增加互比检查。
+
+按官方外观层级，assembly-owned 材质只使用实际 assembly owner 上下文中的 component occurrence；face、body、feature 和 part assignment 使用 Part owner。装配材质指向非 occurrence target 时拒绝，不转换、提升或猜测作用域。参与对象绑定的原生读取或 mapping 错误、错误 component/source document、未绑定或真实歧义均拒绝；无关辅助诊断不另设全表零错误资格。测试标签、对象不相等或自报“属于 Part”均不能建立原生资格。
 
 有效外观按有文档依据的对象层级解释，不任意规定继承。已证明参与的单色现代 material 必须绑定 exact owner/state 与实际交付面，`ColorForm=1`，无参与纹理或 surface finish。通用规则 `appearance.primary_color_colorref` 版本 `v1` 对非布尔、范围为 `0..0xffffff` 的 `PrimaryColor` 整数计算 `R=(v&255)/255`、`G=((v>>8)&255)/255`、`B=((v>>16)&255)/255`，`alpha=1-Transparency`，不取最高字节作为 alpha。九值属性的 alpha 同样由其原生透明度派生。保留原值、规则版本、结果和字段级 derived warning；独立验证自行计算。位顺序依据固定成熟导出器的同 API 实现交叉证据，不能冒称官方文档明确给出了 byte packing，也不从手工参考回填。
 

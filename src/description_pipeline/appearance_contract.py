@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import posixpath
 from collections.abc import Mapping, Sequence
 
 RGBA_ATOL = 1e-12
+APPEARANCE_OBJECT_INTERFACE_ORDER = (
+    "IModelDoc2",
+    "IPartDoc",
+    "IComponent2",
+    "IBody2",
+    "IFeature",
+    "IFace2",
+    "IEntity",
+)
+APPEARANCE_OBJECT_INTERFACE_KINDS = frozenset(
+    APPEARANCE_OBJECT_INTERFACE_ORDER
+)
 
 
 def _rgba_values(value: object) -> tuple[float, float, float, float]:
@@ -86,11 +99,13 @@ def index_conversion_mismatch(
         }
     expected_source_api = (
         "IComponent2.GetBodies2/IBody2.GetFaces"
-        if kind in {"face", "feature"}
+        if kind in {"body", "face", "feature"}
         else "IComponent2.GetBodies2"
     )
     expected_api = {
-        "body": "IModelDocExtension.GetCorresponding2",
+        "body": (
+            "IFace2.GetBody+IModelDocExtension.GetPersistReference3"
+        ),
         "face": "IModelDocExtension.GetCorrespondingEntity2",
         "feature": (
             "IFace2.GetFeature+"
@@ -131,7 +146,21 @@ def index_conversion_mismatch(
         "native_interface_kind": expected_indexed_interface,
         "owner_document_path": owner_document_path,
     }
+    body_target_reference_matches = True
+    if kind == "body":
+        reference = indexed.get("persistent_reference")
+        body_target_reference_matches = (
+            isinstance(reference, list)
+            and bool(reference)
+            and all(type(item) is int for item in reference)
+            and target.get("persistent_reference_sha256")
+            == hashlib.sha256(
+                bytes(item & 0xFF for item in reference)
+            ).hexdigest()
+        )
     valid = (
+        body_target_reference_matches
+        and
         native_interface_kind == expected_indexed_interface
         and isinstance(conversion, Mapping)
         and conversion.get("component") == component

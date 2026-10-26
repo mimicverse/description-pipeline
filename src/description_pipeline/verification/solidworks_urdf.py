@@ -30,6 +30,7 @@ from ..geometry.native_scope import (
     native_warning_projection,
 )
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
+from ..runtime import python_version_is_supported
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.naming import fixed_joint_name
 from ..sources.solidworks.native_limits import (
@@ -834,7 +835,12 @@ def _tool(root, native_receipts=None):
     )
     _require(re.fullmatch(r"[0-9a-f]{64}", tool["source_sha256"]) is not None, "Missing tool code digest")
     runtime = tool["runtime"]
-    _require(runtime["python"].startswith("3.12.") and bool(runtime["packages"]), "Missing pinned build runtime")
+    _require(
+        isinstance(runtime, dict)
+        and python_version_is_supported(runtime.get("python"))
+        and bool(runtime.get("packages")),
+        "Missing pinned build runtime",
+    )
     for version in runtime["packages"].values():
         _require(isinstance(version, str), "Invalid dependency versions")
         Version(version)

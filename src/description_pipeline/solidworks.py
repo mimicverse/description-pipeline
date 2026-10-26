@@ -5,13 +5,13 @@ from __future__ import annotations
 import importlib.metadata
 import platform
 import shutil
-import sys
 
 from . import __version__
 from .delivery import PIPELINE_ID
 from .runtime import (
     RUNTIME_VERSIONS,
     native_readiness,
+    python_version_is_supported,
     required_packages,
     runtime_role,
 )
@@ -24,7 +24,7 @@ def doctor() -> dict:
     results = [
         {
             "id": "python",
-            "passed": sys.version_info[:2] == (3, 12),
+            "passed": python_version_is_supported(platform.python_version()),
             "actual": platform.python_version(),
         }
     ]

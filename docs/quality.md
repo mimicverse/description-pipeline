@@ -43,15 +43,24 @@ typed display-state 参数下的 `GetRenderMaterialsCount2` 分开保存。只�
 exact-state 总数确证为 0 时才可证明没有 state render assignment；非零或未知总数下的
 NULL 仍是未解析事实，present rows 的基数必须与总数一致。
 
-state material 的 entity 与同次几何遍历的 `native_reference_index` 以 material 实际
+state material 的 entity 与同次几何遍历的唯一原生实体／归属观察，以 material 实际
 owner document 的 persistent reference、exact occurrence、配置与显示状态独立 join。
+Source 只封存逐 face 的原生引用、parent-body／feature 关系及成功或失败，不另存由其
+推导的 body、feature、face 索引或 footprint；assembly occurrence 的直接原生引用保留一次。
+Generate 与 Verify 各自构造临时索引，不通过第二份封存派生结果及互比门建立资格。
 实际交付网格保持 occurrence 对象；Part 内 face、body 和 feature identity 须由 traversal
 证明 assembly input context，再复用 current captured component source document 的 Part
-extension 调用 `GetCorrespondingEntity2`/`GetCorresponding2`，feature 从转换后的 Part
-face 取得，最后由同一 Part extension 读取 reference，并用
+extension 对 occurrence face 调用 `GetCorrespondingEntity2`。body 与 feature 从验证后的
+Part face 通过公开 `GetBody()`、`GetFeature()` 取得，最后由同一 Part extension 读取 reference，并用
 `GetObjectByPersistReference3` 的 exact status `0` 与预期 `IFace2`/`IBody2`/`IFeature`
 QI 验证解析结果仍在该 Part namespace；同一 reference 只解析一次并复用。父装配
-extension 不是 receiver 或 resolver；
+extension 不是 receiver 或 resolver；body 不调用 `GetCorresponding2`，不另遍历 Part 几何。
+材质实体必须保留全部受支持的 public QI 结果；命中 target kind 须有对应接口证明，
+文档目标仍以 `IModelDoc2`、path/configuration 核验，不强制其具有实体 reference。
+body footprint 必须来自同次实际 Part-face parent-body 关系；合法共享 identity 与多个
+occurrence fragments 保留实际 face 集合，不能 first-face 代全体，也不能把不同 Part
+body、缺失或分歧见证按相同 coverage 合并。参与绑定的未知归属失败，无关辅助失败不设全表门。
+
 不得把 assembly alias、双 namespace 或兜底匹配当成 Part 身份。按官方外观层级，
 assembly-owned material 使用实际 assembly owner 中的组件实例；face、feature、body 和
 part assignment 使用 Part owner。assembly 材质指向非 occurrence target 时明确拒绝，不
@@ -62,8 +71,8 @@ Source 预填匹配。参与对象绑定的 owner key 无法命中，或命中 t
 exact Count=0 owner 或 exact document proof 可忽略辅助诊断。同一 occurrence 内的 material
 优先级固定为 `face > feature > body > part document`；document target 表示 part 材质，
 不能无条件提升为 assembly occurrence override。真实 assembly occurrence override 仍优先
-于上述 part 内层级。同一 feature identity 可拥有多个面的完整 `faces[]`；重复记录的
-footprint 不一致、不同 identity 共享 reference 或对象/覆盖被并集扩张均为未知并失败。
+于上述 part 内层级。同一 feature identity 可关联多个实际观察到的交付 face；原生关系
+观察冲突、不同 identity 被错误合并或无依据扩大覆盖均为未知并失败。
 Generate 与 Verify 分别执行该 join，并按交付 face 的 triangle span 无损分组为多个
 visual/material；alpha 从原生 index 7 的透明度派生并显示来源 warning。当前没有资产、
 UV 和绑定消费能力的 present texture、对象/配置错绑或冲突必须失败，不输出默认色，
@@ -229,7 +238,7 @@ receipt；已有决定时核验并返回原封存结果，不重新计算。Veri
 
 模型的工程批准、全行程安全、制造公差、接触/碰撞、仿真、训练和实机控制在各自验收中建立。中性原生夹具资格化其实际覆盖的工具行为，不资格化具体硬件。全部必需检查通过后可以发布绑定所选用途的待评审 PR；工程批准与实机资格未建立不新增自动失败门，也不能被 PR 创建授予；不同用途的候选与发布恢复身份相互隔离。
 
-方向专项验收要求：当前不引入基于右手定则或功能动作的新正向推导，优先验证原生有向轴、有效作者声明和必要坐标表达。CAD 偏离已有规范时 warning 完整且有据可修正项不阻断；转换对正反向、小幅非零姿态及适用组合均成立；斜轴不被强行对齐、镜像不被无条件翻转、零位／边界不同步的错误能够检出。原先报告的七处方向差异分别列明原生证据、CAD 运动语义、适用转换及结果，不预置其必须为负号。独立参考测试只在 fixture 的 CAD、配置和版本适用时按相同语义姿态比较，区别表示、已批准符号差异与真实运动差异；不得把参考测试设为生产方向真值或发布必经门。
+方向专项验收要求：当前不引入基于右手定则或功能动作的新正向推导，优先验证原生有向轴、有效作者声明和必要坐标表达。CAD 偏离已有规范时 warning 完整且有据可修正项不阻断；转换对正反向、小幅非零姿态及适用组合均成立；斜轴不被强行对齐、镜像不被无条件翻转、零位／边界不同步的错误能够检出。实际观察到的方向差异分别列明原生证据、CAD 运动语义、适用转换及结果，不预置其必须为负号。独立参考测试只在 fixture 的 CAD、配置和版本适用时按相同语义姿态比较，区别表示、已批准符号差异与真实运动差异；不得把参考测试设为生产方向真值或发布必经门。
 
 驱动／编码器方向关系须另有可追溯的依据：核对实际执行器身份与 CAD occurrence、命令类型／模式、编码器计数方向、零位、传动及关节物理运动。已有配置和验证记录只证明其明确覆盖的版本和范围，不把电机外观或安装朝向当成正转真值。覆盖执行器错绑、编码器与命令方向相反、版本不符、声明缺失及参考符号回填的反例；缺少证据时明确硬件资格未验证，不能以几何一致或 warning 冒称该资格通过，也不阻塞本次导出流程。查证外部配置不改变 CAD 唯一工程来源边界。
 
