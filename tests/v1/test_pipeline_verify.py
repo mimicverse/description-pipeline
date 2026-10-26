@@ -303,7 +303,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(
             PipelineError,
-            "has no proven identity mapping",
+            "has no native reference-index binding",
         ):
             _resolved_faces(
                 raw,
@@ -358,6 +358,18 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         owner = raw["state_render_materials"][0]
         owner["call_state"] = "observed"
         owner["native_render_material_count"] = 1
+        owner["native_reference_index"] = [
+            {
+                "persistent_reference": [4, 5, 6],
+                "target": {
+                    "kind": "face",
+                    "component": "arm-1",
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                },
+            }
+        ]
         owner["materials"] = [
             {
                 "material_index": 0,
@@ -560,6 +572,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         "call_state": "empty",
                         "materials": [],
                         "mapping_errors": [],
+                        "native_reference_index": [],
                         "read_errors": {},
                     }
                 ],

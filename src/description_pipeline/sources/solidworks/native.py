@@ -4940,6 +4940,8 @@ class SolidWorksBackend(CadBackend):
             "features": {},
         }
         mapping_errors = []
+        native_reference_index = []
+        index_keys = set()
 
         def add(kind, entity, identity):
             reference, error = _appearance_persistent_reference(
@@ -4958,6 +4960,25 @@ class SolidWorksBackend(CadBackend):
             key = _appearance_reference_key(reference)
             if key is not None:
                 maps[kind].setdefault(key, []).append(identity)
+                index_key = (kind, key)
+                if index_key not in index_keys:
+                    index_keys.add(index_key)
+                    target = copy.deepcopy(identity)
+                    target.pop("persistent_reference", None)
+                    native_reference_index.append(
+                        {
+                            "persistent_reference": copy.deepcopy(reference),
+                            "target": {
+                                "kind": {
+                                    "occurrences": "occurrence",
+                                    "bodies": "body",
+                                    "faces": "face",
+                                    "features": "feature",
+                                }[kind],
+                                **target,
+                            },
+                        }
+                    )
 
         for name, component in holders:
             add("occurrences", component, {"component": name})
@@ -4993,12 +5014,9 @@ class SolidWorksBackend(CadBackend):
                     "face_index": row["face_index"],
                     "name": row["identity"]["name"],
                     "type_name": row["identity"]["type_name"],
-                    "persistent_reference": row["identity"][
-                        "persistent_reference"
-                    ],
                 },
             )
-        return maps, mapping_errors
+        return maps, mapping_errors, native_reference_index
 
     def _capture_state_render_materials(
         self,
@@ -5058,6 +5076,7 @@ class SolidWorksBackend(CadBackend):
                     "call_state": "error",
                     "materials": [],
                     "mapping_errors": [],
+                    "native_reference_index": [],
                     "read_errors": {},
                 }
                 if owner_error is not None:
@@ -5091,7 +5110,11 @@ class SolidWorksBackend(CadBackend):
                     record["call_state"] == "observed"
                     and extension is not None
                 ):
-                    maps, mapping_errors = self._appearance_identity_maps(
+                    (
+                        maps,
+                        mapping_errors,
+                        native_reference_index,
+                    ) = self._appearance_identity_maps(
                         extension,
                         holder_rows,
                         bodies,
@@ -5099,6 +5122,9 @@ class SolidWorksBackend(CadBackend):
                         features,
                     )
                     record["mapping_errors"] = mapping_errors
+                    record["native_reference_index"] = (
+                        native_reference_index
+                    )
                     for material in record["materials"]:
                         for entity in material["entity_records"]:
                             entity["matched_identity"] = {
@@ -5135,6 +5161,7 @@ class SolidWorksBackend(CadBackend):
                         "call_state": "error",
                         "materials": [],
                         "mapping_errors": [],
+                        "native_reference_index": [],
                         "read_errors": {
                             "owner": _native_error_record(error),
                         },
@@ -5656,6 +5683,7 @@ class SolidWorksBackend(CadBackend):
                     "call_state": "error",
                     "materials": [],
                     "mapping_errors": [],
+                    "native_reference_index": [],
                     "read_errors": {
                         "owner_resolution": _native_error_record(error),
                     },

@@ -37,6 +37,19 @@ def _face_key(body_type: object, body_index: object, face_index: object):
     return (body_type, body_index, face_index)
 
 
+def _persistent_reference_key(value: object) -> tuple[int, ...] | None:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            type(item) is not int or not -128 <= item <= 255
+            for item in value
+        )
+    ):
+        return None
+    return tuple(item & 0xFF for item in value)
+
+
 def _valid_values(value: object) -> bool:
     return (
         isinstance(value, list)
@@ -294,6 +307,7 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             and isinstance(owner.get("read_errors"), Mapping)
             and not owner.get("read_errors")
             and isinstance(owner.get("mapping_errors"), list)
+            and isinstance(owner.get("native_reference_index"), list)
             and isinstance(owner.get("materials"), (list, type(None)))
             and (
                 (
@@ -330,6 +344,30 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             or (owner["call_state"] == "observed" and bool(owner["materials"])),
             f"{owner_path} call state and material rows disagree",
         )
+        reference_index = {}
+        for index_position, indexed in enumerate(
+            owner["native_reference_index"]
+        ):
+            index_path = (
+                owner_path
+                + f".native_reference_index[{index_position}]"
+            )
+            _require(
+                isinstance(indexed, Mapping),
+                f"{index_path} is malformed",
+            )
+            indexed_key = _persistent_reference_key(
+                indexed.get("persistent_reference")
+            )
+            target = indexed.get("target")
+            _require(
+                indexed_key is not None
+                and isinstance(target, Mapping)
+                and target.get("kind")
+                in {"occurrence", "body", "face", "feature"},
+                f"{index_path} cannot be bound exactly",
+            )
+            reference_index.setdefault(indexed_key, []).append(target)
         for index, material in enumerate(owner["materials"]):
             material_path = f"{owner_path}.materials[{index}]"
             _require(
@@ -364,87 +402,54 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     isinstance(entity, Mapping)
                     and entity.get("entity_index") == entity_index
                     and isinstance(entity.get("native_object_type"), str)
-                    and isinstance(entity.get("matched_identity"), Mapping)
                     and isinstance(entity.get("read_errors"), Mapping)
-                    and isinstance(entity.get("persistent_reference"), list)
-                    and bool(entity.get("persistent_reference"))
-                    and all(
-                        type(value) is int
-                        for value in entity["persistent_reference"]
-                    )
                     ,
                     f"{entity_path} is malformed",
                 )
-                identity = entity["matched_identity"]
-                occurrences = identity.get("occurrences")
-                bodies = identity.get("bodies")
-                matched_faces = identity.get("faces")
-                features = identity.get("features")
-                _require(
-                    isinstance(occurrences, list)
-                    and isinstance(bodies, list)
-                    and isinstance(matched_faces, list)
-                    and isinstance(features, list),
-                    f"{entity_path}.matched_identity is incomplete",
+                entity_key = _persistent_reference_key(
+                    entity.get("persistent_reference")
                 )
-                if any(
-                    isinstance(item, Mapping)
-                    and str(item.get("component") or "") == component
-                    for item in occurrences
-                ):
-                    faces |= all_faces
-                for body in bodies:
-                    _require(isinstance(body, Mapping), f"{entity_path} body identity is malformed")
-                    if str(body.get("component") or "") != component:
-                        continue
-                    body_key = _face_key(body.get("body_type"), body.get("body_index"), 0)
-                    faces |= {face for face in all_faces if face[:2] == body_key[:2]}
-                for face in matched_faces:
-                    _require(isinstance(face, Mapping), f"{entity_path} face identity is malformed")
-                    if str(face.get("component") or "") != component:
-                        continue
-                    face_key = _face_key(
-                        face.get("body_type"),
-                        face.get("body_index"),
-                        face.get("face_index"),
-                    )
-                    if face_key in all_faces:
-                        faces.add(face_key)
-                for feature in features:
+                _require(
+                    entity_key is not None
+                    and not entity["read_errors"],
+                    f"{entity_path} has no usable native identity",
+                )
+                targets = reference_index.get(entity_key)
+                _require(
+                    bool(targets),
+                    f"{entity_path} has no native reference-index binding",
+                )
+                for target in targets:
+                    target_component = target.get("component")
                     _require(
-                        isinstance(feature, Mapping),
-                        f"{entity_path} feature identity is malformed",
+                        isinstance(target_component, str)
+                        and bool(target_component),
+                        f"{entity_path} target has no exact component",
                     )
-                    if str(feature.get("component") or "") != component:
+                    if target_component != component:
+                        continue
+                    kind = target["kind"]
+                    if kind == "occurrence":
+                        faces |= all_faces
                         continue
                     face_key = _face_key(
-                        feature.get("body_type"),
-                        feature.get("body_index"),
-                        feature.get("face_index"),
+                        target.get("body_type"),
+                        target.get("body_index"),
+                        target.get("face_index", 0),
                     )
-                    if face_key in all_faces:
+                    _require(
+                        face_key is not None,
+                        f"{entity_path} target identity is invalid",
+                    )
+                    if kind == "body":
+                        faces |= {
+                            face
+                            for face in all_faces
+                            if face[:2] == face_key[:2]
+                        }
+                    elif face_key in all_faces:
                         faces.add(face_key)
             if not faces:
-                _require(
-                    not owner["mapping_errors"]
-                    and not any(
-                        entity.get("read_errors")
-                        for entity in material["entity_records"]
-                    )
-                    and not any(
-                        not any(
-                            entity["matched_identity"].get(kind)
-                            for kind in (
-                                "occurrences",
-                                "bodies",
-                                "faces",
-                                "features",
-                            )
-                        )
-                        for entity in material["entity_records"]
-                    ),
-                    f"{material_path} has no proven identity mapping",
-                )
                 continue
             _require(
                 not material.get("read_errors")

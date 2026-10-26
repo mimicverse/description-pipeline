@@ -191,6 +191,7 @@ def _fixture_appearance_raw(
                 "call_state": "empty",
                 "materials": [],
                 "mapping_errors": [],
+                "native_reference_index": [],
                 "read_errors": {},
             },
             {
@@ -207,6 +208,7 @@ def _fixture_appearance_raw(
                 "call_state": "empty",
                 "materials": [],
                 "mapping_errors": [],
+                "native_reference_index": [],
                 "read_errors": {},
             },
             {
@@ -223,6 +225,7 @@ def _fixture_appearance_raw(
                 "call_state": "empty",
                 "materials": [],
                 "mapping_errors": [],
+                "native_reference_index": [],
                 "read_errors": {},
             },
         ],

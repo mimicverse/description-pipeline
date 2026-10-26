@@ -38,6 +38,7 @@ from description_pipeline.sources.solidworks.native import (
     _appearance_document_display_state,
     _appearance_persistent_reference,
     _appearance_render_material,
+    _state_render_materials_raw,
     _project_mass_reading,
     _project_link_group_mass,
     _raw_mass_fact,
@@ -2637,6 +2638,19 @@ class AppearanceRawTests(unittest.TestCase):
                     }
                 ],
             )
+            reference_index = component_materials["native_reference_index"]
+            self.assertTrue(
+                any(
+                    row["target"] == {
+                        "kind": "face",
+                        "component": "arm-1",
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                    }
+                    for row in reference_index
+                )
+            )
             face_raw = body_raw["faces"]
             feature_identity = face_raw[0]["appearance"]["native_identity"][
                 "feature"
@@ -3253,6 +3267,47 @@ class AppearanceHelperTests(unittest.TestCase):
         self.assertEqual(failing_record["entities_state"], "error")
         self.assertIn("entities", failing_record["read_errors"])
 
+    def test_null_render_materials_retain_count_and_count_error(self) -> None:
+        with _com_stubs():
+            count_extension = types.SimpleNamespace(
+                GetRenderMaterialsCount=lambda: 1,
+                GetRenderMaterials2=lambda _option, _names: None,
+            )
+            count_record, _ = _state_render_materials_raw(
+                types.SimpleNamespace(Extension=count_extension),
+                configuration="Default",
+                display_state="State",
+            )
+            self.assertEqual(count_record["call_state"], "null_result")
+            self.assertEqual(count_record["native_render_material_count"], 1)
+            self.assertIsNone(count_record["native_render_material_count_error"])
+            self.assertIsNone(count_record["materials"])
+
+            failing_count_extension = types.SimpleNamespace(
+                GetRenderMaterialsCount=_raiser(
+                    RuntimeError("count read failed")
+                ),
+                GetRenderMaterials2=lambda _option, _names: None,
+            )
+            failing_count_record, _ = _state_render_materials_raw(
+                types.SimpleNamespace(Extension=failing_count_extension),
+                configuration="Default",
+                display_state="State",
+            )
+            self.assertEqual(
+                failing_count_record["call_state"],
+                "null_result",
+            )
+            self.assertIsNone(
+                failing_count_record["native_render_material_count"]
+            )
+            self.assertEqual(
+                failing_count_record["read_errors"][
+                    "native_render_material_count"
+                ]["code"],
+                "RuntimeError",
+            )
+
     def test_state_unavailable_owner_record_is_explicit(self) -> None:
         backend = _CaptureBackend(session_factory=lambda: None)
         owner = {
@@ -3615,6 +3670,37 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
             second[0]["mapping_errors"][0]["identity"]["component"],
             "component-b",
         )
+        first_targets = [
+            row["target"]
+            for row in first[0]["native_reference_index"]
+        ]
+        second_targets = [
+            row["target"]
+            for row in second[0]["native_reference_index"]
+        ]
+        self.assertIn(
+            {
+                "kind": "face",
+                "component": "component-a",
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": 0,
+            },
+            first_targets,
+        )
+        self.assertIn(
+            {
+                "kind": "face",
+                "component": "component-b",
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": 0,
+            },
+            second_targets,
+        )
+        self.assertNotIn("component-a", {
+            row.get("component") for row in second_targets
+        })
         error_codes = {
             row["error"]["code"] for row in second[0]["mapping_errors"]
         }

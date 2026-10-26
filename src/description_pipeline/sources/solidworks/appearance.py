@@ -251,6 +251,19 @@ def _face_key(body_type: object, body_index: object, face_index: object):
     return (body_type, body_index, face_index)
 
 
+def _persistent_reference_key(value: object) -> tuple[int, ...] | None:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            type(item) is not int or not -128 <= item <= 255
+            for item in value
+        )
+    ):
+        return None
+    return tuple(item & 0xFF for item in value)
+
+
 def _rgba_from_material_values(
     values: Sequence[object],
 ) -> tuple[float, float, float, float] | None:
@@ -818,6 +831,7 @@ def resolve_deliverable_appearance(
                 )
             )
             or not isinstance(owner.get("mapping_errors"), list)
+            or not isinstance(owner.get("native_reference_index"), list)
             or not isinstance(owner.get("read_errors"), Mapping)
         ):
             raise _appearance_resolution_error(
@@ -871,6 +885,38 @@ def resolve_deliverable_appearance(
                 owner_path,
                 "an observed render-material call carries no material rows",
             )
+        reference_index: dict[tuple[int, ...], list[Mapping[str, Any]]] = {}
+        for index_position, indexed in enumerate(
+            owner["native_reference_index"]
+        ):
+            index_path = (
+                owner_path
+                + f".native_reference_index[{index_position}]"
+            )
+            if not isinstance(indexed, Mapping):
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_entity_invalid",
+                    index_path,
+                    "a native reference index entry is malformed",
+                )
+            indexed_key = _persistent_reference_key(
+                indexed.get("persistent_reference")
+            )
+            target = indexed.get("target")
+            if (
+                indexed_key is None
+                or not isinstance(target, Mapping)
+                or target.get("kind")
+                not in {"occurrence", "body", "face", "feature"}
+            ):
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_entity_invalid",
+                    index_path,
+                    "a native reference index entry cannot be bound exactly",
+                )
+            reference_index.setdefault(indexed_key, []).append(target)
         for material_position, material in enumerate(owner["materials"]):
             path = f"{owner_path}.materials[{material_position}]"
             if not isinstance(material, Mapping):
@@ -930,7 +976,6 @@ def resolve_deliverable_appearance(
                     not isinstance(entity, Mapping)
                     or entity.get("entity_index") != entity_index
                     or not isinstance(entity.get("native_object_type"), str)
-                    or not isinstance(entity.get("matched_identity"), Mapping)
                     or not isinstance(entity.get("read_errors"), Mapping)
                 ):
                     raise _appearance_resolution_error(
@@ -939,163 +984,67 @@ def resolve_deliverable_appearance(
                         entity_path,
                         "a display-state render-material entity cannot be bound exactly",
                     )
-                reference = entity.get("persistent_reference")
-                if (
-                    not isinstance(reference, list)
-                    or not reference
-                    or any(type(value) is not int for value in reference)
-                ):
+                entity_key = _persistent_reference_key(
+                    entity.get("persistent_reference")
+                )
+                if entity_key is None or entity["read_errors"]:
                     raise _appearance_resolution_error(
                         component,
                         "cad_appearance_render_entity_binding_unproven",
                         entity_path + ".persistent_reference",
                         "a display-state render-material entity has no usable native identity",
-                        observed=reference,
+                        observed=entity.get("persistent_reference"),
                         errors=dict(entity["read_errors"]),
                     )
-                identity = entity["matched_identity"]
-                occurrences = identity.get("occurrences")
-                if not isinstance(occurrences, list):
-                    raise _appearance_resolution_error(
-                        component,
-                        "cad_appearance_render_entity_invalid",
-                        entity_path + ".matched_identity.occurrences",
-                        "matched occurrence identities are malformed",
-                    )
-                if any(
-                    isinstance(item, Mapping)
-                    and str(item.get("component") or "") == component
-                    for item in occurrences
-                ):
-                    faces_by_scope["occurrence"] |= set(all_faces)
-                bodies = identity.get("bodies")
-                if not isinstance(bodies, list):
-                    raise _appearance_resolution_error(
-                        component,
-                        "cad_appearance_render_entity_invalid",
-                        entity_path + ".matched_identity.bodies",
-                        "matched body identities are malformed",
-                    )
-                for body in bodies:
-                    if not isinstance(body, Mapping):
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_invalid",
-                            entity_path + ".matched_identity.bodies",
-                            "a matched body identity is malformed",
-                        )
-                    if str(body.get("component") or "") != component:
-                        continue
-                    body_key = _face_key(
-                        body.get("body_type"),
-                        body.get("body_index"),
-                        0,
-                    )
-                    if body_key is None:
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_invalid",
-                            entity_path + ".matched_identity.bodies",
-                            "a matched body identity is invalid",
-                        )
-                    faces_by_scope["body"] |= {
-                        face
-                        for face in all_faces
-                        if face[:2] == body_key[:2]
-                    }
-                faces = identity.get("faces")
-                if not isinstance(faces, list):
-                    raise _appearance_resolution_error(
-                        component,
-                        "cad_appearance_render_entity_invalid",
-                        entity_path + ".matched_identity.faces",
-                        "matched face identities are malformed",
-                    )
-                for face in faces:
-                    if not isinstance(face, Mapping):
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_invalid",
-                            entity_path + ".matched_identity.faces",
-                            "a matched face identity is malformed",
-                        )
-                    if str(face.get("component") or "") != component:
-                        continue
-                    face_key = _face_key(
-                        face.get("body_type"),
-                        face.get("body_index"),
-                        face.get("face_index"),
-                    )
-                    if face_key is None:
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_invalid",
-                            entity_path + ".matched_identity.faces",
-                            "a matched face identity is invalid",
-                        )
-                    if face_key in all_faces:
-                        faces_by_scope["face"].add(face_key)
-                features = identity.get("features")
-                if not isinstance(features, list):
-                    raise _appearance_resolution_error(
-                        component,
-                        "cad_appearance_render_entity_invalid",
-                        entity_path + ".matched_identity.features",
-                        "matched feature identities are malformed",
-                    )
-                for feature in features:
-                    if not isinstance(feature, Mapping):
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_invalid",
-                            entity_path + ".matched_identity.features",
-                            "a matched feature identity is malformed",
-                        )
-                    if str(feature.get("component") or "") != component:
-                        continue
-                    face_key = _face_key(
-                        feature.get("body_type"),
-                        feature.get("body_index"),
-                        feature.get("face_index"),
-                    )
-                    if face_key is None:
-                        raise _appearance_resolution_error(
-                            component,
-                            "cad_appearance_render_entity_invalid",
-                            entity_path + ".matched_identity.features",
-                            "a matched feature face identity is invalid",
-                        )
-                    if face_key in all_faces:
-                        faces_by_scope["feature"].add(face_key)
-            for scoped_faces in faces_by_scope.values():
-                material_faces |= scoped_faces
-            if not material_faces:
-                if owner["mapping_errors"] or any(
-                    entity.get("read_errors") for entity in entities
-                ) or any(
-                    not any(
-                        entity["matched_identity"].get(kind)
-                        for kind in (
-                            "occurrences",
-                            "bodies",
-                            "faces",
-                            "features",
-                        )
-                    )
-                    for entity in entities
-                ):
+                targets = reference_index.get(entity_key)
+                if not targets:
                     raise _appearance_resolution_error(
                         component,
                         "cad_appearance_render_entity_binding_unproven",
-                        path,
-                        "a nonmatching display-state entity has no proven identity mapping",
-                        mapping_errors=list(owner["mapping_errors"]),
-                        entity_errors=[
-                            dict(entity["read_errors"])
-                            for entity in entities
-                            if entity.get("read_errors")
-                        ],
+                        entity_path + ".persistent_reference",
+                        "the native reference index does not bind this entity",
                     )
+                for target in targets:
+                    target_component = target.get("component")
+                    if (
+                        not isinstance(target_component, str)
+                        or not target_component
+                    ):
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_invalid",
+                            entity_path + ".persistent_reference",
+                            "a native reference target has no exact component",
+                        )
+                    if target_component != component:
+                        continue
+                    kind = target["kind"]
+                    if kind == "occurrence":
+                        faces_by_scope["occurrence"] |= set(all_faces)
+                        continue
+                    face_key = _face_key(
+                        target.get("body_type"),
+                        target.get("body_index"),
+                        target.get("face_index", 0),
+                    )
+                    if face_key is None:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_invalid",
+                            entity_path + ".persistent_reference",
+                            "a native reference target identity is invalid",
+                        )
+                    if kind == "body":
+                        faces_by_scope["body"] |= {
+                            face
+                            for face in all_faces
+                            if face[:2] == face_key[:2]
+                        }
+                    elif face_key in all_faces:
+                        faces_by_scope[kind].add(face_key)
+            for scoped_faces in faces_by_scope.values():
+                material_faces |= scoped_faces
+            if not material_faces:
                 continue
             if (
                 errors

@@ -129,6 +129,7 @@ def _empty_state_owner(
         "call_state": "empty",
         "materials": [],
         "mapping_errors": [],
+        "native_reference_index": [],
         "read_errors": {},
     }
 
@@ -347,6 +348,18 @@ class AppearanceResolutionTests(unittest.TestCase):
         )
         top["call_state"] = "observed"
         top["native_render_material_count"] = 1
+        top["native_reference_index"] = [
+            {
+                "persistent_reference": [4, 5, 6],
+                "target": {
+                    "kind": "face",
+                    "component": COMPONENT,
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                },
+            }
+        ]
         top["materials"] = [
             {
                 "material_index": 0,
@@ -681,6 +694,18 @@ class AppearanceResolutionTests(unittest.TestCase):
                     }
                 ],
                 "mapping_errors": [],
+                "native_reference_index": [
+                    {
+                        "persistent_reference": [1, 2, 3],
+                        "target": {
+                            "kind": "face",
+                            "component": COMPONENT,
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": 0,
+                        },
+                    }
+                ],
                 "read_errors": {},
             }
         ]
