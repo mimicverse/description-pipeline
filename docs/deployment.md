@@ -2,7 +2,7 @@
 
 部署由一台 Linux 平台主机和一个串行 Windows 原生执行端组成。用户仅访问一个 HTTPS 操作台；Airflow、数据库、内部 API 和原生端点不直接向用户开放。
 
-Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
+Linux 承担平台编排、工程模型与 URDF 生成、独立验证、报告和发布。Windows 运行原生 CAD 读取，并在释放 CAD 后完成当前 Capture 的原值投影、惯量规范化、raw/STL 序列化与证据封包；这部分不再占用 CAD 会话，但仍使用 Windows 主机，不能宣称全部可移植计算已迁到 Linux。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
 
 ## 开发与发行链路
 

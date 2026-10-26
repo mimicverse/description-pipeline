@@ -665,7 +665,8 @@ persistent reference。scene 保留实际 placement，不能为简化转换替�
 
 `prepare_prepared_capture` 只绑定已封存 prepared 的 root/configuration，不打开
 COM；Freeze 保留初次准备职责。Capture 读取 scene 与内存几何事实后，按唯一会话
-所有权协议释放 CAD，再离线执行原值投影、raw/STL 序列化和封包。STL 从同一 raw
+所有权协议释放 CAD，再在 Windows 离线执行原值投影、惯量规范化、raw/STL 序列化
+和封包。这部分纯计算不再持有 CAD，会话释放不代表 Windows 作业已经结束。STL 从同一 raw
 三角形派生，保留 component-local 坐标，明确法向量和浮点编码的派生来源，不能重复
 应用 occurrence placement。原生错误及已取得的 partial facts 保全，不被离线异常替代。
 
