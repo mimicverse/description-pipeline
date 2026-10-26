@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -128,6 +129,76 @@ class NativeTrianglesContractTest(unittest.TestCase):
                 source_scope=self.source_scope,
                 warnings=[],
             )
+
+    def test_zero_cross_product_triangle_is_rejected(self):
+        triangle = (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw.triangles"
+            stl = root / "mesh.stl"
+            write_native_triangle_stream(
+                raw,
+                [
+                    value
+                    for point in triangle
+                    for value in point
+                ],
+            )
+            with self.assertRaisesRegex(
+                PipelineError,
+                "native triangle is degenerate",
+            ):
+                materialize_native_stl(
+                    raw,
+                    stl,
+                    [
+                        {
+                            "triangle_start": 0,
+                            "triangle_count": 1,
+                            "face_owner_id": 0,
+                        }
+                    ],
+                )
+
+    def test_small_nonzero_cross_product_uses_the_real_unit_normal(self):
+        scale = 1.0e-100
+        triangle = (
+            (0.0, 0.0, 0.0),
+            (scale, 0.0, 0.0),
+            (0.0, scale, 0.0),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw.triangles"
+            stl = root / "mesh.stl"
+            write_native_triangle_stream(
+                raw,
+                [
+                    value
+                    for point in triangle
+                    for value in point
+                ],
+            )
+            self.assertEqual(
+                materialize_native_stl(
+                    raw,
+                    stl,
+                    [
+                        {
+                            "triangle_start": 0,
+                            "triangle_count": 1,
+                            "face_owner_id": 0,
+                        }
+                    ],
+                ),
+                1,
+            )
+            normal = struct.unpack_from("<3f", stl.read_bytes(), 84)
+            self.assertEqual(normal, (0.0, 0.0, 1.0))
 
     def test_occurrence_transform_is_converted_offline(self):
         raw = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.1, -0.2, 0.3, 1.0, 0.0, 0.0, 0.0]
