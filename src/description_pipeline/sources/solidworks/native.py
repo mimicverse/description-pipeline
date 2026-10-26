@@ -5318,9 +5318,19 @@ class SolidWorksBackend(CadBackend):
         feature_groups = {}
         for position, row in enumerate(features):
             feature = row["feature"]
-            native_object = getattr(feature, "_oleobj_", feature)
+            identity = row["identity"]
+            reference_key = _appearance_reference_key(
+                identity.get("persistent_reference")
+            )
+            group_key = (
+                reference_key
+                if reference_key is not None
+                else repr(identity.get("persistent_reference")),
+                identity.get("name"),
+                identity.get("type_name"),
+            )
             group = feature_groups.setdefault(
-                id(native_object),
+                group_key,
                 {
                     "feature": feature,
                     "position": position,
@@ -5837,6 +5847,10 @@ class SolidWorksBackend(CadBackend):
             document_identity.get("kind") == "document"
             and document_identity.get("state") in {"observed", "partial"}
             and isinstance(document_identity.get("document_path"), str)
+            and isinstance(
+                document_identity.get("active_configuration"),
+                str,
+            )
         ):
             binding_state = "document"
             binding_candidates = [copy.deepcopy(document_identity)]

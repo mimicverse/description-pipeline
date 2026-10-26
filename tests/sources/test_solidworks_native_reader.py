@@ -3527,6 +3527,55 @@ class AppearanceHelperTests(unittest.TestCase):
             identity["read_errors"]["active_configuration"]["code"],
             "configuration_read_failed",
         )
+        self.assertEqual(
+            backend._appearance_entity_binding(context, {})[
+                "binding_state"
+            ],
+            "unbound",
+        )
+
+    def test_document_identity_without_active_configuration_is_unbound(
+        self,
+    ) -> None:
+        document = types.SimpleNamespace(
+            _fixture_interfaces={"IModelDoc2"},
+            GetPathName=lambda: "C:\\part.SLDPRT",
+        )
+        backend = _CaptureBackend(session_factory=lambda: None)
+        with patch.object(
+            native_module,
+            "_appearance_active_configuration",
+            return_value=(
+                None,
+                {
+                    "code": "configuration_read_failed",
+                    "detail": None,
+                    "message": "configuration read failed",
+                },
+            ),
+        ):
+            context = backend._appearance_entity_context(
+                document,
+                {"native_interface_kind": "IModelDoc2"},
+                owner_scope="component_document",
+                primary_component=types.SimpleNamespace(),
+                component_name="arm-1",
+                binding_document_path="C:\\robot.SLDASM",
+                corresponding_extension=types.SimpleNamespace(),
+                owner_document_path="C:\\part.SLDPRT",
+                owner_configuration="Configured",
+                display_state="State",
+            )
+        self.assertEqual(
+            context["record"]["native_identity"]["state"],
+            "partial",
+        )
+        self.assertEqual(
+            backend._appearance_entity_binding(context, {})[
+                "binding_state"
+            ],
+            "unbound",
+        )
 
     def test_render_material_entities_preserve_null_and_error(self) -> None:
         null_material = types.SimpleNamespace(
@@ -3960,6 +4009,9 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
         feature = types.SimpleNamespace(
             _persist_reference=b"feature"
         )
+        equivalent_feature_view = types.SimpleNamespace(
+            _persist_reference=b"feature"
+        )
         extension = types.SimpleNamespace(
             GetPersistReference3=lambda entity: list(
                 entity._persist_reference
@@ -3974,7 +4026,9 @@ class AppearanceOwnerResolutionTests(unittest.TestCase):
                 "body_type": 0,
                 "body_index": 0,
                 "face_index": face_index,
-                "feature": feature,
+                "feature": (
+                    feature if face_index == 0 else equivalent_feature_view
+                ),
                 "identity": {
                     "name": "Extrude",
                     "type_name": "Extrusion",
