@@ -60,12 +60,54 @@ class EngineeringModel:
             raise PipelineError("Frame names collide with generated URDF links/joints")
         children = set()
         for link in links.values():
+            faces_by_component: dict[str, set[str]] = {}
             for geometry in link["visuals"] + link["collisions"]:
                 for field in ("size", "scale"):
                     if field in geometry and any(value <= 0 for value in geometry[field]):
                         raise PipelineError(f"Geometry {field} must be positive")
                 if any(not 0 <= value <= 1 for value in geometry.get("rgba", [])):
                     raise PipelineError("RGBA must be in [0, 1]")
+                if "face_references" in geometry or "triangle_ranges" in geometry:
+                    face_references = geometry.get("face_references")
+                    ranges = geometry.get("triangle_ranges")
+                    if (
+                        geometry.get("provenance", {}).get("material_source")
+                        != "native_appearance"
+                        or not isinstance(face_references, list)
+                        or not face_references
+                        or not isinstance(geometry.get("mesh_sha256"), str)
+                        or not isinstance(ranges, list)
+                        or not ranges
+                        or geometry.get("rgba") is None
+                        or not isinstance(geometry.get("material"), str)
+                    ):
+                        raise PipelineError(
+                            "Native appearance visual lacks its exact face or mesh partition"
+                        )
+                    next_start = 0
+                    for row in ranges:
+                        if (
+                            not isinstance(row, dict)
+                            or set(row) != {"triangle_start", "triangle_count"}
+                            or type(row["triangle_start"]) is not int
+                            or type(row["triangle_count"]) is not int
+                            or row["triangle_start"] < next_start
+                            or row["triangle_count"] <= 0
+                        ):
+                            raise PipelineError(
+                                "Native appearance triangle ranges are not positive, ordered, and non-overlapping"
+                            )
+                        next_start += row["triangle_count"]
+                    component = str(
+                        geometry.get("provenance", {}).get("native_component")
+                        or ""
+                    )
+                    seen = faces_by_component.setdefault(component, set())
+                    if seen & set(face_references):
+                        raise PipelineError(
+                            "Native appearance groups repeat a delivered face"
+                        )
+                    seen.update(face_references)
             inertial = link["inertial"]
             if inertial is None:
                 if link["provenance"].get("kind") != "reference_frame" or link["visuals"] or link["collisions"]:

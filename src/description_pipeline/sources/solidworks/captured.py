@@ -5,6 +5,7 @@ seals native observations and their source configuration; Linux constructs the
 link-frame scene when generation consumes those observations.
 """
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,15 +71,27 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
     if manifest.get("evidence_class") != "fixture":
         from .appearance import (
             UNRECORDED_APPEARANCE,
-            require_deliverable_appearance,
+            appearance_groups,
+            resolve_deliverable_appearance,
         )
+        from ...geometry.native_tessellation import native_stl_subset
 
         components_by_name = {str(row.get("name") or ""): row for row in components}
         for entry in geometry:
             component = str(entry.get("component") or "")
             source_scope = entry.get("source_scope") or {}
             raw_component = components_by_name.get(component)
-            require_deliverable_appearance(
+            tessellation = entry.get("tessellation")
+            face_spans = (
+                tessellation.get("face_spans")
+                if isinstance(tessellation, dict)
+                else None
+            )
+            if not isinstance(face_spans, list) or not face_spans:
+                raise PipelineError(
+                    f"Native appearance has no delivered face spans: {component}"
+                )
+            resolution = resolve_deliverable_appearance(
                 (
                     raw_component.get("appearance_raw", UNRECORDED_APPEARANCE)
                     if raw_component is not None
@@ -89,8 +102,35 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
                 expected_configuration=source_scope.get(
                     "referenced_configuration"
                 ),
-                expected_bodies=entry.get("body_inventory"),
+                face_spans=face_spans,
             )
+            source_path = confined(root, str(entry.get("path") or ""))
+            source_bytes = source_path.read_bytes()
+            if hashlib.sha256(source_bytes).hexdigest() != entry.get("sha"):
+                raise PipelineError(
+                    f"Native appearance source STL differs from its geometry record: {component}"
+                )
+            groups = []
+            for group in appearance_groups(resolution.faces):
+                subset, triangles = native_stl_subset(
+                    source_bytes,
+                    group["triangle_ranges"],
+                )
+                expected_triangles = sum(
+                    row["triangle_count"]
+                    for row in group["triangle_ranges"]
+                )
+                if triangles != expected_triangles:
+                    raise PipelineError(
+                        f"Native appearance subset count is inconsistent: {component}"
+                    )
+                groups.append(
+                    {
+                        **group,
+                        "mesh_sha256": hashlib.sha256(subset).hexdigest(),
+                    }
+                )
+            entry["appearance_groups"] = groups
     readings = SimpleNamespace(
         components=[SimpleNamespace(**row) for row in components],
         coordinate_systems=datums,

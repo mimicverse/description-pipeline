@@ -141,6 +141,7 @@ def publication_succeeded(submission, subject) -> bool:
 #: ``verification.solidworks_urdf.required_checks`` adds the dynamic per-object gates.
 FIXED_REQUIRED_CHECKS = frozenset(
     {
+        "appearance.native",
         "bundle.subject",
         "input.valid",
         "source.native_discovery",

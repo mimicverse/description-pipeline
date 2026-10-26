@@ -80,9 +80,13 @@ def read_bytes(data: bytes) -> MeshStats:
 
 def vertices(path: Path):
     """Return triangle vertices after the same strict format validation."""
+    return vertices_bytes(Path(path).read_bytes())
+
+
+def vertices_bytes(data: bytes):
+    """Return triangle vertices from already loaded bytes."""
     import numpy as np
 
-    data = Path(path).read_bytes()
     stats = read_bytes(data)
     if stats.binary:
         records = np.frombuffer(

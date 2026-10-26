@@ -437,7 +437,11 @@ class GenerateHandlerTests(unittest.TestCase):
                     "generate.appearance_unrepresentable",
                 )
                 self.assertIn(
-                    "cad_appearance_effective_scope_unproven",
+                    (
+                        "cad_appearance_record_missing"
+                        if not all_false
+                        else "cad_appearance_display_state_invalid"
+                    ),
                     {
                         issue["code"]
                         for issue in caught.exception.detail["appearance"]["issues"]
@@ -519,11 +523,7 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             contract_sha256=CONTRACT_SHA256,
             policy_sha256=check_policy_digest(),
         )
-        with patch(
-            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
-            return_value=None,
-        ):
-            return evaluate_bundle(root), generate
+        return evaluate_bundle(root), generate
 
     def _evaluate(self, generate_ref=None) -> dict:
         return self._evaluate_details(generate_ref)[0]
@@ -538,14 +538,10 @@ class GenerateVerifyClosureTests(unittest.TestCase):
         payload = copy.deepcopy(original_model)
         mutation(payload)
         manifest = verify_snapshot(self.fixture.capture_root / "evidence")
-        with patch(
-            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
-            return_value=None,
-        ):
-            payload["semantic_identity"] = derive_engineering_input(
-                self.fixture.capture_root / "evidence",
-                manifest,
-            )["semantic_identity"]
+        payload["semantic_identity"] = derive_engineering_input(
+            self.fixture.capture_root / "evidence",
+            manifest,
+        )["semantic_identity"]
         model = EngineeringModel.from_dict(payload)
         emission = emit(
             model,
@@ -653,7 +649,11 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             (
                 "object-binding",
                 object_binding,
-                {"provenance.value_warnings"},
+                {
+                    "appearance.native",
+                    "geometry.arm_link",
+                    "provenance.value_warnings",
+                },
             ),
             (
                 "missing-warning",
@@ -736,10 +736,6 @@ class GenerateVerifyClosureTests(unittest.TestCase):
             executor=self.fixture.generate_executor,
         )
         with (
-            patch(
-                "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
-                return_value=None,
-            ),
             patch.object(
                 discovery_module,
                 "canonicalize_axis",

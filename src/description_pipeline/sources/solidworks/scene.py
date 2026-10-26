@@ -9,6 +9,7 @@ joint definition is an error, not a default.
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -18,6 +19,7 @@ from .errors import ConfigError
 from .naming import (
     asset_namespace,
     fixed_joint_name,
+    material_name,
     mesh_path,
     visual_name,
 )
@@ -598,7 +600,11 @@ def build_scene(
             entry = geometry_by_component.get(reading.name)
             if entry is None:
                 continue
-            if "rgba" in entry or "material" in entry:
+            if (
+                "rgba" in entry
+                or "material" in entry
+                or entry.get("appearance_groups") is not None
+            ) and not isinstance(entry.get("appearance_groups"), list):
                 raise ConfigError(
                     "This capture schema has no independently verified CAD appearance record",
                     {
@@ -607,21 +613,91 @@ def build_scene(
                         "rgba": entry.get("rgba"),
                     },
                 )
-            visual = {
-                "kind": "mesh",
-                "name": visual_name(reading.name, link=name),
-                "filename": entry["path"],
-                "sha256": entry["sha"],
-                "mesh_name": mesh_path(
-                    entry["sha"],
-                    namespace=mesh_namespace,
-                ),
-                "scale": [1.0, 1.0, 1.0],
-                "xyz": list(reading.relative_translation),
-                "rpy": list(rpy_from_matrix(reading.relative_rotation)),
-                "provenance": {"native_component": reading.name},
-            }
-            visuals.append(visual)
+            groups = entry.get("appearance_groups")
+            if groups is not None:
+                if not isinstance(groups, list) or not groups:
+                    raise ConfigError(
+                        "Native appearance groups are empty or malformed",
+                        {"component": reading.name},
+                    )
+                for group in groups:
+                    if (
+                        not isinstance(group, dict)
+                        or not isinstance(group.get("group_id"), str)
+                        or len(group["group_id"]) != 16
+                        or group.get("rgba") is None
+                        or not isinstance(group.get("mesh_sha256"), str)
+                        or len(group["mesh_sha256"]) != 64
+                        or not isinstance(group.get("face_references"), list)
+                        or not group["face_references"]
+                        or not isinstance(group.get("triangle_ranges"), list)
+                        or not group["triangle_ranges"]
+                        or not isinstance(group.get("sources"), list)
+                        or not group["sources"]
+                    ):
+                        raise ConfigError(
+                            "Native appearance group is malformed",
+                            {"component": reading.name},
+                        )
+                    identity = (
+                        f"{reading.name}:appearance:{group['group_id']}"
+                    )
+                    visuals.append(
+                        {
+                            "kind": "mesh",
+                            "name": visual_name(identity, link=name),
+                            "filename": entry["path"],
+                            "sha256": entry["sha"],
+                            "mesh_sha256": group["mesh_sha256"],
+                            "mesh_name": mesh_path(
+                                group["mesh_sha256"],
+                                namespace=mesh_namespace,
+                            ),
+                            "face_references": list(
+                                group["face_references"]
+                            ),
+                            "triangle_ranges": copy.deepcopy(
+                                group["triangle_ranges"]
+                            ),
+                            "rgba": list(group["rgba"]),
+                            "material": material_name(
+                                identity,
+                                link=name,
+                            ),
+                            "scale": [1.0, 1.0, 1.0],
+                            "xyz": list(reading.relative_translation),
+                            "rpy": list(
+                                rpy_from_matrix(reading.relative_rotation)
+                            ),
+                            "provenance": {
+                                "native_component": reading.name,
+                                "material_source": "native_appearance",
+                                "appearance": {
+                                    "group_id": group["group_id"],
+                                    "face_references": list(
+                                        group["face_references"]
+                                    ),
+                                    "sources": copy.deepcopy(group["sources"]),
+                                },
+                            },
+                        }
+                    )
+            else:
+                visual = {
+                    "kind": "mesh",
+                    "name": visual_name(reading.name, link=name),
+                    "filename": entry["path"],
+                    "sha256": entry["sha"],
+                    "mesh_name": mesh_path(
+                        entry["sha"],
+                        namespace=mesh_namespace,
+                    ),
+                    "scale": [1.0, 1.0, 1.0],
+                    "xyz": list(reading.relative_translation),
+                    "rpy": list(rpy_from_matrix(reading.relative_rotation)),
+                    "provenance": {"native_component": reading.name},
+                }
+                visuals.append(visual)
         links.append(
             {
                 "id": body_id,
@@ -872,6 +948,7 @@ def _value_warnings(
     unqualified_drive = []
     visuals = []
     mesh_paths = []
+    native_appearances = []
     for body in bodies:
         if body.get("source_name") and body["source_name"] != body.get("name"):
             rule = body.get("name_rule") if isinstance(body.get("name_rule"), dict) else {}
@@ -1149,6 +1226,33 @@ def _value_warnings(
                     "reason": "native component identity formatting",
                 }
             )
+            if visual.get("provenance", {}).get("material_source") == "native_appearance":
+                appearance = visual["provenance"].get("appearance") or {}
+                native_appearances.append(
+                    {
+                        "object_type": "visual",
+                        "object": visual["name"],
+                        "fields": [
+                            "material.name",
+                            "material.color.rgba",
+                            "mesh.filename",
+                            "mesh.faces",
+                        ],
+                        "actual": {
+                            "material": visual.get("material"),
+                            "rgba": visual.get("rgba"),
+                            "mesh": visual.get("mesh_name"),
+                            "face_references": appearance.get("face_references"),
+                        },
+                        "sources": appearance.get("sources"),
+                        "rule_id": "appearance.native_owner_state",
+                        "rule_version": "v1",
+                        "reason": (
+                            "RGBA is resolved from the recorded native owner/display-state "
+                            "appearance and grouped by exact delivered face spans"
+                        ),
+                    }
+                )
             mesh_paths.append(
                 {
                     "object_type": "visual",
@@ -1156,7 +1260,10 @@ def _value_warnings(
                     "field": "mesh filename",
                     "actual": visual["mesh_name"],
                     "source": "current capture content addressing",
-                    "original": visual.get("sha256"),
+                    "original": visual.get(
+                        "mesh_sha256",
+                        visual.get("sha256"),
+                    ),
                     "rule_id": "naming.mesh",
                     "rule_version": "naming-v1",
                     "reason": "current capture content addressing",
@@ -1274,6 +1381,17 @@ def _value_warnings(
                 "code": "naming.content_addressed_mesh",
                 "message": "Mesh paths are derived from the current captured STL content digest.",
                 "objects": mesh_paths,
+            }
+        )
+    if native_appearances:
+        warnings.append(
+            {
+                "code": "appearance.native_derived",
+                "message": (
+                    "Material colors are derived from recorded native appearance owners "
+                    "and display-state assignments for the delivered faces."
+                ),
+                "objects": native_appearances,
             }
         )
     if cfg.get("robot_name_source") == "cad_filename_derived":

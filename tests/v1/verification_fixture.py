@@ -96,6 +96,98 @@ def _mass_reading(mass: float, com: tuple[float, float, float], part_document: P
     }
 
 
+def _fixture_appearance_owner(configuration: str, values=None) -> dict:
+    return {
+        "used_api": "fixture-native-appearance-owner",
+        "material_call": {
+            "configuration_semantics": "active_configuration",
+            "active_configuration": configuration,
+        },
+        "presence_call": {
+            "arguments": [],
+            "configuration_semantics": "native_owner_context",
+        },
+        "material_property_values": values,
+        "has_material_property_values": values is not None,
+        "texture": {
+            "configuration": configuration,
+            "state": "absent",
+            "material_name": None,
+        },
+        "read_errors": {},
+    }
+
+
+def _fixture_appearance_raw(
+    component: str,
+    source_scope: dict,
+    face_inventory: list[dict],
+) -> dict:
+    configuration = str(source_scope["referenced_configuration"])
+    face_values = (
+        [0.7, 0.7, 0.7, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+        [0.15, 0.35, 0.75, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+    )
+    bodies = {}
+    for face in face_inventory:
+        body_key = (face["body_type"], face["body_index"])
+        body = bodies.setdefault(
+            body_key,
+            {
+                "component": component,
+                "enumeration_api": "IComponent2.GetBodies2",
+                "body_type": body_key[0],
+                "body_index": body_key[1],
+                "body_name": "fixture-solid",
+                "appearance": _fixture_appearance_owner(configuration),
+                "faces": [],
+            },
+        )
+        body["faces"].append(
+            {
+                "face_index": face["face_index"],
+                "appearance": {
+                    **_fixture_appearance_owner(
+                        configuration,
+                        face_values[face["face_index"] % 2],
+                    ),
+                    "native_identity": {
+                        "persistent_reference": None,
+                        "feature": {
+                            "name": "fixture-solid",
+                            "type_name": "Fixture",
+                            "persistent_reference": None,
+                        },
+                    },
+                },
+            }
+        )
+    return {
+        "component": component,
+        "source_document_path": source_scope["source_document_path"],
+        "referenced_configuration": configuration,
+        "native_active_configuration": configuration,
+        "native_active_configuration_error": None,
+        "native_referenced_display_state": "Default_Display_State",
+        "native_referenced_display_state_error": None,
+        "document": _fixture_appearance_owner(configuration),
+        "occurrence": _fixture_appearance_owner(configuration),
+        "bodies": [bodies[key] for key in sorted(bodies)],
+        "state_render_materials": [
+            {
+                "owner_document_path": source_scope["source_document_path"],
+                "owner_scope": "component_document",
+                "api": "IModelDocExtension.GetRenderMaterials2",
+                "display_state_option": 3,
+                "display_state": "Default_Display_State",
+                "call_state": "empty",
+                "materials": [],
+                "read_errors": {},
+            }
+        ],
+    }
+
+
 class QualifiedFixtureBackend(AxisFixtureBackend):
     """Prepared one-session fixture with hermetic native environment metadata.
 
@@ -115,6 +207,19 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
             "license": 1,
             "visible": True,
         }
+
+    def capture_prepared_geometry(self, source_scopes, on_activity=None):
+        rows = super().capture_prepared_geometry(
+            source_scopes,
+            on_activity=on_activity,
+        )
+        for component, row in rows.items():
+            row["appearance_raw"] = _fixture_appearance_raw(
+                component,
+                source_scopes[component],
+                row["face_inventory"],
+            )
+        return rows
 
 
 class HermeticNativeFixture:

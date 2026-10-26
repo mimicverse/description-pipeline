@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+from xml.etree import ElementTree as ET
 
 try:
     import pgserver
@@ -20,8 +21,9 @@ except ImportError:
     psycopg2 = None
 
 from description_pipeline.artifacts import ArtifactStore
+from description_pipeline.geometry import stl
 from description_pipeline.interface_records import check_policy_digest
-from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
+from description_pipeline.io import PipelineError, digest, file_digest, format_number, read_data, write_json
 import description_pipeline.pipeline.verify as pipeline_verify
 from description_pipeline.pipeline.contracts import (
     DiagnosticReplayScope,
@@ -29,6 +31,7 @@ from description_pipeline.pipeline.contracts import (
     StageCandidate,
     StageCommand,
     StageResult,
+    StageFailure,
 )
 from description_pipeline.pipeline.diagnostic import (
     DiagnosticAdmissionSpec,
@@ -102,26 +105,19 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             expected_executor_sha256=self.generate_executor,
             predecessor_decision_id="capture-decision",
         )
-        # These tests exercise the downstream verifier, not appearance
-        # qualification. Dedicated native-appearance tests exercise the
-        # unpatched production gate through GenerateHandler and VerifyHandler.
-        with patch(
-            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
-            return_value=None,
-        ):
-            generated = GenerateHandler(self.store).execute(
+        generated = GenerateHandler(self.store).execute(
+            self.generator_command,
+            self._claim(
                 self.generator_command,
-                self._claim(
-                    self.generator_command,
-                    owner=digest({"process": "generate"}),
-                    executor=self.generate_executor,
-                ),
-                StageWorkspace(
-                    root=self.root / "generate-attempt",
-                    inputs={self.capture_ref.artifact_id: self.capture_root},
-                ),
-                effects=NoExternalEffects(),
-            )
+                owner=digest({"process": "generate"}),
+                executor=self.generate_executor,
+            ),
+            StageWorkspace(
+                root=self.root / "generate-attempt",
+                inputs={self.capture_ref.artifact_id: self.capture_root},
+            ),
+            effects=NoExternalEffects(),
+        )
         self.generate_source = Path(generated.candidate_root)
         self.generate_ref = self.store.seal_tree(
             self.generate_source,
@@ -202,14 +198,10 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
 
     def _run_verify(self, generate_ref=None):
         command, claim, workspace = self._verify_request(generate_ref)
-        with patch(
-            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
-            return_value=None,
-        ):
-            execution = VerifyHandler(
-                identity_provider=hermetic._portable_tool,
-                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
-            ).execute(command, claim, workspace, effects=NoExternalEffects())
+        execution = VerifyHandler(
+            identity_provider=hermetic._portable_tool,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        ).execute(command, claim, workspace, effects=NoExternalEffects())
         output = Path(execution.candidate_root)
         return (
             command,
@@ -221,36 +213,99 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             claim,
         )
 
-    def test_native_unrecorded_appearance_fails_verify_handler(self):
-        command, claim, workspace = self._verify_request()
-        execution = VerifyHandler(
-            identity_provider=hermetic._portable_tool,
-            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
-        ).execute(
-            command,
-            claim,
-            workspace,
-            effects=NoExternalEffects(),
-        )
-        self.assertEqual(execution.outcome, "failed")
-        certificate = read_data(
-            Path(execution.candidate_root) / CERTIFICATE_FILENAME
-        )
-        check = next(
-            row
-            for row in certificate["checks"]
-            if row["id"] == "provenance.value_warnings"
-        )
-        self.assertIs(check["passed"], False)
-        self.assertIn(
-            "cad_appearance_effective_scope_unproven",
-            {
-                issue["code"]
-                for issue in check["details"]["appearance"]["issues"]
-            },
-        )
+    def _bundle_report(self, generate_ref):
+        from description_pipeline.verification.solidworks_urdf import evaluate_bundle
 
-    def test_native_all_false_appearance_fails_verify_handler(self):
+        command, _claim, workspace = self._verify_request(generate_ref)
+        request = pipeline_verify.VerifyDomainRequest(
+            generate_artifact=command.input_artifacts[0],
+            capture_artifact=command.input_artifacts[1],
+            expected_verifier_sha256=command.expected_executor_sha256,
+            contract_sha256=command.contract_sha256,
+            policy_sha256=command.policy_sha256,
+            config_snapshot_sha256=command.config_snapshot_sha256,
+            purpose="engineering",
+        )
+        prepared = pipeline_verify._prepare(
+            request,
+            workspace=workspace,
+            command=command,
+            identity_provider=hermetic._portable_tool,
+        )
+        view = pipeline_verify._evaluation_view(
+            workspace.root / "bundle-view",
+            generate=prepared.generate,
+            capture=prepared.capture,
+            contract_sha256=command.contract_sha256,
+            policy_sha256=command.policy_sha256,
+        )
+        return evaluate_bundle(view)
+
+    def test_native_face_partition_reaches_independent_verify(self):
+        result = self._run_verify()
+        self.assertEqual(result[1].outcome, "completed")
+        appearance = next(
+            row
+            for row in result[2]["checks"]
+            if row["id"] == "appearance.native"
+        )
+        self.assertTrue(appearance["passed"])
+        self.assertGreaterEqual(appearance["details"]["groups"], 4)
+
+    def test_native_face_color_tamper_fails_independent_verify(self):
+        source = self.root / "mutated-native-appearance"
+        shutil.copytree(self.generate_source, source)
+        model_path = source / "model/robot.json"
+        model = read_data(model_path)
+        visual = next(
+            visual
+            for link in model["links"]
+            for visual in link["visuals"]
+            if (visual.get("provenance") or {}).get("material_source")
+            == "native_appearance"
+        )
+        original_rgba = list(visual["rgba"])
+        visual["rgba"] = [
+            (value + 0.125) % 1.0 for value in visual["rgba"][:3]
+        ] + [visual["rgba"][3]]
+        write_json(model_path, model)
+        urdf_path = source / "urdf/robot.urdf"
+        document = ET.parse(urdf_path)
+        xml_visual = next(
+            node
+            for node in document.getroot().iter("visual")
+            if node.get("name") == visual["name"]
+        )
+        xml_visual.find("material/color").set(
+            "rgba",
+            " ".join(format_number(value) for value in visual["rgba"]),
+        )
+        ET.indent(document)
+        urdf_path.write_bytes(
+            ET.tostring(document.getroot(), encoding="utf-8", xml_declaration=True)
+            + b"\n"
+        )
+        receipt_path = source / GENERATE_RECEIPT
+        receipt = read_data(receipt_path)
+        receipt["model_sha256"] = file_digest(model_path)
+        receipt["urdf_sha256"] = file_digest(urdf_path)
+        write_json(receipt_path, receipt)
+        mutated = self.store.seal_tree(
+            source,
+            kind="stage_output:generate",
+            producer_run_id=self.generator_command.run_id,
+            producer_stage="generate",
+            producer_tool_sha256=self.generate_executor,
+        )
+        report = self._bundle_report(mutated)
+        appearance = next(
+            row for row in report["checks"] if row["id"] == "appearance.native"
+        )
+        self.assertFalse(appearance["passed"])
+        self.assertIn("RGBA differs", appearance["details"]["error"])
+        self.assertNotEqual(original_rgba, visual["rgba"])
+
+    def test_native_all_false_appearance_fails_generate_handler(self):
         source = self.root / "native-all-false-capture"
         shutil.copytree(self.capture_root, source)
         evidence = source / "evidence"
@@ -299,19 +354,10 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                     "read_errors": {},
                 }
 
-            occurrence["appearance_raw"] = {
-                "component": component,
-                "source_document_path": scope["source_document_path"],
-                "referenced_configuration": configuration,
-                "native_active_configuration": configuration,
-                "native_active_configuration_error": None,
-                "document": owner(
-                    "IModelDocExtension.GetMaterialPropertyValues"
-                ),
-                "occurrence": owner(
-                    "IComponent2.GetMaterialPropertyValues2"
-                ),
-                "bodies": [
+            body_rows = []
+            spans = geometry[component]["tessellation"]["face_spans"]
+            for body in geometry[component]["tessellation"]["bodies"]:
+                body_rows.append(
                     {
                         "component": component,
                         "enumeration_api": "IComponent2.GetBodies2",
@@ -322,8 +368,43 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                             "IBody2.MaterialPropertyValues2",
                             active=True,
                         ),
+                        "faces": [
+                            {
+                                "face_index": span["face_index"],
+                                "appearance": owner(
+                                    "IFace2.GetMaterialPropertyValues2"
+                                ),
+                            }
+                            for span in spans
+                            if span["body_type"] == body["body_type"]
+                            and span["body_index"] == body["body_index"]
+                        ],
                     }
-                    for body in geometry[component]["tessellation"]["bodies"]
+                )
+            occurrence["appearance_raw"] = {
+                "component": component,
+                "source_document_path": scope["source_document_path"],
+                "referenced_configuration": configuration,
+                "native_active_configuration": configuration,
+                "native_active_configuration_error": None,
+                "native_referenced_display_state": "Display State 1",
+                "native_referenced_display_state_error": None,
+                "document": owner("IModelDoc2.MaterialPropertyValues", active=True),
+                "occurrence": owner(
+                    "IComponent2.GetMaterialPropertyValues2"
+                ),
+                "bodies": body_rows,
+                "state_render_materials": [
+                    {
+                        "owner_document_path": scope["source_document_path"],
+                        "owner_scope": "component_document",
+                        "api": "IModelDocExtension.GetRenderMaterials2",
+                        "display_state_option": 3,
+                        "display_state": "Display State 1",
+                        "call_state": "empty",
+                        "materials": [],
+                        "read_errors": {},
+                    }
                 ],
             }
         write_json(facts_path, facts)
@@ -371,11 +452,8 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             ),
             command_id=generate_command.command_id,
         )
-        with patch(
-            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
-            return_value=None,
-        ):
-            generated = GenerateHandler(self.store).execute(
+        with self.assertRaises(StageFailure) as caught:
+            GenerateHandler(self.store).execute(
                 generate_command,
                 generate_claim,
                 StageWorkspace(
@@ -384,42 +462,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 ),
                 effects=NoExternalEffects(),
             )
-        generate_ref = self.store.seal_tree(
-            generated.candidate_root,
-            kind="stage_output:generate",
-            producer_run_id=generate_command.run_id,
-            producer_stage="generate",
-            producer_tool_sha256=self.generate_executor,
-        )
-        command, claim, workspace = self._verify_request(
-            generate_ref,
-            capture_ref=capture_ref,
-            capture_root=capture_root,
-        )
-        execution = VerifyHandler(
-            identity_provider=hermetic._portable_tool,
-            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
-        ).execute(
-            command,
-            claim,
-            workspace,
-            effects=NoExternalEffects(),
-        )
-        self.assertEqual(execution.outcome, "failed")
-        certificate = read_data(
-            Path(execution.candidate_root) / CERTIFICATE_FILENAME
-        )
-        check = next(
-            row
-            for row in certificate["checks"]
-            if row["id"] == "provenance.value_warnings"
-        )
-        self.assertIn(
-            "cad_appearance_effective_scope_unproven",
-            {
-                issue["code"]
-                for issue in check["details"]["appearance"]["issues"]
-            },
+        self.assertEqual(
+            caught.exception.reason_code,
+            "generate.appearance_unrepresentable",
         )
 
     def _seal_mutated_generate(self, name: str, mutate) -> object:
@@ -444,6 +489,38 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         first_execution, first_certificate, first_receipt = first[1], first[2], first[3]
         second_certificate, second_receipt = second[2], second[3]
         self.assertEqual(first_execution.outcome, "completed")
+        model = read_data(self.generate_source / "model/robot.json")
+        appearance_links = [
+            link
+            for link in model["links"]
+            if any(
+                (visual.get("provenance") or {}).get("material_source")
+                == "native_appearance"
+                for visual in link["visuals"]
+            )
+        ]
+        self.assertEqual(len(appearance_links), 2)
+        for link in appearance_links:
+            self.assertEqual(len(link["visuals"]), 2)
+            self.assertEqual(
+                {tuple(visual["rgba"]) for visual in link["visuals"]},
+                {
+                    (0.7, 0.7, 0.7, 1.0),
+                    (0.15, 0.35, 0.75, 1.0),
+                },
+            )
+            face_references = [
+                reference
+                for visual in link["visuals"]
+                for reference in visual["face_references"]
+            ]
+            self.assertEqual(len(face_references), 6)
+            self.assertEqual(len(set(face_references)), 6)
+            for visual in link["visuals"]:
+                delivered = self.generate_source / visual["mesh_name"]
+                stats = stl.read_bytes(delivered.read_bytes())
+                self.assertTrue(stats.binary)
+                self.assertEqual(stats.triangles, 6)
         self.assertFalse(hasattr(first_execution, "required_effect_ids"))
         self.assertEqual(first_certificate["actual_verifier_sha256"], first[6].executor_sha256)
         self.assertNotEqual(first_certificate["actual_verifier_sha256"], first[6].owner_sha256)
@@ -487,19 +564,15 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             claim_id="diagnostic-verify-claim",
             command_id=diagnostic.command_id,
         )
-        with patch(
-            "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
-            return_value=None,
-        ):
-            execution = VerifyHandler(
-                identity_provider=hermetic._portable_tool,
-                clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
-            ).execute(
-                diagnostic,
-                diagnostic_claim,
-                workspace,
-                effects=NoExternalEffects(),
-            )
+        execution = VerifyHandler(
+            identity_provider=hermetic._portable_tool,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        ).execute(
+            diagnostic,
+            diagnostic_claim,
+            workspace,
+            effects=NoExternalEffects(),
+        )
         self.assertEqual(execution.outcome, "completed")
         self.assertEqual(diagnostic.diagnostic_scope, scope)
 
@@ -719,10 +792,6 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 "evaluate_bundle",
                 wraps=pipeline_verify.evaluate_bundle,
             ) as evaluator,
-            patch(
-                "description_pipeline.sources.solidworks.appearance.require_deliverable_appearance",
-                return_value=None,
-            ),
         ):
             replayed = replay_verification(
                 generate_root=self.generate_root,

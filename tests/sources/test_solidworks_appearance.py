@@ -9,9 +9,14 @@ from description_pipeline.sources.solidworks.appearance import (
     UNRECORDED_APPEARANCE,
     AppearanceError,
     audit_appearance,
+    appearance_groups,
     bind_capture_appearance,
     require_deliverable_appearance,
+    resolve_deliverable_appearance,
 )
+from description_pipeline.geometry.native_tessellation import native_stl_subset
+
+from . import support
 
 COMPONENT = "arm-1"
 DOCUMENT = r"C:\capture\arm.SLDPRT"
@@ -100,6 +105,51 @@ def _raw(
                 "body_name": "arm",
                 "appearance": body
                 or _body_layer(active_configuration=active_configuration),
+            }
+        ],
+    }
+
+
+def _resolved_raw(values):
+    face_rows = []
+    for index, face_values in enumerate(values):
+        face_rows.append(
+            {
+                "face_index": index,
+                "appearance": _layer(
+                    owner_configuration=CONFIGURATION,
+                    values=face_values,
+                    has_values=True,
+                ),
+            }
+        )
+    return {
+        **_raw(),
+        "native_referenced_display_state": "Display State 1",
+        "native_referenced_display_state_error": None,
+        "state_render_materials": [
+            {
+                "owner_document_path": DOCUMENT,
+                "owner_scope": "component_document",
+                "api": "IModelDocExtension.GetRenderMaterials2",
+                "display_state_option": 3,
+                "display_state": "Display State 1",
+                "call_state": "empty",
+                "materials": [],
+                "read_errors": {},
+            }
+        ],
+        "bodies": [
+            {
+                "component": COMPONENT,
+                "enumeration_api": "IComponent2.GetBodies2",
+                "body_type": 0,
+                "body_index": 0,
+                "body_name": "arm",
+                "appearance": _body_layer(
+                    active_configuration=CONFIGURATION
+                ),
+                "faces": face_rows,
             }
         ],
     }
@@ -296,6 +346,161 @@ class AppearanceAuditTests(unittest.TestCase):
         self.assertEqual(bound_geometry[0]["source_scope"], scope)
         self.assertNotIn("appearance_raw", raw_scene["components"][0])
         self.assertNotIn("source_scope", geometry[0])
+
+
+class AppearanceResolutionTests(unittest.TestCase):
+    def test_face_owners_partition_one_occurrence_into_multiple_materials(self):
+        red = [1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.25, 0.0]
+        blue = [0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]
+        spans = [
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "face_index": index,
+                "triangle_start": index * 2,
+                "triangle_count": 2,
+                "face_reference_sha256": str(index + 1) * 64,
+            }
+            for index in range(2)
+        ]
+        resolution = resolve_deliverable_appearance(
+            _resolved_raw([red, blue]),
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=spans,
+        )
+        groups = appearance_groups(resolution.faces)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(
+            {tuple(group["rgba"]) for group in groups},
+            {
+                (1.0, 0.0, 0.0, 0.75),
+                (0.0, 0.0, 1.0, 1.0),
+            },
+        )
+        self.assertTrue(
+            all(
+                group["triangle_ranges"]
+                == [{"triangle_start": index * 2, "triangle_count": 2}]
+                for index, group in enumerate(
+                    sorted(groups, key=lambda row: row["face_references"][0])
+                )
+            )
+        )
+        source = support.binary_stl_bytes(
+            [((0, 0, 0), (1, 0, 0), (0, 1, 0))] * 4
+        )
+        subsets = [
+            native_stl_subset(source, group["triangle_ranges"])
+            for group in groups
+        ]
+        self.assertEqual(
+            sum(count for _payload, count in subsets),
+            4,
+        )
+        self.assertTrue(all(count == 2 for _payload, count in subsets))
+
+    def test_documented_face_override_wins_over_part_default(self):
+        red = [1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]
+        blue = [0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]
+        raw = _resolved_raw([red])
+        raw["document"] = _layer(
+            owner_configuration=CONFIGURATION,
+            values=blue,
+            has_values=True,
+        )
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }
+            ],
+        )
+        self.assertEqual(resolved.faces[0].rgba, (1.0, 0.0, 0.0, 1.0))
+        self.assertEqual(resolved.faces[0].source["scopes"], ["face"])
+
+    def test_source_render_material_owner_shape_stops_before_unproven_color_decode(self):
+        raw = _resolved_raw(
+            [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
+        )
+        raw["state_render_materials"] = [
+            {
+                "owner_document_path": DOCUMENT,
+                "owner_scope": "component_document",
+                "api": "IModelDocExtension.GetRenderMaterials2",
+                "display_state_option": 3,
+                "configuration": CONFIGURATION,
+                "display_state": "Display State 1",
+                "call_state": "observed",
+                "materials": [
+                    {
+                        "material_index": 0,
+                        "linked_display_states": ["Display State 1"],
+                        "entities": ["native-face"],
+                        "entities_state": "observed",
+                        "entity_records": [
+                            {
+                                "entity_index": 0,
+                                "native_object_type": "IFace2",
+                                "persistent_reference": [1, 2, 3],
+                                "read_errors": {},
+                                "matched_identity": {
+                                    "occurrences": [],
+                                    "bodies": [],
+                                    "faces": [
+                                        {
+                                            "component": COMPONENT,
+                                            "body_type": 0,
+                                            "body_index": 0,
+                                            "face_index": 0,
+                                        }
+                                    ],
+                                    "features": [],
+                                },
+                            }
+                        ],
+                        "primary_color": 0x00AABBCC,
+                        "transparency": 0.25,
+                        "color_form": 1,
+                        "texture_filename": "",
+                        "surface_finish_file": "",
+                        "read_errors": {},
+                    }
+                ],
+                "read_errors": {},
+            }
+        ]
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                raw,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=[
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "triangle_start": 0,
+                        "triangle_count": 1,
+                        "face_reference_sha256": "a" * 64,
+                    }
+                ],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_color_encoding_unproven",
+        )
 
 
 if __name__ == "__main__":

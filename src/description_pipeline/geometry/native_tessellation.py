@@ -199,6 +199,63 @@ def read_native_triangle_stream(
     return list(iter_native_triangles(Path(path), expected_count=expected_count))
 
 
+def native_stl_subset(
+    source_bytes: bytes,
+    triangle_ranges: object,
+) -> tuple[bytes, int]:
+    """Return one binary STL containing only validated source triangle ranges."""
+
+    _require(isinstance(source_bytes, bytes), "Native STL source is not bytes")
+    _require(
+        len(source_bytes) >= len(_STL_HEADER) + 4
+        and len(source_bytes)
+        == len(_STL_HEADER)
+        + 4
+        + _STL_BYTES_PER_TRIANGLE * struct.unpack_from("<I", source_bytes, 80)[0],
+        "Native STL source is not an exact binary STL",
+    )
+    total = struct.unpack_from("<I", source_bytes, 80)[0]
+    _require(
+        isinstance(triangle_ranges, list) and bool(triangle_ranges),
+        "Native appearance triangle ranges are missing",
+    )
+    records = []
+    next_start = 0
+    for item in triangle_ranges:
+        _require(
+            isinstance(item, dict)
+            and set(item) == {"triangle_start", "triangle_count"}
+            and _integer(item["triangle_start"])
+            and _integer(item["triangle_count"])
+            and item["triangle_start"] >= next_start
+            and item["triangle_count"] > 0,
+            "Native appearance triangle ranges are not positive, ordered, and non-overlapping",
+        )
+        start = item["triangle_start"]
+        count = item["triangle_count"]
+        _require(
+            start + count <= total,
+            "Native appearance triangle range exceeds the source STL",
+        )
+        offset = len(_STL_HEADER) + 4 + _STL_BYTES_PER_TRIANGLE * start
+        records.append(
+            source_bytes[offset : offset + _STL_BYTES_PER_TRIANGLE * count]
+        )
+        next_start = start + count
+    payload = b"".join(records)
+    count = len(payload) // _STL_BYTES_PER_TRIANGLE
+    _require(
+        count > 0 and len(payload) == count * _STL_BYTES_PER_TRIANGLE,
+        "Native appearance subset is empty",
+    )
+    return (
+        _STL_HEADER
+        + struct.pack("<I", count)
+        + payload,
+        count,
+    )
+
+
 def materialize_native_stl(
     raw_path: Path,
     stl_path: Path,

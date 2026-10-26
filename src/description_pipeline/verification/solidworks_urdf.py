@@ -8,6 +8,7 @@ can repeat exactly the same verification.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import ntpath
@@ -22,6 +23,7 @@ import numpy as np
 from ..native_transfer import load_native_receipts
 from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
+from ..geometry.native_tessellation import native_stl_subset
 from ..geometry.native_scope import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     native_scope_warning_diagnostics_are_complete,
@@ -1517,24 +1519,29 @@ def _check_mesh_part(data: bytes, source_bytes: bytes, start: int, count: int) -
 def _geometry(root, body, node, model_link, geometry, components, body_pose, urdf_pose, exclusions):
     visuals = node.findall("visual")
     canonical = model_link["visuals"]
-    _require(len(canonical) == len(body["components"]), "Canonical visuals differ from the selected occurrences")
-    expected = 0
+    shapes_by_component = {}
+    for shape in canonical:
+        provenance = shape.get("provenance") or {}
+        occurrence = str(provenance.get("native_component") or "")
+        _require(occurrence, "Canonical visual carries no native occurrence")
+        shapes_by_component.setdefault(occurrence, []).append(shape)
+    _require(
+        set(shapes_by_component) == set(body["components"]),
+        "Canonical visual group owners differ from the selected occurrences",
+    )
+    _require(not node.findall("collision") and not model_link["collisions"], "Unspecified collision conversion")
+    all_points, used = [], []
+    cursor = 0
     for occurrence in body["components"]:
         row = geometry[occurrence]
         _require(
             type(row.get("triangles")) is int and row["triangles"] > 0,
             "Geometry receipt carries no triangle count",
         )
-        expected += _mesh_chunk_count(row["triangles"])
-    _require(len(visuals) == expected, "Visual geometry does not cover every occurrence")
-    _require(not node.findall("collision") and not model_link["collisions"], "Unspecified collision conversion")
-    all_points, used = [], []
-    cursor = 0
-    for occurrence, shape in zip(body["components"], canonical, strict=True):
-        row = geometry[occurrence]
         original = confined(root / "evidence", row["path"])
         _require(
-            file_digest(original) == row["sha"] and shape["filename"] == row["path"], "Source mesh identity differs"
+            file_digest(original) == row["sha"],
+            "Source mesh identity differs",
         )
         source_bytes = original.read_bytes()
         stats = stl.read_bytes(source_bytes)
@@ -1549,60 +1556,121 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             f"(area ratio {stats.degenerate_area / stats.area:.3e}, bound 1.0e-06; "
             f"count ratio {stats.degenerate / stats.triangles:.3e}, bound 1.0e-02)",
         )
-        chunks = _mesh_chunk_count(stats.triangles)
-        group = visuals[cursor : cursor + chunks]
-        cursor += chunks
-        materials, origins = set(), []
-        for part, visual in enumerate(group):
-            mesh = _one(_one(visual, "geometry"), "mesh")
-            uri = mesh.attrib["filename"]
-            _require(
-                uri.startswith("../meshes/") and "\\" not in uri and ":" not in uri,
-                "Mesh URI must reference delivered meshes",
-            )
-            delivery_name = "meshes/" + uri[len("../meshes/") :]
-            _require(
-                isinstance(shape.get("mesh_name"), str) and bool(shape["mesh_name"]),
-                "Visual lacks a canonical mesh name",
-            )
-            base_name = shape["mesh_name"]
-            expected_name = (
-                base_name.removesuffix(".stl") + f"_part_{part}.stl" if chunks > 1 else base_name
-            )
-            _require(
-                delivery_name == expected_name,
-                "Delivered mesh naming differs from the canonical mesh contract",
-            )
-            delivered = confined(root, delivery_name)
-            if chunks == 1:
-                _require(file_digest(delivered) == row["sha"], "Delivered mesh bytes differ from captured geometry")
-            else:
-                _check_mesh_part(
-                    delivered.read_bytes(),
-                    source_bytes,
-                    CHUNK_TRIANGLES_MAX * part,
-                    min(CHUNK_TRIANGLES_MAX, stats.triangles - CHUNK_TRIANGLES_MAX * part),
-                )
-            used.append(delivery_name)
-            _require(
-                np.array_equal(_numbers(mesh, "scale", 3), [1, 1, 1]) and shape["scale"] == [1, 1, 1],
-                "Meshes must use native SI units without rescaling",
-            )
-            material = visual.find("material")
-            materials.add(ET.tostring(material, encoding="unicode") if material is not None else "")
-            origins.append(_xml_pose(visual))
-        _require(len(materials) == 1, "Mesh parts carry different visual materials")
         native_pose = np.linalg.inv(body_pose) @ components[occurrence]
-        for origin in origins:
-            _same_pose(origin, native_pose)
-        _same_pose(_pose(shape["xyz"], shape["rpy"]), native_pose)
+        covered_triangles = 0
+        for shape in shapes_by_component[occurrence]:
+            _require(
+                shape.get("filename") == row["path"]
+                and shape.get("sha256") == row["sha"],
+                "Visual source geometry differs from the occurrence",
+            )
+            ranges = shape.get("triangle_ranges")
+            if ranges is None:
+                subset_bytes = source_bytes
+                subset_triangles = stats.triangles
+                expected_mesh_sha = row["sha"]
+            else:
+                subset_bytes, subset_triangles = native_stl_subset(
+                    source_bytes,
+                    ranges,
+                )
+                expected_mesh_sha = shape.get("mesh_sha256")
+                _require(
+                    isinstance(expected_mesh_sha, str)
+                    and hashlib.sha256(subset_bytes).hexdigest()
+                    == expected_mesh_sha,
+                    "Canonical appearance subset digest differs from the source records",
+                )
+            covered_triangles += subset_triangles
+            chunks = _mesh_chunk_count(subset_triangles)
+            group = visuals[cursor : cursor + chunks]
+            cursor += chunks
+            _require(
+                len(group) == chunks,
+                "Visual geometry does not cover every canonical appearance chunk",
+            )
+            materials, origins = set(), []
+            for part, visual in enumerate(group):
+                mesh = _one(_one(visual, "geometry"), "mesh")
+                uri = mesh.attrib["filename"]
+                _require(
+                    uri.startswith("../meshes/")
+                    and "\\" not in uri
+                    and ":" not in uri,
+                    "Mesh URI must reference delivered meshes",
+                )
+                delivery_name = "meshes/" + uri[len("../meshes/") :]
+                _require(
+                    isinstance(shape.get("mesh_name"), str)
+                    and bool(shape["mesh_name"]),
+                    "Visual lacks a canonical mesh name",
+                )
+                base_name = shape["mesh_name"]
+                expected_name = (
+                    base_name.removesuffix(".stl") + f"_part_{part}.stl"
+                    if chunks > 1
+                    else base_name
+                )
+                _require(
+                    delivery_name == expected_name,
+                    "Delivered mesh naming differs from the canonical mesh contract",
+                )
+                delivered = confined(root, delivery_name)
+                if chunks == 1:
+                    _require(
+                        file_digest(delivered) == expected_mesh_sha,
+                        "Delivered mesh bytes differ from their canonical source records",
+                    )
+                else:
+                    _check_mesh_part(
+                        delivered.read_bytes(),
+                        subset_bytes,
+                        CHUNK_TRIANGLES_MAX * part,
+                        min(
+                            CHUNK_TRIANGLES_MAX,
+                            subset_triangles - CHUNK_TRIANGLES_MAX * part,
+                        ),
+                    )
+                used.append(delivery_name)
+                _require(
+                    np.array_equal(_numbers(mesh, "scale", 3), [1, 1, 1])
+                    and shape["scale"] == [1, 1, 1],
+                    "Meshes must use native SI units without rescaling",
+                )
+                material = visual.find("material")
+                materials.add(
+                    ET.tostring(material, encoding="unicode")
+                    if material is not None
+                    else ""
+                )
+                origins.append(_xml_pose(visual))
+            _require(
+                len(materials) == 1,
+                "Mesh parts carry different visual materials",
+            )
+            for origin in origins:
+                _same_pose(origin, native_pose)
+            _same_pose(_pose(shape["xyz"], shape["rpy"]), native_pose)
+        _require(
+            covered_triangles == stats.triangles,
+            "Native appearance groups do not exactly partition the source triangles",
+        )
         _require(
             stats.volume > 1e-15 or occurrence in exclusions or _qualified_surface_only(root, occurrence),
             "Zero-volume geometry needs a documented exclusion",
         )
         _verify_native_solid_orientation(source_bytes, row)
-        points = stl.vertices(original)
-        world = urdf_pose @ origins[0]
+        group_vertices = []
+        for shape in shapes_by_component[occurrence]:
+            ranges = shape.get("triangle_ranges")
+            subset_bytes = (
+                source_bytes
+                if ranges is None
+                else native_stl_subset(source_bytes, ranges)[0]
+            )
+            group_vertices.append(stl.vertices_bytes(subset_bytes))
+        points = np.concatenate(group_vertices)
+        world = urdf_pose @ _xml_pose(visuals[cursor - 1])
         native = components[occurrence]
         # Compare placement using actual vertices, not bounds written by generation.
         actual = points @ world[:3, :3].T + world[:3, 3]
@@ -1612,6 +1680,7 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             "Mesh vertices are displaced from native CAD",
         )
         all_points.append(points @ native_pose[:3, :3].T + native_pose[:3, 3])
+    _require(cursor == len(visuals), "Visual geometry has unexpected trailing chunks")
     points = np.concatenate(all_points)
     com = _vector(model_link["inertial"]["xyz"])
     _require(
@@ -2096,11 +2165,24 @@ def _verify_model(
     source = definition["source"]
     carrier = source.get("carrier")
     native_geometry_rows = evidence.geometry(root)
-    if "raw/native_capture_facts.json" in (manifest.get("files") or {}):
+    source_manifest = verify_snapshot(root / "evidence")
+    native_appearance = source_manifest.get("evidence_class") != "fixture"
+    if "raw/native_capture_facts.json" in (source_manifest.get("files") or {}):
         raw, native_geometry_rows = bind_capture_appearance(
             raw,
             native_geometry_rows,
             evidence.native_capture_facts(root),
+        )
+        from .native_appearance import verify_native_appearance
+
+        gates.add(
+            "appearance.native",
+            lambda: verify_native_appearance(
+                root,
+                raw,
+                native_geometry_rows,
+                model,
+            ),
         )
     metadata_warnings = _metadata_value_warnings(
         root,
@@ -2120,7 +2202,7 @@ def _verify_model(
             carrier,
             native_geometry_rows=native_geometry_rows,
             raw_scene=raw,
-            native_appearance=manifest.get("evidence_class") != "fixture",
+            native_appearance=native_appearance,
             metadata_warnings=metadata_warnings,
         ),
     )
@@ -2385,10 +2467,6 @@ def _value_warning_gate(
 ):
     """Re-derive every non-native value warning from source facts and the model."""
 
-    from ..sources.solidworks.appearance import (
-        UNRECORDED_APPEARANCE,
-        require_deliverable_appearance,
-    )
     from ..sources.solidworks.naming import asset_namespace, carrier_names_and_rules, mesh_path, visual_name
 
     mesh_namespace = asset_namespace(Path(str(source.get("assembly") or "robot")).name)
@@ -2425,11 +2503,6 @@ def _value_warning_gate(
     model_joints = model.get("joints") or []
     shapes = [(link, shape) for link in links for shape in link.get("visuals") or []]
     native_geometry = {}
-    raw_components = {
-        str(row.get("name") or ""): row
-        for row in (raw_scene or {}).get("components", [])
-        if isinstance(row, dict)
-    }
     for row in native_geometry_rows or []:
         _require(isinstance(row, dict), "Raw geometry rows must be objects")
         component = str(row.get("component") or "")
@@ -2877,50 +2950,48 @@ def _value_warning_gate(
                 and native_row.get("sha") == shape.get("sha256"),
                 "Visual mesh identity differs from the raw geometry evidence",
             )
-        _require(
-            shape.get("name") == visual_name(native_component, link=link["name"]),
-            "Visual name differs from the CAD-derived rule",
-        )
         current_sha256 = file_digest(confined(root / "evidence", str(shape.get("filename") or "")))
         _require(shape.get("sha256") == current_sha256, "Visual digest differs from capture evidence")
-        _require(
-            shape.get("mesh_name")
-            == mesh_path(current_sha256, namespace=mesh_namespace),
-            "Mesh path differs from content addressing",
-        )
-        if native_appearance:
-            raw_component = raw_components.get(native_component)
-            _require(
-                raw_component is not None,
-                "Visual is missing from the sealed raw scene",
-            )
-            source_scope = (
-                (native_geometry.get(native_component) or {}).get(
-                    "source_scope"
-                )
-                or {}
-            )
-            require_deliverable_appearance(
-                raw_component.get(
-                    "appearance_raw",
-                    UNRECORDED_APPEARANCE,
-                ),
-                component=native_component,
-                expected_document_path=source_scope.get(
-                    "source_document_path"
-                ),
-                expected_configuration=source_scope.get(
-                    "referenced_configuration"
-                ),
-                expected_bodies=(native_geometry.get(native_component) or {}).get(
-                    "body_inventory"
-                ),
-            )
         if shape.get("rgba") is not None:
             _require(
                 provenance.get("material_source") == "native_appearance",
                 "The capture schema carries no independently verified CAD appearance",
             )
+        appearance_provenance = provenance.get("appearance")
+        if appearance_provenance is not None:
+            _require(
+                isinstance(appearance_provenance, dict)
+                and isinstance(appearance_provenance.get("group_id"), str)
+                and isinstance(appearance_provenance.get("face_references"), list)
+                and isinstance(appearance_provenance.get("sources"), list),
+                "Native appearance provenance is malformed",
+            )
+            expected_visual_name = visual_name(
+                f"{native_component}:appearance:{appearance_provenance['group_id']}",
+                link=link["name"],
+            )
+            current_mesh_sha256 = shape.get("mesh_sha256")
+            _require(
+                isinstance(current_mesh_sha256, str)
+                and shape.get("mesh_name")
+                == mesh_path(current_mesh_sha256, namespace=mesh_namespace),
+                "Native appearance mesh path differs from its derived content digest",
+            )
+        else:
+            expected_visual_name = visual_name(
+                native_component,
+                link=link["name"],
+            )
+            current_mesh_sha256 = current_sha256
+            _require(
+                shape.get("mesh_name")
+                == mesh_path(current_sha256, namespace=mesh_namespace),
+                "Mesh path differs from content addressing",
+            )
+        _require(
+            shape.get("name") == expected_visual_name,
+            "Visual name differs from the CAD-derived rule",
+        )
         add(
             "naming.derived_visual",
             {
@@ -2943,7 +3014,7 @@ def _value_warning_gate(
                 "field": "mesh filename",
                 "actual": shape["mesh_name"],
                 "source": "current capture content addressing",
-                "original": current_sha256,
+                "original": current_mesh_sha256,
                 "rule_id": "naming.mesh",
                 "rule_version": "naming-v1",
                 "reason": "current capture content addressing",
@@ -3030,6 +3101,37 @@ def _value_warning_gate(
                 },
             )
     for _link, shape in shapes:
+        provenance = shape.get("provenance") or {}
+        if provenance.get("material_source") != "native_appearance":
+            continue
+        appearance = provenance.get("appearance") or {}
+        add(
+            "appearance.native_derived",
+            {
+                "object_type": "visual",
+                "object": shape["name"],
+                "fields": [
+                    "material.name",
+                    "material.color.rgba",
+                    "mesh.filename",
+                    "mesh.faces",
+                ],
+                "actual": {
+                    "material": shape.get("material"),
+                    "rgba": shape.get("rgba"),
+                    "mesh": shape.get("mesh_name"),
+                    "face_references": appearance.get("face_references"),
+                },
+                "sources": appearance.get("sources"),
+                "rule_id": "appearance.native_owner_state",
+                "rule_version": "v1",
+                "reason": (
+                    "RGBA is resolved from the recorded native owner/display-state "
+                    "appearance and grouped by exact delivered face spans"
+                ),
+            },
+        )
+    for _link, shape in shapes:
         fields = ["scale"]
         actual_value = {"scale": shape.get("scale")}
         add(
@@ -3047,6 +3149,10 @@ def _value_warning_gate(
         return Counter(json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows)
 
     messages = {
+        "appearance.native_derived": (
+            "Material colors are derived from recorded native appearance owners "
+            "and display-state assignments for the delivered faces."
+        ),
         "geometry.derived_from_native": (
             "Geometry, frame transforms and signed joint axes are derived from native evidence."
         ),

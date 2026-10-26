@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import posixpath
 from collections.abc import Mapping, Sequence
@@ -12,6 +14,128 @@ from typing import Any
 from ...io import PipelineError
 
 UNRECORDED_APPEARANCE = object()
+
+
+@dataclass(frozen=True, slots=True)
+class FaceAppearance:
+    """One delivered face bound to its exact native triangle span and RGBA."""
+
+    body_type: int
+    body_index: int
+    face_index: int
+    face_reference_sha256: str
+    triangle_start: int
+    triangle_count: int
+    rgba: tuple[float, float, float, float]
+    source: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class AppearanceResolution:
+    """The successful per-face appearance resolution for one occurrence."""
+
+    component: str
+    referenced_configuration: str
+    referenced_display_state: str
+    faces: tuple[FaceAppearance, ...]
+
+
+def appearance_groups(
+    faces: Sequence[FaceAppearance],
+) -> tuple[dict[str, Any], ...]:
+    """Partition one occurrence's exact face inventory by resolved RGBA."""
+
+    if not faces:
+        raise PipelineError("Native appearance has no delivered faces")
+    ordered = sorted(faces, key=lambda face: face.triangle_start)
+    seen_faces: set[str] = set()
+    next_triangle = 0
+    by_rgba: dict[tuple[float, float, float, float], list[FaceAppearance]] = {}
+    for face in ordered:
+        if (
+            type(face.body_type) is not int
+            or face.body_type not in (0, 1)
+            or type(face.body_index) is not int
+            or face.body_index < 0
+            or type(face.face_index) is not int
+            or face.face_index < 0
+            or not isinstance(face.face_reference_sha256, str)
+            or len(face.face_reference_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in face.face_reference_sha256
+            )
+            or type(face.triangle_start) is not int
+            or type(face.triangle_count) is not int
+            or face.triangle_count <= 0
+            or face.triangle_start != next_triangle
+            or len(face.rgba) != 4
+            or any(
+                type(value) not in (int, float)
+                or not math.isfinite(float(value))
+                or not 0 <= value <= 1
+                for value in face.rgba
+            )
+        ):
+            raise PipelineError(
+                "Resolved face appearance has invalid identity, span, or RGBA"
+            )
+        if face.face_reference_sha256 in seen_faces:
+            raise PipelineError("Resolved appearance repeats a delivered face")
+        seen_faces.add(face.face_reference_sha256)
+        next_triangle += face.triangle_count
+        by_rgba.setdefault(tuple(float(value) for value in face.rgba), []).append(
+            face
+        )
+
+    groups = []
+    for rgba, group_faces in by_rgba.items():
+        ranges = []
+        for face in group_faces:
+            if (
+                ranges
+                and ranges[-1]["triangle_start"]
+                + ranges[-1]["triangle_count"]
+                == face.triangle_start
+            ):
+                ranges[-1]["triangle_count"] += face.triangle_count
+            else:
+                ranges.append(
+                    {
+                        "triangle_start": face.triangle_start,
+                        "triangle_count": face.triangle_count,
+                    }
+                )
+        face_references = sorted(
+            face.face_reference_sha256 for face in group_faces
+        )
+        sources = {
+            hashlib.sha256(
+                json.dumps(
+                    face.source,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(): copy.deepcopy(dict(face.source))
+            for face in group_faces
+        }
+        groups.append(
+            {
+                "group_id": hashlib.sha256(
+                    (
+                        ",".join(face_references)
+                        + ":"
+                        + ",".join(format(value, ".17g") for value in rgba)
+                    ).encode("ascii")
+                ).hexdigest()[:16],
+                "rgba": list(rgba),
+                "face_references": face_references,
+                "triangle_ranges": ranges,
+                "sources": [sources[key] for key in sorted(sources)],
+            }
+        )
+    return tuple(sorted(groups, key=lambda group: group["face_references"][0]))
 
 
 @dataclass(frozen=True)
@@ -94,6 +218,875 @@ def _valid_values(value: object) -> bool:
             type(item) in (int, float) and math.isfinite(float(item))
             for item in value
         )
+    )
+
+
+def _appearance_resolution_error(
+    component: str,
+    code: str,
+    path: str,
+    message: str,
+    **detail: Any,
+) -> AppearanceError:
+    return AppearanceError(
+        AppearanceAudit(
+            component,
+            "unrepresentable",
+            (_issue(code, path, message, **detail),),
+            (),
+        )
+    )
+
+
+def _face_key(body_type: object, body_index: object, face_index: object):
+    if (
+        type(body_type) is not int
+        or body_type not in (0, 1)
+        or type(body_index) is not int
+        or body_index < 0
+        or type(face_index) is not int
+        or face_index < 0
+    ):
+        return None
+    return (body_type, body_index, face_index)
+
+
+def _rgba_from_material_values(
+    values: Sequence[object],
+) -> tuple[float, float, float, float] | None:
+    if not _valid_values(values) or all(float(value) == -1.0 for value in values):
+        return None
+    if any(float(value) < 0 or float(value) > 1 for value in values):
+        return None
+    return (
+        float(values[0]),
+        float(values[1]),
+        float(values[2]),
+        1.0 - float(values[7]),
+    )
+
+
+def _rgba_from_colorref(value: object, transparency: object):
+    if (
+        type(value) is not int
+        or value < 0
+        or value > 0xFFFFFF
+        or type(transparency) not in (int, float)
+        or not math.isfinite(float(transparency))
+        or not 0 <= float(transparency) <= 1
+    ):
+        return None
+    return (
+        (value & 0xFF) / 255.0,
+        ((value >> 8) & 0xFF) / 255.0,
+        ((value >> 16) & 0xFF) / 255.0,
+        1.0 - float(transparency),
+    )
+
+
+def _owner_color(
+    raw: object,
+    *,
+    component: str,
+    path: str,
+    expected_configuration: str,
+    use_presence: bool = True,
+) -> tuple[tuple[float, float, float, float], dict[str, Any]] | None:
+    if not isinstance(raw, Mapping):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_owner_missing",
+            path,
+            "the appearance owner record is absent or malformed",
+        )
+    used_api = raw.get("used_api")
+    if not isinstance(used_api, str) or not used_api:
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_api_missing",
+            path + ".used_api",
+            "the appearance owner record names no native API",
+        )
+    material_call = raw.get("material_call")
+    if not isinstance(material_call, Mapping):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_configuration_mismatch",
+            path + ".material_call",
+            "the appearance material call has no configuration identity",
+        )
+    active = material_call.get("active_configuration")
+    names = material_call.get("configuration_names")
+    if (
+        active != expected_configuration
+        and not (isinstance(names, list) and expected_configuration in names)
+    ):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_configuration_mismatch",
+            path + ".material_call",
+            "the appearance material call is not bound to the referenced configuration",
+            expected=expected_configuration,
+            observed=dict(material_call),
+        )
+    read_errors = raw.get("read_errors")
+    if not isinstance(read_errors, Mapping):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_errors_malformed",
+            path + ".read_errors",
+            "the appearance error record is not an object",
+        )
+    relevant_errors = {
+        field: error
+        for field, error in read_errors.items()
+        if use_presence or field != "has_material_property_values"
+    }
+    if relevant_errors:
+        field, error = sorted(relevant_errors.items())[0]
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_read_failed",
+            f"{path}.read_errors.{field}",
+            "an appearance read failed and cannot be treated as absence",
+            error=error,
+        )
+    texture = raw.get("texture")
+    if not isinstance(texture, Mapping):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_texture_invalid",
+            path + ".texture",
+            "the texture record is absent or malformed",
+        )
+    if texture.get("state") != "absent":
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_texture_unrepresentable",
+            path + ".texture",
+            "the owner carries a texture that is not qualified for delivery",
+            observed=dict(texture),
+        )
+    if texture.get("material_name") is not None:
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_texture_state_conflict",
+            path + ".texture.material_name",
+            "an absent texture carries a material name",
+            observed=texture.get("material_name"),
+        )
+    values = raw.get("material_property_values")
+    has_values = raw.get("has_material_property_values")
+    if values is None:
+        if use_presence and has_values is not None and type(has_values) is not bool:
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_presence_invalid",
+                path + ".has_material_property_values",
+                "the appearance presence flag is not a native boolean",
+                observed=has_values,
+            )
+        return None
+    if not _valid_values(values):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_values_invalid",
+            path + ".material_property_values",
+            "material values are not the documented nine finite numbers",
+            observed=values,
+        )
+    rgba = _rgba_from_material_values(values)
+    if rgba is None:
+        if all(float(value) == -1.0 for value in values):
+            return None
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_values_invalid",
+            path + ".material_property_values",
+            "material values are outside the documented [0, 1] range",
+            observed=values,
+        )
+    if use_presence and has_values is False:
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_presence_conflict",
+            path,
+            "the presence flag denies explicit material values",
+            material_property_values=values,
+        )
+    if use_presence and has_values is not None and type(has_values) is not bool:
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_presence_invalid",
+            path + ".has_material_property_values",
+            "the appearance presence flag is not a native boolean",
+            observed=has_values,
+        )
+    return rgba, {
+        "kind": "owner",
+        "used_api": used_api,
+        "material_property_values": list(values),
+        "rgba": list(rgba),
+        "alpha_rule": {
+            "rule_id": "appearance.urdf_opacity_from_native_transparency",
+            "rule_version": "v1",
+            "native_transparency_index": 7,
+            "urdf_alpha": 1.0 - float(values[7]),
+        },
+    }
+
+
+def _target_face_keys(
+    target: object,
+    *,
+    component: str,
+    path: str,
+    all_faces: Sequence[tuple[int, int, int]],
+) -> set[tuple[int, int, int]]:
+    if not isinstance(target, Mapping):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_render_target_invalid",
+            path,
+            "a display-state appearance target is not an object",
+        )
+    scope = target.get("scope")
+    if scope == "occurrence":
+        return set(all_faces)
+    body_key = _face_key(
+        target.get("body_type"),
+        target.get("body_index"),
+        0,
+    )
+    if scope == "body" and body_key is not None:
+        return {
+            face
+            for face in all_faces
+            if face[:2] == body_key[:2]
+        }
+    if scope == "face":
+        face_key = _face_key(
+            target.get("body_type"),
+            target.get("body_index"),
+            target.get("face_index"),
+        )
+        if face_key is not None:
+            return {face_key} if face_key in all_faces else set()
+    if scope == "feature":
+        face_keys = target.get("face_keys")
+        if isinstance(face_keys, list):
+            result = set()
+            for index, raw_face in enumerate(face_keys):
+                if not isinstance(raw_face, Mapping):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_target_invalid",
+                        f"{path}.face_keys[{index}]",
+                        "a feature appearance target has a malformed face key",
+                    )
+                face_key = _face_key(
+                    raw_face.get("body_type"),
+                    raw_face.get("body_index"),
+                    raw_face.get("face_index"),
+                )
+                if face_key is None:
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_target_invalid",
+                        f"{path}.face_keys[{index}]",
+                        "a feature appearance target has an invalid face key",
+                    )
+                if face_key in all_faces:
+                    result.add(face_key)
+            return result
+    raise _appearance_resolution_error(
+        component,
+        "cad_appearance_render_target_invalid",
+        path,
+        "a display-state appearance target has no exact delivered-face binding",
+        observed=dict(target),
+    )
+
+
+def resolve_deliverable_appearance(
+    raw: object,
+    *,
+    component: str,
+    expected_document_path: object,
+    expected_configuration: object,
+    face_spans: Sequence[Mapping[str, Any]],
+) -> AppearanceResolution:
+    """Resolve one RGBA for every delivered face from the frozen owner/state facts."""
+
+    component = str(component)
+    if raw is UNRECORDED_APPEARANCE or raw is None or not isinstance(raw, Mapping):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_record_missing",
+            "appearance_raw",
+            "an explicit appearance record is missing",
+        )
+    configuration = (
+        expected_configuration
+        if isinstance(expected_configuration, str)
+        else ""
+    )
+    if (
+        raw.get("component") != component
+        or not _same_document_path(
+            raw.get("source_document_path"),
+            expected_document_path,
+        )
+        or not configuration
+        or raw.get("referenced_configuration") != configuration
+    ):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_owner_mismatch",
+            "appearance_raw",
+            "the appearance record is not bound to the requested occurrence and configuration",
+        )
+    if (
+        raw.get("native_active_configuration_error") is not None
+        or raw.get("native_active_configuration") != configuration
+    ):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_active_configuration_invalid",
+            "appearance_raw.native_active_configuration",
+            "the active configuration is not the referenced configuration",
+            expected=configuration,
+            observed=raw.get("native_active_configuration"),
+            error=raw.get("native_active_configuration_error"),
+        )
+    if (
+        raw.get("native_referenced_display_state_error") is not None
+        or not isinstance(raw.get("native_referenced_display_state"), str)
+        or not raw.get("native_referenced_display_state")
+    ):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_display_state_invalid",
+            "appearance_raw.native_referenced_display_state",
+            "the referenced display state is unreadable",
+            observed=raw.get("native_referenced_display_state"),
+            error=raw.get("native_referenced_display_state_error"),
+        )
+    display_state = str(raw["native_referenced_display_state"])
+
+    spans = []
+    next_triangle = 0
+    face_by_key: dict[tuple[int, int, int], Mapping[str, Any]] = {}
+    for index, span in enumerate(face_spans):
+        if not isinstance(span, Mapping):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_face_span_invalid",
+                f"face_spans[{index}]",
+                "a delivered face span is malformed",
+            )
+        key = _face_key(
+            span.get("body_type"),
+            span.get("body_index"),
+            span.get("face_index"),
+        )
+        reference = span.get("face_reference_sha256")
+        if (
+            key is None
+            or key in face_by_key
+            or span.get("triangle_start") != next_triangle
+            or type(span.get("triangle_count")) is not int
+            or span.get("triangle_count") <= 0
+            or not isinstance(reference, str)
+            or len(reference) != 64
+        ):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_face_span_invalid",
+                f"face_spans[{index}]",
+                "a delivered face span is not a unique contiguous face identity",
+            )
+        face_by_key[key] = span
+        spans.append(span)
+        next_triangle += span["triangle_count"]
+    if not spans:
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_face_inventory_missing",
+            "face_spans",
+            "the delivered component has no native faces",
+        )
+    all_faces = tuple(face_by_key)
+
+    body_owners = {}
+    bodies = raw.get("bodies")
+    if not isinstance(bodies, list):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_bodies_invalid",
+            "appearance_raw.bodies",
+            "the body appearance inventory is not a list",
+        )
+    for index, body in enumerate(bodies):
+        path = f"appearance_raw.bodies[{index}]"
+        if not isinstance(body, Mapping):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_body_invalid",
+                path,
+                "the body appearance record is not an object",
+            )
+        key = _face_key(body.get("body_type"), body.get("body_index"), 0)
+        if key is None or key in body_owners:
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_body_identity_invalid",
+                path,
+                "the body appearance record has no unique native identity",
+            )
+        face_rows = body.get("faces")
+        if not isinstance(face_rows, list):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_body_faces_invalid",
+                path + ".faces",
+                "the body appearance record carries no face inventory",
+            )
+        owner = body.get("appearance")
+        faces = {}
+        for face_index, face in enumerate(face_rows):
+            face_path = f"{path}.faces[{face_index}]"
+            if not isinstance(face, Mapping):
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_face_invalid",
+                    face_path,
+                    "a face appearance record is not an object",
+                )
+            key = _face_key(key[0], key[1], face.get("face_index"))
+            if key is None or key in faces:
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_face_identity_invalid",
+                    face_path,
+                    "a face appearance record has no unique identity",
+                )
+            faces[key] = face.get("appearance")
+        body_owners[key[:2]] = (owner, faces)
+    if {key[:2] for key in all_faces} != set(body_owners):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_body_inventory_mismatch",
+            "appearance_raw.bodies",
+            "appearance body owners differ from delivered body spans",
+        )
+    for body_key, (_owner, faces) in body_owners.items():
+        expected_faces = {key for key in all_faces if key[:2] == body_key}
+        if set(faces) != expected_faces:
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_face_inventory_mismatch",
+                f"appearance_raw.bodies[{body_key[0]}/{body_key[1]}].faces",
+                "face appearance owners differ from delivered face spans",
+            )
+
+    occurrence_owner = raw.get("occurrence")
+    document_owner = raw.get("document")
+
+    owner_records = raw.get("state_render_materials")
+    if not isinstance(owner_records, list):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_render_materials_missing",
+            "appearance_raw.state_render_materials",
+            "the display-state appearance owner records are missing",
+        )
+
+    parsed_materials = []
+    owner_scope_rank = {
+        "top_assembly": 0,
+        "parent_assembly": 1,
+        "component_document": 2,
+    }
+    for owner_index, owner in enumerate(owner_records):
+        owner_path = f"appearance_raw.state_render_materials[{owner_index}]"
+        if (
+            not isinstance(owner, Mapping)
+            or owner.get("owner_scope") not in owner_scope_rank
+            or not isinstance(owner.get("owner_document_path"), str)
+            or owner.get("api") != "IModelDocExtension.GetRenderMaterials2"
+            or owner.get("display_state_option") != 3
+            or owner.get("display_state") != display_state
+            or owner.get("call_state")
+            not in {
+                "observed",
+                "empty",
+                "null_result",
+                "error",
+                "state_unavailable",
+            }
+            or (
+                owner.get("materials") is not None
+                and not isinstance(owner.get("materials"), list)
+            )
+            or not isinstance(owner.get("read_errors"), Mapping)
+        ):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_render_owner_invalid",
+                owner_path,
+                "a display-state render-material owner record is malformed",
+            )
+        if (
+            owner.get("call_state") not in {"observed", "empty"}
+            or owner.get("read_errors")
+        ):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_render_enumeration_failed",
+                owner_path,
+                "a relevant display-state render-material owner was not read successfully",
+                call_state=owner.get("call_state"),
+                errors=dict(owner["read_errors"]),
+            )
+        if owner.get("call_state") == "empty" and owner.get("materials"):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_render_owner_invalid",
+                owner_path,
+                "an empty render-material call carries material rows",
+            )
+        if owner.get("call_state") == "observed" and not owner.get("materials"):
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_render_owner_invalid",
+                owner_path,
+                "an observed render-material call carries no material rows",
+            )
+        for material_position, material in enumerate(owner["materials"]):
+            path = f"{owner_path}.materials[{material_position}]"
+            if not isinstance(material, Mapping):
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_material_invalid",
+                    path,
+                    "a display-state render material is not an object",
+                )
+            errors = material.get("read_errors")
+            linked = material.get("linked_display_states")
+            entities = material.get("entity_records")
+            entities_state = material.get("entities_state")
+            if (
+                material.get("material_index") != material_position
+                or not isinstance(errors, Mapping)
+                or not isinstance(linked, (list, type(None)))
+                or not isinstance(entities, list)
+                or entities_state
+                not in {"observed", "empty", "null_result", "error"}
+            ):
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_material_invalid",
+                    path,
+                    "a display-state render material cannot be bound exactly",
+                    errors=dict(errors) if isinstance(errors, Mapping) else errors,
+                    linked_display_states=linked,
+                )
+            if entities_state in {"null_result", "error"}:
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_entities_unresolved",
+                    path + ".entities_state",
+                    "a display-state appearance has no readable entity inventory",
+                    entities_state=entities_state,
+                )
+            if entities_state == "empty":
+                continue
+            if not entities:
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_entity_invalid",
+                    path + ".entity_records",
+                    "an observed appearance carries no entity records",
+                )
+            material_faces: set[tuple[int, int, int]] = set()
+            faces_by_scope: dict[str, set[tuple[int, int, int]]] = {
+                "occurrence": set(),
+                "face": set(),
+                "feature": set(),
+                "body": set(),
+            }
+            for entity_index, entity in enumerate(entities):
+                entity_path = f"{path}.entities[{entity_index}]"
+                if (
+                    not isinstance(entity, Mapping)
+                    or entity.get("entity_index") != entity_index
+                    or not isinstance(entity.get("native_object_type"), str)
+                    or not isinstance(entity.get("matched_identity"), Mapping)
+                    or not isinstance(entity.get("read_errors"), Mapping)
+                ):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_invalid",
+                        entity_path,
+                        "a display-state render-material entity cannot be bound exactly",
+                    )
+                identity = entity["matched_identity"]
+                occurrences = identity.get("occurrences")
+                if not isinstance(occurrences, list):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_invalid",
+                        entity_path + ".matched_identity.occurrences",
+                        "matched occurrence identities are malformed",
+                    )
+                if any(
+                    isinstance(item, Mapping)
+                    and str(item.get("component") or "") == component
+                    for item in occurrences
+                ):
+                    faces_by_scope["occurrence"] |= set(all_faces)
+                bodies = identity.get("bodies")
+                if not isinstance(bodies, list):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_invalid",
+                        entity_path + ".matched_identity.bodies",
+                        "matched body identities are malformed",
+                    )
+                for body in bodies:
+                    if not isinstance(body, Mapping):
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_invalid",
+                            entity_path + ".matched_identity.bodies",
+                            "a matched body identity is malformed",
+                        )
+                    if str(body.get("component") or "") != component:
+                        continue
+                    body_key = _face_key(
+                        body.get("body_type"),
+                        body.get("body_index"),
+                        0,
+                    )
+                    if body_key is None:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_invalid",
+                            entity_path + ".matched_identity.bodies",
+                            "a matched body identity is invalid",
+                        )
+                    faces_by_scope["body"] |= {
+                        face
+                        for face in all_faces
+                        if face[:2] == body_key[:2]
+                    }
+                faces = identity.get("faces")
+                if not isinstance(faces, list):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_invalid",
+                        entity_path + ".matched_identity.faces",
+                        "matched face identities are malformed",
+                    )
+                for face in faces:
+                    if not isinstance(face, Mapping):
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_invalid",
+                            entity_path + ".matched_identity.faces",
+                            "a matched face identity is malformed",
+                        )
+                    if str(face.get("component") or "") != component:
+                        continue
+                    face_key = _face_key(
+                        face.get("body_type"),
+                        face.get("body_index"),
+                        face.get("face_index"),
+                    )
+                    if face_key is None:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_invalid",
+                            entity_path + ".matched_identity.faces",
+                            "a matched face identity is invalid",
+                        )
+                    if face_key in all_faces:
+                        faces_by_scope["face"].add(face_key)
+                features = identity.get("features")
+                if not isinstance(features, list):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_invalid",
+                        entity_path + ".matched_identity.features",
+                        "matched feature identities are malformed",
+                    )
+                for feature in features:
+                    if not isinstance(feature, Mapping):
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_invalid",
+                            entity_path + ".matched_identity.features",
+                            "a matched feature identity is malformed",
+                        )
+                    if str(feature.get("component") or "") != component:
+                        continue
+                    face_key = _face_key(
+                        feature.get("body_type"),
+                        feature.get("body_index"),
+                        feature.get("face_index"),
+                    )
+                    if face_key is None:
+                        raise _appearance_resolution_error(
+                            component,
+                            "cad_appearance_render_entity_invalid",
+                            entity_path + ".matched_identity.features",
+                            "a matched feature face identity is invalid",
+                        )
+                    if face_key in all_faces:
+                        faces_by_scope["feature"].add(face_key)
+            for scoped_faces in faces_by_scope.values():
+                material_faces |= scoped_faces
+            if not material_faces:
+                continue
+            if (
+                errors
+                or display_state not in linked
+                or any(entity.get("read_errors") for entity in entities)
+                or material.get("color_form") != 1
+                or material.get("texture_filename") not in (None, "")
+                or material.get("surface_finish_file") not in (None, "")
+            ):
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_material_unsupported",
+                    path,
+                    "a participating display-state appearance is not a qualified solid color",
+                    errors=dict(errors),
+                    observed=dict(material),
+                )
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_render_color_encoding_unproven",
+                path + ".primary_color",
+                "IRenderMaterial.PrimaryColor byte packing is not proven by the current evidence",
+                observed=material.get("primary_color"),
+            )
+
+    resolved = []
+    for key, span in zip(all_faces, spans, strict=True):
+        body_key = key[:2]
+        body_owner_raw, body_faces_raw = body_owners[body_key]
+        selected = None
+        for scope in ("occurrence", "face", "feature", "body", "document"):
+            choices = []
+            if scope == "occurrence" and occurrence_owner is not None:
+                owner = _owner_color(
+                    occurrence_owner,
+                    component=component,
+                    path="appearance_raw.occurrence",
+                    expected_configuration=configuration,
+                )
+                if owner is not None:
+                    choices.append({"rgba": owner[0], "source": owner[1]})
+            elif scope == "face":
+                owner = _owner_color(
+                    body_faces_raw[key],
+                    component=component,
+                    path=(
+                        "appearance_raw.bodies"
+                        f"[{body_key[0]}/{body_key[1]}]"
+                        f".faces[{key[2]}].appearance"
+                    ),
+                    expected_configuration=configuration,
+                )
+                if owner is not None:
+                    choices.append({"rgba": owner[0], "source": owner[1]})
+            elif scope == "body":
+                owner = _owner_color(
+                    body_owner_raw,
+                    component=component,
+                    path=(
+                        "appearance_raw.bodies"
+                        f"[{body_key[0]}/{body_key[1]}].appearance"
+                    ),
+                    expected_configuration=configuration,
+                )
+                if owner is not None:
+                    choices.append({"rgba": owner[0], "source": owner[1]})
+            elif scope == "document":
+                owner = _owner_color(
+                    document_owner,
+                    component=component,
+                    path="appearance_raw.document",
+                    expected_configuration=configuration,
+                    use_presence=False,
+                )
+                if owner is not None:
+                    choices.append({"rgba": owner[0], "source": owner[1]})
+            choices.extend(
+                {
+                    "rgba": material["rgba"],
+                    "source": material["source"],
+                }
+                for material in parsed_materials
+                if key in material["faces_by_scope"].get(scope, set())
+            )
+            if not choices:
+                continue
+            colors = {
+                tuple(float(value) for value in choice["rgba"])
+                for choice in choices
+            }
+            if len(colors) != 1:
+                code = (
+                    "cad_appearance_ancestor_precedence_unproven"
+                    if scope == "occurrence"
+                    else "cad_appearance_owner_conflict"
+                )
+                raise _appearance_resolution_error(
+                    component,
+                    code,
+                    f"face:{body_key[0]}/{body_key[1]}/{key[2]}",
+                    "applicable appearances disagree at one proven hierarchy scope",
+                    rgba=[list(color) for color in sorted(colors)],
+                    sources=[choice["source"] for choice in choices],
+                )
+            selected = {
+                "rgba": colors.pop(),
+                "sources": [choice["source"] for choice in choices],
+                "scopes": [scope],
+            }
+            break
+        if selected is None:
+            raise _appearance_resolution_error(
+                component,
+                "cad_appearance_effective_face_unresolved",
+                f"face:{body_key[0]}/{body_key[1]}/{key[2]}",
+                "no recorded native owner or display-state material resolves this face",
+            )
+        resolved.append(
+            FaceAppearance(
+                body_type=key[0],
+                body_index=key[1],
+                face_index=key[2],
+                face_reference_sha256=str(span["face_reference_sha256"]),
+                triangle_start=int(span["triangle_start"]),
+                triangle_count=int(span["triangle_count"]),
+                rgba=selected["rgba"],
+                source={
+                    "scopes": selected["scopes"],
+                    "configuration": configuration,
+                    "display_state": display_state,
+                    "owners": selected["sources"],
+                },
+            )
+        )
+    return AppearanceResolution(
+        component=component,
+        referenced_configuration=configuration,
+        referenced_display_state=display_state,
+        faces=tuple(resolved),
     )
 
 

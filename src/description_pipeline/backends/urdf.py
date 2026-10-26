@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import struct
@@ -9,6 +10,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from ..io import PipelineError, confined, file_digest, format_number
+from ..geometry.native_tessellation import native_stl_subset
 from ..geometry.stl import MESH_PART_TRIANGLES_MAX
 from ..model import EngineeringModel
 from ..sources.solidworks.naming import fixed_joint_name, material_name, mesh_path, visual_name
@@ -38,7 +40,14 @@ def _binary_stl_triangle_count(original: Path, raw: bytes) -> int:
     raise PipelineError(f"Native STL mesh is not an exact binary STL: {original.name}")
 
 
-def _export_mesh(original: Path, destination: Path, relative: str) -> list[str]:
+def _export_mesh(
+    original: Path,
+    destination: Path,
+    relative: str,
+    *,
+    triangle_ranges: list[dict] | None = None,
+    expected_sha256: str | None = None,
+) -> list[str]:
     """Deliver one native STL, partitioning only when it exceeds the consumer limit.
 
     Every part repeats the native 80-byte header, declares its own triangle count
@@ -47,10 +56,26 @@ def _export_mesh(original: Path, destination: Path, relative: str) -> list[str]:
     """
     raw = original.read_bytes()
     count = _binary_stl_triangle_count(original, raw)
+    if triangle_ranges is not None:
+        raw, count = native_stl_subset(raw, triangle_ranges)
+        if (
+            not isinstance(expected_sha256, str)
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
+            raise PipelineError(
+                "Native appearance subset digest differs from the canonical model"
+            )
+    elif expected_sha256 is not None:
+        raise PipelineError(
+            "A native appearance subset requires triangle ranges"
+        )
     target = confined(destination, relative, exists=False)
     target.parent.mkdir(parents=True, exist_ok=True)
     if count <= MESH_PART_TRIANGLE_LIMIT:
-        shutil.copyfile(original, target)
+        if triangle_ranges is None:
+            shutil.copyfile(original, target)
+        else:
+            target.write_bytes(raw)
         return [relative]
     stem = relative[: -len(".stl")]
     payload = raw[_STL_PREFIX_BYTES:]
@@ -128,7 +153,13 @@ def generate_urdf(model: EngineeringModel, source: Path, destination: Path) -> P
                         category=tag,
                         namespace=model.name,
                     )
-                    meshes = _export_mesh(original, destination, relative.removeprefix("../"))
+                    meshes = _export_mesh(
+                        original,
+                        destination,
+                        relative.removeprefix("../"),
+                        triangle_ranges=shape.get("triangle_ranges"),
+                        expected_sha256=shape.get("mesh_sha256"),
+                    )
                 else:
                     meshes = [None]
                 for relative in meshes:

@@ -173,6 +173,7 @@ _INDEPENDENT_LABELS = {
     "geometry.expected_extent": "Expected overall extent",
     "physics.expected_mass": "Expected mass range",
     "consumer.urdf": "Consumer URDF loadability",
+    "appearance.native": "Native face appearance and material partition",
     # Physics-module variants that can accompany the fixed set.
     "physics.authority": "Physical-evidence authority",
     "physics.closure": "Physical mass closure",

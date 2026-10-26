@@ -17,7 +17,6 @@ from description_pipeline.sources.solidworks.naming import (
     mesh_path,
     visual_name,
 )
-from description_pipeline.sources.solidworks.appearance import AppearanceError
 from description_pipeline.sources.solidworks.scene import _value_warnings
 from description_pipeline.verification.solidworks_urdf import (
     _carrier_binding,
@@ -398,76 +397,6 @@ class ValueWarningTests(unittest.TestCase):
                     }
                 ],
             )
-
-    def test_verify_rejects_explicitly_unobserved_native_appearance(self):
-        raw, scope = appearance_evidence(claimed=False)
-        with self.assertRaises(AppearanceError) as caught:
-            _value_warning_gate(
-                self.root,
-                self.source,
-                self.model,
-                native_geometry_rows=[
-                    {
-                        "component": "part-1",
-                        "path": "geometry/mesh.stl",
-                        "sha": self.digest,
-                        "source_scope": scope,
-                    }
-                ],
-                raw_scene={
-                    "components": [
-                        {
-                            "name": "part-1",
-                            "appearance_raw": raw,
-                        }
-                    ]
-                },
-                native_appearance=True,
-            )
-        self.assertIn(
-            "cad_appearance_effective_scope_unproven",
-            {
-                issue["code"]
-                for issue in caught.exception.details["appearance"]["issues"]
-            },
-        )
-
-    def test_verify_rejects_claimed_raw_without_an_effective_appearance_proof(self):
-        raw, scope = appearance_evidence(claimed=True)
-        with self.assertRaises(AppearanceError) as caught:
-            _value_warning_gate(
-                self.root,
-                self.source,
-                self.model,
-                native_geometry_rows=[
-                    {
-                        "component": "part-1",
-                        "path": "geometry/mesh.stl",
-                        "sha": self.digest,
-                        "source_scope": scope,
-                    }
-                ],
-                raw_scene={
-                    "components": [
-                        {
-                            "name": "part-1",
-                            "appearance_raw": raw,
-                        }
-                    ]
-                },
-                native_appearance=True,
-            )
-        self.assertEqual(
-            caught.exception.details["appearance"]["component"],
-            "part-1",
-        )
-        self.assertIn(
-            "cad_appearance_effective_scope_unproven",
-            {
-                issue["code"]
-                for issue in caught.exception.details["appearance"]["issues"]
-            },
-        )
 
     def test_functional_joint_name_is_rederived_from_raw_axis_not_source_provenance(self):
         native_bodies = [

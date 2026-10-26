@@ -285,7 +285,11 @@ class CadMassAuthorityTests(unittest.TestCase):
                 with self.assertRaises(AppearanceError) as caught:
                     load_scene(snapshot)
                 self.assertIn(
-                    "cad_appearance_effective_scope_unproven",
+                    (
+                        "cad_appearance_record_missing"
+                        if not explicit
+                        else "cad_appearance_display_state_invalid"
+                    ),
                     {
                         issue["code"]
                         for issue in caught.exception.details["appearance"]["issues"]
@@ -302,7 +306,7 @@ class CadMassAuthorityTests(unittest.TestCase):
         appearance = caught.exception.details["appearance"]
         self.assertEqual(appearance["component"], "arm-1")
         self.assertIn(
-            "cad_appearance_effective_scope_unproven",
+            "cad_appearance_display_state_invalid",
             {issue["code"] for issue in appearance["issues"]},
         )
 
