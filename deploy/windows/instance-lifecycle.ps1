@@ -308,6 +308,19 @@ function Start-BoundTask([object]$binding) {
   $parameters = Get-TaskSelectionParameters $binding
   Start-ScheduledTask @parameters
 }
+function Get-ActionConfigArguments([string]$Arguments) {
+  return @([regex]::Matches(
+    $Arguments,
+    '(?:^|\s)--config\s+"([^"]+)"(?=\s|$)'))
+}
+function Test-ActionConfigArgument([string]$Arguments, [string]$ConfigPath) {
+  $matches = @(Get-ActionConfigArguments $Arguments)
+  return (
+    $matches.Count -eq 1 -and
+    (Normalize-PathIdentity $matches[0].Groups[1].Value) -eq
+      (Normalize-PathIdentity $ConfigPath)
+  )
+}
 function Get-TaskGeneration([object]$task) {
   Assert-Single-TaskAction $task
   $execute = [string]$task.Actions[0].Execute
@@ -904,14 +917,12 @@ function Read-ValidatedSnapshot(
     throw 'the sealed source configuration is outside its generation'
   }
   $installIdPath = Join-Path ([string]$source.state_root) 'install-id'
-  $normalizedArguments = Normalize-PathIdentity ([string]$source.arguments)
-  $normalizedConfigPath = Normalize-PathIdentity ([string]$source.config_path)
   if ((Normalize-PathIdentity ([string]$source.execute)) -ne
         (Normalize-PathIdentity (Runtime-Python ([string]$source.endpoint_root))) -or
       (Normalize-PathIdentity ([string]$source.working_directory)) -ne
         (Normalize-PathIdentity ([string]$source.state_root)) -or
-      $normalizedArguments.IndexOf(
-        $normalizedConfigPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+      -not (Test-ActionConfigArgument ([string]$source.arguments) (
+        [string]$source.config_path)) -or
       (Normalize-PathIdentity ([string]$source.install_id_path)) -ne
         (Normalize-PathIdentity $installIdPath)) {
     throw 'the sealed source action or install identity is outside its generation'
@@ -2027,10 +2038,8 @@ function Get-EndpointIdentity($Task, $TaskProjection, [string]$SshHost) {
   if ((Normalize-PathIdentity $configPath) -ne (Normalize-PathIdentity (Config-Path $generation))) {
     Die 'windows_task_projection_mismatch' 'the task action does not bind its generation configuration'
   }
-  if ([string]::IsNullOrWhiteSpace([string]$Task.Actions[0].Arguments) -or
-      ([string]$Task.Actions[0].Arguments).IndexOf(
-        $configPath,
-        [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+  if (-not (Test-ActionConfigArgument (
+        [string]$Task.Actions[0].Arguments) $configPath)) {
     Die 'windows_task_projection_mismatch' 'the raw source action does not carry its managed configuration path'
   }
   if ((Normalize-PathIdentity ([string]$Task.Actions[0].WorkingDirectory)) -ne

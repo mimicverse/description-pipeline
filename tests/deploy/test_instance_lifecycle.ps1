@@ -902,6 +902,21 @@ Check 'launch.module_case_refused' (-not (Test-Runtime-Launcher (Runtime-Launche
   ((Runtime-LauncherArguments $generation) -replace 'description_pipeline', 'Description_Pipeline') $generation))
 Check 'launch.argument_suffix_refused' (-not (Test-Runtime-Launcher (Runtime-Launcher $generation) `
   ((Runtime-LauncherArguments $generation) + ' --foreign') $generation))
+$windowsConfigPath = 'C:/root/old/generation/endpoint.json'
+$windowsArguments = (
+  '-I -B -m description_pipeline serve --config "C:\root\old\generation\endpoint.json"')
+Check 'task.action_config_path_is_separator_neutral' (
+  Test-ActionConfigArgument $windowsArguments $windowsConfigPath)
+Check 'task.action_config_path_suffix_refused' (
+  -not (Test-ActionConfigArgument (
+    '-I -B -m description_pipeline serve --config "C:\root\old\generation\endpoint.json.bak"'
+  ) $windowsConfigPath))
+Check 'task.action_config_path_missing_refused' (
+  -not (Test-ActionConfigArgument '-I -B -m description_pipeline serve' $windowsConfigPath))
+Check 'task.action_config_path_duplicate_refused' (
+  -not (Test-ActionConfigArgument (
+    $windowsArguments + ' --config "C:\root\old\generation\endpoint.json"'
+  ) $windowsConfigPath))
 $sourceGeneration = Join-Path $root 'lifecycle/source-generation'
 $null = New-Item -ItemType Directory -Path $sourceGeneration
 $opaqueTask = [pscustomobject]@{
