@@ -38,18 +38,28 @@
 外观 raw 位于 `native_capture_facts.scene_raw.occurrences[].appearance_raw`。document
 和 face 使用无参 active-configuration 属性，且只有实际 active 与 occurrence referenced
 configuration 相同时才能采用。top、parent 与 component-document owner 各自保留原生
-configuration/display-state，`GetRenderMaterials2` 的 NULL 原值与
-`GetRenderMaterialsCount` 分开保存：只有成功读取的原生总数确证为 0 时才可证明没有
-state render assignment；非零或未知总数下的 NULL 仍是未解析事实。
+configuration/display-state，`GetRenderMaterials2` 的 NULL 原值与同一 owner、configuration、
+typed display-state 参数下的 `GetRenderMaterialsCount2` 分开保存。只有成功读取的
+exact-state 总数确证为 0 时才可证明没有 state render assignment；非零或未知总数下的
+NULL 仍是未解析事实，present rows 的基数必须与总数一致。
 
-state material 的原生对象绑定由 entity persistent reference 与同一 owner 的
-`native_reference_index` 独立 join，不能信任 Source 预填的 `matched_identity`。没有索引
-或索引失败的 entity 视为未知；只有索引明确指向当前交付 scope 外对象时才能忽略。
+state material 的原生对象绑定由 entity persistent reference、同一 owner/context 的
+`native_reference_index` 独立 join，不能信任 Source 预填的 `matched_identity`。document
+target 必须保留并核验 `IModelDoc2` QI、path、active configuration 与 leaf owner；assembly
+context 只接受已证明方向的 `IComponent2.GetCorresponding` / `GetCorrespondingEntity`。
+同一 feature identity 可拥有多个 `faces[]`，不同 identity 共享 reference 仍为未知。
+没有索引或索引失败的 entity 视为未知；只有成功的原生 context 明确指向当前交付 scope
+外对象时才能忽略。
 Generate 与 Verify 分别执行该 join，并按交付 face 的 triangle span 无损分组为多个
 visual/material；alpha 从原生 index 7 的透明度派生并显示来源 warning。当前没有资产、
-UV 和绑定消费能力的 present texture、参与交付但无法证明的颜色编码、对象/配置错绑或
-冲突必须失败，不输出默认色，也不以 warning 代替失败。名称差异的非阻塞许可不扩及
-颜色、纹理或对象绑定。
+UV 和绑定消费能力的 present texture、对象/配置错绑或冲突必须失败，不输出默认色，
+也不以 warning 代替失败。唯一例外是同一 GetEntities target 已证明为当前 leaf model
+document，exact linked display-state 的 ColorForm-one material 具有空 `TextureFilename`
+与 `SurfaceFinishFile` 并覆盖全部交付 face；此时旧 config-wide `GetTexture` pointer
+保留为诊断但非参与。`MaterialName=""` 本身仍是 present，不表示 absence。
+`IRenderMaterial.PrimaryColor` 按版本化 `appearance.primary_color_colorref/v1` 解码为
+R、G、B 低到高字节，alpha 为 `1-transparency`，并记录派生 warning。名称差异的非阻塞
+许可不扩及颜色、纹理或对象绑定。
 
 声明存在性是封存原生观察中的 `present / absent / unreadable / unknown`。`absent` 只在交付配置中成功完成原生声明存储查询并证明不存在时成立，必须保留查询对象、接口、返回状态及结果；缺少记录、读取失败或空的损坏载荷不是不存在。`present` 必须支持格式版本、可完整解码、适用于交付配置，全部持久组件/基准/轴引用可解析，且与原生几何和可比较工作限位一致；否则失败。推导和验证分别执行语义核对，只有存在性契约共享。
 

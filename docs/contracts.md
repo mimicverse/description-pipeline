@@ -677,25 +677,17 @@ COM；Freeze 保留初次准备职责。Capture 读取 scene 与内存几何事�
 
 ### 原生外观读数与交付
 
-`appearance_raw` 分别保留 document、occurrence、body 的实际 API、明确参数、原始数组、
-`HasMaterialPropertyValues`、texture pointer、`MaterialName`、读取错误以及实际与请求
-配置的绑定。这些事实不表示已经取得最终有效外观，也不证明不存在 face、feature 或
-display-state 覆盖；三个观测层颜色相同不能补齐未读取的覆盖层。
+`appearance_raw` 保留 document、occurrence、body、face、feature 和 display-state 的原生观察、实际 API 与参数、原值、配置、对象绑定及读取错误。document 与 face 的无参 active-configuration 属性只在实际 active 与实例 referenced configuration 相同时采用；各顶层、祖先与 leaf owner 使用自己的配置和显示状态。不得以多个旧层颜色相同替代未读覆盖层。
 
-不能自行规定 body、occurrence、document 的优先级或继承。`-1` 与 Has 标志只按
-对应 API、owner 和真实配置的语义解释，不能跨层推断全局缺失，读取错误不能当作
-absent。纹理名称只是名称观察，不是资产字节、UV 或纹理消费证明。
+`GetRenderMaterials2(3, names)` 与 `GetRenderMaterialsCount2(3, names)` 使用同一个表示 exact owner display state 的 typed `SAFEARRAY(BSTR)`。NULL 与计数分开保留；只有成功计数为零才证明该状态无 assignment，正数或未知计数不能解释为 absent。成功枚举的行数必须等于同状态计数，不使用旧无参 Count 或 fallback。
 
-Generate 必须能够证明实际交付 visual 的颜色及纹理可以忠实表示。必需外观读数失败、
-对象或配置错绑、无法唯一证明交付 RGBA 的冲突，以及存在纹理但缺少资产、UV 或绑定
-消费能力时，阶段明确失败并保留原始事实和错误定位，不能任挑颜色、回退默认色或仅
-附 warning 后登记成功。与已证明的交付外观无关的辅助诊断按原事实保留，不另设所有
-辅助 API 零错误的资格。当前单色输出不能把多层 raw 的一致性冒称每个交付面的有效
-外观证明；缺证范围须如实记录。
+文档实体通过真实 `IModelDoc2` QI、实际 `GetPathName` 与 active configuration 建立身份，不要求文档具有实体 persistent reference。其他实体与同次几何遍历的 `native_reference_index` 在已证明的相同 owner document、occurrence 和转换上下文中 join；先确定输入对象上下文，再使用方向正确的原生对应 API，不能按 material owner scope 猜测几何对象上下文。保留原生引用和读取、转换事实；Generate 与 Verify 分别重新 join，不信任 `matched_identity`。未绑定或真实歧义仍拒绝。一个 feature identity 可以拥有多个面的 `faces[]` footprint；不同 feature identity 共用引用不授权取并集染色。
 
-Verify 从原始读数和实际输出独立复核外观来源、绑定及表示一致性，不能只比较生成
-声明。未经证明的覆盖层、纹理资产或转换仍保持未闭合；名称差异的非阻塞许可不扩大
-到颜色、纹理或实际对象归属。
+有效外观按有文档依据的对象层级解释，不任意规定继承。已证明参与的单色现代 material 必须绑定 exact owner/state 与实际交付面，`ColorForm=1`，无参与纹理或 surface finish。通用规则 `appearance.primary_color_colorref` 版本 `v1` 对非布尔、范围为 `0..0xffffff` 的 `PrimaryColor` 整数计算 `R=(v&255)/255`、`G=((v>>8)&255)/255`、`B=((v>>16)&255)/255`，`alpha=1-Transparency`，不取最高字节作为 alpha。九值属性的 alpha 同样由其原生透明度派生。保留原值、规则版本、结果和字段级 derived warning；独立验证自行计算。位顺序依据固定成熟导出器的同 API 实现交叉证据，不能冒称官方文档明确给出了 byte packing，也不从手工参考回填。
+
+若真实文档身份、exact display state 和完整面覆盖证明现代单色 material 参与当前交付，可将配置范围内但不参与该状态的 legacy `GetTexture` pointer 保留为诊断事实，无须读取无关图像与 UV。空 `MaterialName` 本身不证明 absent。真正参与交付的纹理仍须有资产字节、UV、对象绑定和消费能力；缺证、颜色冲突、对象或配置错绑、必要读取失败均明确失败，不能默认色或 warning 放行。辅助诊断不另设所有 API 零错误资格。
+
+交付按已采集 face triangle spans 无损分组为一个或多个 visual/material，完整覆盖原始面且不增删几何。Verify 从原始读数和实际输出独立核验绑定、RGBA、覆盖、网格及来源 warning。visual 或展示材质名称参考差异的非阻塞许可不扩大到颜色、纹理或实际对象归属。
 
 ### Native target identity
 

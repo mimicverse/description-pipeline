@@ -162,17 +162,23 @@ CAD 方向表达偏离规范时给出明确 warning，按 CAD 运动关系和统
 外观在同一只读原生会话中记录 document 与 face 的无参 active-configuration 属性，并
 要求实际 active configuration 与 occurrence referenced configuration 相同。top、
 parent 和 component-document owner 分别保留自己的 configuration/display-state 与读取
-错误；`GetRenderMaterials2` 的 NULL 原值、原生 material count、
-`native_reference_index`、实体 persistent reference 和纹理事实分别封存。只有成功读取的
-原生总数确证为 0 时，NULL 才可证明没有 state render assignment；非零或未知总数下仍是
-未知。Generate 与 Verify 必须从 entity reference 与同一 owner 索引独立 join，不信任
-Source 预填匹配；没有成功索引的实体不能被当作无关对象。
+错误；`GetRenderMaterials2` 的 NULL 原值、同 state `GetRenderMaterialsCount2`、
+`native_reference_index`、实体 binding context、document QI、feature face footprint 和
+纹理事实分别封存。只有成功读取的 exact-state 总数确证为 0 时，NULL 才可证明没有
+state render assignment；present rows 的基数必须与总数一致。Generate 与 Verify 必须从
+entity reference 与同一 owner/context 索引独立 join，不信任 Source 预填匹配；document
+target 必须核验 `IModelDoc2` QI、path 与 active configuration，feature 的多 face 只在
+同一 native feature identity 下合法。
 
 最终表示按实际交付 face 的 triangle spans 生成一个或多个 visual/material；alpha 从原生
-透明度派生并保留来源 warning。present texture 缺少资产、UV 或绑定消费能力、参与交付
-的颜色编码未证明、对象或配置错绑以及未证明冲突必须失败。与交付无关且由非空原生绑定
-证明在 scope 外的辅助事实可以保留为诊断，不为所有辅助错误另设全阻断门；不以默认色、
-伪造 empty、预填 effective 值或 warning 代替颜色与纹理资格。
+透明度派生并保留来源 warning。`PrimaryColor` 按版本化 COLORREF 规则从低到高解码 RGB，
+alpha 为 `1-transparency`。present texture 缺少资产、UV 或绑定消费能力、对象或配置错绑
+以及未证明冲突必须失败。只有已证明的 leaf model document target、exact linked
+display-state ColorForm-one 单色 material、空 `TextureFilename`/`SurfaceFinishFile` 和
+完整 face coverage 同时成立时，旧 config-wide `GetTexture` pointer 才可作为非参与诊断
+保留；`MaterialName=""` 本身不表示 absence。与交付无关且由成功原生 context 证明在
+scope 外的辅助事实可以保留，不为所有辅助错误另设全阻断门；不以默认色、伪造 empty、
+预填 effective 值或 warning 代替颜色与纹理资格。
 
 覆盖质量、COM 或惯量必须有可信来源、范围、配置、参考点、轴和单位；不向运动链接分摊父级覆盖。完整张量保留非对角项，不混用原点与质心惯量。平台按[质量规范](quality.md#physics)读取、转换与独立核验，工程师不抄写张量。
 
